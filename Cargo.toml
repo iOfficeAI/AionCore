@@ -102,6 +102,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 jsonwebtoken = "9"
 bcrypt = "0.17"
 aes-gcm = "0.10"
+zeroize = "1"
 
 # UUID
 uuid = { version = "1", features = ["v7"] }

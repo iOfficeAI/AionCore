@@ -8,6 +8,8 @@ use crate::executor::{
     CommandExecutionInput, CommandExecutionOutput, ManagedExecutionContext, build_execution_plan, execute_plan,
 };
 use crate::resources::{DevelopmentResourceController, ResourceLeaseCoordinator, ResourceLeaseInput};
+use crate::secrets::{SecretAccessContext, SecretReferenceRequest, SecretService};
+use zeroize::Zeroize;
 
 #[derive(Debug, Clone)]
 pub struct RunnerContext {
@@ -24,6 +26,7 @@ pub struct DevelopmentRunner {
     repo: Arc<dyn IDevelopmentOperationsRepository>,
     resources: ResourceLeaseCoordinator,
     controller: Arc<dyn DevelopmentResourceController>,
+    secrets: Option<SecretService>,
 }
 
 impl DevelopmentRunner {
@@ -36,7 +39,13 @@ impl DevelopmentRunner {
             repo,
             resources,
             controller,
+            secrets: None,
         }
+    }
+
+    pub fn with_secrets(mut self, secrets: SecretService) -> Self {
+        self.secrets = Some(secrets);
+        self
     }
 
     pub fn resources(&self) -> &ResourceLeaseCoordinator {
@@ -52,11 +61,12 @@ impl DevelopmentRunner {
 
     pub async fn execute(
         &self,
-        input: CommandExecutionInput<'_>,
+        mut input: CommandExecutionInput<'_>,
         context: &RunnerContext,
     ) -> Result<CommandExecutionOutput, DevelopmentError> {
         let timeout_seconds = input.timeout_seconds;
         let plan = build_execution_plan(&input)?;
+        input.environment.values_mut().for_each(Zeroize::zeroize);
         self.bind_environment(context, &plan.environment_id, &plan.isolation_mode)
             .await?;
         let mut planned_leases = Vec::new();
@@ -100,6 +110,29 @@ impl DevelopmentRunner {
             }
         }
         result
+    }
+
+    pub async fn execute_with_secret_references(
+        &self,
+        mut input: CommandExecutionInput<'_>,
+        context: &RunnerContext,
+        access: &SecretAccessContext,
+        requests: &[SecretReferenceRequest],
+    ) -> Result<CommandExecutionOutput, DevelopmentError> {
+        let service = self
+            .secrets
+            .as_ref()
+            .ok_or_else(|| DevelopmentError::Conflict("Secret materialization is unavailable".into()))?;
+        let materialized = service.materialize(&context.user_id, access, requests).await?;
+        for (key, value) in materialized.values() {
+            if input.environment.insert(key.clone(), value.clone()).is_some() {
+                input.environment.values_mut().for_each(Zeroize::zeroize);
+                return Err(DevelopmentError::BadRequest(
+                    "Secret environment key conflicts with an existing value".into(),
+                ));
+            }
+        }
+        self.execute(input, context).await
     }
 
     async fn bind_environment(

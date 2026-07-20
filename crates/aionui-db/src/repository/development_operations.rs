@@ -2,8 +2,10 @@ use aionui_common::TimestampMs;
 
 use crate::error::DbError;
 use crate::models::{
-    DevelopmentAlertRow, DevelopmentAuditEventRow, DevelopmentPolicyRow, DevelopmentRecoveryRecordRow,
-    DevelopmentRunRow, DevelopmentUsageEventRow, DevelopmentUsageSummary, ExecutionResourceLeaseRow,
+    DevelopmentAlertRow, DevelopmentAuditEventRow, DevelopmentModelPriceRow, DevelopmentPolicyRow,
+    DevelopmentPricedUsageEventRow, DevelopmentRecoveryRecordRow, DevelopmentRunRow, DevelopmentSecretGrantRow,
+    DevelopmentSecretRow, DevelopmentUsageDimensionSummary, DevelopmentUsageEventRow, DevelopmentUsageSummary,
+    ExecutionResourceLeaseRow, UsageDimension,
 };
 
 #[async_trait::async_trait]
@@ -71,4 +73,29 @@ pub trait IDevelopmentOperationsRepository: Send + Sync {
         environment_kind: &str,
         bound_at: TimestampMs,
     ) -> Result<(), DbError>;
+
+    async fn insert_secret(&self, row: &DevelopmentSecretRow) -> Result<(), DbError>;
+    async fn get_secret(&self, user_id: &str, secret_id: &str) -> Result<Option<DevelopmentSecretRow>, DbError>;
+    async fn list_secrets(&self, user_id: &str, project_id: &str) -> Result<Vec<DevelopmentSecretRow>, DbError>;
+    async fn revoke_secret(&self, user_id: &str, secret_id: &str, revoked_at: TimestampMs) -> Result<bool, DbError>;
+    async fn upsert_secret_grant(&self, row: &DevelopmentSecretGrantRow) -> Result<(), DbError>;
+    async fn list_secret_grants(
+        &self,
+        user_id: &str,
+        secret_id: &str,
+    ) -> Result<Vec<DevelopmentSecretGrantRow>, DbError>;
+
+    async fn upsert_model_price(&self, row: &DevelopmentModelPriceRow) -> Result<(), DbError>;
+    async fn resolve_model_price(
+        &self,
+        provider: &str,
+        model: &str,
+        occurred_at: TimestampMs,
+    ) -> Result<Option<DevelopmentModelPriceRow>, DbError>;
+    async fn append_priced_usage(&self, row: &DevelopmentPricedUsageEventRow) -> Result<(), DbError>;
+    async fn summarize_usage_dimension(
+        &self,
+        user_id: &str,
+        dimension: &UsageDimension,
+    ) -> Result<DevelopmentUsageDimensionSummary, DbError>;
 }

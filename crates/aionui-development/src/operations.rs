@@ -5,7 +5,8 @@ use std::sync::Arc;
 use aionui_common::now_ms;
 use aionui_db::models::{
     DevelopmentAlertRow, DevelopmentAuditEventRow, DevelopmentPolicyRow, DevelopmentRecoveryRecordRow,
-    DevelopmentRunRow, DevelopmentUsageEventRow, DevelopmentUsageSummary,
+    DevelopmentRunRow, DevelopmentUsageDimensionSummary, DevelopmentUsageEventRow, DevelopmentUsageSummary,
+    UsageDimension,
 };
 use aionui_db::{
     IAgentWorkspaceLeaseRepository, IDevelopmentOperationsRepository, IDevelopmentRepository, IProjectRepository,
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::DevelopmentError;
+use crate::policy::{DevelopmentPolicyRules, PolicyDecision, PolicyEngine, PolicyOperation};
 use crate::resources::{DevelopmentResourceController, ResourceLeaseCoordinator};
 
 const DEFAULT_MAX_DURATION_MS: i64 = 4 * 60 * 60 * 1000;
@@ -30,10 +32,24 @@ pub struct DevelopmentPolicyInput {
     pub network_mode: String,
     #[serde(default)]
     pub allowed_secret_keys: Vec<String>,
+    #[serde(default)]
+    pub allowed_commands: Vec<String>,
+    #[serde(default)]
+    pub protected_paths: Vec<String>,
+    #[serde(default)]
+    pub allowed_network_hosts: Vec<String>,
+    #[serde(default)]
+    pub protected_branches: Vec<String>,
+    #[serde(default = "default_confirmation_count")]
+    pub dangerous_confirmation_count: i64,
     pub max_duration_ms: i64,
     pub max_parallel_agents: i64,
     pub max_retries: i64,
     pub max_cost_microunits: i64,
+    #[serde(default)]
+    pub max_total_tokens: i64,
+    #[serde(default)]
+    pub fallback_model: Option<String>,
     pub alert_percent: i64,
     pub over_limit_action: String,
 }
@@ -44,12 +60,14 @@ pub struct BudgetEvaluation {
     pub action: String,
     pub reasons: Vec<String>,
     pub usage: DevelopmentUsageSummary,
+    pub replacement_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevelopmentOperationsSnapshot {
     pub policy: DevelopmentPolicyRow,
     pub usage: DevelopmentUsageSummary,
+    pub priced_usage: DevelopmentUsageDimensionSummary,
     pub alerts: Vec<DevelopmentAlertRow>,
     pub audit: Vec<DevelopmentAuditEventRow>,
     pub recovery: Vec<DevelopmentRecoveryRecordRow>,
@@ -124,6 +142,10 @@ impl DevelopmentOperationsService {
             .into_iter()
             .collect();
         secret_keys.sort();
+        let allowed_commands = normalized_values(input.allowed_commands);
+        let protected_paths = normalized_values(input.protected_paths);
+        let allowed_network_hosts = normalized_values(input.allowed_network_hosts);
+        let protected_branches = normalized_values(input.protected_branches);
         let row = DevelopmentPolicyRow {
             id: existing
                 .as_ref()
@@ -140,10 +162,17 @@ impl DevelopmentOperationsService {
             network_mode: input.network_mode,
             allowed_secret_keys_json: serde_json::to_string(&secret_keys)
                 .map_err(|error| DevelopmentError::Internal(error.to_string()))?,
+            allowed_commands_json: json_array(&allowed_commands)?,
+            protected_paths_json: json_array(&protected_paths)?,
+            allowed_network_hosts_json: json_array(&allowed_network_hosts)?,
+            protected_branches_json: json_array(&protected_branches)?,
+            dangerous_confirmation_count: input.dangerous_confirmation_count,
             max_duration_ms: input.max_duration_ms,
             max_parallel_agents: input.max_parallel_agents,
             max_retries: input.max_retries,
             max_cost_microunits: input.max_cost_microunits,
+            max_total_tokens: input.max_total_tokens,
+            fallback_model: clean_optional(input.fallback_model),
             alert_percent: input.alert_percent,
             over_limit_action: input.over_limit_action,
             created_at: existing.map(|row| row.created_at).unwrap_or(now),
@@ -165,16 +194,71 @@ impl DevelopmentOperationsService {
                 "isolation_mode": row.isolation_mode,
                 "network_mode": row.network_mode,
                 "allowed_secret_keys": secret_keys,
+                "allowed_commands": allowed_commands,
+                "protected_paths": protected_paths,
+                "allowed_network_hosts": allowed_network_hosts,
+                "protected_branches": protected_branches,
+                "dangerous_confirmation_count": row.dangerous_confirmation_count,
                 "max_duration_ms": row.max_duration_ms,
                 "max_parallel_agents": row.max_parallel_agents,
                 "max_retries": row.max_retries,
                 "max_cost_microunits": row.max_cost_microunits,
+                "max_total_tokens": row.max_total_tokens,
+                "fallback_model": row.fallback_model,
                 "over_limit_action": row.over_limit_action,
             }),
             &[],
         )
         .await?;
         Ok(row)
+    }
+
+    pub async fn evaluate_policy(
+        &self,
+        user_id: &str,
+        project_id: &str,
+        target_id: &str,
+        operation: &PolicyOperation,
+        confirmations: u8,
+    ) -> Result<PolicyDecision, DevelopmentError> {
+        self.require_project(user_id, project_id).await?;
+        if !target_id.is_empty() {
+            let run = self.require_run(user_id, target_id).await?;
+            if run.project_id != project_id {
+                return Err(DevelopmentError::NotFound(format!("run {target_id}")));
+            }
+        }
+        let policy = self.get_policy(user_id, project_id).await?;
+        let rules = DevelopmentPolicyRules {
+            allowed_commands: parse_string_array(&policy.allowed_commands_json)?,
+            protected_paths: parse_string_array(&policy.protected_paths_json)?,
+            allowed_network_hosts: parse_string_array(&policy.allowed_network_hosts_json)?,
+            protected_branches: parse_string_array(&policy.protected_branches_json)?,
+            dangerous_confirmation_count: u8::try_from(policy.dangerous_confirmation_count)
+                .map_err(|_| DevelopmentError::Internal("invalid persisted confirmation count".into()))?,
+        };
+        let decision = PolicyEngine::evaluate(&rules, operation, confirmations);
+        let result = match decision {
+            PolicyDecision::Allowed => "success",
+            PolicyDecision::Denied { .. } => "denied",
+            PolicyDecision::ConfirmationRequired { .. } => "confirmation_required",
+        };
+        self.audit(
+            user_id,
+            "user",
+            user_id,
+            &format!("policy.{}", policy_operation_kind(operation)),
+            "development_run",
+            target_id,
+            project_id,
+            (!target_id.is_empty()).then_some(target_id),
+            None,
+            result,
+            json!({"decision": decision, "confirmations": confirmations}),
+            &[],
+        )
+        .await?;
+        Ok(decision)
     }
 
     pub async fn evaluate_budget(
@@ -206,6 +290,13 @@ impl DevelopmentOperationsService {
             reasons.push(format!(
                 "cost budget exceeded: {} > {} microunits",
                 usage.cost_microunits, policy.max_cost_microunits
+            ));
+        }
+        let total_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+        if policy.max_total_tokens > 0 && total_tokens > policy.max_total_tokens {
+            reasons.push(format!(
+                "token budget exceeded: {total_tokens} > {}",
+                policy.max_total_tokens
             ));
         }
         if prospective_retry_count > policy.max_retries {
@@ -252,16 +343,23 @@ impl DevelopmentOperationsService {
                 Some(run_id),
                 None,
                 if allowed { "success" } else { "denied" },
-                json!({"reasons": reasons, "action": policy.over_limit_action, "usage": usage}),
+                json!({
+                    "reasons": reasons,
+                    "action": policy.over_limit_action,
+                    "replacement_model": policy.fallback_model,
+                    "usage": usage
+                }),
                 &[],
             )
             .await?;
+            self.apply_budget_action(&run, &policy.over_limit_action).await?;
         }
         Ok(BudgetEvaluation {
             allowed,
             action: policy.over_limit_action,
             reasons,
             usage,
+            replacement_model: policy.fallback_model,
         })
     }
 
@@ -295,7 +393,43 @@ impl DevelopmentOperationsService {
                 ));
             }
         }
+        let run_id = row.run_id.clone();
+        let user_id = row.user_id.clone();
+        let retry_count = row.retry_count;
         self.operations_repo.append_usage(&row).await?;
+        if let Some(run_id) = run_id {
+            self.evaluate_budget(&user_id, &run_id, "usage_recorded", retry_count)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_budget_action(&self, run: &DevelopmentRunRow, action: &str) -> Result<(), DevelopmentError> {
+        if !matches!(
+            run.status.as_str(),
+            "preflight" | "running" | "waiting_approval" | "verifying" | "reviewing" | "integrating" | "rework"
+        ) {
+            return Ok(());
+        }
+        match action {
+            "pause" => {
+                self.development_repo
+                    .update_run_status(&run.id, &run.user_id, "paused", None)
+                    .await?;
+            }
+            "terminate" => {
+                if let (Some(coordinator), Some(controller)) = (&self.resource_coordinator, &self.resource_controller) {
+                    coordinator
+                        .cancel_run(&run.user_id, &run.id, controller.as_ref())
+                        .await?;
+                }
+                self.development_repo
+                    .update_run_status(&run.id, &run.user_id, "cancelled", Some(now_ms()))
+                    .await?;
+            }
+            "notify" | "downgrade_model" => {}
+            _ => return Err(DevelopmentError::Internal("invalid persisted budget action".into())),
+        }
         Ok(())
     }
 
@@ -312,11 +446,18 @@ impl DevelopmentOperationsService {
                 return Err(DevelopmentError::NotFound(format!("run {run_id}")));
             }
         }
+        let usage_dimension = run_id
+            .map(|run_id| UsageDimension::Run(run_id.to_owned()))
+            .unwrap_or_else(|| UsageDimension::Project(project_id.to_owned()));
         Ok(DevelopmentOperationsSnapshot {
             policy: self.get_policy(user_id, project_id).await?,
             usage: self
                 .operations_repo
                 .summarize_usage(user_id, project_id, run_id)
+                .await?,
+            priced_usage: self
+                .operations_repo
+                .summarize_usage_dimension(user_id, &usage_dimension)
                 .await?,
             alerts: self
                 .operations_repo
@@ -728,10 +869,17 @@ pub fn default_policy(user_id: &str, project_id: &str) -> DevelopmentPolicyRow {
         container_pids_limit: 256,
         network_mode: "none".into(),
         allowed_secret_keys_json: "[]".into(),
+        allowed_commands_json: "[]".into(),
+        protected_paths_json: "[\".env\",\".git\",\".github/workflows\"]".into(),
+        allowed_network_hosts_json: "[]".into(),
+        protected_branches_json: "[\"main\",\"master\"]".into(),
+        dangerous_confirmation_count: 2,
         max_duration_ms: DEFAULT_MAX_DURATION_MS,
         max_parallel_agents: 4,
         max_retries: 3,
         max_cost_microunits: 0,
+        max_total_tokens: 0,
+        fallback_model: None,
         alert_percent: 80,
         over_limit_action: "pause".into(),
         created_at: 0,
@@ -775,12 +923,22 @@ fn validate_policy(input: &DevelopmentPolicyInput) -> Result<(), DevelopmentErro
         || !(1..=64).contains(&input.max_parallel_agents)
         || !(0..=100).contains(&input.max_retries)
         || input.max_cost_microunits < 0
+        || input.max_total_tokens < 0
+        || !(1..=2).contains(&input.dangerous_confirmation_count)
         || !(1..=100).contains(&input.alert_percent)
     {
         return Err(DevelopmentError::BadRequest("policy limits are out of range".into()));
     }
-    if !matches!(input.over_limit_action.as_str(), "notify" | "pause" | "terminate") {
+    if !matches!(
+        input.over_limit_action.as_str(),
+        "notify" | "pause" | "downgrade_model" | "terminate"
+    ) {
         return Err(DevelopmentError::BadRequest("unsupported over_limit_action".into()));
+    }
+    if input.over_limit_action == "downgrade_model" && clean_optional(input.fallback_model.clone()).is_none() {
+        return Err(DevelopmentError::BadRequest(
+            "downgrade_model requires fallback_model".into(),
+        ));
     }
     for key in &input.allowed_secret_keys {
         if !valid_env_key(key.trim()) {
@@ -790,6 +948,39 @@ fn validate_policy(input: &DevelopmentPolicyInput) -> Result<(), DevelopmentErro
         }
     }
     Ok(())
+}
+
+fn default_confirmation_count() -> i64 {
+    2
+}
+
+fn normalized_values(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn json_array(values: &[String]) -> Result<String, DevelopmentError> {
+    serde_json::to_string(values).map_err(|error| DevelopmentError::Internal(error.to_string()))
+}
+
+fn parse_string_array(value: &str) -> Result<Vec<String>, DevelopmentError> {
+    serde_json::from_str(value).map_err(|_| DevelopmentError::Internal("invalid persisted policy rules".into()))
+}
+
+fn policy_operation_kind(operation: &PolicyOperation) -> &'static str {
+    match operation {
+        PolicyOperation::Command { .. } => "command",
+        PolicyOperation::Path { .. } => "path",
+        PolicyOperation::Network { .. } => "network",
+        PolicyOperation::Git { .. } => "git",
+        PolicyOperation::Deploy { .. } => "deploy",
+        PolicyOperation::Delete { .. } => "delete",
+    }
 }
 
 fn valid_env_key(value: &str) -> bool {
@@ -813,77 +1004,5 @@ fn clean_optional(value: Option<String>) -> Option<String> {
 }
 
 pub fn redact_sensitive(value: &str, secret_values: &[String]) -> String {
-    let mut value = value.to_owned();
-    let mut secrets: Vec<&String> = secret_values.iter().filter(|secret| !secret.is_empty()).collect();
-    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-    for secret in secrets {
-        value = value.replace(secret, "[REDACTED]");
-    }
-
-    let mut authorization_parts = 0_u8;
-    value
-        .split_whitespace()
-        .map(|token| {
-            let lower = token.to_ascii_lowercase();
-            let is_authorization_header =
-                lower.trim_matches(|character: char| !character.is_ascii_alphanumeric()) == "authorization";
-            if is_authorization_header {
-                authorization_parts = 2;
-                return token.to_owned();
-            }
-            if authorization_parts > 0 {
-                authorization_parts -= 1;
-                return preserve_punctuation(token, "[REDACTED]");
-            }
-            if lower.contains("ghp_") || lower.contains("github_pat_") {
-                return preserve_punctuation(token, "[REDACTED]");
-            }
-            if let Some((key, _)) = token.split_once('=') {
-                let key_lower = key.to_ascii_lowercase();
-                if [
-                    "token",
-                    "secret",
-                    "password",
-                    "passwd",
-                    "api_key",
-                    "apikey",
-                    "authorization",
-                ]
-                .iter()
-                .any(|marker| key_lower.contains(marker))
-                {
-                    return format!("{key}=[REDACTED]");
-                }
-            }
-            redact_url_credentials(token)
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn preserve_punctuation(original: &str, replacement: &str) -> String {
-    let suffix = original
-        .chars()
-        .rev()
-        .take_while(|character| matches!(character, ',' | ';' | ')' | ']' | '}' | '"'))
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    format!("{replacement}{suffix}")
-}
-
-fn redact_url_credentials(token: &str) -> String {
-    let Some(scheme_index) = token.find("://") else {
-        return token.to_owned();
-    };
-    let credentials_start = scheme_index + 3;
-    let Some(relative_at) = token[credentials_start..].find('@') else {
-        return token.to_owned();
-    };
-    format!(
-        "{}[REDACTED]@{}",
-        &token[..credentials_start],
-        &token[credentials_start + relative_at + 1..]
-    )
+    crate::secrets::redact_text(value, secret_values)
 }

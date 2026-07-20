@@ -9,7 +9,8 @@ use aionui_db::{
     SqliteDevelopmentOperationsRepository, SqliteDevelopmentRepository, SqliteProjectRepository, init_database_memory,
 };
 use aionui_development::{
-    DevelopmentOperationsService, DevelopmentPolicyInput, RecoveryDecisionInput, redact_sensitive,
+    DevelopmentOperationsService, DevelopmentPolicyInput, PolicyDecision, PolicyOperation, RecoveryDecisionInput,
+    redact_sensitive,
 };
 
 struct Fixture {
@@ -92,10 +93,17 @@ fn policy() -> DevelopmentPolicyInput {
         container_pids_limit: 128,
         network_mode: "none".into(),
         allowed_secret_keys: vec!["NPM_TOKEN".into()],
+        allowed_commands: vec![],
+        protected_paths: vec![],
+        allowed_network_hosts: vec![],
+        protected_branches: vec!["main".into()],
+        dangerous_confirmation_count: 2,
         max_duration_ms: 60_000,
         max_parallel_agents: 2,
         max_retries: 1,
         max_cost_microunits: 1_000,
+        max_total_tokens: 0,
+        fallback_model: None,
         alert_percent: 80,
         over_limit_action: "pause".into(),
     }
@@ -219,6 +227,242 @@ async fn concurrency_and_retry_limits_are_evaluated_from_persisted_state() {
     assert!(parallel.reasons.iter().any(|reason| reason.contains("parallel")));
     assert!(!retry.allowed);
     assert!(retry.reasons.iter().any(|reason| reason.contains("retry")));
+}
+
+#[tokio::test]
+async fn token_budget_returns_an_audited_model_downgrade_decision() {
+    let fixture = setup(now_ms()).await;
+    let mut configured = policy();
+    configured.max_cost_microunits = 0;
+    configured.max_total_tokens = 100;
+    configured.over_limit_action = "downgrade_model".into();
+    configured.fallback_model = Some("claude-haiku".into());
+    configured.allowed_commands = vec!["cargo".into(), "bun".into()];
+    configured.protected_paths = vec![".github/workflows".into()];
+    configured.allowed_network_hosts = vec!["api.github.com".into()];
+    configured.protected_branches = vec!["main".into()];
+    configured.dangerous_confirmation_count = 2;
+    fixture
+        .service
+        .upsert_policy("user-ops", "project-ops", configured)
+        .await
+        .unwrap();
+    fixture
+        .operations_repo
+        .append_usage(&DevelopmentUsageEventRow {
+            id: "usage-token-over".into(),
+            user_id: "user-ops".into(),
+            project_id: "project-ops".into(),
+            run_id: Some("run-ops".into()),
+            task_id: None,
+            usage_type: "agent_turn".into(),
+            source: "provider".into(),
+            confidence: "reported".into(),
+            input_tokens: 101,
+            output_tokens: 1,
+            cost_microunits: 0,
+            duration_ms: 1,
+            retry_count: 0,
+            metadata_json: "{}".into(),
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+
+    let decision = fixture
+        .service
+        .evaluate_budget("user-ops", "run-ops", "agent_turn", 0)
+        .await
+        .unwrap();
+    assert!(!decision.allowed);
+    assert_eq!(decision.action, "downgrade_model");
+    assert_eq!(decision.replacement_model.as_deref(), Some("claude-haiku"));
+    assert!(decision.reasons.iter().any(|reason| reason.contains("token")));
+
+    let snapshot = fixture
+        .service
+        .snapshot("user-ops", "project-ops", Some("run-ops"))
+        .await
+        .unwrap();
+    let audit = snapshot
+        .audit
+        .iter()
+        .find(|event| event.action == "budget.agent_turn")
+        .unwrap();
+    assert!(audit.redacted_payload_json.contains("claude-haiku"));
+    assert!(audit.redacted_payload_json.contains("downgrade_model"));
+}
+
+#[tokio::test]
+async fn persisted_policy_decisions_are_owner_scoped_and_audited() {
+    let fixture = setup(now_ms()).await;
+    let mut configured = policy();
+    configured.allowed_commands = vec!["cargo".into()];
+    configured.allowed_network_hosts = vec!["api.github.com".into()];
+    configured.protected_paths = vec![".env".into()];
+    fixture
+        .service
+        .upsert_policy("user-ops", "project-ops", configured)
+        .await
+        .unwrap();
+
+    let allowed = fixture
+        .service
+        .evaluate_policy(
+            "user-ops",
+            "project-ops",
+            "run-ops",
+            &PolicyOperation::Command {
+                program: "cargo".into(),
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed, PolicyDecision::Allowed);
+    let denied = fixture
+        .service
+        .evaluate_policy(
+            "user-ops",
+            "project-ops",
+            "run-ops",
+            &PolicyOperation::Network {
+                host: "evil.example".into(),
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(denied, PolicyDecision::Denied { .. }));
+    assert!(
+        fixture
+            .service
+            .evaluate_policy(
+                "other",
+                "project-ops",
+                "run-ops",
+                &PolicyOperation::Command {
+                    program: "cargo".into(),
+                },
+                0,
+            )
+            .await
+            .is_err()
+    );
+
+    let snapshot = fixture
+        .service
+        .snapshot("user-ops", "project-ops", Some("run-ops"))
+        .await
+        .unwrap();
+    assert!(
+        snapshot
+            .audit
+            .iter()
+            .any(|event| { event.action == "policy.command" && event.result == "success" })
+    );
+    assert!(
+        snapshot
+            .audit
+            .iter()
+            .any(|event| { event.action == "policy.network" && event.result == "denied" })
+    );
+}
+
+#[tokio::test]
+async fn pause_and_terminate_budget_actions_change_run_state() {
+    for (action, expected_status) in [("pause", "paused"), ("terminate", "cancelled")] {
+        let fixture = setup(now_ms()).await;
+        let mut configured = policy();
+        configured.max_cost_microunits = 1;
+        configured.over_limit_action = action.into();
+        fixture
+            .service
+            .upsert_policy("user-ops", "project-ops", configured)
+            .await
+            .unwrap();
+        fixture
+            .service
+            .record_usage(DevelopmentUsageEventRow {
+                id: format!("usage-{action}"),
+                user_id: "user-ops".into(),
+                project_id: "project-ops".into(),
+                run_id: Some("run-ops".into()),
+                task_id: None,
+                usage_type: "agent_turn".into(),
+                source: "provider".into(),
+                confidence: "reported".into(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cost_microunits: 2,
+                duration_ms: 1,
+                retry_count: 0,
+                metadata_json: "{}".into(),
+                created_at: now_ms(),
+            })
+            .await
+            .unwrap();
+        let run = fixture
+            .development_repo
+            .get_run("run-ops", "user-ops")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, expected_status);
+        assert_eq!(run.finished_at.is_some(), action == "terminate");
+    }
+}
+
+#[tokio::test]
+async fn notify_budget_action_warns_without_blocking_or_changing_run_state() {
+    let fixture = setup(now_ms()).await;
+    let mut configured = policy();
+    configured.max_cost_microunits = 1;
+    configured.over_limit_action = "notify".into();
+    fixture
+        .service
+        .upsert_policy("user-ops", "project-ops", configured)
+        .await
+        .unwrap();
+    fixture
+        .operations_repo
+        .append_usage(&DevelopmentUsageEventRow {
+            id: "usage-notify".into(),
+            user_id: "user-ops".into(),
+            project_id: "project-ops".into(),
+            run_id: Some("run-ops".into()),
+            task_id: None,
+            usage_type: "agent_turn".into(),
+            source: "provider".into(),
+            confidence: "reported".into(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cost_microunits: 2,
+            duration_ms: 1,
+            retry_count: 0,
+            metadata_json: "{}".into(),
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+
+    let evaluation = fixture
+        .service
+        .evaluate_budget("user-ops", "run-ops", "agent_turn", 0)
+        .await
+        .unwrap();
+    assert!(evaluation.allowed);
+    assert_eq!(evaluation.action, "notify");
+    assert_eq!(
+        fixture
+            .development_repo
+            .get_run("run-ops", "user-ops")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
 }
 
 #[test]

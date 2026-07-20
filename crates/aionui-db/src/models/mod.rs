@@ -45,8 +45,10 @@ pub use development::{
     RequirementVersionRow, ReviewFindingRow, SingleRunWorkspaceRow, TaskArtifactRow, TaskCriterionRow,
 };
 pub use development_operations::{
-    DevelopmentAlertRow, DevelopmentAuditEventRow, DevelopmentPolicyRow, DevelopmentRecoveryRecordRow,
-    DevelopmentUsageEventRow, DevelopmentUsageSummary, ExecutionResourceLeaseRow,
+    DevelopmentAlertRow, DevelopmentAuditEventRow, DevelopmentModelPriceRow, DevelopmentPolicyRow,
+    DevelopmentPricedUsageEventRow, DevelopmentRecoveryRecordRow, DevelopmentSecretGrantRow, DevelopmentSecretRow,
+    DevelopmentUsageDimensionSummary, DevelopmentUsageEventRow, DevelopmentUsageSummary, ExecutionResourceLeaseRow,
+    UsageDimension,
 };
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;

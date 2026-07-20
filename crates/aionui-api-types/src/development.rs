@@ -61,3 +61,52 @@ pub struct SingleRunWorkspace {
     pub created_at: i64,
     pub updated_at: i64,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevelopmentSecretCreateRequest {
+    pub name: String,
+    pub value: String,
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevelopmentSecretReference {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub status: String,
+    pub expires_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevelopmentSecretGrantRequest {
+    pub secret_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub environment_key: String,
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevelopmentModelPriceRequest {
+    pub provider: String,
+    pub model: String,
+    pub input_per_million_microunits: i64,
+    pub output_per_million_microunits: i64,
+    pub cache_read_per_million_microunits: i64,
+    pub cache_write_per_million_microunits: i64,
+    pub source_id: String,
+    pub version: String,
+    pub effective_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevelopmentUsageCost {
+    pub cost_microunits: Option<i64>,
+    pub origin: String,
+    pub price_source_id: Option<String>,
+    pub price_version: Option<String>,
+    pub price_effective_at: Option<i64>,
+}

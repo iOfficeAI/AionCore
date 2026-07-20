@@ -3,8 +3,10 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::{
-    DevelopmentAlertRow, DevelopmentAuditEventRow, DevelopmentPolicyRow, DevelopmentRecoveryRecordRow,
-    DevelopmentRunRow, DevelopmentUsageEventRow, DevelopmentUsageSummary, ExecutionResourceLeaseRow,
+    DevelopmentAlertRow, DevelopmentAuditEventRow, DevelopmentModelPriceRow, DevelopmentPolicyRow,
+    DevelopmentPricedUsageEventRow, DevelopmentRecoveryRecordRow, DevelopmentRunRow, DevelopmentSecretGrantRow,
+    DevelopmentSecretRow, DevelopmentUsageDimensionSummary, DevelopmentUsageEventRow, DevelopmentUsageSummary,
+    ExecutionResourceLeaseRow, UsageDimension,
 };
 use crate::repository::development_operations::IDevelopmentOperationsRepository;
 
@@ -35,16 +37,23 @@ impl IDevelopmentOperationsRepository for SqliteDevelopmentOperationsRepository 
         sqlx::query(
             "INSERT INTO development_policies (id, user_id, project_id, isolation_mode, container_image, \
              devcontainer_config_path, container_cpu_millis, container_memory_mb, container_pids_limit, network_mode, \
-             allowed_secret_keys_json, max_duration_ms, max_parallel_agents, max_retries, max_cost_microunits, \
-             alert_percent, over_limit_action, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             allowed_secret_keys_json, allowed_commands_json, protected_paths_json, allowed_network_hosts_json, \
+             protected_branches_json, dangerous_confirmation_count, max_duration_ms, max_parallel_agents, \
+             max_retries, max_cost_microunits, max_total_tokens, fallback_model, alert_percent, over_limit_action, \
+             created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(user_id, project_id) DO UPDATE SET isolation_mode=excluded.isolation_mode, \
              container_image=excluded.container_image, devcontainer_config_path=excluded.devcontainer_config_path, \
              container_cpu_millis=excluded.container_cpu_millis, container_memory_mb=excluded.container_memory_mb, \
              container_pids_limit=excluded.container_pids_limit, network_mode=excluded.network_mode, \
-             allowed_secret_keys_json=excluded.allowed_secret_keys_json, max_duration_ms=excluded.max_duration_ms, \
+             allowed_secret_keys_json=excluded.allowed_secret_keys_json, \
+             allowed_commands_json=excluded.allowed_commands_json, protected_paths_json=excluded.protected_paths_json, \
+             allowed_network_hosts_json=excluded.allowed_network_hosts_json, \
+             protected_branches_json=excluded.protected_branches_json, \
+             dangerous_confirmation_count=excluded.dangerous_confirmation_count, max_duration_ms=excluded.max_duration_ms, \
              max_parallel_agents=excluded.max_parallel_agents, max_retries=excluded.max_retries, \
-             max_cost_microunits=excluded.max_cost_microunits, alert_percent=excluded.alert_percent, \
+             max_cost_microunits=excluded.max_cost_microunits, max_total_tokens=excluded.max_total_tokens, \
+             fallback_model=excluded.fallback_model, alert_percent=excluded.alert_percent, \
              over_limit_action=excluded.over_limit_action, updated_at=excluded.updated_at",
         )
         .bind(&row.id)
@@ -58,10 +67,17 @@ impl IDevelopmentOperationsRepository for SqliteDevelopmentOperationsRepository 
         .bind(row.container_pids_limit)
         .bind(&row.network_mode)
         .bind(&row.allowed_secret_keys_json)
+        .bind(&row.allowed_commands_json)
+        .bind(&row.protected_paths_json)
+        .bind(&row.allowed_network_hosts_json)
+        .bind(&row.protected_branches_json)
+        .bind(row.dangerous_confirmation_count)
         .bind(row.max_duration_ms)
         .bind(row.max_parallel_agents)
         .bind(row.max_retries)
         .bind(row.max_cost_microunits)
+        .bind(row.max_total_tokens)
+        .bind(&row.fallback_model)
         .bind(row.alert_percent)
         .bind(&row.over_limit_action)
         .bind(row.created_at)
@@ -434,5 +450,217 @@ impl IDevelopmentOperationsRepository for SqliteDevelopmentOperationsRepository 
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn insert_secret(&self, row: &DevelopmentSecretRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO development_secrets (id, user_id, project_id, name, encrypted_value, key_version, status, \
+             expires_at, revoked_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.user_id)
+        .bind(&row.project_id)
+        .bind(&row.name)
+        .bind(&row.encrypted_value)
+        .bind(&row.key_version)
+        .bind(&row.status)
+        .bind(row.expires_at)
+        .bind(row.revoked_at)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_secret(&self, user_id: &str, secret_id: &str) -> Result<Option<DevelopmentSecretRow>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT * FROM development_secrets WHERE user_id = ? AND id = ?")
+                .bind(user_id)
+                .bind(secret_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn list_secrets(&self, user_id: &str, project_id: &str) -> Result<Vec<DevelopmentSecretRow>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM development_secrets WHERE user_id = ? AND project_id = ? ORDER BY created_at DESC, id DESC",
+        )
+        .bind(user_id)
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn revoke_secret(&self, user_id: &str, secret_id: &str, revoked_at: TimestampMs) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE development_secrets SET status = 'revoked', revoked_at = ?, updated_at = ? \
+             WHERE user_id = ? AND id = ? AND status = 'active'",
+        )
+        .bind(revoked_at)
+        .bind(revoked_at)
+        .bind(user_id)
+        .bind(secret_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn upsert_secret_grant(&self, row: &DevelopmentSecretGrantRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO development_secret_grants (id, user_id, project_id, secret_id, scope_type, scope_id, \
+             environment_key, status, expires_at, revoked_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(user_id, secret_id, scope_type, scope_id, environment_key) DO UPDATE SET \
+             status=excluded.status, expires_at=excluded.expires_at, revoked_at=excluded.revoked_at, \
+             updated_at=excluded.updated_at",
+        )
+        .bind(&row.id)
+        .bind(&row.user_id)
+        .bind(&row.project_id)
+        .bind(&row.secret_id)
+        .bind(&row.scope_type)
+        .bind(&row.scope_id)
+        .bind(&row.environment_key)
+        .bind(&row.status)
+        .bind(row.expires_at)
+        .bind(row.revoked_at)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_secret_grants(
+        &self,
+        user_id: &str,
+        secret_id: &str,
+    ) -> Result<Vec<DevelopmentSecretGrantRow>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM development_secret_grants WHERE user_id = ? AND secret_id = ? \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(user_id)
+        .bind(secret_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn upsert_model_price(&self, row: &DevelopmentModelPriceRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO development_model_prices (id, provider, model, input_per_million_microunits, \
+             output_per_million_microunits, cache_read_per_million_microunits, \
+             cache_write_per_million_microunits, source_id, version, effective_at, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(provider, model, source_id, version) DO UPDATE SET \
+             input_per_million_microunits=excluded.input_per_million_microunits, \
+             output_per_million_microunits=excluded.output_per_million_microunits, \
+             cache_read_per_million_microunits=excluded.cache_read_per_million_microunits, \
+             cache_write_per_million_microunits=excluded.cache_write_per_million_microunits, \
+             effective_at=excluded.effective_at",
+        )
+        .bind(&row.id)
+        .bind(&row.provider)
+        .bind(&row.model)
+        .bind(row.input_per_million_microunits)
+        .bind(row.output_per_million_microunits)
+        .bind(row.cache_read_per_million_microunits)
+        .bind(row.cache_write_per_million_microunits)
+        .bind(&row.source_id)
+        .bind(&row.version)
+        .bind(row.effective_at)
+        .bind(row.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn resolve_model_price(
+        &self,
+        provider: &str,
+        model: &str,
+        occurred_at: TimestampMs,
+    ) -> Result<Option<DevelopmentModelPriceRow>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM development_model_prices WHERE provider = ? AND model = ? AND effective_at <= ? \
+             ORDER BY effective_at DESC, created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(provider)
+        .bind(model)
+        .bind(occurred_at)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn append_priced_usage(&self, row: &DevelopmentPricedUsageEventRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO development_usage_events (id, user_id, project_id, run_id, task_id, conversation_id, \
+             agent_id, team_id, usage_type, source, confidence, provider, model, input_tokens, output_tokens, \
+             cache_read_tokens, cache_write_tokens, cost_microunits, cost_status, cost_origin, price_source_id, \
+             price_version, price_effective_at, duration_ms, retry_count, metadata_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.user_id)
+        .bind(&row.project_id)
+        .bind(&row.run_id)
+        .bind(&row.task_id)
+        .bind(&row.conversation_id)
+        .bind(&row.agent_id)
+        .bind(&row.team_id)
+        .bind(&row.usage_type)
+        .bind(&row.source)
+        .bind(&row.confidence)
+        .bind(&row.provider)
+        .bind(&row.model)
+        .bind(row.input_tokens)
+        .bind(row.output_tokens)
+        .bind(row.cache_read_tokens)
+        .bind(row.cache_write_tokens)
+        .bind(row.cost_microunits)
+        .bind(&row.cost_status)
+        .bind(&row.cost_origin)
+        .bind(&row.price_source_id)
+        .bind(&row.price_version)
+        .bind(row.price_effective_at)
+        .bind(row.duration_ms)
+        .bind(row.retry_count)
+        .bind(&row.metadata_json)
+        .bind(row.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn summarize_usage_dimension(
+        &self,
+        user_id: &str,
+        dimension: &UsageDimension,
+    ) -> Result<DevelopmentUsageDimensionSummary, DbError> {
+        let (column, value) = match dimension {
+            UsageDimension::Project(value) => ("project_id", value),
+            UsageDimension::Run(value) => ("run_id", value),
+            UsageDimension::Task(value) => ("task_id", value),
+            UsageDimension::Conversation(value) => ("conversation_id", value),
+            UsageDimension::Agent(value) => ("agent_id", value),
+            UsageDimension::Team(value) => ("team_id", value),
+        };
+        let sql = format!(
+            "SELECT COUNT(*) AS event_count, COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+             COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+             COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, \
+             COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, \
+             COALESCE(SUM(CASE WHEN cost_status = 'known' THEN cost_microunits ELSE 0 END), 0) AS known_cost_microunits, \
+             COALESCE(SUM(CASE WHEN cost_status = 'unknown' THEN 1 ELSE 0 END), 0) AS unknown_cost_events, \
+             COALESCE(SUM(duration_ms), 0) AS duration_ms, COALESCE(SUM(retry_count), 0) AS retry_count \
+             FROM development_usage_events WHERE user_id = ? AND {column} = ?"
+        );
+        Ok(sqlx::query_as(&sql)
+            .bind(user_id)
+            .bind(value)
+            .fetch_one(&self.pool)
+            .await?)
     }
 }

@@ -17,6 +17,8 @@ use crate::error::DevelopmentError;
 use crate::operations::{
     DevelopmentOperationsService, DevelopmentOperationsSnapshot, DevelopmentPolicyInput, RecoveryDecisionInput,
 };
+use crate::pricing::PricingService;
+use crate::secrets::{SecretCreateInput, SecretGrantInput, SecretService};
 use crate::service::{CompletionEvaluation, DevelopmentService};
 use crate::types::{
     AppendPlanRevisionInput, AppendRequirementRevisionInput, AssignDevelopmentRoleInput, CompletionEvidenceInput,
@@ -40,6 +42,8 @@ pub struct DevelopmentRouterState {
     pub service: Arc<DevelopmentService>,
     pub delivery_service: Arc<DeliveryService>,
     pub operations_service: Arc<DevelopmentOperationsService>,
+    pub secret_service: Arc<SecretService>,
+    pub pricing_service: Arc<PricingService>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -145,6 +149,18 @@ pub fn development_routes(state: DevelopmentRouterState) -> Router {
             get(get_operations_policy).put(update_operations_policy),
         )
         .route(
+            "/api/development-projects/{project_id}/secrets",
+            get(list_secrets).post(create_secret),
+        )
+        .route(
+            "/api/development-projects/{project_id}/secrets/{secret_id}/grants",
+            post(grant_secret),
+        )
+        .route(
+            "/api/development-projects/{project_id}/secrets/{secret_id}/revoke",
+            post(revoke_secret),
+        )
+        .route(
             "/api/development-projects/{project_id}/operations",
             get(get_operations_snapshot),
         )
@@ -155,6 +171,100 @@ pub fn development_routes(state: DevelopmentRouterState) -> Router {
         .route("/api/development-operations/reconcile", post(reconcile_operations))
         .route("/api/development-runs/{run_id}/recovery", post(decide_recovery))
         .with_state(state)
+}
+
+async fn list_secrets(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<crate::secrets::SecretMetadata>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .secret_service
+            .list(&user.id, &project_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn create_secret(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+    body: Result<Json<aionui_api_types::DevelopmentSecretCreateRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<crate::secrets::SecretMetadata>>), ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    let secret = state
+        .secret_service
+        .create(
+            &user.id,
+            &project_id,
+            SecretCreateInput {
+                name: input.name,
+                value: input.value,
+                expires_at: input.expires_at,
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(secret))))
+}
+
+async fn grant_secret(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((project_id, secret_id)): Path<(String, String)>,
+    body: Result<Json<aionui_api_types::DevelopmentSecretGrantRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<crate::secrets::SecretGrantMetadata>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    if input.secret_id != secret_id {
+        return Err(ApiError::BadRequest("Secret ID does not match route".into()));
+    }
+    let secrets = state
+        .secret_service
+        .list(&user.id, &project_id)
+        .await
+        .map_err(ApiError::from)?;
+    if !secrets.iter().any(|secret| secret.id == secret_id) {
+        return Err(ApiError::NotFound("Secret".into()));
+    }
+    Ok(Json(ApiResponse::ok(
+        state
+            .secret_service
+            .grant(
+                &user.id,
+                SecretGrantInput {
+                    secret_id,
+                    scope_type: input.scope_type,
+                    scope_id: input.scope_id,
+                    environment_key: input.environment_key,
+                    expires_at: input.expires_at,
+                },
+            )
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn revoke_secret(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((project_id, secret_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let secrets = state
+        .secret_service
+        .list(&user.id, &project_id)
+        .await
+        .map_err(ApiError::from)?;
+    if !secrets.iter().any(|secret| secret.id == secret_id) {
+        return Err(ApiError::NotFound("Secret".into()));
+    }
+    state
+        .secret_service
+        .revoke(&user.id, &secret_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(serde_json::json!({"revoked": true}))))
 }
 
 async fn get_operations_policy(

@@ -10,7 +10,7 @@ use aionui_db::{
 };
 use aionui_development::{
     DeliveryProvider, DeliveryProviderSnapshot, DeliveryService, DevelopmentOperationsService, DevelopmentRouterState,
-    DevelopmentService, ProviderPullRequest, development_routes,
+    DevelopmentService, PricingService, ProviderPullRequest, SecretService, development_routes,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -66,7 +66,9 @@ fn git(repository: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
-async fn app() -> (
+async fn app_for(
+    current_user_id: &str,
+) -> (
     Router,
     tempfile::TempDir,
     aionui_db::Database,
@@ -97,8 +99,9 @@ async fn app() -> (
         .unwrap();
     let development_repo = Arc::new(SqliteDevelopmentRepository::new(db.pool().clone()));
     let lease_repo = Arc::new(SqliteAgentWorkspaceLeaseRepository::new(db.pool().clone()));
+    let operations_repo = Arc::new(SqliteDevelopmentOperationsRepository::new(db.pool().clone()));
     let operations_service = Arc::new(DevelopmentOperationsService::new(
-        Arc::new(SqliteDevelopmentOperationsRepository::new(db.pool().clone())),
+        operations_repo.clone(),
         development_repo.clone(),
         project_repo.clone(),
         lease_repo.clone(),
@@ -121,17 +124,112 @@ async fn app() -> (
         service,
         delivery_service,
         operations_service,
+        secret_service: Arc::new(SecretService::new(
+            operations_repo.clone(),
+            Arc::new(SqliteProjectRepository::new(db.pool().clone())),
+            Arc::new([9_u8; 32]),
+        )),
+        pricing_service: Arc::new(PricingService::new(operations_repo)),
     })
     .layer(Extension(CurrentUser {
-        id: "system_default_user".into(),
-        username: "system_default_user".into(),
+        id: current_user_id.into(),
+        username: current_user_id.into(),
     }));
     (router, project, db, provider)
+}
+
+async fn app() -> (
+    Router,
+    tempfile::TempDir,
+    aionui_db::Database,
+    Arc<FakeDeliveryProvider>,
+) {
+    app_for("system_default_user").await
 }
 
 async fn json(response: axum::response::Response) -> serde_json::Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn secret_routes_return_only_metadata_and_enforce_project_ownership() {
+    let (app, _project, _db, _provider) = app().await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/development-projects/project-1/secrets")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": "GitHub token",
+                        "value": "ghp_route_secret_must_not_escape",
+                        "expires_at": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = json(response).await;
+    let secret_id = body["data"]["id"].as_str().unwrap().to_owned();
+    assert!(!body.to_string().contains("ghp_route_secret_must_not_escape"));
+    assert!(body["data"].get("encrypted_value").is_none());
+
+    let grant = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/development-projects/project-1/secrets/{secret_id}/grants"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "secret_id": &secret_id,
+                        "scope_type": "project",
+                        "scope_id": "project-1",
+                        "environment_key": "GITHUB_TOKEN",
+                        "expires_at": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(grant.status(), StatusCode::OK);
+
+    let (other_app, _other_project, _other_db, _other_provider) = app_for("other-user").await;
+    let unauthorized = other_app
+        .oneshot(
+            Request::builder()
+                .uri("/api/development-projects/project-1/secrets")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::NOT_FOUND);
+
+    let revoked = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/development-projects/project-1/secrets/{secret_id}/revoke"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK);
 }
 
 #[tokio::test]

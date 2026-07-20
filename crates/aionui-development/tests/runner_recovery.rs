@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 use aionui_common::now_ms;
 use aionui_db::{
     ExecutionResourceLeaseRow, IDevelopmentOperationsRepository, SqliteDevelopmentOperationsRepository,
-    init_database_memory,
+    SqliteProjectRepository, init_database_memory,
 };
 use aionui_development::{
     CleanupTarget, CommandExecutionInput, DevelopmentResourceController, DevelopmentRunner, ResourceLeaseCoordinator,
-    ResourceLeaseInput, RunnerContext, default_policy,
+    ResourceLeaseInput, RunnerContext, SecretAccessContext, SecretCreateInput, SecretGrantInput,
+    SecretReferenceRequest, SecretService, default_policy,
 };
 use async_trait::async_trait;
 
@@ -149,6 +150,83 @@ async fn managed_host_execution_persists_environment_and_terminal_process_eviden
     assert_eq!(leases[0].resource_kind, "process");
     assert_eq!(leases[0].status, "released");
     assert_eq!(leases[0].cleanup_result.as_deref(), Some("passed"));
+}
+
+#[tokio::test]
+async fn runner_materializes_opaque_secret_references_only_for_the_leased_child() {
+    let (coordinator, repo, db) = setup().await;
+    let secrets = SecretService::new(
+        repo.clone(),
+        Arc::new(SqliteProjectRepository::new(db.pool().clone())),
+        Arc::new([9_u8; 32]),
+    );
+    let secret = secrets
+        .create(
+            "system_default_user",
+            "project-runner",
+            SecretCreateInput {
+                name: "Runner token".into(),
+                value: "runner-plaintext-secret".into(),
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    secrets
+        .grant(
+            "system_default_user",
+            SecretGrantInput {
+                secret_id: secret.id.clone(),
+                scope_type: "run".into(),
+                scope_id: "run-runner".into(),
+                environment_key: "RUNNER_TOKEN".into(),
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    let runner =
+        DevelopmentRunner::new(repo, coordinator, Arc::new(RecordingController::default())).with_secrets(secrets);
+    let workspace = tempfile::tempdir().unwrap();
+    let mut policy = default_policy("system_default_user", "project-runner");
+    policy.allowed_secret_keys_json = "[\"RUNNER_TOKEN\"]".into();
+
+    let output = runner
+        .execute_with_secret_references(
+            CommandExecutionInput {
+                execution_id: "gate-secret",
+                run_id: "run-runner",
+                command: "printf %s \"$RUNNER_TOKEN\"",
+                working_directory: workspace.path(),
+                timeout_seconds: 5,
+                policy: &policy,
+                runtime_profile: None,
+                environment: Default::default(),
+            },
+            &RunnerContext {
+                user_id: "system_default_user".into(),
+                project_id: "project-runner".into(),
+                run_id: "run-runner".into(),
+                task_id: None,
+                turn_id: Some("turn-secret".into()),
+                gate_id: Some("gate-secret".into()),
+            },
+            &SecretAccessContext {
+                project_id: "project-runner".into(),
+                run_id: Some("run-runner".into()),
+                agent_id: None,
+            },
+            &[SecretReferenceRequest {
+                secret_id: secret.id,
+                environment_key: "RUNNER_TOKEN".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.status, "passed");
+    assert_eq!(output.stdout, "[REDACTED]");
+    let serialized = serde_json::to_string(&output).unwrap();
+    assert!(!serialized.contains("runner-plaintext-secret"));
 }
 
 #[tokio::test]

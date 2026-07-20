@@ -43,7 +43,8 @@ use aionui_development::{
     ApprovalOption, ApprovalRequestInput, ApprovalResolver, ApprovalRouterState, ApprovalService, ApprovalSource,
     DeliveryService, DevelopmentOperationsService, DevelopmentRouterState, DevelopmentRunner, DevelopmentService,
     DevelopmentWorkspacePort, GhCliDeliveryProvider, PrepareDevelopmentWorkspace, PreparedDevelopmentWorkspace,
-    ResolveApprovalContext, ResourceLeaseCoordinator, SystemDevelopmentResourceController,
+    PricingService, ResolveApprovalContext, ResourceLeaseCoordinator, SecretService,
+    SystemDevelopmentResourceController,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -1092,22 +1093,28 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
         )),
     });
     let operations_repo = Arc::new(SqliteDevelopmentOperationsRepository::new(pool));
+    let secret_service = Arc::new(SecretService::new(
+        operations_repo.clone(),
+        project_repo.clone(),
+        Arc::new(derive_encryption_key(&services.jwt_secret_raw)),
+    ));
     let resources = ResourceLeaseCoordinator::new(operations_repo.clone(), format!("app:{}", std::process::id()));
     let resource_controller = Arc::new(SystemDevelopmentResourceController);
-    let runner = Arc::new(DevelopmentRunner::new(
-        operations_repo.clone(),
-        resources.clone(),
-        resource_controller.clone(),
-    ));
+    let runner = Arc::new(
+        DevelopmentRunner::new(operations_repo.clone(), resources.clone(), resource_controller.clone())
+            .with_secrets(secret_service.as_ref().clone()),
+    );
     let operations_service = Arc::new(
         DevelopmentOperationsService::new(
-            operations_repo,
+            operations_repo.clone(),
             development_repo.clone(),
             project_repo.clone(),
             lease_repo.clone(),
         )
         .with_resources(resources, resource_controller),
     );
+    let pricing_service =
+        Arc::new(PricingService::new(operations_repo.clone()).with_budget(operations_service.as_ref().clone()));
     DevelopmentRouterState {
         service: Arc::new(
             DevelopmentService::new(
@@ -1125,6 +1132,8 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
                 .with_operations(operations_service.clone()),
         ),
         operations_service,
+        secret_service,
+        pricing_service,
     }
 }
 

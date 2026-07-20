@@ -5,7 +5,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{body_json, build_app, json_with_token, setup_and_login};
+use common::{body_json, build_app, get_with_token, json_with_token, setup_and_login};
 
 #[tokio::test]
 async fn development_routes_require_authentication() {
@@ -115,6 +115,47 @@ async fn authenticated_user_can_create_an_evidence_backed_development_board() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+
+    let secret_path = format!("/api/development-projects/{project_id}/secrets");
+    let without_csrf = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&secret_path)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(
+                    json!({"name": "CI token", "value": "ghp_e2e_never_return", "expires_at": null}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(without_csrf.status(), StatusCode::FORBIDDEN);
+
+    let created = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &secret_path,
+            json!({"name": "CI token", "value": "ghp_e2e_never_return", "expires_at": null}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = body_json(created).await;
+    assert!(!created.to_string().contains("ghp_e2e_never_return"));
+
+    let (other_token, _other_csrf) = setup_and_login(&mut app, &services, "development-other", "StrongP@ss2").await;
+    let isolated = app
+        .clone()
+        .oneshot(get_with_token(&secret_path, &other_token))
+        .await
+        .unwrap();
+    assert_eq!(isolated.status(), StatusCode::NOT_FOUND);
 
     let response = app
         .clone()

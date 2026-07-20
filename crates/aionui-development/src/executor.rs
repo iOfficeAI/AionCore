@@ -6,6 +6,7 @@ use aionui_db::models::{DevelopmentPolicyRow, ProjectRuntimeProfileRow};
 use aionui_runtime::{Builder, ProcessLeaseSpec};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
+use zeroize::Zeroize;
 
 use crate::DevelopmentError;
 use crate::operations::redact_sensitive;
@@ -43,6 +44,20 @@ pub struct CommandExecutionPlan {
     pub resources: Vec<PlannedExecutionResource>,
     #[serde(skip)]
     secret_values: Vec<String>,
+}
+
+impl Drop for CommandExecutionPlan {
+    fn drop(&mut self) {
+        for value in &mut self.secret_values {
+            value.zeroize();
+        }
+        for step in &mut self.steps {
+            step.environment.values_mut().for_each(Zeroize::zeroize);
+        }
+        if let Some(cleanup) = &mut self.cleanup {
+            cleanup.environment.values_mut().for_each(Zeroize::zeroize);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,7 +111,7 @@ pub fn build_execution_plan(input: &CommandExecutionInput<'_>) -> Result<Command
             execution_id: input.execution_id.into(),
             isolation_mode: "host".into(),
             environment_id: "host:local".into(),
-            steps: vec![host_command(input.command, &workspace, &input.environment)],
+            steps: vec![host_command(input.command, &workspace, &secret_environment)],
             cleanup: None,
             resources: Vec::new(),
             secret_values,
@@ -235,9 +250,10 @@ pub fn build_execution_plan(input: &CommandExecutionInput<'_>) -> Result<Command
     }
 }
 
-pub async fn execute_command(input: CommandExecutionInput<'_>) -> Result<CommandExecutionOutput, DevelopmentError> {
+pub async fn execute_command(mut input: CommandExecutionInput<'_>) -> Result<CommandExecutionOutput, DevelopmentError> {
     let timeout_seconds = input.timeout_seconds;
     let plan = build_execution_plan(&input)?;
+    input.environment.values_mut().for_each(Zeroize::zeroize);
     execute_plan(&plan, timeout_seconds, None).await
 }
 
@@ -415,7 +431,7 @@ fn selected_secret_environment(
     let runtime_keys: BTreeSet<String> = match input.runtime_profile {
         Some(profile) => serde_json::from_str(&profile.env_keys)
             .map_err(|error| DevelopmentError::BadRequest(format!("invalid runtime env keys: {error}")))?,
-        None => BTreeSet::new(),
+        None => policy_keys.clone(),
     };
     let selected = policy_keys
         .intersection(&runtime_keys)

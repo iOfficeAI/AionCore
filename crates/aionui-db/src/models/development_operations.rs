@@ -14,10 +14,17 @@ pub struct DevelopmentPolicyRow {
     pub container_pids_limit: i64,
     pub network_mode: String,
     pub allowed_secret_keys_json: String,
+    pub allowed_commands_json: String,
+    pub protected_paths_json: String,
+    pub allowed_network_hosts_json: String,
+    pub protected_branches_json: String,
+    pub dangerous_confirmation_count: i64,
     pub max_duration_ms: i64,
     pub max_parallel_agents: i64,
     pub max_retries: i64,
     pub max_cost_microunits: i64,
+    pub max_total_tokens: i64,
+    pub fallback_model: Option<String>,
     pub alert_percent: i64,
     pub over_limit_action: String,
     pub created_at: TimestampMs,
@@ -126,4 +133,104 @@ pub struct ExecutionResourceLeaseRow {
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
     pub terminal_at: Option<TimestampMs>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DevelopmentSecretRow {
+    pub id: String,
+    pub user_id: String,
+    pub project_id: String,
+    pub name: String,
+    pub encrypted_value: String,
+    pub key_version: String,
+    pub status: String,
+    pub expires_at: Option<TimestampMs>,
+    pub revoked_at: Option<TimestampMs>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DevelopmentSecretGrantRow {
+    pub id: String,
+    pub user_id: String,
+    pub project_id: String,
+    pub secret_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub environment_key: String,
+    pub status: String,
+    pub expires_at: Option<TimestampMs>,
+    pub revoked_at: Option<TimestampMs>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DevelopmentModelPriceRow {
+    pub id: String,
+    pub provider: String,
+    pub model: String,
+    pub input_per_million_microunits: i64,
+    pub output_per_million_microunits: i64,
+    pub cache_read_per_million_microunits: i64,
+    pub cache_write_per_million_microunits: i64,
+    pub source_id: String,
+    pub version: String,
+    pub effective_at: TimestampMs,
+    pub created_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DevelopmentPricedUsageEventRow {
+    pub id: String,
+    pub user_id: String,
+    pub project_id: String,
+    pub run_id: Option<String>,
+    pub task_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub team_id: Option<String>,
+    pub usage_type: String,
+    pub source: String,
+    pub confidence: String,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cost_microunits: i64,
+    pub cost_status: String,
+    pub cost_origin: String,
+    pub price_source_id: Option<String>,
+    pub price_version: Option<String>,
+    pub price_effective_at: Option<TimestampMs>,
+    pub duration_ms: i64,
+    pub retry_count: i64,
+    pub metadata_json: String,
+    pub created_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UsageDimension {
+    Project(String),
+    Run(String),
+    Task(String),
+    Conversation(String),
+    Agent(String),
+    Team(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DevelopmentUsageDimensionSummary {
+    pub event_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub known_cost_microunits: i64,
+    pub unknown_cost_events: i64,
+    pub duration_ms: i64,
+    pub retry_count: i64,
 }
