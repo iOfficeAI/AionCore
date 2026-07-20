@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.49](https://github.com/iOfficeAI/AionCore/compare/v0.1.48...v0.1.49) (2026-07-20)
+
+
+### Features
+
+* **agents:** sync ACP Registry integrations ([#637](https://github.com/iOfficeAI/AionCore/issues/637)) ([7d35e38](https://github.com/iOfficeAI/AionCore/commit/7d35e386969bb2dca58ca332adf00f9ae5bed6ce))
+* **ai-agent:** use responses api for gpt-5.6 ([cde4129](https://github.com/iOfficeAI/AionCore/commit/cde4129521340fe71e67a40f17f0d00a2935fe2a))
+* **config:** add conversation rename command ([#638](https://github.com/iOfficeAI/AionCore/issues/638)) ([a611553](https://github.com/iOfficeAI/AionCore/commit/a61155379ac031a161b210d4bdc297d009ba5a11))
+* **idle:** extend idle-cleanup timeouts and make them env-configurable ([#643](https://github.com/iOfficeAI/AionCore/issues/643)) ([a719bc7](https://github.com/iOfficeAI/AionCore/commit/a719bc74a5587097246689c683079488fba73007))
+
+
+### Bug Fixes
+
+* **ai-agent:** ignore max token limits for aionui requests ([0121c24](https://github.com/iOfficeAI/AionCore/commit/0121c24d70f4a5a63e79ee71869aee34e6b62506))
+* **ai-agent:** ignore max token limits for aionui requests ([8bdf305](https://github.com/iOfficeAI/AionCore/commit/8bdf305e9a94d1a5aa8402424e8ef8d540eeb66c))
+* **system:** apply keep-awake client preference ([#642](https://github.com/iOfficeAI/AionCore/issues/642)) ([a6a290d](https://github.com/iOfficeAI/AionCore/commit/a6a290dd374a37eca73fc008c25bd6780a0e1f54))
+* **team:** broadcast Stopped status on idle-cleanup team reclaim ([#640](https://github.com/iOfficeAI/AionCore/issues/640)) ([024a3a5](https://github.com/iOfficeAI/AionCore/commit/024a3a578936af0c59ed5aeed7bc1b4c20d990ea))
+
 ## [0.1.48](https://github.com/iOfficeAI/AionCore/compare/v0.1.47...v0.1.48) (2026-07-17)
 
 
