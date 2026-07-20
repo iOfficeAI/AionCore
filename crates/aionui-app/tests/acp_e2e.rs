@@ -168,6 +168,7 @@ async fn management_list_marks_rows_with_unavailable_snapshot() {
             last_check_at: Some(1_750_000_000_000),
             last_success_at: None,
             last_failure_at: Some(1_750_000_000_000),
+            dynamic_probe_result: None,
         },
     )
     .await

@@ -1772,6 +1772,32 @@ fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<Recording
 }
 
 fn make_agent_metadata_row(id: &str, backend: &str, icon: &str) -> AgentMetadataRow {
+    use aionui_api_types::{AgentDynamicProbeResult, AgentProbeStatus, AgentProbeStep, AgentProbeStepResult};
+
+    let checked_at = aionui_common::now_ms();
+    let dynamic_probe_result = serde_json::to_string(&AgentDynamicProbeResult {
+        agent_id: id.to_owned(),
+        checked_at,
+        available_models: vec![backend.to_owned(), "gpt-5".into(), "claude-sonnet-4".into()],
+        steps: [
+            AgentProbeStep::Spawn,
+            AgentProbeStep::Initialize,
+            AgentProbeStep::Models,
+            AgentProbeStep::MinimalPrompt,
+            AgentProbeStep::Cancel,
+        ]
+        .into_iter()
+        .map(|step| AgentProbeStepResult {
+            step,
+            status: AgentProbeStatus::Passed,
+            started_at: checked_at,
+            duration_ms: 1,
+            error_category: None,
+            error_message: None,
+        })
+        .collect(),
+    })
+    .unwrap();
     AgentMetadataRow {
         id: id.to_owned(),
         icon: Some(icon.to_owned()),
@@ -1797,15 +1823,16 @@ fn make_agent_metadata_row(id: &str, backend: &str, icon: &str) -> AgentMetadata
         available_models: None,
         available_commands: None,
         sort_order: 0,
-        last_check_status: None,
-        last_check_kind: None,
+        last_check_status: Some("online".into()),
+        last_check_kind: Some("manual".into()),
         last_check_error_code: None,
         last_check_error_message: None,
         last_check_guidance: None,
         last_check_latency_ms: None,
-        last_check_at: None,
-        last_success_at: None,
+        last_check_at: Some(checked_at),
+        last_success_at: Some(checked_at),
         last_failure_at: None,
+        dynamic_probe_result: Some(dynamic_probe_result),
         command_override: None,
         env_override: None,
         created_at: 0,
@@ -2125,7 +2152,12 @@ async fn tc_create_team_prefers_assistant_avatar_over_backend_logo() {
 
 #[tokio::test]
 async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra() {
-    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
+        Arc::new(StubAgentMetadataRepo::with_rows(vec![make_agent_metadata_row(
+            "claude",
+            "claude",
+            "/api/assets/logos/ai-major/claude.svg",
+        )]));
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: AssistantDefinitionRow {
             id: "def-team-lead".into(),
@@ -2207,7 +2239,12 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
 
 #[tokio::test]
 async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
-    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
+        Arc::new(StubAgentMetadataRepo::with_rows(vec![make_agent_metadata_row(
+            "codex",
+            "codex",
+            "/api/assets/logos/tools/coding/codex.svg",
+        )]));
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: AssistantDefinitionRow {
             id: "def-team-lead".into(),
@@ -2300,7 +2337,12 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
 
 #[tokio::test]
 async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
-    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
+        Arc::new(StubAgentMetadataRepo::with_rows(vec![make_agent_metadata_row(
+            "codex",
+            "codex",
+            "/api/assets/logos/tools/coding/codex.svg",
+        )]));
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: AssistantDefinitionRow {
             id: "def-team-lead".into(),
@@ -2410,7 +2452,11 @@ async fn team_preset_assistant_snapshot_is_frozen() {
     });
     let (svc, _team_repo, conversation_ports, conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
         success_factory(),
-        Arc::new(StubAgentMetadataRepo::empty()),
+        Arc::new(StubAgentMetadataRepo::with_rows(vec![make_agent_metadata_row(
+            "claude",
+            "claude",
+            "/api/assets/logos/ai-major/claude.svg",
+        )])),
         definition_repo,
         Arc::new(EmptyAssistantOverlayRepo),
     );

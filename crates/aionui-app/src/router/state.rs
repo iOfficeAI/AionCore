@@ -444,6 +444,7 @@ fn serialized_enum<T: serde::Serialize>(value: &T) -> String {
 fn agent_management_row_to_project_snapshot(row: aionui_api_types::AgentManagementRow) -> AgentCapabilitySnapshot {
     AgentCapabilitySnapshot {
         id: row.id,
+        agent_type: serialized_enum(&row.agent_type),
         enabled: row.enabled,
         installed: row.installed,
         status: serialized_enum(&row.status),
@@ -454,6 +455,7 @@ fn agent_management_row_to_project_snapshot(row: aionui_api_types::AgentManageme
         available_models: row.available_models,
         available_modes: row.available_modes,
         available_commands: row.available_commands,
+        dynamic_probe: row.dynamic_probe,
     }
 }
 

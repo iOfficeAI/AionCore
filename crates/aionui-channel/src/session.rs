@@ -97,6 +97,7 @@ impl SessionManager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn reset_topic_session(
         &self,
         user_id: &str,
@@ -165,6 +166,7 @@ impl SessionManager {
         Ok(session)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_or_create_topic_session(
         &self,
         user_id: &str,

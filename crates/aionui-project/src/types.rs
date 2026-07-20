@@ -1,3 +1,4 @@
+use aionui_api_types::AgentDynamicProbeResult;
 use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
 
@@ -80,6 +81,7 @@ fn default_environment_kind() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentCapabilitySnapshot {
     pub id: String,
+    pub agent_type: String,
     pub enabled: bool,
     pub installed: bool,
     pub status: String,
@@ -90,6 +92,7 @@ pub struct AgentCapabilitySnapshot {
     pub available_models: Option<serde_json::Value>,
     pub available_modes: Option<serde_json::Value>,
     pub available_commands: Option<serde_json::Value>,
+    pub dynamic_probe: Option<AgentDynamicProbeResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

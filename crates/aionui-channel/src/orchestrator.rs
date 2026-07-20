@@ -202,10 +202,10 @@ async fn send_action_response(
 
         match response.behavior {
             ActionBehavior::Edit => {
-                if let Some(ref edit_id) = response.edit_message_id {
-                    if let Err(error) = sender.edit_message(plugin_id, chat_id, edit_id, outgoing).await {
-                        warn!(error = %error, plugin_id, chat_id, message_id = %edit_id, "failed to edit action response");
-                    }
+                if let Some(ref edit_id) = response.edit_message_id
+                    && let Err(error) = sender.edit_message(plugin_id, chat_id, edit_id, outgoing).await
+                {
+                    warn!(error = %error, plugin_id, chat_id, message_id = %edit_id, "failed to edit action response");
                 }
             }
             _ => {

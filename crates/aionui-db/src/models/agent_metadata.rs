@@ -58,6 +58,10 @@ pub struct AgentMetadataRow {
     pub last_success_at: Option<TimestampMs>,
     pub last_failure_at: Option<TimestampMs>,
 
+    /// Last successful normalized six-stage dynamic probe, encoded as JSON.
+    /// The latest failed attempt remains in the availability error columns.
+    pub dynamic_probe_result: Option<String>,
+
     pub command_override: Option<String>,
     pub env_override: Option<String>,
 
@@ -123,4 +127,5 @@ pub struct UpdateAgentAvailabilitySnapshotParams<'a> {
     pub last_check_at: Option<TimestampMs>,
     pub last_success_at: Option<TimestampMs>,
     pub last_failure_at: Option<TimestampMs>,
+    pub dynamic_probe_result: Option<&'a str>,
 }

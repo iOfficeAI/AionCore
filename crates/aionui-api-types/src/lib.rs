@@ -43,7 +43,8 @@ pub use agent_build_extra::{
     SlashCommandCompletionBehavior, SlashCommandItem,
 };
 pub use agent_discovery::{
-    AgentEnvEntry, AgentHandshake, AgentLogoEntry, AgentManagementRow, AgentManagementStatus, AgentMetadata,
+    AgentDynamicProbeResult, AgentEnvEntry, AgentHandshake, AgentLogoEntry, AgentManagementRow, AgentManagementStatus,
+    AgentMetadata, AgentProbeErrorCategory, AgentProbeStatus, AgentProbeStep, AgentProbeStepResult,
     AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource, AgentSourceInfo, BehaviorPolicy,
 };
 pub use agent_error::{

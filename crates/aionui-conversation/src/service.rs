@@ -640,7 +640,7 @@ impl ConversationService {
     ) -> Result<ConversationResponse, ConversationError> {
         let id = generate_short_id();
         let now = now_ms();
-        let source = req.source.clone().unwrap_or(ConversationSource::Aionui);
+        let source = req.source.unwrap_or(ConversationSource::Aionui);
         let legacy_source = enum_to_db(&source)?;
 
         let source_metadata =

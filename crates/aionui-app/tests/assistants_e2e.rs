@@ -102,6 +102,7 @@ fn test_agent_row(id: &str, backend: Option<&str>, agent_type: AgentType, name: 
         available_modes: None,
         available_models: None,
         available_commands: None,
+        dynamic_probe: None,
         sort_order: 0,
         team_capable: true,
         status: AgentManagementStatus::Online,

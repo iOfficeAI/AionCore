@@ -155,6 +155,7 @@ impl GitTeamWorkspaceManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lease_row(
         &self,
         user_id: &str,

@@ -66,6 +66,7 @@ pub struct ChannelAgentOption {
     pub agent_type: String,
     pub backend: Option<String>,
     pub models: Vec<ChannelModelOption>,
+    pub last_probe_at: Option<i64>,
 }
 
 /// Model option exposed to channel command UIs.
@@ -332,7 +333,7 @@ impl ChannelSettingsService {
             });
         }
 
-        options.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+        options.sort_by_key(|option| option.name.to_lowercase());
         Ok(options)
     }
 
@@ -363,8 +364,9 @@ impl ChannelSettingsService {
                     models: if row.agent_type == DEFAULT_AGENT_TYPE {
                         provider_models.clone()
                     } else {
-                        parse_agent_model_options(&row)
+                        parse_probed_agent_model_options(&row.id, row.dynamic_probe_result.as_deref())
                     },
+                    last_probe_at: parse_dynamic_probe_checked_at(row.dynamic_probe_result.as_deref()),
                 },
             ));
         }
@@ -607,61 +609,36 @@ fn command_exists(command: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_agent_model_options(row: &AgentMetadataRow) -> Vec<ChannelModelOption> {
-    let provider_id = row.id.clone();
-    let Some(raw) = row
-        .available_models
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+fn parse_probed_agent_model_options(provider_id: &str, raw: Option<&str>) -> Vec<ChannelModelOption> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return vec![];
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+    let Ok(probe) = serde_json::from_str::<aionui_api_types::AgentDynamicProbeResult>(raw) else {
         return vec![];
     };
-
-    let entries = value
-        .get("available_models")
-        .and_then(serde_json::Value::as_array)
-        .or_else(|| value.get("availableModels").and_then(serde_json::Value::as_array))
-        .or_else(|| value.as_array());
-
-    let Some(entries) = entries else {
+    if !probe.is_usable() {
         return vec![];
-    };
+    }
 
+    let mut seen = std::collections::HashSet::new();
     let mut models = Vec::new();
-    for entry in entries {
-        let model = entry
-            .as_str()
-            .map(str::to_owned)
-            .or_else(|| entry.get("id").and_then(serde_json::Value::as_str).map(str::to_owned))
-            .or_else(|| {
-                entry
-                    .get("model")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            });
-        let Some(model) = model
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-        else {
+    for model in probe.available_models {
+        let model = model.trim().to_owned();
+        if model.is_empty() || !seen.insert(model.clone()) {
             continue;
-        };
-        let label = entry
-            .get("label")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| entry.get("name").and_then(serde_json::Value::as_str))
-            .map(str::to_owned)
-            .unwrap_or_else(|| model.clone());
+        }
         models.push(ChannelModelOption {
-            provider_id: provider_id.clone(),
+            provider_id: provider_id.to_owned(),
+            label: model.clone(),
             model,
-            label,
         });
     }
     models
+}
+
+fn parse_dynamic_probe_checked_at(raw: Option<&str>) -> Option<i64> {
+    raw.and_then(|value| serde_json::from_str::<aionui_api_types::AgentDynamicProbeResult>(value).ok())
+        .map(|probe| probe.checked_at)
 }
 
 fn provider_model_options_from_rows(providers: &[Provider]) -> Vec<ChannelModelOption> {
@@ -1026,6 +1003,65 @@ mod tests {
     #[test]
     fn unknown_backend_defaults_to_acp() {
         assert_eq!(backend_to_agent_type("unknown"), "acp");
+    }
+
+    #[test]
+    fn dynamic_probe_timestamp_is_exposed_to_channel_model_menu() {
+        let raw = r#"{"agent_id":"codex","checked_at":1750000000000,"steps":[],"available_models":["gpt-5"]}"#;
+        assert_eq!(parse_dynamic_probe_checked_at(Some(raw)), Some(1_750_000_000_000));
+        assert_eq!(parse_dynamic_probe_checked_at(Some("not-json")), None);
+        assert_eq!(parse_dynamic_probe_checked_at(None), None);
+    }
+
+    #[test]
+    fn channel_model_menu_uses_only_last_successful_dynamic_probe_models() {
+        let checked_at = 1_750_000_000_000;
+        let raw = serde_json::to_string(&healthy_probe_with_models(
+            "codex",
+            checked_at,
+            vec!["gpt-5.6".into(), "gpt-5.6".into(), "".into()],
+        ))
+        .unwrap();
+
+        let models = parse_probed_agent_model_options("codex", Some(&raw));
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].provider_id, "codex");
+        assert_eq!(models[0].model, "gpt-5.6");
+        assert_eq!(models[0].label, "gpt-5.6");
+        assert!(parse_probed_agent_model_options("codex", Some("not-json")).is_empty());
+        assert!(parse_probed_agent_model_options("codex", None).is_empty());
+    }
+
+    fn healthy_probe_with_models(
+        agent_id: &str,
+        checked_at: i64,
+        available_models: Vec<String>,
+    ) -> aionui_api_types::AgentDynamicProbeResult {
+        use aionui_api_types::{AgentProbeStatus, AgentProbeStep, AgentProbeStepResult};
+
+        aionui_api_types::AgentDynamicProbeResult {
+            agent_id: agent_id.into(),
+            checked_at,
+            available_models,
+            steps: [
+                AgentProbeStep::Spawn,
+                AgentProbeStep::Initialize,
+                AgentProbeStep::Models,
+                AgentProbeStep::MinimalPrompt,
+                AgentProbeStep::Cancel,
+            ]
+            .into_iter()
+            .map(|step| AgentProbeStepResult {
+                step,
+                status: AgentProbeStatus::Passed,
+                started_at: checked_at,
+                duration_ms: 1,
+                error_category: None,
+                error_message: None,
+            })
+            .collect(),
+        }
     }
 
     // ── get_agent_config ──────────────────────────────────────────────

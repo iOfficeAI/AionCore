@@ -306,6 +306,7 @@ impl AgentRegistry {
                     available_modes: handshake.available_modes.clone(),
                     available_models: handshake.available_models.clone(),
                     available_commands: handshake.available_commands.clone(),
+                    dynamic_probe: handshake.dynamic_probe.clone(),
                     sort_order: meta.sort_order,
                     team_capable: meta.team_capable,
                     status,
@@ -420,6 +421,7 @@ fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<Unavailabl
         available_modes: parse_json(row.available_modes.as_deref(), "available_modes"),
         available_models: parse_json(row.available_models.as_deref(), "available_models"),
         available_commands: parse_json(row.available_commands.as_deref(), "available_commands"),
+        dynamic_probe: decode_json_field(row.dynamic_probe_result.as_deref(), "dynamic_probe_result"),
     };
 
     let backend_str = row.backend.as_deref().unwrap_or("");
@@ -1319,6 +1321,7 @@ mod tests {
             last_check_at: None,
             last_success_at: None,
             last_failure_at: None,
+            dynamic_probe_result: None,
             env_override: None,
             created_at: 0,
             updated_at: 0,
@@ -1365,6 +1368,7 @@ mod tests {
             last_check_at: None,
             last_success_at: None,
             last_failure_at: None,
+            dynamic_probe_result: None,
             env_override: Some(
                 r#"[{"name":"ANTHROPIC_API_KEY","value":"sk-x"},{"name":"PATH","value":"/evil"}]"#.to_string(),
             ),
@@ -1420,6 +1424,7 @@ mod tests {
             last_check_at: None,
             last_success_at: None,
             last_failure_at: None,
+            dynamic_probe_result: None,
             env_override: Some(
                 r#"[{"name":"ANTHROPIC_API_KEY","value":"sk-x","description":""},{"name":"PATH","value":"/evil","description":""}]"#.to_string(),
             ),

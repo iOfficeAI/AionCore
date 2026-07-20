@@ -29,6 +29,7 @@ const AGENT_METADATA_SAFE_COLUMNS: &str = "\
     sort_order, \
     last_check_status, last_check_kind, last_check_error_code, last_check_error_message, \
     last_check_guidance, last_check_latency_ms, last_check_at, last_success_at, last_failure_at, \
+    dynamic_probe_result, \
     command_override, env_override, created_at, updated_at";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +90,7 @@ struct AgentMetadataSafeRow {
     last_check_at: Option<aionui_common::TimestampMs>,
     last_success_at: Option<aionui_common::TimestampMs>,
     last_failure_at: Option<aionui_common::TimestampMs>,
+    dynamic_probe_result: Option<String>,
     command_override: Option<String>,
     env_override: Option<String>,
     created_at: aionui_common::TimestampMs,
@@ -131,6 +133,7 @@ impl AgentMetadataSafeRow {
             last_check_at: row.try_get("last_check_at")?,
             last_success_at: row.try_get("last_success_at")?,
             last_failure_at: row.try_get("last_failure_at")?,
+            dynamic_probe_result: row.try_get("dynamic_probe_result")?,
             command_override: row.try_get("command_override")?,
             env_override: row.try_get("env_override")?,
             created_at: row.try_get("created_at")?,
@@ -206,6 +209,7 @@ impl AgentMetadataSafeRow {
                 last_check_at: self.last_check_at,
                 last_success_at: self.last_success_at,
                 last_failure_at: self.last_failure_at,
+                dynamic_probe_result: self.dynamic_probe_result,
                 command_override: self.command_override,
                 env_override: self.env_override,
                 created_at: self.created_at,
@@ -498,6 +502,7 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
                 last_check_at = ?, \
                 last_success_at = ?, \
                 last_failure_at = ?, \
+                dynamic_probe_result = ?, \
                 updated_at = ? \
              WHERE id = ?",
         )
@@ -510,6 +515,7 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         .bind(params.last_check_at)
         .bind(params.last_success_at)
         .bind(params.last_failure_at)
+        .bind(params.dynamic_probe_result)
         .bind(now)
         .bind(id)
         .execute(&self.pool)
@@ -963,6 +969,9 @@ mod tests {
                 last_check_at: Some(1_750_000_000_000),
                 last_success_at: Some(1_750_000_000_000),
                 last_failure_at: None,
+                dynamic_probe_result: Some(
+                    r#"{"agent_id":"agent-claude","checked_at":1750000000000,"steps":[],"available_models":["sonnet"]}"#,
+                ),
             },
         )
         .await
@@ -973,6 +982,10 @@ mod tests {
         assert_eq!(refreshed.last_check_kind.as_deref(), Some("manual"));
         assert_eq!(refreshed.last_check_latency_ms, Some(180));
         assert_eq!(refreshed.last_success_at, Some(1_750_000_000_000));
+        assert_eq!(
+            refreshed.dynamic_probe_result.as_deref(),
+            Some(r#"{"agent_id":"agent-claude","checked_at":1750000000000,"steps":[],"available_models":["sonnet"]}"#)
+        );
     }
 
     #[tokio::test]

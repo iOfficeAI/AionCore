@@ -84,8 +84,8 @@ impl ProjectService {
         let params = UpdateProjectParams {
             name: input.name.map(|value| non_empty(value, "project name")).transpose()?,
             local_path: input.local_path.map(|value| canonical_directory(&value)).transpose()?,
-            repository_url: input.repository_url.map(|value| trim_optional(value)),
-            default_branch: input.default_branch.map(|value| trim_optional(value)),
+            repository_url: input.repository_url.map(trim_optional),
+            default_branch: input.default_branch.map(trim_optional),
             project_type: input.project_type,
         };
         Ok(self.project_repo.update_for_user(project_id, user_id, &params).await?)
@@ -459,8 +459,20 @@ fn inspect_agent(agent_id: &str, snapshot: Option<AgentCapabilitySnapshot>) -> A
     let stale = snapshot
         .last_check_at
         .is_none_or(|checked_at| now_ms().saturating_sub(checked_at) > AGENT_SNAPSHOT_STALE_MS);
+    let dynamic_stale = snapshot
+        .dynamic_probe
+        .as_ref()
+        .is_some_and(|probe| now_ms().saturating_sub(probe.checked_at) > AGENT_SNAPSHOT_STALE_MS);
+    let dynamic_missing = snapshot.agent_type == "acp" && snapshot.dynamic_probe.is_none();
+    let dynamic_failed = snapshot.dynamic_probe.as_ref().is_some_and(|probe| !probe.is_usable());
     let (level, summary) = if !healthy {
         ("fail", "Agent is not currently healthy")
+    } else if dynamic_missing {
+        ("fail", "ACP Agent has no successful dynamic probe")
+    } else if dynamic_stale {
+        ("fail", "Agent dynamic probe is stale")
+    } else if dynamic_failed {
+        ("fail", "Agent failed the dynamic capability probe")
     } else if stale {
         ("warning", "Agent health snapshot is stale")
     } else {
@@ -483,4 +495,36 @@ fn overall_level<'a>(levels: impl Iterator<Item = &'a str>) -> String {
         warning |= level == "warning";
     }
     if warning { "warning" } else { "pass" }.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inspect_agent;
+    use crate::types::AgentCapabilitySnapshot;
+
+    #[test]
+    fn healthy_acp_agent_without_dynamic_probe_fails_formal_preflight() {
+        let now = aionui_common::now_ms();
+        let result = inspect_agent(
+            "codex",
+            Some(AgentCapabilitySnapshot {
+                id: "codex".into(),
+                agent_type: "acp".into(),
+                enabled: true,
+                installed: true,
+                status: "online".into(),
+                last_check_status: Some("online".into()),
+                last_check_at: Some(now),
+                last_success_at: Some(now),
+                agent_capabilities: None,
+                available_models: None,
+                available_modes: None,
+                available_commands: None,
+                dynamic_probe: None,
+            }),
+        );
+
+        assert_eq!(result.level, "fail");
+        assert!(result.summary.contains("no successful dynamic probe"));
+    }
 }

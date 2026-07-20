@@ -1,3 +1,7 @@
+// This module is the HTTP boundary where crate-owned `ProjectError` values
+// are intentionally mapped to the shared API error envelope.
+#![allow(clippy::disallowed_types)]
+
 use std::sync::Arc;
 
 use aionui_api_types::ApiResponse;

@@ -1360,8 +1360,12 @@ impl ActionExecutor {
             .collect();
         Ok(html_response(
             &format!(
-                "<b>{} 可用模型</b>\n模型选择只影响你在当前话题中的会话。",
-                html_escape(&option.name)
+                "<b>{} 可用模型</b>\n模型选择只影响你在当前话题中的会话。{}",
+                html_escape(&option.name),
+                option
+                    .last_probe_at
+                    .map(|checked_at| format!("\n能力探测时间: {checked_at}"))
+                    .unwrap_or_default()
             ),
             Some(buttons),
         ))
@@ -2252,16 +2256,15 @@ fn resolve_current_agent_option<'a>(
         .and_then(|setting| setting.assistant_id.as_deref().or(setting.custom_agent_id.as_deref()))
         .map(str::trim)
         .filter(|id| !id.is_empty())
+        && let Some(option) = options.iter().find(|option| option.agent_id == id)
     {
-        if let Some(option) = options.iter().find(|option| option.agent_id == id) {
-            return Some(option);
-        }
+        return Some(option);
     }
 
-    if let Some(backend) = config.backend.as_deref() {
-        if let Some(option) = options.iter().find(|option| option.backend.as_deref() == Some(backend)) {
-            return Some(option);
-        }
+    if let Some(backend) = config.backend.as_deref()
+        && let Some(option) = options.iter().find(|option| option.backend.as_deref() == Some(backend))
+    {
+        return Some(option);
     }
 
     options
@@ -3060,6 +3063,11 @@ mod tests {
         available_models: Option<&str>,
         sort_order: i64,
     ) -> AgentMetadataRow {
+        let dynamic_probe_result = if agent_type == "acp" {
+            available_models.and_then(test_dynamic_probe_from_models)
+        } else {
+            None
+        };
         AgentMetadataRow {
             id: id.into(),
             icon: None,
@@ -3098,11 +3106,55 @@ mod tests {
             last_check_at: None,
             last_success_at: last_check_status.map(|_| now_ms()),
             last_failure_at: None,
+            dynamic_probe_result,
             command_override: None,
             env_override: None,
             created_at: now_ms(),
             updated_at: now_ms(),
         }
+    }
+
+    fn test_dynamic_probe_from_models(raw: &str) -> Option<String> {
+        use aionui_api_types::{AgentDynamicProbeResult, AgentProbeStatus, AgentProbeStep, AgentProbeStepResult};
+
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let entries = value
+            .get("available_models")
+            .and_then(serde_json::Value::as_array)
+            .or_else(|| value.as_array())?;
+        let models = entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .as_str()
+                    .or_else(|| entry.get("id").and_then(serde_json::Value::as_str))
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let checked_at = now_ms();
+        serde_json::to_string(&AgentDynamicProbeResult {
+            agent_id: "fixture-agent".into(),
+            checked_at,
+            available_models: models,
+            steps: [
+                AgentProbeStep::Spawn,
+                AgentProbeStep::Initialize,
+                AgentProbeStep::Models,
+                AgentProbeStep::MinimalPrompt,
+                AgentProbeStep::Cancel,
+            ]
+            .into_iter()
+            .map(|step| AgentProbeStepResult {
+                step,
+                status: AgentProbeStatus::Passed,
+                started_at: checked_at,
+                duration_ms: 1,
+                error_category: None,
+                error_message: None,
+            })
+            .collect(),
+        })
+        .ok()
     }
 
     fn make_provider(id: &str, name: &str, models: &str) -> Provider {
@@ -4037,7 +4089,7 @@ mod tests {
                 let text = resp.text.unwrap();
                 assert!(text.contains("当前 Agent: Codex CLI"), "got: {text}");
                 let buttons = resp.buttons.unwrap();
-                assert_eq!(buttons[0][0].label, "GPT-5");
+                assert_eq!(buttons[0][0].label, "gpt-5");
                 assert_eq!(buttons[0][0].action, "model.select");
                 assert_eq!(
                     buttons[0][0].params.as_ref().unwrap().get("m").map(String::as_str),

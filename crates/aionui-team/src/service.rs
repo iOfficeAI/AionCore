@@ -254,6 +254,8 @@ impl TeamSessionService {
             ));
         }
 
+        self.provisioner().validate_dynamic_preflight(&req.agents).await?;
+
         let requested_workspace = match req.workspace.as_deref() {
             Some(workspace) if !workspace.is_empty() => Some(validate_create_workspace_path(workspace)?),
             _ => None,
@@ -292,7 +294,7 @@ impl TeamSessionService {
                 user_id,
                 &team_id,
                 &req.agents,
-                shared_workspace.as_deref(),
+                shared_workspace,
                 prepared_workspaces.as_ref(),
                 &source_metadata,
             )

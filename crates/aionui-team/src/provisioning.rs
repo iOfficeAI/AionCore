@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{AddAgentRequest, CreateTeamRequest, TeamAgentInput};
-use aionui_common::{AgentKillReason, AgentType, ConversationSource, ProviderWithModel, generate_id};
+use aionui_common::{AgentKillReason, AgentType, ConversationSource, ProviderWithModel, generate_id, now_ms};
 use aionui_db::models::TeamRow;
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
-    ITeamRepository, UpdateTeamParams,
+    ITeamRepository, UpdateTeamParams, resolve_agent_binding_from_rows,
 };
 use async_trait::async_trait;
 use tracing::{info, warn};
@@ -152,6 +152,82 @@ mod tests {
         assert_eq!(extra["created_from"], "telegram");
         assert_eq!(metadata.top_level_source(), ConversationSource::Telegram);
     }
+
+    #[test]
+    fn formal_team_preflight_rejects_stale_dynamic_probe() {
+        let now = aionui_common::now_ms();
+        let raw = serde_json::json!({
+            "agent_id": "codex",
+            "checked_at": now - 25 * 60 * 60 * 1000,
+            "available_models": ["gpt-5"],
+            "steps": [
+                {"step":"spawn","status":"passed","started_at":now,"duration_ms":1},
+                {"step":"initialize","status":"passed","started_at":now,"duration_ms":1},
+                {"step":"models","status":"passed","started_at":now,"duration_ms":1},
+                {"step":"minimal_prompt","status":"passed","started_at":now,"duration_ms":1},
+                {"step":"cancel","status":"passed","started_at":now,"duration_ms":1},
+                {"step":"resume","status":"unsupported","started_at":now,"duration_ms":1,
+                 "error_category":"protocol","error_message":"unsupported"}
+            ]
+        })
+        .to_string();
+
+        let error = validate_dynamic_probe_result(&raw, "gpt-5", now).unwrap_err();
+        assert!(error.to_string().contains("stale"));
+    }
+
+    #[test]
+    fn formal_team_preflight_rejects_unobserved_selected_model() {
+        let now = aionui_common::now_ms();
+        let mut result = healthy_probe("codex", now);
+        result.available_models = vec!["gpt-5".into()];
+        let raw = serde_json::to_string(&result).unwrap();
+
+        let error = validate_dynamic_probe_result(&raw, "gpt-5.6", now).unwrap_err();
+        assert!(error.to_string().contains("was not observed"));
+    }
+
+    #[test]
+    fn formal_team_preflight_rejects_latest_failed_check_even_with_prior_success() {
+        let now = aionui_common::now_ms();
+        let raw = serde_json::to_string(&healthy_probe("codex", now)).unwrap();
+
+        let error = validate_agent_dynamic_preflight(Some("offline"), Some(&raw), "gpt-5", now).unwrap_err();
+
+        assert!(error.to_string().contains("latest health check failed"));
+    }
+
+    fn healthy_probe(agent_id: &str, checked_at: i64) -> aionui_api_types::AgentDynamicProbeResult {
+        use aionui_api_types::{AgentProbeStatus, AgentProbeStep, AgentProbeStepResult};
+
+        aionui_api_types::AgentDynamicProbeResult {
+            agent_id: agent_id.into(),
+            checked_at,
+            available_models: vec!["gpt-5".into()],
+            steps: [
+                AgentProbeStep::Spawn,
+                AgentProbeStep::Initialize,
+                AgentProbeStep::Models,
+                AgentProbeStep::MinimalPrompt,
+                AgentProbeStep::Cancel,
+                AgentProbeStep::Resume,
+            ]
+            .into_iter()
+            .map(|step| AgentProbeStepResult {
+                step,
+                status: if step == AgentProbeStep::Resume {
+                    AgentProbeStatus::Unsupported
+                } else {
+                    AgentProbeStatus::Passed
+                },
+                started_at: checked_at,
+                duration_ms: 1,
+                error_category: None,
+                error_message: None,
+            })
+            .collect(),
+        }
+    }
 }
 
 fn clean_source(value: Option<&str>) -> Option<String> {
@@ -165,6 +241,56 @@ fn set_extra_string(extra: &mut serde_json::Value, key: &str, value: Option<&str
     if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
         extra[key] = serde_json::Value::String(value.to_owned());
     }
+}
+
+const DYNAMIC_PROBE_STALE_MS: i64 = 24 * 60 * 60 * 1000;
+
+fn validate_dynamic_probe_result(raw: &str, selected_model: &str, checked_at: i64) -> Result<(), TeamError> {
+    let probe: aionui_api_types::AgentDynamicProbeResult = serde_json::from_str(raw).map_err(|_| {
+        TeamError::InvalidRequest("Agent dynamic probe snapshot is invalid; run health check again".into())
+    })?;
+    if checked_at.saturating_sub(probe.checked_at) > DYNAMIC_PROBE_STALE_MS {
+        return Err(TeamError::InvalidRequest(format!(
+            "Agent '{}' dynamic probe is stale; run health check again",
+            probe.agent_id
+        )));
+    }
+    if !probe.is_usable() {
+        return Err(TeamError::InvalidRequest(format!(
+            "Agent '{}' failed dynamic capability preflight",
+            probe.agent_id
+        )));
+    }
+    let selected_model = selected_model.trim();
+    if !selected_model.is_empty()
+        && !selected_model.eq_ignore_ascii_case("default")
+        && !probe.available_models.iter().any(|model| model == selected_model)
+    {
+        return Err(TeamError::InvalidRequest(format!(
+            "Model '{selected_model}' was not observed during Agent '{}' dynamic probe",
+            probe.agent_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_agent_dynamic_preflight(
+    last_check_status: Option<&str>,
+    dynamic_probe_result: Option<&str>,
+    selected_model: &str,
+    checked_at: i64,
+) -> Result<(), TeamError> {
+    if !last_check_status.is_some_and(|status| matches!(status, "online" | "available")) {
+        return Err(TeamError::InvalidRequest(
+            "Agent latest health check failed; run health check again before creating a Team".into(),
+        ));
+    }
+    let raw = dynamic_probe_result.ok_or_else(|| {
+        TeamError::InvalidRequest(
+            "Agent has no successful dynamic probe; run health check before creating a Team".into(),
+        )
+    })?;
+    validate_dynamic_probe_result(raw, selected_model, checked_at)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +339,42 @@ impl TeamAgentProvisioner {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
+    }
+
+    pub(crate) async fn validate_dynamic_preflight(&self, agents: &[TeamAgentInput]) -> Result<(), TeamError> {
+        for agent in agents {
+            let Some(assistant_id) = Self::effective_assistant_id(agent.assistant_id.as_deref()) else {
+                continue;
+            };
+            let definition = self
+                .assistant_definition_repo
+                .get_by_assistant_id(&assistant_id)
+                .await?
+                .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_id}")))?;
+            let effective_agent_id = self
+                .assistant_overlay_repo
+                .get(&definition.id)
+                .await?
+                .and_then(|row| row.agent_id_override)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(definition.agent_id);
+            let rows = self.agent_metadata_repo.list_all().await?;
+            let resolved = resolve_agent_binding_from_rows(&rows, &effective_agent_id)
+                .ok_or_else(|| TeamError::InvalidRequest(format!("Agent not found: {effective_agent_id}")))?;
+            let row = rows
+                .iter()
+                .find(|row| row.id == resolved.agent_id)
+                .ok_or_else(|| TeamError::InvalidRequest(format!("Agent not found: {effective_agent_id}")))?;
+            if row.agent_type == "acp" {
+                validate_agent_dynamic_preflight(
+                    row.last_check_status.as_deref(),
+                    row.dynamic_probe_result.as_deref(),
+                    &agent.model,
+                    now_ms(),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn new(

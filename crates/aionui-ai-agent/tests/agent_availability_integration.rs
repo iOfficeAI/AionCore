@@ -83,6 +83,7 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
             last_check_at: Some(1_750_000_000_000),
             last_success_at: None,
             last_failure_at: Some(1_750_000_000_000),
+            dynamic_probe_result: None,
         },
     )
     .await
@@ -100,6 +101,7 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
             last_check_at: Some(1_750_000_100_000),
             last_success_at: Some(1_750_000_100_000),
             last_failure_at: None,
+            dynamic_probe_result: None,
         },
     )
     .await

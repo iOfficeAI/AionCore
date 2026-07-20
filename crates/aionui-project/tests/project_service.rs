@@ -77,6 +77,7 @@ async fn preflight_reports_dirty_git_missing_command_and_unhealthy_agent() {
     let (service, _db) = service(FakeAgents {
         snapshots: vec![AgentCapabilitySnapshot {
             id: "codex".into(),
+            agent_type: "acp".into(),
             enabled: true,
             installed: true,
             status: "offline".into(),
@@ -87,6 +88,7 @@ async fn preflight_reports_dirty_git_missing_command_and_unhealthy_agent() {
             available_models: None,
             available_modes: None,
             available_commands: None,
+            dynamic_probe: None,
         }],
         ..Default::default()
     })
@@ -149,6 +151,7 @@ async fn explicit_agent_refresh_is_forwarded_and_healthy_snapshot_passes() {
     let (service, _db) = service(FakeAgents {
         snapshots: vec![AgentCapabilitySnapshot {
             id: "codex".into(),
+            agent_type: "aionrs".into(),
             enabled: true,
             installed: true,
             status: "online".into(),
@@ -159,6 +162,7 @@ async fn explicit_agent_refresh_is_forwarded_and_healthy_snapshot_passes() {
             available_models: Some(serde_json::json!([{ "id": "gpt-5" }])),
             available_modes: None,
             available_commands: None,
+            dynamic_probe: None,
         }],
         refresh_seen: refresh_seen.clone(),
     })
@@ -199,6 +203,7 @@ async fn stale_healthy_agent_snapshot_requires_attention() {
     let (service, _db) = service(FakeAgents {
         snapshots: vec![AgentCapabilitySnapshot {
             id: "claude".into(),
+            agent_type: "aionrs".into(),
             enabled: true,
             installed: true,
             status: "online".into(),
@@ -209,6 +214,7 @@ async fn stale_healthy_agent_snapshot_requires_attention() {
             available_models: None,
             available_modes: None,
             available_commands: None,
+            dynamic_probe: None,
         }],
         ..Default::default()
     })
@@ -233,6 +239,57 @@ async fn stale_healthy_agent_snapshot_requires_attention() {
         .unwrap();
     assert_eq!(result.agents[0].level, "warning");
     assert!(result.agents[0].summary.contains("stale"));
+}
+
+#[tokio::test]
+async fn stale_dynamic_probe_blocks_formal_project_preflight() {
+    let temp = tempfile::tempdir().unwrap();
+    let now = aionui_common::now_ms();
+    let (service, _db) = service(FakeAgents {
+        snapshots: vec![AgentCapabilitySnapshot {
+            id: "codex".into(),
+            agent_type: "acp".into(),
+            enabled: true,
+            installed: true,
+            status: "online".into(),
+            last_check_status: Some("online".into()),
+            last_check_at: Some(now),
+            last_success_at: Some(now),
+            agent_capabilities: None,
+            available_models: Some(serde_json::json!(["gpt-5"])),
+            available_modes: None,
+            available_commands: None,
+            dynamic_probe: Some(aionui_api_types::AgentDynamicProbeResult {
+                agent_id: "codex".into(),
+                checked_at: now - 25 * 60 * 60 * 1000,
+                available_models: vec!["gpt-5".into()],
+                steps: vec![],
+            }),
+        }],
+        ..Default::default()
+    })
+    .await;
+    let project = service
+        .create(
+            "system_default_user",
+            CreateProjectInput {
+                name: "Stale dynamic probe".into(),
+                local_path: temp.path().to_string_lossy().into_owned(),
+                repository_url: None,
+                default_branch: None,
+                project_type: "unknown".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = service
+        .preflight("system_default_user", &project.id, &["codex".into()], false)
+        .await
+        .unwrap();
+
+    assert_eq!(result.agents[0].level, "fail");
+    assert!(result.agents[0].summary.contains("dynamic probe is stale"));
 }
 
 #[tokio::test]

@@ -43,6 +43,7 @@ pub use routes::{AgentRouterState, RemoteAgentRouterState, agent_routes, remote_
 pub use services::AgentAvailabilityFeedbackPort;
 pub use services::AgentService;
 pub use services::RemoteAgentService;
+pub use services::{DynamicAgentProbe, DynamicProbeFailure, DynamicProbeSession, DynamicProbeSessionFactory};
 pub use session_context::{
     AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, AionrsSessionBuildContext, ConversationContext,
     WorkspaceContext,

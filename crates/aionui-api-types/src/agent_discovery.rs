@@ -104,6 +104,10 @@ pub struct AgentHandshake {
     pub available_models: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_commands: Option<serde_json::Value>,
+    /// Last successful normalized dynamic preflight. Stored alongside
+    /// handshake data because it is runtime-observed Agent capability state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_probe: Option<AgentDynamicProbeResult>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +132,82 @@ pub enum AgentSnapshotCheckKind {
     Scheduled,
     Manual,
     Session,
+}
+
+/// Ordered stages executed by the dynamic Agent preflight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProbeStep {
+    Spawn,
+    Initialize,
+    Models,
+    MinimalPrompt,
+    Cancel,
+    Resume,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProbeStatus {
+    Passed,
+    Failed,
+    Unsupported,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProbeErrorCategory {
+    Authentication,
+    ModelRejected,
+    Protocol,
+    Startup,
+    Timeout,
+    RateLimited,
+    Permission,
+    RuntimeMissing,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentProbeStepResult {
+    pub step: AgentProbeStep,
+    pub status: AgentProbeStatus,
+    pub started_at: TimestampMs,
+    pub duration_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_category: Option<AgentProbeErrorCategory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDynamicProbeResult {
+    pub agent_id: String,
+    pub checked_at: TimestampMs,
+    pub steps: Vec<AgentProbeStepResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_models: Vec<String>,
+}
+
+impl AgentDynamicProbeResult {
+    /// Resume is optional in ACP; every other stage is required before an
+    /// Agent can be used for a formal development session.
+    pub fn is_usable(&self) -> bool {
+        const REQUIRED: [AgentProbeStep; 5] = [
+            AgentProbeStep::Spawn,
+            AgentProbeStep::Initialize,
+            AgentProbeStep::Models,
+            AgentProbeStep::MinimalPrompt,
+            AgentProbeStep::Cancel,
+        ];
+
+        REQUIRED.iter().all(|required| {
+            self.steps
+                .iter()
+                .any(|result| result.step == *required && result.status == AgentProbeStatus::Passed)
+        })
+    }
 }
 
 /// A single `backend → logo URL` pair in the agent logo catalog.
@@ -289,6 +369,8 @@ pub struct AgentManagementRow {
     pub available_models: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_commands: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_probe: Option<AgentDynamicProbeResult>,
     pub sort_order: i64,
     #[serde(default)]
     pub team_capable: bool,

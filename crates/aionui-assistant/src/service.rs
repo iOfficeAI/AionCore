@@ -2680,6 +2680,7 @@ mod tests {
             available_modes: None,
             available_models: None,
             available_commands: None,
+            dynamic_probe: None,
             sort_order: 3100,
             team_capable: true,
             status,
