@@ -3,15 +3,25 @@ use std::time::Duration;
 
 use aionui_common::{AgentKillReason, now_ms};
 use async_trait::async_trait;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::task_manager::IWorkerTaskManager;
 
-/// Default idle timeout for ACP agents (5 minutes).
-const DEFAULT_IDLE_TIMEOUT_SECS: i64 = 5 * 60;
+/// Default idle timeout for solo (single-chat) ACP agents (10 minutes).
+const DEFAULT_SOLO_IDLE_TIMEOUT_SECS: i64 = 10 * 60;
 
-/// Scan interval for idle agent cleanup (1 minute).
-const SCAN_INTERVAL_SECS: u64 = 60;
+/// Default idle timeout for team sessions (30 minutes).
+const DEFAULT_TEAM_IDLE_TIMEOUT_SECS: i64 = 30 * 60;
+
+/// Default scan interval for idle agent cleanup (1 minute).
+const DEFAULT_SCAN_INTERVAL_SECS: u64 = 60;
+
+/// Environment variable overriding the solo (single-chat) idle timeout, in seconds.
+const ENV_SOLO_IDLE_TIMEOUT_SECS: &str = "AIONUI_IDLE_TIMEOUT_SECS";
+/// Environment variable overriding the team idle timeout, in seconds.
+const ENV_TEAM_IDLE_TIMEOUT_SECS: &str = "AIONUI_TEAM_IDLE_TIMEOUT_SECS";
+/// Environment variable overriding the idle scan interval, in seconds.
+const ENV_IDLE_SCAN_INTERVAL_SECS: &str = "AIONUI_IDLE_SCAN_INTERVAL_SECS";
 
 #[async_trait]
 pub trait IdleCleanupCoordinator: Send + Sync {
@@ -50,8 +60,8 @@ pub fn start_idle_scanner_with_coordinator(
     scan_interval_secs: Option<u64>,
     idle_cleanup_coordinator: Option<Arc<dyn IdleCleanupCoordinator>>,
 ) -> tokio::task::JoinHandle<()> {
-    let threshold = idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
-    let scan_interval = scan_interval_secs.unwrap_or(SCAN_INTERVAL_SECS);
+    let threshold = idle_timeout_secs.unwrap_or(DEFAULT_SOLO_IDLE_TIMEOUT_SECS);
+    let scan_interval = scan_interval_secs.unwrap_or(DEFAULT_SCAN_INTERVAL_SECS);
     info!(
         threshold_secs = threshold,
         scan_interval_secs = scan_interval,
@@ -141,6 +151,60 @@ async fn scan_and_cleanup(
         elapsed_ms = now_ms().saturating_sub(started_at),
         "Idle scan: cleanup completed"
     );
+}
+
+/// Parse a positive `i64` seconds value, falling back to `default` on
+/// missing/invalid input (non-numeric, empty, or `<= 0`).
+fn parse_positive_i64(raw: Option<String>, var: &str, default: i64) -> i64 {
+    match raw {
+        None => default,
+        Some(value) => match value.trim().parse::<i64>() {
+            Ok(parsed) if parsed > 0 => parsed,
+            _ => {
+                warn!(env_var = var, value = %value, default, "invalid idle-cleanup env value; using default");
+                default
+            }
+        },
+    }
+}
+
+/// Parse a positive `u64` seconds value, falling back to `default` on
+/// missing/invalid input (non-numeric, empty, or `== 0`).
+fn parse_positive_u64(raw: Option<String>, var: &str, default: u64) -> u64 {
+    match raw {
+        None => default,
+        Some(value) => match value.trim().parse::<u64>() {
+            Ok(parsed) if parsed > 0 => parsed,
+            _ => {
+                warn!(env_var = var, value = %value, default, "invalid idle-cleanup env value; using default");
+                default
+            }
+        },
+    }
+}
+
+/// Resolve idle-cleanup config from raw env values. Pure — takes the raw
+/// `Option<String>` values and does not read the environment, so it is unit
+/// testable. Returns `(solo_timeout_secs, team_timeout_secs, scan_interval_secs)`.
+fn resolve_idle_config(
+    solo_raw: Option<String>,
+    team_raw: Option<String>,
+    scan_raw: Option<String>,
+) -> (i64, i64, u64) {
+    let solo = parse_positive_i64(solo_raw, ENV_SOLO_IDLE_TIMEOUT_SECS, DEFAULT_SOLO_IDLE_TIMEOUT_SECS);
+    let team = parse_positive_i64(team_raw, ENV_TEAM_IDLE_TIMEOUT_SECS, DEFAULT_TEAM_IDLE_TIMEOUT_SECS);
+    let scan = parse_positive_u64(scan_raw, ENV_IDLE_SCAN_INTERVAL_SECS, DEFAULT_SCAN_INTERVAL_SECS);
+    (solo, team, scan)
+}
+
+/// Read the idle-cleanup env vars and resolve the effective config.
+/// Returns `(solo_timeout_secs, team_timeout_secs, scan_interval_secs)`.
+pub fn resolve_idle_config_from_env() -> (i64, i64, u64) {
+    resolve_idle_config(
+        std::env::var(ENV_SOLO_IDLE_TIMEOUT_SECS).ok(),
+        std::env::var(ENV_TEAM_IDLE_TIMEOUT_SECS).ok(),
+        std::env::var(ENV_IDLE_SCAN_INTERVAL_SECS).ok(),
+    )
 }
 
 #[cfg(test)]
@@ -239,5 +303,41 @@ mod tests {
 
         assert_eq!(seen.lock().unwrap().clone(), vec!["team-lead", "solo"]);
         assert_eq!(manager_impl.killed(), vec!["solo"]);
+    }
+
+    #[test]
+    fn resolve_idle_config_defaults_when_absent() {
+        let (solo, team, scan) = resolve_idle_config(None, None, None);
+        assert_eq!(solo, 600);
+        assert_eq!(team, 1800);
+        assert_eq!(scan, 60);
+    }
+
+    #[test]
+    fn resolve_idle_config_parses_valid_values() {
+        let (solo, team, scan) = resolve_idle_config(
+            Some("300".to_string()),
+            Some("300".to_string()),
+            Some("10".to_string()),
+        );
+        assert_eq!(solo, 300);
+        assert_eq!(team, 300);
+        assert_eq!(scan, 10);
+    }
+
+    #[test]
+    fn resolve_idle_config_falls_back_on_invalid_values() {
+        // negative, zero, non-numeric, empty -> defaults
+        let (solo, team, scan) = resolve_idle_config(
+            Some("-5".to_string()),
+            Some("0".to_string()),
+            Some("abc".to_string()),
+        );
+        assert_eq!(solo, 600);
+        assert_eq!(team, 1800);
+        assert_eq!(scan, 60);
+
+        let (solo2, _, _) = resolve_idle_config(Some("".to_string()), None, None);
+        assert_eq!(solo2, 600);
     }
 }
