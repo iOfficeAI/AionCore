@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-process"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "aionui-common",
  "aionui-runtime",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-session"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "aionui-common",
  "aionui-process",
