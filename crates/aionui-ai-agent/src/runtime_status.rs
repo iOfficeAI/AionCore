@@ -76,4 +76,3 @@ fn map_failure_kind(kind: NodeRuntimeFailureKind) -> RuntimeFailureKind {
         NodeRuntimeFailureKind::Unknown => RuntimeFailureKind::Unknown,
     }
 }
-

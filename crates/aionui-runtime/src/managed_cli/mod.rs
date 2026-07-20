@@ -81,7 +81,10 @@ fn main_executable_in(name: &str, root: &Path) -> Option<PathBuf> {
 /// otherwise `None` (dev / Download mode, or a missing bundle), signalling the
 /// caller to fall back to the bare command name resolved via PATH.
 pub fn resolve_bundled_cli(name: &str) -> Option<PathBuf> {
-    if !matches!(managed_resources::managed_resources_mode(), ManagedResourcesMode::Bundled) {
+    if !matches!(
+        managed_resources::managed_resources_mode(),
+        ManagedResourcesMode::Bundled
+    ) {
         return None;
     }
     let version = cli_version(name)?;
@@ -92,7 +95,11 @@ pub fn resolve_bundled_cli(name: &str) -> Option<PathBuf> {
             return Some(exe);
         }
     }
-    tracing::warn!(cli = name, version, "bundled cli missing in Bundled mode; falling back to PATH");
+    tracing::warn!(
+        cli = name,
+        version,
+        "bundled cli missing in Bundled mode; falling back to PATH"
+    );
     None
 }
 

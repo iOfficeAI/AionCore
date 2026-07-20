@@ -2,13 +2,13 @@ use std::process::ExitCode;
 
 use crate::cli::PrepareManagedResourcesArgs;
 use crate::commands::error::{CliBoundaryCode, CliBoundaryError};
+use aionui_runtime::ensure_node_runtime;
 use aionui_runtime::managed_cli::{managed_cli_contract_for_export, prepare_managed_cli_to_root};
 use aionui_runtime::managed_resources::export_node_runtime_to_root;
 use aionui_runtime::managed_resources_contract::{
     MANAGED_RESOURCES_CONTRACT_SCHEMA_VERSION, ManagedResourcesContract, validate_contract, write_contract,
 };
 use aionui_runtime::node_runtime::managed_node_contract_for_export;
-use aionui_runtime::ensure_node_runtime;
 
 const MANAGED_CLI_NAMES: [&str; 2] = ["claude", "codex"];
 

@@ -23,9 +23,7 @@ use aionui_api_types::{
 };
 use aionui_common::AgentType;
 use aionui_db::{AgentMetadataRow, IAgentMetadataRepository, UpdateAgentHandshakeParams};
-use aionui_runtime::{
-    RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path,
-};
+use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::{RwLock, mpsc};

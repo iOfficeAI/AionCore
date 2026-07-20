@@ -200,10 +200,7 @@ fn validate_node_paths(root: &Path, node: &ManagedNodeResourceContract) -> Resul
     Ok(())
 }
 
-fn validate_cli_paths(
-    root: &Path,
-    cli: &ManagedCliResourceContract,
-) -> Result<(), ManagedResourcesContractError> {
+fn validate_cli_paths(root: &Path, cli: &ManagedCliResourceContract) -> Result<(), ManagedResourcesContractError> {
     let cli_root = root.join(&cli.root);
     if !cli_root.is_dir() {
         return Err(ManagedResourcesContractError::invalid(format!(
@@ -317,7 +314,10 @@ mod tests {
         assert_eq!(value["runtimeKey"], "win32-x64");
         assert!(value.get("schema_version").is_none());
         assert_eq!(value["clis"][0]["name"], "claude");
-        assert_eq!(value["clis"][1]["executable"], "vendor/x86_64-pc-windows-msvc/bin/codex.exe");
+        assert_eq!(
+            value["clis"][1]["executable"],
+            "vendor/x86_64-pc-windows-msvc/bin/codex.exe"
+        );
     }
 
     #[test]
@@ -377,6 +377,9 @@ mod tests {
 
         let error = validate_contract(temp.path(), &contract).expect_err("missing paths should fail");
 
-        assert!(error.to_string().contains("required file missing") || error.to_string().contains("required directory missing"));
+        assert!(
+            error.to_string().contains("required file missing")
+                || error.to_string().contains("required directory missing")
+        );
     }
 }

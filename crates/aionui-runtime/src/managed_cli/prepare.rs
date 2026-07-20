@@ -77,8 +77,8 @@ pub struct PreparedCli {
 /// native binary subtree under `out_root/cli/<name>/<version>/<target>/`.
 pub async fn prepare_managed_cli_to_root(name: &str, out_root: &Path) -> Result<PreparedCli, ManagedCliError> {
     let version = cli_version(name).ok_or_else(|| ManagedCliError::new(format!("unknown CLI {name}")))?;
-    let target = current_runtime_key()
-        .ok_or_else(|| ManagedCliError::new("unsupported platform for managed CLI prepare"))?;
+    let target =
+        current_runtime_key().ok_or_else(|| ManagedCliError::new("unsupported platform for managed CLI prepare"))?;
     let package = npm_package(name).ok_or_else(|| ManagedCliError::new(format!("unknown CLI {name}")))?;
     let (npm_os, npm_cpu) = npm_os_cpu().ok_or_else(|| ManagedCliError::new("unsupported npm os/cpu"))?;
 
@@ -140,18 +140,17 @@ pub async fn prepare_managed_cli_to_root(name: &str, out_root: &Path) -> Result<
     }
 
     let node_modules = project_dir.join("node_modules");
-    let cli_root = out_root
-        .join("cli")
-        .join(name)
-        .join(version)
-        .join(target);
+    let cli_root = out_root.join("cli").join(name).join(version).join(target);
 
     let (executable, required_directories) = match name {
         "claude" => {
             let src = find_platform_package(&node_modules, "@anthropic-ai", "claude-code-")?
                 .join(format!("claude{}", exe_suffix()));
             if !src.is_file() {
-                return Err(ManagedCliError::new(format!("claude binary missing at {}", src.display())));
+                return Err(ManagedCliError::new(format!(
+                    "claude binary missing at {}",
+                    src.display()
+                )));
             }
             std::fs::create_dir_all(&cli_root).map_err(ManagedCliError::io)?;
             let dst = cli_root.join(format!("claude{}", exe_suffix()));
@@ -163,7 +162,10 @@ pub async fn prepare_managed_cli_to_root(name: &str, out_root: &Path) -> Result<
             let pkg = find_platform_package(&node_modules, "@openai", "codex-")?;
             let src_vendor = pkg.join("vendor");
             if !src_vendor.is_dir() {
-                return Err(ManagedCliError::new(format!("codex vendor dir missing at {}", src_vendor.display())));
+                return Err(ManagedCliError::new(format!(
+                    "codex vendor dir missing at {}",
+                    src_vendor.display()
+                )));
             }
             managed_resources::materialize_directory(&src_vendor, &cli_root.join("vendor"))
                 .map_err(ManagedCliError::io)?;
@@ -172,7 +174,10 @@ pub async fn prepare_managed_cli_to_root(name: &str, out_root: &Path) -> Result<
             let exe = format!("vendor/{triple}/bin/codex{}", exe_suffix());
             let exe_abs = cli_root.join(&exe);
             if !exe_abs.is_file() {
-                return Err(ManagedCliError::new(format!("codex binary missing at {}", exe_abs.display())));
+                return Err(ManagedCliError::new(format!(
+                    "codex binary missing at {}",
+                    exe_abs.display()
+                )));
             }
             set_executable(&exe_abs)?;
             (exe, vec![format!("vendor/{triple}")])
@@ -270,7 +275,12 @@ mod tests {
     #[test]
     fn contract_export_makes_paths_relative() {
         let bundle = tempfile::tempdir().unwrap();
-        let root = bundle.path().join("cli").join("claude").join("2.1.215").join("darwin-arm64");
+        let root = bundle
+            .path()
+            .join("cli")
+            .join("claude")
+            .join("2.1.215")
+            .join("darwin-arm64");
         std::fs::create_dir_all(&root).unwrap();
         let prepared = PreparedCli {
             name: "claude".into(),
