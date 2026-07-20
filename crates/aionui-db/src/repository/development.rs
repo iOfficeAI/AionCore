@@ -2,8 +2,9 @@ use aionui_common::TimestampMs;
 
 use crate::error::DbError;
 use crate::models::{
-    DevelopmentCiCheckRow, DevelopmentDeliveryRow, DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow,
-    QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
+    AcceptanceCriterionRow, CompletionEvidenceRow, DevelopmentCiCheckRow, DevelopmentDeliveryRow,
+    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, PlanRevisionRow, QualityGateRunRow,
+    RequirementVersionRow, ReviewFindingRow, SingleRunWorkspaceRow, TaskArtifactRow, TaskCriterionRow,
 };
 
 #[async_trait::async_trait]
@@ -49,4 +50,31 @@ pub trait IDevelopmentRepository: Send + Sync {
     async fn get_delivery(&self, user_id: &str, run_id: &str) -> Result<Option<DevelopmentDeliveryRow>, DbError>;
     async fn upsert_ci_check(&self, row: &DevelopmentCiCheckRow) -> Result<(), DbError>;
     async fn list_ci_checks(&self, delivery_id: &str) -> Result<Vec<DevelopmentCiCheckRow>, DbError>;
+
+    async fn append_requirement_version(
+        &self,
+        row: &RequirementVersionRow,
+        criteria: &[AcceptanceCriterionRow],
+    ) -> Result<(), DbError>;
+    async fn list_requirement_versions(&self, run_id: &str) -> Result<Vec<RequirementVersionRow>, DbError>;
+    async fn list_active_criteria(&self, run_id: &str) -> Result<Vec<AcceptanceCriterionRow>, DbError>;
+    async fn append_plan_revision(&self, row: &PlanRevisionRow) -> Result<(), DbError>;
+    async fn list_plan_revisions(&self, run_id: &str) -> Result<Vec<PlanRevisionRow>, DbError>;
+    async fn map_task_criteria(&self, rows: &[TaskCriterionRow]) -> Result<(), DbError>;
+    async fn list_task_criteria(&self, run_id: &str) -> Result<Vec<TaskCriterionRow>, DbError>;
+    async fn create_completion_evidence(&self, row: &CompletionEvidenceRow) -> Result<(), DbError>;
+    async fn list_completion_evidence(&self, run_id: &str) -> Result<Vec<CompletionEvidenceRow>, DbError>;
+    async fn create_single_run_workspace(&self, row: &SingleRunWorkspaceRow) -> Result<(), DbError>;
+    async fn get_single_run_workspace(
+        &self,
+        run_id: &str,
+        user_id: &str,
+    ) -> Result<Option<SingleRunWorkspaceRow>, DbError>;
+    async fn update_single_run_workspace(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        candidate_commit: Option<&str>,
+        cleanup_status: &str,
+    ) -> Result<bool, DbError>;
 }

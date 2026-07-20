@@ -4,9 +4,11 @@ mod delivery;
 mod error;
 mod executor;
 mod operations;
+mod requirements;
 mod routes;
 mod service;
 mod types;
+mod workspace;
 
 pub use approval::{
     ApprovalError, ApprovalOption, ApprovalRequestInput, ApprovalResolver, ApprovalService, ApprovalSource,
@@ -29,3 +31,4 @@ pub use operations::{
 pub use routes::{DevelopmentRouterState, development_routes};
 pub use service::{CompletionEvaluation, DevelopmentService};
 pub use types::*;
+pub use workspace::{DevelopmentWorkspacePort, PrepareDevelopmentWorkspace, PreparedDevelopmentWorkspace};

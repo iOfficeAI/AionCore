@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)] // HTTP boundary maps crate-owned errors to the shared API response.
+
 use std::sync::Arc;
 
 use aionui_api_types::ApiResponse;

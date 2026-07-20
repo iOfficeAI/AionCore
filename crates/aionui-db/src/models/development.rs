@@ -142,3 +142,76 @@ pub struct DevelopmentCiCheckRow {
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct RequirementVersionRow {
+    pub id: String,
+    pub run_id: String,
+    pub version: i64,
+    pub content: String,
+    pub change_summary: Option<String>,
+    pub created_by: String,
+    pub created_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AcceptanceCriterionRow {
+    pub id: String,
+    pub run_id: String,
+    pub requirement_version_id: String,
+    pub ordinal: i64,
+    pub statement: String,
+    pub required: bool,
+    pub created_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct PlanRevisionRow {
+    pub id: String,
+    pub run_id: String,
+    pub revision: i64,
+    pub summary: String,
+    pub content: String,
+    pub created_by: String,
+    pub created_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TaskCriterionRow {
+    pub run_id: String,
+    pub task_id: String,
+    pub criterion_id: String,
+    pub mapped_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct CompletionEvidenceRow {
+    pub id: String,
+    pub run_id: String,
+    pub task_id: String,
+    pub criterion_id: String,
+    pub evidence_type: String,
+    pub artifact_id: Option<String>,
+    pub reference: String,
+    pub accepted: bool,
+    pub reviewer_id: Option<String>,
+    pub created_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SingleRunWorkspaceRow {
+    pub run_id: String,
+    pub user_id: String,
+    pub project_id: String,
+    pub baseline_commit: String,
+    pub initial_diff_checksum: String,
+    pub initial_diff_path: String,
+    pub workspace_lease_id: Option<String>,
+    pub workspace_path: Option<String>,
+    pub branch: Option<String>,
+    pub candidate_commit: Option<String>,
+    pub safe_point: String,
+    pub cleanup_status: String,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}

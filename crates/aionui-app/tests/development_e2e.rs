@@ -137,6 +137,81 @@ async fn authenticated_user_can_create_an_evidence_backed_development_board() {
 
     let response = app
         .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/development-runs/{run_id}/requirements"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/development-runs/{run_id}/plans"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(
+                    json!({"summary": "Plan", "content": "Implement"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let (other_token, _other_csrf) = setup_and_login(&mut app, &services, "other-developer", "StrongP@ss2").await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/development-runs/{run_id}/requirements"))
+                .header("authorization", format!("Bearer {other_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/development-runs/{run_id}/requirements"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let requirements = body_json(response).await;
+    assert_eq!(requirements["data"]["original_requirement"], "Implement quality gates");
+    assert_eq!(requirements["data"]["active_criteria"].as_array().unwrap().len(), 1);
+
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/development-runs/{run_id}/plans"),
+            json!({"summary": "Plan", "content": "Implement and verify"}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
         .oneshot(json_with_token(
             "POST",
             &format!("/api/development-runs/{run_id}/tasks"),

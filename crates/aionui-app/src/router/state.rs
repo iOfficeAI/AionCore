@@ -41,7 +41,8 @@ use aionui_db::{
 };
 use aionui_development::{
     ApprovalOption, ApprovalRequestInput, ApprovalResolver, ApprovalRouterState, ApprovalService, ApprovalSource,
-    DeliveryService, DevelopmentOperationsService, DevelopmentRouterState, DevelopmentService, GhCliDeliveryProvider,
+    DeliveryService, DevelopmentOperationsService, DevelopmentRouterState, DevelopmentService,
+    DevelopmentWorkspacePort, GhCliDeliveryProvider, PrepareDevelopmentWorkspace, PreparedDevelopmentWorkspace,
     ResolveApprovalContext,
 };
 use aionui_extension::{
@@ -107,6 +108,38 @@ struct ChannelDevelopmentAdapter {
     development_repo: Arc<dyn IDevelopmentRepository>,
     approval_repo: Arc<dyn IApprovalRepository>,
     service: Arc<DevelopmentService>,
+}
+
+struct DevelopmentWorkspaceAdapter {
+    manager: Arc<aionui_team::GitTeamWorkspaceManager>,
+}
+
+#[async_trait::async_trait]
+impl DevelopmentWorkspacePort for DevelopmentWorkspaceAdapter {
+    async fn prepare(&self, input: PrepareDevelopmentWorkspace) -> Result<PreparedDevelopmentWorkspace, String> {
+        self.manager
+            .prepare_single_run(
+                &input.user_id,
+                &input.run_id,
+                &input.repository_path,
+                &input.baseline_commit,
+            )
+            .await
+            .map(|lease| PreparedDevelopmentWorkspace {
+                lease_id: lease.id,
+                workspace_path: lease.worktree_path,
+                branch: lease.branch_name,
+                safe_point: lease.base_commit,
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    async fn restore(&self, lease_id: &str, safe_point: &str) -> Result<String, String> {
+        self.manager
+            .restore_single_run(lease_id, safe_point)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[async_trait::async_trait]
@@ -1052,6 +1085,12 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
     let project_repo: Arc<dyn IProjectRepository> = Arc::new(SqliteProjectRepository::new(pool.clone()));
     let lease_repo: Arc<dyn IAgentWorkspaceLeaseRepository> =
         Arc::new(SqliteAgentWorkspaceLeaseRepository::new(pool.clone()));
+    let workspace = Arc::new(DevelopmentWorkspaceAdapter {
+        manager: Arc::new(aionui_team::GitTeamWorkspaceManager::new(
+            lease_repo.clone(),
+            services.data_dir.join("development-worktrees"),
+        )),
+    });
     let operations_repo = Arc::new(SqliteDevelopmentOperationsRepository::new(pool));
     let operations_service = Arc::new(DevelopmentOperationsService::new(
         operations_repo,
@@ -1067,7 +1106,8 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
                 lease_repo,
                 services.data_dir.join("development-artifacts"),
             )
-            .with_operations(operations_service.clone()),
+            .with_operations(operations_service.clone())
+            .with_workspace(workspace),
         ),
         delivery_service: Arc::new(
             DeliveryService::new(development_repo, project_repo, Arc::new(GhCliDeliveryProvider))

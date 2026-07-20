@@ -93,3 +93,26 @@ pub struct AssignDevelopmentRoleInput {
 pub struct TransitionDevelopmentTaskInput {
     pub status: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendRequirementRevisionInput {
+    pub content: String,
+    pub change_summary: String,
+    pub acceptance_criteria: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendPlanRevisionInput {
+    pub summary: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionEvidenceInput {
+    pub criterion_id: String,
+    pub evidence_type: String,
+    pub artifact_id: Option<String>,
+    pub reference: String,
+    pub accepted: bool,
+    pub reviewer_id: Option<String>,
+}

@@ -3,8 +3,9 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::{
-    DevelopmentCiCheckRow, DevelopmentDeliveryRow, DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow,
-    QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
+    AcceptanceCriterionRow, CompletionEvidenceRow, DevelopmentCiCheckRow, DevelopmentDeliveryRow,
+    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, PlanRevisionRow, QualityGateRunRow,
+    RequirementVersionRow, ReviewFindingRow, SingleRunWorkspaceRow, TaskArtifactRow, TaskCriterionRow,
 };
 use crate::repository::development::IDevelopmentRepository;
 
@@ -415,5 +416,210 @@ impl IDevelopmentRepository for SqliteDevelopmentRepository {
         .bind(delivery_id)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    async fn append_requirement_version(
+        &self,
+        row: &RequirementVersionRow,
+        criteria: &[AcceptanceCriterionRow],
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO development_requirement_versions \
+             (id, run_id, version, content, change_summary, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.run_id)
+        .bind(row.version)
+        .bind(&row.content)
+        .bind(&row.change_summary)
+        .bind(&row.created_by)
+        .bind(row.created_at)
+        .execute(&mut *tx)
+        .await?;
+        for criterion in criteria {
+            sqlx::query(
+                "INSERT INTO development_acceptance_criteria \
+                 (id, run_id, requirement_version_id, ordinal, statement, required, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&criterion.id)
+            .bind(&criterion.run_id)
+            .bind(&criterion.requirement_version_id)
+            .bind(criterion.ordinal)
+            .bind(&criterion.statement)
+            .bind(criterion.required)
+            .bind(criterion.created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_requirement_versions(&self, run_id: &str) -> Result<Vec<RequirementVersionRow>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT * FROM development_requirement_versions WHERE run_id = ? ORDER BY version ASC")
+                .bind(run_id)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn list_active_criteria(&self, run_id: &str) -> Result<Vec<AcceptanceCriterionRow>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT c.* FROM development_acceptance_criteria c \
+             JOIN development_requirement_versions v ON v.id = c.requirement_version_id \
+             WHERE c.run_id = ? AND v.version = (SELECT MAX(version) FROM development_requirement_versions WHERE run_id = ?) \
+             ORDER BY c.ordinal ASC",
+        )
+        .bind(run_id)
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn append_plan_revision(&self, row: &PlanRevisionRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO development_plan_revisions \
+             (id, run_id, revision, summary, content, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.run_id)
+        .bind(row.revision)
+        .bind(&row.summary)
+        .bind(&row.content)
+        .bind(&row.created_by)
+        .bind(row.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_plan_revisions(&self, run_id: &str) -> Result<Vec<PlanRevisionRow>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT * FROM development_plan_revisions WHERE run_id = ? ORDER BY revision ASC")
+                .bind(run_id)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn map_task_criteria(&self, rows: &[TaskCriterionRow]) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        for row in rows {
+            sqlx::query(
+                "INSERT INTO development_task_criteria (run_id, task_id, criterion_id, mapped_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&row.run_id)
+            .bind(&row.task_id)
+            .bind(&row.criterion_id)
+            .bind(row.mapped_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_task_criteria(&self, run_id: &str) -> Result<Vec<TaskCriterionRow>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT run_id, task_id, criterion_id, mapped_at FROM development_task_criteria \
+             WHERE run_id = ? ORDER BY mapped_at ASC, task_id ASC, criterion_id ASC",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn create_completion_evidence(&self, row: &CompletionEvidenceRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO development_completion_evidence \
+             (id, run_id, task_id, criterion_id, evidence_type, artifact_id, reference, accepted, reviewer_id, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.run_id)
+        .bind(&row.task_id)
+        .bind(&row.criterion_id)
+        .bind(&row.evidence_type)
+        .bind(&row.artifact_id)
+        .bind(&row.reference)
+        .bind(row.accepted)
+        .bind(&row.reviewer_id)
+        .bind(row.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_completion_evidence(&self, run_id: &str) -> Result<Vec<CompletionEvidenceRow>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM development_completion_evidence WHERE run_id = ? ORDER BY created_at ASC, id ASC",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn create_single_run_workspace(&self, row: &SingleRunWorkspaceRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO development_single_run_workspaces \
+             (run_id, user_id, project_id, baseline_commit, initial_diff_checksum, initial_diff_path, \
+              workspace_lease_id, workspace_path, branch, candidate_commit, safe_point, cleanup_status, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.run_id)
+        .bind(&row.user_id)
+        .bind(&row.project_id)
+        .bind(&row.baseline_commit)
+        .bind(&row.initial_diff_checksum)
+        .bind(&row.initial_diff_path)
+        .bind(&row.workspace_lease_id)
+        .bind(&row.workspace_path)
+        .bind(&row.branch)
+        .bind(&row.candidate_commit)
+        .bind(&row.safe_point)
+        .bind(&row.cleanup_status)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_single_run_workspace(
+        &self,
+        run_id: &str,
+        user_id: &str,
+    ) -> Result<Option<SingleRunWorkspaceRow>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT * FROM development_single_run_workspaces WHERE run_id = ? AND user_id = ?")
+                .bind(run_id)
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn update_single_run_workspace(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        candidate_commit: Option<&str>,
+        cleanup_status: &str,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE development_single_run_workspaces SET candidate_commit = COALESCE(?, candidate_commit), \
+             cleanup_status = ?, updated_at = ? WHERE run_id = ? AND user_id = ?",
+        )
+        .bind(candidate_commit)
+        .bind(cleanup_status)
+        .bind(now_ms())
+        .bind(run_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 }

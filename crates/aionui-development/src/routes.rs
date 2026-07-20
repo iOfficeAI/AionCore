@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)] // HTTP boundary maps crate-owned errors to the shared API response.
+
 use std::sync::Arc;
 
 use aionui_api_types::ApiResponse;
@@ -17,8 +19,9 @@ use crate::operations::{
 };
 use crate::service::{CompletionEvaluation, DevelopmentService};
 use crate::types::{
-    AssignDevelopmentRoleInput, CreateArtifactInput, CreateDevelopmentRunInput, CreateDevelopmentTaskInput,
-    ExecuteQualityGateInput, ResolveFindingInput, SubmitReviewInput, TransitionDevelopmentTaskInput,
+    AppendPlanRevisionInput, AppendRequirementRevisionInput, AssignDevelopmentRoleInput, CompletionEvidenceInput,
+    CreateArtifactInput, CreateDevelopmentRunInput, CreateDevelopmentTaskInput, ExecuteQualityGateInput,
+    ResolveFindingInput, SubmitReviewInput, TransitionDevelopmentTaskInput,
 };
 
 impl From<DevelopmentError> for ApiError {
@@ -74,6 +77,24 @@ pub fn development_routes(state: DevelopmentRouterState) -> Router {
     Router::new()
         .route("/api/development-runs", post(create_run).get(list_runs))
         .route("/api/development-runs/{run_id}", get(get_run))
+        .route(
+            "/api/development-runs/{run_id}/requirements",
+            get(get_requirements).post(append_requirement_revision),
+        )
+        .route("/api/development-runs/{run_id}/plans", post(append_plan_revision))
+        .route(
+            "/api/development-runs/{run_id}/completion-evidence/{task_id}",
+            post(record_completion_evidence),
+        )
+        .route("/api/development-runs/{run_id}/completion", post(complete_run))
+        .route(
+            "/api/development-runs/{run_id}/workspace",
+            get(get_single_workspace).post(prepare_single_workspace),
+        )
+        .route(
+            "/api/development-runs/{run_id}/workspace/cancel",
+            post(cancel_single_workspace),
+        )
         .route(
             "/api/development-runs/{run_id}/roles",
             post(assign_role).get(list_roles),
@@ -400,6 +421,126 @@ async fn get_run(
 ) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentRunRow>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         state.service.get_run(&user.id, &run_id).await.map_err(ApiError::from)?,
+    )))
+}
+
+async fn get_requirements(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ApiResponse<aionui_api_types::RequirementsSnapshot>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .requirements_snapshot(&user.id, &run_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn append_requirement_revision(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+    body: Result<Json<AppendRequirementRevisionInput>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<aionui_api_types::RequirementVersion>>), ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    let row = state
+        .service
+        .append_requirement_revision(
+            &user.id,
+            &run_id,
+            &input.content,
+            &input.change_summary,
+            input.acceptance_criteria,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(row))))
+}
+
+async fn append_plan_revision(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+    body: Result<Json<AppendPlanRevisionInput>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<aionui_api_types::PlanRevision>>), ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    let row = state
+        .service
+        .append_plan_revision(&user.id, &run_id, input)
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(row))))
+}
+
+async fn record_completion_evidence(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((run_id, task_id)): Path<(String, String)>,
+    body: Result<Json<CompletionEvidenceInput>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<aionui_db::models::CompletionEvidenceRow>>), ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    let row = state
+        .service
+        .record_completion_evidence(&user.id, &run_id, &task_id, input)
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(row))))
+}
+
+async fn complete_run(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentRunRow>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .complete_run(&user.id, &run_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn get_single_workspace(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ApiResponse<Option<aionui_api_types::SingleRunWorkspace>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_single_workspace(&user.id, &run_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn prepare_single_workspace(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+) -> Result<(StatusCode, Json<ApiResponse<aionui_api_types::SingleRunWorkspace>>), ApiError> {
+    let row = state
+        .service
+        .prepare_single_workspace(&user.id, &run_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(row))))
+}
+
+async fn cancel_single_workspace(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ApiResponse<aionui_api_types::SingleRunWorkspace>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .cancel_single_workspace(&user.id, &run_id)
+            .await
+            .map_err(ApiError::from)?,
     )))
 }
 

@@ -17,14 +17,15 @@ pub use database::{
 };
 pub use error::DbError;
 pub use models::{
-    AgentMetadataRow, AgentWorkspaceLeaseRow, ApprovalRequestRow, AssistantDefinitionRow, AssistantOverlayRow,
-    AssistantOverrideRow, AssistantPreferenceRow, AssistantRow, ConversationArtifactRow,
-    ConversationAssistantSnapshotRow, CreateAssistantParams, DevelopmentAlertRow, DevelopmentAuditEventRow,
-    DevelopmentPolicyRow, DevelopmentRecoveryRecordRow, DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow,
-    DevelopmentUsageEventRow, DevelopmentUsageSummary, ProjectCommandProfileRow, ProjectKnowledgeContextRow,
-    ProjectKnowledgeFactRow, ProjectKnowledgeIndexRow, ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow,
-    ProjectRuntimeProfileRow, QualityGateRunRow, ReviewFindingRow, SkillImportRecordRow, SkillRow, TaskArtifactRow,
-    UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
+    AcceptanceCriterionRow, AgentMetadataRow, AgentWorkspaceLeaseRow, ApprovalRequestRow, AssistantDefinitionRow,
+    AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow, CompletionEvidenceRow,
+    ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams, DevelopmentAlertRow,
+    DevelopmentAuditEventRow, DevelopmentPolicyRow, DevelopmentRecoveryRecordRow, DevelopmentRunRoleRow,
+    DevelopmentRunRow, DevelopmentTaskRow, DevelopmentUsageEventRow, DevelopmentUsageSummary, PlanRevisionRow,
+    ProjectCommandProfileRow, ProjectKnowledgeContextRow, ProjectKnowledgeFactRow, ProjectKnowledgeIndexRow,
+    ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow, QualityGateRunRow,
+    RequirementVersionRow, ReviewFindingRow, SingleRunWorkspaceRow, SkillImportRecordRow, SkillRow, TaskArtifactRow,
+    TaskCriterionRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
     UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams,
 };

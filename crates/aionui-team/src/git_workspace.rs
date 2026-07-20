@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use crate::TeamError;
 
 pub const INTEGRATION_SLOT_ID: &str = "__integration__";
+pub const SINGLE_RUN_SLOT_ID: &str = "__single_agent__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceAgentSpec {
@@ -112,6 +113,64 @@ impl GitTeamWorkspaceManager {
 
     fn team_root(&self, team_id: &str) -> PathBuf {
         self.managed_root.join(safe_component(team_id, 40, "team"))
+    }
+
+    pub async fn prepare_single_run(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        repository_path: &str,
+        baseline_commit: &str,
+    ) -> Result<AgentWorkspaceLeaseRow, TeamError> {
+        let requested = Path::new(repository_path);
+        let root = PathBuf::from(git_output(requested, &["rev-parse", "--show-toplevel"]).await?)
+            .canonicalize()
+            .map_err(|error| workspace_error(format!("failed to canonicalize repository: {error}")))?;
+        let resolved_baseline = git_output(&root, &["rev-parse", baseline_commit]).await?;
+        if resolved_baseline != baseline_commit {
+            return Err(workspace_error(
+                "single-run baseline commit could not be verified".into(),
+            ));
+        }
+        let namespace = format!("run:{run_id}");
+        let branch = format!("aion/run/{}/agent", safe_component(run_id, 32, "run"));
+        let path = self.team_root(&namespace).join("agent");
+        let row = self.lease_row(
+            user_id,
+            &namespace,
+            SINGLE_RUN_SLOT_ID,
+            &root.to_string_lossy(),
+            &path,
+            branch,
+            baseline_commit,
+        );
+        self.create_worktree(row).await
+    }
+
+    pub async fn restore_single_run(&self, lease_id: &str, safe_point: &str) -> Result<String, TeamError> {
+        let lease = self
+            .leases
+            .get(lease_id)
+            .await?
+            .ok_or_else(|| workspace_error(format!("workspace lease not found: {lease_id}")))?;
+        if lease.slot_id != SINGLE_RUN_SLOT_ID || lease.base_commit != safe_point {
+            return Err(workspace_error(
+                "single-run safe point does not match the managed lease".into(),
+            ));
+        }
+        let worktree = Path::new(&lease.worktree_path);
+        git_output(worktree, &["reset", "--hard", safe_point]).await?;
+        git_output(worktree, &["clean", "-fd"]).await?;
+        let result = self.release_slot(&lease.team_id, SINGLE_RUN_SLOT_ID).await?;
+        Ok(match result.disposition {
+            WorkspaceCleanupDisposition::Removed | WorkspaceCleanupDisposition::AlreadyReleased => {
+                "restored_and_released"
+            }
+            WorkspaceCleanupDisposition::BranchRetained => "restored_branch_retained",
+            WorkspaceCleanupDisposition::DirtyPreserved => "restore_dirty_preserved",
+            WorkspaceCleanupDisposition::MissingPreserved => "restore_missing_preserved",
+        }
+        .into())
     }
 
     async fn inspect_repository(&self, repository_path: &str) -> Result<(String, String), TeamError> {

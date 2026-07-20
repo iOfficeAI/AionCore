@@ -6,8 +6,9 @@ use std::time::Instant;
 
 use aionui_common::now_ms;
 use aionui_db::models::{
-    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, DevelopmentUsageEventRow, ProjectCommandProfileRow,
-    QualityGateRunRow, ReviewFindingRow, TaskArtifactRow,
+    AcceptanceCriterionRow, CompletionEvidenceRow, DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow,
+    DevelopmentUsageEventRow, PlanRevisionRow, ProjectCommandProfileRow, QualityGateRunRow, RequirementVersionRow,
+    ReviewFindingRow, SingleRunWorkspaceRow, TaskArtifactRow, TaskCriterionRow,
 };
 use aionui_db::{IAgentWorkspaceLeaseRepository, IDevelopmentRepository, IProjectRepository};
 use serde::{Deserialize, Serialize};
@@ -17,9 +18,12 @@ use tokio::io::AsyncReadExt;
 use crate::error::DevelopmentError;
 use crate::executor::{CommandExecutionInput, execute_command};
 use crate::operations::{DevelopmentOperationsService, default_policy};
+use crate::requirements::build_snapshot;
 use crate::types::{
-    CreateArtifactInput, CreateDevelopmentRunInput, CreateDevelopmentTaskInput, ReviewFindingInput, SubmitReviewInput,
+    AppendPlanRevisionInput, CompletionEvidenceInput, CreateArtifactInput, CreateDevelopmentRunInput,
+    CreateDevelopmentTaskInput, ReviewFindingInput, SubmitReviewInput,
 };
+use crate::workspace::{DevelopmentWorkspacePort, PrepareDevelopmentWorkspace};
 
 const MAX_GATE_OUTPUT_BYTES: usize = 1024 * 1024;
 
@@ -36,6 +40,7 @@ pub struct DevelopmentService {
     lease_repo: Arc<dyn IAgentWorkspaceLeaseRepository>,
     artifact_root: PathBuf,
     operations: Option<Arc<DevelopmentOperationsService>>,
+    workspace: Option<Arc<dyn DevelopmentWorkspacePort>>,
 }
 
 impl DevelopmentService {
@@ -51,11 +56,17 @@ impl DevelopmentService {
             lease_repo,
             artifact_root,
             operations: None,
+            workspace: None,
         }
     }
 
     pub fn with_operations(mut self, operations: Arc<DevelopmentOperationsService>) -> Self {
         self.operations = Some(operations);
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: Arc<dyn DevelopmentWorkspacePort>) -> Self {
+        self.workspace = Some(workspace);
         self
     }
 
@@ -108,6 +119,8 @@ impl DevelopmentService {
             updated_at: now,
         };
         self.development_repo.create_run(&row).await?;
+        self.append_requirement_version(user_id, &row.id, &row.request_summary, None, &criteria)
+            .await?;
         if let Some(operations) = &self.operations {
             operations
                 .audit(
@@ -142,6 +155,210 @@ impl DevelopmentService {
         project_id: Option<&str>,
     ) -> Result<Vec<DevelopmentRunRow>, DevelopmentError> {
         Ok(self.development_repo.list_runs(user_id, project_id).await?)
+    }
+
+    async fn append_requirement_version(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        content: &str,
+        change_summary: Option<String>,
+        criteria: &[String],
+    ) -> Result<RequirementVersionRow, DevelopmentError> {
+        let versions = self.development_repo.list_requirement_versions(run_id).await?;
+        let now = now_ms();
+        let row = RequirementVersionRow {
+            id: uuid::Uuid::now_v7().to_string(),
+            run_id: run_id.into(),
+            version: versions.last().map_or(1, |version| version.version + 1),
+            content: required_text(content.into(), "requirement content")?,
+            change_summary: change_summary.and_then(clean_optional),
+            created_by: user_id.into(),
+            created_at: now,
+        };
+        let criteria = criteria
+            .iter()
+            .enumerate()
+            .map(|(ordinal, statement)| AcceptanceCriterionRow {
+                id: uuid::Uuid::now_v7().to_string(),
+                run_id: run_id.into(),
+                requirement_version_id: row.id.clone(),
+                ordinal: ordinal as i64,
+                statement: statement.clone(),
+                required: true,
+                created_at: now,
+            })
+            .collect::<Vec<_>>();
+        self.development_repo
+            .append_requirement_version(&row, &criteria)
+            .await?;
+        Ok(row)
+    }
+
+    pub async fn append_requirement_revision(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        content: &str,
+        change_summary: &str,
+        criteria: Vec<String>,
+    ) -> Result<aionui_api_types::RequirementVersion, DevelopmentError> {
+        let run = self.get_run(user_id, run_id).await?;
+        if matches!(run.status.as_str(), "succeeded" | "failed" | "cancelled") {
+            return Err(DevelopmentError::Conflict(
+                "terminal run requirements cannot be revised".into(),
+            ));
+        }
+        let criteria = clean_criteria(criteria)?;
+        let summary = required_text(change_summary.into(), "change_summary")?;
+        let row = self
+            .append_requirement_version(user_id, run_id, content, Some(summary), &criteria)
+            .await?;
+        Ok(aionui_api_types::RequirementVersion {
+            id: row.id,
+            version: row.version,
+            content: row.content,
+            change_summary: row.change_summary,
+            created_at: row.created_at,
+        })
+    }
+
+    pub async fn append_plan_revision(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        input: AppendPlanRevisionInput,
+    ) -> Result<aionui_api_types::PlanRevision, DevelopmentError> {
+        let run = self.get_run(user_id, run_id).await?;
+        if matches!(run.status.as_str(), "succeeded" | "failed" | "cancelled") {
+            return Err(DevelopmentError::Conflict(
+                "terminal run plans cannot be revised".into(),
+            ));
+        }
+        let existing = self.development_repo.list_plan_revisions(run_id).await?;
+        let row = PlanRevisionRow {
+            id: uuid::Uuid::now_v7().to_string(),
+            run_id: run_id.into(),
+            revision: existing.last().map_or(1, |revision| revision.revision + 1),
+            summary: required_text(input.summary, "plan summary")?,
+            content: required_text(input.content, "plan content")?,
+            created_by: user_id.into(),
+            created_at: now_ms(),
+        };
+        self.development_repo.append_plan_revision(&row).await?;
+        Ok(aionui_api_types::PlanRevision {
+            id: row.id,
+            revision: row.revision,
+            summary: row.summary,
+            content: row.content,
+            created_at: row.created_at,
+        })
+    }
+
+    pub async fn requirements_snapshot(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<aionui_api_types::RequirementsSnapshot, DevelopmentError> {
+        self.get_run(user_id, run_id).await?;
+        Ok(build_snapshot(
+            run_id,
+            self.development_repo.list_requirement_versions(run_id).await?,
+            self.development_repo.list_active_criteria(run_id).await?,
+            self.development_repo.list_plan_revisions(run_id).await?,
+            self.development_repo.list_task_criteria(run_id).await?,
+            self.development_repo.list_completion_evidence(run_id).await?,
+        ))
+    }
+
+    pub async fn record_completion_evidence(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        task_id: &str,
+        input: CompletionEvidenceInput,
+    ) -> Result<CompletionEvidenceRow, DevelopmentError> {
+        self.get_run(user_id, run_id).await?;
+        if !matches!(input.evidence_type.as_str(), "code" | "test" | "no_change") {
+            return Err(DevelopmentError::BadRequest(
+                "evidence_type must be code, test, or no_change".into(),
+            ));
+        }
+        let task = self
+            .development_repo
+            .get_task(run_id, task_id)
+            .await?
+            .ok_or_else(|| DevelopmentError::NotFound(format!("task {task_id}")))?;
+        let mappings = self.development_repo.list_task_criteria(run_id).await?;
+        if !mappings
+            .iter()
+            .any(|mapping| mapping.task_id == task.id && mapping.criterion_id == input.criterion_id)
+        {
+            return Err(DevelopmentError::BadRequest(
+                "completion evidence must reference a criterion owned by this task".into(),
+            ));
+        }
+        if let Some(artifact_id) = input.artifact_id.as_deref()
+            && !self
+                .development_repo
+                .list_artifacts(run_id, Some(task_id))
+                .await?
+                .iter()
+                .any(|artifact| artifact.id == artifact_id)
+        {
+            return Err(DevelopmentError::BadRequest(
+                "evidence artifact is not owned by this task".into(),
+            ));
+        }
+        let row = CompletionEvidenceRow {
+            id: uuid::Uuid::now_v7().to_string(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            criterion_id: input.criterion_id,
+            evidence_type: input.evidence_type,
+            artifact_id: input.artifact_id,
+            reference: required_text(input.reference, "evidence reference")?,
+            accepted: input.accepted,
+            reviewer_id: input.reviewer_id.and_then(clean_optional),
+            created_at: now_ms(),
+        };
+        if row.accepted && row.reviewer_id.is_none() {
+            return Err(DevelopmentError::BadRequest(
+                "accepted evidence requires reviewer_id".into(),
+            ));
+        }
+        self.development_repo.create_completion_evidence(&row).await?;
+        Ok(row)
+    }
+
+    pub async fn complete_run(&self, user_id: &str, run_id: &str) -> Result<DevelopmentRunRow, DevelopmentError> {
+        let snapshot = self.requirements_snapshot(user_id, run_id).await?;
+        let missing: Vec<_> = snapshot
+            .coverage
+            .iter()
+            .filter(|item| !item.accepted || item.task_ids.is_empty())
+            .map(|item| item.statement.clone())
+            .collect();
+        if !missing.is_empty() {
+            return Err(DevelopmentError::Conflict(format!(
+                "required acceptance evidence is missing: {}",
+                missing.join(", ")
+            )));
+        }
+        let gates = self.development_repo.list_gates(run_id, None).await?;
+        let mut required = HashMap::new();
+        for gate in gates.iter().filter(|gate| gate.required) {
+            required.insert((gate.task_id.as_deref(), gate.gate_type.as_str()), gate);
+        }
+        if required.values().any(|gate| gate.status != "passed") {
+            return Err(DevelopmentError::Conflict(
+                "one or more required quality gates have not passed".into(),
+            ));
+        }
+        self.development_repo
+            .update_run_status(run_id, user_id, "succeeded", Some(now_ms()))
+            .await?;
+        self.get_run(user_id, run_id).await
     }
 
     pub async fn assign_role(
@@ -188,6 +405,21 @@ impl DevelopmentService {
         let run = self.get_run(user_id, run_id).await?;
         let subject = required_text(input.subject, "subject")?;
         let criteria = clean_criteria(input.acceptance_criteria)?;
+        let owned_criteria = self.development_repo.list_active_criteria(run_id).await?;
+        let mapped_criteria: Vec<_> = criteria
+            .iter()
+            .filter_map(|statement| {
+                owned_criteria
+                    .iter()
+                    .find(|criterion| criterion.statement == *statement)
+            })
+            .cloned()
+            .collect();
+        if mapped_criteria.len() != criteria.len() || mapped_criteria.is_empty() {
+            return Err(DevelopmentError::BadRequest(
+                "every task acceptance criterion must belong to the active run requirement version".into(),
+            ));
+        }
         if !matches!(input.risk_level.as_str(), "low" | "medium" | "high" | "critical") {
             return Err(DevelopmentError::BadRequest("unsupported risk_level".into()));
         }
@@ -231,6 +463,19 @@ impl DevelopmentService {
             updated_at: now,
         };
         self.development_repo.create_task(&row).await?;
+        self.development_repo
+            .map_task_criteria(
+                &mapped_criteria
+                    .into_iter()
+                    .map(|criterion| TaskCriterionRow {
+                        run_id: run_id.into(),
+                        task_id: row.id.clone(),
+                        criterion_id: criterion.id,
+                        mapped_at: now,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
         Ok(row)
     }
 
@@ -819,6 +1064,125 @@ impl DevelopmentService {
         Ok(())
     }
 
+    pub async fn prepare_single_workspace(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<aionui_api_types::SingleRunWorkspace, DevelopmentError> {
+        let run = self.get_run(user_id, run_id).await?;
+        if run.execution_mode != "single" {
+            return Err(DevelopmentError::BadRequest(
+                "only single-Agent runs use a single workspace".into(),
+            ));
+        }
+        if let Some(existing) = self.development_repo.get_single_run_workspace(run_id, user_id).await? {
+            return Ok(single_workspace_dto(existing));
+        }
+        let project = self
+            .project_repo
+            .get_for_user(&run.project_id, user_id)
+            .await?
+            .ok_or_else(|| DevelopmentError::NotFound(format!("project {}", run.project_id)))?;
+        let repository = git2::Repository::discover(&project.local_path)
+            .map_err(|error| DevelopmentError::BadRequest(format!("project repository is unavailable: {error}")))?;
+        let baseline_commit = repository
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| oid.to_string())
+            .ok_or_else(|| DevelopmentError::BadRequest("project repository has no baseline commit".into()))?;
+        let snapshot = initial_user_diff(&repository)?;
+        let checksum = format!("sha256:{:x}", Sha256::digest(&snapshot));
+        let directory = self.artifact_root.join(run_id).join("workspace");
+        tokio::fs::create_dir_all(&directory).await?;
+        let snapshot_path = directory.join("initial-user.diff");
+        tokio::fs::write(&snapshot_path, &snapshot).await?;
+        let workspace = self
+            .workspace
+            .as_ref()
+            .ok_or_else(|| DevelopmentError::Conflict("development workspace provider is unavailable".into()))?
+            .prepare(PrepareDevelopmentWorkspace {
+                user_id: user_id.into(),
+                run_id: run_id.into(),
+                repository_path: repository
+                    .workdir()
+                    .unwrap_or_else(|| Path::new(&project.local_path))
+                    .to_string_lossy()
+                    .into_owned(),
+                baseline_commit: baseline_commit.clone(),
+            })
+            .await
+            .map_err(DevelopmentError::Conflict)?;
+        let now = now_ms();
+        let row = SingleRunWorkspaceRow {
+            run_id: run_id.into(),
+            user_id: user_id.into(),
+            project_id: run.project_id,
+            baseline_commit,
+            initial_diff_checksum: checksum,
+            initial_diff_path: snapshot_path.to_string_lossy().into_owned(),
+            workspace_lease_id: Some(workspace.lease_id),
+            workspace_path: Some(workspace.workspace_path),
+            branch: Some(workspace.branch),
+            candidate_commit: None,
+            safe_point: workspace.safe_point,
+            cleanup_status: "active".into(),
+            created_at: now,
+            updated_at: now,
+        };
+        self.development_repo.create_single_run_workspace(&row).await?;
+        Ok(single_workspace_dto(row))
+    }
+
+    pub async fn get_single_workspace(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<aionui_api_types::SingleRunWorkspace>, DevelopmentError> {
+        self.get_run(user_id, run_id).await?;
+        Ok(self
+            .development_repo
+            .get_single_run_workspace(run_id, user_id)
+            .await?
+            .map(single_workspace_dto))
+    }
+
+    pub async fn cancel_single_workspace(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<aionui_api_types::SingleRunWorkspace, DevelopmentError> {
+        self.get_run(user_id, run_id).await?;
+        let row = self
+            .development_repo
+            .get_single_run_workspace(run_id, user_id)
+            .await?
+            .ok_or_else(|| DevelopmentError::NotFound(format!("single workspace for run {run_id}")))?;
+        let lease_id = row
+            .workspace_lease_id
+            .as_deref()
+            .ok_or_else(|| DevelopmentError::Conflict("single workspace has no active lease".into()))?;
+        let cleanup = self
+            .workspace
+            .as_ref()
+            .ok_or_else(|| DevelopmentError::Conflict("development workspace provider is unavailable".into()))?
+            .restore(lease_id, &row.safe_point)
+            .await
+            .map_err(DevelopmentError::Conflict)?;
+        self.development_repo
+            .update_single_run_workspace(run_id, user_id, None, &cleanup)
+            .await?;
+        self.development_repo
+            .update_run_status(run_id, user_id, "cancelled", Some(now_ms()))
+            .await?;
+        let updated = self
+            .development_repo
+            .get_single_run_workspace(run_id, user_id)
+            .await?
+            .ok_or_else(|| DevelopmentError::NotFound(format!("single workspace for run {run_id}")))?;
+        Ok(single_workspace_dto(updated))
+    }
+
     async fn validate_lease(
         &self,
         user_id: &str,
@@ -830,7 +1194,8 @@ impl DevelopmentService {
             .get(lease_id)
             .await?
             .ok_or_else(|| DevelopmentError::NotFound(format!("workspace lease {lease_id}")))?;
-        if lease.user_id != user_id || run.team_id.as_deref() != Some(lease.team_id.as_str()) {
+        let expected_namespace = run.team_id.clone().unwrap_or_else(|| format!("run:{}", run.id));
+        if lease.user_id != user_id || lease.team_id != expected_namespace {
             return Err(DevelopmentError::NotFound(format!("workspace lease {lease_id}")));
         }
         if lease.lease_status != "active" {
@@ -934,6 +1299,45 @@ fn valid_task_transition(current: &str, target: &str) -> bool {
             | ("rework", "in_progress")
             | ("rework", "cancelled")
     )
+}
+
+fn single_workspace_dto(row: SingleRunWorkspaceRow) -> aionui_api_types::SingleRunWorkspace {
+    aionui_api_types::SingleRunWorkspace {
+        run_id: row.run_id,
+        baseline_commit: row.baseline_commit,
+        initial_diff_checksum: row.initial_diff_checksum,
+        initial_diff_path: row.initial_diff_path,
+        workspace_lease_id: row.workspace_lease_id,
+        workspace_path: row.workspace_path,
+        branch: row.branch,
+        candidate_commit: row.candidate_commit,
+        safe_point: row.safe_point,
+        cleanup_status: row.cleanup_status,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
+}
+
+fn initial_user_diff(repository: &git2::Repository) -> Result<Vec<u8>, DevelopmentError> {
+    let head = repository
+        .head()
+        .and_then(|head| head.peel_to_tree())
+        .map_err(|error| DevelopmentError::BadRequest(format!("cannot read baseline tree: {error}")))?;
+    let mut options = git2::DiffOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true);
+    let diff = repository
+        .diff_tree_to_workdir_with_index(Some(&head), Some(&mut options))
+        .map_err(|error| DevelopmentError::Internal(format!("cannot capture initial diff: {error}")))?;
+    let mut bytes = Vec::new();
+    diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+        bytes.extend_from_slice(line.content());
+        true
+    })
+    .map_err(|error| DevelopmentError::Internal(format!("cannot serialize initial diff: {error}")))?;
+    Ok(bytes)
 }
 
 fn command_for_gate<'a>(profile: &'a ProjectCommandProfileRow, gate_type: &str) -> Option<&'a str> {

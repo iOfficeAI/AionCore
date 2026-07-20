@@ -229,3 +229,29 @@ async fn owned_path_validation_rejects_traversal_and_sibling_worktree() {
         );
     }
 }
+
+#[tokio::test]
+async fn single_run_isolates_from_dirty_source_and_restores_managed_safe_point() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = initialized_repo(temp.path());
+    let baseline = git(&source, &["rev-parse", "HEAD"]);
+    fs::write(source.join("README.md"), "user change\n").unwrap();
+    fs::write(source.join("private-draft.txt"), "keep in source\n").unwrap();
+    let (manager, _db) = manager(temp.path()).await;
+
+    let lease = manager
+        .prepare_single_run("user-1", "run-123", source.to_str().unwrap(), &baseline)
+        .await
+        .unwrap();
+    let worktree = Path::new(&lease.worktree_path);
+    assert_eq!(fs::read_to_string(worktree.join("README.md")).unwrap(), "baseline\n");
+    assert_eq!(fs::read_to_string(source.join("README.md")).unwrap(), "user change\n");
+    assert!(source.join("private-draft.txt").exists());
+
+    fs::write(worktree.join("agent-change.txt"), "temporary\n").unwrap();
+    let cleanup = manager.restore_single_run(&lease.id, &baseline).await.unwrap();
+    assert_eq!(cleanup, "restored_and_released");
+    assert!(!worktree.exists());
+    assert_eq!(fs::read_to_string(source.join("README.md")).unwrap(), "user change\n");
+    assert!(source.join("private-draft.txt").exists());
+}

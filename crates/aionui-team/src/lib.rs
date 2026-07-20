@@ -31,8 +31,8 @@ pub use crash_detection::{CrashReason, detect_crash, is_rate_limited};
 pub use error::TeamError;
 pub use events::TeamEventEmitter;
 pub use git_workspace::{
-    GitTeamWorkspaceManager, INTEGRATION_SLOT_ID, PreparedTeamWorkspaces, TeamWorkspaceManager, WorkspaceAgentSpec,
-    WorkspaceCleanupDisposition, WorkspaceCleanupResult,
+    GitTeamWorkspaceManager, INTEGRATION_SLOT_ID, PreparedTeamWorkspaces, SINGLE_RUN_SLOT_ID, TeamWorkspaceManager,
+    WorkspaceAgentSpec, WorkspaceCleanupDisposition, WorkspaceCleanupResult,
 };
 pub use mailbox::Mailbox;
 pub use mcp::{TEAM_MCP_SERVER_NAME, TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
