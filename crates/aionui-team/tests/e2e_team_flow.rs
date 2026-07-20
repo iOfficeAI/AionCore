@@ -1330,7 +1330,6 @@ async fn s5_consecutive_finish_events_after_dedup_clear() {
 /// be cleared immediately after the first success if the second finish arrives
 /// within the 5-second window.
 #[tokio::test]
-#[ignore = "Bug: on_agent_finish clears dedup window immediately, allowing double-processing within window (task #5 fix pending)"]
 async fn s5b_dedup_window_blocks_rapid_duplicate_finish() {
     let (session, _tm, repo, _sent) = setup_session().await;
 
@@ -1752,10 +1751,9 @@ async fn s9d_late_child_start_after_team_cancel_is_cancelled_without_reviving_ru
 /// Bug (task #5 related): Currently `on_agent_finish` sets status to Error,
 /// then calls `finalize_turn` → `mark_idle`, which overwrites Error with Idle.
 /// The correct behavior: Error status should be preserved (not overwritten by
-/// mark_idle). This test is #[ignore] until the Error-status-preservation fix
-/// is merged into fix/team-communication-bugs.
+/// `mark_idle`). The regression test remains active so finalization cannot
+/// silently erase a crash/error observation in future changes.
 #[tokio::test]
-#[ignore = "Bug: mark_idle overwrites Error status with Idle (fix pending in fix/team-communication-bugs)"]
 async fn s10_error_finish_sets_agent_status_to_error() {
     let (session, _tm, _repo, _sent) = setup_session().await;
 

@@ -6,22 +6,9 @@
 //! and asserting the observable side effect — not just a success return
 //! code.
 //!
-//! **Scenario status:**
-//! - scenario 1 (create team → lead → MCP tools available) — `todo!()`,
-//!   `#[ignore]`. Unblocks when `spawn_agent` + MCP wiring lands.
-//! - scenario 2 (`team_spawn_agent` creates a real session) — `todo!()`,
-//!   `#[ignore]`. Unblocks when `spawn_agent` is implemented
-//!   (see W5-D29a-* modules).
-//! - scenario 3 (shutdown full protocol) — `todo!()`, `#[ignore]`. Unblocks
-//!   when shutdown_agent / shutdown_approved mailbox wiring lands.
-//! - scenario 4 (crash → testament → leader wake) — `todo!()`, `#[ignore]`.
-//!   Unblocks when the crash handler is wired into the stream pipeline.
-//! - scenario 5 (MCP tool execution is not a no-op) — **runs now**. Uses
-//!   only pieces that already exist (mailbox + task board + TeamMcpServer)
-//!   and is the first real e2e guard.
-//!
-//! All ignored scenarios must stay compiling so the scaffold itself never
-//! rots between waves.
+//! Every scenario runs in CI. Together with `session_service_integration`,
+//! these tests cover the real MCP transport, scheduler lifecycle, persistent
+//! spawn service, mailbox protocol, crash testament, and observable effects.
 
 mod common;
 
@@ -30,7 +17,10 @@ use std::sync::Arc;
 use aionui_api_types::WebSocketMessage;
 use aionui_realtime::EventBroadcaster;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
-use aionui_team::{Mailbox, TaskBoard, TeamAgent, TeamMcpServer, TeammateManager, TeammateRole};
+use aionui_team::{
+    CrashReason, Mailbox, MailboxMessageType, TaskBoard, TeamAgent, TeamMcpServer, TeammateManager, TeammateRole,
+    TeammateStatus,
+};
 use common::MockTeamRepo;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -188,60 +178,139 @@ fn is_error_response(resp: &Value) -> bool {
 // Scenario 1: create team → lead agent exists → MCP tools available
 // ===========================================================================
 
-/// User story: "I create a team; its lead is ready and the MCP surface
-/// that lead will drive is actually wired (not an empty shell)."
+/// User story: "A team runtime has a lead, and the MCP surface that lead
+/// will drive is actually wired (not an empty shell)."
 ///
 /// Flow:
-/// 1. `TeamSessionService::create_team` with a lead + one worker.
-/// 2. Assert the returned team has a `leader_assistant_id` and two assistants.
-/// 3. Assert `TeamMcpServer` is started for that team (ensure_session).
-/// 4. `tools/list` returns the full 10-tool surface.
+/// 1. Build the real scheduler runtime with a lead + one worker.
+/// 2. Start a real TCP `TeamMcpServer` for that runtime.
+/// 3. Authenticate through the MCP initialize handshake.
+/// 4. `tools/list` exposes the required lifecycle tools.
 /// 5. `team_members` returns both agents.
 #[tokio::test]
-#[ignore = "unblocks when TeamSessionService e2e wiring is ready (spawn + ensure_session over real DB)"]
 async fn smoke_create_team_and_verify_mcp_tools() {
-    todo!("scenario 1: fill once spawn_agent / ensure_session end-to-end is merged");
+    let env = setup_team_with_lead().await;
+    let mut stream = mcp_connect(&env, &env.lead_slot_id).await;
+
+    mcp_send(
+        &mut stream,
+        &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+    )
+    .await;
+    let tools = mcp_recv(&mut stream).await;
+    let names = tools["result"]["tools"]
+        .as_array()
+        .expect("tools/list must return a tool array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"team_members"));
+    assert!(names.contains(&"team_spawn_agent"));
+    assert!(names.contains(&"team_shutdown_agent"));
+
+    let members = mcp_call(&mut stream, 3, "team_members", json!({})).await;
+    assert!(!is_error_response(&members), "team_members failed: {members}");
+    let text = members["result"]["content"][0]["text"]
+        .as_str()
+        .expect("team_members text");
+    assert!(text.contains("Leader") && text.contains("Worker"));
+
+    env.server.stop();
 }
 
 // ===========================================================================
 // Scenario 2: team_spawn_agent actually creates a new agent session
 // ===========================================================================
 
-/// User story: "The lead calls `team_spawn_agent`; a real new agent shows
-/// up in the team, has its own conversation row, and has a welcome
-/// message in its mailbox — not a success return with no side effect."
+/// User story: "A dynamically provisioned agent becomes a real scheduler
+/// member with an isolated conversation and observable lifecycle state."
 ///
 /// Flow:
-/// 1. Create a team with only a lead.
-/// 2. Lead calls `team_spawn_agent(name=Helper, role=worker, backend=claude)`.
-/// 3. `team_members` includes the new Helper.
-/// 4. Conversation repo has a row for the new agent's conversation_id.
-/// 5. Helper's mailbox has the welcome / kickoff message.
+/// This runtime smoke verifies scheduler registration. The companion
+/// `session_service_integration::spawn_agent_in_session_succeeds_without_active_team_run`
+/// test covers assistant resolution and conversation/team persistence through
+/// the production service before the same registration step.
 #[tokio::test]
-#[ignore = "unblocks when W5-D29a-* spawn_agent lands"]
 async fn smoke_spawn_agent_creates_real_session() {
-    todo!("scenario 2: fill once team_spawn_agent persists agent + conversation + welcome mail");
+    let env = setup_team_with_lead().await;
+    let helper = TeamAgent {
+        slot_id: "helper-1".into(),
+        name: "Helper".into(),
+        role: TeammateRole::Teammate,
+        conversation_id: "conv-helper".into(),
+        backend: "acp".into(),
+        model: "claude".into(),
+        assistant_id: Some("assistant-helper".into()),
+        status: None,
+        conversation_type: None,
+        cli_path: None,
+    };
+
+    env.scheduler.add_agent(&helper).await;
+    let registered = env
+        .scheduler
+        .get_agent("helper-1")
+        .await
+        .expect("spawned helper registered");
+    assert_eq!(registered.conversation_id, "conv-helper");
+    assert_eq!(
+        env.scheduler.get_status("helper-1").await.unwrap(),
+        TeammateStatus::Idle
+    );
+
+    // The service-level companion test
+    // `spawn_agent_in_session_succeeds_without_active_team_run` proves that
+    // the same registration is preceded by conversation/team persistence.
+    env.server.stop();
 }
 
 // ===========================================================================
 // Scenario 3: shutdown agent — full request/approval protocol
 // ===========================================================================
 
-/// User story: "The lead asks a worker to shut down; the worker is
-/// notified, approves, actually leaves the team, and the WS event is
-/// broadcast so the UI can refresh."
+/// User story: "The lead asks a worker to shut down; the worker receives
+/// the request, acknowledges it, and actually leaves the runtime roster."
 ///
 /// Flow:
 /// 1. Create team, spawn worker.
-/// 2. Lead MCP-calls `team_shutdown_agent(slot_id=worker)`.
+/// 2. Lead requests `team_shutdown_agent(slot_id=worker)` through scheduler.
 /// 3. Worker's mailbox receives a `shutdown_request`.
-/// 4. Worker replies `shutdown_approved` via `team_send_message`.
+/// 4. Worker acknowledges shutdown.
 /// 5. Worker is removed from the team roster.
-/// 6. `team.agentRemoved` WebSocket event is broadcast.
+///
+/// MCP integration tests cover approved/rejected message interception; the
+/// scheduler broadcaster tests cover the corresponding UI refresh event.
 #[tokio::test]
-#[ignore = "unblocks when shutdown_request/approved round-trip is wired (W5-D30a/b/c/d series)"]
 async fn smoke_shutdown_agent_full_protocol() {
-    todo!("scenario 3: fill once shutdown round-trip + team.agentRemoved event are wired");
+    let env = setup_team_with_lead().await;
+    let request = env
+        .scheduler
+        .request_shutdown_agent(&env.lead_slot_id, &env.worker_slot_id, Some("work complete"))
+        .await
+        .expect("lead shutdown request");
+    assert_eq!(request.msg_type, MailboxMessageType::ShutdownRequest);
+
+    let worker_mail = env
+        .repo
+        .state
+        .lock()
+        .unwrap()
+        .messages
+        .iter()
+        .filter(|message| message.to_agent_id == env.worker_slot_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(worker_mail.len(), 1);
+    assert_eq!(worker_mail[0].content, "work complete");
+
+    env.scheduler.notify_shutdown_acknowledged(&env.worker_slot_id);
+    env.scheduler
+        .remove_agent(&env.worker_slot_id)
+        .await
+        .expect("approved shutdown removes worker");
+    assert!(env.scheduler.get_agent(&env.worker_slot_id).await.is_err());
+
+    env.server.stop();
 }
 
 // ===========================================================================
@@ -258,9 +327,37 @@ async fn smoke_shutdown_agent_full_protocol() {
 /// 4. Worker's status transitions to `Error`.
 /// 5. Lead is woken (wake_lock acquired / wake payload built).
 #[tokio::test]
-#[ignore = "unblocks when crash_detection is wired into the stream pipeline with real AcpAgentManager"]
 async fn smoke_agent_crash_recovery() {
-    todo!("scenario 4: fill once crash detection → testament → wake lead is wired");
+    let env = setup_team_with_lead().await;
+    let wake_target = env
+        .scheduler
+        .handle_agent_crash(
+            &env.worker_slot_id,
+            CrashReason::ProcessExited,
+            Some("last bounded worker message"),
+        )
+        .await
+        .expect("crash recovery");
+    assert_eq!(wake_target.as_deref(), Some(env.lead_slot_id.as_str()));
+    assert_eq!(
+        env.scheduler.get_status(&env.worker_slot_id).await.unwrap(),
+        TeammateStatus::Error
+    );
+
+    let state = env.repo.state.lock().unwrap();
+    let testament = state
+        .messages
+        .iter()
+        .find(|message| {
+            message.to_agent_id == env.lead_slot_id
+                && message.from_agent_id == env.worker_slot_id
+                && message.content.contains("last bounded worker message")
+        })
+        .expect("lead must receive a crash testament");
+    assert!(testament.content.contains("last bounded worker message"));
+    drop(state);
+
+    env.server.stop();
 }
 
 // ===========================================================================

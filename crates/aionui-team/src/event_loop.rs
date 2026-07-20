@@ -10,6 +10,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::crash_detection::CrashReason;
 use crate::mailbox::Mailbox;
 use crate::ports::{
     AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnRequest, AgentTurnSource, AgentTurnStarted,
@@ -121,6 +122,21 @@ struct TurnExecution {
 
 fn is_retryable_start_skip(error: &AgentTurnExecutionError) -> bool {
     matches!(error, AgentTurnExecutionError::Skipped { reason } if reason.contains("already running"))
+}
+
+fn crash_reason_for_execution_error(error: &AgentTurnExecutionError) -> Option<CrashReason> {
+    let AgentTurnExecutionError::Failed { reason } = error else {
+        return None;
+    };
+    let normalized = reason.to_ascii_lowercase();
+    if normalized.contains("process exited") {
+        Some(CrashReason::ProcessExited)
+    } else if normalized.contains("session not found") {
+        Some(CrashReason::SessionNotFound)
+    } else {
+        // Do not copy arbitrary provider output into the crash testament.
+        Some(CrashReason::Unknown("agent turn failed".into()))
+    }
 }
 
 /// The event loop for one agent slot. Spawned as a tokio task.
@@ -337,6 +353,16 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
                 outcome = "failed",
                 "event loop: agent turn port call failed"
             );
+            if let Some(reason) = crash_reason_for_execution_error(&e)
+                && let Err(crash_error) = ctx.scheduler.handle_agent_crash(&ctx.slot_id, reason, None).await
+            {
+                warn!(
+                    team_id = %ctx.team_id,
+                    slot_id = %ctx.slot_id,
+                    error = %crash_error,
+                    "event loop: failed to persist crash recovery state"
+                );
+            }
             if input.team_run_id.is_some()
                 && let Some(reservation) = reservation.as_ref()
             {
@@ -392,6 +418,33 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
         team_run_id: input.team_run_id.clone(),
         turn_id: Some(outcome.turn_id),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_turn_errors_are_classified_without_persisting_provider_details() {
+        assert_eq!(
+            crash_reason_for_execution_error(&AgentTurnExecutionError::Failed {
+                reason: "ACP process exited unexpectedly with token=secret".into(),
+            }),
+            Some(CrashReason::ProcessExited)
+        );
+        assert_eq!(
+            crash_reason_for_execution_error(&AgentTurnExecutionError::Failed {
+                reason: "provider password=secret".into(),
+            }),
+            Some(CrashReason::Unknown("agent turn failed".into()))
+        );
+        assert_eq!(
+            crash_reason_for_execution_error(&AgentTurnExecutionError::Skipped {
+                reason: "already running".into(),
+            }),
+            None
+        );
+    }
 }
 
 /// Finalize a completed turn: mark idle (or error), cascade to leader.

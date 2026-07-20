@@ -352,9 +352,6 @@ impl TeamSession {
 
         let wake_target = self.scheduler.finalize_turn(&slot_id, &[]).await?;
 
-        // Clear the dedup window unconditionally once finalize has run.
-        self.scheduler.clear_finalized_turn(conversation_id);
-
         // Re-wake self if there are still unread messages in mailbox.
         // This handles the case where messages arrived while the agent was
         // working (e.g. shutdown_request). Mirrors Claude's useMailboxBridge:
