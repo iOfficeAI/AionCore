@@ -50,15 +50,16 @@ pub(super) async fn build(
         config.backend.clone_from(&meta.backend);
     }
 
-    // Session-model port (phase 1): claude/codex run through the clean-slate
-    // direct-CLI SessionBackend (SessionAgentTask), NOT the ACP manager. Every other
-    // ACP vendor keeps the AcpAgentManager path below. Gated on a spawner being wired
-    // (production); absent (tests) → fall through to the ACP path. The build inputs
-    // mirror clean-slate `build_runtime` 1:1 (resume anchor, mode/model precedence,
-    // MCP + preset + skills init surface, cc-switch env, codex sandbox/approval).
-    if let (Some(backend_label), Some(spawner)) = (config.backend.as_deref(), deps.session_spawner.clone())
+    // Session-model port: claude/codex ALWAYS run through the clean-slate direct-CLI
+    // SessionBackend (SessionAgentTask), NOT the ACP manager. Every other ACP vendor
+    // keeps the AcpAgentManager path below. There is no fallback: a claude/codex
+    // build that yields no instance is a hard error, not a silent drop to ACP. The
+    // build inputs mirror clean-slate `build_runtime` 1:1 (resume anchor, mode/model
+    // precedence, MCP + preset + skills init surface, cc-switch env, codex sandbox/approval).
+    if let Some(backend_label) = config.backend.as_deref()
         && matches!(backend_label, "claude" | "codex")
-        && let Some(instance) = crate::session_agent::build_session_instance(
+    {
+        let instance = crate::session_agent::build_session_instance(
             backend_label,
             crate::session_agent::SessionBuildInputs {
                 conversation_id: ctx.conversation_id.clone(),
@@ -80,10 +81,14 @@ pub(super) async fn build(
                 // this early-return bypasses).
                 acp_session_repo: Some(deps.acp_agent_service.repo()),
             },
-            spawner,
+            deps.session_spawner.clone(),
         )
         .await?
-    {
+        .ok_or_else(|| {
+            AgentError::internal(format!(
+                "session backend for '{backend_label}' unexpectedly returned no instance"
+            ))
+        })?;
         tracing::info!(
             conversation_id = %ctx.conversation_id,
             backend = %backend_label,

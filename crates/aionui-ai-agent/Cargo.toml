@@ -62,6 +62,8 @@ tracing-subscriber.workspace = true
 aionui-common.workspace = true
 aionui-extension.workspace = true
 aionui-db.workspace = true
+aionui-process.workspace = true
+uuid.workspace = true
 sqlx.workspace = true
 
 # Integration tests under `tests/` need the `AgentInstance::Mock` variant.
