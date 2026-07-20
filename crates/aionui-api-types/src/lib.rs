@@ -129,9 +129,12 @@ pub use office::{
     PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StartPreviewRequest, StopPreviewRequest,
 };
 pub use project::{
-    DirtyWorktreeChoice, ProjectKnowledgeFact, ProjectKnowledgeStatus, ProjectRepositoryFacts,
-    ProjectRepositoryOnboardingInput, ProjectTaskContext, ProjectTaskContextRequest, RepositorySource,
-    RepositorySubmodule,
+    DevelopmentEvaluation, DevelopmentRetentionPolicy, DirtyWorktreeChoice, EvaluationComparison,
+    EvaluationComparisonRequest, EvaluationRecordInput, EvaluationRegression, ImportProjectBundleRequest,
+    PlatformInstanceSummary, ProjectExportBundle, ProjectExportManifest, ProjectImportReport, ProjectKnowledgeFact,
+    ProjectKnowledgeStatus, ProjectRepositoryFacts, ProjectRepositoryOnboardingInput, ProjectTaskContext,
+    ProjectTaskContextRequest, RepositorySource, RepositorySubmodule, RetentionCleanupReport, RetentionCleanupRequest,
+    RetentionPolicyInput,
 };
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest, DetectionSuggestion,

@@ -3,8 +3,11 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    ApiResponse, DevelopmentConfirmationRequest, DevelopmentDeploymentRequest, DevelopmentRunControlRequest,
-    DevelopmentRunControlState, DevelopmentRunTimeline, DevelopmentTagRequest, DevelopmentTimelineEvent,
+    ApiResponse, DevelopmentConfirmationRequest, DevelopmentDeploymentRequest, DevelopmentEvaluation,
+    DevelopmentRetentionPolicy, DevelopmentRunControlRequest, DevelopmentRunControlState, DevelopmentRunTimeline,
+    DevelopmentTagRequest, DevelopmentTimelineEvent, EvaluationComparison, EvaluationComparisonRequest,
+    EvaluationRecordInput, ImportProjectBundleRequest, PlatformInstanceSummary, ProjectExportBundle,
+    ProjectImportReport, RetentionCleanupReport, RetentionCleanupRequest, RetentionPolicyInput,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -21,10 +24,12 @@ use std::collections::BTreeMap;
 use crate::delivery::{CreatePullRequestInput, CreateTagInput, DeliveryService, PrepareDeliveryInput};
 use crate::deployment::{DeploymentRequestInput, DeploymentService};
 use crate::error::DevelopmentError;
+use crate::export::PortabilityService;
 use crate::operations::{
     DevelopmentOperationsService, DevelopmentOperationsSnapshot, DevelopmentPolicyInput, RecoveryDecisionInput,
 };
 use crate::pricing::PricingService;
+use crate::retention::RetentionService;
 use crate::secrets::{SecretCreateInput, SecretGrantInput, SecretService};
 use crate::service::{CompletionEvaluation, DevelopmentService};
 use crate::types::{
@@ -55,6 +60,8 @@ pub struct DevelopmentRouterState {
     pub development_repo: Arc<dyn IDevelopmentRepository>,
     pub operations_repo: Arc<dyn IDevelopmentOperationsRepository>,
     pub approval_repo: Arc<dyn IApprovalRepository>,
+    pub portability_service: Arc<PortabilityService>,
+    pub retention_service: Arc<RetentionService>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -211,9 +218,142 @@ pub fn development_routes(state: DevelopmentRouterState) -> Router {
             "/api/development-projects/{project_id}/operations/alerts/{alert_id}/ack",
             post(acknowledge_operations_alert),
         )
+        .route(
+            "/api/development-projects/{project_id}/export",
+            get(export_project_bundle),
+        )
+        .route(
+            "/api/development-projects/{project_id}/retention",
+            get(get_retention_policy).put(update_retention_policy),
+        )
+        .route(
+            "/api/development-projects/{project_id}/retention/cleanup",
+            post(cleanup_retained_data),
+        )
+        .route("/api/development-projects/import", post(import_project_bundle))
+        .route("/api/development-platform/instance", get(get_platform_instance))
+        .route("/api/development-evaluations", post(record_evaluation))
+        .route("/api/development-evaluations/compare", post(compare_evaluations))
         .route("/api/development-operations/reconcile", post(reconcile_operations))
         .route("/api/development-runs/{run_id}/recovery", post(decide_recovery))
         .with_state(state)
+}
+
+async fn export_project_bundle(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ApiResponse<ProjectExportBundle>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .portability_service
+            .export_project(&user.id, &project_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn get_retention_policy(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ApiResponse<DevelopmentRetentionPolicy>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .retention_service
+            .get_policy(&user.id, &project_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn update_retention_policy(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+    body: Result<Json<RetentionPolicyInput>, JsonRejection>,
+) -> Result<Json<ApiResponse<DevelopmentRetentionPolicy>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .retention_service
+            .update_policy(&user.id, &project_id, input)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn cleanup_retained_data(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+    body: Result<Json<RetentionCleanupRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<RetentionCleanupReport>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .retention_service
+            .cleanup(&user.id, &project_id, input)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn import_project_bundle(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<ImportProjectBundleRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectImportReport>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .portability_service
+            .import_project(&user.id, request)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn get_platform_instance(
+    State(state): State<DevelopmentRouterState>,
+) -> Result<Json<ApiResponse<PlatformInstanceSummary>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .portability_service
+            .platform_instance()
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn record_evaluation(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<EvaluationRecordInput>, JsonRejection>,
+) -> Result<Json<ApiResponse<DevelopmentEvaluation>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .portability_service
+            .record_evaluation(&user.id, input)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn compare_evaluations(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<EvaluationComparisonRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<EvaluationComparison>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .portability_service
+            .compare_evaluations(&user.id, request)
+            .await
+            .map_err(ApiError::from)?,
+    )))
 }
 
 async fn get_timeline(

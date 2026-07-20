@@ -44,9 +44,10 @@ use aionui_db::{
 use aionui_development::{
     ApprovalOption, ApprovalRequestInput, ApprovalResolver, ApprovalRouterState, ApprovalService, ApprovalSource,
     DeliveryService, DeploymentService, DevelopmentOperationsService, DevelopmentRouterState, DevelopmentRunner,
-    DevelopmentService, DevelopmentWorkspacePort, GhCliDeliveryProvider, GitLabCliDeliveryProvider,
+    DevelopmentService, DevelopmentWorkspacePort, GhCliDeliveryProvider, GitLabCliDeliveryProvider, PortabilityService,
     PrepareDevelopmentWorkspace, PreparedDevelopmentWorkspace, PricingService, ResolveApprovalContext,
-    ResourceLeaseCoordinator, SecretService, SystemDevelopmentResourceController, UnconfiguredDeploymentProvider,
+    ResourceLeaseCoordinator, RetentionService, SecretService, SystemDevelopmentResourceController,
+    UnconfiguredDeploymentProvider,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -1110,7 +1111,7 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
             services.data_dir.join("development-worktrees"),
         )),
     });
-    let operations_repo = Arc::new(SqliteDevelopmentOperationsRepository::new(pool));
+    let operations_repo = Arc::new(SqliteDevelopmentOperationsRepository::new(pool.clone()));
     let secret_service = Arc::new(SecretService::new(
         operations_repo.clone(),
         project_repo.clone(),
@@ -1133,6 +1134,30 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
     );
     let pricing_service =
         Arc::new(PricingService::new(operations_repo.clone()).with_budget(operations_service.as_ref().clone()));
+    let mut portability_service = PortabilityService::new(
+        pool.clone(),
+        services.jwt_secret_raw.as_bytes(),
+        format!("app:{}", std::process::id()),
+    );
+    if let Ok(configured_signers) = std::env::var("AIONUI_PORTABILITY_TRUSTED_SIGNERS") {
+        for signer in configured_signers
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Err(error) = portability_service.trust_signer(signer) {
+                tracing::warn!(error = %error, "ignored invalid configured portability signer");
+            }
+        }
+    }
+    let portability_service = Arc::new(portability_service);
+    let retention_service = Arc::new(RetentionService::new(pool));
+    let startup_portability = portability_service.clone();
+    tokio::spawn(async move {
+        if let Err(error) = startup_portability.record_startup().await {
+            tracing::warn!(error = %error, "failed to update platform instance startup metadata");
+        }
+    });
     DevelopmentRouterState {
         service: Arc::new(
             DevelopmentService::new(
@@ -1168,6 +1193,8 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
         development_repo,
         operations_repo,
         approval_repo: Arc::new(SqliteApprovalRepository::new(services.database.pool().clone())),
+        portability_service,
+        retention_service,
     }
 }
 

@@ -10,8 +10,8 @@ use aionui_db::{
 };
 use aionui_development::{
     DeliveryProvider, DeliveryProviderSnapshot, DeliveryService, DeploymentService, DevelopmentOperationsService,
-    DevelopmentRouterState, DevelopmentService, PricingService, ProviderPullRequest, SecretService,
-    UnconfiguredDeploymentProvider, development_routes,
+    DevelopmentRouterState, DevelopmentService, PortabilityService, PricingService, ProviderPullRequest,
+    RetentionService, SecretService, UnconfiguredDeploymentProvider, development_routes,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -139,6 +139,12 @@ async fn app_for(
         development_repo,
         operations_repo,
         approval_repo: Arc::new(aionui_db::SqliteApprovalRepository::new(db.pool().clone())),
+        portability_service: Arc::new(PortabilityService::new(
+            db.pool().clone(),
+            b"development-route-test",
+            "route-test-instance",
+        )),
+        retention_service: Arc::new(RetentionService::new(db.pool().clone())),
     })
     .layer(Extension(CurrentUser {
         id: current_user_id.into(),
@@ -159,6 +165,67 @@ async fn app() -> (
 async fn json(response: axum::response::Response) -> serde_json::Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn retention_routes_are_owner_scoped_and_require_confirmation_for_cleanup() {
+    let (app, _project, _db, _provider) = app().await;
+    let updated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/development-projects/project-1/retention")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"conversation_history_days":30,"artifact_days":60,"evaluation_days":90}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(json(updated).await["data"]["artifact_days"], 60);
+
+    let preview = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/development-projects/project-1/retention/cleanup")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"dry_run":true,"confirmation_count":0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), StatusCode::OK);
+    assert_eq!(json(preview).await["data"]["dry_run"], true);
+
+    let rejected = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/development-projects/project-1/retention/cleanup")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"dry_run":false,"confirmation_count":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let (other_app, _project, _db, _provider) = app_for("other-user").await;
+    let forbidden = other_app
+        .oneshot(
+            Request::builder()
+                .uri("/api/development-projects/project-1/retention")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
