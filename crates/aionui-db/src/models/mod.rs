@@ -41,8 +41,9 @@ pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
 pub use development::{
     AcceptanceCriterionRow, CompletionEvidenceRow, DevelopmentCiCheckRow, DevelopmentDeliveryRow,
-    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, PlanRevisionRow, QualityGateRunRow,
-    RequirementVersionRow, ReviewFindingRow, SingleRunWorkspaceRow, TaskArtifactRow, TaskCriterionRow,
+    DevelopmentDeliveryTagRow, DevelopmentDeploymentRow, DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow,
+    PlanRevisionRow, QualityGateRunRow, RequirementVersionRow, ReviewFindingRow, SingleRunWorkspaceRow,
+    TaskArtifactRow, TaskCriterionRow,
 };
 pub use development_operations::{
     DevelopmentAlertRow, DevelopmentAuditEventRow, DevelopmentModelPriceRow, DevelopmentPolicyRow,

@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use aionui_api_types::ApiResponse;
+use aionui_api_types::{
+    ApiResponse, DevelopmentConfirmationRequest, DevelopmentDeploymentRequest, DevelopmentTagRequest,
+};
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use axum::Router;
@@ -12,7 +14,8 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use serde::Deserialize;
 
-use crate::delivery::{CreatePullRequestInput, DeliveryService, PrepareDeliveryInput};
+use crate::delivery::{CreatePullRequestInput, CreateTagInput, DeliveryService, PrepareDeliveryInput};
+use crate::deployment::{DeploymentRequestInput, DeploymentService};
 use crate::error::DevelopmentError;
 use crate::operations::{
     DevelopmentOperationsService, DevelopmentOperationsSnapshot, DevelopmentPolicyInput, RecoveryDecisionInput,
@@ -41,6 +44,7 @@ impl From<DevelopmentError> for ApiError {
 pub struct DevelopmentRouterState {
     pub service: Arc<DevelopmentService>,
     pub delivery_service: Arc<DeliveryService>,
+    pub deployment_service: Arc<DeploymentService>,
     pub operations_service: Arc<DevelopmentOperationsService>,
     pub secret_service: Arc<SecretService>,
     pub pricing_service: Arc<PricingService>,
@@ -67,6 +71,12 @@ struct ReconcileInput {
     stale_after_ms: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct RecoverDeploymentsInput {
+    #[serde(default = "default_stale_after_ms")]
+    stale_after_ms: i64,
+}
+
 fn default_stale_after_ms() -> i64 {
     30 * 60 * 1000
 }
@@ -74,7 +84,7 @@ fn default_stale_after_ms() -> i64 {
 #[derive(Debug, Deserialize)]
 struct ConfirmedInput {
     #[serde(default)]
-    confirmed: bool,
+    confirmation_count: u8,
 }
 
 pub fn development_routes(state: DevelopmentRouterState) -> Router {
@@ -144,6 +154,30 @@ pub fn development_routes(state: DevelopmentRouterState) -> Router {
         .route("/api/development-runs/{run_id}/delivery/sync", post(sync_delivery))
         .route("/api/development-runs/{run_id}/delivery/merge", post(merge_delivery))
         .route("/api/development-runs/{run_id}/delivery/report", get(delivery_report))
+        .route(
+            "/api/development-runs/{run_id}/delivery/tags",
+            get(list_delivery_tags).post(create_delivery_tag),
+        )
+        .route(
+            "/api/development-runs/{run_id}/deployments",
+            get(list_deployments).post(request_deployment),
+        )
+        .route(
+            "/api/development-runs/{run_id}/deployments/recover",
+            post(recover_deployments),
+        )
+        .route(
+            "/api/development-runs/{run_id}/deployments/{deployment_id}/approve",
+            post(approve_deployment),
+        )
+        .route(
+            "/api/development-runs/{run_id}/deployments/{deployment_id}/execute",
+            post(execute_deployment),
+        )
+        .route(
+            "/api/development-runs/{run_id}/deployments/{deployment_id}/cancel",
+            post(cancel_deployment),
+        )
         .route(
             "/api/development-projects/{project_id}/operations/policy",
             get(get_operations_policy).put(update_operations_policy),
@@ -401,7 +435,7 @@ async fn push_delivery(
     Ok(Json(ApiResponse::ok(
         state
             .delivery_service
-            .push(&user.id, &run_id, input.confirmed)
+            .push(&user.id, &run_id, input.confirmation_count)
             .await
             .map_err(ApiError::from)?,
     )))
@@ -447,7 +481,7 @@ async fn merge_delivery(
     Ok(Json(ApiResponse::ok(
         state
             .delivery_service
-            .merge(&user.id, &run_id, input.confirmed)
+            .merge(&user.id, &run_id, input.confirmation_count)
             .await
             .map_err(ApiError::from)?,
     )))
@@ -462,6 +496,155 @@ async fn delivery_report(
         state
             .delivery_service
             .report(&user.id, &run_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn create_delivery_tag(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+    body: Result<Json<DevelopmentTagRequest>, JsonRejection>,
+) -> Result<
+    (
+        StatusCode,
+        Json<ApiResponse<aionui_db::models::DevelopmentDeliveryTagRow>>,
+    ),
+    ApiError,
+> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    let row = state
+        .delivery_service
+        .create_tag(
+            &user.id,
+            &run_id,
+            CreateTagInput {
+                name: input.name,
+                commit_sha: input.commit_sha,
+                confirmed: input.confirmed,
+                confirmation_count: input.confirmation_count,
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(row))))
+}
+
+async fn list_delivery_tags(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<aionui_db::models::DevelopmentDeliveryTagRow>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .delivery_service
+            .list_tags(&user.id, &run_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn request_deployment(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+    body: Result<Json<DevelopmentDeploymentRequest>, JsonRejection>,
+) -> Result<
+    (
+        StatusCode,
+        Json<ApiResponse<aionui_db::models::DevelopmentDeploymentRow>>,
+    ),
+    ApiError,
+> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    let row = state
+        .deployment_service
+        .request(
+            &user.id,
+            &run_id,
+            DeploymentRequestInput {
+                environment: input.environment,
+                deployment_key: input.deployment_key,
+                commit_sha: input.commit_sha,
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(row))))
+}
+
+async fn list_deployments(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<aionui_db::models::DevelopmentDeploymentRow>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .deployment_service
+            .list(&user.id, &run_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn approve_deployment(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((run_id, deployment_id)): Path<(String, String)>,
+    body: Result<Json<DevelopmentConfirmationRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentDeploymentRow>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .deployment_service
+            .approve(&user.id, &run_id, &deployment_id, input.confirmation_count)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn execute_deployment(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((run_id, deployment_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentDeploymentRow>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .deployment_service
+            .execute(&user.id, &run_id, &deployment_id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn cancel_deployment(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((run_id, deployment_id)): Path<(String, String)>,
+    body: Result<Json<DevelopmentConfirmationRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_db::models::DevelopmentDeploymentRow>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .deployment_service
+            .cancel(&user.id, &run_id, &deployment_id, input.confirmed)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn recover_deployments(
+    State(state): State<DevelopmentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(run_id): Path<String>,
+    body: Result<Json<RecoverDeploymentsInput>, JsonRejection>,
+) -> Result<Json<ApiResponse<Vec<aionui_db::models::DevelopmentDeploymentRow>>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .deployment_service
+            .recover_stale(&user.id, &run_id, input.stale_after_ms)
             .await
             .map_err(ApiError::from)?,
     )))

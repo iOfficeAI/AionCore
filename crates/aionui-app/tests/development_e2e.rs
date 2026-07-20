@@ -37,6 +37,63 @@ async fn development_routes_require_authentication() {
 }
 
 #[tokio::test]
+async fn delivery_state_changes_require_csrf_and_reads_require_authentication() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "delivery-admin", "StrongP@ss1").await;
+    let state_changes = [
+        ("/api/development-runs/run-id/delivery/tags", json!({})),
+        ("/api/development-runs/run-id/deployments", json!({})),
+        (
+            "/api/development-runs/run-id/deployments/deployment-id/approve",
+            json!({"confirmed": true, "confirmation_count": 2}),
+        ),
+        (
+            "/api/development-runs/run-id/deployments/deployment-id/execute",
+            json!({}),
+        ),
+        (
+            "/api/development-runs/run-id/deployments/deployment-id/cancel",
+            json!({"confirmed": true}),
+        ),
+        (
+            "/api/development-runs/run-id/deployments/recover",
+            json!({"stale_after_ms": 1000}),
+        ),
+    ];
+    for (path, body) in state_changes {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path} must require CSRF");
+    }
+
+    for path in [
+        "/api/development-runs/run-id/delivery/tags",
+        "/api/development-runs/run-id/deployments",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+            "{path} must require authentication"
+        );
+    }
+}
+
+#[tokio::test]
 async fn authenticated_user_can_create_an_evidence_backed_development_board() {
     let project = tempfile::tempdir().unwrap();
     let (mut app, services) = build_app().await;

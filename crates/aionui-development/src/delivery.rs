@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use aionui_common::now_ms;
 use aionui_db::models::{
-    DevelopmentCiCheckRow, DevelopmentDeliveryRow, DevelopmentRunRow, DevelopmentTaskRow, ProjectRow, TaskArtifactRow,
+    DevelopmentCiCheckRow, DevelopmentDeliveryRow, DevelopmentDeliveryTagRow, DevelopmentRunRow, DevelopmentTaskRow,
+    ProjectRow, TaskArtifactRow,
 };
 use aionui_db::{IDevelopmentRepository, IProjectRepository};
 use async_trait::async_trait;
@@ -12,10 +13,10 @@ use git2::{IndexAddOption, Repository, Signature, build::CheckoutBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::process::Command;
 
 use crate::DevelopmentError;
 use crate::operations::{DevelopmentOperationsService, redact_sensitive};
+use crate::policy::{PolicyDecision, PolicyOperation};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderPullRequest {
@@ -35,13 +36,34 @@ pub struct ProviderCiCheck {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderReviewComment {
+    pub id: String,
+    pub body: String,
+    pub url: Option<String>,
+    pub author: Option<String>,
+    pub resolved: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeliveryProviderSnapshot {
     pub pull_request: ProviderPullRequest,
     pub checks: Vec<ProviderCiCheck>,
+    pub review_comments: Vec<ProviderReviewComment>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderTag {
+    pub name: String,
+    pub commit_sha: String,
+    pub remote_url: Option<String>,
 }
 
 #[async_trait]
 pub trait DeliveryProvider: Send + Sync {
+    fn name(&self) -> &'static str {
+        "github"
+    }
+
     async fn preflight(&self, repository: &Path) -> Result<(), String>;
     async fn push(&self, repository: &Path, branch: &str) -> Result<(), String>;
     async fn ensure_pull_request(
@@ -54,6 +76,49 @@ pub trait DeliveryProvider: Send + Sync {
     ) -> Result<ProviderPullRequest, String>;
     async fn synchronize(&self, repository: &Path, number: i64) -> Result<DeliveryProviderSnapshot, String>;
     async fn merge(&self, repository: &Path, number: i64) -> Result<(), String>;
+    async fn ensure_tag(&self, _repository: &Path, _tag: &str, _commit: &str) -> Result<ProviderTag, String> {
+        Err("delivery provider does not support tags".into())
+    }
+}
+
+#[derive(Clone)]
+pub struct DeliveryProviderRegistry {
+    providers: HashMap<String, Arc<dyn DeliveryProvider>>,
+}
+
+impl DeliveryProviderRegistry {
+    pub fn new(provider: Arc<dyn DeliveryProvider>) -> Self {
+        let mut providers = HashMap::new();
+        providers.insert(provider.name().to_owned(), provider);
+        Self { providers }
+    }
+
+    pub fn with_provider(mut self, provider: Arc<dyn DeliveryProvider>) -> Self {
+        self.providers.insert(provider.name().to_owned(), provider);
+        self
+    }
+
+    pub fn get(&self, name: &str) -> Result<Arc<dyn DeliveryProvider>, DevelopmentError> {
+        self.providers
+            .get(name)
+            .cloned()
+            .ok_or_else(|| DevelopmentError::BadRequest(format!("unsupported delivery provider: {name}")))
+    }
+
+    pub fn name_for_repository(&self, repository: Option<&str>) -> Result<&'static str, DevelopmentError> {
+        let repository = repository.unwrap_or_default().to_ascii_lowercase();
+        let name = if repository.contains("gitlab") {
+            "gitlab"
+        } else if repository.contains("github") {
+            "github"
+        } else {
+            return Err(DevelopmentError::BadRequest(
+                "repository host is not a supported GitHub or GitLab provider".into(),
+            ));
+        };
+        self.get(name)?;
+        Ok(name)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,11 +133,21 @@ pub struct CreatePullRequestInput {
     pub confirmed: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateTagInput {
+    pub name: String,
+    pub commit_sha: String,
+    #[serde(default)]
+    pub confirmed: bool,
+    #[serde(default)]
+    pub confirmation_count: u8,
+}
+
 #[derive(Clone)]
 pub struct DeliveryService {
     development_repo: Arc<dyn IDevelopmentRepository>,
     project_repo: Arc<dyn IProjectRepository>,
-    provider: Arc<dyn DeliveryProvider>,
+    providers: DeliveryProviderRegistry,
     operations: Option<Arc<DevelopmentOperationsService>>,
 }
 
@@ -85,13 +160,18 @@ impl DeliveryService {
         Self {
             development_repo,
             project_repo,
-            provider,
+            providers: DeliveryProviderRegistry::new(provider),
             operations: None,
         }
     }
 
     pub fn with_operations(mut self, operations: Arc<DevelopmentOperationsService>) -> Self {
         self.operations = Some(operations);
+        self
+    }
+
+    pub fn with_provider(mut self, provider: Arc<dyn DeliveryProvider>) -> Self {
+        self.providers = self.providers.with_provider(provider);
         self
     }
 
@@ -169,13 +249,17 @@ impl DeliveryService {
                 .await?;
         }
 
+        let provider = self
+            .providers
+            .name_for_repository(project.repository_url.as_deref())?
+            .to_owned();
         let now = now_ms();
         let delivery = DevelopmentDeliveryRow {
             id: uuid::Uuid::now_v7().to_string(),
             run_id: run_id.into(),
             project_id: run.project_id.clone(),
             user_id: user_id.into(),
-            provider: "github".into(),
+            provider,
             repository: project.repository_url.clone(),
             branch: prepared.branch,
             base_branch,
@@ -200,10 +284,12 @@ impl DeliveryService {
         &self,
         user_id: &str,
         run_id: &str,
-        confirmed: bool,
+        confirmation_count: u8,
     ) -> Result<DevelopmentDeliveryRow, DevelopmentError> {
-        require_confirmation(confirmed, "push")?;
+        require_confirmation_count(confirmation_count, "push")?;
         let mut delivery = self.get(user_id, run_id).await?;
+        self.authorize_git(user_id, &delivery, "push", Some(&delivery.branch), confirmation_count)
+            .await?;
         if delivery.push_status == "pushed" {
             return Ok(delivery);
         }
@@ -215,10 +301,11 @@ impl DeliveryService {
         self.require_budget(user_id, run_id, "delivery.push").await?;
         validate_delivery_branch(&delivery.branch, &delivery.base_branch)?;
         let path = self.repository_path(user_id, run_id).await?;
-        if let Err(error) = self.provider.preflight(&path).await {
+        let provider = self.providers.get(&delivery.provider)?;
+        if let Err(error) = provider.preflight(&path).await {
             return self.fail_provider_operation(delivery, error).await;
         }
-        if let Err(error) = self.provider.push(&path, &delivery.branch).await {
+        if let Err(error) = provider.push(&path, &delivery.branch).await {
             return self.fail_provider_operation(delivery, error).await;
         }
         delivery.push_status = "pushed".into();
@@ -254,8 +341,8 @@ impl DeliveryService {
             .transpose()?
             .unwrap_or_else(|| clean_summary(&run.request_summary));
         let body = self.report_value(user_id, run_id, &delivery).await?.to_string();
-        let pull_request = match self
-            .provider
+        let provider = self.providers.get(&delivery.provider)?;
+        let pull_request = match provider
             .ensure_pull_request(&path, &delivery.branch, &delivery.base_branch, &title, &body)
             .await
         {
@@ -280,7 +367,8 @@ impl DeliveryService {
             .ok_or_else(|| DevelopmentError::Conflict("pull request has not been created".into()))?;
         let run = self.get_run(user_id, run_id).await?;
         let path = self.repository_path(user_id, run_id).await?;
-        let snapshot = match self.provider.synchronize(&path, number).await {
+        let provider = self.providers.get(&delivery.provider)?;
+        let snapshot = match provider.synchronize(&path, number).await {
             Ok(snapshot) => snapshot,
             Err(error) => return self.fail_provider_operation(delivery, error).await,
         };
@@ -328,13 +416,17 @@ impl DeliveryService {
                 })
                 .await?;
         }
+        for comment in snapshot.review_comments.iter().filter(|comment| !comment.resolved) {
+            self.ensure_review_rework_task(&run, &delivery, comment).await?;
+        }
 
         delivery.pr_number = Some(snapshot.pull_request.number);
         delivery.pr_url = Some(snapshot.pull_request.url);
         delivery.pr_status = snapshot.pull_request.status;
         delivery.review_status = snapshot.pull_request.review_status;
         delivery.ci_status = aggregate_ci_status(&snapshot.checks).into();
-        let blockers = self.delivery_blockers(&run).await?;
+        let mut blockers = self.delivery_blockers(&run).await?;
+        blockers.extend(self.final_integration_blockers(&delivery).await?);
         if delivery.ci_status == "failed" {
             delivery.status = "rework_required".into();
             delivery.merge_status = "blocked".into();
@@ -357,15 +449,24 @@ impl DeliveryService {
         &self,
         user_id: &str,
         run_id: &str,
-        confirmed: bool,
+        confirmation_count: u8,
     ) -> Result<DevelopmentDeliveryRow, DevelopmentError> {
-        require_confirmation(confirmed, "merge")?;
+        require_confirmation_count(confirmation_count, "merge")?;
         let mut delivery = self.get(user_id, run_id).await?;
+        self.authorize_git(
+            user_id,
+            &delivery,
+            "merge",
+            Some(&delivery.base_branch),
+            confirmation_count,
+        )
+        .await?;
         if delivery.status == "merged" || delivery.merge_status == "merged" {
             return Ok(delivery);
         }
         let run = self.get_run(user_id, run_id).await?;
         let mut blockers = self.delivery_blockers(&run).await?;
+        blockers.extend(self.final_integration_blockers(&delivery).await?);
         if delivery.ci_status != "passed" {
             blockers.push("CI checks have not passed".into());
         }
@@ -383,7 +484,8 @@ impl DeliveryService {
             .pr_number
             .ok_or_else(|| DevelopmentError::Conflict("pull request has not been created".into()))?;
         let path = self.repository_path(user_id, run_id).await?;
-        if let Err(error) = self.provider.merge(&path, number).await {
+        let provider = self.providers.get(&delivery.provider)?;
+        if let Err(error) = provider.merge(&path, number).await {
             return self.fail_provider_operation(delivery, error).await;
         }
         delivery.status = "merged".into();
@@ -402,9 +504,133 @@ impl DeliveryService {
         self.report_value(user_id, run_id, &delivery).await
     }
 
+    pub async fn create_tag(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        input: CreateTagInput,
+    ) -> Result<DevelopmentDeliveryTagRow, DevelopmentError> {
+        require_confirmation(input.confirmed, "tag creation")?;
+        require_confirmation_count(input.confirmation_count, "tag creation")?;
+        validate_tag_name(&input.name)?;
+        let delivery = self.get(user_id, run_id).await?;
+        if delivery.status != "merged" || delivery.merge_status != "merged" {
+            return Err(DevelopmentError::Conflict(
+                "delivery must be merged before a release tag can be created".into(),
+            ));
+        }
+        if delivery.commit_sha.as_deref() != Some(input.commit_sha.as_str()) {
+            return Err(DevelopmentError::Conflict(
+                "tag commit does not match the immutable delivery commit".into(),
+            ));
+        }
+        self.authorize_git(user_id, &delivery, "tag", Some(&input.name), input.confirmation_count)
+            .await?;
+        if let Some(existing) = self
+            .development_repo
+            .get_delivery_tag(user_id, &delivery.id, &input.name)
+            .await?
+        {
+            if existing.commit_sha != input.commit_sha {
+                return Err(DevelopmentError::Conflict(
+                    "tag name already belongs to a different commit".into(),
+                ));
+            }
+            return Ok(existing);
+        }
+
+        self.require_budget(user_id, run_id, "delivery.tag").await?;
+        let now = now_ms();
+        let pending = DevelopmentDeliveryTagRow {
+            id: uuid::Uuid::now_v7().to_string(),
+            delivery_id: delivery.id.clone(),
+            user_id: user_id.into(),
+            name: input.name.clone(),
+            commit_sha: input.commit_sha.clone(),
+            remote_url: None,
+            status: "pending".into(),
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        if !self.development_repo.create_delivery_tag(&pending).await? {
+            return self
+                .development_repo
+                .get_delivery_tag(user_id, &delivery.id, &input.name)
+                .await?
+                .ok_or_else(|| DevelopmentError::Conflict("tag creation is already in progress".into()));
+        }
+        let path = self.repository_path(user_id, run_id).await?;
+        let provider = self.providers.get(&delivery.provider)?;
+        match provider.ensure_tag(&path, &input.name, &input.commit_sha).await {
+            Ok(tag) => {
+                self.development_repo
+                    .update_delivery_tag_result(
+                        user_id,
+                        &pending.id,
+                        "succeeded",
+                        tag.remote_url.as_deref(),
+                        None,
+                        now_ms(),
+                    )
+                    .await?;
+            }
+            Err(error) => {
+                let error = redact_secret(&error);
+                self.development_repo
+                    .update_delivery_tag_result(user_id, &pending.id, "failed", None, Some(&error), now_ms())
+                    .await?;
+                return Err(DevelopmentError::Internal(error));
+            }
+        }
+        self.development_repo
+            .get_delivery_tag(user_id, &delivery.id, &input.name)
+            .await?
+            .ok_or_else(|| DevelopmentError::Internal("created tag record disappeared".into()))
+    }
+
+    pub async fn list_tags(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<DevelopmentDeliveryTagRow>, DevelopmentError> {
+        let delivery = self.get(user_id, run_id).await?;
+        Ok(self.development_repo.list_delivery_tags(user_id, &delivery.id).await?)
+    }
+
     async fn require_budget(&self, user_id: &str, run_id: &str, operation: &str) -> Result<(), DevelopmentError> {
         if let Some(operations) = &self.operations {
             operations.require_budget(user_id, run_id, operation, 0).await?;
+        }
+        Ok(())
+    }
+
+    async fn authorize_git(
+        &self,
+        user_id: &str,
+        delivery: &DevelopmentDeliveryRow,
+        operation: &str,
+        branch: Option<&str>,
+        confirmation_count: u8,
+    ) -> Result<(), DevelopmentError> {
+        if let Some(operations) = &self.operations {
+            let decision = operations
+                .evaluate_policy(
+                    user_id,
+                    &delivery.project_id,
+                    &delivery.run_id,
+                    &PolicyOperation::Git {
+                        operation: operation.into(),
+                        branch: branch.map(str::to_owned),
+                    },
+                    confirmation_count,
+                )
+                .await?;
+            if decision != PolicyDecision::Allowed {
+                return Err(DevelopmentError::BadRequest(format!(
+                    "{operation} does not satisfy the Project policy"
+                )));
+            }
         }
         Ok(())
     }
@@ -470,6 +696,33 @@ impl DeliveryService {
         Ok(blockers)
     }
 
+    async fn final_integration_blockers(
+        &self,
+        delivery: &DevelopmentDeliveryRow,
+    ) -> Result<Vec<String>, DevelopmentError> {
+        let latest = self
+            .development_repo
+            .list_gates(&delivery.run_id, None)
+            .await?
+            .into_iter()
+            .filter(|gate| {
+                gate.required
+                    && gate.task_id.is_none()
+                    && gate.gate_type == "integration"
+                    && gate.created_at >= delivery.created_at
+            })
+            .max_by_key(|gate| gate.created_at);
+        match latest {
+            Some(gate) if gate.status == "passed" => Ok(Vec::new()),
+            Some(_) => Ok(vec![
+                "the latest final integration gate for the candidate commit has not passed".into(),
+            ]),
+            None => Ok(vec![
+                "a required run-level integration gate must pass after candidate creation".into(),
+            ]),
+        }
+    }
+
     async fn ensure_rework_task(
         &self,
         run: &DevelopmentRunRow,
@@ -522,6 +775,51 @@ impl DeliveryService {
         Ok(task_id)
     }
 
+    async fn ensure_review_rework_task(
+        &self,
+        run: &DevelopmentRunRow,
+        delivery: &DevelopmentDeliveryRow,
+        comment: &ProviderReviewComment,
+    ) -> Result<String, DevelopmentError> {
+        let task_id = deterministic_review_rework_id(&delivery.id, &comment.id);
+        if self.development_repo.get_task(&run.id, &task_id).await?.is_some() {
+            return Ok(task_id);
+        }
+        let now = now_ms();
+        let body = redact_secret(&comment.body);
+        self.development_repo
+            .create_task(&DevelopmentTaskRow {
+                id: task_id.clone(),
+                team_id: run.team_id.clone().unwrap_or_else(|| format!("run:{}", run.id)),
+                run_id: Some(run.id.clone()),
+                subject: "Address provider review comment".into(),
+                description: (!body.is_empty()).then_some(body),
+                status: "ready".into(),
+                owner: None,
+                blocked_by: "[]".into(),
+                blocks: "[]".into(),
+                metadata: Some(
+                    json!({
+                        "delivery_id": delivery.id,
+                        "provider_comment_id": comment.id,
+                        "url": comment.url,
+                        "author": comment.author,
+                    })
+                    .to_string(),
+                ),
+                acceptance_criteria: json!(["The provider review comment is addressed and re-reviewed"]).to_string(),
+                task_type: "review_rework".into(),
+                risk_level: "high".into(),
+                assigned_workspace_lease_id: None,
+                review_status: "pending".into(),
+                verification_status: "pending".into(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        Ok(task_id)
+    }
+
     async fn persist_with_report(
         &self,
         mut delivery: DevelopmentDeliveryRow,
@@ -549,7 +847,8 @@ impl DeliveryService {
         for task in &tasks {
             findings.extend(self.development_repo.list_findings(run_id, &task.id).await?);
         }
-        let unresolved_risks = self.delivery_blockers(&run).await?;
+        let mut unresolved_risks = self.delivery_blockers(&run).await?;
+        unresolved_risks.extend(self.final_integration_blockers(delivery).await?);
         let acceptance_criteria: Value = serde_json::from_str(&run.acceptance_criteria).unwrap_or_else(|_| json!([]));
         Ok(json!({
             "schema_version": 1,
@@ -718,6 +1017,16 @@ fn require_confirmation(confirmed: bool, operation: &str) -> Result<(), Developm
     }
 }
 
+fn require_confirmation_count(confirmations: u8, operation: &str) -> Result<(), DevelopmentError> {
+    if confirmations >= 2 {
+        Ok(())
+    } else {
+        Err(DevelopmentError::BadRequest(format!(
+            "two explicit confirmations are required for {operation}"
+        )))
+    }
+}
+
 fn validate_delivery_branch(branch: &str, base_branch: &str) -> Result<(), DevelopmentError> {
     if branch == base_branch || matches!(branch, "main" | "master") {
         return Err(DevelopmentError::Conflict(
@@ -737,6 +1046,21 @@ fn validate_delivery_branch(branch: &str, base_branch: &str) -> Result<(), Devel
         })
     {
         return Err(DevelopmentError::BadRequest("delivery branch name is unsafe".into()));
+    }
+    Ok(())
+}
+
+pub fn validate_tag_name(tag: &str) -> Result<(), DevelopmentError> {
+    let valid = !tag.is_empty()
+        && tag.len() <= 128
+        && !tag.starts_with(['.', '-'])
+        && !tag.ends_with('.')
+        && !tag.contains("..")
+        && tag
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '/'));
+    if !valid {
+        return Err(DevelopmentError::BadRequest("invalid release tag name".into()));
     }
     Ok(())
 }
@@ -791,6 +1115,11 @@ fn deterministic_rework_id(delivery_id: &str, check_id: &str) -> String {
     format!("ci-rework-{}", hex_prefix(&digest, 16))
 }
 
+fn deterministic_review_rework_id(delivery_id: &str, comment_id: &str) -> String {
+    let digest = Sha256::digest(format!("{delivery_id}:review:{comment_id}").as_bytes());
+    format!("review-rework-{}", hex_prefix(&digest, 16))
+}
+
 fn hex_prefix(bytes: &[u8], length: usize) -> String {
     bytes
         .iter()
@@ -834,173 +1163,4 @@ fn redact_secret(value: &str) -> String {
         words.truncate(2000);
     }
     words
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct GhCliDeliveryProvider;
-
-#[async_trait]
-impl DeliveryProvider for GhCliDeliveryProvider {
-    async fn preflight(&self, repository: &Path) -> Result<(), String> {
-        Repository::open(repository).map_err(|error| format!("Git repository unavailable: {error}"))?;
-        let mut command = Command::new("gh");
-        command.arg("auth").arg("status").current_dir(repository);
-        checked_output(command).await.map(|_| ())
-    }
-
-    async fn push(&self, repository: &Path, branch: &str) -> Result<(), String> {
-        validate_delivery_branch(branch, "main").map_err(|error| error.to_string())?;
-        let mut command = Command::new("git");
-        command
-            .arg("push")
-            .arg("--set-upstream")
-            .arg("origin")
-            .arg(branch)
-            .current_dir(repository);
-        checked_output(command).await.map(|_| ())
-    }
-
-    async fn ensure_pull_request(
-        &self,
-        repository: &Path,
-        head: &str,
-        base: &str,
-        title: &str,
-        body: &str,
-    ) -> Result<ProviderPullRequest, String> {
-        let mut list = Command::new("gh");
-        list.arg("pr")
-            .arg("list")
-            .arg("--head")
-            .arg(head)
-            .arg("--base")
-            .arg(base)
-            .arg("--state")
-            .arg("open")
-            .arg("--json")
-            .arg("number,url,state,reviewDecision")
-            .current_dir(repository);
-        let existing: Value = serde_json::from_slice(&checked_output(list).await?)
-            .map_err(|error| format!("cannot parse GitHub pull request list: {error}"))?;
-        if let Some(value) = existing.as_array().and_then(|values| values.first()) {
-            return parse_pull_request(value);
-        }
-        let mut create = Command::new("gh");
-        create
-            .arg("pr")
-            .arg("create")
-            .arg("--base")
-            .arg(base)
-            .arg("--head")
-            .arg(head)
-            .arg("--title")
-            .arg(title)
-            .arg("--body")
-            .arg(body)
-            .current_dir(repository);
-        checked_output(create).await?;
-        let mut view = Command::new("gh");
-        view.arg("pr")
-            .arg("view")
-            .arg(head)
-            .arg("--json")
-            .arg("number,url,state,reviewDecision")
-            .current_dir(repository);
-        let value: Value = serde_json::from_slice(&checked_output(view).await?)
-            .map_err(|error| format!("cannot parse created GitHub pull request: {error}"))?;
-        parse_pull_request(&value)
-    }
-
-    async fn synchronize(&self, repository: &Path, number: i64) -> Result<DeliveryProviderSnapshot, String> {
-        let mut command = Command::new("gh");
-        command
-            .arg("pr")
-            .arg("view")
-            .arg(number.to_string())
-            .arg("--json")
-            .arg("number,url,state,reviewDecision,statusCheckRollup")
-            .current_dir(repository);
-        let value: Value = serde_json::from_slice(&checked_output(command).await?)
-            .map_err(|error| format!("cannot parse GitHub pull request status: {error}"))?;
-        let pull_request = parse_pull_request(&value)?;
-        let checks = value
-            .get("statusCheckRollup")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .map(parse_ci_check)
-            .collect();
-        Ok(DeliveryProviderSnapshot { pull_request, checks })
-    }
-
-    async fn merge(&self, repository: &Path, number: i64) -> Result<(), String> {
-        let mut command = Command::new("gh");
-        command
-            .arg("pr")
-            .arg("merge")
-            .arg(number.to_string())
-            .arg("--merge")
-            .current_dir(repository);
-        checked_output(command).await.map(|_| ())
-    }
-}
-
-async fn checked_output(mut command: Command) -> Result<Vec<u8>, String> {
-    let output = command.output().await.map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
-    }
-}
-
-fn parse_pull_request(value: &Value) -> Result<ProviderPullRequest, String> {
-    let number = value
-        .get("number")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| "GitHub response has no pull request number".to_string())?;
-    Ok(ProviderPullRequest {
-        number,
-        url: value.get("url").and_then(Value::as_str).unwrap_or_default().into(),
-        status: value
-            .get("state")
-            .and_then(Value::as_str)
-            .unwrap_or("OPEN")
-            .to_ascii_lowercase(),
-        review_status: match value.get("reviewDecision").and_then(Value::as_str).unwrap_or_default() {
-            "APPROVED" => "approved",
-            "CHANGES_REQUESTED" => "changes_requested",
-            _ => "pending",
-        }
-        .into(),
-    })
-}
-
-fn parse_ci_check(value: &Value) -> ProviderCiCheck {
-    let name = value
-        .get("name")
-        .or_else(|| value.get("workflowName"))
-        .and_then(Value::as_str)
-        .unwrap_or("GitHub check")
-        .to_owned();
-    let details_url = value
-        .get("detailsUrl")
-        .or_else(|| value.get("targetUrl"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let raw_status = value
-        .get("conclusion")
-        .and_then(Value::as_str)
-        .filter(|status| !status.is_empty())
-        .or_else(|| value.get("status").and_then(Value::as_str))
-        .unwrap_or("QUEUED");
-    let id_source = format!("{name}:{}", details_url.as_deref().unwrap_or_default());
-    let digest = Sha256::digest(id_source.as_bytes());
-    ProviderCiCheck {
-        id: format!("github-{}", hex_prefix(&digest, 24)),
-        name,
-        status: normalize_check_status(raw_status),
-        details_url,
-        summary: value.get("description").and_then(Value::as_str).map(str::to_owned),
-    }
 }

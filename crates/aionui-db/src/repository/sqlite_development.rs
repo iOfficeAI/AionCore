@@ -4,8 +4,9 @@ use sqlx::SqlitePool;
 use crate::error::DbError;
 use crate::models::{
     AcceptanceCriterionRow, CompletionEvidenceRow, DevelopmentCiCheckRow, DevelopmentDeliveryRow,
-    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, PlanRevisionRow, QualityGateRunRow,
-    RequirementVersionRow, ReviewFindingRow, SingleRunWorkspaceRow, TaskArtifactRow, TaskCriterionRow,
+    DevelopmentDeliveryTagRow, DevelopmentDeploymentRow, DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow,
+    PlanRevisionRow, QualityGateRunRow, RequirementVersionRow, ReviewFindingRow, SingleRunWorkspaceRow,
+    TaskArtifactRow, TaskCriterionRow,
 };
 use crate::repository::development::IDevelopmentRepository;
 
@@ -416,6 +417,219 @@ impl IDevelopmentRepository for SqliteDevelopmentRepository {
         .bind(delivery_id)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    async fn create_delivery_tag(&self, row: &DevelopmentDeliveryTagRow) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "INSERT INTO development_delivery_tags \
+             (id, delivery_id, user_id, name, commit_sha, remote_url, status, last_error, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(delivery_id, name) DO NOTHING",
+        )
+        .bind(&row.id)
+        .bind(&row.delivery_id)
+        .bind(&row.user_id)
+        .bind(&row.name)
+        .bind(&row.commit_sha)
+        .bind(&row.remote_url)
+        .bind(&row.status)
+        .bind(&row.last_error)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn get_delivery_tag(
+        &self,
+        user_id: &str,
+        delivery_id: &str,
+        name: &str,
+    ) -> Result<Option<DevelopmentDeliveryTagRow>, DbError> {
+        Ok(
+            sqlx::query_as(
+                "SELECT * FROM development_delivery_tags WHERE user_id = ? AND delivery_id = ? AND name = ?",
+            )
+            .bind(user_id)
+            .bind(delivery_id)
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?,
+        )
+    }
+
+    async fn list_delivery_tags(
+        &self,
+        user_id: &str,
+        delivery_id: &str,
+    ) -> Result<Vec<DevelopmentDeliveryTagRow>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM development_delivery_tags WHERE user_id = ? AND delivery_id = ? ORDER BY created_at DESC",
+        )
+        .bind(user_id)
+        .bind(delivery_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn update_delivery_tag_result(
+        &self,
+        user_id: &str,
+        tag_id: &str,
+        status: &str,
+        remote_url: Option<&str>,
+        last_error: Option<&str>,
+        now: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE development_delivery_tags SET status = ?, remote_url = COALESCE(?, remote_url), \
+             last_error = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+        )
+        .bind(status)
+        .bind(remote_url)
+        .bind(last_error)
+        .bind(now)
+        .bind(tag_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn create_deployment(&self, row: &DevelopmentDeploymentRow) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "INSERT INTO development_deployments \
+             (id, deployment_key, run_id, project_id, user_id, environment, commit_sha, status, requested_by, \
+              approved_by, approval_run_id, approval_environment, approval_commit_sha, approval_requester, \
+              approval_deployment_key, approval_expires_at, approved_at, remote_id, attempt_count, last_error, \
+              started_at, finished_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(user_id, deployment_key) DO NOTHING",
+        )
+        .bind(&row.id)
+        .bind(&row.deployment_key)
+        .bind(&row.run_id)
+        .bind(&row.project_id)
+        .bind(&row.user_id)
+        .bind(&row.environment)
+        .bind(&row.commit_sha)
+        .bind(&row.status)
+        .bind(&row.requested_by)
+        .bind(&row.approved_by)
+        .bind(&row.approval_run_id)
+        .bind(&row.approval_environment)
+        .bind(&row.approval_commit_sha)
+        .bind(&row.approval_requester)
+        .bind(&row.approval_deployment_key)
+        .bind(row.approval_expires_at)
+        .bind(row.approved_at)
+        .bind(&row.remote_id)
+        .bind(row.attempt_count)
+        .bind(&row.last_error)
+        .bind(row.started_at)
+        .bind(row.finished_at)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn get_deployment(
+        &self,
+        user_id: &str,
+        deployment_id: &str,
+    ) -> Result<Option<DevelopmentDeploymentRow>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT * FROM development_deployments WHERE user_id = ? AND id = ?")
+                .bind(user_id)
+                .bind(deployment_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn get_deployment_by_key(
+        &self,
+        user_id: &str,
+        deployment_key: &str,
+    ) -> Result<Option<DevelopmentDeploymentRow>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT * FROM development_deployments WHERE user_id = ? AND deployment_key = ?")
+                .bind(user_id)
+                .bind(deployment_key)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn list_deployments(&self, user_id: &str, run_id: &str) -> Result<Vec<DevelopmentDeploymentRow>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM development_deployments WHERE user_id = ? AND run_id = ? ORDER BY created_at DESC",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn approve_deployment(&self, user_id: &str, deployment_id: &str, now: TimestampMs) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE development_deployments SET status = 'approved', approved_by = ?, approved_at = ?, updated_at = ? \
+             WHERE id = ? AND user_id = ? AND status = 'pending_approval' AND approval_expires_at > ?",
+        )
+        .bind(user_id)
+        .bind(now)
+        .bind(now)
+        .bind(deployment_id)
+        .bind(user_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn claim_deployment(&self, user_id: &str, deployment_id: &str, now: TimestampMs) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE development_deployments SET status = 'running', attempt_count = attempt_count + 1, \
+             started_at = COALESCE(started_at, ?), updated_at = ? \
+             WHERE id = ? AND user_id = ? AND status = 'approved' AND approval_expires_at > ?",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(deployment_id)
+        .bind(user_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn update_deployment_result(
+        &self,
+        user_id: &str,
+        deployment_id: &str,
+        status: &str,
+        remote_id: Option<&str>,
+        last_error: Option<&str>,
+        now: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE development_deployments SET status = ?, remote_id = COALESCE(?, remote_id), last_error = ?, \
+             finished_at = CASE WHEN ? IN ('succeeded', 'failed', 'cancelled') THEN ? ELSE finished_at END, updated_at = ? \
+             WHERE id = ? AND user_id = ?",
+        )
+        .bind(status)
+        .bind(remote_id)
+        .bind(last_error)
+        .bind(status)
+        .bind(now)
+        .bind(now)
+        .bind(deployment_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn append_requirement_version(

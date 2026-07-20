@@ -95,8 +95,9 @@ pub use custom_agent::{
     SetAgentOverridesRequest, SetEnabledRequest,
 };
 pub use development::{
-    AcceptanceCriterion, CriterionCoverage, DevelopmentModelPriceRequest, DevelopmentSecretCreateRequest,
-    DevelopmentSecretGrantRequest, DevelopmentSecretReference, DevelopmentUsageCost, PlanRevision, RequirementVersion,
+    AcceptanceCriterion, CriterionCoverage, DevelopmentConfirmationRequest, DevelopmentDeploymentRequest,
+    DevelopmentModelPriceRequest, DevelopmentSecretCreateRequest, DevelopmentSecretGrantRequest,
+    DevelopmentSecretReference, DevelopmentTagRequest, DevelopmentUsageCost, PlanRevision, RequirementVersion,
     RequirementsSnapshot, SingleRunWorkspace,
 };
 pub use extension::{

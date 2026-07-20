@@ -110,3 +110,28 @@ pub struct DevelopmentUsageCost {
     pub price_version: Option<String>,
     pub price_effective_at: Option<i64>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevelopmentTagRequest {
+    pub name: String,
+    pub commit_sha: String,
+    #[serde(default)]
+    pub confirmed: bool,
+    #[serde(default)]
+    pub confirmation_count: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevelopmentDeploymentRequest {
+    pub environment: String,
+    pub deployment_key: String,
+    pub commit_sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevelopmentConfirmationRequest {
+    #[serde(default)]
+    pub confirmed: bool,
+    #[serde(default)]
+    pub confirmation_count: u8,
+}

@@ -144,6 +144,48 @@ pub struct DevelopmentCiCheckRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DevelopmentDeliveryTagRow {
+    pub id: String,
+    pub delivery_id: String,
+    pub user_id: String,
+    pub name: String,
+    pub commit_sha: String,
+    pub remote_url: Option<String>,
+    pub status: String,
+    pub last_error: Option<String>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DevelopmentDeploymentRow {
+    pub id: String,
+    pub deployment_key: String,
+    pub run_id: String,
+    pub project_id: String,
+    pub user_id: String,
+    pub environment: String,
+    pub commit_sha: String,
+    pub status: String,
+    pub requested_by: String,
+    pub approved_by: Option<String>,
+    pub approval_run_id: String,
+    pub approval_environment: String,
+    pub approval_commit_sha: String,
+    pub approval_requester: String,
+    pub approval_deployment_key: String,
+    pub approval_expires_at: TimestampMs,
+    pub approved_at: Option<TimestampMs>,
+    pub remote_id: Option<String>,
+    pub attempt_count: i64,
+    pub last_error: Option<String>,
+    pub started_at: Option<TimestampMs>,
+    pub finished_at: Option<TimestampMs>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RequirementVersionRow {
     pub id: String,
     pub run_id: String,

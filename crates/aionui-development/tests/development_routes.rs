@@ -9,8 +9,9 @@ use aionui_db::{
     SqliteDevelopmentOperationsRepository, SqliteDevelopmentRepository, SqliteProjectRepository, init_database_memory,
 };
 use aionui_development::{
-    DeliveryProvider, DeliveryProviderSnapshot, DeliveryService, DevelopmentOperationsService, DevelopmentRouterState,
-    DevelopmentService, PricingService, ProviderPullRequest, SecretService, development_routes,
+    DeliveryProvider, DeliveryProviderSnapshot, DeliveryService, DeploymentService, DevelopmentOperationsService,
+    DevelopmentRouterState, DevelopmentService, PricingService, ProviderPullRequest, SecretService,
+    UnconfiguredDeploymentProvider, development_routes,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -117,12 +118,17 @@ async fn app_for(
     );
     let provider = Arc::new(FakeDeliveryProvider::default());
     let delivery_service = Arc::new(
-        DeliveryService::new(development_repo, project_repo, provider.clone())
+        DeliveryService::new(development_repo.clone(), project_repo.clone(), provider.clone())
             .with_operations(operations_service.clone()),
     );
     let router = development_routes(DevelopmentRouterState {
         service,
         delivery_service,
+        deployment_service: Arc::new(DeploymentService::new(
+            development_repo,
+            project_repo,
+            Arc::new(UnconfiguredDeploymentProvider),
+        )),
         operations_service,
         secret_service: Arc::new(SecretService::new(
             operations_repo.clone(),
@@ -525,7 +531,7 @@ async fn delivery_routes_prepare_and_require_confirmation_for_push() {
                 .method("POST")
                 .uri("/api/development-runs/run-route-delivery/delivery/push")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"confirmed":false}"#))
+                .body(Body::from(r#"{"confirmed":false,"confirmation_count":0}"#))
                 .unwrap(),
         )
         .await
@@ -540,7 +546,7 @@ async fn delivery_routes_prepare_and_require_confirmation_for_push() {
                 .method("POST")
                 .uri("/api/development-runs/run-route-delivery/delivery/push")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"confirmed":true}"#))
+                .body(Body::from(r#"{"confirmed":true,"confirmation_count":2}"#))
                 .unwrap(),
         )
         .await

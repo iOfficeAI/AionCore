@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use aionui_db::{IDevelopmentRepository, IProjectRepository, SqliteDevelopmentRepository, SqliteProjectRepository};
 use aionui_development::{
-    CreatePullRequestInput, DeliveryProvider, DeliveryProviderSnapshot, DeliveryService, PrepareDeliveryInput,
-    ProviderCiCheck, ProviderPullRequest,
+    CreatePullRequestInput, CreateTagInput, DeliveryProvider, DeliveryProviderSnapshot, DeliveryService,
+    PrepareDeliveryInput, ProviderCiCheck, ProviderPullRequest, ProviderReviewComment, ProviderTag,
 };
 use async_trait::async_trait;
 
@@ -13,6 +13,7 @@ struct FakeProvider {
     pushes: Mutex<usize>,
     pull_requests: Mutex<usize>,
     merges: Mutex<usize>,
+    tags: Mutex<usize>,
     snapshot: Mutex<DeliveryProviderSnapshot>,
     preflight_error: Mutex<Option<String>>,
 }
@@ -55,6 +56,15 @@ impl DeliveryProvider for FakeProvider {
     async fn merge(&self, _repository: &Path, _number: i64) -> Result<(), String> {
         *self.merges.lock().unwrap() += 1;
         Ok(())
+    }
+
+    async fn ensure_tag(&self, _repository: &Path, tag: &str, commit: &str) -> Result<ProviderTag, String> {
+        *self.tags.lock().unwrap() += 1;
+        Ok(ProviderTag {
+            name: tag.into(),
+            commit_sha: commit.into(),
+            remote_url: Some(format!("https://github.example/releases/tag/{tag}")),
+        })
     }
 }
 
@@ -171,6 +181,32 @@ async fn setup() -> (
     (service, provider, repo, workspace, db)
 }
 
+async fn pass_final_integration_gate(service: &DeliveryService, repo: &SqliteDevelopmentRepository) {
+    let delivery = service.get("system_default_user", "run-delivery").await.unwrap();
+    let timestamp = delivery.created_at + 1;
+    repo.create_gate(&aionui_db::models::QualityGateRunRow {
+        id: "gate-final-integration".into(),
+        run_id: "run-delivery".into(),
+        task_id: None,
+        gate_type: "integration".into(),
+        command: "cargo test --workspace".into(),
+        working_directory: "/tmp".into(),
+        exit_code: Some(0),
+        status: "passed".into(),
+        stdout_artifact_id: None,
+        stderr_artifact_id: None,
+        duration_ms: Some(1),
+        isolation_mode: "host".into(),
+        execution_id: Some("final-integration".into()),
+        required: true,
+        started_at: Some(timestamp),
+        finished_at: Some(timestamp),
+        created_at: timestamp,
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn prepare_creates_non_protected_branch_and_candidate_commit_idempotently() {
     let (service, _provider, _repo, workspace, _db) = setup().await;
@@ -213,8 +249,8 @@ async fn remote_flow_is_retry_safe_and_failed_ci_creates_one_rework_task() {
         )
         .await
         .unwrap();
-    service.push("system_default_user", "run-delivery", true).await.unwrap();
-    service.push("system_default_user", "run-delivery", true).await.unwrap();
+    service.push("system_default_user", "run-delivery", 2).await.unwrap();
+    service.push("system_default_user", "run-delivery", 2).await.unwrap();
     assert_eq!(*provider.pushes.lock().unwrap(), 1);
 
     service
@@ -240,6 +276,7 @@ async fn remote_flow_is_retry_safe_and_failed_ci_creates_one_rework_task() {
         .await
         .unwrap();
     assert_eq!(*provider.pull_requests.lock().unwrap(), 1);
+    pass_final_integration_gate(&service, &repo).await;
 
     *provider.snapshot.lock().unwrap() = DeliveryProviderSnapshot {
         pull_request: ProviderPullRequest {
@@ -255,15 +292,11 @@ async fn remote_flow_is_retry_safe_and_failed_ci_creates_one_rework_task() {
             details_url: None,
             summary: Some("tests failed".into()),
         }],
+        review_comments: vec![],
     };
     let failed = service.sync("system_default_user", "run-delivery").await.unwrap();
     assert_eq!(failed.ci_status, "failed");
-    assert!(
-        service
-            .merge("system_default_user", "run-delivery", true)
-            .await
-            .is_err()
-    );
+    assert!(service.merge("system_default_user", "run-delivery", 2).await.is_err());
     let rework = repo
         .list_tasks("run-delivery")
         .await
@@ -297,6 +330,7 @@ async fn remote_flow_is_retry_safe_and_failed_ci_creates_one_rework_task() {
             details_url: None,
             summary: Some("tests passed".into()),
         }],
+        review_comments: vec![],
     };
     let passed = service.sync("system_default_user", "run-delivery").await.unwrap();
     assert_eq!(passed.ci_status, "passed");
@@ -313,12 +347,152 @@ async fn remote_flow_is_retry_safe_and_failed_ci_creates_one_rework_task() {
         .unwrap();
     let ready = service.sync("system_default_user", "run-delivery").await.unwrap();
     assert_eq!(ready.status, "merge_ready");
-    let merged = service
-        .merge("system_default_user", "run-delivery", true)
-        .await
-        .unwrap();
+    let merged = service.merge("system_default_user", "run-delivery", 2).await.unwrap();
     assert_eq!(merged.status, "merged");
     assert_eq!(*provider.merges.lock().unwrap(), 1);
+    let commit_sha = merged.commit_sha.clone().unwrap();
+    let first_tag = service
+        .create_tag(
+            "system_default_user",
+            "run-delivery",
+            CreateTagInput {
+                name: "v1.0.0".into(),
+                commit_sha: commit_sha.clone(),
+                confirmed: true,
+                confirmation_count: 2,
+            },
+        )
+        .await
+        .unwrap();
+    let duplicate_tag = service
+        .create_tag(
+            "system_default_user",
+            "run-delivery",
+            CreateTagInput {
+                name: "v1.0.0".into(),
+                commit_sha,
+                confirmed: true,
+                confirmation_count: 2,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_tag.id, duplicate_tag.id);
+    assert_eq!(*provider.tags.lock().unwrap(), 1);
+    assert!(service.list_tags("other-user", "run-delivery").await.is_err());
+}
+
+#[tokio::test]
+async fn unresolved_review_comments_are_redispatched_once_as_rework_tasks() {
+    let (service, provider, repo, workspace, _db) = setup().await;
+    std::fs::write(workspace.path().join("README.md"), "review me\n").unwrap();
+    service
+        .prepare(
+            "system_default_user",
+            "run-delivery",
+            PrepareDeliveryInput { message: None },
+        )
+        .await
+        .unwrap();
+    service.push("system_default_user", "run-delivery", 2).await.unwrap();
+    service
+        .create_pull_request(
+            "system_default_user",
+            "run-delivery",
+            CreatePullRequestInput {
+                title: None,
+                confirmed: true,
+            },
+        )
+        .await
+        .unwrap();
+    *provider.snapshot.lock().unwrap() = DeliveryProviderSnapshot {
+        pull_request: ProviderPullRequest {
+            number: 7,
+            url: "https://github.example/pr/7".into(),
+            status: "open".into(),
+            review_status: "changes_requested".into(),
+        },
+        checks: vec![ProviderCiCheck {
+            id: "check-unit".into(),
+            name: "unit".into(),
+            status: "passed".into(),
+            details_url: None,
+            summary: None,
+        }],
+        review_comments: vec![ProviderReviewComment {
+            id: "review-comment-17".into(),
+            body: "Handle the error path".into(),
+            url: Some("https://github.example/pr/7#discussion-17".into()),
+            author: Some("reviewer".into()),
+            resolved: false,
+        }],
+    };
+
+    service.sync("system_default_user", "run-delivery").await.unwrap();
+    service.sync("system_default_user", "run-delivery").await.unwrap();
+
+    let tasks = repo
+        .list_tasks("run-delivery")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|task| task.task_type == "review_rework")
+        .collect::<Vec<_>>();
+    assert_eq!(tasks.len(), 1);
+    assert!(
+        tasks[0]
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Handle the error path")
+    );
+}
+
+#[tokio::test]
+async fn merge_ready_requires_a_passing_run_level_integration_gate_after_candidate_creation() {
+    let (service, provider, _repo, workspace, _db) = setup().await;
+    std::fs::write(workspace.path().join("README.md"), "candidate\n").unwrap();
+    service
+        .prepare(
+            "system_default_user",
+            "run-delivery",
+            PrepareDeliveryInput { message: None },
+        )
+        .await
+        .unwrap();
+    service.push("system_default_user", "run-delivery", 2).await.unwrap();
+    service
+        .create_pull_request(
+            "system_default_user",
+            "run-delivery",
+            CreatePullRequestInput {
+                title: None,
+                confirmed: true,
+            },
+        )
+        .await
+        .unwrap();
+    *provider.snapshot.lock().unwrap() = DeliveryProviderSnapshot {
+        pull_request: ProviderPullRequest {
+            number: 7,
+            url: "https://github.example/pr/7".into(),
+            status: "open".into(),
+            review_status: "approved".into(),
+        },
+        checks: vec![ProviderCiCheck {
+            id: "check-unit".into(),
+            name: "unit".into(),
+            status: "passed".into(),
+            details_url: None,
+            summary: None,
+        }],
+        review_comments: vec![],
+    };
+
+    let delivery = service.sync("system_default_user", "run-delivery").await.unwrap();
+    assert_eq!(delivery.merge_status, "blocked");
+    assert!(service.merge("system_default_user", "run-delivery", 2).await.is_err());
 }
 
 #[tokio::test]
@@ -414,7 +588,7 @@ async fn no_change_requires_explicit_artifact_and_cannot_be_pushed() {
         .unwrap();
     assert_eq!(delivery.status, "no_change");
     assert!(delivery.commit_sha.is_none());
-    assert!(service.push("system_default_user", "run-delivery", true).await.is_err());
+    assert!(service.push("system_default_user", "run-delivery", 2).await.is_err());
 }
 
 #[tokio::test]
@@ -431,7 +605,7 @@ async fn provider_failures_are_persisted_without_credentials() {
         .unwrap();
     *provider.preflight_error.lock().unwrap() =
         Some("authorization: bearer-secret token=ghp_sensitive password=hunter2".into());
-    assert!(service.push("system_default_user", "run-delivery", true).await.is_err());
+    assert!(service.push("system_default_user", "run-delivery", 2).await.is_err());
     let delivery = service.get("system_default_user", "run-delivery").await.unwrap();
     let error = delivery.last_error.unwrap();
     assert!(error.contains("[REDACTED]"));

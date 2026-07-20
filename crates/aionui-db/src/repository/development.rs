@@ -3,8 +3,9 @@ use aionui_common::TimestampMs;
 use crate::error::DbError;
 use crate::models::{
     AcceptanceCriterionRow, CompletionEvidenceRow, DevelopmentCiCheckRow, DevelopmentDeliveryRow,
-    DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow, PlanRevisionRow, QualityGateRunRow,
-    RequirementVersionRow, ReviewFindingRow, SingleRunWorkspaceRow, TaskArtifactRow, TaskCriterionRow,
+    DevelopmentDeliveryTagRow, DevelopmentDeploymentRow, DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow,
+    PlanRevisionRow, QualityGateRunRow, RequirementVersionRow, ReviewFindingRow, SingleRunWorkspaceRow,
+    TaskArtifactRow, TaskCriterionRow,
 };
 
 #[async_trait::async_trait]
@@ -50,6 +51,51 @@ pub trait IDevelopmentRepository: Send + Sync {
     async fn get_delivery(&self, user_id: &str, run_id: &str) -> Result<Option<DevelopmentDeliveryRow>, DbError>;
     async fn upsert_ci_check(&self, row: &DevelopmentCiCheckRow) -> Result<(), DbError>;
     async fn list_ci_checks(&self, delivery_id: &str) -> Result<Vec<DevelopmentCiCheckRow>, DbError>;
+    async fn create_delivery_tag(&self, row: &DevelopmentDeliveryTagRow) -> Result<bool, DbError>;
+    async fn get_delivery_tag(
+        &self,
+        user_id: &str,
+        delivery_id: &str,
+        name: &str,
+    ) -> Result<Option<DevelopmentDeliveryTagRow>, DbError>;
+    async fn list_delivery_tags(
+        &self,
+        user_id: &str,
+        delivery_id: &str,
+    ) -> Result<Vec<DevelopmentDeliveryTagRow>, DbError>;
+    async fn update_delivery_tag_result(
+        &self,
+        user_id: &str,
+        tag_id: &str,
+        status: &str,
+        remote_url: Option<&str>,
+        last_error: Option<&str>,
+        now: TimestampMs,
+    ) -> Result<bool, DbError>;
+
+    async fn create_deployment(&self, row: &DevelopmentDeploymentRow) -> Result<bool, DbError>;
+    async fn get_deployment(
+        &self,
+        user_id: &str,
+        deployment_id: &str,
+    ) -> Result<Option<DevelopmentDeploymentRow>, DbError>;
+    async fn get_deployment_by_key(
+        &self,
+        user_id: &str,
+        deployment_key: &str,
+    ) -> Result<Option<DevelopmentDeploymentRow>, DbError>;
+    async fn list_deployments(&self, user_id: &str, run_id: &str) -> Result<Vec<DevelopmentDeploymentRow>, DbError>;
+    async fn approve_deployment(&self, user_id: &str, deployment_id: &str, now: TimestampMs) -> Result<bool, DbError>;
+    async fn claim_deployment(&self, user_id: &str, deployment_id: &str, now: TimestampMs) -> Result<bool, DbError>;
+    async fn update_deployment_result(
+        &self,
+        user_id: &str,
+        deployment_id: &str,
+        status: &str,
+        remote_id: Option<&str>,
+        last_error: Option<&str>,
+        now: TimestampMs,
+    ) -> Result<bool, DbError>;
 
     async fn append_requirement_version(
         &self,

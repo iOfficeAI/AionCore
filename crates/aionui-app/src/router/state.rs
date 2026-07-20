@@ -41,10 +41,10 @@ use aionui_db::{
 };
 use aionui_development::{
     ApprovalOption, ApprovalRequestInput, ApprovalResolver, ApprovalRouterState, ApprovalService, ApprovalSource,
-    DeliveryService, DevelopmentOperationsService, DevelopmentRouterState, DevelopmentRunner, DevelopmentService,
-    DevelopmentWorkspacePort, GhCliDeliveryProvider, PrepareDevelopmentWorkspace, PreparedDevelopmentWorkspace,
-    PricingService, ResolveApprovalContext, ResourceLeaseCoordinator, SecretService,
-    SystemDevelopmentResourceController,
+    DeliveryService, DeploymentService, DevelopmentOperationsService, DevelopmentRouterState, DevelopmentRunner,
+    DevelopmentService, DevelopmentWorkspacePort, GhCliDeliveryProvider, GitLabCliDeliveryProvider,
+    PrepareDevelopmentWorkspace, PreparedDevelopmentWorkspace, PricingService, ResolveApprovalContext,
+    ResourceLeaseCoordinator, SecretService, SystemDevelopmentResourceController, UnconfiguredDeploymentProvider,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -1128,7 +1128,16 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
             .with_runner(runner),
         ),
         delivery_service: Arc::new(
-            DeliveryService::new(development_repo, project_repo, Arc::new(GhCliDeliveryProvider))
+            DeliveryService::new(
+                development_repo.clone(),
+                project_repo.clone(),
+                Arc::new(GhCliDeliveryProvider),
+            )
+            .with_provider(Arc::new(GitLabCliDeliveryProvider))
+            .with_operations(operations_service.clone()),
+        ),
+        deployment_service: Arc::new(
+            DeploymentService::new(development_repo, project_repo, Arc::new(UnconfiguredDeploymentProvider))
                 .with_operations(operations_service.clone()),
         ),
         operations_service,
