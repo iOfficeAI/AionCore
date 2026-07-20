@@ -2,6 +2,9 @@ use aionui_api_types::AgentDynamicProbeResult;
 use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
 
+use aionui_api_types::ProjectRepositoryFacts;
+use aionui_db::models::ProjectRow;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateProjectInput {
     pub name: String,
@@ -14,6 +17,12 @@ pub struct CreateProjectInput {
 
 fn default_project_type() -> String {
     "unknown".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnboardProjectResult {
+    pub project: ProjectRow,
+    pub repository: ProjectRepositoryFacts,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -1035,12 +1035,10 @@ fn build_project_state(services: &AppServices, agent_service: Arc<AgentService>)
     let agent_port: Arc<dyn ProjectAgentCapabilityPort> =
         Arc::new(ProjectAgentCapabilityAdapter { service: agent_service });
     ProjectRouterState {
-        service: Arc::new(ProjectService::new(
-            project_repo,
-            conversation_repo,
-            team_repo,
-            agent_port,
-        )),
+        service: Arc::new(
+            ProjectService::new(project_repo, conversation_repo, team_repo, agent_port)
+                .with_managed_project_root(services.data_dir.join("projects")),
+        ),
     }
 }
 

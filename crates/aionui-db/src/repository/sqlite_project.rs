@@ -2,7 +2,9 @@ use aionui_common::now_ms;
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{ProjectCommandProfileRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow};
+use crate::models::{
+    ProjectCommandProfileRow, ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow,
+};
 use crate::repository::project::{IProjectRepository, UpdateProjectParams};
 
 #[derive(Clone, Debug)]
@@ -207,6 +209,60 @@ impl IProjectRepository for SqliteProjectRepository {
         .await?)
     }
 
+    async fn upsert_repository_facts(&self, row: &ProjectRepositoryFactsRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO project_repository_facts \
+             (project_id, repository_url, default_branch, baseline_commit, repository_dirty, \
+              dirty_worktree_choice, dirty_snapshot_ref, credential_reference, detected_languages_json, \
+              detected_package_managers_json, detected_rules_files_json, monorepo_packages_json, \
+              submodules_json, lfs_detected, detected_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(project_id) DO UPDATE SET \
+              repository_url = excluded.repository_url, default_branch = excluded.default_branch, \
+              baseline_commit = excluded.baseline_commit, repository_dirty = excluded.repository_dirty, \
+              dirty_worktree_choice = excluded.dirty_worktree_choice, dirty_snapshot_ref = excluded.dirty_snapshot_ref, \
+              credential_reference = excluded.credential_reference, detected_languages_json = excluded.detected_languages_json, \
+              detected_package_managers_json = excluded.detected_package_managers_json, \
+              detected_rules_files_json = excluded.detected_rules_files_json, \
+              monorepo_packages_json = excluded.monorepo_packages_json, submodules_json = excluded.submodules_json, \
+              lfs_detected = excluded.lfs_detected, detected_at = excluded.detected_at",
+        )
+        .bind(&row.project_id)
+        .bind(&row.repository_url)
+        .bind(&row.default_branch)
+        .bind(&row.baseline_commit)
+        .bind(row.repository_dirty)
+        .bind(&row.dirty_worktree_choice)
+        .bind(&row.dirty_snapshot_ref)
+        .bind(&row.credential_reference)
+        .bind(&row.detected_languages_json)
+        .bind(&row.detected_package_managers_json)
+        .bind(&row.detected_rules_files_json)
+        .bind(&row.monorepo_packages_json)
+        .bind(&row.submodules_json)
+        .bind(row.lfs_detected)
+        .bind(row.detected_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_repository_facts(
+        &self,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ProjectRepositoryFactsRow>, DbError> {
+        Ok(sqlx::query_as::<_, ProjectRepositoryFactsRow>(
+            "SELECT facts.* FROM project_repository_facts facts \
+             JOIN projects project ON project.id = facts.project_id \
+             WHERE facts.project_id = ? AND project.user_id = ?",
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     async fn bind_resource(
         &self,
         project_id: &str,
@@ -238,6 +294,34 @@ impl IProjectRepository for SqliteProjectRepository {
         .execute(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    async fn resource_is_owned(&self, user_id: &str, resource_type: &str, resource_id: &str) -> Result<bool, DbError> {
+        let query = match resource_type {
+            "conversation" => "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ? AND user_id = ?)",
+            "team" => "SELECT EXISTS(SELECT 1 FROM teams WHERE id = ? AND user_id = ?)",
+            "cron" => {
+                "SELECT EXISTS(\
+                    SELECT 1 FROM cron_jobs cron \
+                    JOIN conversations conversation ON conversation.id = cron.conversation_id \
+                    WHERE cron.id = ? AND conversation.user_id = ?\
+                )"
+            }
+            "channel" => {
+                "SELECT EXISTS(\
+                    SELECT 1 FROM assistant_sessions channel \
+                    JOIN conversations conversation ON conversation.id = channel.conversation_id \
+                    WHERE channel.id = ? AND conversation.user_id = ?\
+                )"
+            }
+            _ => return Ok(false),
+        };
+        let owned: i64 = sqlx::query_scalar(query)
+            .bind(resource_id)
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(owned != 0)
     }
 
     async fn get_for_resource(

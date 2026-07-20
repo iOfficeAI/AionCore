@@ -115,6 +115,55 @@ async fn project_routes_support_crud_profiles_and_preflight() {
 }
 
 #[tokio::test]
+async fn project_routes_onboard_and_return_repository_evidence() {
+    let (app, temp, _db) = app().await;
+    let repository_path = temp.path().join("repository");
+    std::fs::create_dir(&repository_path).unwrap();
+    let repository = git2::Repository::init(&repository_path).unwrap();
+    std::fs::write(repository_path.join("main.rs"), "fn main() {}\n").unwrap();
+    let mut index = repository.index().unwrap();
+    index.add_path(std::path::Path::new("main.rs")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repository.find_tree(tree_id).unwrap();
+    let signature = git2::Signature::now("Aion test", "aion@example.test").unwrap();
+    repository
+        .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+        .unwrap();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/projects/onboard")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "name": "Onboarded",
+                "source": { "kind": "local", "path": repository_path },
+                "dirty_worktree_choice": "reject",
+                "project_type": "single"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = json(response).await;
+    let project_id = body["data"]["project"]["id"].as_str().unwrap();
+    assert!(body["data"]["repository"]["baseline_commit"].as_str().is_some());
+    assert_eq!(body["data"]["repository"]["languages"], serde_json::json!(["rust"]));
+
+    let evidence = Request::builder()
+        .uri(format!("/api/projects/{project_id}/repository-facts"))
+        .body(Body::empty())
+        .unwrap();
+    let evidence = json(app.oneshot(evidence).await.unwrap()).await;
+    assert_eq!(
+        evidence["data"]["baseline_commit"],
+        body["data"]["repository"]["baseline_commit"]
+    );
+}
+
+#[tokio::test]
 async fn project_routes_reject_invalid_json_and_missing_project() {
     let (app, _temp, _db) = app().await;
     let invalid = Request::builder()

@@ -50,3 +50,22 @@ pub struct ProjectResourceLinkRow {
     pub resource_id: String,
     pub created_at: TimestampMs,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ProjectRepositoryFactsRow {
+    pub project_id: String,
+    pub repository_url: Option<String>,
+    pub default_branch: Option<String>,
+    pub baseline_commit: Option<String>,
+    pub repository_dirty: bool,
+    pub dirty_worktree_choice: String,
+    pub dirty_snapshot_ref: Option<String>,
+    pub credential_reference: Option<String>,
+    pub detected_languages_json: String,
+    pub detected_package_managers_json: String,
+    pub detected_rules_files_json: String,
+    pub monorepo_packages_json: String,
+    pub submodules_json: String,
+    pub lfs_detected: bool,
+    pub detected_at: TimestampMs,
+}

@@ -21,10 +21,10 @@ pub use models::{
     AssistantOverrideRow, AssistantPreferenceRow, AssistantRow, ConversationArtifactRow,
     ConversationAssistantSnapshotRow, CreateAssistantParams, DevelopmentAlertRow, DevelopmentAuditEventRow,
     DevelopmentPolicyRow, DevelopmentRecoveryRecordRow, DevelopmentRunRoleRow, DevelopmentRunRow, DevelopmentTaskRow,
-    DevelopmentUsageEventRow, DevelopmentUsageSummary, ProjectCommandProfileRow, ProjectResourceLinkRow, ProjectRow,
-    ProjectRuntimeProfileRow, QualityGateRunRow, ReviewFindingRow, SkillImportRecordRow, SkillRow, TaskArtifactRow,
-    UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
-    UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    DevelopmentUsageEventRow, DevelopmentUsageSummary, ProjectCommandProfileRow, ProjectRepositoryFactsRow,
+    ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow, QualityGateRunRow, ReviewFindingRow,
+    SkillImportRecordRow, SkillRow, TaskArtifactRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
+    UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams,
 };
 pub use repository::channel::UpdatePluginStatusParams;

@@ -761,6 +761,7 @@ dependencies = [
  "aionui-auth",
  "aionui-common",
  "aionui-db",
+ "aionui-runtime",
  "async-trait",
  "axum",
  "git2",
@@ -773,6 +774,7 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
+ "walkdir",
  "which 7.0.3",
 ]
 

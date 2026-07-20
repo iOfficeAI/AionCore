@@ -1,5 +1,7 @@
 use crate::error::DbError;
-use crate::models::{ProjectCommandProfileRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow};
+use crate::models::{
+    ProjectCommandProfileRow, ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct UpdateProjectParams {
@@ -35,6 +37,12 @@ pub trait IProjectRepository: Send + Sync {
         project_id: &str,
         user_id: &str,
     ) -> Result<Option<ProjectRuntimeProfileRow>, DbError>;
+    async fn upsert_repository_facts(&self, row: &ProjectRepositoryFactsRow) -> Result<(), DbError>;
+    async fn get_repository_facts(
+        &self,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ProjectRepositoryFactsRow>, DbError>;
 
     async fn bind_resource(
         &self,
@@ -43,6 +51,7 @@ pub trait IProjectRepository: Send + Sync {
         resource_type: &str,
         resource_id: &str,
     ) -> Result<ProjectResourceLinkRow, DbError>;
+    async fn resource_is_owned(&self, user_id: &str, resource_type: &str, resource_id: &str) -> Result<bool, DbError>;
     async fn get_for_resource(
         &self,
         user_id: &str,

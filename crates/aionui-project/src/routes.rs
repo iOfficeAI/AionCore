@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use aionui_api_types::ApiResponse;
+use aionui_api_types::{ApiResponse, ProjectRepositoryFacts, ProjectRepositoryOnboardingInput};
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use axum::Router;
@@ -57,6 +57,7 @@ struct ResourceQuery {
 pub fn project_routes(state: ProjectRouterState) -> Router {
     Router::new()
         .route("/api/projects", post(create).get(list))
+        .route("/api/projects/onboard", post(onboard))
         .route("/api/projects/by-resource", get(get_for_resource))
         .route("/api/projects/{id}", get(get_one).patch(update).delete(delete_one))
         .route(
@@ -69,7 +70,32 @@ pub fn project_routes(state: ProjectRouterState) -> Router {
         )
         .route("/api/projects/{id}/links", get(list_links).post(bind_resource))
         .route("/api/projects/{id}/preflight", post(preflight))
+        .route("/api/projects/{id}/repository-facts", get(get_repository_facts))
         .with_state(state)
+}
+
+async fn onboard(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<ProjectRepositoryOnboardingInput>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<crate::types::OnboardProjectResult>>), ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    let result = state.service.onboard(&user.id, input).await.map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(result))))
+}
+
+async fn get_repository_facts(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<ProjectRepositoryFacts>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_repository_facts(&user.id, &id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
 }
 
 async fn create(

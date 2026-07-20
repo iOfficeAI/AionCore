@@ -19,6 +19,7 @@ mod file;
 mod lifecycle;
 mod mcp;
 mod office;
+mod project;
 mod provider;
 mod remote_agent;
 mod response;
@@ -118,6 +119,10 @@ pub use office::{
     ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, GetSnapshotContentRequest, ListSnapshotsRequest, PptJsonData,
     PptSlideData, PreviewHistoryTargetDto, PreviewSnapshotInfoDto, PreviewState, PreviewStatusEvent,
     PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StartPreviewRequest, StopPreviewRequest,
+};
+pub use project::{
+    DirtyWorktreeChoice, ProjectRepositoryFacts, ProjectRepositoryOnboardingInput, RepositorySource,
+    RepositorySubmodule,
 };
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest, DetectionSuggestion,

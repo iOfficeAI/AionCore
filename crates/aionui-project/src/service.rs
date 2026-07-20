@@ -1,14 +1,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use aionui_api_types::{DirtyWorktreeChoice, ProjectRepositoryFacts, ProjectRepositoryOnboardingInput};
 use aionui_common::now_ms;
-use aionui_db::models::{ProjectCommandProfileRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow};
+use aionui_db::models::{
+    ProjectCommandProfileRow, ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow,
+};
 use aionui_db::{IConversationRepository, IProjectRepository, ITeamRepository, UpdateProjectParams};
 
 use crate::error::ProjectError;
+use crate::repository_source::RepositoryOnboarder;
 use crate::types::{
-    AgentCapabilitySnapshot, AgentPreflightResult, CreateProjectInput, PreflightCheck, ProjectCommandProfileInput,
-    ProjectPreflightResult, ProjectRuntimeProfileInput, UpdateProjectInput,
+    AgentCapabilitySnapshot, AgentPreflightResult, CreateProjectInput, OnboardProjectResult, PreflightCheck,
+    ProjectCommandProfileInput, ProjectPreflightResult, ProjectRuntimeProfileInput, UpdateProjectInput,
 };
 
 const AGENT_SNAPSHOT_STALE_MS: i64 = 24 * 60 * 60 * 1000;
@@ -24,6 +28,7 @@ pub struct ProjectService {
     conversation_repo: Arc<dyn IConversationRepository>,
     team_repo: Arc<dyn ITeamRepository>,
     agent_port: Arc<dyn ProjectAgentCapabilityPort>,
+    repository_onboarder: RepositoryOnboarder,
 }
 
 impl ProjectService {
@@ -38,7 +43,59 @@ impl ProjectService {
             conversation_repo,
             team_repo,
             agent_port,
+            repository_onboarder: RepositoryOnboarder::new(std::env::temp_dir().join("aionui-managed-projects")),
         }
+    }
+
+    pub fn with_managed_project_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.repository_onboarder = RepositoryOnboarder::new(root);
+        self
+    }
+
+    pub async fn onboard(
+        &self,
+        user_id: &str,
+        input: ProjectRepositoryOnboardingInput,
+    ) -> Result<OnboardProjectResult, ProjectError> {
+        let name = non_empty(input.name, "project name")?;
+        validate_project_type(&input.project_type)?;
+        let repository = self
+            .repository_onboarder
+            .onboard(input.source, input.dirty_worktree_choice)
+            .await?;
+        let now = now_ms();
+        let project = ProjectRow {
+            id: uuid::Uuid::now_v7().to_string(),
+            user_id: user_id.to_owned(),
+            name,
+            local_path: repository.local_path.clone(),
+            repository_url: repository.repository_url.clone(),
+            default_branch: repository.default_branch.clone(),
+            project_type: input.project_type,
+            created_at: now,
+            updated_at: now,
+        };
+        self.project_repo.create(&project).await?;
+        let facts = repository_facts_row(&project.id, &repository)?;
+        if let Err(error) = self.project_repo.upsert_repository_facts(&facts).await {
+            let _ = self.project_repo.delete_for_user(&project.id, user_id).await;
+            return Err(error.into());
+        }
+        Ok(OnboardProjectResult { project, repository })
+    }
+
+    pub async fn get_repository_facts(
+        &self,
+        user_id: &str,
+        project_id: &str,
+    ) -> Result<ProjectRepositoryFacts, ProjectError> {
+        let project = self.get(user_id, project_id).await?;
+        let row = self
+            .project_repo
+            .get_repository_facts(project_id, user_id)
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("repository facts for project {project_id}")))?;
+        project_repository_facts(row, project.local_path)
     }
 
     pub async fn create(&self, user_id: &str, input: CreateProjectInput) -> Result<ProjectRow, ProjectError> {
@@ -196,6 +253,11 @@ impl ProjectService {
                 .get_team(resource_id)
                 .await?
                 .is_some_and(|row| row.user_id == user_id),
+            "cron" | "channel" => {
+                self.project_repo
+                    .resource_is_owned(user_id, resource_type, resource_id)
+                    .await?
+            }
             other => return Err(ProjectError::BadRequest(format!("unsupported resource type: {other}"))),
         };
         if !owned {
@@ -222,7 +284,7 @@ impl ProjectService {
         resource_type: &str,
         resource_id: &str,
     ) -> Result<ProjectRow, ProjectError> {
-        if !matches!(resource_type, "conversation" | "team") {
+        if !matches!(resource_type, "conversation" | "team" | "cron" | "channel") {
             return Err(ProjectError::BadRequest(format!(
                 "unsupported resource type: {resource_type}"
             )));
@@ -277,6 +339,71 @@ fn non_empty(value: String, field: &str) -> Result<String, ProjectError> {
 
 fn trim_optional(value: Option<String>) -> Option<String> {
     value.map(|item| item.trim().to_owned()).filter(|item| !item.is_empty())
+}
+
+fn repository_facts_row(
+    project_id: &str,
+    facts: &ProjectRepositoryFacts,
+) -> Result<ProjectRepositoryFactsRow, ProjectError> {
+    let json_error = |error: serde_json::Error| ProjectError::Internal(error.to_string());
+    Ok(ProjectRepositoryFactsRow {
+        project_id: project_id.to_owned(),
+        repository_url: facts.repository_url.clone(),
+        default_branch: facts.default_branch.clone(),
+        baseline_commit: facts.baseline_commit.clone(),
+        repository_dirty: facts.dirty,
+        dirty_worktree_choice: dirty_choice_name(facts.dirty_worktree_choice).into(),
+        dirty_snapshot_ref: facts.dirty_snapshot_ref.clone(),
+        credential_reference: facts.credential_reference.clone(),
+        detected_languages_json: serde_json::to_string(&facts.languages).map_err(json_error)?,
+        detected_package_managers_json: serde_json::to_string(&facts.package_managers).map_err(json_error)?,
+        detected_rules_files_json: serde_json::to_string(&facts.rules_files).map_err(json_error)?,
+        monorepo_packages_json: serde_json::to_string(&facts.monorepo_packages).map_err(json_error)?,
+        submodules_json: serde_json::to_string(&facts.submodules).map_err(json_error)?,
+        lfs_detected: facts.lfs_detected,
+        detected_at: facts.detected_at,
+    })
+}
+
+fn project_repository_facts(
+    row: ProjectRepositoryFactsRow,
+    local_path: String,
+) -> Result<ProjectRepositoryFacts, ProjectError> {
+    let json_error = |error: serde_json::Error| ProjectError::Internal(error.to_string());
+    Ok(ProjectRepositoryFacts {
+        local_path,
+        repository_url: row.repository_url,
+        default_branch: row.default_branch,
+        baseline_commit: row.baseline_commit,
+        dirty: row.repository_dirty,
+        dirty_worktree_choice: match row.dirty_worktree_choice.as_str() {
+            "preserve" => DirtyWorktreeChoice::Preserve,
+            "snapshot" => DirtyWorktreeChoice::Snapshot,
+            "reject" => DirtyWorktreeChoice::Reject,
+            value => {
+                return Err(ProjectError::Internal(format!(
+                    "invalid persisted dirty choice: {value}"
+                )));
+            }
+        },
+        dirty_snapshot_ref: row.dirty_snapshot_ref,
+        credential_reference: row.credential_reference,
+        languages: serde_json::from_str(&row.detected_languages_json).map_err(json_error)?,
+        package_managers: serde_json::from_str(&row.detected_package_managers_json).map_err(json_error)?,
+        rules_files: serde_json::from_str(&row.detected_rules_files_json).map_err(json_error)?,
+        monorepo_packages: serde_json::from_str(&row.monorepo_packages_json).map_err(json_error)?,
+        submodules: serde_json::from_str(&row.submodules_json).map_err(json_error)?,
+        lfs_detected: row.lfs_detected,
+        detected_at: row.detected_at,
+    })
+}
+
+fn dirty_choice_name(value: DirtyWorktreeChoice) -> &'static str {
+    match value {
+        DirtyWorktreeChoice::Preserve => "preserve",
+        DirtyWorktreeChoice::Snapshot => "snapshot",
+        DirtyWorktreeChoice::Reject => "reject",
+    }
 }
 
 fn validate_project_type(value: &str) -> Result<(), ProjectError> {

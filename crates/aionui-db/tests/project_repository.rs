@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aionui_db::models::{ProjectCommandProfileRow, ProjectRow, ProjectRuntimeProfileRow};
+use aionui_db::models::{ProjectCommandProfileRow, ProjectRepositoryFactsRow, ProjectRow, ProjectRuntimeProfileRow};
 use aionui_db::{DbError, IProjectRepository, SqliteProjectRepository, UpdateProjectParams, init_database_memory};
 
 const USER: &str = "system_default_user";
@@ -118,4 +118,86 @@ async fn resource_binding_replaces_the_previous_project_for_same_owner() {
     assert_eq!(linked.id, "p2");
     assert!(repo.list_resource_links("p1", USER).await.unwrap().is_empty());
     assert_eq!(repo.list_resource_links("p2", USER).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn repository_facts_roundtrip_without_exposing_secret_values() {
+    let (repo, _db) = repo().await;
+    repo.create(&project("p1", "/tmp/p1")).await.unwrap();
+    repo.upsert_repository_facts(&ProjectRepositoryFactsRow {
+        project_id: "p1".into(),
+        repository_url: Some("ssh://git@example.test/org/repo.git".into()),
+        default_branch: Some("main".into()),
+        baseline_commit: Some("abc123".into()),
+        repository_dirty: true,
+        dirty_worktree_choice: "snapshot".into(),
+        dirty_snapshot_ref: Some("/managed/_snapshots/one".into()),
+        credential_reference: Some("vault:github-production".into()),
+        detected_languages_json: r#"["rust"]"#.into(),
+        detected_package_managers_json: r#"["cargo"]"#.into(),
+        detected_rules_files_json: r#"["AGENTS.md"]"#.into(),
+        monorepo_packages_json: r#"["crates/demo"]"#.into(),
+        submodules_json: "[]".into(),
+        lfs_detected: true,
+        detected_at: 300,
+    })
+    .await
+    .unwrap();
+
+    let stored = repo.get_repository_facts("p1", USER).await.unwrap().unwrap();
+    assert_eq!(stored.baseline_commit.as_deref(), Some("abc123"));
+    assert_eq!(stored.credential_reference.as_deref(), Some("vault:github-production"));
+    assert!(!serde_json::to_string(&stored).unwrap().contains("private-token"));
+    assert!(repo.get_repository_facts("p1", "other-user").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn cron_and_channel_ownership_follow_their_bound_conversation_owner() {
+    let (repo, db) = repo().await;
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+         VALUES ('conversation-owned', 'system_default_user', 'Owned', 'acp', 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cron_jobs \
+         (id, name, schedule_kind, schedule_value, payload_message, execution_mode, conversation_id, created_by, \
+          created_at, updated_at) \
+         VALUES ('cron-owned', 'Owned cron', 'every', '60', 'run', 'existing', 'conversation-owned', 'user', 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO assistant_users (id, platform_user_id, platform_type, authorized_at) \
+         VALUES ('channel-user', 'telegram-user', 'telegram', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO assistant_sessions \
+         (id, user_id, agent_type, conversation_id, created_at, last_activity) \
+         VALUES ('channel-owned', 'channel-user', 'acp', 'conversation-owned', 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    assert!(repo.resource_is_owned(USER, "cron", "cron-owned").await.unwrap());
+    assert!(repo.resource_is_owned(USER, "channel", "channel-owned").await.unwrap());
+    assert!(
+        !repo
+            .resource_is_owned("other-user", "cron", "cron-owned")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repo
+            .resource_is_owned("other-user", "channel", "channel-owned")
+            .await
+            .unwrap()
+    );
 }
