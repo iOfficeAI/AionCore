@@ -1066,6 +1066,11 @@ pub async fn build_session_instance(
         model,
         mode,
         init,
+        // Packaged app: resolve the bundled claude/codex binary and forward its
+        // absolute path so the backend spawns OUR CLI, not the user's PATH one.
+        // `None` in dev / non-bundled runs → backend falls back to the bare name
+        // (PATH). Detection (cli_probe) stays PATH-only and is unaffected.
+        cli_program: aionui_runtime::resolve_bundled_cli(backend_label),
         ..Default::default()
     };
 
