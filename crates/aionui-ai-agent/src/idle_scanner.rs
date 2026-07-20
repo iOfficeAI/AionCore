@@ -116,7 +116,9 @@ async fn scan_and_cleanup(
 
     if let Some(coordinator) = idle_cleanup_coordinator {
         let before_count = idle_ids.len();
-        idle_ids = coordinator.cleanup_idle_conversations(idle_ids, team_threshold_ms).await;
+        idle_ids = coordinator
+            .cleanup_idle_conversations(idle_ids, team_threshold_ms)
+            .await;
         let handled_count = before_count.saturating_sub(idle_ids.len());
         if handled_count > 0 {
             info!(
@@ -350,11 +352,8 @@ mod tests {
 
     #[test]
     fn resolve_idle_config_parses_valid_values() {
-        let (solo, team, scan) = resolve_idle_config(
-            Some("300".to_string()),
-            Some("300".to_string()),
-            Some("10".to_string()),
-        );
+        let (solo, team, scan) =
+            resolve_idle_config(Some("300".to_string()), Some("300".to_string()), Some("10".to_string()));
         assert_eq!(solo, 300);
         assert_eq!(team, 300);
         assert_eq!(scan, 10);
@@ -363,11 +362,8 @@ mod tests {
     #[test]
     fn resolve_idle_config_falls_back_on_invalid_values() {
         // negative, zero, non-numeric, empty -> defaults
-        let (solo, team, scan) = resolve_idle_config(
-            Some("-5".to_string()),
-            Some("0".to_string()),
-            Some("abc".to_string()),
-        );
+        let (solo, team, scan) =
+            resolve_idle_config(Some("-5".to_string()), Some("0".to_string()), Some("abc".to_string()));
         assert_eq!(solo, 600);
         assert_eq!(team, 1800);
         assert_eq!(scan, 60);
