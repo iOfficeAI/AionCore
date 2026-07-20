@@ -1881,6 +1881,8 @@ impl TeamSessionService {
                 member_count = agents.len(),
                 "team idle cleanup stopping idle team session"
             );
+            info!(team_id, reason = "idle_cleanup", "broadcasting team session stopped");
+            self.broadcast_session_status(&team_id, TeamSessionStatus::Stopped, None, |_| {});
             self.stop_session_unchecked(&team_id);
             for agent in agents {
                 self.task_manager
@@ -2629,6 +2631,76 @@ mod tests {
         assert!(unhandled.is_empty());
         assert_eq!(svc.session_count_for_test(), 0);
         assert_eq!(task_manager.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_cleanup_broadcasts_team_session_stopped() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Idle Cleanup Stopped Broadcast"))
+            .await
+            .unwrap();
+        let lead = created.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+        task_manager.insert_idle_finished_agent(&lead.conversation_id);
+        task_manager.insert_idle_finished_agent(&worker.conversation_id);
+
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+
+        let unhandled = svc
+            .cleanup_idle_team_runtime_tasks(vec![lead.conversation_id.clone()], &ActiveLeaseRegistry::new(), 300_000)
+            .await;
+
+        assert!(unhandled.is_empty());
+        assert_eq!(svc.session_count_for_test(), 0);
+        assert_eq!(task_manager.active_count(), 0);
+
+        let stopped_events: Vec<_> = broadcaster
+            .events_by_name("team.sessionStatusChanged")
+            .into_iter()
+            .filter(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("stopped"))
+            .collect();
+        assert_eq!(
+            stopped_events.len(),
+            1,
+            "idle cleanup must broadcast exactly one stopped status"
+        );
+        assert_eq!(
+            stopped_events[0]
+                .data
+                .get("team_id")
+                .and_then(serde_json::Value::as_str),
+            Some(created.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_session_does_not_broadcast_team_session_stopped() {
+        let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster();
+        let created = svc
+            .create_team(
+                "user-test",
+                single_agent_team_request("Explicit Stop No Stopped Broadcast"),
+            )
+            .await
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+
+        svc.stop_session("user-test", &created.id).await.unwrap();
+
+        let stopped_count = broadcaster
+            .events_by_name("team.sessionStatusChanged")
+            .into_iter()
+            .filter(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("stopped"))
+            .count();
+        assert_eq!(stopped_count, 0, "explicit stop must not broadcast a stopped status");
     }
 
     #[test]

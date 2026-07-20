@@ -644,8 +644,8 @@ mod tests {
     async fn seed_rows_populated_after_migrations() {
         let (repo, _db) = setup().await;
         let rows = repo.list_all().await.unwrap();
-        // 19 ACP vendors + 2 non-ACP builtins + 1 internal = 22.
-        assert_eq!(rows.len(), 22);
+        // 37 ACP vendors + 2 non-ACP builtins + 1 internal = 40.
+        assert_eq!(rows.len(), 40);
         assert!(
             rows.iter()
                 .any(|r| r.name == "Claude Code" && r.agent_source == "builtin")
@@ -679,7 +679,11 @@ mod tests {
             .find(|r| r.name == "Pi" && r.backend.as_deref() == Some("pi") && r.agent_source == "builtin")
             .expect("seeded Pi ACP row");
         assert_eq!(pi.command.as_deref(), Some("npx"));
-        assert_eq!(pi.args.as_deref(), Some(r#"["-y","pi-acp@0.0.31"]"#));
+        assert_eq!(pi.args.as_deref(), Some(r#"["-y","pi-acp"]"#));
+        assert_eq!(
+            pi.agent_source_info.as_deref(),
+            Some(r#"{"binary_name":"pi","bridge_binary":"npx"}"#)
+        );
     }
 
     #[tokio::test]
@@ -802,7 +806,7 @@ mod tests {
         assert_eq!(codebuddy.command.as_deref(), Some("npx"));
         assert_eq!(
             codebuddy.args.as_deref(),
-            Some(r#"["-y","--package","@tencent-ai/codebuddy-code@2.97.0","codebuddy","--acp"]"#)
+            Some(r#"["-y","--package","@tencent-ai/codebuddy-code","codebuddy","--acp"]"#)
         );
         assert_eq!(
             codebuddy.agent_source_info.as_deref(),

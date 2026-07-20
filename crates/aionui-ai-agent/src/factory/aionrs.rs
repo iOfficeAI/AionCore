@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aion_agent::session::SessionManager;
+use aion_config::compat::OpenAiApiMode;
 use aion_config::config::{McpServerConfig, TransportType};
 use aionui_api_types::{
     AionrsBuildExtra, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
@@ -96,7 +97,19 @@ pub(super) async fn build(
     let provider = map_aionrs_provider(&row.platform, &model_id, row.model_protocols.as_deref())?;
 
     let (base_url, compat_overrides) =
-        resolve_aionrs_url_and_compat(&row.platform, &row.base_url, &provider, row.is_full_url);
+        resolve_aionrs_url_and_compat(&row.platform, &row.base_url, &provider, &model_id, row.is_full_url);
+
+    if compat_overrides.openai_api_mode == Some(OpenAiApiMode::Responses) {
+        info!(
+            conversation_id = %ctx.conversation_id,
+            platform = %row.platform,
+            provider = %provider,
+            model = %model_id,
+            is_full_url = row.is_full_url,
+            api_mode = "responses",
+            "Resolved Aionrs OpenAI transport"
+        );
+    }
 
     let bedrock_config = if row.platform == "bedrock" {
         resolve_bedrock_config(row.bedrock_config.as_deref())
@@ -160,7 +173,7 @@ pub(super) async fn build(
         model: model_id,
         base_url,
         system_prompt: overrides.system_prompt,
-        max_tokens: overrides.max_tokens,
+        max_tokens: None,
         max_turns: overrides.max_turns,
         max_tool_call_malformed_turns: overrides.max_tool_call_malformed_turns,
         max_tool_call_failure_turns: overrides.max_tool_call_failure_turns,
@@ -237,18 +250,26 @@ pub(crate) fn map_aionrs_provider(
 /// Resolve base_url and compat overrides for the aionrs provider.
 ///
 /// The stored base_url is treated as the user-controlled endpoint prefix.
-/// OpenAI-compatible providers append `/chat/completions`; Anthropic-compatible
-/// providers append `/v1/messages`.
+/// OpenAI-compatible providers use Chat Completions by default; official
+/// OpenAI GPT-5.6 models use Responses. Anthropic-compatible providers append
+/// `/v1/messages`.
 pub(crate) fn resolve_aionrs_url_and_compat(
     platform: &str,
     raw_base_url: &str,
     mapped_provider: &str,
+    model_id: &str,
     is_full_url: bool,
 ) -> (Option<String>, AionrsCompatOverrides) {
     let mut compat = AionrsCompatOverrides::default();
+    let use_responses = uses_openai_responses_api(platform, mapped_provider, model_id);
 
     if is_full_url {
         let trimmed = raw_base_url.trim_end_matches('/');
+        if use_responses && let Some(responses_url) = rewrite_chat_completions_url_to_responses(trimmed) {
+            compat.openai_api_mode = Some(OpenAiApiMode::Responses);
+            compat.api_path = Some(String::new());
+            return (Some(responses_url), compat);
+        }
         compat.api_path = Some(String::new());
         return (Some(trimmed.to_owned()), compat);
     }
@@ -263,9 +284,17 @@ pub(crate) fn resolve_aionrs_url_and_compat(
     let trimmed = raw_base_url.trim_end_matches('/');
     let base_url = Some(trimmed.to_owned()).filter(|u| !u.is_empty());
 
+    if use_responses {
+        compat.openai_api_mode = Some(OpenAiApiMode::Responses);
+    }
+
     match mapped_provider {
         "openai" if base_url.is_some() => {
-            compat.api_path = Some("/chat/completions".to_owned());
+            compat.api_path = Some(if use_responses {
+                "/responses".to_owned()
+            } else {
+                "/chat/completions".to_owned()
+            });
         }
         "anthropic" if base_url.is_some() && platform != "anthropic" => {
             compat.api_path = Some("/v1/messages".to_owned());
@@ -278,6 +307,21 @@ pub(crate) fn resolve_aionrs_url_and_compat(
     }
 
     (base_url, compat)
+}
+
+fn uses_openai_responses_api(platform: &str, mapped_provider: &str, model_id: &str) -> bool {
+    if mapped_provider != "openai" || platform == "gemini" {
+        return false;
+    }
+
+    let model = model_id.to_ascii_lowercase();
+    model == "gpt-5.6" || model.starts_with("gpt-5.6-")
+}
+
+fn rewrite_chat_completions_url_to_responses(url: &str) -> Option<String> {
+    url.strip_suffix("/chat/completions")
+        .map(|prefix| format!("{prefix}/responses"))
+        .or_else(|| url.ends_with("/responses").then(|| url.to_owned()))
 }
 
 fn resolve_model_protocol(model_id: &str, model_protocols: Option<&str>) -> Result<String, AgentError> {
@@ -1038,6 +1082,75 @@ mod tests {
         assert!(!is_openai_host("not-a-url"));
     }
 
+    #[test]
+    fn openai_protocol_gpt_5_6_family_uses_responses() {
+        let cases = [
+            ("openai", "https://api.openai.com/v1", "gpt-5.6"),
+            ("custom", "https://api.openai.com/v1", "gpt-5.6-sol"),
+            ("new-api", "https://proxy.example.com/v1", "GPT-5.6-SOL-2026-07-01"),
+        ];
+
+        for (platform, raw_base_url, model_id) in cases {
+            let (base_url, compat) = resolve_aionrs_url_and_compat(platform, raw_base_url, "openai", model_id, false);
+
+            assert_eq!(base_url.as_deref(), Some(raw_base_url), "{model_id}");
+            assert_eq!(compat.openai_api_mode, Some(OpenAiApiMode::Responses), "{model_id}");
+            assert_eq!(compat.api_path.as_deref(), Some("/responses"), "{model_id}");
+        }
+    }
+
+    #[test]
+    fn responses_selection_does_not_leak_to_other_providers_or_full_urls() {
+        let cases = [
+            ("gemini", "openai", "gpt-5.6-sol", false),
+            ("bedrock", "bedrock", "openai.gpt-5.6-sol", false),
+            ("openai", "openai", "gpt-5.60-sol", false),
+        ];
+
+        for (platform, provider, model_id, is_full_url) in cases {
+            let (_, compat) = resolve_aionrs_url_and_compat(
+                platform,
+                "https://example.test/v1/chat/completions",
+                provider,
+                model_id,
+                is_full_url,
+            );
+
+            assert_eq!(compat.openai_api_mode, None, "{platform}/{model_id}");
+        }
+    }
+
+    #[test]
+    fn openai_protocol_gpt_5_6_full_url_is_rewritten_to_responses() {
+        for raw_base_url in [
+            "https://api.openai.com/v1/chat/completions",
+            "https://proxy.example.com/v1/chat/completions/",
+            "https://api.openai.com/v1/responses",
+        ] {
+            let (base_url, compat) =
+                resolve_aionrs_url_and_compat("custom", raw_base_url, "openai", "gpt-5.6-sol", true);
+
+            assert!(base_url.as_deref().unwrap().ends_with("/responses"), "{raw_base_url}");
+            assert_eq!(compat.openai_api_mode, Some(OpenAiApiMode::Responses), "{raw_base_url}");
+            assert_eq!(compat.api_path.as_deref(), Some(""), "{raw_base_url}");
+        }
+    }
+
+    #[test]
+    fn unrelated_full_url_is_not_rewritten_for_gpt_5_6() {
+        let (base_url, compat) = resolve_aionrs_url_and_compat(
+            "custom",
+            "https://proxy.example.com/generate",
+            "openai",
+            "gpt-5.6-sol",
+            true,
+        );
+
+        assert_eq!(base_url.as_deref(), Some("https://proxy.example.com/generate"));
+        assert_eq!(compat.openai_api_mode, None);
+        assert_eq!(compat.api_path.as_deref(), Some(""));
+    }
+
     struct UrlCompatCase<'a> {
         name: &'a str,
         platform: &'a str,
@@ -1205,8 +1318,13 @@ mod tests {
         ];
 
         for case in cases {
-            let (base_url, compat) =
-                resolve_aionrs_url_and_compat(case.platform, case.raw_base_url, case.mapped_provider, case.is_full_url);
+            let (base_url, compat) = resolve_aionrs_url_and_compat(
+                case.platform,
+                case.raw_base_url,
+                case.mapped_provider,
+                "gpt-4o",
+                case.is_full_url,
+            );
             assert_eq!(base_url.as_deref(), case.expected_base_url, "{}", case.name);
             assert_eq!(compat.api_path.as_deref(), case.expected_api_path, "{}", case.name);
             assert_eq!(
@@ -1348,7 +1466,7 @@ mod tests {
             let provider = map_aionrs_provider("custom", "m", None).expect(case.name);
             assert_eq!(provider, "openai", "{}", case.name);
 
-            let (base_url, compat) = resolve_aionrs_url_and_compat("custom", case.base_url, &provider, false);
+            let (base_url, compat) = resolve_aionrs_url_and_compat("custom", case.base_url, &provider, "m", false);
             assert_eq!(base_url.as_deref(), Some(case.base_url), "{}", case.name);
             assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"), "{}", case.name);
             assert_eq!(
@@ -1439,7 +1557,7 @@ mod tests {
             let provider = map_aionrs_provider(case.platform, "m", None).expect(case.name);
             assert_eq!(provider, case.expected_provider, "{}", case.name);
 
-            let (base_url, compat) = resolve_aionrs_url_and_compat(case.platform, case.base_url, &provider, false);
+            let (base_url, compat) = resolve_aionrs_url_and_compat(case.platform, case.base_url, &provider, "m", false);
             assert_eq!(base_url.as_deref(), case.expected_base_url, "{}", case.name);
             assert_eq!(compat.api_path.as_deref(), case.expected_api_path, "{}", case.name);
 

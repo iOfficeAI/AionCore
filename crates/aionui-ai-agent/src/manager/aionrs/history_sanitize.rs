@@ -85,7 +85,10 @@ fn strip_malformed_tool_calls(messages: &mut Vec<Message>) -> usize {
         msg.content.retain(|block| match block {
             ContentBlock::ToolUse { name, .. } => !name.trim().is_empty(),
             ContentBlock::ToolResult { tool_use_id, .. } => !malformed_tool_use_ids.contains(tool_use_id),
-            ContentBlock::Text { .. } | ContentBlock::Thinking { .. } | ContentBlock::Image { .. } => true,
+            ContentBlock::Text { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::ProviderItem { .. } => true,
         });
     }
 
@@ -119,10 +122,13 @@ fn is_orphaned_assistant_tool_call(msg: &Message, answered: &HashSet<String>) ->
                     has_text = true;
                 }
             }
-            // Thinking, ToolResult, and Image blocks do not change the orphan
-            // determination. ToolResult should not appear on assistant
-            // messages, but if it does we ignore it here.
-            ContentBlock::Thinking { .. } | ContentBlock::ToolResult { .. } | ContentBlock::Image { .. } => {}
+            // Thinking, provider-owned items, ToolResult, and Image blocks do
+            // not change the orphan determination. ToolResult should not
+            // appear on assistant messages, but if it does we ignore it here.
+            ContentBlock::Thinking { .. }
+            | ContentBlock::ProviderItem { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::Image { .. } => {}
         }
     }
 

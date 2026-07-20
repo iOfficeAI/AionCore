@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -28,7 +29,7 @@ fn make_test_config() -> AionrsResolvedConfig {
         model: "claude-sonnet-4-20250514".into(),
         base_url: None,
         system_prompt: None,
-        max_tokens: Some(4096),
+        max_tokens: None,
         max_turns: None,
         max_tool_call_malformed_turns: None,
         max_tool_call_failure_turns: None,
@@ -41,6 +42,79 @@ fn make_test_config() -> AionrsResolvedConfig {
         runtime_env: Vec::new(),
         prompt_dump_dir: None,
     }
+}
+
+fn make_cli_args(project_dir: PathBuf, provider: &str, model: &str) -> CliArgs {
+    CliArgs {
+        provider: Some(provider.to_owned()),
+        api_key: Some("sk-test-key".to_owned()),
+        base_url: None,
+        model: Some(model.to_owned()),
+        max_tokens: None,
+        thinking: None,
+        thinking_budget: None,
+        max_turns: None,
+        max_tool_call_malformed_turns: None,
+        max_tool_call_failure_turns: None,
+        system_prompt: None,
+        profile: None,
+        auto_approve: false,
+        project_dir: Some(project_dir),
+    }
+}
+
+#[test]
+fn resolve_aionui_config_discards_standalone_max_token_settings() {
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join(".aionrs.toml"),
+        r#"
+[default]
+max_tokens = 1234
+
+[providers.openai.compat]
+default_max_tokens = 2345
+
+[[providers.openai.compat.model_max_tokens]]
+pattern = "gpt-test"
+max_tokens = 3456
+"#,
+    )
+    .unwrap();
+    let cli_args = make_cli_args(project.path().to_path_buf(), "openai", "gpt-test");
+
+    let standalone = Config::resolve(&cli_args).unwrap();
+    assert_eq!(standalone.max_tokens, Some(1234));
+    assert_eq!(standalone.compat.default_max_tokens_for_model("gpt-test"), Some(3456));
+
+    let embedded = resolve_aionui_config(&cli_args).unwrap();
+    assert_eq!(embedded.max_tokens, None);
+    assert_eq!(embedded.compat.default_max_tokens_for_model("gpt-test"), None);
+}
+
+#[test]
+fn resolve_aionui_config_keeps_builtin_provider_max_token_policy() {
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join(".aionrs.toml"),
+        r#"
+[providers.anthropic.compat]
+default_max_tokens = 42
+
+[[providers.anthropic.compat.model_max_tokens]]
+pattern = "claude-sonnet-4-6"
+max_tokens = 42
+"#,
+    )
+    .unwrap();
+    let cli_args = make_cli_args(project.path().to_path_buf(), "anthropic", "claude-sonnet-4-6");
+
+    let embedded = resolve_aionui_config(&cli_args).unwrap();
+    assert_eq!(embedded.max_tokens, None);
+    assert_eq!(
+        embedded.compat.default_max_tokens_for_model("claude-sonnet-4-6"),
+        Some(128_000)
+    );
 }
 
 #[test]

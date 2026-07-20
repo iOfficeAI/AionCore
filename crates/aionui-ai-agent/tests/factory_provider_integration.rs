@@ -164,10 +164,7 @@ async fn aionrs_factory_resolves_provider_from_db() {
             model: "gpt-4o".into(),
             use_model: None,
         },
-        AionrsBuildExtra {
-            max_tokens: Some(2048),
-            ..Default::default()
-        },
+        AionrsBuildExtra::default(),
     );
 
     let result = factory(options).await;

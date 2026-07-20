@@ -9,7 +9,8 @@ use aion_agent::bootstrap::AgentBootstrap;
 use aion_agent::engine::AgentEngine;
 use aion_agent::output::OutputSink;
 use aion_agent::session::Session;
-use aion_config::config::{CliArgs, Config, McpServerConfig};
+use aion_config::compat::ProviderCompat;
+use aion_config::config::{CliArgs, Config, McpServerConfig, ProviderType};
 use aion_mcp::manager::McpManager;
 use aion_protocol::commands::{ApprovalScope, SessionMode};
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
@@ -36,6 +37,24 @@ use crate::types::{AionrsResolvedConfig, SendMessageData};
 
 use super::content::build_content_blocks;
 use super::error::{aionrs_engine_error_to_send_error, aionrs_runtime_error_summary};
+
+fn resolve_aionui_config(cli_args: &CliArgs) -> Result<Config, AgentError> {
+    let mut config =
+        Config::resolve(cli_args).map_err(|e| AgentError::internal(format!("Config resolve failed: {e}")))?;
+
+    // AionUi owns the embedded runtime policy. Standalone aionrs max-token
+    // settings must not leak in from global or workspace config files.
+    config.max_tokens = None;
+    let default_transport = match config.provider {
+        ProviderType::Anthropic | ProviderType::Vertex => ProviderCompat::anthropic_defaults().transport,
+        ProviderType::OpenAI => ProviderCompat::openai_defaults().transport,
+        ProviderType::Bedrock => ProviderCompat::bedrock_defaults().transport,
+    };
+    config.compat.transport.default_max_tokens = default_transport.default_max_tokens;
+    config.compat.transport.model_max_tokens = default_transport.model_max_tokens;
+
+    Ok(config)
+}
 
 #[derive(Clone, Debug)]
 struct AionrsFinalInputDumpContext {
@@ -157,7 +176,7 @@ impl AionrsAgentManager {
             api_key: Some(config_extra.api_key.clone()),
             base_url: config_extra.base_url.clone(),
             model: Some(config_extra.model.clone()),
-            max_tokens: config_extra.max_tokens,
+            max_tokens: None,
             max_turns: config_extra.max_turns,
             max_tool_call_malformed_turns: config_extra.max_tool_call_malformed_turns,
             max_tool_call_failure_turns: config_extra.max_tool_call_failure_turns,
@@ -169,8 +188,7 @@ impl AionrsAgentManager {
             project_dir: Some(PathBuf::from(&workspace)),
         };
 
-        let mut config =
-            Config::resolve(&cli_args).map_err(|e| AgentError::internal(format!("Config resolve failed: {e}")))?;
+        let mut config = resolve_aionui_config(&cli_args)?;
 
         // Backend-specific overrides
         config.bedrock = config_extra.bedrock_config;
@@ -178,6 +196,9 @@ impl AionrsAgentManager {
         config.session.directory = config_extra.session_directory.to_string_lossy().into_owned();
         config.compat.image_input = Some(image_input_capability);
 
+        if let Some(mode) = config_extra.compat_overrides.openai_api_mode {
+            config.compat.transport.openai_api_mode = Some(mode);
+        }
         if let Some(field) = config_extra.compat_overrides.max_tokens_field {
             config.compat.transport.max_tokens_field = Some(field);
         }

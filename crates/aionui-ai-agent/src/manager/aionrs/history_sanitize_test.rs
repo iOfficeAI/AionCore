@@ -93,6 +93,25 @@ fn keeps_regular_assistant_text_message() {
 }
 
 #[test]
+fn keeps_provider_owned_reasoning_item() {
+    let mut messages = vec![Message::new(
+        Role::Assistant,
+        vec![ContentBlock::ProviderItem {
+            provider: "openai_responses".to_owned(),
+            item: json!({"id": "rs_1", "type": "reasoning", "encrypted_content": "encrypted"}),
+        }],
+    )];
+
+    let removed = sanitize_session_messages(&mut messages);
+
+    assert_eq!(removed, 0);
+    assert!(matches!(
+        messages[0].content.as_slice(),
+        [ContentBlock::ProviderItem { .. }]
+    ));
+}
+
+#[test]
 fn keeps_assistant_with_text_and_orphan_tool_call() {
     // Assistant emitted some streamed text before the tool was cancelled.
     // Provider will accept this because content is non-null even though

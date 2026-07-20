@@ -23,6 +23,13 @@ pub(crate) fn command_name(meta: &AgentMetadata) -> Option<&str> {
 pub(crate) async fn validate(meta: &AgentMetadata) -> Result<(), String> {
     let command = command_name(meta).ok_or_else(|| "agent has no CLI command to probe".to_owned())?;
     let path = resolve_command_path(command).ok_or_else(|| format!("`{command}` not found on PATH"))?;
+    if meta.agent_source == aionui_api_types::AgentSource::Builtin
+        && meta.agent_source_info.bridge_binary.as_deref() == Some("npx")
+        && let Some(backend) = meta.backend.as_deref()
+        && aionui_runtime::should_skip_registry_npx_version_probe(backend).map_err(|error| error.to_string())?
+    {
+        return Ok(());
+    }
     validate_version(&path).await
 }
 

@@ -9,12 +9,12 @@ use serde_json::{Map, Value, json};
 
 use crate::cli::{
     ConfigAgentCustomCommand, ConfigAgentOverridesCommand, ConfigAgentsArgs, ConfigAgentsCommand, ConfigArgs,
-    ConfigAssistantTextCommand, ConfigAssistantsArgs, ConfigAssistantsCommand, ConfigCommand, ConfigCronArgs,
-    ConfigCronCommand, ConfigCronCurrentArgs, ConfigCronCurrentCommand, ConfigCronJobSkillCommand, ConfigCronJobsArgs,
-    ConfigCronJobsCommand, ConfigMcpArgs, ConfigMcpCommand, ConfigMcpOauthCommand, ConfigMcpServersCommand,
-    ConfigProviderModelsCommand, ConfigProvidersArgs, ConfigProvidersCommand, ConfigSettingsArgs,
-    ConfigSettingsClientCommand, ConfigSettingsCommand, ConfigSkillsArgs, ConfigSkillsCommand,
-    ConfigSkillsExternalPathsCommand, ConfigSkillsMarketCommand,
+    ConfigAssistantTextCommand, ConfigAssistantsArgs, ConfigAssistantsCommand, ConfigCommand, ConfigConversationArgs,
+    ConfigConversationCommand, ConfigCronArgs, ConfigCronCommand, ConfigCronCurrentArgs, ConfigCronCurrentCommand,
+    ConfigCronJobSkillCommand, ConfigCronJobsArgs, ConfigCronJobsCommand, ConfigMcpArgs, ConfigMcpCommand,
+    ConfigMcpOauthCommand, ConfigMcpServersCommand, ConfigProviderModelsCommand, ConfigProvidersArgs,
+    ConfigProvidersCommand, ConfigSettingsArgs, ConfigSettingsClientCommand, ConfigSettingsCommand, ConfigSkillsArgs,
+    ConfigSkillsCommand, ConfigSkillsExternalPathsCommand, ConfigSkillsMarketCommand,
 };
 use crate::commands::config_capabilities;
 
@@ -38,6 +38,7 @@ async fn run(args: ConfigArgs) -> Result<(), ConfigError> {
     match args.command {
         ConfigCommand::Capabilities => print_envelope(config_capabilities::data(), meta(None), "config capabilities"),
         ConfigCommand::Context => run_context(&client).await,
+        ConfigCommand::Conversation(args) => run_conversation(&client, args).await,
         ConfigCommand::Assistants(args) => run_assistants(&client, args).await,
         ConfigCommand::Skills(args) => run_skills(&client, args).await,
         ConfigCommand::Mcp(args) => run_mcp(&client, args).await,
@@ -63,6 +64,22 @@ async fn run_context(client: &reqwest::Client) -> Result<(), ConfigError> {
         meta(None),
         command,
     )
+}
+
+async fn run_conversation(client: &reqwest::Client, args: ConfigConversationArgs) -> Result<(), ConfigError> {
+    match args.command {
+        ConfigConversationCommand::Rename => {
+            run_id_payload_request_with_resource_readback(
+                client,
+                "config conversation rename",
+                Method::PATCH,
+                IdRoute::new("/api/conversations", "", "conversation_id"),
+                IdRoute::new("/api/conversations", "", "conversation_id"),
+                false,
+            )
+            .await
+        }
+    }
 }
 
 async fn run_assistants(client: &reqwest::Client, args: ConfigAssistantsArgs) -> Result<(), ConfigError> {
