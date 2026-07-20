@@ -95,9 +95,17 @@ pub fn resolve_bundled_cli(name: &str) -> Option<PathBuf> {
             return Some(exe);
         }
     }
+    // Bundled CLI is missing but we are in Bundled mode: the backend will spawn
+    // the bare command name resolved via PATH. Surface which concrete binary
+    // that resolves to (or `<none>` when PATH has no such command either) so the
+    // fallback is diagnosable in production logs (which run at info level).
+    let resolved = crate::resolve_command_path(name)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<none>".to_owned());
     tracing::warn!(
         cli = name,
         version,
+        resolved = %resolved,
         "bundled cli missing in Bundled mode; falling back to PATH"
     );
     None
