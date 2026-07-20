@@ -305,6 +305,7 @@ impl BackendConnection for ClaudeConnection {
                 config.cwd.as_deref(),
                 &spawn_args,
                 &config.spawn_env,
+                config.cli_program.as_deref(),
             )
             .await
             .map_err(|e| BackendError::Transport(format!("claude spawn failed: {e}")))?;
@@ -322,6 +323,7 @@ impl BackendConnection for ClaudeConnection {
             cwd: config.cwd.clone(),
             extra_args: spawn_args,
             env: config.spawn_env.clone(),
+            cli_program: config.cli_program.clone(),
         };
         let backend = ClaudeSessionBackend::spawn(logical_id, adapter, io, config, wake).await;
         // #98/#101: ask claude for its discovery catalog (selectable models + slash
@@ -478,6 +480,9 @@ struct ClaudeWakeRecipe {
     /// a resume-respawn re-applies the SAME env (R16 continuity — a woken process
     /// must reach the same provider as the original).
     env: Vec<aionui_common::EnvVar>,
+    /// The bundled-CLI path captured at open time so a resume-respawn uses the
+    /// SAME binary (R16 continuity). `None` ⇒ bare "claude" via PATH.
+    cli_program: Option<std::path::PathBuf>,
 }
 
 /// #98/#101: the discovery catalog captured from the `control_request{initialize}`
@@ -676,6 +681,7 @@ impl ClaudeSessionBackend {
                 self.wake.cwd.as_deref(),
                 &self.wake.extra_args,
                 &self.wake.env,
+                self.wake.cli_program.as_deref(),
             )
             .await
             .map_err(|e| BackendError::Transport(format!("claude resume-spawn failed: {e}")))?;
@@ -2564,6 +2570,7 @@ impl ClaudeSessionBackend {
             cwd: None,
             extra_args: Vec::new(),
             env: Vec::new(),
+            cli_program: None,
         };
         Self::spawn(session_id, ClaudeAdapter::new(), io, SessionConfig::default(), wake).await
     }
@@ -2590,6 +2597,7 @@ impl ClaudeSessionBackend {
             cwd: None,
             extra_args: Vec::new(),
             env: Vec::new(),
+            cli_program: None,
         };
         let config = SessionConfig {
             idle_ttl_ms: Some(idle_ttl_ms),

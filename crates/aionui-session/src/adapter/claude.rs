@@ -780,6 +780,7 @@ impl BackendAdapter for ClaudeAdapter {
         cwd: Option<&str>,
         extra_args: &[String],
         env: &[aionui_common::EnvVar],
+        cli_program: Option<&std::path::Path>,
     ) -> Result<Box<dyn AgentIo>, ProcessError> {
         // Feature 004 R2/D2: persistent stream-json-input process (multi-turn).
         // The prompt is NOT a spawn arg — it is delivered per-turn over stdin via
@@ -836,7 +837,9 @@ impl BackendAdapter for ClaudeAdapter {
         args.extend(extra_args.iter().cloned());
 
         let spec = CommandSpec {
-            command: "claude".into(),
+            // Orchestration-resolved bundled CLI (packaged app) or bare "claude"
+            // (dev → PATH). See SessionConfig.cli_program.
+            command: cli_program.map(|p| p.to_path_buf()).unwrap_or_else(|| "claude".into()),
             args,
             // #103: provider env injected by the orchestration layer (e.g. cc-switch
             // ANTHROPIC_BASE_URL/AUTH_TOKEN for backend == "claude"). Empty =

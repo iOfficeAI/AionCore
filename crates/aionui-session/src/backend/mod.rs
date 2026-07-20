@@ -235,4 +235,12 @@ pub struct SessionConfig {
     /// `CodexWakeRecipe.config`) so a resume re-applies the same policy (R16
     /// continuity). Backends other than codex ignore it.
     pub approval_policy: Option<String>,
+    /// The orchestration layer's resolved bundled-CLI absolute path. `None` ⇒ the
+    /// backend uses its historical bare command name ("claude"/"codex", resolved
+    /// via PATH), byte-identical to pre-bundling. Filled by the app registry
+    /// (session_agent) via `managed_cli::resolve_bundled_cli`; the session/backend
+    /// layer stays bundling-agnostic and only forwards it into the spawn. Carried
+    /// into the F-4 wake recipe (rides the cloned `config`) so a resume re-spawn
+    /// uses the same binary (R16 continuity).
+    pub cli_program: Option<std::path::PathBuf>,
 }

@@ -75,7 +75,9 @@ impl BackendConnection for CodexConnection {
         let mut args = vec!["app-server".to_string()];
         args.extend(config.extra_args.iter().cloned());
         let cmd = aionui_common::CommandSpec {
-            command: "codex".into(),
+            // Orchestration-resolved bundled CLI (packaged app) or bare "codex"
+            // (dev → PATH). See SessionConfig.cli_program.
+            command: config.cli_program.clone().unwrap_or_else(|| "codex".into()),
             args,
             env: Vec::new(),
             cwd: config.cwd.clone(),
@@ -1044,7 +1046,8 @@ impl CodexSessionBackend {
         let mut args = vec!["app-server".to_string()];
         args.extend(self.wake.config.extra_args.iter().cloned());
         let cmd = aionui_common::CommandSpec {
-            command: "codex".into(),
+            // Same bundled-CLI resolution as the initial spawn (R16 continuity).
+            command: self.wake.config.cli_program.clone().unwrap_or_else(|| "codex".into()),
             args,
             env: Vec::new(),
             cwd: self.wake.config.cwd.clone(),

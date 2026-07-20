@@ -156,6 +156,9 @@ pub trait BackendAdapter: Send + Sync {
     /// process's `CommandSpec.env` (on top of the inherited parent env). Empty =
     /// inherit parent env only. The claude direct-CLI path uses this to carry the
     /// cc-switch provider env; the adapter only forwards it, never sources it.
+    /// `cli_program`: the orchestration-resolved bundled-CLI absolute path.
+    /// `None` ⇒ the adapter uses its historical bare command name resolved via
+    /// PATH (byte-identical to pre-bundling). Forwarded only — never sourced here.
     async fn start_turn(
         &self,
         spawner: &dyn Spawner,
@@ -163,6 +166,7 @@ pub trait BackendAdapter: Send + Sync {
         cwd: Option<&str>,
         extra_args: &[String],
         env: &[aionui_common::EnvVar],
+        cli_program: Option<&std::path::Path>,
     ) -> Result<Box<dyn AgentIo>, ProcessError>;
 
     /// Responsibility (1b) PROMPT DELIVERY: write ONE user turn to the retained
