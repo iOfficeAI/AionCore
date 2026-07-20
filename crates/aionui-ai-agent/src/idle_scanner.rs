@@ -41,13 +41,15 @@ pub trait IdleCleanupCoordinator: Send + Sync {
 pub fn start_idle_scanner(
     worker_task_manager: Arc<dyn IWorkerTaskManager>,
     shutdown: tokio::sync::watch::Receiver<bool>,
-    idle_timeout_secs: Option<i64>,
+    solo_timeout_secs: Option<i64>,
+    team_timeout_secs: Option<i64>,
     scan_interval_secs: Option<u64>,
 ) -> tokio::task::JoinHandle<()> {
     start_idle_scanner_with_coordinator(
         worker_task_manager,
         shutdown,
-        idle_timeout_secs,
+        solo_timeout_secs,
+        team_timeout_secs,
         scan_interval_secs,
         None,
     )
@@ -56,14 +58,17 @@ pub fn start_idle_scanner(
 pub fn start_idle_scanner_with_coordinator(
     worker_task_manager: Arc<dyn IWorkerTaskManager>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-    idle_timeout_secs: Option<i64>,
+    solo_timeout_secs: Option<i64>,
+    team_timeout_secs: Option<i64>,
     scan_interval_secs: Option<u64>,
     idle_cleanup_coordinator: Option<Arc<dyn IdleCleanupCoordinator>>,
 ) -> tokio::task::JoinHandle<()> {
-    let threshold = idle_timeout_secs.unwrap_or(DEFAULT_SOLO_IDLE_TIMEOUT_SECS);
+    let solo_threshold = solo_timeout_secs.unwrap_or(DEFAULT_SOLO_IDLE_TIMEOUT_SECS);
+    let team_threshold = team_timeout_secs.unwrap_or(DEFAULT_TEAM_IDLE_TIMEOUT_SECS);
     let scan_interval = scan_interval_secs.unwrap_or(DEFAULT_SCAN_INTERVAL_SECS);
     info!(
-        threshold_secs = threshold,
+        solo_timeout_secs = solo_threshold,
+        team_timeout_secs = team_threshold,
         scan_interval_secs = scan_interval,
         "Starting idle agent scanner"
     );
@@ -76,7 +81,8 @@ pub fn start_idle_scanner_with_coordinator(
                 _ = interval.tick() => {
                     scan_and_cleanup(
                         &worker_task_manager,
-                        threshold*1000,
+                        solo_threshold * 1000,
+                        team_threshold * 1000,
                         idle_cleanup_coordinator.clone(),
                     ).await;
                 }
@@ -96,11 +102,12 @@ pub fn start_idle_scanner_with_coordinator(
 /// Perform one scan: find idle tasks and kill them.
 async fn scan_and_cleanup(
     manager: &Arc<dyn IWorkerTaskManager>,
-    threshold_ms: i64,
+    solo_threshold_ms: i64,
+    team_threshold_ms: i64,
     idle_cleanup_coordinator: Option<Arc<dyn IdleCleanupCoordinator>>,
 ) {
     let started_at = now_ms();
-    let mut idle_ids = manager.collect_idle(threshold_ms);
+    let mut idle_ids = manager.collect_idle(solo_threshold_ms);
 
     if idle_ids.is_empty() {
         debug!(active_count = manager.active_count(), "Idle scan: no idle agents found");
@@ -109,7 +116,7 @@ async fn scan_and_cleanup(
 
     if let Some(coordinator) = idle_cleanup_coordinator {
         let before_count = idle_ids.len();
-        idle_ids = coordinator.cleanup_idle_conversations(idle_ids, threshold_ms).await;
+        idle_ids = coordinator.cleanup_idle_conversations(idle_ids, team_threshold_ms).await;
         let handled_count = before_count.saturating_sub(idle_ids.len());
         if handled_count > 0 {
             info!(
@@ -222,6 +229,7 @@ mod tests {
     struct RecordingTaskManager {
         idle_ids: Vec<String>,
         killed: Arc<Mutex<Vec<String>>>,
+        collect_threshold: Arc<Mutex<Option<i64>>>,
     }
 
     impl RecordingTaskManager {
@@ -229,11 +237,16 @@ mod tests {
             Self {
                 idle_ids: idle_ids.into_iter().map(str::to_owned).collect(),
                 killed: Arc::new(Mutex::new(Vec::new())),
+                collect_threshold: Arc::new(Mutex::new(None)),
             }
         }
 
         fn killed(&self) -> Vec<String> {
             self.killed.lock().unwrap().clone()
+        }
+
+        fn collect_threshold(&self) -> Option<i64> {
+            *self.collect_threshold.lock().unwrap()
         }
     }
 
@@ -271,13 +284,15 @@ mod tests {
             self.idle_ids.len()
         }
 
-        fn collect_idle(&self, _idle_threshold_ms: i64) -> Vec<String> {
+        fn collect_idle(&self, idle_threshold_ms: i64) -> Vec<String> {
+            *self.collect_threshold.lock().unwrap() = Some(idle_threshold_ms);
             self.idle_ids.clone()
         }
     }
 
     struct RecordingCoordinator {
         seen: Arc<Mutex<Vec<String>>>,
+        threshold: Arc<Mutex<Option<i64>>>,
     }
 
     #[async_trait]
@@ -285,8 +300,9 @@ mod tests {
         async fn cleanup_idle_conversations(
             &self,
             idle_conversation_ids: Vec<String>,
-            _idle_threshold_ms: i64,
+            idle_threshold_ms: i64,
         ) -> Vec<String> {
+            *self.threshold.lock().unwrap() = Some(idle_threshold_ms);
             self.seen.lock().unwrap().extend(idle_conversation_ids);
             vec!["solo".to_owned()]
         }
@@ -297,12 +313,31 @@ mod tests {
         let manager_impl = Arc::new(RecordingTaskManager::new(vec!["team-lead", "solo"]));
         let manager: Arc<dyn IWorkerTaskManager> = manager_impl.clone();
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let coordinator: Arc<dyn IdleCleanupCoordinator> = Arc::new(RecordingCoordinator { seen: seen.clone() });
+        let coordinator: Arc<dyn IdleCleanupCoordinator> = Arc::new(RecordingCoordinator {
+            seen: seen.clone(),
+            threshold: Arc::new(Mutex::new(None)),
+        });
 
-        scan_and_cleanup(&manager, 300_000, Some(coordinator)).await;
+        scan_and_cleanup(&manager, 600_000, 1_800_000, Some(coordinator)).await;
 
         assert_eq!(seen.lock().unwrap().clone(), vec!["team-lead", "solo"]);
         assert_eq!(manager_impl.killed(), vec!["solo"]);
+    }
+
+    #[tokio::test]
+    async fn scan_passes_solo_to_collect_and_team_to_coordinator() {
+        let manager_impl = Arc::new(RecordingTaskManager::new(vec!["team-lead", "solo"]));
+        let manager: Arc<dyn IWorkerTaskManager> = manager_impl.clone();
+        let coordinator_impl = Arc::new(RecordingCoordinator {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            threshold: Arc::new(Mutex::new(None)),
+        });
+        let coordinator: Arc<dyn IdleCleanupCoordinator> = coordinator_impl.clone();
+
+        scan_and_cleanup(&manager, 600_000, 1_800_000, Some(coordinator)).await;
+
+        assert_eq!(manager_impl.collect_threshold(), Some(600_000));
+        assert_eq!(*coordinator_impl.threshold.lock().unwrap(), Some(1_800_000));
     }
 
     #[test]
