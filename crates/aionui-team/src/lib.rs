@@ -15,6 +15,7 @@ pub mod prompt_dump;
 pub mod prompts;
 pub mod provisioning;
 pub mod routes;
+pub mod runtime_tools;
 pub mod scheduler;
 pub mod service;
 pub mod session;
@@ -22,6 +23,7 @@ pub mod task_board;
 pub mod team_run;
 #[cfg(test)]
 pub(crate) mod test_utils;
+pub mod tool_executor;
 pub mod types;
 pub mod visibility;
 mod work_coordinator;
@@ -49,6 +51,7 @@ pub use provisioning::{
     TeamAgentProvisioner, TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationProvisioningPort,
 };
 pub use routes::{TeamRouterState, team_routes};
+pub use runtime_tools::ResolvedTeamToolContext;
 pub use scheduler::{
     SchedulerAction, TeammateManager, WAKE_TIMEOUT_MS, WakePayload, format_crash_testament, normalize_name,
 };
@@ -56,6 +59,7 @@ pub use service::{TeamIdleCleanupCoordinator, TeamSessionService};
 pub use session::{TeamSession, WakeInput};
 pub use task_board::{TaskBoard, TaskUpdate};
 pub use team_run::{TeamRunManager, target_role_for};
+pub use tool_executor::{TeamToolContext, TeamToolExecutor, team_tool_call_from_name};
 pub use types::{
     MailboxMessage, MailboxMessageType, TaskStatus, Team, TeamAgent, TeamTask, TeammateRole, TeammateStatus,
 };

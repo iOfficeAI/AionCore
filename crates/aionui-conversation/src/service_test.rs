@@ -10,10 +10,12 @@ use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{
-    AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, BuildTaskOptions, CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData,
+    AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, AIONUI_RUNTIME_TOKEN_ENV, BuildTaskOptions,
+    CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData,
 };
 use aionui_ai_agent::{
     AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager,
+    RuntimeTokenService,
 };
 
 use aionui_api_types::{
@@ -3894,6 +3896,75 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
 }
 
 #[tokio::test]
+async fn set_config_option_does_not_persist_preference_on_error() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo, definition_repo, overlay_repo, preference_repo) =
+        make_service_with_mock_task_manager_and_assistant_support(task_mgr.clone()).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_acp_auto",
+        "assistant-acp-auto",
+        "codex",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_acp_auto",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            assistant_definition_id: "asstdef_acp_auto",
+            last_model_id: Some("original-model"),
+            last_permission_value: Some("original-mode"),
+            last_thought_level_value: Some("original-low"),
+            last_skill_ids: "[]",
+            last_disabled_builtin_skill_ids: "[]",
+            last_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-auto").await;
+
+    // Agent reports a session-change conflict (mirrors the legacy ACK-then-
+    // session-changed race): the service must return the error and leave the
+    // persisted preference untouched.
+    let agent = Arc::new(
+        MockAgent::new(&conv.id).with_set_config_option_error(AgentError::conflict(
+            "Active ACP session changed while applying config option",
+        )),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+
+    let result = svc
+        .set_config_option(
+            &conv.id,
+            "model",
+            SetConfigOptionRequest {
+                value: "gpt-5.5".to_owned(),
+            },
+        )
+        .await;
+    assert!(result.is_err(), "conflict from agent must surface as error");
+
+    let pref_after = preference_repo.get("asstdef_acp_auto").await.unwrap().unwrap();
+    assert_eq!(
+        pref_after.last_model_id.as_deref(),
+        Some("original-model"),
+        "preference must not be written when set_config_option errors"
+    );
+}
+
+#[tokio::test]
 async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixed() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, repo, definition_repo, overlay_repo, preference_repo) =
@@ -5641,6 +5712,43 @@ async fn warmup_injects_conversation_runtime_context() {
     let options = task_mgr.captured_options();
     assert_eq!(options.len(), 1);
     assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
+}
+
+#[tokio::test]
+async fn warmup_injects_runtime_token_for_mcp_team_conversation() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let svc = svc.with_runtime_token_service(Arc::new(RuntimeTokenService::new()));
+    let mut req = make_create_req();
+    req.extra = serde_json::json!({
+        "teamId": "team-1",
+        "slot_id": "slot-1",
+        "role": "lead",
+        "team_mcp_stdio_config": {
+            "team_id": "team-1",
+            "port": 4242,
+            "token": "mcp-token",
+            "slot_id": "slot-1",
+            "binary_path": "/tmp/aioncore"
+        }
+    });
+    let conv = svc.create("user_1", req).await.unwrap();
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new(&conv.id),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.warmup("user_1", &conv.id, &task_mgr_dyn).await.unwrap();
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 1);
+    assert!(
+        options[0]
+            .context
+            .runtime_env
+            .iter()
+            .any(|(key, value)| key == AIONUI_RUNTIME_TOKEN_ENV && !value.is_empty()),
+        "MCP Team conversations should receive AIONUI_RUNTIME_TOKEN for CLI fallback"
+    );
 }
 
 #[tokio::test]

@@ -7,6 +7,7 @@ use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{
     ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
+    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
 };
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
@@ -320,6 +321,7 @@ pub struct ConversationService {
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
+    runtime_token_service: Option<Arc<RuntimeTokenService>>,
 
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -392,6 +394,7 @@ impl ConversationService {
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
+            runtime_token_service: None,
 
             conversation_repo,
             agent_metadata_repo,
@@ -407,6 +410,11 @@ impl ConversationService {
     pub fn with_runtime_helper_context(mut self, helper_bin: String, base_url: String) -> Self {
         self.runtime_helper_bin = Some(helper_bin);
         self.runtime_base_url = Some(base_url);
+        self
+    }
+
+    pub fn with_runtime_token_service(mut self, runtime_token_service: Arc<RuntimeTokenService>) -> Self {
+        self.runtime_token_service = Some(runtime_token_service);
         self
     }
 
@@ -3241,12 +3249,31 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
     ) {
+        let runtime_token = self.runtime_token_for_build(build_opts, user_id, conversation_id);
         build_opts.apply_conversation_runtime_context(
             user_id,
             conversation_id,
             self.runtime_helper_bin.as_deref(),
             self.runtime_base_url.as_deref(),
+            runtime_token.as_deref(),
         );
+    }
+
+    fn runtime_token_for_build(
+        &self,
+        build_opts: &BuildTaskOptions,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Option<String> {
+        build_opts.context.team.as_ref()?;
+        let service = self.runtime_token_service.as_ref()?;
+        let issue = service.issue(
+            user_id,
+            conversation_id,
+            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
+        );
+        Some(issue.token)
     }
 
     /// Ensure native skill links exist in the runtime workspace. Auto

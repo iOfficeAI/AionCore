@@ -1,33 +1,27 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::scheduler::SchedulerAction;
 use crate::types::TeammateRole;
 
-pub use aionui_team_prompts::tools::{
+pub use aionui_api_types::{
     TEAM_DESCRIBE_ASSISTANT_DESCRIPTION, TEAM_LIST_ASSISTANTS_DESCRIPTION, TEAM_SPAWN_AGENT_DESCRIPTION,
 };
+use aionui_api_types::{TeamToolPermission, TeamToolRole};
 
 // ---------------------------------------------------------------------------
 // Tool descriptors (returned by tools/list)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ToolDescriptor {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
-}
+pub type ToolDescriptor = aionui_api_types::TeamToolDescriptor;
 
 pub fn all_tool_descriptors_for_role(caller_role: TeammateRole) -> Vec<ToolDescriptor> {
-    aionui_team_prompts::visible_team_tool_descriptors(caller_role == TeammateRole::Lead)
-        .into_iter()
-        .map(|descriptor| ToolDescriptor {
-            name: descriptor.name,
-            description: descriptor.description,
-            input_schema: descriptor.input_schema,
-        })
-        .collect()
+    let role = if caller_role == TeammateRole::Lead {
+        TeamToolRole::Lead
+    } else {
+        TeamToolRole::Teammate
+    };
+    aionui_api_types::team_tool_descriptors_for_role(role)
 }
 
 pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
@@ -35,7 +29,13 @@ pub fn all_tool_descriptors() -> Vec<ToolDescriptor> {
 }
 
 pub fn authorize_tool(caller_role: TeammateRole, tool_name: &str) -> Result<(), String> {
-    aionui_team_prompts::authorize_team_tool(caller_role == TeammateRole::Lead, tool_name)
+    let Some(spec) = aionui_api_types::team_tool_descriptor(tool_name) else {
+        return Err(format!("Unknown tool: {tool_name}"));
+    };
+    if spec.permission == TeamToolPermission::LeadOnly && caller_role != TeammateRole::Lead {
+        return Err(format!("Only Lead can use {tool_name}"));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -46,6 +46,8 @@ pub fn authorize_tool(caller_role: TeammateRole, tool_name: &str) -> Result<(), 
 pub struct SendMessageInput {
     pub to: String,
     pub message: String,
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 /// Arguments for the `team_spawn_agent` MCP tool call.
@@ -111,12 +113,12 @@ pub struct ShutdownAgentInput {
 }
 
 // ---------------------------------------------------------------------------
-// Backend whitelist for spawn_agent (hard whitelist only — synchronous fast-path).
+// Built-in backend predicate for spawn_agent (synchronous fast-path).
 // Dynamic capability check (MCP-based) happens in TeamSession::spawn_agent.
 // ---------------------------------------------------------------------------
 
-pub fn is_whitelisted_backend(backend: &str) -> bool {
-    aionui_common::constants::TEAM_CAPABLE_BACKENDS.contains(&backend)
+pub fn is_builtin_mcp_backend(backend: &str) -> bool {
+    backend == aionui_common::constants::AIONRS_RUNTIME_BACKEND
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +137,7 @@ pub fn parse_tool_call(
             Ok(SchedulerAction::SendMessage {
                 to: input.to,
                 message: input.message,
+                files: input.files,
             })
         }
         "team_spawn_agent" => Err("handled directly by server".into()),
@@ -281,12 +284,18 @@ mod tests {
 
     #[test]
     fn parse_send_message() {
-        let args = json!({"to": "slot-1", "message": "hello"});
+        let args = json!({
+            "to": "slot-1",
+            "message": "hello",
+            "files": ["/tmp/image.png"]
+        });
         let action = parse_tool_call("team_send_message", &args, TeammateRole::Teammate).unwrap();
         assert!(matches!(
             action,
-            SchedulerAction::SendMessage { to, message }
-            if to == "slot-1" && message == "hello"
+            SchedulerAction::SendMessage { to, message, files }
+            if to == "slot-1"
+                && message == "hello"
+                && files == vec!["/tmp/image.png".to_owned()]
         ));
     }
 
@@ -343,11 +352,12 @@ mod tests {
     }
 
     #[test]
-    fn whitelist_check() {
-        assert!(is_whitelisted_backend("claude"));
-        assert!(is_whitelisted_backend("codex"));
-        assert!(!is_whitelisted_backend("gpt"));
-        assert!(!is_whitelisted_backend(""));
+    fn builtin_mcp_backend_check() {
+        assert!(is_builtin_mcp_backend("aionrs"));
+        assert!(!is_builtin_mcp_backend("claude"));
+        assert!(!is_builtin_mcp_backend("codex"));
+        assert!(!is_builtin_mcp_backend("gpt"));
+        assert!(!is_builtin_mcp_backend(""));
     }
 
     #[test]

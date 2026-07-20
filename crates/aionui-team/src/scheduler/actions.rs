@@ -9,6 +9,7 @@ pub enum SchedulerAction {
     SendMessage {
         to: String,
         message: String,
+        files: Vec<String>,
     },
     TaskCreate {
         subject: String,
@@ -81,8 +82,8 @@ impl TeammateManager {
         action: &SchedulerAction,
     ) -> Result<Option<String>, TeamError> {
         match action {
-            SchedulerAction::SendMessage { to, message } => {
-                self.handle_send_message(from_slot_id, to, message).await?;
+            SchedulerAction::SendMessage { to, message, files } => {
+                self.handle_send_message(from_slot_id, to, message, files).await?;
                 Ok(None)
             }
             SchedulerAction::TaskCreate {
@@ -151,7 +152,13 @@ impl TeammateManager {
         self.mark_idle(slot_id, summary.as_deref()).await
     }
 
-    async fn handle_send_message(&self, from_slot_id: &str, to: &str, message: &str) -> Result<(), TeamError> {
+    async fn handle_send_message(
+        &self,
+        from_slot_id: &str,
+        to: &str,
+        message: &str,
+        files: &[String],
+    ) -> Result<(), TeamError> {
         if to == "*" {
             let slots = self.slots.lock().await;
             let targets: Vec<String> = slots.keys().filter(|id| id.as_str() != from_slot_id).cloned().collect();
@@ -159,25 +166,27 @@ impl TeammateManager {
 
             for target in &targets {
                 self.mailbox
-                    .write(
+                    .write_with_files(
                         &self.team_id,
                         target,
                         from_slot_id,
                         MailboxMessageType::Message,
                         message,
                         None,
+                        Some(files),
                     )
                     .await?;
             }
         } else {
             self.mailbox
-                .write(
+                .write_with_files(
                     &self.team_id,
                     to,
                     from_slot_id,
                     MailboxMessageType::Message,
                     message,
                     None,
+                    Some(files),
                 )
                 .await?;
         }

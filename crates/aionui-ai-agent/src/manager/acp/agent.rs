@@ -682,11 +682,16 @@ impl AcpAgentManager {
             );
         }
 
+        let set_path_label = set_path.log_label();
+        let method = set_path.acp_method();
+
         tracing::info!(
             conversation_id = %self.params.conversation_id,
             agent_backend = ?self.params.metadata.backend,
             config_id = %option_id,
             requested = %resolved_value,
+            set_path = set_path_label,
+            method,
             "acp_config_option_set_requested"
         );
 
@@ -706,6 +711,8 @@ impl AcpAgentManager {
                             agent_backend = ?self.params.metadata.backend,
                             config_id = %config_id,
                             requested = %resolved_value,
+                            set_path = set_path_label,
+                            method,
                             error = %err,
                             "acp_config_option_command_failed"
                         );
@@ -717,7 +724,8 @@ impl AcpAgentManager {
                     agent_backend = ?self.params.metadata.backend,
                     config_id = %config_id,
                     requested = %resolved_value,
-                    method = "session/set_config_option",
+                    set_path = set_path_label,
+                    method,
                     "acp_config_option_command_ack"
                 );
 
@@ -731,8 +739,14 @@ impl AcpAgentManager {
                     session.apply_advertised_config_options(response.config_options);
                     self.commit_session_changes(&mut session).await;
                 }
-                self.wait_for_observed_config_option(&config_id, &resolved_value, OBSERVED_CONFIRMATION_TIMEOUT)
-                    .await
+                self.wait_for_observed_config_option(
+                    &config_id,
+                    &resolved_value,
+                    OBSERVED_CONFIRMATION_TIMEOUT,
+                    set_path_label,
+                    method,
+                )
+                .await
             }
             ConfigSetPath::LegacyMode => {
                 self.protocol
@@ -747,6 +761,8 @@ impl AcpAgentManager {
                             agent_backend = ?self.params.metadata.backend,
                             config_id = %option_id,
                             requested = %resolved_value,
+                            set_path = set_path_label,
+                            method,
                             error = %err,
                             "acp_config_option_command_failed"
                         );
@@ -757,12 +773,18 @@ impl AcpAgentManager {
                     agent_backend = ?self.params.metadata.backend,
                     config_id = %option_id,
                     requested = %resolved_value,
-                    method = "session/set_mode",
+                    set_path = set_path_label,
+                    method,
                     "acp_config_option_command_ack"
                 );
-                self.ensure_session_unchanged(&session_id, "mode").await?;
-                self.wait_for_observed_config_option("mode", &resolved_value, OBSERVED_CONFIRMATION_TIMEOUT)
-                    .await
+                self.apply_legacy_config_ack(
+                    &session_id,
+                    &ConfigSetPath::LegacyMode,
+                    option_id,
+                    &resolved_value,
+                    method,
+                )
+                .await
             }
             ConfigSetPath::LegacyModel => {
                 self.protocol
@@ -777,6 +799,8 @@ impl AcpAgentManager {
                             agent_backend = ?self.params.metadata.backend,
                             config_id = %option_id,
                             requested = %resolved_value,
+                            set_path = set_path_label,
+                            method,
                             error = %err,
                             "acp_config_option_command_failed"
                         );
@@ -787,12 +811,18 @@ impl AcpAgentManager {
                     agent_backend = ?self.params.metadata.backend,
                     config_id = %option_id,
                     requested = %resolved_value,
-                    method = "session/set_model",
+                    set_path = set_path_label,
+                    method,
                     "acp_config_option_command_ack"
                 );
-                self.ensure_session_unchanged(&session_id, "model").await?;
-                self.wait_for_observed_config_option("model", &resolved_value, OBSERVED_CONFIRMATION_TIMEOUT)
-                    .await
+                self.apply_legacy_config_ack(
+                    &session_id,
+                    &ConfigSetPath::LegacyModel,
+                    option_id,
+                    &resolved_value,
+                    method,
+                )
+                .await
             }
         }
         .map(|snapshot| SetConfigOptionResponse {
@@ -801,22 +831,71 @@ impl AcpAgentManager {
         })
     }
 
-    async fn ensure_session_unchanged(&self, session_id: &str, field: &str) -> Result<(), AgentError> {
-        let session = self.session.read().await;
-        if session.session_id() == Some(session_id) {
-            return Ok(());
+    /// Apply a successful legacy `set_mode` / `set_model` ACK to the local
+    /// aggregate. Call ONLY after the protocol RPC returned success.
+    ///
+    /// Runs the whole confirm sequence inside a single session write lock so
+    /// no notification-driven update can interleave between the session-id
+    /// re-check and the confirm:
+    ///   validate active session_id -> confirm_mode/confirm_model
+    ///   -> snapshot -> commit_session_changes.
+    ///
+    /// The protocol RPC itself runs WITHOUT the write lock held, so agent
+    /// notification processing is never blocked during the round-trip.
+    ///
+    /// Returns the post-confirm [`ConfigSnapshot`], or a conflict error when
+    /// the active session changed between the RPC ACK and acquiring the lock.
+    async fn apply_legacy_config_ack(
+        &self,
+        session_id: &str,
+        set_path: &ConfigSetPath,
+        config_id: &str,
+        resolved_value: &str,
+        method: &'static str,
+    ) -> Result<ConfigSnapshot, AgentError> {
+        let mut session = self.session.write().await;
+        if session.session_id() != Some(session_id) {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                config_id = %config_id,
+                set_path = set_path.log_label(),
+                method,
+                confirmed_session_id = %session_id,
+                active_session_id = ?session.session_id(),
+                "acp_config_option_session_changed"
+            );
+            return Err(AgentError::conflict(
+                "Active ACP session changed while applying config option",
+            ));
         }
-        warn!(
+
+        match set_path {
+            ConfigSetPath::LegacyMode => session.confirm_mode(ModeId::new(resolved_value.to_owned())),
+            ConfigSetPath::LegacyModel => session.confirm_model(ModelId::new(resolved_value.to_owned())),
+            // Guarded rather than panicking: this helper is only ever called
+            // from the two legacy arms above.
+            ConfigSetPath::ConfigOption { .. } => {
+                return Err(AgentError::conflict(
+                    "apply_legacy_config_ack invoked for a non-legacy set path",
+                ));
+            }
+        }
+
+        let snapshot = session.config_snapshot();
+        self.commit_session_changes(&mut session).await;
+        drop(session);
+
+        tracing::info!(
             conversation_id = %self.params.conversation_id,
             agent_backend = ?self.params.metadata.backend,
-            config_id = %field,
-            confirmed_session_id = %session_id,
-            active_session_id = ?session.session_id(),
-            "acp_config_option_session_changed"
+            config_id = %config_id,
+            resolved_value = %resolved_value,
+            set_path = set_path.log_label(),
+            method,
+            "acp_legacy_config_ack_applied"
         );
-        Err(AgentError::conflict(
-            "Active ACP session changed while applying config option",
-        ))
+        Ok(snapshot)
     }
 
     async fn wait_for_observed_config_option(
@@ -824,6 +903,8 @@ impl AcpAgentManager {
         option_id: &str,
         requested: &str,
         timeout: Duration,
+        set_path_label: &'static str,
+        method: &'static str,
     ) -> Result<ConfigSnapshot, AgentError> {
         let started = Instant::now();
         loop {
@@ -837,6 +918,8 @@ impl AcpAgentManager {
                     agent_backend = ?self.params.metadata.backend,
                     config_id = %option_id,
                     requested = %requested,
+                    set_path = set_path_label,
+                    method,
                     elapsed_ms = started.elapsed().as_millis(),
                     "acp_config_option_observed_confirmed"
                 );
@@ -848,6 +931,8 @@ impl AcpAgentManager {
                     agent_backend = ?self.params.metadata.backend,
                     config_id = %option_id,
                     requested = %requested,
+                    set_path = set_path_label,
+                    method,
                     timeout_ms = timeout.as_millis(),
                     last_observed = ?snapshot.option_current(option_id),
                     "acp_config_option_confirmation_timeout"
