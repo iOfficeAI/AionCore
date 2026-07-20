@@ -65,3 +65,48 @@ pub struct ProjectRepositoryFacts {
     pub lfs_detected: bool,
     pub detected_at: TimestampMs,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectKnowledgeFact {
+    pub kind: String,
+    pub name: String,
+    pub qualified_name: Option<String>,
+    pub source_path: String,
+    pub source_line: Option<i64>,
+    pub indexed_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectKnowledgeStatus {
+    pub project_id: String,
+    pub provider: String,
+    pub provider_project_name: String,
+    pub provider_version: Option<String>,
+    pub status: String,
+    pub generation: i64,
+    pub source_commit: Option<String>,
+    pub indexed_at: Option<TimestampMs>,
+    pub changed_paths: Vec<String>,
+    pub error_category: Option<String>,
+    pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectTaskContext {
+    pub id: String,
+    pub project_id: String,
+    pub provider_project_name: String,
+    pub generation: i64,
+    pub query: String,
+    pub symbols: Vec<String>,
+    pub callers: Vec<String>,
+    pub tests: Vec<String>,
+    pub routes: Vec<String>,
+    pub data_entities: Vec<String>,
+    pub created_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectTaskContextRequest {
+    pub query: String,
+}

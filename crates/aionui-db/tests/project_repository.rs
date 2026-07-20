@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use aionui_db::models::{ProjectCommandProfileRow, ProjectRepositoryFactsRow, ProjectRow, ProjectRuntimeProfileRow};
+use aionui_db::models::{
+    ProjectCommandProfileRow, ProjectKnowledgeContextRow, ProjectKnowledgeFactRow, ProjectKnowledgeIndexRow,
+    ProjectRepositoryFactsRow, ProjectRow, ProjectRuntimeProfileRow,
+};
 use aionui_db::{DbError, IProjectRepository, SqliteProjectRepository, UpdateProjectParams, init_database_memory};
 
 const USER: &str = "system_default_user";
@@ -149,6 +152,67 @@ async fn repository_facts_roundtrip_without_exposing_secret_values() {
     assert_eq!(stored.credential_reference.as_deref(), Some("vault:github-production"));
     assert!(!serde_json::to_string(&stored).unwrap().contains("private-token"));
     assert!(repo.get_repository_facts("p1", "other-user").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn knowledge_generation_and_context_are_atomic_and_owner_scoped() {
+    let (repo, _db) = repo().await;
+    repo.create(&project("p1", "/tmp/p1")).await.unwrap();
+    let index = ProjectKnowledgeIndexRow {
+        project_id: "p1".into(),
+        provider: "codebase-memory".into(),
+        provider_project_name: "aionui-project-p1".into(),
+        provider_version: Some("0.9.0".into()),
+        status: "healthy".into(),
+        generation: 1,
+        source_commit: Some("abc123".into()),
+        indexed_at: Some(400),
+        changed_paths_json: r#"["src/lib.rs"]"#.into(),
+        error_category: None,
+        updated_at: 400,
+    };
+    let facts = vec![ProjectKnowledgeFactRow {
+        id: "fact-1".into(),
+        project_id: "p1".into(),
+        generation: 1,
+        kind: "symbol".into(),
+        name: "run".into(),
+        qualified_name: Some("app.run".into()),
+        source_path: "src/lib.rs".into(),
+        source_line: Some(9),
+        indexed_at: 400,
+    }];
+    repo.commit_knowledge_generation(&index, &facts).await.unwrap();
+
+    assert_eq!(repo.get_knowledge_index("p1", USER).await.unwrap(), Some(index));
+    assert_eq!(repo.list_knowledge_facts("p1", USER).await.unwrap(), facts);
+    assert!(repo.get_knowledge_index("p1", "other-user").await.unwrap().is_none());
+    assert!(repo.list_knowledge_facts("p1", "other-user").await.unwrap().is_empty());
+
+    let context = ProjectKnowledgeContextRow {
+        id: "context-1".into(),
+        project_id: "p1".into(),
+        provider_project_name: "aionui-project-p1".into(),
+        generation: 1,
+        query: "change run".into(),
+        symbols_json: r#"["app.run"]"#.into(),
+        callers_json: "[]".into(),
+        tests_json: r#"["tests/run.rs"]"#.into(),
+        routes_json: "[]".into(),
+        data_entities_json: "[]".into(),
+        created_at: 500,
+    };
+    repo.insert_knowledge_context(&context).await.unwrap();
+    assert_eq!(
+        repo.get_knowledge_context("context-1", USER).await.unwrap(),
+        Some(context)
+    );
+    assert!(
+        repo.get_knowledge_context("context-1", "other-user")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

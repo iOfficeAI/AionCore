@@ -6,8 +6,9 @@ use aionui_db::{
     SqliteProjectRepository, SqliteTeamRepository, init_database_memory,
 };
 use aionui_project::{
-    AgentCapabilitySnapshot, ProjectAgentCapabilityPort, ProjectError, ProjectRouterState, ProjectService,
-    project_routes,
+    AgentCapabilitySnapshot, KnowledgeProviderError, ProjectAgentCapabilityPort, ProjectError, ProjectKnowledgeFact,
+    ProjectKnowledgeProvider, ProjectKnowledgeProviderHealth, ProjectKnowledgeProviderRequest,
+    ProjectKnowledgeProviderResult, ProjectRouterState, ProjectService, ProjectTaskContext, project_routes,
 };
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -24,18 +25,98 @@ impl ProjectAgentCapabilityPort for NoAgents {
     }
 }
 
+struct RouteKnowledge;
+
+#[async_trait::async_trait]
+impl ProjectKnowledgeProvider for RouteKnowledge {
+    async fn health(&self) -> Result<ProjectKnowledgeProviderHealth, KnowledgeProviderError> {
+        Ok(ProjectKnowledgeProviderHealth {
+            provider: "codebase-memory".into(),
+            version: Some("test".into()),
+        })
+    }
+
+    async fn index(
+        &self,
+        request: &ProjectKnowledgeProviderRequest,
+    ) -> Result<ProjectKnowledgeProviderResult, KnowledgeProviderError> {
+        Ok(ProjectKnowledgeProviderResult {
+            provider_project_name: request.provider_project_name.clone(),
+            source_commit: request.source_commit.clone(),
+            changed_paths: request.changed_paths.clone(),
+            facts: vec![ProjectKnowledgeFact {
+                kind: "symbol".into(),
+                name: "main".into(),
+                qualified_name: Some("app.main".into()),
+                source_path: "main.rs".into(),
+                source_line: Some(1),
+                indexed_at: 0,
+            }],
+        })
+    }
+
+    async fn update(
+        &self,
+        request: &ProjectKnowledgeProviderRequest,
+    ) -> Result<ProjectKnowledgeProviderResult, KnowledgeProviderError> {
+        self.index(request).await
+    }
+
+    async fn architecture(
+        &self,
+        _provider_project_name: &str,
+    ) -> Result<Vec<ProjectKnowledgeFact>, KnowledgeProviderError> {
+        Ok(Vec::new())
+    }
+
+    async fn search(
+        &self,
+        _provider_project_name: &str,
+        _query: &str,
+    ) -> Result<Vec<ProjectKnowledgeFact>, KnowledgeProviderError> {
+        Ok(Vec::new())
+    }
+
+    async fn trace(
+        &self,
+        _provider_project_name: &str,
+        _function_name: &str,
+    ) -> Result<Vec<ProjectKnowledgeFact>, KnowledgeProviderError> {
+        Ok(Vec::new())
+    }
+
+    async fn task_context(
+        &self,
+        provider_project_name: &str,
+        query: &str,
+        generation: i64,
+    ) -> Result<ProjectTaskContext, KnowledgeProviderError> {
+        Ok(ProjectTaskContext {
+            id: String::new(),
+            project_id: String::new(),
+            provider_project_name: provider_project_name.into(),
+            generation,
+            query: query.into(),
+            symbols: vec!["app.main".into()],
+            callers: Vec::new(),
+            tests: Vec::new(),
+            routes: Vec::new(),
+            data_entities: Vec::new(),
+            created_at: 0,
+        })
+    }
+}
+
 async fn app() -> (Router, tempfile::TempDir, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
     let project_repo: Arc<dyn IProjectRepository> = Arc::new(SqliteProjectRepository::new(db.pool().clone()));
     let conversation_repo: Arc<dyn IConversationRepository> =
         Arc::new(SqliteConversationRepository::new(db.pool().clone()));
     let team_repo: Arc<dyn ITeamRepository> = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
-    let service = Arc::new(ProjectService::new(
-        project_repo,
-        conversation_repo,
-        team_repo,
-        Arc::new(NoAgents),
-    ));
+    let service = Arc::new(
+        ProjectService::new(project_repo, conversation_repo, team_repo, Arc::new(NoAgents))
+            .with_knowledge_provider(Arc::new(RouteKnowledge)),
+    );
     let temp = tempfile::tempdir().unwrap();
     let router = project_routes(ProjectRouterState { service }).layer(Extension(CurrentUser {
         id: "system_default_user".into(),
@@ -161,6 +242,76 @@ async fn project_routes_onboard_and_return_repository_evidence() {
         evidence["data"]["baseline_commit"],
         body["data"]["repository"]["baseline_commit"]
     );
+}
+
+#[tokio::test]
+async fn project_routes_refresh_knowledge_and_create_minimal_task_context() {
+    let (app, temp, _db) = app().await;
+    let repository = git2::Repository::init(temp.path()).unwrap();
+    std::fs::write(temp.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let mut index = repository.index().unwrap();
+    index.add_path(std::path::Path::new("main.rs")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repository.find_tree(tree_id).unwrap();
+    let signature = git2::Signature::now("Aion test", "aion@example.test").unwrap();
+    repository
+        .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+        .unwrap();
+    let create = Request::builder()
+        .method("POST")
+        .uri("/api/projects")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "name": "Knowledge",
+                "local_path": temp.path(),
+                "project_type": "single"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let project_id = json(app.clone().oneshot(create).await.unwrap()).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let status = Request::builder()
+        .uri(format!("/api/projects/{project_id}/knowledge"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        json(app.clone().oneshot(status).await.unwrap()).await["data"]["status"],
+        "stale"
+    );
+
+    let refresh = Request::builder()
+        .method("POST")
+        .uri(format!("/api/projects/{project_id}/knowledge/refresh"))
+        .body(Body::empty())
+        .unwrap();
+    let refreshed = json(app.clone().oneshot(refresh).await.unwrap()).await;
+    assert_eq!(refreshed["data"]["status"], "healthy");
+    assert_eq!(refreshed["data"]["generation"], 1);
+
+    let facts = Request::builder()
+        .uri(format!("/api/projects/{project_id}/knowledge/facts"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        json(app.clone().oneshot(facts).await.unwrap()).await["data"][0]["source_path"],
+        "main.rs"
+    );
+
+    let context = Request::builder()
+        .method("POST")
+        .uri(format!("/api/projects/{project_id}/knowledge/context"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"query":"change main"}"#))
+        .unwrap();
+    let context = json(app.oneshot(context).await.unwrap()).await;
+    assert_eq!(context["data"]["generation"], 1);
+    assert_eq!(context["data"]["symbols"], serde_json::json!(["app.main"]));
 }
 
 #[tokio::test]

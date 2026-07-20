@@ -69,3 +69,46 @@ pub struct ProjectRepositoryFactsRow {
     pub lfs_detected: bool,
     pub detected_at: TimestampMs,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ProjectKnowledgeIndexRow {
+    pub project_id: String,
+    pub provider: String,
+    pub provider_project_name: String,
+    pub provider_version: Option<String>,
+    pub status: String,
+    pub generation: i64,
+    pub source_commit: Option<String>,
+    pub indexed_at: Option<TimestampMs>,
+    pub changed_paths_json: String,
+    pub error_category: Option<String>,
+    pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ProjectKnowledgeFactRow {
+    pub id: String,
+    pub project_id: String,
+    pub generation: i64,
+    pub kind: String,
+    pub name: String,
+    pub qualified_name: Option<String>,
+    pub source_path: String,
+    pub source_line: Option<i64>,
+    pub indexed_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ProjectKnowledgeContextRow {
+    pub id: String,
+    pub project_id: String,
+    pub provider_project_name: String,
+    pub generation: i64,
+    pub query: String,
+    pub symbols_json: String,
+    pub callers_json: String,
+    pub tests_json: String,
+    pub routes_json: String,
+    pub data_entities_json: String,
+    pub created_at: TimestampMs,
+}

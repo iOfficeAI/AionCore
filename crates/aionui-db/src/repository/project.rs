@@ -1,6 +1,7 @@
 use crate::error::DbError;
 use crate::models::{
-    ProjectCommandProfileRow, ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow,
+    ProjectCommandProfileRow, ProjectKnowledgeContextRow, ProjectKnowledgeFactRow, ProjectKnowledgeIndexRow,
+    ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -43,6 +44,28 @@ pub trait IProjectRepository: Send + Sync {
         project_id: &str,
         user_id: &str,
     ) -> Result<Option<ProjectRepositoryFactsRow>, DbError>;
+    async fn upsert_knowledge_index(&self, row: &ProjectKnowledgeIndexRow) -> Result<(), DbError>;
+    async fn commit_knowledge_generation(
+        &self,
+        index: &ProjectKnowledgeIndexRow,
+        facts: &[ProjectKnowledgeFactRow],
+    ) -> Result<(), DbError>;
+    async fn get_knowledge_index(
+        &self,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ProjectKnowledgeIndexRow>, DbError>;
+    async fn list_knowledge_facts(
+        &self,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Vec<ProjectKnowledgeFactRow>, DbError>;
+    async fn insert_knowledge_context(&self, row: &ProjectKnowledgeContextRow) -> Result<(), DbError>;
+    async fn get_knowledge_context(
+        &self,
+        context_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ProjectKnowledgeContextRow>, DbError>;
 
     async fn bind_resource(
         &self,

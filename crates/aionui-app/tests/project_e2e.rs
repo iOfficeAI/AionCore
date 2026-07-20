@@ -73,3 +73,32 @@ async fn project_create_requires_csrf_for_authenticated_web_mode() {
 
     assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn project_knowledge_refresh_requires_csrf_for_authenticated_web_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    git2::Repository::init(temp.path()).unwrap();
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "project-knowledge-csrf", "StrongP@ss1").await;
+    let create = json_with_token(
+        "POST",
+        "/api/projects",
+        json!({
+            "name": "Knowledge",
+            "local_path": temp.path(),
+            "project_type": "single"
+        }),
+        &token,
+        &csrf,
+    );
+    let created = body_json(app.clone().oneshot(create).await.unwrap()).await;
+    let project_id = created["data"]["id"].as_str().unwrap();
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/projects/{project_id}/knowledge/refresh"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::FORBIDDEN);
+}

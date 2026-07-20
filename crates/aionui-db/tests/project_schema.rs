@@ -26,6 +26,23 @@ async fn project_migration_creates_all_phase_one_tables() {
 }
 
 #[tokio::test]
+async fn project_knowledge_migration_creates_indexes_facts_and_contexts() {
+    let database = init_database_memory().await.unwrap();
+    for table in [
+        "project_knowledge_indexes",
+        "project_knowledge_facts",
+        "project_knowledge_contexts",
+    ] {
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind(table)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(exists, 1, "missing table {table}");
+    }
+}
+
+#[tokio::test]
 async fn project_schema_enforces_owner_path_uniqueness_and_resource_types() {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool();

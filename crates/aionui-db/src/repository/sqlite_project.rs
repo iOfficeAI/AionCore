@@ -3,7 +3,8 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::{
-    ProjectCommandProfileRow, ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow,
+    ProjectCommandProfileRow, ProjectKnowledgeContextRow, ProjectKnowledgeFactRow, ProjectKnowledgeIndexRow,
+    ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow,
 };
 use crate::repository::project::{IProjectRepository, UpdateProjectParams};
 
@@ -258,6 +259,166 @@ impl IProjectRepository for SqliteProjectRepository {
              WHERE facts.project_id = ? AND project.user_id = ?",
         )
         .bind(project_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn upsert_knowledge_index(&self, row: &ProjectKnowledgeIndexRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO project_knowledge_indexes \
+             (project_id, provider, provider_project_name, provider_version, status, generation, source_commit, \
+              indexed_at, changed_paths_json, error_category, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(project_id) DO UPDATE SET \
+              provider = excluded.provider, provider_project_name = excluded.provider_project_name, \
+              provider_version = excluded.provider_version, status = excluded.status, generation = excluded.generation, \
+              source_commit = excluded.source_commit, indexed_at = excluded.indexed_at, \
+              changed_paths_json = excluded.changed_paths_json, error_category = excluded.error_category, \
+              updated_at = excluded.updated_at",
+        )
+        .bind(&row.project_id)
+        .bind(&row.provider)
+        .bind(&row.provider_project_name)
+        .bind(&row.provider_version)
+        .bind(&row.status)
+        .bind(row.generation)
+        .bind(&row.source_commit)
+        .bind(row.indexed_at)
+        .bind(&row.changed_paths_json)
+        .bind(&row.error_category)
+        .bind(row.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn commit_knowledge_generation(
+        &self,
+        index: &ProjectKnowledgeIndexRow,
+        facts: &[ProjectKnowledgeFactRow],
+    ) -> Result<(), DbError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO project_knowledge_indexes \
+             (project_id, provider, provider_project_name, provider_version, status, generation, source_commit, \
+              indexed_at, changed_paths_json, error_category, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(project_id) DO UPDATE SET \
+              provider = excluded.provider, provider_project_name = excluded.provider_project_name, \
+              provider_version = excluded.provider_version, status = excluded.status, generation = excluded.generation, \
+              source_commit = excluded.source_commit, indexed_at = excluded.indexed_at, \
+              changed_paths_json = excluded.changed_paths_json, error_category = excluded.error_category, \
+              updated_at = excluded.updated_at",
+        )
+        .bind(&index.project_id)
+        .bind(&index.provider)
+        .bind(&index.provider_project_name)
+        .bind(&index.provider_version)
+        .bind(&index.status)
+        .bind(index.generation)
+        .bind(&index.source_commit)
+        .bind(index.indexed_at)
+        .bind(&index.changed_paths_json)
+        .bind(&index.error_category)
+        .bind(index.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("DELETE FROM project_knowledge_facts WHERE project_id = ?")
+            .bind(&index.project_id)
+            .execute(&mut *transaction)
+            .await?;
+        for fact in facts {
+            sqlx::query(
+                "INSERT INTO project_knowledge_facts \
+                 (id, project_id, generation, kind, name, qualified_name, source_path, source_line, indexed_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&fact.id)
+            .bind(&fact.project_id)
+            .bind(fact.generation)
+            .bind(&fact.kind)
+            .bind(&fact.name)
+            .bind(&fact.qualified_name)
+            .bind(&fact.source_path)
+            .bind(fact.source_line)
+            .bind(fact.indexed_at)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn get_knowledge_index(
+        &self,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ProjectKnowledgeIndexRow>, DbError> {
+        Ok(sqlx::query_as::<_, ProjectKnowledgeIndexRow>(
+            "SELECT knowledge.* FROM project_knowledge_indexes knowledge \
+             JOIN projects project ON project.id = knowledge.project_id \
+             WHERE knowledge.project_id = ? AND project.user_id = ?",
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn list_knowledge_facts(
+        &self,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Vec<ProjectKnowledgeFactRow>, DbError> {
+        Ok(sqlx::query_as::<_, ProjectKnowledgeFactRow>(
+            "SELECT fact.* FROM project_knowledge_facts fact \
+             JOIN projects project ON project.id = fact.project_id \
+             JOIN project_knowledge_indexes knowledge ON knowledge.project_id = fact.project_id \
+              AND knowledge.generation = fact.generation \
+             WHERE fact.project_id = ? AND project.user_id = ? \
+             ORDER BY fact.kind ASC, fact.name ASC, fact.source_path ASC, fact.source_line ASC",
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn insert_knowledge_context(&self, row: &ProjectKnowledgeContextRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO project_knowledge_contexts \
+             (id, project_id, provider_project_name, generation, query, symbols_json, callers_json, tests_json, \
+              routes_json, data_entities_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.project_id)
+        .bind(&row.provider_project_name)
+        .bind(row.generation)
+        .bind(&row.query)
+        .bind(&row.symbols_json)
+        .bind(&row.callers_json)
+        .bind(&row.tests_json)
+        .bind(&row.routes_json)
+        .bind(&row.data_entities_json)
+        .bind(row.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_knowledge_context(
+        &self,
+        context_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ProjectKnowledgeContextRow>, DbError> {
+        Ok(sqlx::query_as::<_, ProjectKnowledgeContextRow>(
+            "SELECT context.* FROM project_knowledge_contexts context \
+             JOIN projects project ON project.id = context.project_id \
+             WHERE context.id = ? AND project.user_id = ?",
+        )
+        .bind(context_id)
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await?)

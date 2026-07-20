@@ -58,7 +58,8 @@ use aionui_office::{
     ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
 };
 use aionui_project::{
-    AgentCapabilitySnapshot, ProjectAgentCapabilityPort, ProjectError, ProjectRouterState, ProjectService,
+    AgentCapabilitySnapshot, CodebaseMemoryCliProvider, ProjectAgentCapabilityPort, ProjectError, ProjectRouterState,
+    ProjectService,
 };
 use aionui_realtime::{NoopMessageRouter, WsHandlerState};
 use aionui_shell::ShellRouterState;
@@ -1034,10 +1035,13 @@ fn build_project_state(services: &AppServices, agent_service: Arc<AgentService>)
     let team_repo: Arc<dyn ITeamRepository> = Arc::new(SqliteTeamRepository::new(pool));
     let agent_port: Arc<dyn ProjectAgentCapabilityPort> =
         Arc::new(ProjectAgentCapabilityAdapter { service: agent_service });
+    let knowledge_command =
+        std::env::var("AIONUI_CODEBASE_MEMORY_COMMAND").unwrap_or_else(|_| "codebase-memory-mcp".into());
     ProjectRouterState {
         service: Arc::new(
             ProjectService::new(project_repo, conversation_repo, team_repo, agent_port)
-                .with_managed_project_root(services.data_dir.join("projects")),
+                .with_managed_project_root(services.data_dir.join("projects"))
+                .with_knowledge_provider(Arc::new(CodebaseMemoryCliProvider::new(knowledge_command))),
         ),
     }
 }

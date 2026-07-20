@@ -51,7 +51,8 @@ pub use mcp_server::McpServerRow;
 pub use message::MessageRow;
 pub use oauth_token::OAuthTokenRow;
 pub use project::{
-    ProjectCommandProfileRow, ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow,
+    ProjectCommandProfileRow, ProjectKnowledgeContextRow, ProjectKnowledgeFactRow, ProjectKnowledgeIndexRow,
+    ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow,
 };
 pub use provider::Provider;
 pub use remote_agent::RemoteAgentRow;

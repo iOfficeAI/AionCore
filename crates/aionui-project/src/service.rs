@@ -1,14 +1,22 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aionui_api_types::{DirtyWorktreeChoice, ProjectRepositoryFacts, ProjectRepositoryOnboardingInput};
+use aionui_api_types::{
+    DirtyWorktreeChoice, ProjectKnowledgeFact, ProjectKnowledgeStatus, ProjectRepositoryFacts,
+    ProjectRepositoryOnboardingInput, ProjectTaskContext,
+};
 use aionui_common::now_ms;
 use aionui_db::models::{
-    ProjectCommandProfileRow, ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow,
+    ProjectCommandProfileRow, ProjectKnowledgeContextRow, ProjectKnowledgeFactRow, ProjectKnowledgeIndexRow,
+    ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow,
 };
 use aionui_db::{IConversationRepository, IProjectRepository, ITeamRepository, UpdateProjectParams};
 
 use crate::error::ProjectError;
+use crate::knowledge::{
+    CodebaseMemoryCliProvider, KnowledgeProviderError, ProjectKnowledgeProvider, ProjectKnowledgeProviderRequest,
+    ProjectKnowledgeProviderResult, inspect_repository,
+};
 use crate::repository_source::RepositoryOnboarder;
 use crate::types::{
     AgentCapabilitySnapshot, AgentPreflightResult, CreateProjectInput, OnboardProjectResult, PreflightCheck,
@@ -29,6 +37,7 @@ pub struct ProjectService {
     team_repo: Arc<dyn ITeamRepository>,
     agent_port: Arc<dyn ProjectAgentCapabilityPort>,
     repository_onboarder: RepositoryOnboarder,
+    knowledge_provider: Arc<dyn ProjectKnowledgeProvider>,
 }
 
 impl ProjectService {
@@ -44,11 +53,17 @@ impl ProjectService {
             team_repo,
             agent_port,
             repository_onboarder: RepositoryOnboarder::new(std::env::temp_dir().join("aionui-managed-projects")),
+            knowledge_provider: Arc::new(CodebaseMemoryCliProvider::default()),
         }
     }
 
     pub fn with_managed_project_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.repository_onboarder = RepositoryOnboarder::new(root);
+        self
+    }
+
+    pub fn with_knowledge_provider(mut self, provider: Arc<dyn ProjectKnowledgeProvider>) -> Self {
+        self.knowledge_provider = provider;
         self
     }
 
@@ -96,6 +111,258 @@ impl ProjectService {
             .await?
             .ok_or_else(|| ProjectError::NotFound(format!("repository facts for project {project_id}")))?;
         project_repository_facts(row, project.local_path)
+    }
+
+    pub async fn get_knowledge_status(
+        &self,
+        user_id: &str,
+        project_id: &str,
+    ) -> Result<ProjectKnowledgeStatus, ProjectError> {
+        let project = self.get(user_id, project_id).await?;
+        let repository = inspect_repository(&project.local_path)
+            .await
+            .map_err(provider_project_error)?;
+        let Some(row) = self.project_repo.get_knowledge_index(project_id, user_id).await? else {
+            return Ok(ProjectKnowledgeStatus {
+                project_id: project_id.into(),
+                provider: "codebase-memory".into(),
+                provider_project_name: provider_project_name(project_id),
+                provider_version: None,
+                status: "stale".into(),
+                generation: 0,
+                source_commit: repository.source_commit,
+                indexed_at: None,
+                changed_paths: repository.changed_paths,
+                error_category: Some("not_indexed".into()),
+                updated_at: now_ms(),
+            });
+        };
+        let mut status = knowledge_status_from_row(&row)?;
+        if matches!(status.status.as_str(), "healthy" | "stale")
+            && (status.source_commit != repository.source_commit || status.changed_paths != repository.changed_paths)
+        {
+            status.status = "stale".into();
+            status.source_commit = repository.source_commit;
+            status.changed_paths = repository.changed_paths;
+            status.error_category = Some("repository_changed".into());
+        }
+        Ok(status)
+    }
+
+    pub async fn refresh_knowledge(
+        &self,
+        user_id: &str,
+        project_id: &str,
+    ) -> Result<ProjectKnowledgeStatus, ProjectError> {
+        let project = self.get(user_id, project_id).await?;
+        let repository = inspect_repository(&project.local_path)
+            .await
+            .map_err(provider_project_error)?;
+        let existing = self.project_repo.get_knowledge_index(project_id, user_id).await?;
+        if let Some(row) = existing.as_ref()
+            && row.status == "healthy"
+            && row.source_commit == repository.source_commit
+            && parse_string_list(&row.changed_paths_json)? == repository.changed_paths
+        {
+            return knowledge_status_from_row(row);
+        }
+
+        let project_name = existing
+            .as_ref()
+            .map(|row| row.provider_project_name.clone())
+            .unwrap_or_else(|| provider_project_name(project_id));
+        let health = match self.knowledge_provider.health().await {
+            Ok(health) => health,
+            Err(error) => {
+                self.persist_provider_failure(project_id, existing.as_ref(), &project_name, &repository, &error)
+                    .await?;
+                return Err(provider_project_error(error));
+            }
+        };
+        let generation = existing.as_ref().map_or(1, |row| row.generation + 1);
+        let started_at = now_ms();
+        let indexing = ProjectKnowledgeIndexRow {
+            project_id: project_id.into(),
+            provider: health.provider.clone(),
+            provider_project_name: project_name.clone(),
+            provider_version: health.version.clone(),
+            status: "indexing".into(),
+            generation: existing.as_ref().map_or(0, |row| row.generation),
+            source_commit: repository.source_commit.clone(),
+            indexed_at: existing.as_ref().and_then(|row| row.indexed_at),
+            changed_paths_json: serialize_string_list(&repository.changed_paths)?,
+            error_category: None,
+            updated_at: started_at,
+        };
+        self.project_repo.upsert_knowledge_index(&indexing).await?;
+
+        let request = ProjectKnowledgeProviderRequest {
+            project_path: project.local_path,
+            provider_project_name: project_name.clone(),
+            source_commit: repository.source_commit.clone(),
+            changed_paths: repository.changed_paths.clone(),
+        };
+        let provider_result = if existing.as_ref().is_some_and(|row| row.generation > 0) {
+            self.knowledge_provider.update(&request).await
+        } else {
+            self.knowledge_provider.index(&request).await
+        };
+        let provider_result = match provider_result {
+            Ok(result) => result,
+            Err(error) => {
+                self.persist_provider_failure(project_id, existing.as_ref(), &project_name, &repository, &error)
+                    .await?;
+                return Err(provider_project_error(error));
+            }
+        };
+        validate_provider_result(&provider_result, &request)?;
+        let architecture = match self.knowledge_provider.architecture(&project_name).await {
+            Ok(facts) => facts,
+            Err(error) => {
+                self.persist_provider_failure(project_id, existing.as_ref(), &project_name, &repository, &error)
+                    .await?;
+                return Err(provider_project_error(error));
+            }
+        };
+        let indexed_at = now_ms();
+        let mut facts = provider_result.facts;
+        facts.extend(architecture);
+        normalize_and_validate_facts(&mut facts, indexed_at)?;
+        let fact_rows = facts
+            .into_iter()
+            .map(|fact| ProjectKnowledgeFactRow {
+                id: uuid::Uuid::now_v7().to_string(),
+                project_id: project_id.into(),
+                generation,
+                kind: fact.kind,
+                name: fact.name,
+                qualified_name: fact.qualified_name,
+                source_path: fact.source_path,
+                source_line: fact.source_line,
+                indexed_at: fact.indexed_at,
+            })
+            .collect::<Vec<_>>();
+        let completed = ProjectKnowledgeIndexRow {
+            project_id: project_id.into(),
+            provider: health.provider,
+            provider_project_name: project_name,
+            provider_version: health.version,
+            status: "healthy".into(),
+            generation,
+            source_commit: provider_result.source_commit,
+            indexed_at: Some(indexed_at),
+            changed_paths_json: serialize_string_list(&provider_result.changed_paths)?,
+            error_category: None,
+            updated_at: indexed_at,
+        };
+        self.project_repo
+            .commit_knowledge_generation(&completed, &fact_rows)
+            .await?;
+        knowledge_status_from_row(&completed)
+    }
+
+    async fn persist_provider_failure(
+        &self,
+        project_id: &str,
+        existing: Option<&ProjectKnowledgeIndexRow>,
+        project_name: &str,
+        repository: &crate::knowledge::RepositoryKnowledgeState,
+        error: &KnowledgeProviderError,
+    ) -> Result<(), ProjectError> {
+        let now = now_ms();
+        let status = if matches!(error, KnowledgeProviderError::Unavailable) {
+            "unavailable"
+        } else {
+            "failed"
+        };
+        self.project_repo
+            .upsert_knowledge_index(&ProjectKnowledgeIndexRow {
+                project_id: project_id.into(),
+                provider: "codebase-memory".into(),
+                provider_project_name: project_name.into(),
+                provider_version: existing.and_then(|row| row.provider_version.clone()),
+                status: status.into(),
+                generation: existing.map_or(0, |row| row.generation),
+                source_commit: repository.source_commit.clone(),
+                indexed_at: existing.and_then(|row| row.indexed_at),
+                changed_paths_json: serialize_string_list(&repository.changed_paths)?,
+                error_category: Some(error.category().into()),
+                updated_at: now,
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_knowledge_facts(
+        &self,
+        user_id: &str,
+        project_id: &str,
+    ) -> Result<Vec<ProjectKnowledgeFact>, ProjectError> {
+        self.get(user_id, project_id).await?;
+        Ok(self
+            .project_repo
+            .list_knowledge_facts(project_id, user_id)
+            .await?
+            .into_iter()
+            .map(|row| ProjectKnowledgeFact {
+                kind: row.kind,
+                name: row.name,
+                qualified_name: row.qualified_name,
+                source_path: row.source_path,
+                source_line: row.source_line,
+                indexed_at: row.indexed_at,
+            })
+            .collect())
+    }
+
+    pub async fn task_context(
+        &self,
+        user_id: &str,
+        project_id: &str,
+        query: &str,
+    ) -> Result<ProjectTaskContext, ProjectError> {
+        self.get(user_id, project_id).await?;
+        let query = query.trim();
+        if query.is_empty() || query.len() > 500 {
+            return Err(ProjectError::BadRequest(
+                "task context query must contain 1 to 500 bytes".into(),
+            ));
+        }
+        let index = self
+            .project_repo
+            .get_knowledge_index(project_id, user_id)
+            .await?
+            .filter(|row| row.generation > 0)
+            .ok_or_else(|| ProjectError::Conflict("project knowledge has not been indexed".into()))?;
+        let mut context = self
+            .knowledge_provider
+            .task_context(&index.provider_project_name, query, index.generation)
+            .await
+            .map_err(provider_project_error)?;
+        if context.provider_project_name != index.provider_project_name || context.generation != index.generation {
+            return Err(provider_project_error(KnowledgeProviderError::MalformedOutput));
+        }
+        validate_context(&context)?;
+        context.id = uuid::Uuid::now_v7().to_string();
+        context.project_id = project_id.into();
+        context.query = query.into();
+        context.created_at = now_ms();
+        self.project_repo
+            .insert_knowledge_context(&ProjectKnowledgeContextRow {
+                id: context.id.clone(),
+                project_id: context.project_id.clone(),
+                provider_project_name: context.provider_project_name.clone(),
+                generation: context.generation,
+                query: context.query.clone(),
+                symbols_json: serialize_string_list(&context.symbols)?,
+                callers_json: serialize_string_list(&context.callers)?,
+                tests_json: serialize_string_list(&context.tests)?,
+                routes_json: serialize_string_list(&context.routes)?,
+                data_entities_json: serialize_string_list(&context.data_entities)?,
+                created_at: context.created_at,
+            })
+            .await?;
+        Ok(context)
     }
 
     pub async fn create(&self, user_id: &str, input: CreateProjectInput) -> Result<ProjectRow, ProjectError> {
@@ -622,6 +889,114 @@ fn overall_level<'a>(levels: impl Iterator<Item = &'a str>) -> String {
         warning |= level == "warning";
     }
     if warning { "warning" } else { "pass" }.into()
+}
+
+fn provider_project_name(project_id: &str) -> String {
+    format!("aionui-project-{project_id}")
+}
+
+fn provider_project_error(error: KnowledgeProviderError) -> ProjectError {
+    ProjectError::Internal(format!("knowledge provider {}", error.category()))
+}
+
+fn serialize_string_list(values: &[String]) -> Result<String, ProjectError> {
+    serde_json::to_string(values).map_err(|_| ProjectError::Internal("invalid project knowledge data".into()))
+}
+
+fn parse_string_list(value: &str) -> Result<Vec<String>, ProjectError> {
+    serde_json::from_str(value).map_err(|_| ProjectError::Internal("invalid project knowledge data".into()))
+}
+
+fn knowledge_status_from_row(row: &ProjectKnowledgeIndexRow) -> Result<ProjectKnowledgeStatus, ProjectError> {
+    Ok(ProjectKnowledgeStatus {
+        project_id: row.project_id.clone(),
+        provider: row.provider.clone(),
+        provider_project_name: row.provider_project_name.clone(),
+        provider_version: row.provider_version.clone(),
+        status: row.status.clone(),
+        generation: row.generation,
+        source_commit: row.source_commit.clone(),
+        indexed_at: row.indexed_at,
+        changed_paths: parse_string_list(&row.changed_paths_json)?,
+        error_category: row.error_category.clone(),
+        updated_at: row.updated_at,
+    })
+}
+
+fn validate_provider_result(
+    result: &ProjectKnowledgeProviderResult,
+    request: &ProjectKnowledgeProviderRequest,
+) -> Result<(), ProjectError> {
+    if result.provider_project_name != request.provider_project_name
+        || result.source_commit != request.source_commit
+        || result.changed_paths != request.changed_paths
+        || result.facts.len() > 500
+    {
+        return Err(provider_project_error(KnowledgeProviderError::MalformedOutput));
+    }
+    Ok(())
+}
+
+fn normalize_and_validate_facts(facts: &mut Vec<ProjectKnowledgeFact>, indexed_at: i64) -> Result<(), ProjectError> {
+    if facts.len() > 500 {
+        return Err(provider_project_error(KnowledgeProviderError::MalformedOutput));
+    }
+    for fact in facts.iter_mut() {
+        if !matches!(
+            fact.kind.as_str(),
+            "symbol" | "caller" | "test" | "route" | "data_entity" | "architecture"
+        ) || fact.name.trim().is_empty()
+            || !safe_relative_source_path(&fact.source_path)
+            || fact.source_line.is_some_and(|line| line <= 0)
+        {
+            return Err(provider_project_error(KnowledgeProviderError::MalformedOutput));
+        }
+        fact.name = fact.name.trim().to_owned();
+        fact.indexed_at = indexed_at;
+    }
+    facts.sort_by(|left, right| {
+        (&left.kind, &left.name, &left.source_path, left.source_line).cmp(&(
+            &right.kind,
+            &right.name,
+            &right.source_path,
+            right.source_line,
+        ))
+    });
+    facts.dedup_by(|left, right| {
+        left.kind == right.kind
+            && left.name == right.name
+            && left.qualified_name == right.qualified_name
+            && left.source_path == right.source_path
+            && left.source_line == right.source_line
+    });
+    Ok(())
+}
+
+fn safe_relative_source_path(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && !path.is_absolute()
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_)
+            )
+        })
+}
+
+fn validate_context(context: &ProjectTaskContext) -> Result<(), ProjectError> {
+    for values in [
+        &context.symbols,
+        &context.callers,
+        &context.tests,
+        &context.routes,
+        &context.data_entities,
+    ] {
+        if values.len() > 20 || values.iter().any(|value| value.trim().is_empty() || value.len() > 1000) {
+            return Err(provider_project_error(KnowledgeProviderError::MalformedOutput));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

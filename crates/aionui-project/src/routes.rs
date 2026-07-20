@@ -4,7 +4,10 @@
 
 use std::sync::Arc;
 
-use aionui_api_types::{ApiResponse, ProjectRepositoryFacts, ProjectRepositoryOnboardingInput};
+use aionui_api_types::{
+    ApiResponse, ProjectKnowledgeFact, ProjectKnowledgeStatus, ProjectRepositoryFacts,
+    ProjectRepositoryOnboardingInput, ProjectTaskContext, ProjectTaskContextRequest,
+};
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use axum::Router;
@@ -71,6 +74,10 @@ pub fn project_routes(state: ProjectRouterState) -> Router {
         .route("/api/projects/{id}/links", get(list_links).post(bind_resource))
         .route("/api/projects/{id}/preflight", post(preflight))
         .route("/api/projects/{id}/repository-facts", get(get_repository_facts))
+        .route("/api/projects/{id}/knowledge", get(get_knowledge_status))
+        .route("/api/projects/{id}/knowledge/refresh", post(refresh_knowledge))
+        .route("/api/projects/{id}/knowledge/facts", get(list_knowledge_facts))
+        .route("/api/projects/{id}/knowledge/context", post(task_context))
         .with_state(state)
 }
 
@@ -93,6 +100,64 @@ async fn get_repository_facts(
         state
             .service
             .get_repository_facts(&user.id, &id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn get_knowledge_status(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<ProjectKnowledgeStatus>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_knowledge_status(&user.id, &id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn refresh_knowledge(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<ProjectKnowledgeStatus>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .refresh_knowledge(&user.id, &id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn list_knowledge_facts(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<ProjectKnowledgeFact>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .list_knowledge_facts(&user.id, &id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn task_context(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<ProjectTaskContextRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectTaskContext>>, ApiError> {
+    let Json(input) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .task_context(&user.id, &id, &input.query)
             .await
             .map_err(ApiError::from)?,
     )))

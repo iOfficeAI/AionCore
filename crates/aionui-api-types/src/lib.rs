@@ -121,7 +121,8 @@ pub use office::{
     PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StartPreviewRequest, StopPreviewRequest,
 };
 pub use project::{
-    DirtyWorktreeChoice, ProjectRepositoryFacts, ProjectRepositoryOnboardingInput, RepositorySource,
+    DirtyWorktreeChoice, ProjectKnowledgeFact, ProjectKnowledgeStatus, ProjectRepositoryFacts,
+    ProjectRepositoryOnboardingInput, ProjectTaskContext, ProjectTaskContextRequest, RepositorySource,
     RepositorySubmodule,
 };
 pub use provider::{
