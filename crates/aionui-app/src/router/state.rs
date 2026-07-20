@@ -359,7 +359,10 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
 
     SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),
-        client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(pool.clone()))),
+        client_pref_service: ClientPrefService::with_keep_awake_controller(
+            Arc::new(SqliteClientPreferenceRepository::new(pool.clone())),
+            Arc::new(aionui_system::SystemKeepAwakeController::new()),
+        ),
         provider_service: ProviderService::new(provider_repo.clone(), encryption_key),
         model_fetch_service: ModelFetchService::new(provider_repo, encryption_key, http_client.clone()),
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
