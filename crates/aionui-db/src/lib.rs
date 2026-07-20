@@ -21,13 +21,14 @@ pub use models::{
     AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow, CompletionEvidenceRow,
     ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams, DevelopmentAlertRow,
     DevelopmentAuditEventRow, DevelopmentPolicyRow, DevelopmentRecoveryRecordRow, DevelopmentRunRoleRow,
-    DevelopmentRunRow, DevelopmentTaskRow, DevelopmentUsageEventRow, DevelopmentUsageSummary, PlanRevisionRow,
-    ProjectCommandProfileRow, ProjectKnowledgeContextRow, ProjectKnowledgeFactRow, ProjectKnowledgeIndexRow,
-    ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow, ProjectRuntimeProfileRow, QualityGateRunRow,
-    RequirementVersionRow, ReviewFindingRow, SingleRunWorkspaceRow, SkillImportRecordRow, SkillRow, TaskArtifactRow,
-    TaskCriterionRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
-    UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
-    UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams,
+    DevelopmentRunRow, DevelopmentTaskRow, DevelopmentUsageEventRow, DevelopmentUsageSummary,
+    ExecutionResourceLeaseRow, PlanRevisionRow, ProjectCommandProfileRow, ProjectKnowledgeContextRow,
+    ProjectKnowledgeFactRow, ProjectKnowledgeIndexRow, ProjectRepositoryFactsRow, ProjectResourceLinkRow, ProjectRow,
+    ProjectRuntimeProfileRow, QualityGateRunRow, RequirementVersionRow, ReviewFindingRow, SingleRunWorkspaceRow,
+    SkillImportRecordRow, SkillRow, TaskArtifactRow, TaskCriterionRow, UpdateAgentAvailabilitySnapshotParams,
+    UpdateAgentHandshakeParams, UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
+    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
+    UpsertOverrideParams,
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{

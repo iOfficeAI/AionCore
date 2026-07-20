@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::DevelopmentError;
+use crate::resources::{DevelopmentResourceController, ResourceLeaseCoordinator};
 
 const DEFAULT_MAX_DURATION_MS: i64 = 4 * 60 * 60 * 1000;
 const MAX_AUDIT_PAYLOAD_BYTES: usize = 32 * 1024;
@@ -65,6 +66,8 @@ pub struct DevelopmentOperationsService {
     development_repo: Arc<dyn IDevelopmentRepository>,
     project_repo: Arc<dyn IProjectRepository>,
     lease_repo: Arc<dyn IAgentWorkspaceLeaseRepository>,
+    resource_coordinator: Option<ResourceLeaseCoordinator>,
+    resource_controller: Option<Arc<dyn DevelopmentResourceController>>,
 }
 
 impl DevelopmentOperationsService {
@@ -79,7 +82,19 @@ impl DevelopmentOperationsService {
             development_repo,
             project_repo,
             lease_repo,
+            resource_coordinator: None,
+            resource_controller: None,
         }
+    }
+
+    pub fn with_resources(
+        mut self,
+        coordinator: ResourceLeaseCoordinator,
+        controller: Arc<dyn DevelopmentResourceController>,
+    ) -> Self {
+        self.resource_coordinator = Some(coordinator);
+        self.resource_controller = Some(controller);
+        self
     }
 
     pub async fn get_policy(&self, user_id: &str, project_id: &str) -> Result<DevelopmentPolicyRow, DevelopmentError> {
@@ -360,6 +375,9 @@ impl DevelopmentOperationsService {
         &self,
         stale_after_ms: i64,
     ) -> Result<Vec<DevelopmentRecoveryRecordRow>, DevelopmentError> {
+        if let Some(resources) = &self.resource_coordinator {
+            resources.reconcile_stale(now_ms()).await?;
+        }
         self.reconcile_stale_runs_scoped(None, stale_after_ms).await
     }
 
@@ -503,17 +521,35 @@ impl DevelopmentOperationsService {
         run_id: &str,
         input: RecoveryDecisionInput,
     ) -> Result<DevelopmentRecoveryRecordRow, DevelopmentError> {
-        if !matches!(input.action.as_str(), "resume" | "terminate") {
+        if !matches!(
+            input.action.as_str(),
+            "resume" | "retry" | "rollback" | "takeover" | "terminate"
+        ) {
             return Err(DevelopmentError::BadRequest(
-                "recovery action must be resume or terminate".into(),
+                "recovery action must be retry, rollback, takeover, or terminate".into(),
             ));
         }
         let run = self.require_run(user_id, run_id).await?;
-        let target = if input.action == "resume" {
+        let target = if matches!(input.action.as_str(), "resume" | "retry" | "takeover") {
             "running"
         } else {
             "cancelled"
         };
+        if let Some(resources) = &self.resource_coordinator {
+            let decision = if input.action == "resume" {
+                "retry"
+            } else {
+                input.action.as_str()
+            };
+            for lease in self.operations_repo.list_resource_leases(user_id, run_id, true).await? {
+                resources.record_recovery_decision(&lease.id, decision).await?;
+            }
+            if matches!(decision, "rollback" | "terminate")
+                && let Some(controller) = &self.resource_controller
+            {
+                resources.cancel_run(user_id, run_id, controller.as_ref()).await?;
+            }
+        }
         let finished_at = (target == "cancelled").then(now_ms);
         self.development_repo
             .update_run_status(run_id, user_id, target, finished_at)

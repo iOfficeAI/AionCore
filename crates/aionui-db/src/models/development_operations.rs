@@ -100,3 +100,30 @@ pub struct DevelopmentRecoveryRecordRow {
     pub details_json: String,
     pub created_at: TimestampMs,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ExecutionResourceLeaseRow {
+    pub id: String,
+    pub user_id: String,
+    pub project_id: String,
+    pub run_id: String,
+    pub task_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub gate_id: Option<String>,
+    pub environment_id: String,
+    pub environment_kind: String,
+    pub resource_kind: String,
+    pub resource_identifier: String,
+    pub status: String,
+    pub accepts_work: i64,
+    pub owner_instance_id: String,
+    pub heartbeat_at: TimestampMs,
+    pub expires_at: TimestampMs,
+    pub cleanup_order: i64,
+    pub cleanup_status: Option<String>,
+    pub cleanup_result: Option<String>,
+    pub recovery_decision: Option<String>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+    pub terminal_at: Option<TimestampMs>,
+}

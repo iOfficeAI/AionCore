@@ -31,6 +31,7 @@ use std::process::Stdio;
 use tokio::process::{Child, Command};
 
 use crate::ResolvedCommand;
+use crate::lease::{LeasedChild, ProcessLeaseSpec};
 use crate::resolver::resolve_command_path;
 
 struct ProgramPlan {
@@ -67,6 +68,23 @@ pub async fn kill_process_tree(child: &mut Child) -> io::Result<()> {
     #[cfg(not(any(unix, windows)))]
     child.kill().await?;
     child.wait().await.map(|_| ())
+}
+
+/// Force-kill a previously persisted process-tree identifier.
+/// A missing process is treated as already cleaned up.
+pub async fn kill_process_tree_by_id(pid: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    return force_kill_process_tree(pid, Some(pid));
+    #[cfg(windows)]
+    return kill_windows_process_tree(pid).await;
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "persisted process-tree cleanup is unsupported on this platform",
+        ))
+    }
 }
 
 impl std::fmt::Debug for Builder {
@@ -213,6 +231,16 @@ impl Builder {
     /// Spawn the process and return the standard `tokio::process::Child`.
     pub fn spawn(mut self) -> io::Result<Child> {
         self.inner.spawn()
+    }
+
+    /// Spawn a child owned by an explicit execution lease.
+    ///
+    /// The returned wrapper preserves normal `Child` access while adding a
+    /// heartbeat, an accepting-work fence, a deadline, and process-tree
+    /// termination. Callers that supervise Agent or project commands should
+    /// use this boundary instead of retaining a raw child.
+    pub fn spawn_leased(mut self, spec: ProcessLeaseSpec) -> io::Result<LeasedChild> {
+        self.inner.spawn().map(|child| LeasedChild::new(child, spec))
     }
 
     /// Run to completion and collect stdout/stderr.

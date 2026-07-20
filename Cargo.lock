@@ -628,6 +628,7 @@ dependencies = [
  "aionui-auth",
  "aionui-common",
  "aionui-db",
+ "aionui-runtime",
  "async-trait",
  "axum",
  "git2",
@@ -640,6 +641,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tower",
+ "tracing",
  "uuid",
 ]
 

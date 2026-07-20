@@ -41,9 +41,9 @@ use aionui_db::{
 };
 use aionui_development::{
     ApprovalOption, ApprovalRequestInput, ApprovalResolver, ApprovalRouterState, ApprovalService, ApprovalSource,
-    DeliveryService, DevelopmentOperationsService, DevelopmentRouterState, DevelopmentService,
+    DeliveryService, DevelopmentOperationsService, DevelopmentRouterState, DevelopmentRunner, DevelopmentService,
     DevelopmentWorkspacePort, GhCliDeliveryProvider, PrepareDevelopmentWorkspace, PreparedDevelopmentWorkspace,
-    ResolveApprovalContext,
+    ResolveApprovalContext, ResourceLeaseCoordinator, SystemDevelopmentResourceController,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -1092,12 +1092,22 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
         )),
     });
     let operations_repo = Arc::new(SqliteDevelopmentOperationsRepository::new(pool));
-    let operations_service = Arc::new(DevelopmentOperationsService::new(
-        operations_repo,
-        development_repo.clone(),
-        project_repo.clone(),
-        lease_repo.clone(),
+    let resources = ResourceLeaseCoordinator::new(operations_repo.clone(), format!("app:{}", std::process::id()));
+    let resource_controller = Arc::new(SystemDevelopmentResourceController);
+    let runner = Arc::new(DevelopmentRunner::new(
+        operations_repo.clone(),
+        resources.clone(),
+        resource_controller.clone(),
     ));
+    let operations_service = Arc::new(
+        DevelopmentOperationsService::new(
+            operations_repo,
+            development_repo.clone(),
+            project_repo.clone(),
+            lease_repo.clone(),
+        )
+        .with_resources(resources, resource_controller),
+    );
     DevelopmentRouterState {
         service: Arc::new(
             DevelopmentService::new(
@@ -1107,7 +1117,8 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
                 services.data_dir.join("development-artifacts"),
             )
             .with_operations(operations_service.clone())
-            .with_workspace(workspace),
+            .with_workspace(workspace)
+            .with_runner(runner),
         ),
         delivery_service: Arc::new(
             DeliveryService::new(development_repo, project_repo, Arc::new(GhCliDeliveryProvider))

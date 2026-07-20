@@ -46,7 +46,7 @@ pub use development::{
 };
 pub use development_operations::{
     DevelopmentAlertRow, DevelopmentAuditEventRow, DevelopmentPolicyRow, DevelopmentRecoveryRecordRow,
-    DevelopmentUsageEventRow, DevelopmentUsageSummary,
+    DevelopmentUsageEventRow, DevelopmentUsageSummary, ExecutionResourceLeaseRow,
 };
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;

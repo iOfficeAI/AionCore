@@ -4,7 +4,7 @@ use sqlx::SqlitePool;
 use crate::error::DbError;
 use crate::models::{
     DevelopmentAlertRow, DevelopmentAuditEventRow, DevelopmentPolicyRow, DevelopmentRecoveryRecordRow,
-    DevelopmentRunRow, DevelopmentUsageEventRow, DevelopmentUsageSummary,
+    DevelopmentRunRow, DevelopmentUsageEventRow, DevelopmentUsageSummary, ExecutionResourceLeaseRow,
 };
 use crate::repository::development_operations::IDevelopmentOperationsRepository;
 
@@ -330,5 +330,109 @@ impl IDevelopmentOperationsRepository for SqliteDevelopmentOperationsRepository 
         .bind(updated_before)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    async fn upsert_resource_lease(&self, row: &ExecutionResourceLeaseRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO execution_resource_leases (id, user_id, project_id, run_id, task_id, turn_id, gate_id, \
+             environment_id, environment_kind, resource_kind, resource_identifier, status, accepts_work, \
+             owner_instance_id, heartbeat_at, expires_at, cleanup_order, cleanup_status, cleanup_result, \
+             recovery_decision, created_at, updated_at, terminal_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET status=excluded.status, accepts_work=excluded.accepts_work, \
+             owner_instance_id=excluded.owner_instance_id, heartbeat_at=excluded.heartbeat_at, \
+             expires_at=excluded.expires_at, cleanup_status=excluded.cleanup_status, \
+             cleanup_result=excluded.cleanup_result, \
+             recovery_decision=COALESCE(execution_resource_leases.recovery_decision, excluded.recovery_decision), \
+             updated_at=excluded.updated_at, terminal_at=excluded.terminal_at",
+        )
+        .bind(&row.id)
+        .bind(&row.user_id)
+        .bind(&row.project_id)
+        .bind(&row.run_id)
+        .bind(&row.task_id)
+        .bind(&row.turn_id)
+        .bind(&row.gate_id)
+        .bind(&row.environment_id)
+        .bind(&row.environment_kind)
+        .bind(&row.resource_kind)
+        .bind(&row.resource_identifier)
+        .bind(&row.status)
+        .bind(row.accepts_work)
+        .bind(&row.owner_instance_id)
+        .bind(row.heartbeat_at)
+        .bind(row.expires_at)
+        .bind(row.cleanup_order)
+        .bind(&row.cleanup_status)
+        .bind(&row.cleanup_result)
+        .bind(&row.recovery_decision)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .bind(row.terminal_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_resource_lease(&self, lease_id: &str) -> Result<Option<ExecutionResourceLeaseRow>, DbError> {
+        Ok(sqlx::query_as("SELECT * FROM execution_resource_leases WHERE id = ?")
+            .bind(lease_id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    async fn list_resource_leases(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        active_only: bool,
+    ) -> Result<Vec<ExecutionResourceLeaseRow>, DbError> {
+        let status = if active_only {
+            " AND status IN ('active', 'stopping', 'orphaned', 'cleanup_failed')"
+        } else {
+            ""
+        };
+        Ok(sqlx::query_as(&format!(
+            "SELECT * FROM execution_resource_leases WHERE user_id = ? AND run_id = ?{status} \
+             ORDER BY cleanup_order ASC, created_at ASC, id ASC"
+        ))
+        .bind(user_id)
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn list_stale_resource_leases(&self, now: TimestampMs) -> Result<Vec<ExecutionResourceLeaseRow>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM execution_resource_leases WHERE status IN ('active', 'stopping') \
+             AND expires_at <= ? ORDER BY expires_at ASC, id ASC",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn bind_execution_environment(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        environment_id: &str,
+        environment_kind: &str,
+        bound_at: TimestampMs,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO execution_environment_bindings \
+             (entity_type, entity_id, environment_id, environment_kind, bound_at) VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(entity_type, entity_id, environment_id) DO UPDATE SET \
+             environment_kind=excluded.environment_kind, bound_at=excluded.bound_at",
+        )
+        .bind(entity_type)
+        .bind(entity_id)
+        .bind(environment_id)
+        .bind(environment_kind)
+        .bind(bound_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }

@@ -19,6 +19,7 @@ use crate::error::DevelopmentError;
 use crate::executor::{CommandExecutionInput, execute_command};
 use crate::operations::{DevelopmentOperationsService, default_policy};
 use crate::requirements::build_snapshot;
+use crate::runner::{DevelopmentRunner, RunnerContext};
 use crate::types::{
     AppendPlanRevisionInput, CompletionEvidenceInput, CreateArtifactInput, CreateDevelopmentRunInput,
     CreateDevelopmentTaskInput, ReviewFindingInput, SubmitReviewInput,
@@ -41,6 +42,7 @@ pub struct DevelopmentService {
     artifact_root: PathBuf,
     operations: Option<Arc<DevelopmentOperationsService>>,
     workspace: Option<Arc<dyn DevelopmentWorkspacePort>>,
+    runner: Option<Arc<DevelopmentRunner>>,
 }
 
 impl DevelopmentService {
@@ -57,6 +59,7 @@ impl DevelopmentService {
             artifact_root,
             operations: None,
             workspace: None,
+            runner: None,
         }
     }
 
@@ -67,6 +70,11 @@ impl DevelopmentService {
 
     pub fn with_workspace(mut self, workspace: Arc<dyn DevelopmentWorkspacePort>) -> Self {
         self.workspace = Some(workspace);
+        self
+    }
+
+    pub fn with_runner(mut self, runner: Arc<DevelopmentRunner>) -> Self {
+        self.runner = Some(runner);
         self
     }
 
@@ -354,6 +362,9 @@ impl DevelopmentService {
             return Err(DevelopmentError::Conflict(
                 "one or more required quality gates have not passed".into(),
             ));
+        }
+        if let Some(runner) = &self.runner {
+            runner.cleanup_run(user_id, run_id).await?;
         }
         self.development_repo
             .update_run_status(run_id, user_id, "succeeded", Some(now_ms()))
@@ -712,7 +723,7 @@ impl DevelopmentService {
             created_at: started_at,
         };
         self.development_repo.create_gate(&row).await?;
-        let output = match execute_command(CommandExecutionInput {
+        let command_input = CommandExecutionInput {
             execution_id: &gate_id,
             run_id,
             command,
@@ -721,9 +732,26 @@ impl DevelopmentService {
             policy: &policy,
             runtime_profile: runtime_profile.as_ref(),
             environment,
-        })
-        .await
-        {
+        };
+        let output_result = match &self.runner {
+            Some(runner) => {
+                runner
+                    .execute(
+                        command_input,
+                        &RunnerContext {
+                            user_id: user_id.into(),
+                            project_id: run.project_id.clone(),
+                            run_id: run_id.into(),
+                            task_id: task_id.map(str::to_owned),
+                            turn_id: None,
+                            gate_id: Some(gate_id.clone()),
+                        },
+                    )
+                    .await
+            }
+            None => execute_command(command_input).await,
+        };
+        let output = match output_result {
             Ok(output) => output,
             Err(error) => {
                 row.status = "failed".into();
@@ -1158,6 +1186,9 @@ impl DevelopmentService {
             .get_single_run_workspace(run_id, user_id)
             .await?
             .ok_or_else(|| DevelopmentError::NotFound(format!("single workspace for run {run_id}")))?;
+        if let Some(runner) = &self.runner {
+            runner.cleanup_run(user_id, run_id).await?;
+        }
         let lease_id = row
             .workspace_lease_id
             .as_deref()
