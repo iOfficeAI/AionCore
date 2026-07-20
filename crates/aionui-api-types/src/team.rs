@@ -527,6 +527,7 @@ pub enum TeamSessionStatus {
     Starting,
     Ready,
     Failed,
+    Stopped,
 }
 
 /// Diagnostic phase for team session startup.
@@ -1254,6 +1255,7 @@ mod tests {
         assert_session_status_roundtrip(TeamSessionStatus::Starting, "starting");
         assert_session_status_roundtrip(TeamSessionStatus::Ready, "ready");
         assert_session_status_roundtrip(TeamSessionStatus::Failed, "failed");
+        assert_session_status_roundtrip(TeamSessionStatus::Stopped, "stopped");
     }
 
     #[test]
