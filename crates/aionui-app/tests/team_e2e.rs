@@ -3,17 +3,70 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
+use aionui_api_types::{AgentDynamicProbeResult, AgentProbeStatus, AgentProbeStep, AgentProbeStepResult};
+use aionui_app::AppServices;
 use aionui_db::{IConversationRepository, MessagePageDirection, MessagePageParams};
 use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{
-    body_json, build_app, build_app_with_mock_agents, delete_with_token, get_with_token, json_with_token,
-    setup_and_login,
-};
+use common::{body_json, delete_with_token, get_with_token, json_with_token, setup_and_login};
 
 const DEFAULT_TEAM_ASSISTANT_ID: &str = "team-e2e-assistant";
+const DEFAULT_TEAM_AGENT_ID: &str = "2d23ff1c";
+
+async fn seed_healthy_team_agent(services: &AppServices) {
+    let checked_at = aionui_common::now_ms();
+    let probe = serde_json::to_string(&AgentDynamicProbeResult {
+        agent_id: DEFAULT_TEAM_AGENT_ID.into(),
+        checked_at,
+        available_models: vec!["claude".into()],
+        steps: [
+            AgentProbeStep::Spawn,
+            AgentProbeStep::Initialize,
+            AgentProbeStep::Models,
+            AgentProbeStep::MinimalPrompt,
+            AgentProbeStep::Cancel,
+        ]
+        .into_iter()
+        .map(|step| AgentProbeStepResult {
+            step,
+            status: AgentProbeStatus::Passed,
+            started_at: checked_at,
+            duration_ms: 1,
+            error_category: None,
+            error_message: None,
+        })
+        .collect(),
+    })
+    .unwrap();
+    let result = sqlx::query(
+        "UPDATE agent_metadata SET last_check_status='online', last_check_kind='test', \
+         last_check_at=?, last_success_at=?, last_failure_at=NULL, dynamic_probe_result=?, updated_at=? \
+         WHERE id=?",
+    )
+    .bind(checked_at)
+    .bind(checked_at)
+    .bind(probe)
+    .bind(checked_at)
+    .bind(DEFAULT_TEAM_AGENT_ID)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(result.rows_affected(), 1, "team test Agent metadata must exist");
+}
+
+async fn build_app() -> (axum::Router, AppServices) {
+    let (app, services) = common::build_app().await;
+    seed_healthy_team_agent(&services).await;
+    (app, services)
+}
+
+async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
+    let (app, services) = common::build_app_with_mock_agents().await;
+    seed_healthy_team_agent(&services).await;
+    (app, services)
+}
 
 fn team_agent(name: &str, role: &str) -> serde_json::Value {
     json!({
@@ -60,7 +113,7 @@ async fn ensure_default_team_assistant(app: &mut axum::Router, token: &str, csrf
         json!({
             "id": DEFAULT_TEAM_ASSISTANT_ID,
             "name": "Team E2E Assistant",
-            "agent_id": "2d23ff1c"
+            "agent_id": DEFAULT_TEAM_AGENT_ID
         }),
         token,
         csrf,
