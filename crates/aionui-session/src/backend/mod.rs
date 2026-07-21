@@ -165,6 +165,14 @@ pub struct SessionInit {
     pub mcp_servers: Vec<McpServerSpec>,
     /// Skill ids/names to surface to the agent on the first turn (acp/aionrs
     /// deliver these via the first prompt, not a `session/new` param).
+    ///
+    /// NB: claude/codex direct-CLI backends intentionally do NOT consume this —
+    /// skills reach them as workspace symlinks (conversation service links the
+    /// resolved skills into the agent's `native_skills_dirs`, e.g.
+    /// `.claude/skills` / `.codex/skills`) and both CLIs discover them natively
+    /// (codex LIVE-verified 0.144.1: `skills/list` returns a `<cwd>/.codex/skills`
+    /// entry as scope=repo; see samples/codex-cli/0.144.1/_probe_workspace_skills.py).
+    /// The field is carried for the aionrs/acp first-prompt delivery path only.
     pub skills: Vec<String>,
     /// Composed system prompt / preset context (the `compose_preset_context`
     /// output + aionrs `preset_rules`-merged prompt). Delivered first-message.
