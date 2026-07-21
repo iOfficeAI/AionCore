@@ -466,6 +466,7 @@
     "moonshot-cn": {
       "api": "https://api.moonshot.cn/v1",
       "models": [
+        "kimi-k2.7-code",
         "kimi-k2.6",
         "kimi-k2.5",
         "moonshot-v1-8k-vision-preview",
@@ -476,6 +477,7 @@
     "moonshot-global": {
       "api": "https://api.moonshot.ai/v1",
       "models": [
+        "kimi-k2.7-code",
         "kimi-k2.6",
         "kimi-k2.5",
         "moonshot-v1-8k-vision-preview",

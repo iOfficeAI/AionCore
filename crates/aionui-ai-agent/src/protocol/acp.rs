@@ -54,6 +54,10 @@ use agent_client_protocol::schema::{
 /// Timeout for the ACP initialize handshake (seconds).
 const INIT_TIMEOUT_SECS: u64 = 30;
 
+/// Timeout for the short config/mode/model RPCs (seconds). Intentionally
+/// shorter than INIT_TIMEOUT_SECS; a dropped/absent response self-heals via retry.
+const CONFIG_RPC_TIMEOUT_SECS: u64 = 10;
+
 /// Client identity reported in the ACP `initialize` handshake (`clientInfo`).
 ///
 /// Some agents forward these fields downstream as client metadata — e.g. Mistral
@@ -274,22 +278,47 @@ impl AcpProtocol {
     }
 
     /// Set the session mode.
+    ///
+    /// Bounded by `CONFIG_RPC_TIMEOUT_SECS`: a dropped or never-arriving
+    /// response returns `AcpError::RequestTimeout` instead of hanging forever
+    /// (see ELECTRON-3MS). Unlike `session/prompt`/`session/load`, this is a
+    /// short config RPC, so the timeout does not truncate a long-running turn.
+    /// The timeout is applied via [`Self::send_config_request`], which keeps the
+    /// in-flight SDK request alive on timeout (see that method for why).
     pub async fn set_mode(&self, req: SetSessionModeRequest) -> Result<SetSessionModeResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_set_mode).await
+        self.send_config_request(
+            req,
+            AGENT_METHOD_NAMES.session_set_mode,
+            std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+        )
+        .await
     }
 
     /// Set the session model.
+    ///
+    /// Bounded by `CONFIG_RPC_TIMEOUT_SECS`; see [`Self::set_mode`].
     pub async fn set_model(&self, req: SetSessionModelRequest) -> Result<SetSessionModelResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_set_model).await
+        self.send_config_request(
+            req,
+            AGENT_METHOD_NAMES.session_set_model,
+            std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+        )
+        .await
     }
 
     /// Set a session config option.
+    ///
+    /// Bounded by `CONFIG_RPC_TIMEOUT_SECS`; see [`Self::set_mode`].
     pub async fn set_config_option(
         &self,
         req: SetSessionConfigOptionRequest,
     ) -> Result<SetSessionConfigOptionResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_set_config_option)
-            .await
+        self.send_config_request(
+            req,
+            AGENT_METHOD_NAMES.session_set_config_option,
+            std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+        )
+        .await
     }
 
     /// List sessions, optionally filtered by working directory.
@@ -335,6 +364,79 @@ impl AcpProtocol {
     }
 
     // ── Private helpers ──────────────────────────────────────────────────
+
+    /// Bounded config RPC that keeps the in-flight SDK request alive on timeout.
+    ///
+    /// The naive approach — `tokio::time::timeout(dur, self.send_request(..))` —
+    /// drops the `send_request` future when the timeout fires, which drops the
+    /// SDK response *receiver* while the matching subscriber is still registered.
+    /// A later-arriving response then fails with `failed to send response,
+    /// receiver dropped`, and the SDK surfaces that as a fatal error that tears
+    /// down the entire ACP connection — collaterally cancelling any concurrent
+    /// `session/prompt` (observed on the Claude backend as a `-32603`
+    /// "oneshot canceled" turn failure; codex happens to hit the harmless
+    /// `no subscriber found` path instead, but the defect is in this shared
+    /// protocol layer and is backend-agnostic). See ELECTRON-3MS follow-up.
+    ///
+    /// Fix: run the SDK call on a detached task that *owns* the receiver, and
+    /// bound only the caller-side await. On timeout the task is detached (a
+    /// dropped `JoinHandle` does not abort), so a late response is delivered to
+    /// a live-but-ignored receiver and discarded; the task then completes and
+    /// drops cleanly, leaving the connection intact. The detached task is
+    /// bounded by the connection lifetime — when the agent responds or the SDK
+    /// connection closes, `block_task().await` resolves and the task exits.
+    async fn send_config_request<Req>(
+        &self,
+        req: Req,
+        method: &str,
+        duration: std::time::Duration,
+    ) -> Result<Req::Response, AcpError>
+    where
+        Req: agent_client_protocol::JsonRpcRequest + serde::Serialize + std::fmt::Debug + Send + 'static,
+        Req::Response: serde::Serialize + std::fmt::Debug + Send + 'static,
+    {
+        self.ensure_connected()?;
+        log_client_request(method, &json_str(&req));
+        let connection = self.connection.clone();
+        let method_owned = method.to_owned();
+        let sdk_result = Self::await_config_rpc_detached(method, duration, async move {
+            let rsp = connection.send_request(req).block_task().await;
+            log_agent_response(&method_owned, &json_or_err(&rsp));
+            rsp
+        })
+        .await?;
+        sdk_result.map_err(|e| AcpError::from_sdk(e, method))
+    }
+
+    /// Await `fut` on a detached task, bounded by `duration`, mapping elapsed
+    /// time into `AcpError::RequestTimeout`. On timeout the spawned task is
+    /// detached (never aborted) so its in-flight work — the SDK response
+    /// receiver — survives; see [`Self::send_config_request`] for why that
+    /// matters. `duration` is a parameter so unit tests can drive it
+    /// deterministically under a paused clock.
+    async fn await_config_rpc_detached<F>(
+        method: &str,
+        duration: std::time::Duration,
+        fut: F,
+    ) -> Result<F::Output, AcpError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let handle = tokio::spawn(fut);
+        match tokio::time::timeout(duration, handle).await {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(join_err)) => Err(AcpError::AgentInternal {
+                message: format!("{method} config RPC task panicked: {join_err}"),
+                code: -32603,
+                data: None,
+            }),
+            Err(_) => Err(AcpError::RequestTimeout {
+                method: method.to_owned(),
+                timeout_secs: duration.as_secs(),
+            }),
+        }
+    }
 
     /// Shared request path: connectivity check, structured logging, SDK call.
     async fn send_request<Req>(&self, req: Req, method: &str) -> Result<Req::Response, AcpError>
@@ -1007,5 +1109,96 @@ mod tests {
         let json = serde_json::to_value(&req).expect("request serializes");
         assert_eq!(json["clientInfo"]["name"], "AionUi");
         assert_ne!(json["clientInfo"]["version"], "");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_config_rpc_detached_maps_stuck_future_to_request_timeout() {
+        // A never-returning config RPC (dropped/absent response) must resolve
+        // to RequestTimeout — not hang forever — for each of the three
+        // set-path methods (§10.1). Under `start_paused`, the runtime
+        // auto-advances the clock to the timer while the only task is blocked
+        // on the timeout, so awaiting resolves deterministically without
+        // wall-clock delay.
+        for method in [
+            AGENT_METHOD_NAMES.session_set_config_option,
+            AGENT_METHOD_NAMES.session_set_mode,
+            AGENT_METHOD_NAMES.session_set_model,
+        ] {
+            let result = AcpProtocol::await_config_rpc_detached(
+                method,
+                std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+                std::future::pending::<()>(),
+            )
+            .await;
+            match result {
+                Err(AcpError::RequestTimeout {
+                    method: m,
+                    timeout_secs,
+                }) => {
+                    assert_eq!(m, method);
+                    assert_eq!(timeout_secs, CONFIG_RPC_TIMEOUT_SECS);
+                }
+                other => panic!("expected RequestTimeout for {method}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_config_rpc_detached_passes_through_ready_ok() {
+        // Success path: a fast-completing RPC returns its Ok value unchanged.
+        let result = AcpProtocol::await_config_rpc_detached(
+            AGENT_METHOD_NAMES.session_set_config_option,
+            std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+            async { Ok::<_, AcpError>(()) },
+        )
+        .await;
+        assert!(matches!(result, Ok(Ok(()))), "ready Ok must pass through: {result:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_config_rpc_detached_leaves_in_flight_task_running_on_timeout() {
+        // Regression for the ELECTRON-3MS follow-up (Claude -32603 / connection
+        // teardown): when a config RPC times out, the underlying SDK request
+        // future must NOT be aborted. If it were, the SDK response receiver
+        // would be dropped while the subscriber is still registered, and a
+        // late response would hit `failed to send response, receiver dropped`,
+        // tearing down the whole ACP connection and killing any concurrent
+        // `session/prompt`.
+        //
+        // We model the SDK call as a spawned task that only finishes *after*
+        // the timeout, and assert that (a) the caller sees RequestTimeout and
+        // (b) the task still runs to completion — i.e. it was detached, not
+        // aborted (which is what keeps the real response receiver alive).
+        let completed = Arc::new(AtomicBool::new(false));
+        let flag = completed.clone();
+
+        let result = AcpProtocol::await_config_rpc_detached(
+            AGENT_METHOD_NAMES.session_set_config_option,
+            std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+            async move {
+                // Resolves well after the caller-side timeout fires.
+                tokio::time::sleep(std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS * 3)).await;
+                flag.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(AcpError::RequestTimeout { .. })),
+            "timeout must map to RequestTimeout: {result:?}"
+        );
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "in-flight task must not have completed yet at the moment of timeout"
+        );
+
+        // Advance past the in-flight task's own timer; a detached (not aborted)
+        // task keeps running and eventually completes.
+        tokio::time::sleep(std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS * 3)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "timed-out config RPC task must survive the timeout (detached, not aborted)"
+        );
     }
 }

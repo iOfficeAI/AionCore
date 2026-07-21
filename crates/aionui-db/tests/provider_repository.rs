@@ -28,6 +28,7 @@ fn sample_params() -> CreateProviderParams<'static> {
         model_protocols: None,
         model_enabled: None,
         model_health: None,
+        model_settings: "{}",
         bedrock_config: None,
         is_full_url: false,
     }
@@ -74,6 +75,7 @@ async fn create_with_all_optional_fields() {
             model_protocols: Some(r#"{"m1":"openai"}"#),
             model_enabled: Some(r#"{"m1":true}"#),
             model_health: Some(r#"{"m1":{"status":"healthy"}}"#),
+            model_settings: r#"{"m1":{"image_input":"supported"}}"#,
             bedrock_config: Some(r#"{"region":"us-east-1"}"#),
             ..sample_params()
         })
@@ -83,6 +85,7 @@ async fn create_with_all_optional_fields() {
     assert_eq!(p.model_protocols.as_deref(), Some(r#"{"m1":"openai"}"#));
     assert_eq!(p.model_enabled.as_deref(), Some(r#"{"m1":true}"#));
     assert!(p.model_health.is_some());
+    assert_eq!(p.model_settings, r#"{"m1":{"image_input":"supported"}}"#);
     assert!(p.bedrock_config.is_some());
 }
 
@@ -167,6 +170,28 @@ async fn update_api_key_changes_encrypted_value() {
         .unwrap();
 
     assert_eq!(updated.api_key_encrypted, "new_encrypted");
+}
+
+#[tokio::test]
+async fn update_model_settings_replaces_per_model_overrides() {
+    let r = repo().await;
+    let created = r.create(sample_params()).await.unwrap();
+
+    let updated = r
+        .update(
+            &created.id,
+            UpdateProviderParams {
+                model_settings: Some(r#"{"gpt-5.6-sol":{"openai_api_mode":"responses"}}"#),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        updated.model_settings,
+        r#"{"gpt-5.6-sol":{"openai_api_mode":"responses"}}"#
+    );
 }
 
 #[tokio::test]

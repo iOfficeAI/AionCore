@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use aion_config::compat::OpenAiApiMode;
+use aion_types::message::ImageInputCapability;
 use serde::{Deserialize, Serialize};
 
 use crate::session_context::AgentSessionContext;
@@ -113,6 +114,7 @@ impl RuntimeCapabilities {
 #[derive(Debug, Clone, Default)]
 pub struct AionrsCompatOverrides {
     pub(crate) openai_api_mode: Option<OpenAiApiMode>,
+    pub(crate) image_input: Option<ImageInputCapability>,
     pub max_tokens_field: Option<String>,
     pub api_path: Option<String>,
 }

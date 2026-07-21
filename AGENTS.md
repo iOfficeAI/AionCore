@@ -2,25 +2,14 @@
 
 <!-- Maintenance rule: Only add content that tells AI assistants WHAT TO DO or WHAT NOT TO DO.
      Implementation details, design rationale, and "how the system works" belong in ARCHITECTURE.md.
-     If a section doesn't contain an actionable rule or constraint, it doesn't belong here. -->
+     If a section doesn't contain an actionable rule or constraint, it doesn't belong here.
+     Rules must reference stable concepts (layers, contracts, conventions) — never anchor them to
+     specific field, type, or method names or file paths. Those drift and go stale fast; symbol-level
+     detail belongs in code comments or ARCHITECTURE.md, not here. -->
 
 Project-specific rules and conventions for AI assistants and contributors.
 
-## High-Priority Rules
-
-### Do NOT add fields to `AcpAgentManager` unless every alternative is exhausted
-
-`AcpAgentManager` (in `crates/aionui-ai-agent/src/acp_agent.rs`) is already large and carries multiple overlapping state holders (e.g. `runtime_snapshot`, `state`, `preferred_mode`, `config`). New fields tend to duplicate semantics that `AcpRuntimeSnapshot` or `AcpState` already model, which fragments the source of truth and makes resume/new paths diverge.
-
-Before adding a field:
-1. Can the value live in `AcpRuntimeSnapshot`? (runtime/session-scoped state, including user-selected current_mode/current_model/config_selections)
-2. Can it be derived from existing fields (`metadata`, `config`, `runtime_snapshot`, `state`)?
-3. Can it be persisted via `acp_session.session_config` + `preload_persisted` instead of a new in-memory field?
-4. If it must be in-memory and transient, can it be scoped to the call site (local variable, channel, task state) rather than the manager?
-
-Only after exhausting the above — and explicitly documenting why each option is insufficient — add a new field. When doing so, also document its lifecycle (who writes, who reads, when it is invalidated) in a doc comment on the field.
-
-### Logging
+## Logging
 
 When planning or changing a critical path or hard-to-observe flow, evaluate whether logging needs to change. In implementation plans for such changes, briefly state whether logs will be added, existing observability is sufficient, or logs are intentionally unnecessary. Do not add logs for simple refactors, test-only changes, UI copy/style changes, or when existing tests, errors, metrics, or logs already provide enough observability.
 
@@ -63,7 +52,7 @@ Every domain crate must follow:
 - Response format: `ApiResponse<T>` (success) / `ErrorResponse` (failure)
 - All request/response types defined in `aionui-api-types`
 - `aionui-api-types` must NOT depend on axum/tower or any HTTP framework
-- Use `aionui_common::ApiError` only at API/HTTP boundaries such as routes and middleware. Service/domain code must prefer crate-owned errors (`ConversationError`, `TeamError`, etc.) and map them to `ApiError` in route modules. Do not introduce new `AppError` usages; it exists only as a temporary compatibility alias.
+- Use `aionui_common::ApiError` only at API/HTTP boundaries such as routes and middleware. Service/domain code must prefer crate-owned errors (`ConversationError`, `TeamError`, etc.) and map them to `ApiError` in route modules.
 
 ### WebSocket Events
 
@@ -99,18 +88,18 @@ Every domain crate must follow:
 - Rust 2024 edition, stable toolchain (pinned in `rust-toolchain.toml`)
 - Comments in English, commit messages in English
 - Each `.rs` file follows single responsibility — one module, one concern
-- Max 1000 lines per `.rs` file; split into submodules when approaching the limit
+- Target under 1000 lines per `.rs` file; exceeding it is a signal to split into submodules, not a hard limit (test files exempt)
 
 ## Development Workflow
 
 ### Subprocess Spawning
 
-New subprocess spawn sites must use `aionui_runtime::Builder::agent(program)` or `aionui_runtime::Builder::clean_cli(program)`. Do NOT use raw `tokio::process::Command`. See [ARCHITECTURE.md § Runtime Infrastructure](./ARCHITECTURE.md#runtime-infrastructure) for details.
+New subprocess spawn sites must go through `aionui_runtime`'s spawn Builder — never raw `tokio::process::Command`. See [ARCHITECTURE.md § Runtime Infrastructure](./ARCHITECTURE.md#runtime-infrastructure) for the correct constructor and details.
 
 ### Pushing Code
 
 Always use `just push` instead of `git push`.
-It runs fmt → clippy → test before pushing, preventing CI failures.
+It runs the full pre-push gate (migration check, lint, format, tests) before pushing, preventing CI failures.
 Supports the same arguments as `git push` (e.g. `just push -u origin feat/branch`).
 
 ### Add Endpoint to Existing Crate
@@ -225,5 +214,5 @@ cargo test -p aionui-<crate1> -p aionui-<crate2>                               #
 ### Before Push (full workspace)
 
 ```bash
-just push                                             # fmt → clippy → test → git push
+just push                                             # full pre-push gate, then push
 ```
