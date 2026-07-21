@@ -623,9 +623,11 @@ impl TeamSession {
             slot_id: to_slot_id.to_owned(),
             role: target_role_for(to_agent.role),
             source: WorkSource::McpSendMessage,
-            binding: CausalBinding::InheritRunningBatch {
-                caller_slot_id: from_slot_id.to_owned(),
-            },
+            // A teammate message must wake its target even after the previous
+            // user-visible run has settled. Preserve run causality when one
+            // exists, otherwise enqueue background work instead of rejecting
+            // the message for lacking an active run.
+            binding: CausalBinding::ActiveRunOrBackground,
         })?;
         let mailbox_message = match self
             .mailbox
@@ -1024,10 +1026,24 @@ impl TeamSession {
         if let Some(target) = outcome.cancel_target {
             if let Some(turn_id) = target.turn_id {
                 let agent = self.scheduler.get_agent(slot_id).await?;
-                self.cancellation_port
+                // The runtime may already be gone (for example after an ACP
+                // process crash).  Pausing must still terminalize the work
+                // batch in that case; otherwise the TeamRun retains a stale
+                // active turn forever and blocks every queued user message.
+                if let Err(error) = self
+                    .cancellation_port
                     .cancel_agent_turn(&self.user_id, &agent.conversation_id, &turn_id)
                     .await
-                    .map_err(|error| TeamError::InvalidRequest(error.to_string()))?;
+                {
+                    warn!(
+                        team_id = %self.team.id,
+                        team_run_id,
+                        slot_id,
+                        turn_id,
+                        error = %error,
+                        "team slot pause could not cancel an already-unavailable runtime; reclaiming work batch"
+                    );
+                }
                 self.team_event_emitter().broadcast_child_turn(
                     TEAM_CHILD_TURN_CANCELLED_EVENT,
                     TeamChildTurnPayload {
