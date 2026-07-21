@@ -217,6 +217,53 @@ impl CatalogPreload {
     }
 }
 
+/// Resolved prompt-dump target for the direct-CLI (claude/codex) path.
+///
+/// Lifecycle: written once at task `build` time from the already-resolved
+/// `<data_dir>/prompt-dumps` dir + the vendor label; read only in
+/// `send_message`; never invalidated. `None` = `--dump-prompts` off (the
+/// production default), in which case dumping is skipped with zero effect.
+/// Carries `backend` because a `SessionBackend` exposes no vendor accessor and
+/// both claude/codex present as `AgentType::Acp`, so the send-point dump could
+/// not otherwise label the vendor.
+#[derive(Debug, Clone)]
+pub struct SessionPromptDump {
+    dir: std::path::PathBuf,
+    backend: &'static str,
+}
+
+/// Map the canonical multimodal block slice to raw JSON for a prompt dump.
+/// Dev-only artifact: contents are kept RAW (image/audio base64 in full, text
+/// verbatim) — the dump only runs under an explicit `--dump-prompts`.
+fn session_content_blocks_to_json(content: &[ContentBlock]) -> Vec<serde_json::Value> {
+    use base64::Engine as _;
+    content
+        .iter()
+        .map(|b| match b {
+            ContentBlock::Text(t) => serde_json::json!({ "type": "text", "text": t }),
+            ContentBlock::Image { data, media_type } => serde_json::json!({
+                "type": "image",
+                "media_type": media_type,
+                "data": base64::engine::general_purpose::STANDARD.encode(data),
+            }),
+            ContentBlock::Audio { data, media_type } => serde_json::json!({
+                "type": "audio",
+                "media_type": media_type,
+                "data": base64::engine::general_purpose::STANDARD.encode(data),
+            }),
+            ContentBlock::ResourceLink { uri, mime_type } => serde_json::json!({
+                "type": "resource_link",
+                "uri": uri,
+                "mime_type": mime_type,
+            }),
+            ContentBlock::AtMention { user_id } => serde_json::json!({
+                "type": "at_mention",
+                "user_id": user_id,
+            }),
+        })
+        .collect()
+}
+
 /// One claude/codex session, presented as an `IAgentTask`.
 pub struct SessionAgentTask {
     agent_type: AgentType,
@@ -242,6 +289,9 @@ pub struct SessionAgentTask {
     catalog_preload: CatalogPreload,
     /// Command-id counter for `CommandMeta` (dispatch correlation).
     command_seq: AtomicI64,
+    /// Resolved prompt-dump target (see [`SessionPromptDump`]). `None` when
+    /// `--dump-prompts` is off. Read only by `send_message`.
+    prompt_dump: Option<SessionPromptDump>,
 }
 
 impl SessionAgentTask {
@@ -269,6 +319,7 @@ impl SessionAgentTask {
             backend,
             session_repo,
             CatalogPreload::default(),
+            None,
         )
     }
 
@@ -285,6 +336,7 @@ impl SessionAgentTask {
         backend: Arc<dyn SessionBackend>,
         session_repo: Option<Arc<dyn IAcpSessionRepository>>,
         handshake: &aionui_api_types::AgentHandshake,
+        prompt_dump: Option<SessionPromptDump>,
     ) -> Arc<Self> {
         Self::build(
             agent_type,
@@ -293,6 +345,7 @@ impl SessionAgentTask {
             backend,
             session_repo,
             CatalogPreload::from_handshake(handshake),
+            prompt_dump,
         )
     }
 
@@ -303,6 +356,7 @@ impl SessionAgentTask {
         backend: Arc<dyn SessionBackend>,
         session_repo: Option<Arc<dyn IAcpSessionRepository>>,
         catalog_preload: CatalogPreload,
+        prompt_dump: Option<SessionPromptDump>,
     ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let runtime = Arc::new(SessionRuntime {
@@ -328,11 +382,48 @@ impl SessionAgentTask {
             session_repo,
             catalog_preload,
             command_seq: AtomicI64::new(0),
+            prompt_dump,
         })
     }
 
     fn next_command_id(&self) -> u64 {
         self.command_seq.fetch_add(1, Ordering::Relaxed) as u64
+    }
+
+    /// DEV (`--dump-prompts`): dump this turn's final input blocks as a
+    /// `session-cli-final-input` JSON, symmetric with the ACP path's
+    /// `acp-final-input`. Best-effort: a failure only warns and never affects
+    /// the send. No-op when `--dump-prompts` is off (`prompt_dump == None`).
+    fn dump_session_cli_final_input(&self, content: &[ContentBlock], client_msg_id: Option<&str>) {
+        let Some(dump) = self.prompt_dump.as_ref() else {
+            return;
+        };
+        let input = serde_json::json!({ "content": session_content_blocks_to_json(content) });
+        let resolved_context = serde_json::json!({ "workspace": &self.workspace });
+        match crate::dev_prompt_dump::dump_agent_final_input(
+            &dump.dir,
+            crate::dev_prompt_dump::AgentFinalInputDump {
+                kind: "session-cli-final-input",
+                backend: dump.backend,
+                conversation_id: &self.conversation_id,
+                session_id: self.runtime.session_id().as_deref(),
+                msg_id: client_msg_id,
+                turn_id: None,
+                input,
+                resolved_context,
+            },
+        ) {
+            Ok(path) => tracing::debug!(
+                conversation_id = %self.conversation_id,
+                path = %path.display(),
+                "DEV session-cli final input dump written"
+            ),
+            Err(error) => tracing::warn!(
+                conversation_id = %self.conversation_id,
+                error = %error,
+                "DEV session-cli final input dump failed"
+            ),
+        }
     }
 
     // ── enum-level helpers forwarded from AgentInstance::Session ──────────
@@ -829,6 +920,10 @@ impl IAgentTask for SessionAgentTask {
                 mime_type: None,
             });
         }
+        // DEV (`--dump-prompts`): borrow the final blocks BEFORE they move into
+        // Command::Send. No-op / best-effort — never affects the dispatch.
+        self.dump_session_cli_final_input(&content, Some(data.msg_id.as_str()));
+
         let cmd = Command::Send {
             content,
             metadata: CommandMeta {
@@ -934,6 +1029,11 @@ pub struct SessionBuildInputs<'a> {
     /// the writes the legacy ACP path performed via `AcpSessionSyncService`, which
     /// this direct-CLI path bypasses. `None` (tests) = no persistence.
     pub acp_session_repo: Option<Arc<dyn IAcpSessionRepository>>,
+    /// DEV (`--dump-prompts`): the already-resolved `<data_dir>/prompt-dumps`
+    /// dir, or `None` when off. `build_session_instance` uses it for the
+    /// spawn-time `session-cli-config` dump AND threads it (with the vendor
+    /// label) into the `SessionAgentTask` for the send-time dump.
+    pub prompt_dump_dir: Option<std::path::PathBuf>,
 }
 
 /// The pure spec + mode/model mapping — the sibling of clean-slate's
@@ -1019,6 +1119,7 @@ pub async fn build_session_instance(
         broadcaster,
         catalog_writeback,
         acp_session_repo,
+        prompt_dump_dir,
     } = inputs;
 
     // GAP #1/#2 — the pure spec + mode/model mapping (resume anchor → Resume/Fresh,
@@ -1153,6 +1254,13 @@ pub async fn build_session_instance(
         spawn_catalog_writeback(agent_id, backend.clone(), catalog_tx);
     }
 
+    let prompt_dump = prompt_dump_dir.map(|dir| SessionPromptDump {
+        dir,
+        // Only "claude"/"codex" reach here (the caller guards the match; other
+        // labels returned None above), so this binary choice is total.
+        backend: if backend_label == "claude" { "claude" } else { "codex" },
+    });
+
     let task = SessionAgentTask::new_with_preload(
         AgentType::Acp,
         conversation_id,
@@ -1160,6 +1268,7 @@ pub async fn build_session_instance(
         backend,
         acp_session_repo,
         &metadata.handshake,
+        prompt_dump,
     );
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
 }
@@ -4061,6 +4170,128 @@ mod pump_tests {
         assert_eq!(data.session_id.as_deref(), Some("sid-abc"));
     }
 
+    /// Read the single `.json` dump written under `dir`.
+    fn read_only_json_dump(dir: &std::path::Path) -> serde_json::Value {
+        let path = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+            .expect("a dump file must exist");
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    // DEV (`--dump-prompts`): send_message dumps the final input blocks as a
+    // `session-cli-final-input` JSON, with the vendor label and raw text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_message_dumps_final_input_when_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(vec![]));
+        let task = SessionAgentTask::build(
+            AgentType::Acp,
+            "conv-1".into(),
+            "/w".into(),
+            backend,
+            None,
+            CatalogPreload::default(),
+            Some(SessionPromptDump {
+                dir: tmp.path().to_path_buf(),
+                backend: "claude",
+            }),
+        );
+        crate::agent_task::IAgentTask::send_message(
+            task.as_ref(),
+            SendMessageData {
+                content: "hello".into(),
+                msg_id: "m-1".into(),
+                turn_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let dump = read_only_json_dump(tmp.path());
+        assert_eq!(dump["kind"], "session-cli-final-input");
+        assert_eq!(dump["backend"], "claude");
+        assert_eq!(dump["conversation_id"], "conv-1");
+        assert_eq!(dump["msg_id"], "m-1");
+        assert_eq!(dump["input"]["content"][0]["type"], "text");
+        assert_eq!(dump["input"]["content"][0]["text"], "hello");
+    }
+
+    // Multimodal blocks are dumped RAW: an Image block keeps its full base64 body
+    // (no redaction / no byte-len summary), per the dev-only "keep original" rule.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_message_dumps_image_block_raw_base64() {
+        use base64::Engine as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(vec![]));
+        let task = SessionAgentTask::build(
+            AgentType::Acp,
+            "conv-1".into(),
+            "/w".into(),
+            backend,
+            None,
+            CatalogPreload::default(),
+            Some(SessionPromptDump {
+                dir: tmp.path().to_path_buf(),
+                backend: "codex",
+            }),
+        );
+        // Inject an image directly onto the task's dump path via a content slice
+        // containing an Image block.
+        task.dump_session_cli_final_input(
+            &[ContentBlock::Image {
+                data: vec![1u8, 2, 3],
+                media_type: "image/png".into(),
+            }],
+            Some("m-img"),
+        );
+
+        let dump = read_only_json_dump(tmp.path());
+        assert_eq!(dump["backend"], "codex");
+        assert_eq!(dump["input"]["content"][0]["type"], "image");
+        assert_eq!(dump["input"]["content"][0]["media_type"], "image/png");
+        assert_eq!(
+            dump["input"]["content"][0]["data"],
+            base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3])
+        );
+    }
+
+    // With `--dump-prompts` off (`prompt_dump == None`), send_message writes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_message_no_dump_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(vec![]));
+        let task = SessionAgentTask::build(
+            AgentType::Acp,
+            "conv-1".into(),
+            "/w".into(),
+            backend,
+            None,
+            CatalogPreload::default(),
+            None,
+        );
+        crate::agent_task::IAgentTask::send_message(
+            task.as_ref(),
+            SendMessageData {
+                content: "hi".into(),
+                msg_id: "m-2".into(),
+                turn_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_dir(tmp.path()).unwrap().count(),
+            0,
+            "no dump when --dump-prompts is off"
+        );
+    }
+
     // claude's non-blocking Workflow turn emits MULTIPLE `result` frames: a LAUNCH
     // result while subagents still run, then a TERMINAL result after every
     // `task_notification{completed}`. The pump must suppress the launch result's
@@ -4540,6 +4771,7 @@ mod pump_tests {
             backend,
             None,
             &handshake_with_catalog(),
+            None,
         );
 
         // get_model serves the preloaded catalog + persisted current model.
@@ -4591,7 +4823,7 @@ mod pump_tests {
         };
         let backend: Arc<dyn SessionBackend> = Arc::new(StaticCapsBackend);
         let task =
-            SessionAgentTask::new_with_preload(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None, &stale);
+            SessionAgentTask::new_with_preload(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None, &stale, None);
         let m = task.get_model().await.unwrap().model_info.expect("model_info");
         assert_eq!(
             m.available_models.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
@@ -4644,6 +4876,7 @@ mod pump_tests {
             backend,
             None,
             &handshake_with_catalog(),
+            None,
         );
 
         let m = task.get_model().await.unwrap().model_info.expect("model_info");

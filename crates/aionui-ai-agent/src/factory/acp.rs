@@ -77,6 +77,9 @@ pub(super) async fn build(
                 // pump (the ACP path does this via acp_agent_service.attach, which
                 // this early-return bypasses).
                 acp_session_repo: Some(deps.acp_agent_service.repo()),
+                // DEV (`--dump-prompts`): resolve the dump dir once (mirrors the
+                // aionrs factory's `prompt_dump_dir`). `None` when off.
+                prompt_dump_dir: crate::dev_prompt_dump::dump_dir_for_data_dir(&deps.data_dir, deps.dump_prompts),
             },
             deps.session_spawner.clone(),
         )
