@@ -54,6 +54,10 @@ use agent_client_protocol::schema::{
 /// Timeout for the ACP initialize handshake (seconds).
 const INIT_TIMEOUT_SECS: u64 = 30;
 
+/// Timeout for the short config/mode/model RPCs (seconds). Intentionally
+/// shorter than INIT_TIMEOUT_SECS; a dropped/absent response self-heals via retry.
+const CONFIG_RPC_TIMEOUT_SECS: u64 = 10;
+
 /// Client identity reported in the ACP `initialize` handshake (`clientInfo`).
 ///
 /// Some agents forward these fields downstream as client metadata — e.g. Mistral
@@ -274,22 +278,45 @@ impl AcpProtocol {
     }
 
     /// Set the session mode.
+    ///
+    /// Bounded by `CONFIG_RPC_TIMEOUT_SECS`: a dropped or never-arriving
+    /// response returns `AcpError::RequestTimeout` instead of hanging forever
+    /// (see ELECTRON-3MS). Unlike `session/prompt`/`session/load`, this is a
+    /// short config RPC, so the timeout does not truncate a long-running turn.
     pub async fn set_mode(&self, req: SetSessionModeRequest) -> Result<SetSessionModeResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_set_mode).await
+        Self::with_config_rpc_timeout(
+            AGENT_METHOD_NAMES.session_set_mode,
+            std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+            self.send_request(req, AGENT_METHOD_NAMES.session_set_mode),
+        )
+        .await
     }
 
     /// Set the session model.
+    ///
+    /// Bounded by `CONFIG_RPC_TIMEOUT_SECS`; see [`Self::set_mode`].
     pub async fn set_model(&self, req: SetSessionModelRequest) -> Result<SetSessionModelResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_set_model).await
+        Self::with_config_rpc_timeout(
+            AGENT_METHOD_NAMES.session_set_model,
+            std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+            self.send_request(req, AGENT_METHOD_NAMES.session_set_model),
+        )
+        .await
     }
 
     /// Set a session config option.
+    ///
+    /// Bounded by `CONFIG_RPC_TIMEOUT_SECS`; see [`Self::set_mode`].
     pub async fn set_config_option(
         &self,
         req: SetSessionConfigOptionRequest,
     ) -> Result<SetSessionConfigOptionResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_set_config_option)
-            .await
+        Self::with_config_rpc_timeout(
+            AGENT_METHOD_NAMES.session_set_config_option,
+            std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+            self.send_request(req, AGENT_METHOD_NAMES.session_set_config_option),
+        )
+        .await
     }
 
     /// List sessions, optionally filtered by working directory.
@@ -335,6 +362,22 @@ impl AcpProtocol {
     }
 
     // ── Private helpers ──────────────────────────────────────────────────
+
+    /// Wrap a short config-RPC future with a bounded timeout, mapping elapsed
+    /// time into `AcpError::RequestTimeout`. `duration` is a parameter so unit
+    /// tests can drive it deterministically under a paused clock.
+    async fn with_config_rpc_timeout<F, T>(method: &str, duration: std::time::Duration, fut: F) -> Result<T, AcpError>
+    where
+        F: std::future::Future<Output = Result<T, AcpError>>,
+    {
+        match tokio::time::timeout(duration, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(AcpError::RequestTimeout {
+                method: method.to_owned(),
+                timeout_secs: duration.as_secs(),
+            }),
+        }
+    }
 
     /// Shared request path: connectivity check, structured logging, SDK call.
     async fn send_request<Req>(&self, req: Req, method: &str) -> Result<Req::Response, AcpError>
@@ -1007,5 +1050,49 @@ mod tests {
         let json = serde_json::to_value(&req).expect("request serializes");
         assert_eq!(json["clientInfo"]["name"], "AionUi");
         assert_ne!(json["clientInfo"]["version"], "");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_config_rpc_timeout_maps_stuck_future_to_request_timeout() {
+        // A never-returning config RPC (dropped/absent response) must resolve
+        // to RequestTimeout — not hang forever — for each of the three
+        // set-path methods (§10.1). Under `start_paused`, the runtime
+        // auto-advances the clock to the timer while the only task is blocked
+        // on the timeout, so awaiting resolves deterministically without
+        // wall-clock delay.
+        for method in [
+            AGENT_METHOD_NAMES.session_set_config_option,
+            AGENT_METHOD_NAMES.session_set_mode,
+            AGENT_METHOD_NAMES.session_set_model,
+        ] {
+            let result = AcpProtocol::with_config_rpc_timeout(
+                method,
+                std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+                std::future::pending::<Result<(), AcpError>>(),
+            )
+            .await;
+            match result {
+                Err(AcpError::RequestTimeout {
+                    method: m,
+                    timeout_secs,
+                }) => {
+                    assert_eq!(m, method);
+                    assert_eq!(timeout_secs, CONFIG_RPC_TIMEOUT_SECS);
+                }
+                other => panic!("expected RequestTimeout for {method}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_config_rpc_timeout_passes_through_ready_ok() {
+        // Success path: a fast-completing RPC returns its Ok value unchanged.
+        let result = AcpProtocol::with_config_rpc_timeout(
+            AGENT_METHOD_NAMES.session_set_config_option,
+            std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+            async { Ok::<_, AcpError>(()) },
+        )
+        .await;
+        assert!(result.is_ok(), "ready Ok must pass through: {result:?}");
     }
 }
