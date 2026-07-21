@@ -1099,6 +1099,7 @@ mod tests {
             media_actions: None,
             reply_to_message_id: None,
             silent: None,
+            topic: None,
         };
         let result = plugin.edit_message("chat1", "msg1", msg).await;
         assert!(result.is_err());
@@ -1123,6 +1124,7 @@ mod tests {
             media_actions: None,
             reply_to_message_id: None,
             silent: None,
+            topic: None,
         };
         let result = plugin.send_message("chat1", msg).await;
         assert!(result.is_err());
