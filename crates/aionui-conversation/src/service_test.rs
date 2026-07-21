@@ -5091,11 +5091,18 @@ async fn send_message_records_agent_availability_feedback_on_send_failure() {
     let failures = feedback.failures.lock().unwrap().clone();
     assert_eq!(
         failures,
-        vec![RecordedAvailabilityFailure {
-            agent_id: "agent-feedback-1".into(),
-            code: "session_send_failed".into(),
-            message: "provider returned 401 invalid api key".into(),
-        }]
+        vec![
+            RecordedAvailabilityFailure {
+                agent_id: "agent-feedback-1".into(),
+                code: "session_send_failed".into(),
+                message: "provider returned 401 invalid api key".into(),
+            },
+            RecordedAvailabilityFailure {
+                agent_id: "agent-feedback-1".into(),
+                code: "auth_required".into(),
+                message: "provider returned 401 invalid api key".into(),
+            },
+        ]
     );
 }
 
