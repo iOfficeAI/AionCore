@@ -3714,7 +3714,7 @@ async fn manual_add_agent_active_session_attaches_runtime_in_background_without_
 }
 
 #[tokio::test]
-async fn manual_add_agent_attach_failure_marks_slot_error_and_notifies_leader() {
+async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice() {
     use futures_util::FutureExt;
 
     let fail_next = Arc::new(AtomicBool::new(false));
@@ -3826,10 +3826,10 @@ async fn manual_add_agent_attach_failure_marks_slot_error_and_notifies_leader() 
     let lead_slot_id = created.leader_assistant_id.as_deref().expect("leader slot");
     let leader_messages = team_repo.get_history(&created.id, lead_slot_id, None).await.unwrap();
     assert!(
-        leader_messages
+        !leader_messages
             .iter()
-            .any(|message| message.content.contains("failed to attach its runtime")),
-        "leader should receive a persisted attach-failure notice"
+            .any(|message| message.content.contains("failed to start its runtime")),
+        "user-initiated add failure must NOT wake the leader; it surfaces inline to the user (spec 5.4)"
     );
 
     svc.ensure_session("user1", &created.id)

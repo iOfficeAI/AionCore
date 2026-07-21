@@ -561,6 +561,8 @@ impl TeamSessionService {
                 agent.clone(),
                 self.task_manager.clone(),
                 reservation,
+                // User-initiated add: failures surface inline, do not wake leader.
+                false,
             );
             info!(
                 team_id = %team_id,
@@ -1113,6 +1115,9 @@ impl TeamSessionService {
                     item.agent.clone(),
                     self.task_manager.clone(),
                     owner,
+                    // Reconciliation repairs runtimes without a fresh delivery to
+                    // re-delegate; failures surface via runtime status only.
+                    false,
                 ));
             }
             waiters.push((item.agent, waiter));
