@@ -31,6 +31,77 @@ use crate::builtin::BuiltinAssistant;
 use crate::builtin::{AvatarAsset, BuiltinAssistantRegistry};
 use crate::error::AssistantError;
 
+/// Max attempts (initial + retries) and per-retry backoff for a bootstrap step
+/// contended by a concurrent startup (Sentry 135525166 Option B).
+const BOOTSTRAP_RETRY_MAX_ATTEMPTS: u32 = 5;
+const BOOTSTRAP_RETRY_BACKOFF_MS: [u64; 4] = [50, 100, 200, 400];
+
+/// Whether an assistant error is transient SQLite busy/locked contention. Repos
+/// convert `DbError` into `AssistantError::Internal(other.to_string())`, so the
+/// service can only classify by text — reusing the same markers as
+/// `DbError::is_busy` (single source of truth).
+fn assistant_error_is_busy(error: &AssistantError) -> bool {
+    matches!(error, AssistantError::Internal(message) if aionui_db::message_indicates_busy(message))
+}
+
+/// Whether an assistant error is a UNIQUE constraint violation — either the
+/// explicit `Conflict` variant (from `DbError::Conflict`) or a UNIQUE message
+/// surfaced through `Internal`.
+fn assistant_error_is_unique(error: &AssistantError) -> bool {
+    match error {
+        AssistantError::Conflict(_) => true,
+        AssistantError::Internal(message) => aionui_db::message_indicates_unique_violation(message),
+        _ => false,
+    }
+}
+
+/// Run one bootstrap step with bounded concurrent-startup retry (Sentry 135525166
+/// Option B). Free function (no `self`) so the retry policy is unit-testable.
+///
+/// - `Ok(())` → done.
+/// - UNIQUE conflict → treated as already-applied by a concurrent startup
+///   (idempotent convergence), returns `Ok(())`.
+/// - SQLITE_BUSY → retried with backoff; if still busy after the budget,
+///   returns [`AssistantError::ConcurrentBootstrapContention`].
+/// - any other error → returned immediately (real errors are not swallowed).
+async fn retry_bootstrap_step<'a, F>(step_name: &'static str, op: F) -> Result<(), AssistantError>
+where
+    F: Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AssistantError>> + Send + 'a>>,
+{
+    for attempt in 0..BOOTSTRAP_RETRY_MAX_ATTEMPTS {
+        match op().await {
+            Ok(()) => return Ok(()),
+            Err(error) if assistant_error_is_unique(&error) => {
+                debug!(
+                    step = step_name,
+                    "bootstrap step already applied by a concurrent startup (unique conflict treated as done)"
+                );
+                return Ok(());
+            }
+            Err(error) if assistant_error_is_busy(&error) => {
+                if attempt + 1 >= BOOTSTRAP_RETRY_MAX_ATTEMPTS {
+                    return Err(AssistantError::ConcurrentBootstrapContention(format!(
+                        "bootstrap step '{step_name}' contended after retries"
+                    )));
+                }
+                let backoff = BOOTSTRAP_RETRY_BACKOFF_MS[(attempt as usize).min(BOOTSTRAP_RETRY_BACKOFF_MS.len() - 1)];
+                warn!(
+                    step = step_name,
+                    attempt = attempt + 1,
+                    backoff_ms = backoff,
+                    "bootstrap step contended under concurrent startup (busy); retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    // The loop always returns above; this satisfies the type checker.
+    Err(AssistantError::ConcurrentBootstrapContention(format!(
+        "bootstrap step '{step_name}' contended after retries"
+    )))
+}
+
 /// Aggregated business logic for `/api/assistants/*` and rule/skill dispatch.
 pub struct AssistantService {
     pool: SqlitePool,
@@ -106,12 +177,35 @@ impl AssistantService {
     /// Bootstrap unified assistant storage from builtin assets and the
     /// legacy mirror tables.
     pub async fn bootstrap_assistant_storage(&self) -> Result<(), AssistantError> {
-        self.materialize_builtin_definitions().await?;
-        self.soft_delete_removed_builtin_definitions().await?;
-        self.sync_legacy_user_assistants_to_new_tables().await?;
-        self.reconcile_user_avatar_assets().await?;
-        self.sync_legacy_overrides_to_new_states().await?;
-        self.reconcile_generated_assistants().await?;
+        // Each step already re-runs idempotently on every startup. Wrap each in
+        // bounded concurrent-startup retry so a transient SQLITE_BUSY is retried
+        // and a UNIQUE conflict (another startup already inserted the row) is
+        // treated as done, instead of bubbling up as a fatal BOOTSTRAP_SERVER_FAILED
+        // (Sentry 135525166 Option B). We do NOT widen any startup lock here.
+        retry_bootstrap_step("materialize_builtin_definitions", || {
+            Box::pin(self.materialize_builtin_definitions())
+        })
+        .await?;
+        retry_bootstrap_step("soft_delete_removed_builtin_definitions", || {
+            Box::pin(self.soft_delete_removed_builtin_definitions())
+        })
+        .await?;
+        retry_bootstrap_step("sync_legacy_user_assistants_to_new_tables", || {
+            Box::pin(self.sync_legacy_user_assistants_to_new_tables())
+        })
+        .await?;
+        retry_bootstrap_step("reconcile_user_avatar_assets", || {
+            Box::pin(self.reconcile_user_avatar_assets())
+        })
+        .await?;
+        retry_bootstrap_step("sync_legacy_overrides_to_new_states", || {
+            Box::pin(self.sync_legacy_overrides_to_new_states())
+        })
+        .await?;
+        retry_bootstrap_step("reconcile_generated_assistants", || {
+            Box::pin(async { self.reconcile_generated_assistants().await.map(|_| ()) })
+        })
+        .await?;
         Ok(())
     }
 
@@ -2964,7 +3058,104 @@ mod tests {
         SqliteProviderRepository, UpsertOverrideParams, init_database_memory,
     };
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    // T-B2 — bounded concurrent-startup retry policy (Sentry 135525166 Option B).
+    fn busy_error() -> AssistantError {
+        AssistantError::Internal("Database query failed: database is locked".to_string())
+    }
+
+    #[tokio::test]
+    async fn retry_step_succeeds_after_transient_busy() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_bootstrap_step("materialize_builtin_definitions", || {
+            Box::pin(async {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n < 2 { Err(busy_error()) } else { Ok(()) }
+            })
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_step_reports_contention_when_busy_persists() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_bootstrap_step("materialize_builtin_definitions", || {
+            Box::pin(async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(busy_error())
+            })
+        })
+        .await;
+
+        assert!(matches!(result, Err(AssistantError::ConcurrentBootstrapContention(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), BOOTSTRAP_RETRY_MAX_ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn retry_step_treats_unique_conflict_as_done_without_retry() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_bootstrap_step("materialize_builtin_definitions", || {
+            Box::pin(async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(AssistantError::Conflict("assistant_definitions.id".to_string()))
+            })
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_step_returns_other_errors_immediately() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_bootstrap_step("materialize_builtin_definitions", || {
+            Box::pin(async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(AssistantError::Internal("disk full".to_string()))
+            })
+        })
+        .await;
+
+        assert!(matches!(result, Err(AssistantError::Internal(message)) if message == "disk full"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    // T-B3 — bootstrap must stay idempotent on an existing, already-populated
+    // database when re-run (simulating re-entry / concurrent restart). No
+    // duplicate definitions, no failure (Sentry 135525166 Option B; spec §9).
+    #[tokio::test]
+    async fn bootstrap_assistant_storage_is_idempotent_across_repeated_runs() {
+        let fx = fixture_with_builtins(vec![
+            mk_builtin("builtin-a", "Builtin A"),
+            mk_builtin("builtin-b", "Builtin B"),
+        ])
+        .await;
+
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+        let after_first = fx.definition_repo.list().await.unwrap();
+
+        // Re-run bootstrap on the now non-empty database multiple times.
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+        let after_repeat = fx.definition_repo.list().await.unwrap();
+
+        assert_eq!(
+            after_first.len(),
+            2,
+            "both builtins should be materialized on the first run"
+        );
+        assert_eq!(
+            after_repeat.len(),
+            after_first.len(),
+            "repeated bootstrap must not duplicate assistant definitions"
+        );
+    }
 
     struct Fixture {
         service: AssistantService,

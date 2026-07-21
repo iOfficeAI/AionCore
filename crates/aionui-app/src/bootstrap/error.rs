@@ -12,6 +12,10 @@ pub(crate) enum BootstrapErrorCode {
     ServiceInitFailed,
     ServerFailed,
     ShutdownFailed,
+    /// Emitted when this process yields the data-dir instance guard to a peer
+    /// aioncore that already owns the data directory (Sentry 135525166). Benign
+    /// and transient — AionUi treats it as recoverable and retries.
+    PeerAlreadyRunning,
 }
 
 impl BootstrapErrorCode {
@@ -25,13 +29,16 @@ impl BootstrapErrorCode {
             Self::ServiceInitFailed => "BOOTSTRAP_SERVICE_INIT_FAILED",
             Self::ServerFailed => "BOOTSTRAP_SERVER_FAILED",
             Self::ShutdownFailed => "BOOTSTRAP_SHUTDOWN_FAILED",
+            Self::PeerAlreadyRunning => "BOOTSTRAP_PEER_ALREADY_RUNNING",
         }
     }
 
     pub(crate) fn exit_kind(self) -> ExitKind {
         match self {
             Self::ConfigInvalid => ExitKind::Config,
-            Self::BindFailed => ExitKind::Unavailable,
+            // Resource temporarily unavailable: the port could not be bound, or
+            // a peer already owns the data directory. Both map to exit code 3.
+            Self::BindFailed | Self::PeerAlreadyRunning => ExitKind::Unavailable,
             Self::RuntimeInitFailed
             | Self::LoggingInitFailed
             | Self::DataInitFailed
@@ -150,6 +157,21 @@ mod tests {
         assert_eq!(
             err.stderr_line(),
             "BOOTSTRAP_BIND_FAILED stage=bind.listener port=13400: failed to bind HTTP listener"
+        );
+    }
+
+    #[test]
+    fn peer_already_running_renders_benign_boundary_and_exit_3() {
+        let err = BootstrapError::new(
+            BootstrapErrorCode::PeerAlreadyRunning,
+            "instance_guard.acquire",
+            "another aioncore already owns this data directory",
+        );
+
+        assert_eq!(err.exit_code(), ExitCode::from(3));
+        assert!(
+            err.stderr_line()
+                .starts_with("BOOTSTRAP_PEER_ALREADY_RUNNING stage=instance_guard.acquire")
         );
     }
 

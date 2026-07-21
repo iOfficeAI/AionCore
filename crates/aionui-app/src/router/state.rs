@@ -82,6 +82,26 @@ impl RouterBuildError {
     }
 }
 
+/// Map an assistant bootstrap failure to a router build error.
+///
+/// A [`AssistantError::ConcurrentBootstrapContention`] is benign and recoverable
+/// (a transient concurrent-startup race), so it gets a distinct boundary stage
+/// (`router.assistant.bootstrap.concurrency_contended`) that AionUi maps to a
+/// gentle "retry/restart" message instead of the "local data corruption" false
+/// alarm. The boundary code stays `BOOTSTRAP_SERVER_FAILED`; only the stage
+/// differs (Sentry 135525166). All other errors keep the original stage.
+fn assistant_bootstrap_build_error(error: AssistantError) -> RouterBuildError {
+    if matches!(error, AssistantError::ConcurrentBootstrapContention(_)) {
+        RouterBuildError::new(
+            "router.assistant.bootstrap.concurrency_contended",
+            "assistant storage bootstrap contended under concurrent startup",
+        )
+        .with_source(error)
+    } else {
+        RouterBuildError::new("router.assistant.bootstrap", "failed to bootstrap assistant storage").with_source(error)
+    }
+}
+
 impl std::fmt::Display for RouterBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.stage, self.message)
@@ -195,9 +215,11 @@ pub async fn build_module_states(
     );
 
     let assistant = build_assistant_state(services);
-    assistant.service.bootstrap_assistant_storage().await.map_err(|error| {
-        RouterBuildError::new("router.assistant.bootstrap", "failed to bootstrap assistant storage").with_source(error)
-    })?;
+    assistant
+        .service
+        .bootstrap_assistant_storage()
+        .await
+        .map_err(assistant_bootstrap_build_error)?;
     let cron = build_cron_state(services);
     // Cron builds its own ConversationService (not a clone of the shared one),
     // so wire the assistant rule dispatcher here — otherwise scheduled runs
@@ -850,6 +872,18 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    // T-B4 — concurrent-startup contention gets a distinct boundary stage so it
+    // is not misreported as local data corruption (Sentry 135525166).
+    #[test]
+    fn concurrent_contention_maps_to_distinct_bootstrap_stage() {
+        let contended =
+            assistant_bootstrap_build_error(AssistantError::ConcurrentBootstrapContention("contended".into()));
+        assert_eq!(contended.stage(), "router.assistant.bootstrap.concurrency_contended");
+
+        let other = assistant_bootstrap_build_error(AssistantError::Internal("boom".into()));
+        assert_eq!(other.stage(), "router.assistant.bootstrap");
+    }
 
     use crate::AppConfig;
     use aionui_ai_agent::types::{AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, BuildTaskOptions, SendMessageData};

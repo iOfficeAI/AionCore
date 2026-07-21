@@ -4,6 +4,7 @@
 mod agent_binding;
 mod database;
 mod error;
+mod instance_lock;
 mod legacy_handoff;
 pub mod models;
 mod repository;
@@ -16,7 +17,11 @@ pub use database::{
     Database, DatabaseInitError, DatabaseInitOptions, init_database, init_database_memory, init_database_staged,
     init_database_staged_with_options, init_database_with_options, maybe_copy_legacy_database,
 };
-pub use error::DbError;
+pub use error::{
+    DbError, SQLITE_BUSY_MESSAGE_MARKERS, SQLITE_UNIQUE_VIOLATION_MARKER, message_indicates_busy,
+    message_indicates_unique_violation,
+};
+pub use instance_lock::{DataDirInstanceGuard, instance_lock_path};
 pub use models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow,
     AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams,
