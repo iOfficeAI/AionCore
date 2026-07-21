@@ -141,6 +141,7 @@ zstd = "0.13"
 cron = "0.15"
 chrono = "0.4"
 chrono-tz = "0.10"
+iana-time-zone = "0.1"
 
 # Shell
 open = "5"

@@ -22,7 +22,9 @@ use crate::events::CronEventEmitter;
 
 use crate::error::CronError;
 use crate::executor::{ExecutionResult, JobExecutor, PreparedRunNow, RETRY_INTERVAL_MS};
-use crate::scheduler::{CronScheduler, compute_next_run, compute_next_run_after_occurrence, validate_schedule};
+use crate::scheduler::{
+    CronScheduler, compute_next_run, compute_next_run_after_occurrence, validate_schedule, validate_timezone,
+};
 use crate::skill_file::{delete_skill_file, has_skill_file, write_raw_skill_file, write_skill_file};
 use crate::types::{
     CreatedBy, CronAgentConfig, CronJob, CronSchedule, ExecutionMode, cron_job_from_row, cron_job_to_response,
@@ -101,11 +103,7 @@ impl CronService {
             .verify_conversation_helper_context(user_id, conversation_id)
             .await?;
 
-        let schedule_dto = CronScheduleDto::Cron {
-            expr: req.schedule,
-            tz: None,
-            description: Some(req.schedule_description),
-        };
+        let schedule_dto = conversation_cron_schedule(req.schedule, req.schedule_description);
 
         let conversation_title = Some(row.name.clone());
         let (agent_type, agent_config, assistant_backend_override) =
@@ -2049,6 +2047,41 @@ fn schedule_from_dto_with_existing_timezone(dto: &CronScheduleDto, existing: &Cr
     }
 }
 
+/// Resolve the host's IANA timezone name (e.g. `"Asia/Shanghai"`).
+///
+/// Returns `None` when the local zone cannot be detected or is not present in
+/// the tz database; the caller then leaves the schedule without a timezone and
+/// the scheduler falls back to UTC.
+fn local_timezone_name() -> Option<String> {
+    let tz = match iana_time_zone::get_timezone() {
+        Ok(tz) => tz,
+        Err(err) => {
+            warn!(error = %err, "Failed to detect local timezone; conversation cron will use UTC");
+            return None;
+        }
+    };
+    if validate_timezone(&tz).is_err() {
+        warn!(timezone = %tz, "Local timezone not recognized by tz database; conversation cron will use UTC");
+        return None;
+    }
+    Some(tz)
+}
+
+/// Build the schedule for a conversation cron created via `cron current create`.
+///
+/// The request carries only a bare cron expression whose human-readable
+/// description refers to local wall-clock time (e.g. "every day at 12:00"), so
+/// the host's local timezone is stamped onto the schedule. Without it the
+/// scheduler treats an absent tz as UTC and fires the job at the wrong hour on
+/// any non-UTC host.
+fn conversation_cron_schedule(expr: String, description: String) -> CronScheduleDto {
+    CronScheduleDto::Cron {
+        expr,
+        tz: local_timezone_name(),
+        description: Some(description),
+    }
+}
+
 fn schedule_to_row_fields(schedule: &CronSchedule) -> (String, String, Option<String>, Option<String>) {
     match schedule {
         CronSchedule::At { at_ms, description } => ("at".to_owned(), at_ms.to_string(), None, description.clone()),
@@ -2068,6 +2101,51 @@ fn schedule_to_row_fields(schedule: &CronSchedule) -> (String, String, Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- conversation cron timezone --------------------------------------------
+
+    #[test]
+    fn conversation_cron_wires_local_timezone() {
+        let dto = conversation_cron_schedule("0 0 12 * * *".into(), "every day at 12:00".into());
+        let CronScheduleDto::Cron { expr, tz, description } = dto else {
+            panic!("conversation cron must build a Cron schedule");
+        };
+        assert_eq!(expr, "0 0 12 * * *");
+        assert_eq!(description.as_deref(), Some("every day at 12:00"));
+        // The bare request has no timezone; the builder must stamp the host's
+        // local zone (previously hardcoded to None, which the scheduler treats
+        // as UTC).
+        assert_eq!(tz, local_timezone_name());
+        if let Some(tz) = tz {
+            assert!(validate_timezone(&tz).is_ok(), "stamped timezone must be valid: {tz}");
+        }
+    }
+
+    #[test]
+    fn conversation_cron_fires_at_local_wall_clock() {
+        use chrono::{Local, TimeZone, Timelike};
+
+        // Only meaningful when the host's zone is detectable; otherwise the
+        // schedule intentionally degrades to UTC (covered by the wiring test).
+        if local_timezone_name().is_none() {
+            return;
+        }
+
+        // "every day at 12:00" must fire at 12:00 local wall-clock. Before the
+        // fix the schedule carried no tz and the scheduler resolved it in UTC,
+        // firing at the wrong hour on any non-UTC host.
+        let dto = conversation_cron_schedule("0 0 12 * * *".into(), "every day at 12:00".into());
+        let schedule = schedule_from_dto(&dto);
+        let now = Local.with_ymd_and_hms(2026, 7, 21, 8, 0, 0).unwrap().timestamp_millis();
+
+        let next = compute_next_run(&schedule, now).expect("cron should produce a next run");
+        let next_hour = Local.timestamp_millis_opt(next).single().unwrap().hour();
+
+        assert_eq!(
+            next_hour, 12,
+            "conversation cron must fire at 12:00 local wall-clock, not UTC"
+        );
+    }
 
     // -- validate_skill_body_content -------------------------------------------
 
