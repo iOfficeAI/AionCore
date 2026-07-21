@@ -1702,7 +1702,7 @@ async fn recovery_creates_background_intents_without_restoring_old_memory_run() 
 
 #[tokio::test]
 async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
-    let (svc, team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
+    let (svc, _team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
     let created = svc
         .create_team(
             "user1",
@@ -1719,23 +1719,14 @@ async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
         .await
         .expect("clear existing session");
 
-    team_repo
-        .write_message(&aionui_db::models::MailboxMessageRow {
-            id: "mailbox-worker-1".into(),
-            team_id: created.id.clone(),
-            to_agent_id: worker_slot_id.clone(),
-            from_agent_id: "user".into(),
-            msg_type: "message".into(),
-            content: "do X".into(),
-            summary: None,
-            files: None,
-            read: false,
-            created_at: aionui_common::now_ms(),
-        })
-        .await
-        .expect("seed teammate mailbox");
-
     svc.ensure_session("user1", &created.id).await.expect("ensure");
+
+    // Leader-only warmup: the teammate is dormant at first start. Delivering a
+    // message lazily wakes it, and its first turn is a cold wake built with the
+    // canonical role prompt plus the delivered content (spec 5.1).
+    svc.send_message_to_agent("user1", &created.id, &worker_slot_id, "do X", None)
+        .await
+        .expect("deliver to teammate triggers lazy wakeup");
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -2059,8 +2050,6 @@ struct WarmupConcurrencyProbe {
     active: AtomicUsize,
     max_active: AtomicUsize,
     starts: Mutex<Vec<String>>,
-    start_times: Mutex<Vec<(String, std::time::Duration)>>,
-    started_at: tokio::time::Instant,
 }
 
 impl Default for WarmupConcurrencyProbe {
@@ -2069,8 +2058,6 @@ impl Default for WarmupConcurrencyProbe {
             active: AtomicUsize::new(0),
             max_active: AtomicUsize::new(0),
             starts: Mutex::new(Vec::new()),
-            start_times: Mutex::new(Vec::new()),
-            started_at: tokio::time::Instant::now(),
         }
     }
 }
@@ -2084,13 +2071,7 @@ impl WarmupConcurrencyProbe {
             let probe = Arc::clone(&probe);
             async move {
                 let conversation_id = opts.context.conversation.conversation_id.clone();
-                let elapsed = probe.started_at.elapsed();
                 probe.starts.lock().unwrap().push(conversation_id.clone());
-                probe
-                    .start_times
-                    .lock()
-                    .unwrap()
-                    .push((conversation_id.clone(), elapsed));
                 let current = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
                 probe.max_active.fetch_max(current, Ordering::SeqCst);
                 tokio::time::sleep(delay).await;
@@ -2110,10 +2091,6 @@ impl WarmupConcurrencyProbe {
 
     fn starts(&self) -> Vec<String> {
         self.starts.lock().unwrap().clone()
-    }
-
-    fn start_times(&self) -> Vec<(String, std::time::Duration)> {
-        self.start_times.lock().unwrap().clone()
     }
 }
 
@@ -5448,7 +5425,7 @@ async fn d9_create_team_persists_without_warming_initial_agents() {
 }
 
 #[tokio::test]
-async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
+async fn d9_ensure_session_warms_up_only_the_lead() {
     let (svc, tm) = setup_with_factory(success_factory());
     let created = svc
         .create_team(
@@ -5465,22 +5442,32 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
     reset_runtime_state(&svc, &tm, &created.id).await;
     svc.ensure_session("user1", &created.id).await.unwrap();
 
-    // Two agents → kill called 2x and get_or_build_task called 2x, each with
-    // the corresponding conversation_id. Order is agents-iteration order.
+    // Leader-only warmup (spec 5.1): only the lead is killed+rebuilt at first
+    // start; the teammate stays dormant and is never built.
+    let lead = created.assistants.iter().find(|a| a.role == "lead").unwrap();
+    let worker = created.assistants.iter().find(|a| a.role == "teammate").unwrap();
     let calls = tm.snapshot();
-    assert_eq!(calls.kill.len(), 2, "expected 2 kill calls");
-    assert_eq!(calls.build.len(), 2, "expected 2 build calls");
-    for (i, agent) in created.assistants.iter().enumerate() {
-        assert_eq!(calls.kill[i].0, agent.conversation_id);
-        assert_eq!(calls.kill[i].1, Some(AgentKillReason::TeamMcpRebuild));
-        assert_eq!(calls.build[i], agent.conversation_id);
-    }
+    assert_eq!(
+        calls.build,
+        vec![lead.conversation_id.clone()],
+        "only the lead should be built"
+    );
+    assert_eq!(calls.kill.len(), 1, "only the lead should be killed+rebuilt");
+    assert_eq!(calls.kill[0].0, lead.conversation_id);
+    assert_eq!(calls.kill[0].1, Some(AgentKillReason::TeamMcpRebuild));
+    assert!(
+        !calls.build.contains(&worker.conversation_id),
+        "dormant teammate must not be built at first start"
+    );
 }
 
-#[tokio::test(start_paused = true)]
-async fn d9_ensure_session_rebuilds_agents_with_staggered_bounded_parallelism() {
+#[tokio::test]
+async fn d9_ensure_session_warms_up_only_the_lead_without_teammate_stagger() {
+    // The batch rebuild machine (bounded concurrency + staggered starts) was
+    // removed in favor of leader-only warmup on a single attach path (spec 5.1).
+    // First start must warm exactly the lead — no teammate warmup, no stagger.
     let probe = Arc::new(WarmupConcurrencyProbe::default());
-    let (svc, _tm) = setup_with_factory(probe.factory(std::time::Duration::from_secs(20)));
+    let (svc, _tm) = setup_with_factory(probe.factory(std::time::Duration::from_millis(10)));
     let created = svc
         .create_team(
             "user1",
@@ -5492,56 +5479,25 @@ async fn d9_ensure_session_rebuilds_agents_with_staggered_bounded_parallelism() 
         )
         .await
         .unwrap();
-    let mut expected_starts = Vec::new();
-    expected_starts.extend(
-        created
-            .assistants
-            .iter()
-            .filter(|assistant| assistant.role == "lead")
-            .map(|assistant| assistant.conversation_id.clone()),
-    );
-    expected_starts.extend(
-        created
-            .assistants
-            .iter()
-            .filter(|assistant| assistant.role != "lead")
-            .map(|assistant| assistant.conversation_id.clone()),
-    );
+    let lead = created
+        .assistants
+        .iter()
+        .find(|assistant| assistant.role == "lead")
+        .unwrap();
 
-    let svc_for_task = Arc::clone(&svc);
-    let team_id = created.id.clone();
-    let handle = tokio::spawn(async move { svc_for_task.ensure_session("user1", &team_id).await });
-
-    tokio::time::advance(std::time::Duration::from_secs(120)).await;
-    handle.await.unwrap().unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
 
     let starts = probe.starts();
     assert_eq!(
-        starts, expected_starts,
-        "team rebuild warmup must start leader first and preserve teammate order"
-    );
-    assert!(
-        probe.max_active() > 1,
-        "team rebuild warmup should overlap staggered agents when warmup takes longer than the launch interval"
+        starts,
+        vec![lead.conversation_id.clone()],
+        "leader-only warmup must start exactly the lead"
     );
     assert_eq!(
         probe.max_active(),
-        3,
-        "team rebuild warmup should cap concurrent agents at 3"
+        1,
+        "leader-only warmup runs a single attach, never overlapping teammates"
     );
-    let start_times = probe.start_times();
-    assert_eq!(start_times.len(), expected_starts.len());
-    for pair in start_times.windows(2).take(2) {
-        let delta = pair[1].1.saturating_sub(pair[0].1);
-        assert!(
-            delta >= std::time::Duration::from_secs(3),
-            "agent starts should be staggered by at least 3s; observed {delta:?}"
-        );
-        assert!(
-            delta < std::time::Duration::from_secs(5),
-            "agent starts should use the configured 3s stagger, not the old 5s interval; observed {delta:?}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -5615,10 +5571,16 @@ async fn d9_ensure_session_is_idempotent() {
     svc.ensure_session("user1", &created.id).await.unwrap();
     svc.ensure_session("user1", &created.id).await.unwrap();
 
-    // Second call short-circuits — no additional kill/build calls.
+    // Leader-only warmup: first ensure kills+builds only the lead; the second
+    // ensure reconciles (lead already Ready, teammate dormant/skipped) and adds
+    // no kill/build calls.
     let calls = tm.snapshot();
-    assert_eq!(calls.kill.len(), 2, "second ensure_session must not re-kill");
-    assert_eq!(calls.build.len(), 2, "second ensure_session must not re-build");
+    assert_eq!(
+        calls.kill.len(),
+        1,
+        "leader-only: only the lead is (re)built, and only once"
+    );
+    assert_eq!(calls.build.len(), 1, "second ensure_session must not re-build");
 }
 
 #[tokio::test]
@@ -5714,9 +5676,11 @@ async fn concurrent_ensures_launch_one_dynamic_attach() {
         .iter()
         .find(|agent| agent.role == "teammate")
         .unwrap();
-    task_manager
-        .remove_task_without_recording(&worker.conversation_id)
-        .await;
+    // Leader-only warmup leaves the worker dormant, so reconciliation would skip
+    // it (spec 5.1). Repair is exercised against the always-warm lead: drop its
+    // task so concurrent ensures reconcile it, and assert lease dedup launches
+    // exactly one attach.
+    task_manager.remove_task_without_recording(&lead.conversation_id).await;
     task_manager.reset_calls();
     gate.enable();
 
@@ -5735,15 +5699,15 @@ async fn concurrent_ensures_launch_one_dynamic_attach() {
     gate.wait_for_starts(1).await;
     tokio::task::yield_now().await;
     assert!(handles.iter().all(|handle| !handle.is_finished()));
-    assert_eq!(gate.starts(), vec![worker.conversation_id.clone()]);
-    assert_eq!(task_manager.snapshot().build, vec![worker.conversation_id.clone()]);
+    assert_eq!(gate.starts(), vec![lead.conversation_id.clone()]);
+    assert_eq!(task_manager.snapshot().build, vec![lead.conversation_id.clone()]);
     assert!(
         task_manager
             .snapshot()
             .kill
             .iter()
-            .all(|(conversation_id, _)| conversation_id != &lead.conversation_id),
-        "healthy members must not be killed during a one-slot repair"
+            .all(|(conversation_id, _)| conversation_id != &worker.conversation_id),
+        "dormant members must not be woken or killed during a one-slot repair"
     );
     assert!(Arc::ptr_eq(
         &original_scheduler,
@@ -5754,7 +5718,7 @@ async fn concurrent_ensures_launch_one_dynamic_attach() {
     for handle in handles {
         handle.await.unwrap().unwrap();
     }
-    assert_eq!(gate.starts(), vec![worker.conversation_id.clone()]);
+    assert_eq!(gate.starts(), vec![lead.conversation_id.clone()]);
 }
 
 #[tokio::test]
@@ -5791,47 +5755,34 @@ async fn stopped_session_rejects_late_attach_completion() {
         .await
         .unwrap();
     gate.wait_for_starts(1).await;
+    let lead_conversation_id = created.assistants[0].conversation_id.clone();
     svc.stop_session("user1", &created.id).await.unwrap();
-    let svc_for_replacement = Arc::clone(&svc);
-    let replacement_team_id = created.id.clone();
-    let replacement =
-        tokio::spawn(async move { svc_for_replacement.ensure_session("user1", &replacement_team_id).await });
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let replacement_kill_started = task_manager
-                .snapshot()
-                .kill
-                .iter()
-                .filter(|(conversation_id, _)| conversation_id == &added.conversation_id)
-                .count();
-            if replacement_kill_started >= 2 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("replacement bootstrap must begin replacing the same member before old attach release");
-    assert!(!replacement.is_finished());
-    gate.release(1);
-    replacement.await.unwrap().unwrap();
 
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let cleanup_kills = task_manager
-                .snapshot()
-                .kill
-                .iter()
-                .filter(|(conversation_id, _)| conversation_id == &added.conversation_id)
-                .count();
-            if cleanup_kills >= 2 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("late completion must clean up its partial task");
+    // Leader-only warmup: the replacement session cold-starts the lead only
+    // (its build is not gated), so it completes without touching the
+    // dynamically-added worker, which stays dormant in the new session.
+    svc.ensure_session("user1", &created.id)
+        .await
+        .expect("replacement leader-only ensure completes");
+
+    // The worker attach in the old session issued exactly one kill (before its
+    // gated build). Record it so we can assert the fenced late completion adds
+    // no further kill.
+    let worker_kills_before_release = task_manager
+        .snapshot()
+        .kill
+        .iter()
+        .filter(|(conversation_id, _)| conversation_id == &added.conversation_id)
+        .count();
+
+    // Release the old (stopped) session's still-in-flight worker attach and let
+    // it run to completion. The generation fence must reject it: it must never
+    // publish Ready, and its stale cleanup must be skipped because a different
+    // session is now published (so it cannot kill the new session's runtime).
+    gate.release(1);
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
 
     let added_events = recorder
         .events_by_name("team.agentRuntimeStatusChanged")
@@ -5843,12 +5794,22 @@ async fn stopped_session_rejects_late_attach_completion() {
             .iter()
             .filter(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready"))
             .count(),
-        1,
-        "only the replacement session may publish Ready for the member"
+        0,
+        "a fenced late attach must not publish Ready; leader-only keeps the worker dormant in the new session"
+    );
+    let worker_kills_after_release = task_manager
+        .snapshot()
+        .kill
+        .iter()
+        .filter(|(conversation_id, _)| conversation_id == &added.conversation_id)
+        .count();
+    assert_eq!(
+        worker_kills_after_release, worker_kills_before_release,
+        "the fenced late completion must not kill the worker again once a different session is published"
     );
     assert!(
-        task_manager.get_task(&added.conversation_id).is_some(),
-        "stale cleanup must not kill the replacement session runtime"
+        task_manager.get_task(&lead_conversation_id).is_some(),
+        "stale worker cleanup must not kill the replacement session's live lead runtime"
     );
     assert!(svc.get_session_scheduler(&created.id).is_some());
 }
@@ -5875,27 +5836,39 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
 
     reset_runtime_state(&svc, &tm, &created.id).await;
     let result = svc.ensure_session("user1", &created.id).await;
-    assert!(result.is_err(), "ensure_session should propagate build error");
+    assert!(
+        result.is_err(),
+        "ensure_session should propagate the leader build error"
+    );
 
-    // Serial rebuild stops at the first failing agent, and no session is
-    // inserted after the failure.
+    // Leader-only warmup: only the lead attach is attempted; its failure fails
+    // the whole session and no teammate is ever built or killed.
+    let lead = created.assistants.iter().find(|a| a.role == "lead").unwrap();
+    let worker = created.assistants.iter().find(|a| a.role == "teammate").unwrap();
     let calls = tm.snapshot();
     assert_eq!(
-        calls.kill.len(),
-        3,
-        "failed bootstrap cleans the full two-member snapshot"
+        calls.build,
+        vec![lead.conversation_id.clone()],
+        "only the lead build is attempted"
     );
-    assert_eq!(calls.build.len(), 1);
+    assert!(
+        !calls.build.contains(&worker.conversation_id)
+            && calls
+                .kill
+                .iter()
+                .all(|(conversation_id, _)| conversation_id != &worker.conversation_id),
+        "the dormant teammate is never built or killed on a leader bootstrap failure"
+    );
 
     let send_result = svc.send_message("user1", &created.id, "Hello", None).await;
     assert!(
         send_result.is_err(),
-        "session must not be registered after build failure"
+        "session must not be registered after leader build failure"
     );
 }
 
 #[tokio::test]
-async fn cold_bootstrap_failure_stops_session_and_cleans_all_successful_runtimes() {
+async fn cold_bootstrap_failure_stops_session_when_leader_attach_fails() {
     use futures_util::FutureExt;
 
     let fail_conversation_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -5926,53 +5899,48 @@ async fn cold_bootstrap_failure_stops_session_and_cleans_all_successful_runtimes
         )
         .await
         .unwrap();
-    let failed_agent = created
+    // Leader-only warmup: only the lead is attached at cold start, so only a
+    // lead failure can fail the session (teammate failures are isolated and
+    // deferred to lazy wakeup, spec 5.1). Fail the lead's build.
+    let lead = created
         .assistants
         .iter()
-        .find(|assistant| assistant.name == "Worker 3")
-        .expect("failed agent")
-        .conversation_id
-        .clone();
-    *fail_conversation_id.lock().unwrap() = Some(failed_agent);
+        .find(|assistant| assistant.role == "lead")
+        .expect("lead");
+    *fail_conversation_id.lock().unwrap() = Some(lead.conversation_id.clone());
 
     let result = svc.ensure_session("user1", &created.id).await;
-    assert!(result.is_err(), "ensure_session should propagate build error");
+    assert!(
+        result.is_err(),
+        "ensure_session should propagate the leader build error"
+    );
     let error = result.unwrap_err().to_string();
     assert!(
-        error.contains("Worker 3")
-            && error.contains("backend=acp")
-            && error.contains("model=worker-3")
-            && error.contains("role=teammate"),
-        "rebuild error should identify the failing agent by name, backend, model, and role: {error}"
+        error.contains(&lead.slot_id),
+        "leader attach failure should surface as a member-runtime failure for the lead slot: {error}"
     );
 
     let calls = tm.snapshot();
     assert_eq!(
-        calls.build.len(),
-        4,
-        "serial rebuild should stop only after the failing attempted agent"
+        calls.build,
+        vec![lead.conversation_id.clone()],
+        "only the lead is built at cold start"
     );
-    assert_eq!(
-        calls.kill.len(),
-        11,
-        "cleanup is idempotent after partial-success cleanup"
-    );
-    for agent in &created.assistants {
+    for teammate in created.assistants.iter().filter(|a| a.role != "lead") {
         assert!(
-            calls
-                .kill
-                .iter()
-                .filter(|(conversation_id, _)| conversation_id == &agent.conversation_id)
-                .count()
-                >= 2,
-            "bootstrap failure must issue final cleanup for {}",
-            agent.conversation_id
+            !calls.build.contains(&teammate.conversation_id)
+                && calls
+                    .kill
+                    .iter()
+                    .all(|(conversation_id, _)| conversation_id != &teammate.conversation_id),
+            "dormant teammate {} must never be built or killed on leader bootstrap failure",
+            teammate.conversation_id
         );
     }
     assert_eq!(tm.active_count(), 0);
     assert!(
         svc.get_session_scheduler(&created.id).is_none(),
-        "session must not be registered after partial rebuild failure"
+        "session must not be registered after leader bootstrap failure"
     );
 
     let team_session_failed = recorder
@@ -5985,7 +5953,7 @@ async fn cold_bootstrap_failure_stops_session_and_cleans_all_successful_runtimes
         });
     assert!(
         team_session_failed.is_some(),
-        "partial rebuild failure must emit a team-level failed/attaching_agents terminal event"
+        "leader bootstrap failure must emit a team-level failed/attaching_agents terminal event"
     );
 }
 
@@ -6025,7 +5993,7 @@ async fn ensure_session_serializes_manual_add_until_rebuild_completes() {
 
     let svc_for_add = Arc::clone(&svc);
     let add_team_id = created.id.clone();
-    let mut add_handle = tokio::spawn(async move {
+    let add_handle = tokio::spawn(async move {
         svc_for_add
             .add_agent(
                 "user1",
@@ -6041,11 +6009,10 @@ async fn ensure_session_serializes_manual_add_until_rebuild_completes() {
             .await
     });
 
-    tokio::select! {
-        result = &mut add_handle => panic!("add_agent completed while ensure_session was rebuilding: {result:?}"),
-        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
-    }
-
+    // Leader-only warmup publishes the session before the (blocking) lead attach
+    // and releases the membership guard, so a manual add now runs concurrently
+    // with leader warmup instead of being serialized behind it. The invariant
+    // that must still hold is a consistent final roster.
     release_build.notify_waiters();
     ensure_handle.await.unwrap().unwrap();
     add_handle.await.unwrap().unwrap();
@@ -6087,17 +6054,14 @@ async fn ensure_session_serializes_manual_remove_until_rebuild_completes() {
     let svc_for_remove = Arc::clone(&svc);
     let remove_team_id = created.id.clone();
     let remove_slot = worker_slot.clone();
-    let mut remove_handle = tokio::spawn(async move {
+    let remove_handle = tokio::spawn(async move {
         svc_for_remove
             .remove_agent("user1", &remove_team_id, &remove_slot)
             .await
     });
 
-    tokio::select! {
-        result = &mut remove_handle => panic!("remove_agent completed while ensure_session was rebuilding: {result:?}"),
-        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
-    }
-
+    // Leader-only warmup runs the manual remove concurrently with leader warmup
+    // (see the add variant); assert the final roster is consistent.
     release_build.notify_waiters();
     ensure_handle.await.unwrap().unwrap();
     remove_handle.await.unwrap().unwrap();
@@ -6141,17 +6105,14 @@ async fn ensure_session_serializes_manual_rename_until_rebuild_completes() {
     let svc_for_rename = Arc::clone(&svc);
     let rename_team_id = created.id.clone();
     let rename_slot = worker_slot.clone();
-    let mut rename_handle = tokio::spawn(async move {
+    let rename_handle = tokio::spawn(async move {
         svc_for_rename
             .rename_agent("user1", &rename_team_id, &rename_slot, "Senior Worker")
             .await
     });
 
-    tokio::select! {
-        result = &mut rename_handle => panic!("rename_agent completed while ensure_session was rebuilding: {result:?}"),
-        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
-    }
-
+    // Leader-only warmup runs the manual rename concurrently with leader warmup
+    // (see the add variant); assert the rename is reflected in the final roster.
     release_build.notify_waiters();
     ensure_handle.await.unwrap().unwrap();
     rename_handle.await.unwrap().unwrap();
@@ -6266,9 +6227,14 @@ async fn d115_remove_team_kills_every_agent_process() {
         .unwrap();
 
     reset_runtime_state(&svc, &tm, &created.id).await;
-    // Bring two agents online — after ensure_session, active_count == 2.
+    // Leader-only warmup: only the lead is live after ensure_session; the
+    // teammate stays dormant (spec 5.1).
     svc.ensure_session("user1", &created.id).await.unwrap();
-    assert_eq!(tm.active_count(), 2, "ensure_session must register 2 live agents");
+    assert_eq!(
+        tm.active_count(),
+        1,
+        "leader-only warmup registers only the lead runtime"
+    );
 
     let before_kill = tm.snapshot().kill.len();
 

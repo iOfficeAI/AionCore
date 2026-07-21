@@ -5,7 +5,6 @@ pub(crate) mod spawn_support;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
-use std::time::Instant;
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::{
@@ -22,7 +21,6 @@ use aionui_db::{
 };
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
-use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::error::TeamError;
@@ -30,7 +28,6 @@ use crate::event_loop::{AgentLoopContext, EventLoopRegistrationError};
 use crate::events::{
     TEAM_CREATED_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT, TEAM_SESSION_STATUS_CHANGED_EVENT, TeamEventEmitter,
 };
-use crate::mcp::TeamMcpStdioConfig;
 use crate::member_runtime::{
     AttachLease, AttachOutcome, AttachWaiter, BeginRemove, MemberRuntimeFailure, MemberRuntimeSnapshot, ReserveAttach,
 };
@@ -44,7 +41,6 @@ use crate::runtime_tools::{
 use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
 use crate::team_run::TeamRunManager;
 use crate::types::{Team, TeamAgent, TeammateRole};
-use crate::work_coordinator::RuntimeConstraint;
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
 
@@ -83,96 +79,10 @@ impl IdleCleanupCoordinator for TeamIdleCleanupCoordinator {
     }
 }
 
-struct TeamAgentRebuildOutcome {
-    agent: TeamAgent,
-    duration_ms: u128,
-    result: Result<(), TeamError>,
-}
-
 struct MemberRuntimeReconcileWork {
     agent: TeamAgent,
     waiter: AttachWaiter,
     owner: Option<AttachLease>,
-}
-
-const TEAM_REBUILD_MAX_CONCURRENCY: usize = 3;
-const TEAM_REBUILD_START_STAGGER: std::time::Duration = std::time::Duration::from_secs(3);
-
-fn format_rebuild_agent_identity(agent: &TeamAgent) -> String {
-    format!(
-        "{} (backend={}, model={}, role={}, slot_id={}, conversation_id={})",
-        agent.name, agent.backend, agent.model, agent.role, agent.slot_id, agent.conversation_id
-    )
-}
-
-fn spawn_rebuild_agent_process(
-    jobs: &mut JoinSet<TeamAgentRebuildOutcome>,
-    provisioner: TeamAgentProvisioner,
-    task_manager: Arc<dyn IWorkerTaskManager>,
-    user_id: String,
-    agent: TeamAgent,
-    cfg: TeamMcpStdioConfig,
-) {
-    jobs.spawn(async move {
-        let team_id = cfg.team_id.clone();
-        info!(
-            team_id = %team_id,
-            slot_id = %agent.slot_id,
-            agent_name = %agent.name,
-            conversation_id = %agent.conversation_id,
-            backend = %agent.backend,
-            model = %agent.model,
-            role = %agent.role,
-            "team agent rebuild attach started"
-        );
-        let attach_started_at = Instant::now();
-        let result = provisioner
-            .attach_agent_process(&user_id, &agent, cfg, &task_manager)
-            .await;
-        let duration_ms = attach_started_at.elapsed().as_millis();
-        match &result {
-            Ok(()) => info!(
-                team_id = %team_id,
-                slot_id = %agent.slot_id,
-                agent_name = %agent.name,
-                conversation_id = %agent.conversation_id,
-                backend = %agent.backend,
-                model = %agent.model,
-                role = %agent.role,
-                duration_ms,
-                "team agent rebuild attach finished"
-            ),
-            Err(error) => warn!(
-                team_id = %team_id,
-                slot_id = %agent.slot_id,
-                agent_name = %agent.name,
-                conversation_id = %agent.conversation_id,
-                backend = %agent.backend,
-                model = %agent.model,
-                role = %agent.role,
-                duration_ms,
-                error = %error,
-                "team agent rebuild attach failed"
-            ),
-        }
-        TeamAgentRebuildOutcome {
-            agent,
-            duration_ms,
-            result,
-        }
-    });
-}
-
-async fn join_next_rebuild_outcome(
-    jobs: &mut JoinSet<TeamAgentRebuildOutcome>,
-) -> Result<Option<TeamAgentRebuildOutcome>, TeamError> {
-    match jobs.join_next().await {
-        Some(Ok(outcome)) => Ok(Some(outcome)),
-        Some(Err(error)) => Err(TeamError::InvalidRequest(format!(
-            "team agent rebuild task failed: {error}"
-        ))),
-        None => Ok(None),
-    }
 }
 
 pub struct TeamSessionService {
@@ -940,56 +850,38 @@ impl TeamSessionService {
             |_| {},
         );
 
-        if let Err(e) = self
-            .rebuild_agent_processes(team_id, &session, &user_id, &agents_snapshot)
-            .await
-        {
-            self.broadcast_session_status(
-                team_id,
-                TeamSessionStatus::Failed,
-                Some(TeamSessionPhase::AttachingAgents),
-                |p| {
-                    p.error = Some(e.to_string());
-                },
-            );
-            session.stop();
-            self.cleanup_bootstrap_runtime_tasks(&agents_snapshot).await;
-            return Err(e);
-        }
+        let service = self
+            .self_ref
+            .upgrade()
+            .ok_or_else(|| TeamError::InvalidRequest("team service is shutting down".to_owned()))?;
 
-        if let Err(error) = self.spawn_event_loops(&session, &user_id, &agents_snapshot) {
-            warn!(
-                team_id,
-                generation = session.generation(),
-                error = %error,
-                "team bootstrap event loop registration failed"
-            );
-            session.stop();
-            self.cleanup_bootstrap_runtime_tasks(&agents_snapshot).await;
-            self.broadcast_session_status(
-                team_id,
-                TeamSessionStatus::Failed,
-                Some(TeamSessionPhase::AttachingAgents),
-                |payload| payload.error = Some(error.to_string()),
-            );
-            return Err(error);
-        }
-
-        if agents_snapshot
+        // Leader-only warmup: only the lead slot is attached at first start.
+        // Teammates stay dormant (Absent in the registry) until a delivery
+        // lazily wakes them (spec 5.1).
+        let Some(leader) = agents_snapshot
             .iter()
-            .any(|agent| !session.member_runtimes().seed_ready(agent.slot_id.clone()))
-        {
-            let error = TeamError::InvalidRequest("failed to seed bootstrap member runtime registry".to_owned());
+            .find(|agent| agent.role == TeammateRole::Lead)
+            .cloned()
+        else {
+            let error = TeamError::InvalidRequest("team has no lead agent".to_owned());
+            self.broadcast_session_status(
+                team_id,
+                TeamSessionStatus::Failed,
+                Some(TeamSessionPhase::AttachingAgents),
+                |p| p.error = Some(error.to_string()),
+            );
             session.stop();
-            self.cleanup_bootstrap_runtime_tasks(&agents_snapshot).await;
             return Err(error);
-        }
-        for agent in &agents_snapshot {
-            session
-                .work_coordinator()
-                .set_runtime_constraint(&agent.slot_id, RuntimeConstraint::Ready);
-        }
+        };
 
+        // Publish the session BEFORE attaching so the single attach path
+        // (`attach_member_runtime`) observes it as the current published
+        // session. Drop the startup guards before awaiting the attach: that
+        // path re-acquires the membership lock (via `refresh_member_runtime_status`)
+        // and the ensure lock (via `cleanup_stale_member_runtime_task` on
+        // failure), so holding them here would deadlock. Concurrent ensures
+        // that were blocked on membership_guard now observe the published
+        // session and take the reconciliation path instead of cold-starting.
         let slow_monitor_handle = Self::spawn_slow_monitor(session.clone());
         let entry = SessionEntry {
             session: session.clone(),
@@ -997,9 +889,60 @@ impl TeamSessionService {
         };
         self.sessions.insert(team_id.to_owned(), entry);
         drop(membership_guard);
+        drop(ensure_guard);
 
-        for agent in &agents_snapshot {
-            self.broadcast_agent_runtime_status(team_id, agent, TeamAgentRuntimeStatus::Ready, None);
+        self.broadcast_agent_runtime_status(team_id, &leader, TeamAgentRuntimeStatus::Pending, None);
+        let leader_outcome = match session.member_runtimes().reserve_attach(&leader.slot_id, false) {
+            ReserveAttach::Start(lease) => {
+                attach_member_runtime(
+                    Arc::clone(&service),
+                    session.clone(),
+                    user_id.clone(),
+                    leader.clone(),
+                    self.task_manager.clone(),
+                    lease,
+                    // Leader cold-start failure bubbles to a session-level Failed
+                    // (full-screen card), not an inline per-member notice.
+                    false,
+                )
+                .await
+            }
+            ReserveAttach::Join(waiter) | ReserveAttach::Removing(waiter) => waiter.wait().await,
+            ReserveAttach::AlreadyReady => AttachOutcome::Ready,
+            ReserveAttach::SessionStopped => AttachOutcome::SessionStopped,
+        };
+
+        match leader_outcome {
+            AttachOutcome::Ready | AttachOutcome::Removed => {}
+            AttachOutcome::Failed(failure) => {
+                self.broadcast_session_status(
+                    team_id,
+                    TeamSessionStatus::Failed,
+                    Some(TeamSessionPhase::AttachingAgents),
+                    |p| p.error = Some(failure.public_reason.clone()),
+                );
+                session.stop();
+                self.sessions.remove(team_id);
+                return Err(TeamError::MemberRuntimeFailed {
+                    team_id: team_id.to_owned(),
+                    slot_id: leader.slot_id.clone(),
+                    conversation_id: leader.conversation_id.clone(),
+                    public_reason: failure.public_reason,
+                });
+            }
+            AttachOutcome::SessionStopped => {
+                session.stop();
+                self.sessions.remove(team_id);
+                return Err(TeamError::InvalidRequest(
+                    "team session stopped during leader warmup".to_owned(),
+                ));
+            }
+        }
+
+        // Teammates start dormant; the leader's Ready was already broadcast by
+        // its successful attach.
+        for agent in agents_snapshot.iter().filter(|a| a.role != TeammateRole::Lead) {
+            self.broadcast_agent_runtime_status(team_id, agent, TeamAgentRuntimeStatus::Dormant, None);
         }
 
         self.broadcast_session_status(
@@ -1042,7 +985,16 @@ impl TeamSessionService {
             if !scheduler_slots.contains(&agent.slot_id) {
                 session.scheduler().add_agent(agent).await;
             }
-            let reservation = match session.member_runtimes().snapshot(&agent.slot_id) {
+            let snapshot = session.member_runtimes().snapshot(&agent.slot_id);
+            // Skip dormant teammates: an Absent non-lead member was never
+            // triggered, so a re-ensure (second warmupSession, model switch,
+            // retry) must NOT wake it, or it would punch through lazy warmup
+            // (spec 5.1). The leader, Ready-repair, Failed-retry, and in-flight
+            // members still reconcile.
+            if matches!(snapshot, MemberRuntimeSnapshot::Absent) && agent.role != TeammateRole::Lead {
+                continue;
+            }
+            let reservation = match snapshot {
                 MemberRuntimeSnapshot::Ready if self.task_manager.get_task(&agent.conversation_id).is_none() => {
                     session.member_runtimes().reserve_repair(&agent.slot_id)
                 }
@@ -1186,14 +1138,6 @@ impl TeamSessionService {
         Ok(())
     }
 
-    async fn cleanup_bootstrap_runtime_tasks(&self, agents: &[TeamAgent]) {
-        for agent in agents {
-            self.task_manager
-                .kill_and_wait(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
-                .await;
-        }
-    }
-
     pub(crate) async fn cleanup_stale_member_runtime_task(
         &self,
         captured_session: &TeamSession,
@@ -1325,207 +1269,11 @@ impl TeamSessionService {
             .broadcast_agent_runtime_status(agent, status, error);
     }
 
-    async fn rebuild_agent_processes(
-        &self,
-        team_id: &str,
-        session: &TeamSession,
-        user_id: &str,
-        agents: &[TeamAgent],
-    ) -> Result<(), TeamError> {
-        let provisioner = self.provisioner();
-        let task_manager = self.task_manager.clone();
-        let started_at = Instant::now();
-        let mut rebuild_jobs: Vec<TeamAgent> = agents.to_vec();
-        rebuild_jobs.sort_by_key(|agent| match agent.role {
-            TeammateRole::Lead => 0,
-            TeammateRole::Teammate => 1,
-        });
-
-        info!(
-            team_id,
-            agent_count = agents.len(),
-            max_concurrency = TEAM_REBUILD_MAX_CONCURRENCY,
-            start_stagger_ms = TEAM_REBUILD_START_STAGGER.as_millis(),
-            "team agent rebuild started"
-        );
-
-        let mut outcomes = Vec::new();
-        let mut jobs = JoinSet::new();
-        let mut failed = false;
-
-        for (launched_count, agent) in rebuild_jobs.into_iter().enumerate() {
-            while jobs.len() >= TEAM_REBUILD_MAX_CONCURRENCY {
-                if let Some(outcome) = join_next_rebuild_outcome(&mut jobs).await? {
-                    failed = outcome.result.is_err();
-                    outcomes.push(outcome);
-                }
-                if failed {
-                    break;
-                }
-            }
-            if failed {
-                break;
-            }
-
-            if launched_count > 0 {
-                let stagger = tokio::time::sleep(TEAM_REBUILD_START_STAGGER);
-                tokio::pin!(stagger);
-                loop {
-                    tokio::select! {
-                        _ = &mut stagger => break,
-                        outcome = join_next_rebuild_outcome(&mut jobs), if !jobs.is_empty() => {
-                            if let Some(outcome) = outcome? {
-                                failed = outcome.result.is_err();
-                                outcomes.push(outcome);
-                            }
-                            if failed {
-                                break;
-                            }
-                        }
-                    }
-                }
-                if failed {
-                    break;
-                }
-            }
-
-            let cfg = session.mcp_stdio_config(&agent.slot_id);
-            self.broadcast_agent_runtime_status(team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
-            spawn_rebuild_agent_process(
-                &mut jobs,
-                provisioner.clone(),
-                task_manager.clone(),
-                user_id.to_owned(),
-                agent,
-                cfg,
-            );
-        }
-
-        while let Some(outcome) = join_next_rebuild_outcome(&mut jobs).await? {
-            outcomes.push(outcome);
-        }
-
-        let mut success_count = 0usize;
-        let mut failures: Vec<&TeamAgentRebuildOutcome> = Vec::new();
-        for outcome in &outcomes {
-            match &outcome.result {
-                Ok(()) => success_count += 1,
-                Err(_) => failures.push(outcome),
-            }
-        }
-
-        info!(
-            team_id,
-            agent_count = agents.len(),
-            success_count,
-            failure_count = failures.len(),
-            duration_ms = started_at.elapsed().as_millis(),
-            max_concurrency = TEAM_REBUILD_MAX_CONCURRENCY,
-            start_stagger_ms = TEAM_REBUILD_START_STAGGER.as_millis(),
-            "team agent rebuild completed"
-        );
-
-        if failures.is_empty() {
-            return Ok(());
-        }
-
-        let first_error = failures
-            .first()
-            .map(|outcome| {
-                let error = outcome
-                    .result
-                    .as_ref()
-                    .err()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "unknown rebuild failure".to_owned());
-                format!("{}: {error}", format_rebuild_agent_identity(&outcome.agent))
-            })
-            .unwrap_or_else(|| "unknown rebuild failure".to_owned());
-
-        for failure in &failures {
-            let error = failure
-                .result
-                .as_ref()
-                .err()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "unknown rebuild failure".to_owned());
-            self.broadcast_agent_runtime_status(
-                team_id,
-                &failure.agent,
-                TeamAgentRuntimeStatus::Failed,
-                Some(error.clone()),
-            );
-            warn!(
-                team_id,
-                slot_id = %failure.agent.slot_id,
-                agent_name = %failure.agent.name,
-                conversation_id = %failure.agent.conversation_id,
-                backend = %failure.agent.backend,
-                model = %failure.agent.model,
-                role = %failure.agent.role,
-                duration_ms = failure.duration_ms,
-                error = %error,
-                "warmup failed during rebuild"
-            );
-        }
-
-        for success in outcomes.iter().filter(|outcome| outcome.result.is_ok()) {
-            info!(
-                team_id,
-                slot_id = %success.agent.slot_id,
-                agent_name = %success.agent.name,
-                conversation_id = %success.agent.conversation_id,
-                backend = %success.agent.backend,
-                model = %success.agent.model,
-                role = %success.agent.role,
-                "cleaning up successfully attached agent after rebuild failure"
-            );
-            self.task_manager
-                .kill_and_wait(&success.agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
-                .await;
-        }
-
-        Err(TeamError::InvalidRequest(format!(
-            "failed to attach rebuilt agent: {first_error}"
-        )))
-    }
-
-    /// Spawn per-agent event loops that drain the mailbox whenever notified.
-    /// Each agent gets its own tokio task that runs until the session shuts down.
-    fn spawn_event_loops(
-        &self,
-        session: &Arc<TeamSession>,
-        user_id: &str,
-        agents: &[TeamAgent],
-    ) -> Result<(), TeamError> {
-        let registry = session.event_loops();
-
-        for agent in agents {
-            let ctx = AgentLoopContext {
-                team_id: session.team_id().to_owned(),
-                slot_id: agent.slot_id.clone(),
-                user_id: user_id.to_owned(),
-                session: session.clone(),
-                scheduler: session.scheduler().clone(),
-                mailbox: session.mailbox().clone(),
-                turn_port: self.turn_port.clone(),
-                registry: registry.clone(),
-            };
-            registry.spawn(&agent.slot_id, ctx).map_err(|error| {
-                TeamError::InvalidRequest(format!(
-                    "failed to register bootstrap event loop for slot {}: {error:?}",
-                    agent.slot_id
-                ))
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Register an event loop for a dynamically spawned agent.
+    /// Register an event loop for an attaching agent.
     ///
-    /// Called by [`TeamSession::spawn_agent`] after `attach_spawned_agent_process`
-    /// succeeds so the newly booted agent gets its own drain loop — exactly as
-    /// `spawn_event_loops` does for the initial members during `ensure_session`.
+    /// Called from `attach_member_runtime` (the single attach path used by
+    /// leader cold-start, reconciliation, `add_agent`, `spawn_agent`, and lazy
+    /// wakeup) after the agent process warms up, so it gets its own drain loop.
     pub(crate) fn register_event_loop(
         &self,
         session: &Arc<TeamSession>,
@@ -1633,9 +1381,13 @@ impl TeamSessionService {
                 MemberRuntimeSnapshot::Failed { failure, .. } => {
                     failed_reason.get_or_insert(failure.public_reason);
                 }
-                MemberRuntimeSnapshot::Absent
-                | MemberRuntimeSnapshot::Attaching { .. }
-                | MemberRuntimeSnapshot::Removing { .. } => pending = true,
+                // Absent = never triggered = dormant. A dormant teammate does
+                // NOT block team Ready (leader-only warmup, spec 5.2). The
+                // registry snapshot is the sole authority here — we do not read
+                // the coordinator or event_loops.
+                MemberRuntimeSnapshot::Absent => {}
+                // An in-flight attach/remove briefly blocks Ready.
+                MemberRuntimeSnapshot::Attaching { .. } | MemberRuntimeSnapshot::Removing { .. } => pending = true,
                 MemberRuntimeSnapshot::SessionStopped => return,
             }
         }
@@ -2513,32 +2265,43 @@ mod tests {
             .unwrap();
 
         svc.ensure_session("user-test", &created.id).await.unwrap();
+        // Leader-only warmup: only the lead runtime exists after first start;
+        // the worker stays dormant (spec 5.1), so repair now targets the lead.
         task_manager.insert_mode_agent(&lead.conversation_id);
-        task_manager.insert_mode_agent(&worker.conversation_id);
         task_manager.reset_kills();
         let original_session = Arc::clone(&svc.sessions.get(&created.id).expect("session").session);
         let original_generation = original_session.generation();
-        task_manager.remove(&worker.conversation_id);
+        // Simulate the lead runtime disappearing so reconciliation repairs it in place.
+        task_manager.remove(&lead.conversation_id);
 
         svc.ensure_session("user-test", &created.id).await.unwrap();
 
         let current_session = Arc::clone(&svc.sessions.get(&created.id).expect("session").session);
         assert!(Arc::ptr_eq(&original_session, &current_session));
         assert_eq!(current_session.generation(), original_generation);
-        assert_eq!(task_manager.kills(), vec![worker.conversation_id.clone()]);
+        assert_eq!(task_manager.kills(), vec![lead.conversation_id.clone()]);
         assert!(current_session.event_loops().has(&lead.slot_id));
-        assert!(current_session.event_loops().has(&worker.slot_id));
+        // The dormant worker is never woken by reconciliation (spec 5.1).
+        assert!(!current_session.event_loops().has(&worker.slot_id));
 
         let events = broadcaster.events_by_name("team.agentRuntimeStatusChanged");
-        let statuses: Vec<&str> = events
+        let lead_statuses: Vec<&str> = events
+            .iter()
+            .filter(|event| {
+                event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(lead.slot_id.as_str())
+            })
+            .map(|event| event.data.get("status").and_then(serde_json::Value::as_str).unwrap())
+            .collect();
+        assert_eq!(lead_statuses, vec!["pending", "ready", "pending", "ready"]);
+
+        let worker_statuses: Vec<&str> = events
             .iter()
             .filter(|event| {
                 event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(worker.slot_id.as_str())
             })
             .map(|event| event.data.get("status").and_then(serde_json::Value::as_str).unwrap())
             .collect();
-
-        assert_eq!(statuses, vec!["pending", "ready", "pending", "ready"]);
+        assert_eq!(worker_statuses, vec!["dormant"]);
     }
 
     #[tokio::test]

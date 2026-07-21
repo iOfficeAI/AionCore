@@ -869,6 +869,13 @@ impl TeamSession {
 
         let mut recovered_slots = Vec::new();
         for agent in self.scheduler.list_agents().await {
+            // First-start recovery only drains the lead slot. Teammates are
+            // dormant at first start (leader-only warmup); their unread mailbox
+            // rows are recovered when each is lazily woken and its event loop's
+            // reconcile_mailbox back-scans them (spec 5.1).
+            if agent.role != TeammateRole::Lead {
+                continue;
+            }
             let unread = self
                 .mailbox
                 .peek_unread(&self.team.id, &agent.slot_id)
