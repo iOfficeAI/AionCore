@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aionui_api_types::{
-    AgentDynamicProbeResult, AgentManagementRow, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus,
-    AgentSource, TryConnectCustomAgentResponse,
+    AgentDynamicProbeResult, AgentManagementRow, AgentMetadata, AgentProbeStatus, AgentSnapshotCheckKind,
+    AgentSnapshotCheckStatus, AgentSource, TryConnectCustomAgentResponse,
 };
 use aionui_common::now_ms;
 use aionui_common::{AgentType, CommandSpec, EnvVar};
@@ -91,7 +91,7 @@ impl AgentAvailabilityService {
             if !result.is_usable() {
                 snapshot.status = "offline";
                 snapshot.error_code = Some("dynamic_probe_failed".to_owned());
-                snapshot.error_message = Some("Agent failed the dynamic capability preflight".to_owned());
+                snapshot.error_message = Some(dynamic_probe_failure_message(result));
             } else {
                 let models_json = serde_json::to_string(&result.available_models)
                     .map_err(|error| AgentError::internal(format!("encode probed models: {error}")))?;
@@ -208,6 +208,24 @@ fn probe_snapshot_to_persist(
         Some(probe) => serde_json::to_string(probe).map(Some),
         None => Ok(existing.map(str::to_owned)),
     }
+}
+
+fn dynamic_probe_failure_message(result: &AgentDynamicProbeResult) -> String {
+    result
+        .steps
+        .iter()
+        .find(|step| !matches!(step.status, AgentProbeStatus::Passed | AgentProbeStatus::Unsupported))
+        .map(|step| {
+            let message = step.error_message.as_deref().unwrap_or("no diagnostic message");
+            match step.error_category.as_ref() {
+                Some(category) => format!(
+                    "Agent dynamic preflight failed at {:?} ({category:?}): {message}",
+                    step.step
+                ),
+                None => format!("Agent dynamic preflight failed at {:?}: {message}", step.step),
+            }
+        })
+        .unwrap_or_else(|| "Agent failed the dynamic capability preflight".to_owned())
 }
 
 async fn run_probe(
@@ -453,7 +471,10 @@ impl AgentAvailabilityFeedbackPort for AgentAvailabilityService {
 mod tests {
     use std::sync::Arc;
 
-    use super::{AgentAvailabilityService, probe_aionrs_provider_readiness, probe_snapshot_to_persist, run_probe};
+    use super::{
+        AgentAvailabilityService, dynamic_probe_failure_message, probe_aionrs_provider_readiness,
+        probe_snapshot_to_persist, run_probe,
+    };
     use crate::registry::AgentRegistry;
     use aionui_api_types::{
         AgentHandshake, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus,
@@ -512,6 +533,42 @@ mod tests {
         assert_eq!(
             probe_snapshot_to_persist(Some(existing), None).unwrap().as_deref(),
             Some(existing)
+        );
+    }
+
+    #[test]
+    fn failed_probe_exposes_the_sanitized_failed_stage_diagnostic() {
+        use aionui_api_types::{
+            AgentDynamicProbeResult, AgentProbeErrorCategory, AgentProbeStatus, AgentProbeStep, AgentProbeStepResult,
+        };
+
+        let failed = AgentDynamicProbeResult {
+            agent_id: "codex".into(),
+            checked_at: 2,
+            steps: vec![
+                AgentProbeStepResult {
+                    step: AgentProbeStep::Spawn,
+                    status: AgentProbeStatus::Passed,
+                    started_at: 2,
+                    duration_ms: 1,
+                    error_category: None,
+                    error_message: None,
+                },
+                AgentProbeStepResult {
+                    step: AgentProbeStep::MinimalPrompt,
+                    status: AgentProbeStatus::Failed,
+                    started_at: 3,
+                    duration_ms: 5,
+                    error_category: Some(AgentProbeErrorCategory::ModelRejected),
+                    error_message: Some("Agent rejected the configured model".into()),
+                },
+            ],
+            available_models: vec![],
+        };
+
+        assert_eq!(
+            dynamic_probe_failure_message(&failed),
+            "Agent dynamic preflight failed at MinimalPrompt (ModelRejected): Agent rejected the configured model"
         );
     }
 

@@ -29,6 +29,7 @@ struct PlatformSpec {
     manifest_key: &'static str,
     npm_os: &'static str,
     npm_cpu: &'static str,
+    codex_target_triple: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -656,9 +657,11 @@ fn validate_platform_binary(
         ManagedAcpToolId::CodexAcp => {
             let mut path = project_dir
                 .join("node_modules")
-                .join(format!("@zed-industries/codex-acp-{}", spec.manifest_key))
+                .join(format!("@openai/codex-{}", spec.manifest_key))
+                .join("vendor")
+                .join(spec.codex_target_triple)
                 .join("bin")
-                .join("codex-acp");
+                .join("codex");
             if spec.manifest_key.starts_with("win32-") {
                 path.set_extension("exe");
             }
@@ -812,7 +815,12 @@ fn resolve_package_smoke_target(
     project_dir: &Path,
     package_json: &InstalledPackageJson,
 ) -> Result<PackageSmokeTarget, ManagedAcpToolError> {
-    if let Some(entry) = resolve_package_import_entry(&package_json.exports, package_json.main.as_deref()) {
+    // codex-acp's main entrypoint starts its long-running stdio server as a
+    // side effect, so importing it is not a bounded smoke test. Validate its
+    // CLI entrypoint with Node's syntax checker instead.
+    if package_json.name != "@agentclientprotocol/codex-acp"
+        && let Some(entry) = resolve_package_import_entry(&package_json.exports, package_json.main.as_deref())
+    {
         return Ok(PackageSmokeTarget::Import(
             package_root(project_dir, &package_json.name).join(entry),
         ));
@@ -897,31 +905,37 @@ fn platform_spec() -> Result<PlatformSpec, ManagedAcpToolError> {
             manifest_key: "darwin-arm64",
             npm_os: "darwin",
             npm_cpu: "arm64",
+            codex_target_triple: "aarch64-apple-darwin",
         }),
         ("macos", "x86_64") => Ok(PlatformSpec {
             manifest_key: "darwin-x64",
             npm_os: "darwin",
             npm_cpu: "x64",
+            codex_target_triple: "x86_64-apple-darwin",
         }),
         ("linux", "aarch64") => Ok(PlatformSpec {
             manifest_key: "linux-arm64",
             npm_os: "linux",
             npm_cpu: "arm64",
+            codex_target_triple: "aarch64-unknown-linux-musl",
         }),
         ("linux", "x86_64") => Ok(PlatformSpec {
             manifest_key: "linux-x64",
             npm_os: "linux",
             npm_cpu: "x64",
+            codex_target_triple: "x86_64-unknown-linux-musl",
         }),
         ("windows", "x86_64") => Ok(PlatformSpec {
             manifest_key: "win32-x64",
             npm_os: "win32",
             npm_cpu: "x64",
+            codex_target_triple: "x86_64-pc-windows-msvc",
         }),
         ("windows", "aarch64") => Ok(PlatformSpec {
             manifest_key: "win32-arm64",
             npm_os: "win32",
             npm_cpu: "arm64",
+            codex_target_triple: "aarch64-pc-windows-msvc",
         }),
         (os, arch) => Err(ManagedAcpToolError::unsupported_platform(format!(
             "managed ACP tool unsupported on {os}/{arch}"
@@ -1074,15 +1088,15 @@ mod tests {
 
         let entrypoint = root
             .join("node_modules")
-            .join("@zed-industries")
+            .join("@agentclientprotocol")
             .join("codex-acp")
-            .join("bin")
-            .join("codex-acp.js");
+            .join("dist")
+            .join("index.js");
         std::fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
         std::fs::write(&entrypoint, "console.log('codex bridge');\n").unwrap();
         std::fs::write(
             root.join("manifest.json"),
-            br#"{"entrypoint":"node_modules/@zed-industries/codex-acp/bin/codex-acp.js","path_entries":["node_modules/.bin"]}"#,
+            br#"{"entrypoint":"node_modules/@agentclientprotocol/codex-acp/dist/index.js","path_entries":["node_modules/.bin"]}"#,
         )
         .unwrap();
 
@@ -1216,11 +1230,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let project_dir = tmp.path();
         let package_json = InstalledPackageJson {
-            name: "@zed-industries/codex-acp".into(),
+            name: "@agentclientprotocol/codex-acp".into(),
             bin: json!({
-                "codex-acp": "bin/codex-acp.js",
+                "codex-acp": "dist/index.js",
             }),
-            main: None,
+            main: Some("dist/index.js".into()),
             exports: serde_json::Value::Null,
         };
 
@@ -1231,10 +1245,10 @@ mod tests {
             PackageSmokeTarget::SyntaxCheck(
                 project_dir
                     .join("node_modules")
-                    .join("@zed-industries")
+                    .join("@agentclientprotocol")
                     .join("codex-acp")
-                    .join("bin")
-                    .join("codex-acp.js")
+                    .join("dist")
+                    .join("index.js")
             )
         );
     }
@@ -1242,8 +1256,8 @@ mod tests {
     #[test]
     fn package_path_segments_preserve_scoped_package_structure() {
         assert_eq!(
-            package_path_segments("@zed-industries/codex-acp"),
-            vec!["@zed-industries", "codex-acp"]
+            package_path_segments("@agentclientprotocol/codex-acp"),
+            vec!["@agentclientprotocol", "codex-acp"]
         );
     }
 
@@ -1306,6 +1320,7 @@ mod tests {
             manifest_key: "win32-x64",
             npm_os: "win32",
             npm_cpu: "x64",
+            codex_target_triple: "x86_64-pc-windows-msvc",
         };
 
         let path = bundle_tool_root(bundle_root, ManagedAcpToolId::CodexAcp, spec);

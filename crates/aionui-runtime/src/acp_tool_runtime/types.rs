@@ -20,7 +20,7 @@ impl ManagedAcpToolId {
 
     pub fn version(self) -> &'static str {
         match self {
-            Self::CodexAcp => "0.16.0",
+            Self::CodexAcp => "1.1.4",
             Self::ClaudeAgentAcp => "0.39.0",
         }
     }
@@ -34,7 +34,7 @@ impl ManagedAcpToolId {
 
     pub fn package_name(self) -> &'static str {
         match self {
-            Self::CodexAcp => "@zed-industries/codex-acp",
+            Self::CodexAcp => "@agentclientprotocol/codex-acp",
             Self::ClaudeAgentAcp => "@agentclientprotocol/claude-agent-acp",
         }
     }
@@ -224,8 +224,16 @@ mod tests {
 
     #[test]
     fn managed_acp_tool_versions_match_current_pins() {
-        assert_eq!(ManagedAcpToolId::CodexAcp.version(), "0.16.0");
+        assert_eq!(ManagedAcpToolId::CodexAcp.version(), "1.1.4");
         assert_eq!(ManagedAcpToolId::ClaudeAgentAcp.version(), "0.39.0");
+    }
+
+    #[test]
+    fn codex_uses_the_maintained_agentclientprotocol_package() {
+        assert_eq!(
+            ManagedAcpToolId::CodexAcp.package_name(),
+            "@agentclientprotocol/codex-acp"
+        );
     }
 }
 
