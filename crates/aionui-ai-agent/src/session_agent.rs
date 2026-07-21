@@ -1016,6 +1016,14 @@ pub struct SessionBuildInputs<'a> {
     /// User-configured MCP server repository (feature ELECTRON-1JG). `None` on
     /// paths that never inject MCP (tests) ⇒ no injection.
     pub mcp_server_repo: Option<&'a Arc<dyn IMcpServerRepository>>,
+    /// The conversation runtime context env (`AIONUI_USER_ID` /
+    /// `AIONUI_CONVERSATION_ID` / `AIONUI_HELPER_BIN` / `AIONUI_BASE_URL` /
+    /// `AIONUI_RUNTIME_TOKEN`, filled by `apply_conversation_runtime_context`).
+    /// The legacy ACP path injects these into every agent spawn via
+    /// `apply_acp_launch_policy`; the direct-CLI path forwards them through
+    /// `SessionConfig.spawn_env` so team/helper tooling inside the agent process
+    /// keeps working. Empty ⇒ nothing injected.
+    pub runtime_env: &'a [(String, String)],
     /// Broadcaster forwarded to the MCP resolver for runtime-resolution reporting
     /// parity with the legacy ACP path.
     pub broadcaster: Arc<dyn EventBroadcaster>,
@@ -1116,6 +1124,7 @@ pub async fn build_session_instance(
         session_snapshot,
         backend_session_id,
         mcp_server_repo,
+        runtime_env,
         broadcaster,
         catalog_writeback,
         acp_session_repo,
@@ -1175,17 +1184,25 @@ pub async fn build_session_instance(
         ..Default::default()
     };
 
+    // Spawn env (legacy spawn-surface parity, claude AND codex).
+    session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
+    if !session_config.spawn_env.is_empty() {
+        let keys: Vec<&str> = session_config.spawn_env.iter().map(|e| e.name.as_str()).collect();
+        tracing::info!(conv_id = %conversation_id, ?keys, "session spawn env: agent overrides + runtime context");
+    }
+
     // GAP #5 — claude cc-switch provider env: inject ANTHROPIC_BASE_URL /
     // ANTHROPIC_AUTH_TOKEN (third-party relay creds) into the spawn, mirroring the
     // legacy ACP-claude path. Empty (no cc-switch config) = byte-identical spawn.
     if backend_label == "claude" {
         let provider_env = crate::cc_switch::read_claude_provider_env();
         if !provider_env.is_empty() {
-            session_config.spawn_env = provider_env
-                .into_iter()
-                .map(|(name, value)| aionui_common::EnvVar { name, value })
-                .collect();
-            let keys: Vec<&str> = session_config.spawn_env.iter().map(|e| e.name.as_str()).collect();
+            let keys: Vec<String> = provider_env.keys().cloned().collect();
+            session_config.spawn_env.extend(
+                provider_env
+                    .into_iter()
+                    .map(|(name, value)| aionui_common::EnvVar { name, value }),
+            );
             tracing::info!(conv_id = %conversation_id, ?keys, "cc-switch: provider env injected into claude spawn");
         }
     }
@@ -1309,6 +1326,34 @@ pub async fn build_session_instance(
         prompt_dump,
     );
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
+}
+
+/// Assemble the direct-CLI spawn env (legacy spawn-surface parity; order
+/// matters — later entries win in `ManagedProcess::spawn`):
+///  1. per-agent env overrides (`AgentMetadata.env`, repair panel) — the legacy
+///     path injected these via `resolve_agent_command_spec`; `AIONUI_*`/`PATH`/…
+///     keys are already filtered at the registry (`is_blocked_override_env_key`),
+///     so they cannot shadow the runtime context below.
+///  2. the `AIONUI_*` conversation runtime context (`AIONUI_USER_ID` /
+///     `AIONUI_CONVERSATION_ID` / `AIONUI_HELPER_BIN` / `AIONUI_BASE_URL` /
+///     `AIONUI_RUNTIME_TOKEN`) — the legacy path appended these via
+///     `apply_acp_launch_policy` for every agent spawn.
+fn assemble_spawn_env(
+    agent_env: &[aionui_api_types::AgentEnvEntry],
+    runtime_env: &[(String, String)],
+) -> Vec<aionui_common::EnvVar> {
+    let mut env: Vec<aionui_common::EnvVar> = agent_env
+        .iter()
+        .map(|entry| aionui_common::EnvVar {
+            name: entry.name.clone(),
+            value: entry.value.clone(),
+        })
+        .collect();
+    env.extend(runtime_env.iter().map(|(name, value)| aionui_common::EnvVar {
+        name: name.clone(),
+        value: value.clone(),
+    }));
+    env
 }
 
 /// Build the `session-cli-config` dump payload from the resolved `SessionConfig`
@@ -2606,6 +2651,40 @@ mod build_mapping_tests {
             current_model_id: model.map(ModelId::new),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn assemble_spawn_env_orders_agent_overrides_before_runtime_context() {
+        let agent_env = vec![
+            aionui_api_types::AgentEnvEntry {
+                name: "AWS_PROFILE".into(),
+                value: "pionex".into(),
+                description: None,
+            },
+            aionui_api_types::AgentEnvEntry {
+                name: "HTTPS_PROXY".into(),
+                value: "http://proxy:8080".into(),
+                description: None,
+            },
+        ];
+        let runtime_env = vec![
+            ("AIONUI_USER_ID".to_owned(), "user-1".to_owned()),
+            ("AIONUI_RUNTIME_TOKEN".to_owned(), "tok".to_owned()),
+        ];
+        let env = assemble_spawn_env(&agent_env, &runtime_env);
+        let names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
+        // Agent overrides first, runtime context after (later wins in
+        // ManagedProcess::spawn, so the runtime context can never be shadowed).
+        assert_eq!(
+            names,
+            ["AWS_PROFILE", "HTTPS_PROXY", "AIONUI_USER_ID", "AIONUI_RUNTIME_TOKEN"]
+        );
+        assert_eq!(env[0].value, "pionex");
+        assert_eq!(env[3].value, "tok");
+        assert!(
+            assemble_spawn_env(&[], &[]).is_empty(),
+            "empty in = empty out (inherit-only spawn)"
+        );
     }
 
     #[test]

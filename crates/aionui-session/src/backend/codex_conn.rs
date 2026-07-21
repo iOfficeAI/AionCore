@@ -79,7 +79,10 @@ impl BackendConnection for CodexConnection {
             // (dev → PATH). See SessionConfig.cli_program.
             command: config.cli_program.clone().unwrap_or_else(|| "codex".into()),
             args,
-            env: Vec::new(),
+            // #103 (parity with claude_conn): forward the orchestration-filled
+            // spawn env (per-agent overrides + AIONUI_* conversation runtime
+            // context). Empty = inherit the parent env only, as before.
+            env: config.spawn_env.clone(),
             cwd: config.cwd.clone(),
         };
         let proc = self
@@ -1046,10 +1049,11 @@ impl CodexSessionBackend {
         let mut args = vec!["app-server".to_string()];
         args.extend(self.wake.config.extra_args.iter().cloned());
         let cmd = aionui_common::CommandSpec {
-            // Same bundled-CLI resolution as the initial spawn (R16 continuity).
+            // Same bundled-CLI resolution + spawn env as the initial spawn
+            // (R16 continuity).
             command: self.wake.config.cli_program.clone().unwrap_or_else(|| "codex".into()),
             args,
-            env: Vec::new(),
+            env: self.wake.config.spawn_env.clone(),
             cwd: self.wake.config.cwd.clone(),
         };
         let proc = spawner
@@ -5816,6 +5820,10 @@ mod tests {
                 SessionConfig {
                     cwd: Some("/tmp/work".into()),
                     extra_args: vec!["--flag".into()],
+                    spawn_env: vec![aionui_common::EnvVar {
+                        name: "AIONUI_CONVERSATION_ID".into(),
+                        value: "conv-1".into(),
+                    }],
                     ..Default::default()
                 },
             )
@@ -5839,6 +5847,16 @@ mod tests {
             "extra_args threaded into the spawn"
         );
         assert_eq!(spec.cwd.as_deref(), Some("/tmp/work"), "cwd threaded (workspace)");
+        // #103 parity with claude_conn: the orchestration-filled spawn env
+        // (AIONUI_* runtime context + per-agent overrides) reaches the process.
+        assert_eq!(
+            spec.env
+                .iter()
+                .map(|e| (e.name.as_str(), e.value.as_str()))
+                .collect::<Vec<_>>(),
+            [("AIONUI_CONVERSATION_ID", "conv-1")],
+            "spawn_env forwarded into CommandSpec.env"
+        );
     }
 
     // ===== B-CODEX-MODEL-LIST: discovery (model/list + permissionProfile/list) =====
