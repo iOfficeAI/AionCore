@@ -1693,6 +1693,42 @@ impl TeamSessionService {
         session.send_message_to_agent(slot_id, content, files).await
     }
 
+    /// Directed retry/wakeup for a single member runtime (dormant or failed),
+    /// reusing the one attach path. Backs the send-box "retry start" entry.
+    /// `reserve_attach(slot, true)` retries a `Failed` member; a dormant
+    /// (`Absent`) member is attached fresh. Non-blocking: the attach runs in
+    /// the background and any preserved unread mailbox rows are re-drained by
+    /// the member's event loop via `reconcile_mailbox`.
+    pub async fn attach_agent_runtime(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        self.ensure_session_inner(team_id).await?;
+        let session = {
+            let entry = self
+                .sessions
+                .get(team_id)
+                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+            Arc::clone(&entry.session)
+        };
+        let agent = session.scheduler().get_agent(slot_id).await?;
+        let service = self
+            .self_ref
+            .upgrade()
+            .ok_or_else(|| TeamError::InvalidRequest("team service is shutting down".to_owned()))?;
+        let reservation = session.member_runtimes().reserve_attach(slot_id, true);
+        self.broadcast_agent_runtime_status(team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
+        spawn_attach_agent_process_bg(
+            service,
+            Arc::clone(&session),
+            user_id.to_owned(),
+            agent,
+            self.task_manager.clone(),
+            reservation,
+            // Directed user retry: failures surface inline, do not wake the leader.
+            false,
+        );
+        Ok(())
+    }
+
     pub async fn cancel_run(
         &self,
         user_id: &str,

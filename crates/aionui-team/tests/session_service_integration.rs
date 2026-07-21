@@ -6259,3 +6259,198 @@ async fn d115_remove_team_kills_every_agent_process() {
         "every agent worker must be torn down after remove_team"
     );
 }
+
+// ===========================================================================
+// Task A7: per-member attach route/service — directed retry/wakeup of a single
+// member runtime (dormant or failed). auth + CSRF are enforced by the shared
+// team router middleware layer (same as add_agent/remove_agent/send_message);
+// the service-level behavior is asserted here.
+// ===========================================================================
+
+#[tokio::test]
+async fn attach_agent_runtime_wakes_dormant_teammate() {
+    let (svc, _team_repo, _task_manager, recorder) = setup_with_factory_and_recording_broadcaster(success_factory());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Directed attach".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|assistant| assistant.role == "teammate")
+        .expect("teammate")
+        .clone();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    // The teammate is dormant after leader-only warmup; a directed attach wakes it.
+    svc.attach_agent_runtime("user1", &created.id, &worker.slot_id)
+        .await
+        .expect("directed attach should succeed");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let ready = recorder
+                .events_by_name("team.agentRuntimeStatusChanged")
+                .iter()
+                .any(|event| {
+                    event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(worker.slot_id.as_str())
+                        && event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready")
+                });
+            if ready {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("directed attach must bring the dormant teammate to ready");
+}
+
+#[tokio::test]
+async fn attach_agent_runtime_rejects_cross_user() {
+    let (svc, _tm) = setup_with_factory(success_factory());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Directed attach isolation".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|assistant| assistant.role == "teammate")
+        .expect("teammate")
+        .clone();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    let error = svc
+        .attach_agent_runtime("intruder", &created.id, &worker.slot_id)
+        .await
+        .expect_err("cross-user directed attach must be rejected");
+    assert!(
+        matches!(error, TeamError::Forbidden(_)),
+        "expected Forbidden, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn attach_agent_runtime_rejects_unknown_slot() {
+    let (svc, _tm) = setup_with_factory(success_factory());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Directed attach unknown slot".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    let error = svc
+        .attach_agent_runtime("user1", &created.id, "slot-does-not-exist")
+        .await
+        .expect_err("attaching an unknown slot must be rejected");
+    assert!(
+        matches!(error, TeamError::AgentNotFound(_)),
+        "expected AgentNotFound, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn lazy_attach_failure_preserves_unread_and_skips_leader_on_human_delivery() {
+    use futures_util::FutureExt;
+
+    // Fail exactly the next build after it is armed; the lead attaches cleanly
+    // during cold start, then the teammate's lazy attach fails.
+    let fail_next = Arc::new(AtomicBool::new(false));
+    let factory_fail_next = Arc::clone(&fail_next);
+    let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
+        let should_fail = factory_fail_next.swap(false, Ordering::SeqCst);
+        async move {
+            if should_fail {
+                return Err(AgentError::internal("simulated teammate lazy attach failure"));
+            }
+            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
+                mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
+            )))
+        }
+        .boxed()
+    });
+    let (svc, team_repo, _task_manager, recorder) = setup_with_factory_and_recording_broadcaster(factory);
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Lazy failure preserves unread".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let lead = created.assistants.iter().find(|a| a.role == "lead").unwrap().clone();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|a| a.role == "teammate")
+        .unwrap()
+        .clone();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    // Arm the failure and deliver to the dormant teammate (human-direct).
+    fail_next.store(true, Ordering::SeqCst);
+    svc.send_message_to_agent("user1", &created.id, &worker.slot_id, "please do X", None)
+        .await
+        .expect("human delivery acks immediately even though the lazy attach will fail");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let failed = recorder
+                .events_by_name("team.agentRuntimeStatusChanged")
+                .iter()
+                .any(|event| {
+                    event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(worker.slot_id.as_str())
+                        && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+                });
+            if failed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("failed lazy attach must broadcast a failed runtime status for the teammate");
+
+    // Preserve-unread (spec 5.4b): the delivered message must remain unread so a
+    // retry re-drains it via reconcile_mailbox.
+    let worker_unread = team_repo.peek_unread(&created.id, &worker.slot_id).await.unwrap();
+    assert!(
+        worker_unread.iter().any(|message| message.content == "please do X"),
+        "a failed lazy attach must not mark the pending delivery read"
+    );
+
+    // Human-direct failure must NOT wake the leader (spec 5.4c): the failure is
+    // surfaced inline to the user instead.
+    let lead_unread = team_repo.peek_unread(&created.id, &lead.slot_id).await.unwrap();
+    assert!(
+        !lead_unread
+            .iter()
+            .any(|message| message.from_agent_id == worker.slot_id),
+        "a human-direct lazy attach failure must not notify the leader"
+    );
+}
