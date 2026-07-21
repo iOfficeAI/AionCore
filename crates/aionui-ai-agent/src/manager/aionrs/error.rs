@@ -32,13 +32,75 @@ pub(super) fn aionrs_engine_error_to_send_error(error: &AionrsAgentError) -> Age
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AionrsRuntimeErrorSummary {
+    pub(super) kind: &'static str,
+    pub(super) provider_error_class: Option<&'static str>,
+    pub(super) http_status: Option<u16>,
+    pub(super) failure_count: Option<usize>,
+    pub(super) failure_limit: Option<usize>,
+}
+
+impl AionrsRuntimeErrorSummary {
+    fn new(kind: &'static str, provider_error_class: Option<&'static str>) -> Self {
+        Self {
+            kind,
+            provider_error_class,
+            http_status: None,
+            failure_count: None,
+            failure_limit: None,
+        }
+    }
+}
+
+pub(super) fn aionrs_runtime_error_summary(error: &AionrsAgentError) -> AionrsRuntimeErrorSummary {
+    match error {
+        AionrsAgentError::Provider(ProviderError::Api { status, .. }) => AionrsRuntimeErrorSummary {
+            http_status: Some(*status),
+            ..AionrsRuntimeErrorSummary::new("provider", Some("http_status"))
+        },
+        AionrsAgentError::Provider(ProviderError::Connection(_) | ProviderError::Http(_)) => {
+            AionrsRuntimeErrorSummary::new("provider", Some("network"))
+        }
+        AionrsAgentError::Provider(ProviderError::RateLimited { .. }) => AionrsRuntimeErrorSummary {
+            http_status: Some(429),
+            ..AionrsRuntimeErrorSummary::new("provider", Some("rate_limited"))
+        },
+        AionrsAgentError::Provider(ProviderError::PromptTooLong(_)) => {
+            AionrsRuntimeErrorSummary::new("provider", Some("context_too_large"))
+        }
+        AionrsAgentError::Provider(ProviderError::Parse(_)) => {
+            AionrsRuntimeErrorSummary::new("provider", Some("parse"))
+        }
+        AionrsAgentError::ToolCallFailures { count, limit } => AionrsRuntimeErrorSummary {
+            kind: "tool_call_failures",
+            provider_error_class: None,
+            http_status: None,
+            failure_count: Some(*count),
+            failure_limit: Some(*limit),
+        },
+        AionrsAgentError::ToolCallMalformed { count, limit } => AionrsRuntimeErrorSummary {
+            kind: "tool_call_malformed",
+            provider_error_class: None,
+            http_status: None,
+            failure_count: Some(*count),
+            failure_limit: Some(*limit),
+        },
+        AionrsAgentError::ContextTooLong { .. } => {
+            AionrsRuntimeErrorSummary::new("context_too_large", Some("context_too_large"))
+        }
+        AionrsAgentError::ApiError(_) => AionrsRuntimeErrorSummary::new("api_error", None),
+        AionrsAgentError::UserAborted => AionrsRuntimeErrorSummary::new("user_aborted", None),
+    }
+}
+
 fn aionrs_provider_error_to_send_error(error: &ProviderError, detail: String) -> AgentSendError {
     match error {
         ProviderError::Api { status, .. } => aionrs_provider_status_to_send_error(*status, detail),
-        ProviderError::RateLimited { .. } => provider_send_error(
+        ProviderError::RateLimited { body, .. } => provider_send_error(
             "The model provider rate limited the request",
             AgentErrorCode::UserLlmProviderRateLimited,
-            detail,
+            append_provider_body(detail, body.as_deref()),
             true,
             AgentErrorResolutionKind::Retry,
             None,
@@ -181,6 +243,19 @@ fn unknown_upstream_send_error(detail: String) -> AgentSendError {
     )
 }
 
+/// Append the raw upstream response body (if any) to the detail string so
+/// the UI's technical-details drawer surfaces provider-specific hints such
+/// as `insufficient_quota`, `payment_required`, or per-endpoint rate-limit
+/// notes. The body is passed through the existing `sanitize_error_detail`
+/// pipeline downstream (redaction + truncation), so no extra scrubbing is
+/// needed here.
+fn append_provider_body(detail: String, body: Option<&str>) -> String {
+    match body.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(body) => format!("{detail}\nProvider response: {body}"),
+        None => detail,
+    }
+}
+
 fn tool_call_failure_send_error(detail: String) -> AgentSendError {
     AgentSendError::new(
         "The upstream Agent repeatedly failed while executing tool calls",
@@ -194,126 +269,5 @@ fn tool_call_failure_send_error(detail: String) -> AgentSendError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn aionrs_structured_malformed_tool_call_error_is_provider_error() {
-        let error = AionrsAgentError::ToolCallMalformed { count: 3, limit: 3 };
-        let send_error = aionrs_engine_error_to_send_error(&error);
-
-        assert_eq!(
-            send_error.code(),
-            Some(aionui_api_types::AgentErrorCode::UserLlmProviderInvalidRequest)
-        );
-        assert_eq!(
-            send_error.ownership(),
-            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
-        );
-        assert_eq!(send_error.stream_error().retryable, Some(false));
-    }
-
-    #[test]
-    fn aionrs_provider_connection_error_is_user_llm_provider_error() {
-        let error = AionrsAgentError::Provider(ProviderError::Connection(
-            "Signable request error: failed to create canonical request".to_owned(),
-        ));
-        let send_error = aionrs_engine_error_to_send_error(&error);
-
-        assert_eq!(
-            send_error.code(),
-            Some(aionui_api_types::AgentErrorCode::UserLlmProviderNetworkError)
-        );
-        assert_eq!(
-            send_error.ownership(),
-            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
-        );
-        assert_eq!(send_error.stream_error().retryable, Some(true));
-    }
-
-    #[test]
-    fn aionrs_api_connection_error_is_user_llm_provider_network_error() {
-        let error = AionrsAgentError::Provider(ProviderError::Connection("error decoding response body".to_owned()));
-        let send_error = aionrs_engine_error_to_send_error(&error);
-
-        assert_eq!(
-            send_error.code(),
-            Some(aionui_api_types::AgentErrorCode::UserLlmProviderNetworkError)
-        );
-        assert_eq!(
-            send_error.ownership(),
-            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
-        );
-        assert_eq!(send_error.stream_error().retryable, Some(true));
-    }
-
-    #[test]
-    fn aionrs_provider_status_error_uses_status_instead_of_message_text() {
-        let error = AionrsAgentError::Provider(ProviderError::Api {
-            status: 401,
-            message: "credentials failed".to_owned(),
-        });
-        let send_error = aionrs_engine_error_to_send_error(&error);
-
-        assert_eq!(
-            send_error.code(),
-            Some(aionui_api_types::AgentErrorCode::UserLlmProviderAuthFailed)
-        );
-        assert_eq!(
-            send_error.ownership(),
-            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
-        );
-        assert_eq!(send_error.stream_error().retryable, Some(false));
-    }
-
-    #[test]
-    fn aionrs_context_too_long_is_provider_context_error() {
-        let error = AionrsAgentError::ContextTooLong {
-            input_tokens: 120_000,
-            limit: 100_000,
-        };
-        let send_error = aionrs_engine_error_to_send_error(&error);
-
-        assert_eq!(
-            send_error.code(),
-            Some(aionui_api_types::AgentErrorCode::UserLlmProviderContextTooLarge)
-        );
-        assert_eq!(
-            send_error.ownership(),
-            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
-        );
-        assert_eq!(send_error.stream_error().retryable, Some(false));
-    }
-
-    #[test]
-    fn aionrs_repeated_malformed_tool_call_is_user_llm_provider_error() {
-        let error = AionrsAgentError::ToolCallMalformed { count: 3, limit: 3 };
-        let send_error = aionrs_engine_error_to_send_error(&error);
-
-        assert_eq!(
-            send_error.code(),
-            Some(aionui_api_types::AgentErrorCode::UserLlmProviderInvalidRequest)
-        );
-        assert_eq!(
-            send_error.ownership(),
-            Some(aionui_api_types::AgentErrorOwnership::UserLlmProvider)
-        );
-        assert_eq!(send_error.stream_error().retryable, Some(false));
-    }
-
-    #[test]
-    fn aionrs_tool_call_failures_are_unknown_upstream_error() {
-        let error = AionrsAgentError::ToolCallFailures { count: 3, limit: 3 };
-        let send_error = aionrs_engine_error_to_send_error(&error);
-
-        assert_eq!(
-            send_error.code(),
-            Some(aionui_api_types::AgentErrorCode::UnknownUpstreamError)
-        );
-        assert_eq!(
-            send_error.ownership(),
-            Some(aionui_api_types::AgentErrorOwnership::UnknownUpstream)
-        );
-        assert_eq!(send_error.stream_error().retryable, Some(true));
-    }
-}
+#[path = "error_test.rs"]
+mod error_test;

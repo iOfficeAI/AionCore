@@ -1,268 +1,99 @@
 # Default: list available recipes
+set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+
+cargo_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/cargo.ps1" } else { "bash scripts/just/cargo.sh" }
+build_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/build.ps1" } else { "bash scripts/just/build.sh" }
+install_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/install.ps1" } else { "bash scripts/just/install.sh" }
+migration_check_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/migration/check-immutability.ps1" } else { "bash scripts/migration/check-immutability.sh" }
+migration_check_test_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/migration/check-immutability.test.ps1" } else { "bash scripts/migration/check-immutability.test.sh" }
+auto_commit_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/auto-commit-fixes.ps1" } else { "bash scripts/just/auto-commit-fixes.sh" }
+update_aionrs_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/update-aionrs.ps1" } else { "bash scripts/just/update-aionrs.sh" }
+cat_config_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/cat-config.ps1" } else { "bash scripts/just/cat-config.sh" }
+
 default:
     @just --list
 
 # Enable pre-commit hooks (run once after clone)
 setup:
     git config core.hooksPath .githooks
-    @echo "✅ Git hooks enabled"
+    @echo "Git hooks enabled"
 
 # Run cargo with optional local aionrs SDK patches.
 _cargo *ARGS:
-    #!/usr/bin/env bash
-    set -euo pipefail
+    @{{cargo_script}} {{ARGS}}
 
-    restore_cargo_lock=false
-    cargo_lock_snapshot=""
-    cargo_config_file=".cargo/config.toml"
-    cargo_config_snapshot=""
-    cargo_config_created=false
-    aionrs_root=""
-
-    restore_local_state() {
-        local status=$?
-
-        if [[ -n "$cargo_lock_snapshot" && -f "$cargo_lock_snapshot" ]]; then
-            if [[ "$restore_cargo_lock" == "true" || "$status" -ne 0 ]]; then
-                cp "$cargo_lock_snapshot" Cargo.lock || status=$?
-            fi
-        fi
-        if [[ -n "$cargo_lock_snapshot" ]]; then
-            rm -f "$cargo_lock_snapshot"
-        fi
-
-        if [[ -n "$cargo_config_snapshot" && -f "$cargo_config_snapshot" ]]; then
-            cp "$cargo_config_snapshot" "$cargo_config_file" || status=$?
-            rm -f "$cargo_config_snapshot"
-        elif [[ "$cargo_config_created" == "true" ]]; then
-            rm -f "$cargo_config_file"
-            rmdir .cargo 2>/dev/null || true
-        fi
-
-        return "$status"
-    }
-    trap restore_local_state EXIT
-
-    verify_local_aionrs_patch() {
-        local crate expected_path pkgid
-        for crate in "${crates[@]}"; do
-            expected_path="$aionrs_root/crates/$crate"
-            pkgid=$(cargo pkgid -p "$crate")
-
-            if ! python3 -c 'import sys; from pathlib import Path; from urllib.parse import unquote, urlparse; pkgid=sys.argv[1]; expected=str(Path(sys.argv[2]).resolve()); ok=pkgid.startswith("path+file://") and str(Path(unquote(urlparse(pkgid[len("path+"):]).path)).resolve()) == expected; sys.exit(0 if ok else 1)' "$pkgid" "$expected_path"
-            then
-                echo "AIONRS patch was not used for $crate." >&2
-                echo "  resolved: $pkgid" >&2
-                echo "  expected: $expected_path" >&2
-                exit 1
-            fi
-        done
-    }
-
-    if [[ -n "${AIONRS:-}" ]]; then
-        if [[ ! -d "$AIONRS" ]]; then
-            echo "AIONRS does not exist or is not a directory: $AIONRS" >&2
-            exit 1
-        fi
-
-        aionrs_root=$(cd "$AIONRS" && pwd -P)
-        crates=(
-            aion-agent
-            aion-compact
-            aion-config
-            aion-mcp
-            aion-memory
-            aion-process
-            aion-protocol
-            aion-providers
-            aion-skills
-            aion-tools
-            aion-types
-        )
-
-        patch_config=$(mktemp)
-        {
-            echo
-            echo "[patch.'https://github.com/iOfficeAI/aionrs.git']"
-        } > "$patch_config"
-
-        for crate in "${crates[@]}"; do
-            crate_dir="$aionrs_root/crates/$crate"
-            if [[ ! -f "$crate_dir/Cargo.toml" ]]; then
-                echo "AIONRS is missing $crate: $crate_dir/Cargo.toml" >&2
-                exit 1
-            fi
-
-            toml_path=${crate_dir//\\/\\\\}
-            toml_path=${toml_path//\"/\\\"}
-            echo "$crate = { path = \"$toml_path\" }" >> "$patch_config"
-        done
-
-        mkdir -p .cargo
-        if [[ -f "$cargo_config_file" ]]; then
-            cargo_config_snapshot=$(mktemp)
-            cp "$cargo_config_file" "$cargo_config_snapshot"
-        else
-            cargo_config_created=true
-        fi
-        cat "$patch_config" >> "$cargo_config_file"
-        rm -f "$patch_config"
-
-        echo "Using local aionrs SDK: $aionrs_root" >&2
-
-        if [[ -f Cargo.lock ]]; then
-            cargo_lock_snapshot=$(mktemp)
-            cp Cargo.lock "$cargo_lock_snapshot"
-
-            if git diff --quiet -- Cargo.lock && git diff --cached --quiet -- Cargo.lock; then
-                restore_cargo_lock=true
-            else
-                echo "Cargo.lock already has changes; leaving successful AIONRS lockfile updates in place." >&2
-            fi
-        fi
-
-        echo "Resolving Cargo.lock against local aionrs SDK" >&2
-        update_args=()
-        for crate in "${crates[@]}"; do
-            update_args+=(-p "$crate")
-        done
-        cargo update "${update_args[@]}"
-        verify_local_aionrs_patch
-    fi
-
-    args=({{ARGS}})
-
-    set +e
-    cargo "${args[@]}"
-    status=$?
-    set -e
-    exit "$status"
-
-# Build in release mode and install to ~/.cargo/bin
+# Build in release mode and install to cargo bin
 # Use `just build --force` to skip cache check
 build *FLAGS: lint-fix fmt
-    #!/usr/bin/env bash
-    set -euo pipefail
-    just _cargo build --release
-    new_sum=$(shasum -a 256 target/release/aioncore | cut -d' ' -f1)
-    force=false
-    for flag in {{FLAGS}}; do
-        if [[ "$flag" == "--force" || "$flag" == "-f" ]]; then
-            force=true
-        fi
-    done
-    old_sum=""
-    if [[ -f target/.build-sum ]] && [[ "$force" == "false" ]]; then
-        old_sum=$(cat target/.build-sum)
-    fi
-    if [[ "$new_sum" == "$old_sum" ]]; then
-        echo -e "\n⏭️  Binary unchanged — skipping install (sha256: ${new_sum:0:16}…)"
-    else
-        cp target/release/aioncore ~/.cargo/bin/
-        codesign --force --sign - ~/.cargo/bin/aioncore
-        echo "$new_sum" > target/.build-sum
-        echo -e "\n✅ Build complete — sha256: ${new_sum:0:16}…"
-    fi
+    @{{build_script}} release {{FLAGS}}
 
 # Build in debug mode
 # Use `just build-debug --force` to skip cache check
 build-debug *FLAGS:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    just _cargo build
-    new_sum=$(shasum -a 256 target/debug/aioncore | cut -d' ' -f1)
-    force=false
-    for flag in {{FLAGS}}; do
-        if [[ "$flag" == "--force" || "$flag" == "-f" ]]; then
-            force=true
-        fi
-    done
-    old_sum=""
-    if [[ -f target/.build-debug-sum ]] && [[ "$force" == "false" ]]; then
-        old_sum=$(cat target/.build-debug-sum)
-    fi
-    if [[ "$new_sum" == "$old_sum" ]]; then
-        echo -e "\n⏭️  Debug binary unchanged (sha256: ${new_sum:0:16}…)"
-    else
-        echo "$new_sum" > target/.build-debug-sum
-        echo -e "\n✅ Debug build complete — sha256: ${new_sum:0:16}…"
-    fi
+    @{{build_script}} debug {{FLAGS}}
 
 install:
-    cp target/release/aioncore ~/.cargo/bin/
-    codesign --force --sign - ~/.cargo/bin/aioncore
+    @{{install_script}} release
 
 # Run all tests
 test:
-    just _cargo nextest run --workspace
+    @just _cargo nextest run --workspace
 
 # Ensure already-shipped database migrations stay immutable
 migration-check:
-    scripts/check-migration-immutability.sh
+    @{{migration_check_script}}
 
 # Test the migration immutability guard itself
 migration-check-test:
-    scripts/check-migration-immutability.test.sh
+    @{{migration_check_test_script}}
 
 # Lint (warnings = errors)
 lint:
-    just _cargo clippy --workspace -- -D warnings
+    @just _cargo clippy --workspace -- -D warnings
 
 lint-fix:
-    just _cargo fix --allow-dirty --allow-staged
-    just _cargo clippy --fix --workspace --allow-dirty --allow-staged -- -D warnings
+    @just _cargo fix --allow-dirty --allow-staged
+    @just _cargo clippy --fix --workspace --allow-dirty --allow-staged -- -D warnings
 
 # Format code
 fmt:
-    cargo fmt --all
+    @cargo fmt --all
 
 # Check formatting (CI)
 fmt-check:
-    cargo fmt --all -- --check
+    @cargo fmt --all -- --check
 
 # Lint + format check + migration check + test
 check: migration-check lint fmt-check test
 
 # Run the server (debug)
 run *ARGS:
-    just _cargo run --bin aioncore -- {{ARGS}}
+    @just _cargo run --bin aioncore -- {{ARGS}}
 
 # Run the server (release)
 run-release *ARGS:
-    just _cargo run --release --bin aioncore -- {{ARGS}}
+    @just _cargo run --release --bin aioncore -- {{ARGS}}
 
 # Pre-push gate: migration check, format, lint, auto-commit fixes, test, then push
 push *ARGS: migration-check lint-fix fmt _auto-commit-fixes test
-    git push {{ ARGS }}
+    git push {{ARGS}}
 
 # Auto-commit any formatting/lint fixes if there are changes
 _auto-commit-fixes:
-    #!/usr/bin/env bash
-    if [ -n "$(git diff --name-only)" ]; then
-        git add -A
-        git commit -m "chore: apply auto-fixes (fmt + clippy)"
-    fi
+    @{{auto_commit_script}}
 
 # Update aionrs dependency (e.g. just update-aionrs or just update-aionrs v0.1.19)
 update-aionrs *TAG:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    tag="{{ TAG }}"
-    if [ -z "$tag" ]; then
-        tag=$(git ls-remote --tags https://github.com/iOfficeAI/aionrs.git | awk -F/ '{print $NF}' | grep -v '\\^{}' | sort -V | tail -1)
-        echo "Using latest tag: $tag"
-    fi
-    sed -i '' "s|git = \"https://github.com/iOfficeAI/aionrs.git\", tag = \"[^\"]*\"|git = \"https://github.com/iOfficeAI/aionrs.git\", tag = \"$tag\"|g" Cargo.toml
-    cargo check --workspace
+    @{{update_aionrs_script}} {{TAG}}
 
 # Security audit
 audit:
-    cargo audit
+    @cargo audit
 
 # Clean build artifacts
 clean:
-    cargo clean
+    @cargo clean
 
-# Decode dev config and copy to clipboard
+# Decode dev config and copy to clipboard when possible
 cat-config:
-    @base64 -D -i ~/.aionui-config-dev/aionui-config.txt | python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read()))' | pbcopy
+    @{{cat_config_script}}

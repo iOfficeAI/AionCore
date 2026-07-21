@@ -5,7 +5,7 @@ use std::sync::Arc;
 use aionui_api_types::WebSocketMessage;
 use aionui_realtime::EventBroadcaster;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
-use aionui_team::{Mailbox, TaskBoard, TeamAgent, TeamMcpServer, TeammateManager, TeammateRole};
+use aionui_team::{Mailbox, TaskBoard, TeamAgent, TeamMcpServer, TeamPromptDumpConfig, TeammateManager, TeammateRole};
 use common::MockTeamRepo;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -23,10 +23,6 @@ impl RecordingBroadcaster {
         Self {
             events: std::sync::Mutex::new(vec![]),
         }
-    }
-
-    fn events(&self) -> Vec<WebSocketMessage<Value>> {
-        self.events.lock().unwrap().clone()
     }
 }
 
@@ -49,7 +45,7 @@ fn make_agents() -> Vec<TeamAgent> {
             conversation_id: "conv-lead".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            assistant_id: None,
+            assistant_id: Some("lead-assistant".into()),
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -61,7 +57,7 @@ fn make_agents() -> Vec<TeamAgent> {
             conversation_id: "conv-worker".into(),
             backend: "acp".into(),
             model: "claude".into(),
-            assistant_id: None,
+            assistant_id: Some("worker-assistant".into()),
             status: None,
             conversation_type: None,
             cli_path: None,
@@ -72,10 +68,13 @@ fn make_agents() -> Vec<TeamAgent> {
 struct TestEnv {
     server: TeamMcpServer,
     _repo: Arc<MockTeamRepo>,
-    broadcaster: Arc<RecordingBroadcaster>,
 }
 
 async fn setup() -> TestEnv {
+    setup_with_prompt_dump(None).await
+}
+
+async fn setup_with_prompt_dump(prompt_dump: Option<TeamPromptDumpConfig>) -> TestEnv {
     let repo = Arc::new(MockTeamRepo::new());
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo.clone()));
@@ -94,21 +93,18 @@ async fn setup() -> TestEnv {
     // the Weak cannot upgrade, so `team_spawn_agent` will surface the
     // service-unavailable error. Non-spawn tools still exercise scheduler
     // flows directly and do not hit this path.
-    let server = TeamMcpServer::start(
+    let server = TeamMcpServer::start_with_prompt_dump(
         "test-token-123".into(),
         scheduler,
         "team-1".into(),
         broadcaster,
         std::sync::Weak::new(),
+        prompt_dump,
     )
     .await
     .unwrap();
 
-    TestEnv {
-        server,
-        _repo: repo,
-        broadcaster: recorder,
-    }
+    TestEnv { server, _repo: repo }
 }
 
 async fn connect_and_init(port: u16, token: &str, slot_id: &str) -> TcpStream {
@@ -206,6 +202,34 @@ fn is_error_response(resp: &Value) -> bool {
     resp["result"]["isError"].as_bool().unwrap_or(false)
 }
 
+async fn create_task(stream: &mut TcpStream, id: u64, subject: &str, owner: Option<&str>) -> String {
+    let mut args = json!({ "subject": subject });
+    if let Some(owner) = owner {
+        args["owner"] = json!(owner);
+    }
+    let resp = call_tool(stream, id, "team_task_create", args).await;
+    assert!(!is_error_response(&resp), "team_task_create failed: {resp}");
+    let payload: Value = serde_json::from_str(&extract_text(&resp)).unwrap();
+    payload["task"]["task_id"].as_str().unwrap().to_owned()
+}
+
+async fn update_task_status(stream: &mut TcpStream, id: u64, task_id: &str, status: &str) {
+    let resp = call_tool(
+        stream,
+        id,
+        "team_task_update",
+        json!({ "task_id": task_id, "status": status }),
+    )
+    .await;
+    assert!(!is_error_response(&resp), "team_task_update failed: {resp}");
+}
+
+async fn list_tasks_with_args(stream: &mut TcpStream, id: u64, args: Value) -> Vec<Value> {
+    let resp = call_tool(stream, id, "team_task_list", args).await;
+    assert!(!is_error_response(&resp), "team_task_list failed: {resp}");
+    serde_json::from_str(&extract_text(&resp)).unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // Tests: Connection & Authentication (MC-1, MC-2, MC-3)
 // ---------------------------------------------------------------------------
@@ -223,7 +247,9 @@ async fn mc1_correct_token_connects() {
     send_request(&mut stream, &req).await;
     let resp = read_response(&mut stream).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 10);
+    let names: Vec<&str> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
+    assert!(!names.contains(&"team_list_models"));
 
     env.server.stop();
 }
@@ -283,12 +309,12 @@ async fn mc3_no_token_rejected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tools_list_returns_all_11_tools() {
+async fn tools_list_returns_all_10_tools() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
     let names = list_tools(&mut stream, 10).await;
-    assert_eq!(names.len(), 11);
+    assert_eq!(names.len(), 10);
 
     assert!(names.contains(&"team_send_message".to_owned()));
     assert!(names.contains(&"team_spawn_agent".to_owned()));
@@ -299,8 +325,8 @@ async fn tools_list_returns_all_11_tools() {
     assert!(names.contains(&"team_rename_agent".to_owned()));
     assert!(names.contains(&"team_shutdown_agent".to_owned()));
     assert!(names.contains(&"team_list_assistants".to_owned()));
-    assert!(names.contains(&"team_list_models".to_owned()));
     assert!(names.contains(&"team_describe_assistant".to_owned()));
+    assert!(!names.contains(&"team_list_models".to_owned()));
 
     env.server.stop();
 }
@@ -321,8 +347,8 @@ async fn mcp_tools_list_filters_lead_only_tools() {
     assert!(names.contains(&"team_task_list".to_owned()));
     assert!(names.contains(&"team_members".to_owned()));
     assert!(names.contains(&"team_list_assistants".to_owned()));
-    assert!(names.contains(&"team_list_models".to_owned()));
     assert!(names.contains(&"team_describe_assistant".to_owned()));
+    assert!(!names.contains(&"team_list_models".to_owned()));
 
     env.server.stop();
 }
@@ -386,7 +412,27 @@ async fn ts3_send_message_to_nonexistent_agent() {
 
     assert!(is_error_response(&resp));
     let text = extract_text(&resp);
-    assert!(text.contains("No agent matches 'nonexistent'"));
+    assert!(text.contains("expected slot_id or \"*\""), "unexpected error: {text}");
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn team_send_message_rejects_display_name_target() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+
+    let resp = call_tool(
+        &mut stream,
+        2,
+        "team_send_message",
+        json!({"to": "Worker", "message": "Hello by name"}),
+    )
+    .await;
+
+    assert!(is_error_response(&resp));
+    let text = extract_text(&resp);
+    assert!(text.contains("expected slot_id or \"*\""), "unexpected error: {text}");
 
     env.server.stop();
 }
@@ -427,7 +473,10 @@ async fn team_send_message_shutdown_rejected_intercepted() {
 
     assert!(!is_error_response(&resp));
     let text = extract_text(&resp);
-    assert_eq!(text, "shutdown_rejected: still finishing task");
+    let payload: Value = serde_json::from_str(&text).expect("shutdown_rejected response must be JSON");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["action"], "shutdown_rejected");
+    assert_eq!(payload["reason"], "still finishing task");
 
     env.server.stop();
 }
@@ -472,7 +521,7 @@ async fn sp1_lead_spawn_requires_live_session_service() {
         &mut stream,
         2,
         "team_spawn_agent",
-        json!({"name": "Helper", "role": "worker", "assistant_id": "word-creator"}),
+        json!({"name": "Helper", "assistant_id": "word-creator"}),
     )
     .await;
 
@@ -548,7 +597,10 @@ async fn ttc1_create_basic_task() {
 
     assert!(!is_error_response(&resp));
     let text = extract_text(&resp);
-    assert!(text.contains("Implement feature X"));
+    let payload: Value = serde_json::from_str(&text).expect("team_task_create must return JSON");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["task"]["subject"], "Implement feature X");
+    assert!(payload["task"]["task_id"].as_str().is_some());
 
     env.server.stop();
 }
@@ -573,6 +625,10 @@ async fn ttc2_create_task_with_dependency() {
     .await;
 
     assert!(!is_error_response(&resp));
+    let text = extract_text(&resp);
+    let payload: Value = serde_json::from_str(&text).expect("team_task_create must return JSON");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["task"]["subject"], "Task B");
 
     let list_resp2 = call_tool(&mut stream, 5, "team_task_list", json!({})).await;
     let tasks2: Vec<Value> = serde_json::from_str(&extract_text(&list_resp2)).unwrap();
@@ -616,6 +672,137 @@ async fn ttl1_task_list_after_create() {
     env.server.stop();
 }
 
+#[tokio::test]
+async fn ttl3_task_list_empty_args_still_returns_full_board() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+    let keep_id = create_task(&mut stream, 2, "Keep", Some("worker-1")).await;
+    let deleted_id = create_task(&mut stream, 3, "Deleted", Some("worker-2")).await;
+    update_task_status(&mut stream, 4, &deleted_id, "deleted").await;
+
+    let tasks = list_tasks_with_args(&mut stream, 5, json!({})).await;
+    assert_eq!(tasks.len(), 2);
+    assert!(tasks.iter().any(|task| task["id"] == keep_id));
+    assert!(tasks.iter().any(|task| task["id"] == deleted_id));
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn ttl4_task_list_filters_owner_status_include_deleted_and_limit() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+    let worker_pending = create_task(&mut stream, 2, "Worker pending", Some("worker-1")).await;
+    let lead_pending = create_task(&mut stream, 3, "Lead pending", Some("lead-1")).await;
+    let worker_progress = create_task(&mut stream, 4, "Worker progress", Some("worker-1")).await;
+    let deleted = create_task(&mut stream, 5, "Deleted", Some("worker-1")).await;
+    update_task_status(&mut stream, 6, &worker_progress, "in_progress").await;
+    update_task_status(&mut stream, 7, &deleted, "deleted").await;
+
+    let owner_tasks = list_tasks_with_args(&mut stream, 8, json!({"owner": "worker-1"})).await;
+    assert_eq!(owner_tasks.len(), 3);
+    assert!(owner_tasks.iter().all(|task| task["owner"] == "worker-1"));
+
+    let pending_tasks = list_tasks_with_args(&mut stream, 9, json!({"status": "pending"})).await;
+    assert_eq!(pending_tasks.len(), 2);
+    assert!(pending_tasks.iter().all(|task| task["status"] == "pending"));
+
+    let active_tasks = list_tasks_with_args(&mut stream, 10, json!({"status": ["pending", "in_progress"]})).await;
+    assert_eq!(active_tasks.len(), 3);
+    assert!(active_tasks.iter().any(|task| task["id"] == worker_progress));
+    assert!(!active_tasks.iter().any(|task| task["id"] == deleted));
+
+    let no_deleted = list_tasks_with_args(&mut stream, 11, json!({"include_deleted": false})).await;
+    assert_eq!(no_deleted.len(), 3);
+    assert!(!no_deleted.iter().any(|task| task["id"] == deleted));
+
+    let status_with_deleted_flag =
+        list_tasks_with_args(&mut stream, 12, json!({"status": "pending", "include_deleted": true})).await;
+    assert_eq!(status_with_deleted_flag.len(), 2);
+    assert!(status_with_deleted_flag.iter().all(|task| task["status"] == "pending"));
+    assert!(!status_with_deleted_flag.iter().any(|task| task["id"] == deleted));
+
+    let limited = list_tasks_with_args(&mut stream, 13, json!({"owner": "worker-1", "limit": 1})).await;
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0]["id"], worker_pending);
+    assert_ne!(limited[0]["id"], lead_pending);
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn ttl5_task_list_clamps_large_limit_after_filtering() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+    for index in 0..205 {
+        create_task(&mut stream, 2 + index, &format!("Task {index}"), Some("worker-1")).await;
+    }
+
+    let tasks = list_tasks_with_args(&mut stream, 300, json!({"limit": 10000})).await;
+    assert_eq!(tasks.len(), 200);
+    assert_eq!(tasks[0]["subject"], "Task 0");
+    assert_eq!(tasks[199]["subject"], "Task 199");
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn ttl6_task_list_rejects_invalid_filter_arguments() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+
+    for (id, args, expected) in [
+        (2, json!({"slot_id": "worker-1"}), "Invalid params"),
+        (3, json!({"status": "blocked"}), "Invalid params"),
+        (4, json!({"status": []}), "Invalid params"),
+        (5, json!({"limit": 0}), "Invalid params"),
+    ] {
+        let resp = call_tool(&mut stream, id, "team_task_list", args).await;
+        assert!(is_error_response(&resp), "expected error response: {resp}");
+        assert!(extract_text(&resp).contains(expected));
+    }
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn tools_list_dumps_team_tool_schema_when_enabled() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let dump_config = TeamPromptDumpConfig::enabled(temp.path());
+    let env = setup_with_prompt_dump(Some(dump_config)).await;
+
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+    send_request(
+        &mut stream,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/list"
+        }),
+    )
+    .await;
+    let response = read_response(&mut stream).await;
+    assert!(response["result"]["tools"].as_array().unwrap().len() > 1);
+
+    let dumps: Vec<_> = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(dumps.len(), 1);
+    let dump: Value = serde_json::from_str(&std::fs::read_to_string(&dumps[0]).unwrap()).unwrap();
+    assert_eq!(dump["kind"], "team-tools-list");
+    assert_eq!(dump["scope"], "team-mcp-server-tools-only");
+    assert_eq!(dump["not_final_agent_tools"], true);
+    assert_eq!(dump["team_id"], "team-1");
+    assert_eq!(dump["caller_slot_id"], "lead-1");
+    assert_eq!(dump["caller_role"], "lead");
+    assert!(dump["tools"].as_array().unwrap().iter().any(|tool| {
+        tool["name"] == "team_spawn_agent" && tool["inputSchema"]["properties"]["assistant_id"].is_object()
+    }));
+
+    env.server.stop();
+}
+
 // ---------------------------------------------------------------------------
 // Tests: team_task_update (TTU-1, TTU-2, TTU-3)
 // ---------------------------------------------------------------------------
@@ -640,6 +827,11 @@ async fn ttu1_update_task_status() {
     .await;
 
     assert!(!is_error_response(&resp));
+    let text = extract_text(&resp);
+    let payload: Value = serde_json::from_str(&text).expect("team_task_update must return JSON");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["task"]["task_id"], task_id);
+    assert_eq!(payload["task"]["status"], "completed");
 
     let list_resp2 = call_tool(&mut stream, 5, "team_task_list", json!({})).await;
     let tasks2: Vec<Value> = serde_json::from_str(&extract_text(&list_resp2)).unwrap();
@@ -682,9 +874,16 @@ async fn tm1_list_all_members() {
     let members: Vec<Value> = serde_json::from_str(&text).unwrap();
     assert_eq!(members.len(), 2);
 
-    let names: Vec<&str> = members.iter().map(|m| m["name"].as_str().unwrap()).collect();
-    assert!(names.contains(&"Leader"));
-    assert!(names.contains(&"Worker"));
+    assert_eq!(members[0]["name"], "Leader");
+    assert_eq!(members[0]["role"], "lead");
+    assert_eq!(members[0]["assistant_id"], "lead-assistant");
+    assert_eq!(members[0]["model"], "claude");
+    assert!(members[0].get("conversation_id").is_none());
+    assert_eq!(members[1]["name"], "Worker");
+    assert_eq!(members[1]["role"], "teammate");
+    assert_eq!(members[1]["assistant_id"], "worker-assistant");
+    assert_eq!(members[1]["model"], "claude");
+    assert!(members[1].get("conversation_id").is_none());
 
     // Regression: cold-start agents (including the lead before its first
     // wake) must report an explicit `idle` status — never `null` — so MCP
@@ -720,7 +919,31 @@ async fn tra1_rename_existing_agent() {
 
     assert!(!is_error_response(&resp));
     let text = extract_text(&resp);
-    assert!(text.contains("renamed"));
+    let payload: Value = serde_json::from_str(&text).expect("team_rename_agent must return JSON");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["action"], "agent_renamed");
+    assert_eq!(payload["agent"]["slot_id"], "worker-1");
+    assert_eq!(payload["agent"]["name"], "Senior Worker");
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn team_rename_agent_rejects_display_name_target() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+
+    let resp = call_tool(
+        &mut stream,
+        2,
+        "team_rename_agent",
+        json!({"slot_id": "Worker", "new_name": "Senior Worker"}),
+    )
+    .await;
+
+    assert!(is_error_response(&resp));
+    let text = extract_text(&resp);
+    assert!(text.contains("expected slot_id"), "unexpected error: {text}");
 
     env.server.stop();
 }
@@ -1057,39 +1280,6 @@ async fn sb3_different_agents_get_different_slot_ids() {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: mcpStatus broadcast (W5-D31b-1)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn mcp_status_tcp_ready_is_broadcast_on_successful_bind() {
-    use aionui_api_types::{TeamMcpPhase, TeamMcpStatusPayload};
-
-    let env = setup().await;
-    let port = env.server.port();
-
-    let events = env.broadcaster.events();
-    let status_events: Vec<_> = events.iter().filter(|e| e.name == "team.mcpStatus").collect();
-    assert_eq!(
-        status_events.len(),
-        1,
-        "expected exactly one team.mcpStatus event after bind, got {}",
-        status_events.len()
-    );
-
-    let payload: TeamMcpStatusPayload = serde_json::from_value(status_events[0].data.clone()).unwrap();
-    assert_eq!(payload.team_id, "team-1");
-    assert_eq!(payload.slot_id, "");
-    assert!(matches!(payload.phase, TeamMcpPhase::TcpReady));
-    assert_eq!(payload.port, Some(port));
-    assert!(payload.server_count.is_none());
-    assert!(payload.error.is_none());
-
-    env.server.stop();
-
-    env.server.stop();
-}
-
-// ---------------------------------------------------------------------------
 // Tests: W5-D30b — shutdown_rejected detection in team_send_message
 // ---------------------------------------------------------------------------
 
@@ -1108,14 +1298,10 @@ async fn tsr1_shutdown_rejected_notifies_lead_and_preserves_agent() {
 
     assert!(!is_error_response(&resp));
     let text = extract_text(&resp);
-    assert!(
-        text.contains("shutdown_rejected"),
-        "response should echo the sentinel, got: {text}"
-    );
-    assert!(
-        text.contains("still working"),
-        "response should echo the reason, got: {text}"
-    );
+    let payload: Value = serde_json::from_str(&text).expect("shutdown_rejected response must be JSON");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["action"], "shutdown_rejected");
+    assert_eq!(payload["reason"], "still working");
 
     // Leader mailbox contains the notification, worker did not receive a
     // literal copy of the sentinel.

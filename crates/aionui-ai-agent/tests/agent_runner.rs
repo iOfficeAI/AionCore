@@ -14,7 +14,7 @@ fn env(name: &str, value: &str) -> EnvVar {
 #[tokio::test]
 async fn acp_host_process_runs_through_a_named_execution_lease() {
     let data_dir = tempfile::tempdir().unwrap();
-    let process = CliAgentProcess::spawn_for_sdk(
+    let process = CliAgentProcess::spawn_for_sdk_in_data_dir(
         CommandSpec {
             command: "sh".into(),
             args: vec![
@@ -46,7 +46,7 @@ async fn acp_host_process_runs_through_a_named_execution_lease() {
 #[tokio::test]
 async fn container_agent_modes_fail_closed_when_the_selected_environment_is_incomplete() {
     let data_dir = tempfile::tempdir().unwrap();
-    let docker = match CliAgentProcess::spawn_for_sdk(
+    let docker = match CliAgentProcess::spawn_for_sdk_in_data_dir(
         CommandSpec {
             command: "agent".into(),
             args: Vec::new(),
@@ -65,7 +65,7 @@ async fn container_agent_modes_fail_closed_when_the_selected_environment_is_inco
     };
     assert!(docker.to_string().contains("container image"));
 
-    let devcontainer = match CliAgentProcess::spawn_for_sdk(
+    let devcontainer = match CliAgentProcess::spawn_for_sdk_in_data_dir(
         CommandSpec {
             command: "agent".into(),
             args: Vec::new(),
@@ -84,7 +84,7 @@ async fn container_agent_modes_fail_closed_when_the_selected_environment_is_inco
     };
     assert!(devcontainer.to_string().contains("config path"));
 
-    let devcontainer_with_host_secret = match CliAgentProcess::spawn_for_sdk(
+    let devcontainer_with_host_secret = match CliAgentProcess::spawn_for_sdk_in_data_dir(
         CommandSpec {
             command: "agent".into(),
             args: Vec::new(),

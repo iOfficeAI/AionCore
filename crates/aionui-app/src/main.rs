@@ -32,12 +32,12 @@ fn run_main() -> Result<ExitCode, MainError> {
     // mcp-* subcommands route into short-lived stdio helpers that live entirely
     // outside the main HTTP server. They share the global flags so clap can
     // parse a uniform CLI, but bypass `aionui_runtime::init` (which would
-    // anchor the bun cache under --data-dir) — these helpers don't host agents.
+    // anchor managed runtime state under --data-dir) — these helpers don't
+    // host agents.
     //
     // `doctor`, in contrast, is meant to mirror the real server's CLI
     // detection path exactly. It must hit the same `aionui_runtime::init`
-    // (so the bundled `bun` resolves through the same cache the server
-    // uses) before falling through to PATH probing.
+    // before performing managed-runtime and PATH probing.
     let needs_runtime = cli.command.as_ref().is_none_or(Command::need_runtime);
     if needs_runtime {
         aionui_runtime::set_managed_resources_mode(cli.managed_resources_mode.into());
@@ -78,6 +78,10 @@ fn runtime_init_error_for_command(command: &Option<Command>, error: std::io::Err
 async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError> {
     // MCP stdio helpers must not touch the database, logging setup, or `AppServices`.
     match cli.command {
+        Some(Command::Capabilities) => Ok(commands::run_capabilities()),
+        Some(Command::Config(args)) => Ok(commands::run_config(args).await),
+        Some(Command::Diagnose(args)) => Ok(commands::run_diagnose(args).await),
+        Some(Command::Team(args)) => Ok(commands::run_team(args).await),
         Some(Command::McpBridge) => Ok(commands::run_mcp_bridge().await),
         Some(Command::McpTeamStdio) => Ok(commands::run_team_stdio().await),
         Some(Command::Doctor) => Ok(commands::run_doctor(&cli, &merged_path).await?),

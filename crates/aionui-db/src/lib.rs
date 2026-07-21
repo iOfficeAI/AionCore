@@ -13,7 +13,8 @@ pub use agent_binding::{
     runtime_backend_for_agent,
 };
 pub use database::{
-    Database, DatabaseInitError, init_database, init_database_memory, init_database_staged, maybe_copy_legacy_database,
+    Database, DatabaseInitError, DatabaseInitOptions, init_database, init_database_memory, init_database_staged,
+    init_database_staged_with_options, init_database_with_options, maybe_copy_legacy_database,
 };
 pub use error::DbError;
 pub use models::{
@@ -36,7 +37,9 @@ pub use repository::conversation::{
     ConversationFilters, ConversationRowUpdate, MessagePageCursor, MessagePageDirection, MessagePageParams,
     MessagePageResult, MessageRowUpdate, MessageSearchRow,
 };
-pub use repository::cron::UpdateCronJobParams;
+pub use repository::cron::{
+    ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
+};
 pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::project::UpdateProjectParams;
@@ -45,20 +48,22 @@ pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentPar
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams};
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{
-    AgentWorkspaceLeaseUpdate, CreateAcpSessionParams, IAcpSessionRepository, IAgentMetadataRepository,
-    IAgentWorkspaceLeaseRepository, IApprovalRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IChannelRepository,
-    IClientPreferenceRepository, IConversationRepository, ICronRepository, IDevelopmentOperationsRepository,
-    IDevelopmentRepository, IMcpServerRepository, IOAuthTokenRepository, IProjectRepository, IProviderRepository,
-    IRemoteAgentRepository, ISettingsRepository, ISkillRepository, ITeamRepository, IUserRepository,
-    PersistedSessionState, SaveRuntimeStateParams, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
-    SqliteAgentWorkspaceLeaseRepository, SqliteApprovalRepository, SqliteAssistantDefinitionRepository,
-    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
-    SqliteAssistantRepository, SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
-    SqliteCronRepository, SqliteDevelopmentOperationsRepository, SqliteDevelopmentRepository,
+    AgentWorkspaceLeaseUpdate, CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile,
+    FeedbackDiagnosticsProfileResult, FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IAcpSessionRepository,
+    IAgentMetadataRepository, IAgentWorkspaceLeaseRepository, IApprovalRepository, IAssistantDefinitionRepository,
+    IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
+    IChannelRepository, IClientPreferenceRepository, IConversationRepository, ICronRepository,
+    IDevelopmentOperationsRepository, IDevelopmentRepository, IFeedbackDiagnosticsRepository, IMcpServerRepository,
+    IOAuthTokenRepository, IProjectRepository, IProviderRepository, IRemoteAgentRepository, ISettingsRepository,
+    ISkillRepository, ITeamRepository, IUserRepository, PersistedSessionState, SaveRuntimeStateParams,
+    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAgentWorkspaceLeaseRepository,
+    SqliteApprovalRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
+    SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
+    SqliteDevelopmentOperationsRepository, SqliteDevelopmentRepository, SqliteFeedbackDiagnosticsRepository,
     SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectRepository, SqliteProviderRepository,
     SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSkillRepository, SqliteTeamRepository,
-    SqliteUserRepository, rebuild_legacy_assistant_mirror,
+    SqliteUserRepository,
 };
 
 // Re-export sqlx pool type for downstream crates

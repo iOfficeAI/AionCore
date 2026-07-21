@@ -138,6 +138,7 @@ mod tests {
                 run_count: 0,
                 retry_count: 0,
                 max_retries: 3,
+                queue_enabled: false,
             },
         }
     }

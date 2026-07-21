@@ -1,20 +1,24 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AddAgentRequest, CreateTeamRequest, TeamAgentInput};
+use aionui_api_types::{
+    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentInput, TeamToolTransport,
+};
 use aionui_common::{AgentKillReason, AgentType, ConversationSource, ProviderWithModel, generate_id, now_ms};
-use aionui_db::models::TeamRow;
+use aionui_db::models::{AgentMetadataRow, TeamRow};
 use aionui_db::{
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
-    ITeamRepository, UpdateTeamParams, resolve_agent_binding_from_rows,
+    IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams, resolve_agent_binding_from_rows,
 };
 use async_trait::async_trait;
 use tracing::{info, warn};
 
+use crate::capability::{supports_team_cli_fallback_backend, supports_team_mcp_backend};
 use crate::error::TeamError;
 use crate::mcp::TeamMcpStdioConfig;
+use crate::ports::TeamAssistantCatalogPort;
+use crate::ports::TeamConversationBindingLookup;
 use crate::service::inherit_team_workspace;
-use crate::service::spawn_support::{parse_agent_type, resolve_full_auto_mode, resolve_runtime_backend};
+use crate::service::spawn_support::{acp_backend_metadata, parse_agent_type, session_mode_for_backend};
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::workspace::TeamWorkspaceResolver;
 use crate::{PreparedTeamWorkspaces, TeamWorkspaceManager, WorkspaceAgentSpec};
@@ -23,8 +27,7 @@ use crate::{PreparedTeamWorkspaces, TeamWorkspaceManager, WorkspaceAgentSpec};
 pub struct TeamAgentProvisioner {
     repo: Arc<dyn ITeamRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
-    assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
-    assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+    assistant_catalog: Arc<dyn TeamAssistantCatalogPort>,
     provider_repo: Arc<dyn IProviderRepository>,
     conversation_port: Arc<dyn TeamConversationProvisioningPort>,
     workspace_manager: Option<Arc<dyn TeamWorkspaceManager>>,
@@ -51,6 +54,7 @@ struct NewAgentProvisioning {
     model: String,
     assistant_id: Option<String>,
     workspace: Option<String>,
+    session_mode: Option<String>,
 }
 
 pub(crate) struct PersistSpawnedAgentRequest {
@@ -123,7 +127,7 @@ impl TeamSourceMetadata {
 }
 
 #[cfg(test)]
-mod tests {
+mod source_metadata_tests {
     use super::*;
 
     #[test]
@@ -323,6 +327,8 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 
     async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError>;
 
+    async fn get_config_options(&self, conversation_id: &str) -> Result<GetConfigOptionsResponse, TeamError>;
+
     async fn warmup_agent_process(
         &self,
         user_id: &str,
@@ -331,9 +337,23 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
     ) -> Result<(), TeamError>;
 
     async fn delete_team_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), TeamError>;
+
+    async fn lookup_team_binding_by_conversation(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<TeamConversationBindingLookup>, TeamError> {
+        Err(TeamError::InvalidRequest(
+            "team conversation lookup is unavailable".to_owned(),
+        ))
+    }
 }
 
 impl TeamAgentProvisioner {
+    fn normalized_role(input: &TeamAgentInput) -> Result<TeammateRole, TeamError> {
+        TeammateRole::parse(input.role.trim())
+            .ok_or_else(|| TeamError::InvalidRequest(format!("invalid team agent role: {}", input.role)))
+    }
+
     fn effective_assistant_id(assistant_id: Option<&str>) -> Option<String> {
         assistant_id
             .map(str::trim)
@@ -346,25 +366,20 @@ impl TeamAgentProvisioner {
             let Some(assistant_id) = Self::effective_assistant_id(agent.assistant_id.as_deref()) else {
                 continue;
             };
-            let definition = self
-                .assistant_definition_repo
-                .get_by_assistant_id(&assistant_id)
+            let assistant = self
+                .assistant_catalog
+                .resolve_team_selectable_assistant(&assistant_id)
                 .await?
-                .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_id}")))?;
-            let effective_agent_id = self
-                .assistant_overlay_repo
-                .get(&definition.id)
-                .await?
-                .and_then(|row| row.agent_id_override)
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(definition.agent_id);
+                .ok_or_else(|| {
+                    TeamError::InvalidRequest(format!("Assistant is not available for team mode: {assistant_id}"))
+                })?;
             let rows = self.agent_metadata_repo.list_all().await?;
-            let resolved = resolve_agent_binding_from_rows(&rows, &effective_agent_id)
-                .ok_or_else(|| TeamError::InvalidRequest(format!("Agent not found: {effective_agent_id}")))?;
+            let resolved = resolve_agent_binding_from_rows(&rows, &assistant.backend)
+                .ok_or_else(|| TeamError::InvalidRequest(format!("Agent not found: {}", assistant.backend)))?;
             let row = rows
                 .iter()
                 .find(|row| row.id == resolved.agent_id)
-                .ok_or_else(|| TeamError::InvalidRequest(format!("Agent not found: {effective_agent_id}")))?;
+                .ok_or_else(|| TeamError::InvalidRequest(format!("Agent not found: {}", assistant.backend)))?;
             if row.agent_type == "acp" {
                 validate_agent_dynamic_preflight(
                     row.last_check_status.as_deref(),
@@ -380,8 +395,7 @@ impl TeamAgentProvisioner {
     pub(crate) fn new(
         repo: Arc<dyn ITeamRepository>,
         agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
-        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
-        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+        assistant_catalog: Arc<dyn TeamAssistantCatalogPort>,
         provider_repo: Arc<dyn IProviderRepository>,
         conversation_port: Arc<dyn TeamConversationProvisioningPort>,
         workspace_manager: Option<Arc<dyn TeamWorkspaceManager>>,
@@ -389,8 +403,7 @@ impl TeamAgentProvisioner {
         Self {
             repo,
             agent_metadata_repo,
-            assistant_definition_repo,
-            assistant_overlay_repo,
+            assistant_catalog,
             provider_repo,
             conversation_port,
             workspace_manager,
@@ -410,12 +423,28 @@ impl TeamAgentProvisioner {
         isolated_workspaces: Option<&PreparedTeamWorkspaces>,
         source_metadata: &TeamSourceMetadata,
     ) -> Result<InitialProvisioningResult, TeamError> {
-        let Some((leader_input, teammate_inputs)) = inputs.split_first() else {
+        if inputs.is_empty() {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
         };
 
-        let leader_slot_id = isolated_workspaces
-            .and_then(|plan| plan.agent_leases.first())
+        let roles = inputs
+            .iter()
+            .map(Self::normalized_role)
+            .collect::<Result<Vec<_>, _>>()?;
+        let leaders = roles
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, role)| (*role == TeammateRole::Lead).then_some(idx))
+            .collect::<Vec<_>>();
+        let [leader_idx] = leaders.as_slice() else {
+            return Err(TeamError::InvalidRequest(
+                "exactly one team agent must have role lead".into(),
+            ));
+        };
+
+        let leader_input = &inputs[*leader_idx];
+        let leader_lease = isolated_workspaces.and_then(|plan| plan.agent_leases.get(*leader_idx));
+        let leader_slot_id = leader_lease
             .map(|lease| lease.slot_id.clone())
             .unwrap_or_else(generate_id);
         let leader_role = TeammateRole::Lead;
@@ -433,11 +462,11 @@ impl TeamAgentProvisioner {
                 &leader_backend,
                 &leader_input.model,
                 leader_assistant_id.as_deref(),
-                isolated_workspaces
-                    .and_then(|plan| plan.agent_leases.first())
+                leader_lease
                     .map(|lease| lease.worktree_path.as_str())
                     .or(shared_workspace),
                 source_metadata,
+                None,
             )
             .await?;
 
@@ -470,12 +499,16 @@ impl TeamAgentProvisioner {
             cli_path: None,
         });
 
-        for (index, input) in teammate_inputs.iter().enumerate() {
-            let isolated_lease = isolated_workspaces.and_then(|plan| plan.agent_leases.get(index + 1));
+        for (index, (input, role)) in inputs
+            .iter()
+            .zip(roles.iter())
+            .enumerate()
+            .filter(|(_, (_, role))| **role == TeammateRole::Teammate)
+        {
+            let isolated_lease = isolated_workspaces.and_then(|plan| plan.agent_leases.get(index));
             let slot_id = isolated_lease
                 .map(|lease| lease.slot_id.clone())
                 .unwrap_or_else(generate_id);
-            let role = TeammateRole::parse(&input.role).unwrap_or(TeammateRole::Teammate);
             let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
             let backend = self
                 .resolve_requested_backend(input.backend.as_deref(), assistant_id.as_deref())
@@ -485,7 +518,7 @@ impl TeamAgentProvisioner {
                     user_id,
                     team_id,
                     &slot_id,
-                    role,
+                    *role,
                     &input.name,
                     &backend,
                     &input.model,
@@ -494,12 +527,13 @@ impl TeamAgentProvisioner {
                         .map(|lease| lease.worktree_path.as_str())
                         .or(Some(&team_workspace)),
                     source_metadata,
+                    None,
                 )
                 .await?;
             agents.push(TeamAgent {
                 slot_id,
                 name: input.name.clone(),
-                role,
+                role: *role,
                 conversation_id: conversation.conversation_id,
                 backend,
                 model: input.model.clone(),
@@ -535,7 +569,13 @@ impl TeamAgentProvisioner {
         team: &mut Team,
         req: AddAgentRequest,
     ) -> Result<TeamAgent, TeamError> {
-        let role = TeammateRole::parse(&req.role).unwrap_or(TeammateRole::Teammate);
+        let role = TeammateRole::parse(req.role.trim())
+            .ok_or_else(|| TeamError::InvalidRequest(format!("invalid team agent role: {}", req.role)))?;
+        if role != TeammateRole::Teammate {
+            return Err(TeamError::InvalidRequest(
+                "add_agent only supports teammate role".into(),
+            ));
+        }
         let slot_id = generate_id();
         let workspace = self
             .resolve_workspace_for_new_agent(user_id, row, team, &slot_id, &req.name)
@@ -555,6 +595,7 @@ impl TeamAgentProvisioner {
                 model: req.model,
                 assistant_id,
                 workspace: Some(workspace),
+                session_mode: row.session_mode.clone(),
             })
             .await;
         let agent = match agent {
@@ -576,17 +617,14 @@ impl TeamAgentProvisioner {
     ) -> Result<String, TeamError> {
         let assistant_id = assistant_id.map(str::trim).filter(|value| !value.is_empty());
         if let Some(assistant_id) = assistant_id {
-            let definition = self
-                .assistant_definition_repo
-                .get_by_assistant_id(assistant_id)
+            return self
+                .assistant_catalog
+                .resolve_team_selectable_assistant(assistant_id)
                 .await?
-                .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_id}")))?;
-            let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
-            let effective_agent_id = overlay
-                .and_then(|row| row.agent_id_override)
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(definition.agent_id);
-            return resolve_runtime_backend(&self.agent_metadata_repo, &effective_agent_id).await;
+                .map(|assistant| assistant.backend)
+                .ok_or_else(|| {
+                    TeamError::InvalidRequest(format!("Assistant is not available for team mode: {assistant_id}"))
+                });
         }
 
         let Some(requested_backend) = requested_backend.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -619,6 +657,7 @@ impl TeamAgentProvisioner {
                 model: req.model,
                 assistant_id: req.assistant_id,
                 workspace: Some(workspace),
+                session_mode: row.session_mode.clone(),
             })
             .await;
         let agent = match agent {
@@ -641,8 +680,14 @@ impl TeamAgentProvisioner {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), TeamError> {
         let team_id = mcp_stdio_cfg.team_id.clone();
-        self.write_team_mcp_runtime_config(agent, mcp_stdio_cfg).await?;
-        let _ = task_manager.kill(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild));
+        let transport = self.team_tool_transport(agent).await?;
+        match transport {
+            TeamToolTransport::Mcp => self.write_team_mcp_runtime_config(agent, mcp_stdio_cfg).await?,
+            TeamToolTransport::CliAssumed => self.write_team_cli_runtime_config(agent).await?,
+        }
+        task_manager
+            .kill_and_wait(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
+            .await;
         self.conversation_port
             .warmup_agent_process(user_id, &agent.conversation_id, task_manager)
             .await
@@ -653,10 +698,41 @@ impl TeamAgentProvisioner {
             team_id = %team_id,
             slot_id = %agent.slot_id,
             conversation_id = %agent.conversation_id,
+            backend = %agent.backend,
+            transport = ?transport,
             outcome = "attached",
             "Team agent provisioner attached runtime process"
         );
         Ok(())
+    }
+
+    pub(crate) async fn team_tool_transport(&self, agent: &TeamAgent) -> Result<TeamToolTransport, TeamError> {
+        let capabilities = self.agent_capabilities(&agent.backend).await?;
+        if supports_team_mcp_backend(&agent.backend, capabilities.as_ref()) {
+            return Ok(TeamToolTransport::Mcp);
+        }
+        if supports_team_cli_fallback_backend(capabilities.as_ref()) {
+            return Ok(TeamToolTransport::CliAssumed);
+        }
+        Err(TeamError::InvalidRequest(format!(
+            "agent backend is not eligible for Team transport: {}",
+            agent.backend
+        )))
+    }
+
+    async fn agent_capabilities(&self, backend: &str) -> Result<Option<serde_json::Value>, TeamError> {
+        let Some(metadata) = acp_backend_metadata(&self.agent_metadata_repo, backend).await? else {
+            return Ok(None);
+        };
+        let Some(raw) = metadata
+            .agent_capabilities
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_str(raw).ok())
     }
 
     pub(crate) async fn write_team_mcp_runtime_config(
@@ -664,9 +740,16 @@ impl TeamAgentProvisioner {
         agent: &TeamAgent,
         mcp_stdio_cfg: TeamMcpStdioConfig,
     ) -> Result<(), TeamError> {
+        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, &agent.backend).await?;
+        let agent_type = if acp_metadata.is_some() {
+            AgentType::Acp
+        } else {
+            parse_agent_type(&agent.backend)?
+        };
+        let session_mode = session_mode_for_backend(&agent.backend, agent_type, acp_metadata.as_ref());
         let patch = serde_json::json!({
             "team_mcp_stdio_config": mcp_stdio_cfg,
-            "session_mode": resolve_full_auto_mode(&agent.backend),
+            "session_mode": session_mode,
         });
         self.conversation_port
             .patch_runtime_config(&agent.conversation_id, patch)
@@ -674,6 +757,29 @@ impl TeamAgentProvisioner {
             .map_err(|e| {
                 TeamError::InvalidRequest(format!(
                     "failed to persist team_mcp_stdio_config for {}: {e}",
+                    agent.slot_id
+                ))
+            })
+    }
+
+    pub(crate) async fn write_team_cli_runtime_config(&self, agent: &TeamAgent) -> Result<(), TeamError> {
+        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, &agent.backend).await?;
+        let agent_type = if acp_metadata.is_some() {
+            AgentType::Acp
+        } else {
+            parse_agent_type(&agent.backend)?
+        };
+        let session_mode = session_mode_for_backend(&agent.backend, agent_type, acp_metadata.as_ref());
+        let patch = serde_json::json!({
+            "team_mcp_stdio_config": null,
+            "session_mode": session_mode,
+        });
+        self.conversation_port
+            .patch_runtime_config(&agent.conversation_id, patch)
+            .await
+            .map_err(|e| {
+                TeamError::InvalidRequest(format!(
+                    "failed to persist Team CLI runtime config for {}: {e}",
                     agent.slot_id
                 ))
             })
@@ -708,6 +814,7 @@ impl TeamAgentProvisioner {
                 input.assistant_id.as_deref(),
                 input.workspace.as_deref(),
                 &TeamSourceMetadata::default(),
+                input.session_mode.as_deref(),
             )
             .await?;
         Ok(TeamAgent {
@@ -737,21 +844,27 @@ impl TeamAgentProvisioner {
         assistant_id: Option<&str>,
         workspace: Option<&str>,
         source_metadata: &TeamSourceMetadata,
+        session_mode: Option<&str>,
     ) -> Result<ProvisionedConversation, TeamError> {
-        let extra = self
-            .build_team_extra(
-                team_id,
-                slot_id,
-                role,
-                backend,
-                model,
-                assistant_id,
-                workspace,
-                source_metadata,
-            )
-            .await?;
-
-        let agent_type = parse_agent_type(backend)?;
+        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, backend).await?;
+        let agent_type = if acp_metadata.is_some() {
+            AgentType::Acp
+        } else {
+            parse_agent_type(backend)?
+        };
+        let extra = self.build_team_extra(
+            team_id,
+            slot_id,
+            role,
+            backend,
+            model,
+            assistant_id,
+            workspace,
+            agent_type,
+            acp_metadata.as_ref(),
+            session_mode,
+            source_metadata,
+        );
         let provider_id = if agent_type == AgentType::Aionrs {
             self.resolve_provider_for_model(model)
                 .await
@@ -849,7 +962,7 @@ impl TeamAgentProvisioner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn build_team_extra(
+    fn build_team_extra(
         &self,
         team_id: &str,
         slot_id: &str,
@@ -858,16 +971,24 @@ impl TeamAgentProvisioner {
         model: &str,
         assistant_id: Option<&str>,
         workspace: Option<&str>,
+        agent_type: AgentType,
+        acp_metadata: Option<&AgentMetadataRow>,
+        session_mode: Option<&str>,
         source_metadata: &TeamSourceMetadata,
-    ) -> Result<serde_json::Value, TeamError> {
+    ) -> serde_json::Value {
+        let session_mode = session_mode
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| session_mode_for_backend(backend, agent_type, acp_metadata));
         let mut extra = serde_json::json!({
             "teamId": team_id,
             "slot_id": slot_id,
             "role": role.to_string(),
             "backend": backend,
-            "session_mode": resolve_full_auto_mode(backend),
+            "session_mode": session_mode,
         });
-        if parse_agent_type(backend)? != AgentType::Aionrs {
+        if agent_type != AgentType::Aionrs {
             extra["current_model_id"] = serde_json::Value::String(model.to_owned());
         }
         if let Some(assistant_id) = assistant_id {
@@ -877,7 +998,7 @@ impl TeamAgentProvisioner {
             inherit_team_workspace(&mut extra, workspace);
         }
         source_metadata.apply_to_extra(&mut extra);
-        Ok(extra)
+        extra
     }
 
     async fn persist_agents(&self, team_id: &str, agents: &[TeamAgent]) -> Result<(), TeamError> {
@@ -935,5 +1056,340 @@ impl TeamAgentProvisioner {
         {
             let _ = manager.release_slot(&row.id, slot_id).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aionui_ai_agent::types::BuildTaskOptions;
+    use aionui_ai_agent::{AgentError, AgentInstance};
+    use aionui_db::models::{
+        AgentMetadataRow, Provider, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
+        UpsertAgentMetadataParams,
+    };
+    use aionui_db::{CreateProviderParams, DbError, UpdateProviderParams};
+    use std::sync::Mutex;
+    use tokio::sync::watch;
+
+    struct RecordingProvisioningPort {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        patches: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait]
+    impl TeamConversationProvisioningPort for RecordingProvisioningPort {
+        async fn create_team_conversation(
+            &self,
+            _request: TeamConversationCreateRequest,
+        ) -> Result<TeamConversationCreateResult, TeamError> {
+            Err(TeamError::InvalidRequest("unused".into()))
+        }
+
+        async fn conversation_workspace(&self, _conversation_id: &str) -> Result<Option<String>, TeamError> {
+            Ok(None)
+        }
+
+        async fn conversation_assistant_id(&self, _conversation_id: &str) -> Result<Option<String>, TeamError> {
+            Ok(None)
+        }
+
+        async fn create_team_temp_workspace(&self, _team_id: &str) -> Result<String, TeamError> {
+            Err(TeamError::InvalidRequest("unused".into()))
+        }
+
+        async fn patch_runtime_config(
+            &self,
+            _conversation_id: &str,
+            patch: serde_json::Value,
+        ) -> Result<(), TeamError> {
+            self.patches.lock().unwrap().push(patch);
+            self.events.lock().unwrap().push("patch");
+            Ok(())
+        }
+
+        async fn save_acp_runtime_mode(&self, _conversation_id: &str, _mode: &str) -> Result<(), TeamError> {
+            Ok(())
+        }
+
+        async fn get_config_options(&self, _conversation_id: &str) -> Result<GetConfigOptionsResponse, TeamError> {
+            Ok(GetConfigOptionsResponse {
+                config_options: Vec::new(),
+            })
+        }
+
+        async fn warmup_agent_process(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _task_manager: &Arc<dyn IWorkerTaskManager>,
+        ) -> Result<(), TeamError> {
+            self.events.lock().unwrap().push("warmup");
+            Ok(())
+        }
+
+        async fn delete_team_conversation(&self, _user_id: &str, _conversation_id: &str) -> Result<(), TeamError> {
+            Ok(())
+        }
+    }
+
+    struct BlockingKillTaskManager {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        kill_started: watch::Sender<bool>,
+        release_kill: watch::Receiver<bool>,
+    }
+
+    #[async_trait]
+    impl IWorkerTaskManager for BlockingKillTaskManager {
+        fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+            None
+        }
+
+        async fn get_or_build_task(
+            &self,
+            _conversation_id: &str,
+            _options: BuildTaskOptions,
+        ) -> Result<AgentInstance, AgentError> {
+            Err(AgentError::internal("unused"))
+        }
+
+        fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+            self.events.lock().unwrap().push("kill_sync");
+            let _ = self.kill_started.send(true);
+            Ok(())
+        }
+
+        fn kill_and_wait(
+            &self,
+            _conversation_id: &str,
+            _reason: Option<AgentKillReason>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let events = Arc::clone(&self.events);
+            let kill_started = self.kill_started.clone();
+            let mut release_kill = self.release_kill.clone();
+            Box::pin(async move {
+                events.lock().unwrap().push("kill_wait_start");
+                let _ = kill_started.send(true);
+                while !*release_kill.borrow() {
+                    if release_kill.changed().await.is_err() {
+                        break;
+                    }
+                }
+                events.lock().unwrap().push("kill_wait_done");
+            })
+        }
+
+        async fn clear(&self) {}
+
+        fn active_count(&self) -> usize {
+            0
+        }
+
+        fn collect_idle(&self, _idle_threshold_ms: aionui_common::TimestampMs) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    struct UnusedAgentMetadataRepo;
+
+    struct EmptyTeamAssistantCatalog;
+
+    #[async_trait]
+    impl TeamAssistantCatalogPort for EmptyTeamAssistantCatalog {
+        async fn list_team_selectable_assistants(
+            &self,
+        ) -> Result<Vec<crate::ports::TeamAssistantCatalogEntry>, TeamError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl IAgentMetadataRepository for UnusedAgentMetadataRepo {
+        async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
+            Ok(Vec::new())
+        }
+        async fn get(&self, _id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(None)
+        }
+        async fn find_by_source_and_name(
+            &self,
+            _agent_source: &str,
+            _name: &str,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(None)
+        }
+        async fn find_builtin_by_backend(&self, _backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(None)
+        }
+        async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
+            Err(DbError::Init("unused".into()))
+        }
+        async fn apply_handshake(
+            &self,
+            _id: &str,
+            _params: &UpdateAgentHandshakeParams<'_>,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(None)
+        }
+        async fn update_availability_snapshot(
+            &self,
+            _id: &str,
+            _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(None)
+        }
+        async fn update_agent_overrides(
+            &self,
+            _id: &str,
+            _command_override: Option<&str>,
+            _env_override: Option<&str>,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
+        async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
+            Ok(false)
+        }
+        async fn delete(&self, _id: &str) -> Result<bool, DbError> {
+            Ok(false)
+        }
+    }
+
+    struct EmptyProviderRepo;
+
+    #[async_trait]
+    impl IProviderRepository for EmptyProviderRepo {
+        async fn list(&self) -> Result<Vec<Provider>, DbError> {
+            Ok(Vec::new())
+        }
+        async fn find_by_id(&self, _id: &str) -> Result<Option<Provider>, DbError> {
+            Ok(None)
+        }
+        async fn create(&self, _params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
+            Err(DbError::Init("unused".into()))
+        }
+        async fn update(&self, _id: &str, _params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
+            Err(DbError::Init("unused".into()))
+        }
+        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
+
+    fn test_provisioner(events: Arc<Mutex<Vec<&'static str>>>) -> TeamAgentProvisioner {
+        test_provisioner_with_patches(events, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn test_provisioner_with_patches(
+        events: Arc<Mutex<Vec<&'static str>>>,
+        patches: Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> TeamAgentProvisioner {
+        TeamAgentProvisioner::new(
+            Arc::new(crate::test_utils::MockTeamRepo::new()),
+            Arc::new(UnusedAgentMetadataRepo),
+            Arc::new(EmptyTeamAssistantCatalog),
+            Arc::new(EmptyProviderRepo),
+            Arc::new(RecordingProvisioningPort { events, patches }),
+            None,
+        )
+    }
+
+    fn test_agent() -> TeamAgent {
+        TeamAgent {
+            slot_id: "slot-1".into(),
+            name: "Agent".into(),
+            role: TeammateRole::Teammate,
+            conversation_id: "conv-1".into(),
+            backend: "acp".into(),
+            model: "sonnet".into(),
+            assistant_id: None,
+            status: None,
+            conversation_type: None,
+            cli_path: None,
+        }
+    }
+
+    fn test_mcp_config() -> TeamMcpStdioConfig {
+        TeamMcpStdioConfig {
+            team_id: "team-1".into(),
+            port: 12345,
+            token: "token".into(),
+            slot_id: "slot-1".into(),
+            binary_path: "/tmp/aioncore".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn team_tool_transport_prefers_mcp_for_builtin_aionrs_backend() {
+        let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
+        let mut agent = test_agent();
+        agent.backend = "aionrs".into();
+
+        let transport = provisioner.team_tool_transport(&agent).await.unwrap();
+
+        assert_eq!(transport, TeamToolTransport::Mcp);
+    }
+
+    #[tokio::test]
+    async fn team_tool_transport_uses_cli_for_non_mcp_backend() {
+        let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
+        let mut agent = test_agent();
+        agent.backend = "custom-acp".into();
+
+        let transport = provisioner.team_tool_transport(&agent).await.unwrap();
+
+        assert_eq!(transport, TeamToolTransport::CliAssumed);
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_config_clears_mcp_config() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let patches = Arc::new(Mutex::new(Vec::new()));
+        let provisioner = test_provisioner_with_patches(events, Arc::clone(&patches));
+
+        provisioner.write_team_cli_runtime_config(&test_agent()).await.unwrap();
+
+        let patches = patches.lock().unwrap();
+        assert_eq!(patches[0]["team_mcp_stdio_config"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn attach_agent_process_waits_for_kill_before_warmup() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let patches = Arc::new(Mutex::new(Vec::new()));
+        let (kill_started_tx, mut kill_started_rx) = watch::channel(false);
+        let (release_kill_tx, release_kill_rx) = watch::channel(false);
+        let provisioner = test_provisioner_with_patches(Arc::clone(&events), Arc::clone(&patches));
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(BlockingKillTaskManager {
+            events: Arc::clone(&events),
+            kill_started: kill_started_tx,
+            release_kill: release_kill_rx,
+        });
+        let mut agent = test_agent();
+        agent.backend = "aionrs".into();
+
+        let attach = tokio::spawn(async move {
+            provisioner
+                .attach_agent_process("user-1", &agent, test_mcp_config(), &task_manager)
+                .await
+        });
+        while !*kill_started_rx.borrow() {
+            kill_started_rx.changed().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            !events.lock().unwrap().contains(&"warmup"),
+            "agent warmup must wait until the previous task is fully killed"
+        );
+
+        release_kill_tx.send(true).unwrap();
+        attach.await.unwrap().unwrap();
+
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["patch", "kill_wait_start", "kill_wait_done", "warmup"]
+        );
+        let patches = patches.lock().unwrap();
+        assert!(patches[0]["team_mcp_stdio_config"].is_object());
     }
 }

@@ -24,6 +24,25 @@ use crate::protocol::error::CloseReason;
 /// covers a tracing event with its preceding context.
 pub(super) const STDERR_PEEK_LINES: usize = 32;
 
+fn log_acp_process_exit(
+    conversation_id: &str,
+    agent_id: &str,
+    exit_code: Option<i32>,
+    signal: Option<&str>,
+    stderr_summary_present: bool,
+) {
+    tracing::warn!(
+        target: "aionui_feedback_diagnostics",
+        diagnostic_event = "feedback.runtime.acp_process_exit",
+        conversation_id = %conversation_id,
+        agent_id = %agent_id,
+        exit_code,
+        signal = %signal.unwrap_or("none"),
+        stderr_summary_present,
+        "feedback.runtime.acp_process_exit"
+    );
+}
+
 impl AcpAgentManager {
     /// If `err` is the "SDK gave us default Internal error with no data" shape,
     /// peek the child's recent stderr and try to surface a more informative
@@ -86,6 +105,13 @@ impl AcpAgentManager {
             // allowlist. Empty `redacted_summary` is fine —
             // `CloseReason::user_facing_message` omits the trailing colon then.
             let redacted_summary = super::stderr_error_extractor::extract_error_message(&tail).unwrap_or_default();
+            log_acp_process_exit(
+                &self.params.conversation_id,
+                self.agent_id(),
+                exit_code,
+                signal.as_deref(),
+                !redacted_summary.is_empty(),
+            );
             return CloseReason::ProcessExited {
                 exit_code,
                 signal,
@@ -123,26 +149,83 @@ mod tests {
     use crate::manager::acp::agent::{exit_status_parts, user_facing_message};
     use crate::protocol::error::CloseReason;
 
-    /// Spawn a sh subprocess that writes `stderr_payload` to stderr then
+    fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::Mutex;
+        use tracing_subscriber::fmt;
+
+        #[derive(Clone)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let make_writer = {
+            let buffer = Arc::clone(&buffer);
+            move || SharedBuf(Arc::clone(&buffer))
+        };
+        let subscriber = fmt::Subscriber::builder()
+            .with_max_level(max_level)
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
+
+    /// Spawn a subprocess that writes `stderr_payload` to stderr then
     /// exits with `exit_code`. Used to simulate ACP CLI crashes/exits.
     async fn spawn_with_stderr_and_exit(stderr_payload: &str, exit_code: u8) -> Arc<CliAgentProcess> {
-        // Heredoc protects apostrophes etc.; escape any literal `'` first.
-        let payload = stderr_payload.replace('\'', "'\\''");
-        let script = format!("cat <<'EOF' >&2\n{payload}\nEOF\nexit {exit_code}");
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), script],
-            env: vec![],
-            cwd: None,
-        };
-        let data_dir = tempfile::tempdir().unwrap();
-        let proc = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap();
+        let config = stderr_exit_command_spec(stderr_payload, exit_code);
+        let proc = CliAgentProcess::spawn_for_sdk(config).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), proc.wait_for_exit())
             .await
             .unwrap();
         // Give the stderr reader a beat to flush its ring buffer.
         tokio::time::sleep(Duration::from_millis(100)).await;
         Arc::new(proc)
+    }
+
+    #[cfg(not(windows))]
+    fn stderr_exit_command_spec(stderr_payload: &str, exit_code: u8) -> CommandSpec {
+        // Heredoc protects apostrophes etc.; escape any literal `'` first.
+        let payload = stderr_payload.replace('\'', "'\\''");
+        let script = format!("cat <<'EOF' >&2\n{payload}\nEOF\nexit {exit_code}");
+        CommandSpec {
+            command: "sh".into(),
+            args: vec!["-c".into(), script],
+            env: vec![],
+            cwd: None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn stderr_exit_command_spec(stderr_payload: &str, exit_code: u8) -> CommandSpec {
+        let payload = stderr_payload.replace('\'', "''");
+        let script = format!("[Console]::Error.WriteLine('{payload}'); exit {exit_code}");
+        CommandSpec {
+            command: "powershell.exe".into(),
+            args: vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-Command".into(),
+                script,
+            ],
+            env: vec![],
+            cwd: None,
+        }
     }
 
     /// Mirror of `AcpAgentManager::build_close_reason_from_error` against a
@@ -208,6 +291,27 @@ mod tests {
             }
             other => panic!("expected ProcessExited, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn acp_process_exit_diagnostic_log_uses_stable_contract_without_stderr_payload() {
+        let captured = capture_logs(tracing::Level::INFO, || {
+            super::log_acp_process_exit("conv-acp", "codex", Some(1), None, true);
+        });
+
+        assert!(captured.contains("aionui_feedback_diagnostics"), "{captured}");
+        assert!(captured.contains("feedback.runtime.acp_process_exit"), "{captured}");
+        assert!(captured.contains("conversation_id=conv-acp"), "{captured}");
+        assert!(captured.contains("agent_id=codex"), "{captured}");
+        assert!(
+            captured.contains("exit_code=Some(1)") || captured.contains("exit_code=1"),
+            "{captured}"
+        );
+        assert!(captured.contains("stderr_summary_present=true"), "{captured}");
+        assert!(
+            !captured.contains("raw stderr payload that should be private"),
+            "raw stderr must not be logged: {captured}"
+        );
     }
 
     /// Stderr with no allowlisted keyword must not leak into the toast,

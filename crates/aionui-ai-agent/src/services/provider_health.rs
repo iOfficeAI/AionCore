@@ -20,6 +20,7 @@ use crate::factory::aionrs::{map_aionrs_provider, resolve_aionrs_url_and_compat,
 use crate::types::AionrsResolvedConfig;
 
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const HEALTH_CHECK_MAX_TOKENS: u32 = 16;
 const HEALTH_CHECK_PROMPT: &str = "Reply with exactly OK.";
 const HEALTH_CHECK_MSG_ID: &str = "provider-health-check";
 
@@ -65,9 +66,9 @@ impl ProviderHealthCheckService {
     fn resolve_probe_config(&self, row: &Provider, model_id: &str) -> Result<AionrsResolvedConfig, AgentError> {
         let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &self.encryption_key)
             .map_err(|e| AgentError::internal(e.to_string()))?;
-        let provider = map_aionrs_provider(&row.platform, model_id, row.model_protocols.as_deref());
+        let provider = map_aionrs_provider(&row.platform, model_id, row.model_protocols.as_deref())?;
         let (base_url, compat_overrides) =
-            resolve_aionrs_url_and_compat(&row.platform, &row.base_url, &provider, row.is_full_url);
+            resolve_aionrs_url_and_compat(&row.platform, &row.base_url, &provider, model_id, row.is_full_url);
         let bedrock_config = if row.platform == "bedrock" {
             resolve_bedrock_config(row.bedrock_config.as_deref())
         } else {
@@ -80,15 +81,18 @@ impl ProviderHealthCheckService {
             model: model_id.to_owned(),
             base_url,
             system_prompt: Some("You are a provider health probe. Reply with exactly OK and do not use tools.".into()),
-            max_tokens: 16,
+            max_tokens: Some(HEALTH_CHECK_MAX_TOKENS),
             max_turns: Some(1),
             max_tool_call_malformed_turns: Some(1),
             max_tool_call_failure_turns: Some(1),
             compat_overrides,
             session_directory: self.data_dir.join("aionrs-health-check-sessions"),
             session_mode: None,
+            skills: Vec::new(),
             extra_mcp_servers: HashMap::new(),
             bedrock_config,
+            runtime_env: Vec::new(),
+            prompt_dump_dir: None,
         })
     }
 }
@@ -194,13 +198,15 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
         api_key: Some(config_extra.api_key),
         base_url: config_extra.base_url,
         model: Some(config_extra.model),
-        max_tokens: Some(config_extra.max_tokens),
+        max_tokens: config_extra.max_tokens,
         max_turns: config_extra.max_turns,
         max_tool_call_malformed_turns: config_extra.max_tool_call_malformed_turns,
         max_tool_call_failure_turns: config_extra.max_tool_call_failure_turns,
         system_prompt: config_extra.system_prompt,
         profile: None,
         auto_approve: false,
+        thinking: None,
+        thinking_budget: None,
         project_dir: Some(PathBuf::from(&workspace)),
     };
     let mut config =
@@ -210,6 +216,9 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
     config.session.enabled = false;
     config.mcp.servers.clear();
     config.file_cache.enabled = false;
+    if let Some(mode) = config_extra.compat_overrides.openai_api_mode {
+        config.compat.transport.openai_api_mode = Some(mode);
+    }
     if let Some(field) = config_extra.compat_overrides.max_tokens_field {
         config.compat.transport.max_tokens_field = Some(field);
     }
@@ -218,6 +227,7 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
     }
 
     AgentBootstrap::new(config, workspace, sink)
+        .runtime_env(config_extra.runtime_env)
         .build()
         .await
         .map(|result| result.engine)
@@ -309,6 +319,87 @@ pub(crate) fn extract_http_status(message: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aion_config::compat::OpenAiApiMode;
+    use aionui_common::encrypt_string;
+    use aionui_db::{CreateProviderParams, DbError, UpdateProviderParams};
+
+    const TEST_KEY: [u8; 32] = [0xAB; 32];
+
+    struct UnusedProviderRepository;
+
+    #[async_trait::async_trait]
+    impl IProviderRepository for UnusedProviderRepository {
+        async fn list(&self) -> Result<Vec<Provider>, DbError> {
+            unreachable!("provider repo is not used by resolve_probe_config")
+        }
+
+        async fn find_by_id(&self, _id: &str) -> Result<Option<Provider>, DbError> {
+            unreachable!("provider repo is not used by resolve_probe_config")
+        }
+
+        async fn create(&self, _params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
+            unreachable!("provider repo is not used by resolve_probe_config")
+        }
+
+        async fn update(&self, _id: &str, _params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
+            unreachable!("provider repo is not used by resolve_probe_config")
+        }
+
+        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+            unreachable!("provider repo is not used by resolve_probe_config")
+        }
+    }
+
+    fn test_service() -> ProviderHealthCheckService {
+        ProviderHealthCheckService {
+            provider_repo: Arc::new(UnusedProviderRepository),
+            encryption_key: TEST_KEY,
+            data_dir: PathBuf::from("/tmp/aioncore-provider-health-test"),
+        }
+    }
+
+    fn test_provider() -> Provider {
+        Provider {
+            id: "provider-1".to_owned(),
+            platform: "anthropic".to_owned(),
+            name: "Test Anthropic".to_owned(),
+            base_url: "https://api.anthropic.com".to_owned(),
+            api_key_encrypted: encrypt_string("sk-test", &TEST_KEY).unwrap(),
+            models: r#"["claude-sonnet-4-20250514"]"#.to_owned(),
+            enabled: true,
+            capabilities: "[]".to_owned(),
+            context_limit: None,
+            model_protocols: None,
+            model_enabled: None,
+            model_health: None,
+            bedrock_config: None,
+            is_full_url: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn resolve_probe_config_keeps_health_check_token_cap() {
+        let config = test_service()
+            .resolve_probe_config(&test_provider(), "claude-sonnet-4-20250514")
+            .unwrap();
+
+        assert_eq!(config.max_tokens, Some(HEALTH_CHECK_MAX_TOKENS));
+        assert_eq!(config.max_turns, Some(1));
+    }
+
+    #[test]
+    fn resolve_probe_config_uses_responses_for_openai_gpt_5_6() {
+        let mut provider = test_provider();
+        provider.platform = "openai".to_owned();
+        provider.base_url = "https://api.openai.com/v1".to_owned();
+
+        let config = test_service().resolve_probe_config(&provider, "gpt-5.6-sol").unwrap();
+
+        assert_eq!(config.compat_overrides.openai_api_mode, Some(OpenAiApiMode::Responses));
+        assert_eq!(config.compat_overrides.api_path.as_deref(), Some("/responses"));
+    }
 
     #[test]
     fn classify_error_detects_quota_message() {

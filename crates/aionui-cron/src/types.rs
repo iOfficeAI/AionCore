@@ -174,6 +174,7 @@ pub struct CronJob {
     pub run_count: i64,
     pub retry_count: i64,
     pub max_retries: i64,
+    pub queue_enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +223,7 @@ pub fn cron_job_from_row(row: CronJobRow) -> Result<CronJob, CronError> {
         run_count: row.run_count,
         retry_count: row.retry_count,
         max_retries: row.max_retries,
+        queue_enabled: row.queue_enabled,
     })
 }
 
@@ -293,6 +295,7 @@ pub fn cron_job_to_row(job: &CronJob) -> Result<CronJobRow, CronError> {
         run_count: job.run_count,
         retry_count: job.retry_count,
         max_retries: job.max_retries,
+        queue_enabled: job.queue_enabled,
     })
 }
 
@@ -379,6 +382,7 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
             run_count: job.run_count,
             retry_count: job.retry_count,
             max_retries: job.max_retries,
+            queue_enabled: job.queue_enabled,
         },
     }
 }
@@ -575,6 +579,7 @@ mod tests {
             run_count: 5,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: false,
         }
     }
 
@@ -616,6 +621,7 @@ mod tests {
             run_count: 5,
             retry_count: 0,
             max_retries: 3,
+            queue_enabled: false,
         }
     }
 

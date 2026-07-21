@@ -5,8 +5,8 @@
 //! rows all live there. The registry:
 //!
 //! - hydrates `select *` into memory at startup;
-//! - probes each row's spawn command via `which()` so the `available`
-//!   field reflects PATH state right now (not a persisted column);
+//! - projects startup availability from the latest persisted snapshot
+//!   without probing PATH;
 //! - exposes lookups the factory and routes use (`get`,
 //!   `find_by_backend`, `list_by_agent_type`, etc.);
 //! - writes ACP handshake payloads back to the row through
@@ -27,6 +27,7 @@ use aionui_runtime::{
     ManagedAcpToolId, RuntimeCommandProbe, probe_managed_acp_tool_supported, probe_node_runtime_supported,
     probe_runtime_command, resolve_command_path,
 };
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
@@ -40,6 +41,7 @@ use crate::manager::acp::config_option_catalog::{
 /// drains it serially, so the bound just sizes the burst we can absorb
 /// before producers start to back off.
 const CATALOG_SYNC_CHANNEL_CAPACITY: usize = 256;
+const CLI_PROBE_CONCURRENCY: usize = 8;
 
 /// One unit of work submitted to the catalog sync consumer task.
 #[derive(Debug)]
@@ -59,6 +61,7 @@ mod registry_tests;
 pub struct AgentRegistry {
     repo: Arc<dyn IAgentMetadataRepository>,
     by_id: RwLock<HashMap<String, AgentMetadata>>,
+    unavailable_reasons: RwLock<HashMap<String, UnavailableReason>>,
     /// MPSC sender shared with every forwarder in every `AcpAgentManager`.
     /// Draining happens in a single background task owned by this
     /// registry, so DB writes for the same (id, field) serialize.
@@ -71,6 +74,7 @@ impl AgentRegistry {
         let this = Arc::new(Self {
             repo,
             by_id: RwLock::new(HashMap::new()),
+            unavailable_reasons: RwLock::new(HashMap::new()),
             catalog_tx: tx,
         });
 
@@ -144,10 +148,37 @@ impl AgentRegistry {
             return Ok(());
         };
 
-        if let Some((meta, _)) = decode_row(row) {
+        if let Some((mut meta, reason)) = decode_row(row, AvailabilityProjection::Cached) {
+            let existing_availability = self
+                .by_id
+                .read()
+                .await
+                .get(&meta.id)
+                .map(|existing| (existing.available, existing.resolved_command.clone()));
+            let reason = if let Some((available, resolved_command)) = existing_availability {
+                meta.available = available;
+                meta.resolved_command = resolved_command;
+                if meta.available {
+                    None
+                } else {
+                    self.unavailable_reasons.read().await.get(&meta.id).cloned().or(reason)
+                }
+            } else {
+                reason
+            };
+            self.update_cached_unavailable_reason(&meta.id, reason).await;
             self.by_id.write().await.insert(meta.id.clone(), meta);
         }
         Ok(())
+    }
+
+    async fn update_cached_unavailable_reason(&self, id: &str, reason: Option<UnavailableReason>) {
+        let mut guard = self.unavailable_reasons.write().await;
+        if let Some(reason) = reason {
+            guard.insert(id.to_owned(), reason);
+        } else {
+            guard.remove(id);
+        }
     }
 }
 
@@ -159,8 +190,12 @@ impl AgentRegistry {
             tx: self.catalog_tx.clone(),
         }
     }
-    /// Reload every enabled row from the database and re-probe their
-    /// spawn commands on `$PATH`.
+    /// Reload every row from the database and refresh installation state.
+    ///
+    /// Startup checks whether required commands / managed runtimes resolve and
+    /// runs a bounded `<primary-cli> --version` probe for builtin agents. It does not start sessions,
+    /// perform handshakes, fetch models, or overwrite persisted health-check
+    /// snapshots. User-facing health checks stay explicit.
     pub async fn hydrate(&self) -> Result<(), AgentError> {
         let rows = self
             .repo
@@ -168,12 +203,18 @@ impl AgentRegistry {
             .await
             .map_err(|e| AgentError::internal(format!("load agent_metadata: {e}")))?;
 
-        let mut map = HashMap::with_capacity(rows.len());
-        for row in rows {
-            let Some((meta, reason)) = decode_row(row) else {
-                continue;
-            };
-            log_probe_result(&meta, &reason);
+        let candidates: Vec<_> = rows
+            .into_iter()
+            .filter_map(|row| decode_row(row, AvailabilityProjection::Probe))
+            .collect();
+        let validated = validate_cli_candidates(candidates).await;
+
+        let mut map = HashMap::with_capacity(validated.len());
+        let mut reasons = HashMap::new();
+        for (meta, reason) in validated {
+            if let Some(reason) = reason {
+                reasons.insert(meta.id.clone(), reason);
+            }
             map.insert(meta.id.clone(), meta);
         }
         // Snapshot the summary off the local map before transferring it
@@ -181,34 +222,69 @@ impl AgentRegistry {
         // and we don't want that borrow to outlive the move.
         log_availability_summary(map.values(), "AgentRegistry hydrated");
         *self.by_id.write().await = map;
+        *self.unavailable_reasons.write().await = reasons;
         Ok(())
     }
 
     /// Re-probe every row's command without refetching from the DB.
     /// Useful after PATH has changed (e.g. `launchctl setenv`).
     pub async fn refresh_availability(&self) {
+        let snapshot: Vec<AgentMetadata> = self.by_id.read().await.values().cloned().collect();
+        let candidates: Vec<_> = snapshot
+            .into_iter()
+            .map(|mut meta| {
+                let (path, reason) = probe_with_reason(&meta);
+                meta.resolved_command = path;
+                meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(&meta);
+                let reason = if meta.available { None } else { reason };
+                (meta, reason)
+            })
+            .collect();
+        let validated = validate_cli_candidates(candidates).await;
+
+        let mut results = Vec::with_capacity(validated.len());
+        let mut reasons = HashMap::new();
+        for (meta, reason) in validated {
+            log_probe_result(&meta, &reason);
+            results.push((meta.id.clone(), meta.available, meta.resolved_command.clone()));
+            if let Some(reason) = reason {
+                reasons.insert(meta.id.clone(), reason);
+            }
+        }
         let mut guard = self.by_id.write().await;
-        for meta in guard.values_mut() {
-            let (path, reason) = probe_with_reason(meta);
-            meta.resolved_command = path;
-            meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(meta);
-            let reason = if meta.available { None } else { reason };
-            log_probe_result(meta, &reason);
+        for (id, available, resolved_command) in results {
+            if let Some(meta) = guard.get_mut(&id) {
+                meta.available = available;
+                meta.resolved_command = resolved_command;
+            }
         }
         log_availability_summary(guard.values(), "AgentRegistry refresh_availability complete");
+        *self.unavailable_reasons.write().await = reasons;
     }
 
-    /// Refetch every row from the repository, then re-resolve PATH.
-    ///
-    /// Called after any mutation that changed the set of rows on disk
-    /// (create/delete) or the spawn command of an existing row
-    /// (update). Pure refresh with no DB writes — just rebuilds the
-    /// in-memory snapshot so `list_all()` and `get()` return the latest
-    /// catalog state without waiting for the next process restart.
-    pub async fn invalidate_and_rehydrate(&self) -> Result<(), AgentError> {
-        self.hydrate().await?;
-        self.refresh_availability().await;
-        Ok(())
+    /// Refetch and re-probe one row from the repository, leaving the rest of
+    /// the in-memory availability snapshot untouched.
+    pub async fn reload_one(&self, id: &str) -> Result<Option<AgentMetadata>, AgentError> {
+        let row = self
+            .repo
+            .get(id)
+            .await
+            .map_err(|e| AgentError::internal(format!("load agent_metadata '{id}': {e}")))?;
+        let Some(row) = row else {
+            self.by_id.write().await.remove(id);
+            self.unavailable_reasons.write().await.remove(id);
+            return Ok(None);
+        };
+        let Some((meta, reason)) = decode_row(row, AvailabilityProjection::Probe) else {
+            self.by_id.write().await.remove(id);
+            self.unavailable_reasons.write().await.remove(id);
+            return Ok(None);
+        };
+        let (meta, reason) = validate_cli_availability(meta, reason).await;
+        log_probe_result(&meta, &reason);
+        self.update_cached_unavailable_reason(&meta.id, reason).await;
+        self.by_id.write().await.insert(meta.id.clone(), meta.clone());
+        Ok(Some(meta))
     }
 
     pub async fn get(&self, id: &str) -> Option<AgentMetadata> {
@@ -271,6 +347,7 @@ impl AgentRegistry {
     /// Management read model for settings surfaces that need to show
     /// official/custom rows even when unavailable.
     pub async fn list_management_rows(&self) -> Vec<AgentManagementRow> {
+        let reasons = self.unavailable_reasons.read().await.clone();
         let mut rows: Vec<AgentManagementRow> = self
             .by_id
             .read()
@@ -278,8 +355,9 @@ impl AgentRegistry {
             .values()
             .cloned()
             .map(|meta| {
-                let status = derive_management_status(&meta);
-                let diagnostics = derive_management_diagnostics(&meta, status);
+                let reason = reasons.get(&meta.id);
+                let status = derive_management_status(&meta, reason);
+                let diagnostics = derive_management_diagnostics(&meta, status, reason);
                 let handshake = meta.handshake;
                 AgentManagementRow {
                     id: meta.id,
@@ -329,6 +407,56 @@ impl AgentRegistry {
         rows
     }
 
+    pub async fn management_row_by_id(&self, id: &str) -> Option<AgentManagementRow> {
+        let reason = self.unavailable_reasons.read().await.get(id).cloned();
+        let meta = self.by_id.read().await.get(id).cloned()?;
+        let status = derive_management_status(&meta, reason.as_ref());
+        let diagnostics = derive_management_diagnostics(&meta, status, reason.as_ref());
+        let handshake = meta.handshake.clone();
+        Some(AgentManagementRow {
+            id: meta.id,
+            icon: meta.icon,
+            name: meta.name,
+            name_i18n: meta.name_i18n,
+            description: meta.description,
+            description_i18n: meta.description_i18n,
+            backend: meta.backend,
+            agent_type: meta.agent_type,
+            agent_source: meta.agent_source,
+            agent_source_info: meta.agent_source_info,
+            enabled: meta.enabled,
+            installed: meta.available,
+            command: meta.command,
+            args: meta.args,
+            env: Vec::new(),
+            native_skills_dirs: meta.native_skills_dirs,
+            behavior_policy: meta.behavior_policy,
+            yolo_id: meta.yolo_id,
+            agent_capabilities: handshake.agent_capabilities.clone(),
+            auth_methods: handshake.auth_methods.clone(),
+            config_options: handshake.config_options.clone(),
+            available_modes: handshake.available_modes.clone(),
+            available_models: handshake.available_models.clone(),
+            available_commands: handshake.available_commands.clone(),
+            dynamic_probe: handshake.dynamic_probe.clone(),
+            sort_order: meta.sort_order,
+            team_capable: meta.team_capable,
+            status,
+            last_check_status: meta.last_check_status,
+            last_check_kind: meta.last_check_kind,
+            last_check_error_code: diagnostics.error_code,
+            last_check_error_message: diagnostics.error_message,
+            last_check_error_details: diagnostics.details,
+            last_check_guidance: diagnostics.guidance,
+            last_check_latency_ms: meta.last_check_latency_ms,
+            last_check_at: meta.last_check_at,
+            last_success_at: meta.last_success_at,
+            last_failure_at: meta.last_failure_at,
+            has_command_override: meta.has_command_override,
+            env_override_key_count: meta.env_override_key_count,
+        })
+    }
+
     /// Like [`Self::list_all_including_hidden`] but pairs every row
     /// with a freshly-computed availability reason so callers (the
     /// `doctor` command, diagnostic UIs) can explain *why* a row is
@@ -342,17 +470,14 @@ impl AgentRegistry {
     /// when `available = true` would just confuse the caller, so we
     /// suppress it here.
     pub async fn diagnostic_snapshot(&self) -> Vec<(AgentMetadata, Option<UnavailableReason>)> {
+        let reasons = self.unavailable_reasons.read().await.clone();
         let mut rows: Vec<(AgentMetadata, Option<UnavailableReason>)> = self
             .by_id
             .read()
             .await
             .values()
             .map(|m| {
-                let reason = if m.available {
-                    None
-                } else {
-                    probe_resolved_command(m).err()
-                };
+                let reason = if m.available { None } else { reasons.get(&m.id).cloned() };
                 (m.clone(), reason)
             })
             .collect();
@@ -374,7 +499,7 @@ impl AgentRegistry {
 /// keeps both uninstalled CLIs and rows that most recently failed
 /// ACP/session admission out of visible legacy catalog reads.
 fn is_visible(meta: &AgentMetadata) -> bool {
-    meta.enabled && matches!(derive_management_status(meta), AgentManagementStatus::Online)
+    meta.enabled && matches!(derive_management_status(meta, None), AgentManagementStatus::Online)
 }
 
 /// Extract and trim a command override, filtering out empty strings.
@@ -394,12 +519,23 @@ fn parse_env_override(raw: &Option<String>) -> Option<Vec<AgentEnvEntry>> {
     serde_json::from_str::<Vec<AgentEnvEntry>>(s).ok()
 }
 
-/// Turn a DB row into the public `AgentMetadata`, probing the command
-/// on disk so `available` reflects the current PATH state. Returns
-/// the probe reason alongside the row so the caller can log a single
-/// uniform `(meta, reason)` line per agent without re-running the
-/// probe.
-fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<UnavailableReason>)> {
+#[derive(Clone, Copy)]
+enum AvailabilityProjection {
+    /// Use only deterministic row state plus persisted health snapshots.
+    Cached,
+    /// Resolve the spawn command against the current runtime environment.
+    Probe,
+}
+
+/// Turn a DB row into the public `AgentMetadata`.
+///
+/// Callers choose whether availability should come from persisted snapshots
+/// or from a live command probe. Startup hydration uses cached projection;
+/// explicit refresh and single-agent health-check reloads use probe.
+fn decode_row(
+    row: AgentMetadataRow,
+    availability: AvailabilityProjection,
+) -> Option<(AgentMetadata, Option<UnavailableReason>)> {
     // Extract override fields before row is partially moved
     let command_override_raw = row.command_override.clone();
     let env_override_raw = row.env_override.clone();
@@ -425,8 +561,9 @@ fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<Unavailabl
     };
 
     let backend_str = row.backend.as_deref().unwrap_or("");
-    let team_capable = behavior_policy.supports_team
+    let inferred_team_capable = behavior_policy.supports_team
         || aionui_common::constants::is_team_capable(backend_str, handshake.agent_capabilities.as_ref());
+    let team_capable = behavior_policy.team_capable_override.unwrap_or(inferred_team_capable);
 
     let mut meta = AgentMetadata {
         id: row.id,
@@ -509,10 +646,10 @@ fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<Unavailabl
         }
     }
 
-    let (path, reason) = probe_with_reason(&meta);
-    meta.resolved_command = path;
-    meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(&meta);
-    let reason = if meta.available { None } else { reason };
+    let reason = match availability {
+        AvailabilityProjection::Cached => apply_cached_availability(&mut meta),
+        AvailabilityProjection::Probe => apply_probe_availability(&mut meta),
+    };
     Some((meta, reason))
 }
 
@@ -522,6 +659,142 @@ fn is_internal_aion_cli(meta: &AgentMetadata) -> bool {
 
 fn is_internal_commandless_agent(meta: &AgentMetadata) -> bool {
     meta.enabled && meta.command.is_none() && meta.agent_source == AgentSource::Internal
+}
+
+fn apply_probe_availability(meta: &mut AgentMetadata) -> Option<UnavailableReason> {
+    let (path, reason) = probe_with_reason(meta);
+    meta.resolved_command = path;
+    meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(meta);
+    if meta.available { None } else { reason }
+}
+
+async fn validate_cli_availability(
+    mut meta: AgentMetadata,
+    reason: Option<UnavailableReason>,
+) -> (AgentMetadata, Option<UnavailableReason>) {
+    if !meta.available || meta.agent_source != AgentSource::Builtin {
+        return (meta, reason);
+    }
+
+    let Some(binary) = crate::cli_probe::command_name(&meta).map(str::to_owned) else {
+        return (meta, reason);
+    };
+
+    match crate::cli_probe::validate(&meta).await {
+        Ok(()) => (meta, None),
+        Err(detail) => {
+            meta.available = false;
+            meta.resolved_command = None;
+            (meta, Some(UnavailableReason::PrimaryUnusable { binary, detail }))
+        }
+    }
+}
+
+async fn validate_cli_candidates(
+    candidates: Vec<(AgentMetadata, Option<UnavailableReason>)>,
+) -> Vec<(AgentMetadata, Option<UnavailableReason>)> {
+    futures_util::stream::iter(candidates)
+        .map(|(meta, reason)| validate_cli_availability(meta, reason))
+        .buffer_unordered(CLI_PROBE_CONCURRENCY)
+        .collect()
+        .await
+}
+
+fn apply_cached_availability(meta: &mut AgentMetadata) -> Option<UnavailableReason> {
+    if !meta.enabled {
+        meta.available = false;
+        return Some(UnavailableReason::Disabled);
+    }
+    if is_internal_commandless_agent(meta) {
+        meta.available = true;
+        return None;
+    }
+    if cached_snapshot_indicates_missing(meta) {
+        meta.available = false;
+        return cached_unavailable_reason(meta);
+    }
+    if !has_availability_snapshot(meta) {
+        meta.available = false;
+        return if is_builtin_managed_agent(meta) {
+            None
+        } else if meta.command.as_deref().filter(|s| !s.is_empty()).is_none() {
+            Some(UnavailableReason::NoCommand)
+        } else {
+            None
+        };
+    }
+    meta.available = true;
+    None
+}
+
+fn is_builtin_managed_agent(meta: &AgentMetadata) -> bool {
+    meta.agent_source == AgentSource::Builtin
+        && meta
+            .backend
+            .as_deref()
+            .and_then(ManagedAcpToolId::from_backend)
+            .is_some()
+}
+
+fn is_builtin_codex(meta: &AgentMetadata) -> bool {
+    meta.agent_source == AgentSource::Builtin && meta.backend.as_deref() == Some("codex")
+}
+
+fn has_availability_snapshot(meta: &AgentMetadata) -> bool {
+    meta.last_check_status.is_some()
+        || meta.last_check_kind.is_some()
+        || meta.last_check_error_code.is_some()
+        || meta.last_check_at.is_some()
+        || meta.last_success_at.is_some()
+        || meta.last_failure_at.is_some()
+}
+
+fn cached_snapshot_indicates_missing(meta: &AgentMetadata) -> bool {
+    matches!(
+        meta.last_check_error_code.as_deref(),
+        Some(
+            "command_not_found"
+                | "command_missing"
+                | "primary_missing"
+                | "bridge_missing"
+                | "managed_runtime_unavailable"
+                | "no_command"
+                | "disabled"
+        )
+    )
+}
+
+fn cached_unavailable_reason(meta: &AgentMetadata) -> Option<UnavailableReason> {
+    match meta.last_check_error_code.as_deref()? {
+        "disabled" => Some(UnavailableReason::Disabled),
+        "no_command" => Some(UnavailableReason::NoCommand),
+        "bridge_missing" => meta
+            .agent_source_info
+            .bridge_binary
+            .clone()
+            .map(|bridge| UnavailableReason::BridgeMissing { bridge }),
+        "primary_missing" => meta
+            .agent_source_info
+            .binary_name
+            .clone()
+            .map(|binary| UnavailableReason::PrimaryMissing { binary }),
+        "command_not_found" | "command_missing" => Some(UnavailableReason::CommandMissing {
+            command: meta
+                .agent_source_info
+                .binary_name
+                .clone()
+                .or_else(|| meta.command.clone())
+                .unwrap_or_else(|| "command".to_owned()),
+        }),
+        "managed_runtime_unavailable" => Some(UnavailableReason::ManagedRuntimeUnavailable {
+            resource: meta.backend.clone().unwrap_or_else(|| "runtime".to_owned()),
+            detail: meta
+                .last_check_error_message
+                .clone()
+                .unwrap_or_else(|| "managed runtime was unavailable during the last health check".to_owned()),
+        }),
+        _ => None,
+    }
 }
 
 /// Wrapper around [`probe_resolved_command`] that returns both the
@@ -650,14 +923,21 @@ fn parse_last_check_kind(raw: Option<&str>) -> Option<AgentSnapshotCheckKind> {
     })
 }
 
-fn derive_management_status(meta: &AgentMetadata) -> AgentManagementStatus {
+fn derive_management_status(meta: &AgentMetadata, reason: Option<&UnavailableReason>) -> AgentManagementStatus {
     if !meta.available {
-        return AgentManagementStatus::Missing;
+        if reason.is_some() || has_availability_snapshot(meta) {
+            return AgentManagementStatus::Missing;
+        }
+        return AgentManagementStatus::Unchecked;
+    }
+    if is_internal_commandless_agent(meta) {
+        return AgentManagementStatus::Online;
     }
 
     match meta.last_check_status {
         Some(AgentSnapshotCheckStatus::Offline) => AgentManagementStatus::Offline,
-        _ => AgentManagementStatus::Online,
+        Some(AgentSnapshotCheckStatus::Online) => AgentManagementStatus::Online,
+        None => AgentManagementStatus::Unchecked,
     }
 }
 
@@ -668,9 +948,13 @@ struct ManagementDiagnostics {
     guidance: Option<String>,
 }
 
-fn derive_management_diagnostics(meta: &AgentMetadata, status: AgentManagementStatus) -> ManagementDiagnostics {
+fn derive_management_diagnostics(
+    meta: &AgentMetadata,
+    status: AgentManagementStatus,
+    reason: Option<&UnavailableReason>,
+) -> ManagementDiagnostics {
     let derived_reason = if matches!(status, AgentManagementStatus::Missing) {
-        probe_resolved_command(meta).err()
+        reason.cloned()
     } else {
         None
     };
@@ -743,6 +1027,10 @@ fn diagnostic_details_for_unavailable_reason(reason: &UnavailableReason) -> Opti
             "code": "primary_missing",
             "command": binary,
         })),
+        UnavailableReason::PrimaryUnusable { binary, .. } => Some(json!({
+            "code": "primary_unusable",
+            "command": binary,
+        })),
         UnavailableReason::CommandMissing { command } => Some(json!({
             "code": "command_missing",
             "command": command,
@@ -760,6 +1048,7 @@ fn unavailable_reason_code(reason: &UnavailableReason) -> String {
         UnavailableReason::NoCommand => "no_command",
         UnavailableReason::BridgeMissing { .. } => "bridge_missing",
         UnavailableReason::PrimaryMissing { .. } => "primary_missing",
+        UnavailableReason::PrimaryUnusable { .. } => "primary_unusable",
         UnavailableReason::CommandMissing { .. } => "command_missing",
         UnavailableReason::ManagedRuntimeUnavailable { .. } => "managed_runtime_unavailable",
     }
@@ -777,6 +1066,9 @@ fn guidance_for_unavailable_reason(reason: &UnavailableReason) -> String {
         }
         UnavailableReason::PrimaryMissing { binary } => {
             format!("Install `{binary}` and make sure it is available on PATH, then run Test Connection again.")
+        }
+        UnavailableReason::PrimaryUnusable { binary, .. } => {
+            format!("Repair or reinstall `{binary}`, then run Test Connection again.")
         }
         UnavailableReason::CommandMissing { command } => {
             format!("Install `{command}` and make sure it is available on PATH, then run Test Connection again.")
@@ -897,12 +1189,15 @@ pub enum UnavailableReason {
     /// this bucket (handled in `decode_row`); for everyone else this
     /// is a seed-data bug.
     NoCommand,
-    /// Bridge binary (`agent_source_info.bridge_binary`, e.g. `bun`
-    /// for `bun x @pkg`) is not on `$PATH`.
+    /// Bridge binary (`agent_source_info.bridge_binary`, e.g. `npx`
+    /// for `npx --yes @pkg`) is not on `$PATH`.
     BridgeMissing { bridge: String },
     /// Primary CLI (`agent_source_info.binary_name`, e.g. `claude`
     /// for the bridged Claude row) is not on `$PATH`.
     PrimaryMissing { binary: String },
+    /// Primary CLI resolves on `$PATH`, but its lightweight version probe
+    /// failed, so the wrapper cannot be treated as runnable.
+    PrimaryUnusable { binary: String, detail: String },
     /// Spawn command itself (`command` field) is not on `$PATH`. For
     /// direct-CLI rows this is the same binary as `binary_name`; for
     /// bridge rows it's the bridge.
@@ -919,6 +1214,9 @@ impl std::fmt::Display for UnavailableReason {
             Self::NoCommand => f.write_str("no spawn command configured"),
             Self::BridgeMissing { bridge } => write!(f, "bridge binary `{bridge}` not on $PATH"),
             Self::PrimaryMissing { binary } => write!(f, "primary binary `{binary}` not on $PATH"),
+            Self::PrimaryUnusable { binary, detail } => {
+                write!(f, "primary binary `{binary}` is not runnable: {detail}")
+            }
             Self::CommandMissing { command } => write!(f, "spawn command `{command}` not on $PATH"),
             Self::ManagedRuntimeUnavailable { resource, detail } => {
                 write!(f, "managed `{resource}` unavailable: {detail}")
@@ -933,14 +1231,21 @@ impl std::fmt::Display for UnavailableReason {
 /// source of truth for `available` — callers never re-run `which()`
 /// themselves.
 ///
-/// Bridge-based rows (e.g. `bun x @pkg`) require both `bun` (the spawn
-/// command) and the wrapped CLI (`claude`, recorded in
+/// Bridge-based rows (e.g. `npx --yes @pkg`) require both `npx` (the
+/// spawn command) and the wrapped CLI (`claude`, recorded in
 /// `agent_source_info.binary_name`) to be present. Direct-CLI rows
 /// have `spawn command == primary binary`, so the primary-binary check
 /// is a no-op for them.
 fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableReason> {
     if !meta.enabled {
         return Err(UnavailableReason::Disabled);
+    }
+
+    if is_builtin_codex(meta) {
+        let primary = crate::cli_probe::command_name(meta).unwrap_or("codex");
+        return probe_command_candidate(primary).ok_or_else(|| UnavailableReason::PrimaryMissing {
+            binary: primary.to_owned(),
+        });
     }
 
     if meta.agent_source == AgentSource::Builtin
@@ -1028,7 +1333,7 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 21);
+        assert_eq!(all.len(), 40);
     }
 
     #[tokio::test]
@@ -1046,12 +1351,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_yolo_id_maps_to_full_access() {
+    async fn codex_yolo_id_maps_to_agent_full_access() {
         let reg = registry().await;
         let codex = reg.find_builtin_by_backend("codex").await.unwrap();
         // Legacy AionUi yolo aliases resolve to Codex's native
-        // `full-access` mode via the catalog row.
-        assert_eq!(codex.yolo_id.as_deref(), Some("full-access"));
+        // `agent-full-access` mode via the catalog row.
+        assert_eq!(codex.yolo_id.as_deref(), Some("agent-full-access"));
     }
 
     #[tokio::test]
@@ -1066,6 +1371,45 @@ mod tests {
         let reg = registry().await;
         let hermes = reg.find_builtin_by_backend("hermes").await.unwrap();
         assert_eq!(hermes.yolo_id, None);
+    }
+
+    #[tokio::test]
+    async fn pi_builtin_uses_stable_acp_adapter_and_requires_pi_cli() {
+        let reg = registry().await;
+        let pi = reg.find_builtin_by_backend("pi").await.unwrap();
+
+        assert_eq!(pi.command.as_deref(), Some("npx"));
+        assert_eq!(pi.args, ["-y", "pi-acp"]);
+        assert_eq!(pi.agent_source_info.binary_name.as_deref(), Some("pi"));
+        assert_eq!(pi.agent_source_info.bridge_binary.as_deref(), Some("npx"));
+        assert_eq!(pi.native_skills_dirs.as_deref(), Some(&[".pi/skills".to_owned()][..]));
+        assert!(!pi.team_capable);
+        assert_eq!(pi.yolo_id, None);
+        assert_eq!(
+            pi.handshake
+                .agent_capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.get("load_session"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn every_builtin_npx_agent_has_a_release_lock() {
+        let reg = registry().await;
+        let all = reg.list_all_including_hidden().await;
+        let mut locked = 0;
+        for meta in all
+            .iter()
+            .filter(|meta| meta.agent_source == AgentSource::Builtin && meta.command.as_deref() == Some("npx"))
+        {
+            let backend = meta.backend.as_deref().expect("builtin npx backend");
+            aionui_runtime::pin_registry_npx_args(backend, &meta.args)
+                .unwrap_or_else(|error| panic!("missing release lock for {backend}: {error}"));
+            locked += 1;
+        }
+        assert_eq!(locked, 11);
     }
 
     /// On a host that has *none* of the seeded CLIs installed, the
@@ -1100,7 +1444,7 @@ mod tests {
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
         let count = |t: AgentType| all.iter().filter(|m| m.agent_type == t).count();
-        assert_eq!(count(AgentType::Acp), 18);
+        assert_eq!(count(AgentType::Acp), 37);
         assert_eq!(count(AgentType::Nanobot), 1);
         assert_eq!(count(AgentType::OpenclawGateway), 1);
         assert_eq!(count(AgentType::Aionrs), 1);
@@ -1203,20 +1547,20 @@ mod tests {
     }
 
     /// `diagnostic_snapshot` returns one entry per row, populates a
-    /// reason for every unavailable row, and leaves available rows
-    /// without one. The CI host doesn't have the seeded CLIs
-    /// installed, so the bridge/CLI rows are reliably unavailable
-    /// here — the assertion exploits that to lock the contract.
+    /// reason for rows known unavailable by probe/cache, and leaves
+    /// available or unchecked rows without one. Unchecked rows are
+    /// expected after startup hydration avoids live probing.
     #[tokio::test]
     async fn diagnostic_snapshot_pairs_rows_with_reasons() {
         let reg = registry().await;
         let snapshot = reg.diagnostic_snapshot().await;
-        assert_eq!(snapshot.len(), 21, "every row appears once");
+        assert_eq!(snapshot.len(), 40, "every row appears once");
 
         for (meta, reason) in &snapshot {
             match (meta.available, reason) {
                 (true, None) => {}
                 (false, Some(_)) => {}
+                (false, None) if matches!(derive_management_status(meta, None), AgentManagementStatus::Unchecked) => {}
                 (true, Some(r)) => panic!("available row {} has unexpected reason {:?}", meta.id, r),
                 (false, None) => panic!(
                     "unavailable row {} (source={:?}) is missing a reason",
@@ -1326,7 +1670,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         };
-        let (meta, _) = super::decode_row(row).expect("decodes");
+        let (meta, _) = super::decode_row(row, super::AvailabilityProjection::Cached).expect("decodes");
         assert_eq!(meta.command.as_deref(), Some("/opt/factory/bin/droid"));
     }
 
@@ -1375,7 +1719,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         };
-        let (meta, reason) = super::decode_row(row).expect("decodes");
+        let (meta, reason) = super::decode_row(row, super::AvailabilityProjection::Cached).expect("decodes");
         assert_eq!(meta.agent_type, AgentType::Aionrs);
         assert_eq!(meta.agent_source, AgentSource::Internal);
         assert_eq!(meta.command, None);
@@ -1431,7 +1775,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         };
-        let (meta, _) = super::decode_row(row).expect("decodes");
+        let (meta, _) = super::decode_row(row, super::AvailabilityProjection::Cached).expect("decodes");
         let names: Vec<&str> = meta.env.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"BASE"));
         assert!(names.contains(&"ANTHROPIC_API_KEY"));

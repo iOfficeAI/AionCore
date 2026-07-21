@@ -70,23 +70,35 @@ impl ConversationService {
             Err(err) => return Err(ConversationError::from(err)),
         };
 
-        // Mirror runtime model/mode switches into the persisted assistant
+        // Mirror runtime model/mode/thought-level switches into the persisted assistant
         // snapshot + preference so the next conversation seeded from this
         // assistant in `auto` mode reflects the latest pick. We only act on
         // observed confirmations — `command_ack` means the agent merely
-        // accepted the request, not that the value is in effect, and
-        // unrelated option ids (e.g. `thought_level`) have no preference
-        // mapping. Persistence failures are logged but do not roll back the
+        // accepted the request, not that the value is in effect. Persistence
+        // failures are logged but do not roll back the
         // user-facing config switch.
         if response.confirmation == ConfigOptionConfirmation::Observed {
-            let updates = match option_id {
+            let category = response
+                .config_options
+                .as_ref()
+                .and_then(|options| options.iter().find(|option| option.id == option_id))
+                .and_then(|option| option.category.as_deref())
+                .unwrap_or(option_id);
+            let updates = match category {
                 "model" => Some(AssistantRuntimePreferenceUpdate {
                     model: Some(req.value.as_str()),
                     permission: None,
+                    thought_level: None,
                 }),
                 "mode" => Some(AssistantRuntimePreferenceUpdate {
                     model: None,
                     permission: Some(req.value.as_str()),
+                    thought_level: None,
+                }),
+                "thought_level" | "reasoning_effort" => Some(AssistantRuntimePreferenceUpdate {
+                    model: None,
+                    permission: None,
+                    thought_level: Some(req.value.as_str()),
                 }),
                 _ => None,
             };

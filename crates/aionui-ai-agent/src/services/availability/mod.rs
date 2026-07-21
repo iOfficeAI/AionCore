@@ -39,33 +39,31 @@ struct AvailabilitySnapshot {
 #[derive(Clone)]
 pub struct AgentAvailabilityService {
     registry: Arc<AgentRegistry>,
-    data_dir: PathBuf,
     // Used to decide aionrs (built-in, no external CLI) availability: it is
     // usable only when at least one model provider is configured & enabled.
     provider_repo: Arc<dyn IProviderRepository>,
+    data_dir: PathBuf,
 }
 
 impl AgentAvailabilityService {
     pub fn new(registry: Arc<AgentRegistry>, provider_repo: Arc<dyn IProviderRepository>, data_dir: PathBuf) -> Self {
         Self {
             registry,
-            data_dir,
             provider_repo,
+            data_dir,
         }
     }
 
     pub async fn list_management_rows(&self) -> Vec<AgentManagementRow> {
-        self.registry.refresh_availability().await;
         self.registry.list_management_rows().await
     }
 
     pub async fn run_manual_health_check(&self, id: &str) -> Result<AgentManagementRow, AgentError> {
-        self.registry.invalidate_and_rehydrate().await?;
         let meta = self
             .registry
-            .get(id)
+            .reload_one(id)
             .await
-            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
+            .and_then(|row| row.ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found"))))?;
 
         if !meta.available {
             return self
@@ -78,7 +76,6 @@ impl AgentAvailabilityService {
             &self.registry,
             &self.provider_repo,
             &meta,
-            &self.data_dir,
             AgentSnapshotCheckKind::Manual,
         )
         .await;
@@ -141,11 +138,7 @@ impl AgentAvailabilityService {
     }
 
     pub async fn management_row_by_id(&self, id: &str) -> Option<AgentManagementRow> {
-        self.registry
-            .list_management_rows()
-            .await
-            .into_iter()
-            .find(|row| row.id == id)
+        self.registry.management_row_by_id(id).await
     }
 
     async fn persist_snapshot(
@@ -192,7 +185,7 @@ impl AgentAvailabilityService {
             .update_availability_snapshot(id, &params)
             .await
             .map_err(|error| AgentError::internal(format!("repo.update_availability_snapshot: {error}")))?;
-        self.registry.invalidate_and_rehydrate().await?;
+        self.registry.reload_one(id).await?;
         Ok(())
     }
 }
@@ -232,7 +225,6 @@ async fn run_probe(
     registry: &Arc<AgentRegistry>,
     provider_repo: &Arc<dyn IProviderRepository>,
     meta: &AgentMetadata,
-    data_dir: &std::path::Path,
     kind: AgentSnapshotCheckKind,
 ) -> AvailabilitySnapshot {
     let started_at = now_ms();
@@ -242,7 +234,7 @@ async fn run_probe(
         && let Some(backend) = meta.backend.as_deref()
         && let Some(tool) = ManagedAcpToolId::from_backend(backend)
     {
-        match try_connect_builtin_managed_agent(meta, data_dir, tool).await {
+        match try_connect_builtin_managed_agent(meta, tool).await {
             TryConnectCustomAgentResponse::Success => (AgentSnapshotCheckStatus::Online, None, None),
             TryConnectCustomAgentResponse::FailCli { error } => (
                 AgentSnapshotCheckStatus::Offline,
@@ -268,25 +260,32 @@ async fn run_probe(
             .iter()
             .map(|entry| (entry.name.clone(), entry.value.clone()))
             .collect();
-        match custom_agent_probe::try_connect_custom_agent(command, &meta.args, &env, data_dir, None).await {
-            TryConnectCustomAgentResponse::Success => (AgentSnapshotCheckStatus::Online, None, None),
-            TryConnectCustomAgentResponse::FailCli { error } => (
+        match explicit_probe_args(meta) {
+            Err(error) => (
                 AgentSnapshotCheckStatus::Offline,
-                Some("command_not_found".to_owned()),
+                Some("package_lock_invalid".to_owned()),
                 Some(error),
             ),
-            TryConnectCustomAgentResponse::FailAcp { error } => (
-                AgentSnapshotCheckStatus::Offline,
-                Some("acp_init_failed".to_owned()),
-                Some(error),
-            ),
-            // Reachable but not authorized: still offline (unusable), but a
-            // dedicated code lets the UI guide the user to log in.
-            TryConnectCustomAgentResponse::FailAuth { error } => (
-                AgentSnapshotCheckStatus::Offline,
-                Some("auth_required".to_owned()),
-                Some(error),
-            ),
+            Ok(args) => match custom_agent_probe::try_connect_custom_agent(command, &args, &env, None).await {
+                TryConnectCustomAgentResponse::Success => (AgentSnapshotCheckStatus::Online, None, None),
+                TryConnectCustomAgentResponse::FailCli { error } => (
+                    AgentSnapshotCheckStatus::Offline,
+                    Some("command_not_found".to_owned()),
+                    Some(error),
+                ),
+                TryConnectCustomAgentResponse::FailAcp { error } => (
+                    AgentSnapshotCheckStatus::Offline,
+                    Some("acp_init_failed".to_owned()),
+                    Some(error),
+                ),
+                // Reachable but not authorized: still offline (unusable), but a
+                // dedicated code lets the UI guide the user to log in.
+                TryConnectCustomAgentResponse::FailAuth { error } => (
+                    AgentSnapshotCheckStatus::Offline,
+                    Some("auth_required".to_owned()),
+                    Some(error),
+                ),
+            },
         }
     } else if let Some(backend) = meta.backend.as_deref() {
         let result = cli_detect::health_check(registry, backend).await;
@@ -328,6 +327,17 @@ async fn run_probe(
         latency_ms,
         checked_at: started_at,
     }
+}
+
+fn explicit_probe_args(meta: &AgentMetadata) -> Result<Vec<String>, String> {
+    if meta.agent_source == AgentSource::Builtin && meta.agent_source_info.bridge_binary.as_deref() == Some("npx") {
+        let backend = meta
+            .backend
+            .as_deref()
+            .ok_or_else(|| "builtin npx agent has no backend".to_owned())?;
+        return aionui_runtime::pin_registry_npx_args(backend, &meta.args).map_err(|error| error.to_string());
+    }
+    Ok(meta.args.clone())
 }
 
 /// Readiness check for the built-in aionrs agent.
@@ -379,7 +389,6 @@ async fn run_dynamic_probe(meta: &AgentMetadata, data_dir: &std::path::Path) -> 
 
 async fn try_connect_builtin_managed_agent(
     meta: &AgentMetadata,
-    data_dir: &std::path::Path,
     tool: ManagedAcpToolId,
 ) -> TryConnectCustomAgentResponse {
     let spec = match build_builtin_managed_agent_spec(meta, tool).await {
@@ -389,7 +398,7 @@ async fn try_connect_builtin_managed_agent(
 
     match tokio::time::timeout(
         Duration::from_secs(35),
-        custom_agent_probe::acp_probe_command_spec(spec, data_dir),
+        custom_agent_probe::acp_probe_command_spec(spec),
     )
     .await
     {
@@ -472,7 +481,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        AgentAvailabilityService, dynamic_probe_failure_message, probe_aionrs_provider_readiness,
+        AgentAvailabilityService, dynamic_probe_failure_message, explicit_probe_args, probe_aionrs_provider_readiness,
         probe_snapshot_to_persist, run_probe,
     };
     use crate::registry::AgentRegistry;
@@ -754,19 +763,15 @@ mod tests {
             agent_source: AgentSource::Builtin,
             agent_source_info: AgentSourceInfo {
                 binary_name: Some("definitely-missing-claude-cli".into()),
-                bridge_binary: Some("bun".into()),
+                bridge_binary: Some("npx".into()),
                 hub_package_id: None,
                 version: None,
             },
             enabled: true,
             available: true,
-            command: Some("bun".into()),
+            command: Some("npx".into()),
             resolved_command: None,
-            args: vec![
-                "x".into(),
-                "--bun".into(),
-                "@agentclientprotocol/claude-agent-acp@0.39.0".into(),
-            ],
+            args: vec!["--yes".into(), "@agentclientprotocol/claude-agent-acp@0.58.1".into()],
             env: vec![],
             native_skills_dirs: Some(vec![".claude/skills".into()]),
             behavior_policy: BehaviorPolicy::default(),
@@ -788,14 +793,7 @@ mod tests {
             env_override_key_count: 0,
         };
 
-        let snapshot = run_probe(
-            &registry,
-            &provider_repo,
-            &meta,
-            std::env::temp_dir().as_path(),
-            AgentSnapshotCheckKind::Manual,
-        )
-        .await;
+        let snapshot = run_probe(&registry, &provider_repo, &meta, AgentSnapshotCheckKind::Manual).await;
 
         assert_eq!(snapshot.status, "offline");
         assert_eq!(snapshot.error_code.as_deref(), Some("command_not_found"));
@@ -807,5 +805,13 @@ mod tests {
             "expected missing primary binary message, got {:?}",
             snapshot.error_message
         );
+
+        let mut pi = meta.clone();
+        pi.name = "Pi".into();
+        pi.backend = Some("pi".into());
+        pi.agent_source_info.binary_name = Some("pi".into());
+        pi.agent_source_info.bridge_binary = Some("npx".into());
+        pi.args = vec!["-y".into(), "pi-acp".into()];
+        assert_eq!(explicit_probe_args(&pi).unwrap(), ["-y", "pi-acp@0.0.31"]);
     }
 }

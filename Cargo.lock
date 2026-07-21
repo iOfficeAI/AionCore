@@ -117,8 +117,8 @@ dependencies = [
 
 [[package]]
 name = "aion-agent"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-compact",
  "aion-config",
@@ -142,24 +142,26 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
  "workspace-hack",
 ]
 
 [[package]]
 name = "aion-compact"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "regex",
  "serde",
  "serde_json",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "aion-config"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-compact",
  "aion-process",
@@ -183,8 +185,8 @@ dependencies = [
 
 [[package]]
 name = "aion-mcp"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -204,8 +206,8 @@ dependencies = [
 
 [[package]]
 name = "aion-memory"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-config",
  "chrono",
@@ -218,8 +220,8 @@ dependencies = [
 
 [[package]]
 name = "aion-process"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "libc",
  "tokio",
@@ -229,8 +231,8 @@ dependencies = [
 
 [[package]]
 name = "aion-protocol"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-types",
  "serde",
@@ -242,8 +244,8 @@ dependencies = [
 
 [[package]]
 name = "aion-providers"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-config",
  "aion-types",
@@ -270,8 +272,8 @@ dependencies = [
 
 [[package]]
 name = "aion-skills"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-config",
  "aion-mcp",
@@ -297,8 +299,8 @@ dependencies = [
 
 [[package]]
 name = "aion-tools"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-config",
  "aion-process",
@@ -306,6 +308,7 @@ dependencies = [
  "aion-types",
  "anyhow",
  "async-trait",
+ "base64",
  "futures",
  "glob",
  "lru",
@@ -318,18 +321,20 @@ dependencies = [
 
 [[package]]
 name = "aion-types"
-version = "0.1.36"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
  "serde",
  "serde_json",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "aionui-ai-agent"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "agent-client-protocol",
  "aion-agent",
@@ -357,6 +362,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "hex",
+ "http 1.4.0",
  "libc",
  "regex",
  "rusqlite",
@@ -377,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-api-types"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-common",
  "serde",
@@ -386,9 +392,8 @@ dependencies = [
 
 [[package]]
 name = "aionui-app"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
- "aion-config",
  "aionui-ai-agent",
  "aionui-api-types",
  "aionui-assets",
@@ -415,6 +420,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "chrono",
  "clap",
  "dirs",
  "futures-util",
@@ -442,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assets"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-common",
  "axum",
@@ -457,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assistant"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -483,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-auth"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -507,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-channel"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -539,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-common"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -556,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-conversation"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -570,6 +576,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "chrono",
  "regex",
  "serde",
  "serde_json",
@@ -577,11 +584,12 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "aionui-cron"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -602,12 +610,13 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
 ]
 
 [[package]]
 name = "aionui-db"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-common",
  "async-trait",
@@ -623,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-development"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -651,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-extension"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -662,6 +671,7 @@ dependencies = [
  "axum",
  "dirs",
  "fs2",
+ "hex",
  "http-body-util",
  "include_dir",
  "junction",
@@ -671,17 +681,18 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tower",
  "tracing",
- "zip",
+ "zip 2.4.2",
 ]
 
 [[package]]
 name = "aionui-file"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -704,12 +715,12 @@ dependencies = [
  "tower-http",
  "tracing",
  "walkdir",
- "zip",
+ "zip 2.4.2",
 ]
 
 [[package]]
 name = "aionui-mcp"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -731,11 +742,12 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "aionui-office"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -761,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-project"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -786,7 +798,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-realtime"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-api-types",
  "axum",
@@ -801,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-runtime"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "dirs",
  "flate2",
@@ -822,13 +834,12 @@ dependencies = [
  "wait-timeout",
  "walkdir",
  "which 7.0.3",
- "zip",
- "zstd",
+ "zip 2.4.2",
 ]
 
 [[package]]
 name = "aionui-shell"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -859,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-system"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -877,16 +888,19 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror 2.0.18",
  "tokio",
  "tower",
  "tracing",
+ "tracing-subscriber",
+ "windows-sys 0.61.2",
  "wiremock",
 ]
 
 [[package]]
 name = "aionui-team"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
  "agent-client-protocol",
  "aionui-ai-agent",
@@ -913,8 +927,9 @@ dependencies = [
 
 [[package]]
 name = "aionui-team-prompts"
-version = "0.1.39"
+version = "0.1.49"
 dependencies = [
+ "aionui-api-types",
  "serde",
  "serde_json",
 ]
@@ -1027,6 +1042,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f28d99ec8bfea296261ca1af174f24225171fea9664ba9003cbebee704810528"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "atoi_simd"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3cdb3708a128e559a30fb830e8a77a5022ee6902806925c216658652b452a44"
+dependencies = [
+ "debug_unsafe",
+ "rustversion",
 ]
 
 [[package]]
@@ -1643,17 +1668,19 @@ dependencies = [
 
 [[package]]
 name = "calamine"
-version = "0.26.1"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "138646b9af2c5d7f1804ea4bf93afc597737d2bd4f7341d67c48b03316976eb1"
+checksum = "6975084f43060e56343ffba7f9731fa52a7dcf2e1cd8e2459fd4c6bf4a1bff59"
 dependencies = [
+ "atoi_simd",
  "byteorder",
  "codepage",
  "encoding_rs",
+ "fast-float2",
  "log",
  "quick-xml",
  "serde",
- "zip",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -1910,9 +1937,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2117,6 +2144,12 @@ name = "deadpool-runtime"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
+
+[[package]]
+name = "debug_unsafe"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7eed2c4702fa172d1ce21078faa7c5203e69f5394d48cc436d25928394a867a2"
 
 [[package]]
 name = "deflate64"
@@ -2404,6 +2437,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "fast-float2"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8eb564c5c7423d25c886fb561d1e4ee69f72354d16918afa32c08811f6b6a55"
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2455,6 +2494,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -4055,9 +4095,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.31.0"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1004a344b30a54e2ee58d66a71b32d2db2feb0a31f9a2d302bf0536f15de2a33"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "encoding_rs",
  "memchr",
@@ -4459,7 +4499,7 @@ version = "0.82.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d61a82de4e7b30fc427909f2c5aafaada88cc7ae8316edabae435f74341f9278"
 dependencies = [
- "zip",
+ "zip 2.4.2",
 ]
 
 [[package]]
@@ -5727,6 +5767,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+
+[[package]]
 name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6119,7 +6165,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -6432,6 +6478,9 @@ name = "winnow"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee1708bef14716a11bae175f579062d4554d95be2c6829f518df847b7b3fdd0"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "winsafe"
@@ -6559,7 +6608,51 @@ dependencies = [
 [[package]]
 name = "workspace-hack"
 version = "0.1.0"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.1.36#d33a95e8ad2da3a8ee44f429e23d9e7f41fef99c"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
+dependencies = [
+ "bitflags",
+ "cc",
+ "futures-channel",
+ "futures-core",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "log",
+ "memchr",
+ "mio",
+ "num-traits",
+ "percent-encoding",
+ "proc-macro2",
+ "quote",
+ "regex-automata",
+ "regex-syntax",
+ "rustix",
+ "rustls",
+ "rustls-webpki",
+ "serde_core",
+ "slab",
+ "smallvec",
+ "subtle",
+ "syn",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "toml_datetime 1.1.1+spec-1.1.0",
+ "toml_parser",
+ "tracing",
+ "tracing-core",
+ "uuid",
+ "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
+ "winnow 1.0.2",
+ "zeroize",
+]
 
 [[package]]
 name = "writeable"
@@ -6738,6 +6831,26 @@ dependencies = [
  "zopfli",
  "zstd",
 ]
+
+[[package]]
+name = "zip"
+version = "8.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap 2.14.0",
+ "memchr",
+ "typed-path",
+ "zopfli",
+]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5431d5661c32445236631278f27946e444ddafe4684cac70b185272d4f9c52d5"
 
 [[package]]
 name = "zmij"

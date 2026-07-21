@@ -10,9 +10,9 @@ use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    UpdateConversationArtifactRequest, UpdateConversationRequest,
+    CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery,
+    MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
+    SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -68,6 +68,18 @@ impl From<ConversationError> for ApiError {
                     "requested": requested,
                 })),
             ),
+            ConversationError::TeamRuntimeRequired {
+                conversation_id,
+                team_id,
+            } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_RUNTIME_REQUIRED",
+                "This conversation belongs to a team; use the team runtime session",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "team_id": team_id,
+                })),
+            ),
             ConversationError::Unprocessable { reason } => ApiError::UnprocessableEntity(reason),
             ConversationError::Internal { reason } => ApiError::Internal(reason),
             ConversationError::WorkspacePathUnavailable { path } => ApiError::WorkspacePathUnavailable(path),
@@ -104,7 +116,8 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
-        .route("/api/conversations/{id}/warmup", post(warmup))
+        .route("/api/conversations/{id}/runtime/ensure", post(ensure_runtime))
+        .route("/api/conversations/{id}/active-lease", post(active_lease))
         // Confirmation system
         .route("/api/conversations/{id}/confirmations", get(list_confirmations))
         .route("/api/conversations/{id}/confirmations/{callId}/confirm", post(confirm))
@@ -304,14 +317,27 @@ async fn cancel(
     Ok(Json(ApiResponse::ok(response)))
 }
 
-async fn warmup(
+async fn ensure_runtime(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<EnsureConversationRuntimeResponse>>, ApiError> {
+    let response = state
+        .service
+        .ensure_runtime(&user.id, &id, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn active_lease(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     state
         .service
-        .warmup(&user.id, &id, &state.task_manager)
+        .renew_active_lease(&user.id, &id, &state.active_leases)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))

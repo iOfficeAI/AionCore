@@ -130,6 +130,21 @@ pub(crate) fn extract_config_options_from_value(value: &Value) -> Option<Vec<Ses
     })
 }
 
+pub(crate) fn extract_modes_from_value(value: &Value) -> Option<SessionModeState> {
+    serde_json::from_value(value.clone())
+        .ok()
+        .or_else(|| serde_json::from_value(keys_to_camel_case(value.clone())).ok())
+        .filter(|modes: &SessionModeState| !modes.available_modes.is_empty())
+}
+
+pub(crate) fn extract_models_from_value(value: &Value) -> Option<SessionModelState> {
+    serde_json::from_value(value.clone())
+        .ok()
+        .or_else(|| serde_json::from_value(keys_to_camel_case(value.clone())).ok())
+        .filter(|models: &SessionModelState| !models.available_models.is_empty())
+        .or_else(|| model_payload_to_state(value))
+}
+
 fn find_select<'a>(
     options: &'a [SessionConfigOption],
     ids: &[&str],
@@ -173,6 +188,37 @@ fn decode_config_options(value: &Value) -> Option<Vec<SessionConfigOption>> {
     serde_json::from_value(value.clone())
         .ok()
         .or_else(|| serde_json::from_value(keys_to_camel_case(value.clone())).ok())
+}
+
+fn model_payload_to_state(value: &Value) -> Option<SessionModelState> {
+    let object = value.as_object()?;
+    let models_value = object
+        .get("available_models")
+        .or_else(|| object.get("availableModels"))?;
+    let models = models_value.as_array()?;
+    let available_models: Vec<ModelInfo> = models
+        .iter()
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            let id = object.get("id")?.as_str()?;
+            let label = object
+                .get("label")
+                .or_else(|| object.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or(id);
+            Some(ModelInfo::new(id.to_owned(), label.to_owned()))
+        })
+        .collect();
+    if available_models.is_empty() {
+        return None;
+    }
+    let current_model_id = object
+        .get("current_model_id")
+        .or_else(|| object.get("currentModelId"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| available_models[0].model_id.0.as_ref());
+    Some(SessionModelState::new(current_model_id.to_owned(), available_models))
 }
 
 fn mode_state_to_snake_value(modes: &SessionModeState) -> Option<Value> {
@@ -535,6 +581,42 @@ mod tests {
                 .to_string(),
             "plan"
         );
+    }
+
+    #[test]
+    fn extracts_mode_state_from_snake_metadata_catalog() {
+        let value = json!({
+            "current_mode_id": "auto",
+            "available_modes": [
+                {"id": "read-only", "name": "Read Only"},
+                {"id": "full-access", "name": "Full Access"}
+            ]
+        });
+
+        let modes = extract_modes_from_value(&value).expect("mode state");
+
+        assert_eq!(modes.current_mode_id.to_string(), "auto");
+        assert_eq!(modes.available_modes.len(), 2);
+        assert_eq!(modes.available_modes[1].id.to_string(), "full-access");
+    }
+
+    #[test]
+    fn extracts_model_state_from_frontend_metadata_payload() {
+        let value = json!({
+            "current_model_id": "gpt-5.5",
+            "current_model_label": "GPT-5.5",
+            "available_models": [
+                {"id": "gpt-5.5", "label": "GPT-5.5"},
+                {"id": "gpt-5.4", "label": "gpt-5.4"}
+            ]
+        });
+
+        let models = extract_models_from_value(&value).expect("model state");
+
+        assert_eq!(models.current_model_id.to_string(), "gpt-5.5");
+        assert_eq!(models.available_models.len(), 2);
+        assert_eq!(models.available_models[1].model_id.to_string(), "gpt-5.4");
+        assert_eq!(models.available_models[1].name, "gpt-5.4");
     }
 
     #[test]

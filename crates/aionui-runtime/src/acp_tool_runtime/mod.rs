@@ -12,6 +12,7 @@ use tracing::{info, warn};
 use crate::Builder;
 use crate::cache;
 use crate::managed_resources;
+use crate::managed_resources_contract::{ManagedAcpToolResourceContract, relative_contract_path};
 use crate::node_runtime::DoctorRow;
 use crate::node_runtime::ensure_node_runtime_with_reporter;
 
@@ -29,7 +30,6 @@ struct PlatformSpec {
     manifest_key: &'static str,
     npm_os: &'static str,
     npm_cpu: &'static str,
-    codex_target_triple: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -653,31 +653,7 @@ fn validate_platform_binary(
     project_dir: &Path,
     spec: PlatformSpec,
 ) -> Result<(), ManagedAcpToolError> {
-    let expected = match tool {
-        ManagedAcpToolId::CodexAcp => {
-            let mut path = project_dir
-                .join("node_modules")
-                .join(format!("@openai/codex-{}", spec.manifest_key))
-                .join("vendor")
-                .join(spec.codex_target_triple)
-                .join("bin")
-                .join("codex");
-            if spec.manifest_key.starts_with("win32-") {
-                path.set_extension("exe");
-            }
-            path
-        }
-        ManagedAcpToolId::ClaudeAgentAcp => {
-            let mut path = project_dir
-                .join("node_modules")
-                .join(format!("@anthropic-ai/claude-agent-sdk-{}", spec.manifest_key))
-                .join("claude");
-            if spec.manifest_key.starts_with("win32-") {
-                path.set_extension("exe");
-            }
-            path
-        }
-    };
+    let expected = project_dir.join(platform_binary_relative_path(tool, spec)?);
 
     if expected.is_file() {
         Ok(())
@@ -688,6 +664,88 @@ fn validate_platform_binary(
             expected.display()
         )))
     }
+}
+
+fn platform_binary_relative_path(tool: ManagedAcpToolId, spec: PlatformSpec) -> Result<PathBuf, ManagedAcpToolError> {
+    match tool {
+        ManagedAcpToolId::CodexAcp => codex_platform_binary_relative_path(spec),
+        ManagedAcpToolId::ClaudeAgentAcp => {
+            let mut path = PathBuf::from("node_modules")
+                .join(format!("@anthropic-ai/claude-agent-sdk-{}", spec.manifest_key))
+                .join("claude");
+            if spec.manifest_key.starts_with("win32-") {
+                path.set_extension("exe");
+            }
+            Ok(path)
+        }
+    }
+}
+
+fn codex_platform_binary_relative_path(spec: PlatformSpec) -> Result<PathBuf, ManagedAcpToolError> {
+    let vendor_triple = match spec.manifest_key {
+        "darwin-arm64" => "aarch64-apple-darwin",
+        "darwin-x64" => "x86_64-apple-darwin",
+        "linux-arm64" => "aarch64-unknown-linux-musl",
+        "linux-x64" => "x86_64-unknown-linux-musl",
+        "win32-arm64" => "aarch64-pc-windows-msvc",
+        "win32-x64" => "x86_64-pc-windows-msvc",
+        _ => {
+            return Err(ManagedAcpToolError::invalid(format!(
+                "unsupported Codex ACP platform {}",
+                spec.manifest_key
+            )));
+        }
+    };
+
+    let mut path = PathBuf::from("node_modules")
+        .join(format!("@openai/codex-{}", spec.manifest_key))
+        .join("vendor")
+        .join(vendor_triple)
+        .join("bin")
+        .join("codex");
+    if spec.manifest_key.starts_with("win32-") {
+        path.set_extension("exe");
+    }
+    Ok(path)
+}
+
+pub fn managed_acp_tool_contract_for_export(
+    tool: ManagedAcpToolId,
+    bundle_root: &Path,
+    resolved: &ResolvedManagedAcpTool,
+) -> Result<ManagedAcpToolResourceContract, ManagedAcpToolError> {
+    managed_acp_tool_contract_for_export_with_spec(tool, platform_spec()?, bundle_root, resolved)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn managed_acp_tool_contract_for_export_with_spec(
+    tool: ManagedAcpToolId,
+    spec: PlatformSpec,
+    bundle_root: &Path,
+    resolved: &ResolvedManagedAcpTool,
+) -> Result<ManagedAcpToolResourceContract, ManagedAcpToolError> {
+    if resolved.id != tool {
+        return Err(ManagedAcpToolError::invalid(format!(
+            "resolved managed ACP tool id {:?} does not match requested {:?}",
+            resolved.id, tool
+        )));
+    }
+    let manifest = read_local_manifest(&resolved.root)?;
+    let root = relative_contract_path(bundle_root, &resolved.root)
+        .map_err(|error| ManagedAcpToolError::invalid(format!("managed ACP contract path: {error}")))?;
+    Ok(ManagedAcpToolResourceContract {
+        slug: tool.slug().into(),
+        version: resolved.version.clone(),
+        package_name: tool.package_name().into(),
+        root,
+        platform_directory: spec.manifest_key.into(),
+        manifest: "manifest.json".into(),
+        entrypoint: manifest.entrypoint,
+        path_entries: manifest.path_entries,
+        required_files: vec!["package.json".into(), "package-lock.json".into()],
+        required_directories: vec!["node_modules".into()],
+        platform_executable: normalize_slashes(&platform_binary_relative_path(tool, spec)?),
+    })
 }
 
 async fn validate_dependency_tree(
@@ -815,25 +873,32 @@ fn resolve_package_smoke_target(
     project_dir: &Path,
     package_json: &InstalledPackageJson,
 ) -> Result<PackageSmokeTarget, ManagedAcpToolError> {
-    // codex-acp's main entrypoint starts its long-running stdio server as a
-    // side effect, so importing it is not a bounded smoke test. Validate its
-    // CLI entrypoint with Node's syntax checker instead.
-    if package_json.name != "@agentclientprotocol/codex-acp"
-        && let Some(entry) = resolve_package_import_entry(&package_json.exports, package_json.main.as_deref())
-    {
+    if let Some(entry) = resolve_package_exports_import_entry(&package_json.exports) {
         return Ok(PackageSmokeTarget::Import(
             package_root(project_dir, &package_json.name).join(entry),
         ));
     }
 
-    let bin_entry = resolve_package_bin_entry(package_json.name.as_str(), &package_json.bin)?;
-    Ok(PackageSmokeTarget::SyntaxCheck(
-        package_root(project_dir, &package_json.name).join(bin_entry),
-    ))
+    if let Ok(bin_entry) = resolve_package_bin_entry(package_json.name.as_str(), &package_json.bin) {
+        return Ok(PackageSmokeTarget::SyntaxCheck(
+            package_root(project_dir, &package_json.name).join(bin_entry),
+        ));
+    }
+
+    if let Some(entry) = package_json.main.as_deref().filter(|value| !value.is_empty()) {
+        return Ok(PackageSmokeTarget::Import(
+            package_root(project_dir, &package_json.name).join(entry),
+        ));
+    }
+
+    Err(ManagedAcpToolError::invalid(format!(
+        "package {} does not expose a usable smoke-test entry",
+        package_json.name
+    )))
 }
 
-fn resolve_package_import_entry(exports_field: &serde_json::Value, main_field: Option<&str>) -> Option<String> {
-    let exports_entry = match exports_field {
+fn resolve_package_exports_import_entry(exports_field: &serde_json::Value) -> Option<String> {
+    match exports_field {
         serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
         serde_json::Value::Object(entries) => entries.get(".").and_then(|root| match root {
             serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
@@ -852,9 +917,7 @@ fn resolve_package_import_entry(exports_field: &serde_json::Value, main_field: O
             _ => None,
         }),
         _ => None,
-    };
-
-    exports_entry.or_else(|| main_field.and_then(|value| if value.is_empty() { None } else { Some(value.to_owned()) }))
+    }
 }
 
 fn normalize_slashes(path: &Path) -> String {
@@ -905,37 +968,31 @@ fn platform_spec() -> Result<PlatformSpec, ManagedAcpToolError> {
             manifest_key: "darwin-arm64",
             npm_os: "darwin",
             npm_cpu: "arm64",
-            codex_target_triple: "aarch64-apple-darwin",
         }),
         ("macos", "x86_64") => Ok(PlatformSpec {
             manifest_key: "darwin-x64",
             npm_os: "darwin",
             npm_cpu: "x64",
-            codex_target_triple: "x86_64-apple-darwin",
         }),
         ("linux", "aarch64") => Ok(PlatformSpec {
             manifest_key: "linux-arm64",
             npm_os: "linux",
             npm_cpu: "arm64",
-            codex_target_triple: "aarch64-unknown-linux-musl",
         }),
         ("linux", "x86_64") => Ok(PlatformSpec {
             manifest_key: "linux-x64",
             npm_os: "linux",
             npm_cpu: "x64",
-            codex_target_triple: "x86_64-unknown-linux-musl",
         }),
         ("windows", "x86_64") => Ok(PlatformSpec {
             manifest_key: "win32-x64",
             npm_os: "win32",
             npm_cpu: "x64",
-            codex_target_triple: "x86_64-pc-windows-msvc",
         }),
         ("windows", "aarch64") => Ok(PlatformSpec {
             manifest_key: "win32-arm64",
             npm_os: "win32",
             npm_cpu: "arm64",
-            codex_target_triple: "aarch64-pc-windows-msvc",
         }),
         (os, arch) => Err(ManagedAcpToolError::unsupported_platform(format!(
             "managed ACP tool unsupported on {os}/{arch}"
@@ -1029,6 +1086,63 @@ mod tests {
             .map(|(_, value)| value.clone())
             .unwrap();
         assert!(path.to_string_lossy().contains("/tmp/tool/bin"));
+    }
+
+    #[test]
+    fn managed_acp_contract_uses_package_version_manifest_and_platform_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle_root = tmp.path().join("managed-resources");
+        let root = bundle_root
+            .join("acp")
+            .join("codex-acp")
+            .join("1.1.2")
+            .join("win32-x64");
+        std::fs::create_dir_all(root.join("node_modules/@agentclientprotocol/codex-acp/dist")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin"))
+            .unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(
+            root.join("manifest.json"),
+            br#"{"entrypoint":"node_modules/@agentclientprotocol/codex-acp/dist/index.js","path_entries":["node_modules/.bin"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("node_modules/@agentclientprotocol/codex-acp/dist/index.js"),
+            b"",
+        )
+        .unwrap();
+        std::fs::write(root.join("package.json"), b"{}").unwrap();
+        std::fs::write(root.join("package-lock.json"), b"{}").unwrap();
+        std::fs::write(
+            root.join("node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe"),
+            b"",
+        )
+        .unwrap();
+        let resolved = ResolvedManagedAcpTool {
+            id: ManagedAcpToolId::CodexAcp,
+            version: "1.1.2".into(),
+            root: root.clone(),
+            entrypoint: root.join("node_modules/@agentclientprotocol/codex-acp/dist/index.js"),
+            env_path_entries: vec![root.join("node_modules/.bin")],
+        };
+        let spec = PlatformSpec {
+            manifest_key: "win32-x64",
+            npm_os: "win32",
+            npm_cpu: "x64",
+        };
+
+        let contract =
+            managed_acp_tool_contract_for_export_with_spec(ManagedAcpToolId::CodexAcp, spec, &bundle_root, &resolved)
+                .expect("contract");
+
+        assert_eq!(contract.slug, "codex-acp");
+        assert_eq!(contract.version, "1.1.2");
+        assert_eq!(contract.package_name, "@agentclientprotocol/codex-acp");
+        assert_eq!(contract.root, "acp/codex-acp/1.1.2/win32-x64");
+        assert_eq!(
+            contract.platform_executable,
+            "node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe"
+        );
     }
 
     #[test]
@@ -1226,7 +1340,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_package_smoke_target_falls_back_to_bin_check_for_cli_only_package() {
+    fn resolve_package_smoke_target_prefers_bin_check_for_cli_package_with_main() {
         let tmp = tempfile::tempdir().unwrap();
         let project_dir = tmp.path();
         let package_json = InstalledPackageJson {
@@ -1320,7 +1434,6 @@ mod tests {
             manifest_key: "win32-x64",
             npm_os: "win32",
             npm_cpu: "x64",
-            codex_target_triple: "x86_64-pc-windows-msvc",
         };
 
         let path = bundle_tool_root(bundle_root, ManagedAcpToolId::CodexAcp, spec);

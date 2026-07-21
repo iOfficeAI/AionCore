@@ -7,7 +7,7 @@ use tracing::{debug, error};
 /// Uses platform-native shell commands:
 /// * Unix: `kill -9 -<pid>` to target the spawned process group
 /// * Windows: `taskkill /F /T /PID <pid>` (`/T` walks the process tree —
-///   the ACP CLI typically spawns a node/bun child that must die with it)
+///   the ACP CLI typically spawns a Node child that must die with it)
 ///
 /// If the process has already exited, this is a no-op.
 pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), AgentError> {
@@ -61,6 +61,8 @@ pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), 
     }
     #[cfg(windows)]
     {
+        let _ = process_group_id;
+
         // `taskkill` exit codes:
         //   0   — process killed
         //   128 — "not found" (already exited): treat as success, identical to
@@ -75,7 +77,7 @@ pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), 
                 debug!(pid, "taskkill /F /T succeeded");
                 Ok(())
             }
-            Ok(output) if output.status.code() == Some(128) => {
+            Ok(output) if taskkill_output_is_missing_process(&output) => {
                 debug!(pid, "Process already exited before taskkill");
                 Ok(())
             }
@@ -99,6 +101,16 @@ pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), 
             "Force kill not supported on this platform for pid {pid}"
         )))
     }
+}
+
+#[cfg(windows)]
+fn taskkill_output_is_missing_process(output: &std::process::Output) -> bool {
+    if output.status.code() == Some(128) {
+        return true;
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    stderr.contains("no running instance") || stderr.contains("not found")
 }
 
 #[cfg(test)]

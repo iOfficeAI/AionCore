@@ -86,6 +86,9 @@ impl ITeamRepository for SqliteTeamRepository {
         if params.lead_agent_id.is_some() {
             set_clauses.push("lead_agent_id = ?");
         }
+        if params.session_mode.is_some() {
+            set_clauses.push("session_mode = ?");
+        }
 
         if set_clauses.is_empty() {
             return Ok(());
@@ -106,6 +109,9 @@ impl ITeamRepository for SqliteTeamRepository {
         }
         if let Some(ref lead_agent_id) = params.lead_agent_id {
             query = query.bind(lead_agent_id);
+        }
+        if let Some(ref session_mode) = params.session_mode {
+            query = query.bind(session_mode);
         }
         query = query.bind(now_ms());
         query = query.bind(team_id);

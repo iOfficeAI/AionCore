@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 45 45" fill="currentColor">
+  <title>Pi</title>
+  <!-- Official Pi logo (pi.dev) — P shape with inner counter, plus i dot.
+       Source: https://pi.dev/logo-auto.svg (MIT License, Earendil Inc.).
+       Scaled from 800×800 to 45×45 viewBox for AionUi agent icon grid. -->
+  <path fill-rule="evenodd" d="M9.3 9.3h19.8v13.2h-6.6v6.6H15.9v6.6H9.3Zm6.6 6.6v6.6h6.6v-6.6Z"/>
+  <path d="M29.1 22.5h6.6v13.2h-6.6Z"/>
+</svg>

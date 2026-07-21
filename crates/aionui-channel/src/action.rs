@@ -2457,9 +2457,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    type ApprovalResolution = (String, PluginType, String, Option<i64>, String, usize);
+
     #[derive(Default)]
     struct RecordingApprovalPort {
-        resolutions: Mutex<Vec<(String, PluginType, String, Option<i64>, String, usize)>>,
+        resolutions: Mutex<Vec<ApprovalResolution>>,
     }
 
     #[derive(Default)]
@@ -3058,6 +3060,7 @@ mod tests {
         (executor, repo, personal_directory)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_agent_row(
         id: &str,
         name: &str,
@@ -3681,12 +3684,13 @@ mod tests {
             _ => panic!("Expected Action result"),
         }
 
-        let created = team_directory.created.lock().unwrap();
-        assert_eq!(created.len(), 1);
-        assert_eq!(created[0].name, "BTC 4H Strategy");
-        assert_eq!(created[0].assistant_id, "assistant-telegram-lead");
-        assert_eq!(created[0].lead_name, "Telegram Lead");
-        drop(created);
+        {
+            let created = team_directory.created.lock().unwrap();
+            assert_eq!(created.len(), 1);
+            assert_eq!(created[0].name, "BTC 4H Strategy");
+            assert_eq!(created[0].assistant_id, "assistant-telegram-lead");
+            assert_eq!(created[0].lead_name, "Telegram Lead");
+        }
 
         assert_eq!(team_directory.ensured.lock().unwrap().as_slice(), ["team-created-1"]);
         let sessions = repo.get_all_sessions().await.unwrap();

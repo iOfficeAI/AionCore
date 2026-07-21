@@ -8,6 +8,8 @@ pub mod conversation;
 pub mod cron;
 pub mod development;
 pub mod development_operations;
+pub mod diagnostics;
+mod diagnostics_sanitizer;
 pub mod mcp_server;
 pub mod oauth_token;
 pub mod project;
@@ -25,6 +27,7 @@ mod sqlite_conversation;
 mod sqlite_cron;
 mod sqlite_development;
 mod sqlite_development_operations;
+mod sqlite_diagnostics;
 mod sqlite_mcp_server;
 mod sqlite_oauth_token;
 mod sqlite_project;
@@ -52,6 +55,10 @@ pub use conversation::IConversationRepository;
 pub use cron::ICronRepository;
 pub use development::IDevelopmentRepository;
 pub use development_operations::IDevelopmentOperationsRepository;
+pub use diagnostics::{
+    FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile, FeedbackDiagnosticsProfileResult,
+    FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IFeedbackDiagnosticsRepository,
+};
 pub use mcp_server::IMcpServerRepository;
 pub use oauth_token::IOAuthTokenRepository;
 pub use project::IProjectRepository;
@@ -64,7 +71,7 @@ pub use sqlite_agent_metadata::SqliteAgentMetadataRepository;
 pub use sqlite_approval::SqliteApprovalRepository;
 pub use sqlite_assistant::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
-    SqliteAssistantPreferenceRepository, SqliteAssistantRepository, rebuild_legacy_assistant_mirror,
+    SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
 };
 pub use sqlite_channel::SqliteChannelRepository;
 pub use sqlite_client_preference::SqliteClientPreferenceRepository;
@@ -72,6 +79,7 @@ pub use sqlite_conversation::SqliteConversationRepository;
 pub use sqlite_cron::SqliteCronRepository;
 pub use sqlite_development::SqliteDevelopmentRepository;
 pub use sqlite_development_operations::SqliteDevelopmentOperationsRepository;
+pub use sqlite_diagnostics::SqliteFeedbackDiagnosticsRepository;
 pub use sqlite_mcp_server::SqliteMcpServerRepository;
 pub use sqlite_oauth_token::SqliteOAuthTokenRepository;
 pub use sqlite_project::SqliteProjectRepository;

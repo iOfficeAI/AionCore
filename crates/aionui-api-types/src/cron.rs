@@ -123,6 +123,7 @@ pub struct CronJobStateDto {
     pub run_count: i64,
     pub retry_count: i64,
     pub max_retries: i64,
+    pub queue_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -160,7 +161,35 @@ pub struct CreateCronJobRequest {
     #[serde(default)]
     pub execution_mode: Option<String>,
     #[serde(default)]
+    pub queue_enabled: bool,
+    #[serde(default)]
     pub agent_config: Option<CronAgentConfigWriteDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateConversationCronRequest {
+    pub name: String,
+    pub schedule: String,
+    #[serde(default)]
+    pub schedule_description: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateConversationCronResponse {
+    pub job_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateConversationCronRequest {
+    pub name: String,
+    pub schedule: String,
+    #[serde(default)]
+    pub schedule_description: String,
+    #[serde(default)]
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -183,6 +212,8 @@ pub struct UpdateCronJobRequest {
     pub conversation_title: Option<String>,
     #[serde(default)]
     pub max_retries: Option<i64>,
+    #[serde(default)]
+    pub queue_enabled: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +258,21 @@ pub struct CronJobExecutedEvent {
 
 #[cfg(test)]
 mod write_tests {
-    use super::CronAgentConfigWriteDto;
+    use super::{CreateConversationCronRequest, CronAgentConfigWriteDto};
+
+    #[test]
+    fn create_conversation_cron_request_preserves_multiline_message() {
+        let raw = serde_json::json!({
+            "name": "Daily summary",
+            "schedule": "0 9 * * *",
+            "schedule_description": "Daily at 9",
+            "message": "first\nsecond\nthird",
+        });
+
+        let req: CreateConversationCronRequest = serde_json::from_value(raw).unwrap();
+
+        assert_eq!(req.message, "first\nsecond\nthird");
+    }
 
     #[test]
     fn cron_agent_config_write_rejects_legacy_custom_agent_id() {
@@ -569,6 +614,7 @@ mod tests {
                 run_count: 5,
                 retry_count: 0,
                 max_retries: 3,
+                queue_enabled: false,
             },
         }
     }
@@ -637,6 +683,7 @@ mod tests {
                 run_count: 0,
                 retry_count: 0,
                 max_retries: 3,
+                queue_enabled: true,
             },
         };
         let json = serde_json::to_value(&resp).unwrap();

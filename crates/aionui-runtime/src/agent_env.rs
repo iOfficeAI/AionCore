@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::time::Duration;
 
 use tokio::sync::OnceCell;
 
+#[cfg(unix)]
 use crate::Builder;
 
 static FULL_SHELL_ENV: OnceCell<Vec<(OsString, OsString)>> = OnceCell::const_new();
@@ -146,6 +150,7 @@ async fn load_full_shell_env() -> Vec<(OsString, OsString)> {
     Vec::new()
 }
 
+#[cfg(unix)]
 fn parse_env_output(output: &str) -> Vec<(OsString, OsString)> {
     let mut parsed = Vec::new();
     let mut current_key: Option<String> = None;
@@ -170,6 +175,7 @@ fn parse_env_output(output: &str) -> Vec<(OsString, OsString)> {
     parsed
 }
 
+#[cfg(unix)]
 fn parse_env_start(line: &str) -> Option<(&str, &str)> {
     let (key, value) = line.split_once('=')?;
     if is_valid_env_key(key) {
@@ -179,6 +185,7 @@ fn parse_env_start(line: &str) -> Option<(&str, &str)> {
     }
 }
 
+#[cfg(unix)]
 fn is_valid_env_key(key: &str) -> bool {
     let mut chars = key.chars();
     let Some(first) = chars.next() else {

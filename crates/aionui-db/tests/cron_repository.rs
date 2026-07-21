@@ -13,7 +13,10 @@ use std::sync::Arc;
 
 use aionui_common::now_ms;
 use aionui_db::models::CronJobRow;
-use aionui_db::{DbError, ICronRepository, SqliteCronRepository, UpdateCronJobParams, init_database_memory};
+use aionui_db::{
+    ClaimCronRunParams, CronRunClaimResult, DbError, ICronRepository, SqliteCronRepository, UpdateCronJobParams,
+    init_database_memory,
+};
 
 async fn repo() -> (Arc<dyn ICronRepository>, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
@@ -64,6 +67,7 @@ fn make_job(id: &str) -> CronJobRow {
         run_count: 0,
         retry_count: 0,
         max_retries: 3,
+        queue_enabled: false,
     }
 }
 
@@ -238,6 +242,56 @@ async fn cj12_delete_nonexistent() {
     let (r, _db) = repo().await;
     let err = r.delete("cron_nope").await.unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn cron_run_has_surrogate_id_and_unique_occurrence_key() {
+    let (r, db) = repo().await;
+    r.insert(&make_job("cron_run_identity")).await.unwrap();
+
+    assert_eq!(
+        r.claim_run(&ClaimCronRunParams {
+            job_id: "cron_run_identity",
+            scheduled_at: 10_000,
+            owner_id: "owner-a",
+            now: 10_000,
+            lease_until: 70_000,
+            queue_enabled: false,
+        })
+        .await
+        .unwrap(),
+        CronRunClaimResult::Claimed
+    );
+
+    let run_id: String = sqlx::query_scalar("SELECT id FROM cron_job_runs WHERE job_id = ? AND scheduled_at = ?")
+        .bind("cron_run_identity")
+        .bind(10_000)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(run_id.starts_with("cron_run_"));
+
+    assert_eq!(
+        r.claim_run(&ClaimCronRunParams {
+            job_id: "cron_run_identity",
+            scheduled_at: 10_000,
+            owner_id: "owner-b",
+            now: 11_000,
+            lease_until: 71_000,
+            queue_enabled: false,
+        })
+        .await
+        .unwrap(),
+        CronRunClaimResult::Duplicate
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cron_job_runs WHERE job_id = ? AND scheduled_at = ?")
+        .bind("cron_run_identity")
+        .bind(10_000)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 // ── List enabled ─────────────────────────────────────────────────────

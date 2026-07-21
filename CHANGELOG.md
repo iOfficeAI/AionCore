@@ -1,5 +1,168 @@
 # Changelog
 
+## [0.1.49](https://github.com/iOfficeAI/AionCore/compare/v0.1.48...v0.1.49) (2026-07-20)
+
+
+### Features
+
+* **agents:** sync ACP Registry integrations ([#637](https://github.com/iOfficeAI/AionCore/issues/637)) ([7d35e38](https://github.com/iOfficeAI/AionCore/commit/7d35e386969bb2dca58ca332adf00f9ae5bed6ce))
+* **ai-agent:** use responses api for gpt-5.6 ([cde4129](https://github.com/iOfficeAI/AionCore/commit/cde4129521340fe71e67a40f17f0d00a2935fe2a))
+* **config:** add conversation rename command ([#638](https://github.com/iOfficeAI/AionCore/issues/638)) ([a611553](https://github.com/iOfficeAI/AionCore/commit/a61155379ac031a161b210d4bdc297d009ba5a11))
+* **idle:** extend idle-cleanup timeouts and make them env-configurable ([#643](https://github.com/iOfficeAI/AionCore/issues/643)) ([a719bc7](https://github.com/iOfficeAI/AionCore/commit/a719bc74a5587097246689c683079488fba73007))
+
+
+### Bug Fixes
+
+* **ai-agent:** ignore max token limits for aionui requests ([0121c24](https://github.com/iOfficeAI/AionCore/commit/0121c24d70f4a5a63e79ee71869aee34e6b62506))
+* **ai-agent:** ignore max token limits for aionui requests ([8bdf305](https://github.com/iOfficeAI/AionCore/commit/8bdf305e9a94d1a5aa8402424e8ef8d540eeb66c))
+* **system:** apply keep-awake client preference ([#642](https://github.com/iOfficeAI/AionCore/issues/642)) ([a6a290d](https://github.com/iOfficeAI/AionCore/commit/a6a290dd374a37eca73fc008c25bd6780a0e1f54))
+* **team:** broadcast Stopped status on idle-cleanup team reclaim ([#640](https://github.com/iOfficeAI/AionCore/issues/640)) ([024a3a5](https://github.com/iOfficeAI/AionCore/commit/024a3a578936af0c59ed5aeed7bc1b4c20d990ea))
+
+## [0.1.48](https://github.com/iOfficeAI/AionCore/compare/v0.1.47...v0.1.48) (2026-07-17)
+
+
+### Features
+
+* **agents:** add Pi coding agent as builtin ACP agent ([#618](https://github.com/iOfficeAI/AionCore/issues/618)) ([0b9b3a8](https://github.com/iOfficeAI/AionCore/commit/0b9b3a882712f555e60fd33c027b604471df25c7))
+* **ai-agent:** route image attachments by model capability ([82c5bc1](https://github.com/iOfficeAI/AionCore/commit/82c5bc14bcb1fcf4396e033764732adbe63966ef))
+* **aionrs:** inline image attachments for Aion CLI ([aff870b](https://github.com/iOfficeAI/AionCore/commit/aff870bb1d3328abfc3d0c24d8898f0e148790ab))
+* **team:** add CLI fallback collaboration transport ([#629](https://github.com/iOfficeAI/AionCore/issues/629)) ([bbb6fec](https://github.com/iOfficeAI/AionCore/commit/bbb6fec08f7fd818375664bc5bf206805013f7d0))
+
+
+### Bug Fixes
+
+* **acp:** confirm legacy mode/model on ACK instead of awaiting observed update ([#635](https://github.com/iOfficeAI/AionCore/issues/635)) ([ded7a5c](https://github.com/iOfficeAI/AionCore/commit/ded7a5ce7951cad942852488f30382ed7fb909da))
+* **agents:** honor login PATH and validate builtin CLIs ([#622](https://github.com/iOfficeAI/AionCore/issues/622)) ([3190be1](https://github.com/iOfficeAI/AionCore/commit/3190be1fae7e15be98f5f963e57a54fdee87029e))
+* **ai-agent:** pin image-capable aionrs revision ([6687805](https://github.com/iOfficeAI/AionCore/commit/6687805f09042b9a34b4e5ac22900374358d2671))
+* **assistant:** canonicalize rule file storage ([#625](https://github.com/iOfficeAI/AionCore/issues/625)) ([020a27a](https://github.com/iOfficeAI/AionCore/commit/020a27a77aeb2b5be7a2b4380aab8ae2686311c4))
+* **assistant:** stop legacy override sync from clobbering user toggles ([#634](https://github.com/iOfficeAI/AionCore/issues/634)) ([346700e](https://github.com/iOfficeAI/AionCore/commit/346700e1d62470f84eec94b1c58fd3516d1ea90e))
+
+
+### Code Refactoring
+
+* **runtime:** remove legacy Bun runtime support ([#623](https://github.com/iOfficeAI/AionCore/issues/623)) ([01b5eed](https://github.com/iOfficeAI/AionCore/commit/01b5eed0db886e05b652c4633c9acd337087e1ab))
+
+## [0.1.47](https://github.com/iOfficeAI/AionCore/compare/v0.1.46...v0.1.47) (2026-07-14)
+
+
+### Features
+
+* **cron:** deduplicate and protect scheduled executions ([#601](https://github.com/iOfficeAI/AionCore/issues/601)) ([b189de0](https://github.com/iOfficeAI/AionCore/commit/b189de0e0a5a3cb837de8b0237ce6e7f96c8aa3d))
+* **diagnostics:** expand feedback runtime evidence ([#612](https://github.com/iOfficeAI/AionCore/issues/612)) ([08426dc](https://github.com/iOfficeAI/AionCore/commit/08426dcf83290577a2b8ef706bc3c1d21354425c))
+
+
+### Bug Fixes
+
+* **assistant:** skip dirty assistant bootstrap records ([#615](https://github.com/iOfficeAI/AionCore/issues/615)) ([f48cbc7](https://github.com/iOfficeAI/AionCore/commit/f48cbc757f96e3595b00f4f81330dab958f41d28))
+* **managed-resources:** emit bundled resource manifest ([#617](https://github.com/iOfficeAI/AionCore/issues/617)) ([64b5062](https://github.com/iOfficeAI/AionCore/commit/64b506239639c632eb5f6acb4495e58e74c64167))
+
+## [0.1.46](https://github.com/iOfficeAI/AionCore/compare/v0.1.45...v0.1.46) (2026-07-13)
+
+
+### Bug Fixes
+
+* **acp:** normalize Codex full-access mode ([#608](https://github.com/iOfficeAI/AionCore/issues/608)) ([df51fcf](https://github.com/iOfficeAI/AionCore/commit/df51fcf77aa541c78c6eb6af4e987eab92b1ff07))
+* **butler:** correct three breaking field mismatches + update rule to CLI model ([#607](https://github.com/iOfficeAI/AionCore/issues/607)) ([b02bce6](https://github.com/iOfficeAI/AionCore/commit/b02bce62e5b7d847960be8d98e9f3b8c8e163e2c))
+
+## [0.1.45](https://github.com/iOfficeAI/AionCore/compare/v0.1.44...v0.1.45) (2026-07-10)
+
+
+### Features
+
+* **ai-agent:** adapt to aionrs v0.2.2 config changes ([4f71bf2](https://github.com/iOfficeAI/AionCore/commit/4f71bf2c97de1bafc676906e26a5cf512ff94af9))
+* **cli:** add agent-facing config and diagnose commands ([#595](https://github.com/iOfficeAI/AionCore/issues/595)) ([e80177e](https://github.com/iOfficeAI/AionCore/commit/e80177e95a380c89f833b4302ff24b7359ac2a58))
+
+
+### Bug Fixes
+
+* **ai-agent:** cap provider health check tokens ([1021b63](https://github.com/iOfficeAI/AionCore/commit/1021b631aa1b7b97d7b70d18284df21bf29dda41))
+* **ai-agent:** set default aionrs thinking cli args ([de240a4](https://github.com/iOfficeAI/AionCore/commit/de240a4435058bf349acd7897b2836cff49b884d))
+* **model_fetcher:** extract first key from multi-line api_key for HTTP requests ([#593](https://github.com/iOfficeAI/AionCore/issues/593)) ([1161647](https://github.com/iOfficeAI/AionCore/commit/116164756544306ef8ac257106a03e665c85cf3d))
+* **runtime:** update Claude ACP package ([#599](https://github.com/iOfficeAI/AionCore/issues/599)) ([cf69332](https://github.com/iOfficeAI/AionCore/commit/cf693323913c31d3276a5e103b434c6ca51b519e))
+* **runtime:** update managed Codex ACP package ([#598](https://github.com/iOfficeAI/AionCore/issues/598)) ([1bb2be7](https://github.com/iOfficeAI/AionCore/commit/1bb2be72a040d16f284d4a0b5b2de670aa2f864b))
+* stop defaulting aionrs max tokens ([22bc24b](https://github.com/iOfficeAI/AionCore/commit/22bc24b1f30ef4d475ccada7d36b3ee977054eba))
+
+## [0.1.44](https://github.com/iOfficeAI/AionCore/compare/v0.1.43...v0.1.44) (2026-07-08)
+
+
+### Features
+
+* **agent:** use aionrs runtime env API ([#586](https://github.com/iOfficeAI/AionCore/issues/586)) ([2f6f43f](https://github.com/iOfficeAI/AionCore/commit/2f6f43f305221701ca2baa58123180caf2342055))
+* **ai-agent:** surface upstream 429 body in AgentSendError detail ([#591](https://github.com/iOfficeAI/AionCore/issues/591)) ([b8fe5b6](https://github.com/iOfficeAI/AionCore/commit/b8fe5b6f3c6f93f7b8fc730b658772da3f4f83fa))
+* **system:** add feedback diagnostics report ([#585](https://github.com/iOfficeAI/AionCore/issues/585)) ([a3eb1e4](https://github.com/iOfficeAI/AionCore/commit/a3eb1e49396e715ce8464700dca5e50a966552ee))
+
+
+### Bug Fixes
+
+* **agent:** preserve ACP error cause detail ([#581](https://github.com/iOfficeAI/AionCore/issues/581)) ([220f682](https://github.com/iOfficeAI/AionCore/commit/220f6823c1d29fde640427cfdd77de7e981758b2))
+* **skills:** correct aionui-config butler skill drift (2026-07) ([#584](https://github.com/iOfficeAI/AionCore/issues/584)) ([e72e03f](https://github.com/iOfficeAI/AionCore/commit/e72e03ff6e1366f705352bcefec474887a85adfa))
+* use provider and model protocol to determine llm request. ([37f76a8](https://github.com/iOfficeAI/AionCore/commit/37f76a8bf1ba8aafabb5dd6b6062da40173ef010))
+
+## [0.1.43](https://github.com/iOfficeAI/AionCore/compare/v0.1.42...v0.1.43) (2026-07-06)
+
+
+### Features
+
+* **assistant:** persist thought-level defaults ([#574](https://github.com/iOfficeAI/AionCore/issues/574)) ([dd9f299](https://github.com/iOfficeAI/AionCore/commit/dd9f29967270f4e7263484532fad3b2199ba1894))
+
+
+### Bug Fixes
+
+* **agent:** project available commands in management rows ([#579](https://github.com/iOfficeAI/AionCore/issues/579)) ([689ee8f](https://github.com/iOfficeAI/AionCore/commit/689ee8f91cbabd7e57c4e882f86c1ceec167e36d))
+* **assistant:** filter generated assistants by installed agents ([#578](https://github.com/iOfficeAI/AionCore/issues/578)) ([5b7c366](https://github.com/iOfficeAI/AionCore/commit/5b7c366132006eb16e748e8fc5a0976da9a5b2a3))
+* **cron:** enforce full-auto mode for scheduled tasks ([#576](https://github.com/iOfficeAI/AionCore/issues/576)) ([cf0a9bd](https://github.com/iOfficeAI/AionCore/commit/cf0a9bd88ac295fe8b40a6c1f9f21174b574718d))
+
+## [0.1.42](https://github.com/iOfficeAI/AionCore/compare/v0.1.41...v0.1.42) (2026-07-03)
+
+
+### Features
+
+* **assistant:** 官方助手默认关闭 + 固定顺序 + 一次性重置迁移 ([#567](https://github.com/iOfficeAI/AionCore/issues/567)) ([3e30b02](https://github.com/iOfficeAI/AionCore/commit/3e30b02e021642ea116b68abc441bca0b91c60f3))
+
+
+### Bug Fixes
+
+* **agent:** align unchecked availability with team runtime selection ([#571](https://github.com/iOfficeAI/AionCore/issues/571)) ([f80b0ce](https://github.com/iOfficeAI/AionCore/commit/f80b0ceac3b603c3b58e0f1a25feb31a0261f7c8))
+* **agent:** avoid full availability refresh on reads ([#566](https://github.com/iOfficeAI/AionCore/issues/566)) ([1ffb7aa](https://github.com/iOfficeAI/AionCore/commit/1ffb7aa6a0fcb55a4c8966b965133ab0ace9e8b2))
+* **cron:** preserve existing conversation jobs across lifecycle changes ([#572](https://github.com/iOfficeAI/AionCore/issues/572)) ([fa4217a](https://github.com/iOfficeAI/AionCore/commit/fa4217a6d4ba0cde4d4c7d0d5460969b94eb6c4a))
+* **mcp:** support aionrs config path subcommand with legacy fallback ([#568](https://github.com/iOfficeAI/AionCore/issues/568)) ([72cfba1](https://github.com/iOfficeAI/AionCore/commit/72cfba1909d663117615a595316804c7707bdfd3))
+* preserve ACP config catalogs on resume ([#570](https://github.com/iOfficeAI/AionCore/issues/570)) ([a9c1955](https://github.com/iOfficeAI/AionCore/commit/a9c19553bad1da3283f5dfad1972cd1ed1992546))
+* preserve Linux GLIBC baselines ([#573](https://github.com/iOfficeAI/AionCore/issues/573)) ([ab6e227](https://github.com/iOfficeAI/AionCore/commit/ab6e227504c40f78823988d4c10af8fd153cc47c))
+
+## [0.1.41](https://github.com/iOfficeAI/AionCore/compare/v0.1.40...v0.1.41) (2026-07-02)
+
+
+### Bug Fixes
+
+* **assistant:** normalize avatar storage and identity ([#558](https://github.com/iOfficeAI/AionCore/issues/558)) ([155c278](https://github.com/iOfficeAI/AionCore/commit/155c278b7b603e8bf29e412295cec5ec50bb25fe))
+* **conversation:** derive assistant runtime type from metadata ([#555](https://github.com/iOfficeAI/AionCore/issues/555)) ([236217d](https://github.com/iOfficeAI/AionCore/commit/236217d360ff67d0dcba906f287a34b954cb305d))
+* **conversation:** partition temp workspaces and logs by date ([#560](https://github.com/iOfficeAI/AionCore/issues/560)) ([9bb1f33](https://github.com/iOfficeAI/AionCore/commit/9bb1f333065318c00da73c3a96f7fe92bea38d49))
+* **cron:** apply custom assistant rules in scheduled runs ([#495](https://github.com/iOfficeAI/AionCore/issues/495)) ([3840b77](https://github.com/iOfficeAI/AionCore/commit/3840b77f4f4dc26b58481868507e07e13fb9fbd1))
+* **cron:** lock team cron execution mode ([#562](https://github.com/iOfficeAI/AionCore/issues/562)) ([56f3873](https://github.com/iOfficeAI/AionCore/commit/56f38734844164707782b795627a8d65ff1b3c16))
+* **cron:** route skill scheduling through helper ([#553](https://github.com/iOfficeAI/AionCore/issues/553)) ([c57970f](https://github.com/iOfficeAI/AionCore/commit/c57970fed387ba895dd934f85c4c59af63da6cfa))
+* **database:** require explicit corrupted database recovery ([#563](https://github.com/iOfficeAI/AionCore/issues/563)) ([203bd1b](https://github.com/iOfficeAI/AionCore/commit/203bd1b574438cf730c351879a773a82548b972c))
+* resolve ACP backends from metadata ([#559](https://github.com/iOfficeAI/AionCore/issues/559)) ([6c15bb7](https://github.com/iOfficeAI/AionCore/commit/6c15bb765f8c84baddd89830839c832424ef1789))
+* **runtime:** harden managed Node command resolution ([#565](https://github.com/iOfficeAI/AionCore/issues/565)) ([e69b83a](https://github.com/iOfficeAI/AionCore/commit/e69b83a836b369b4244a04b64f931bea1dd54743))
+* **runtime:** protect active ACP tasks from idle cleanup ([#561](https://github.com/iOfficeAI/AionCore/issues/561)) ([1fa7a54](https://github.com/iOfficeAI/AionCore/commit/1fa7a543e8fd4cec7e423443cbd6299de6a761ad))
+* **skill:** raise import size limits ([#564](https://github.com/iOfficeAI/AionCore/issues/564)) ([50d9aff](https://github.com/iOfficeAI/AionCore/commit/50d9affe53ad64e994564a31215caab428eb7094))
+* **skills:** correct AionUi Butler skill drift against current backend ([#557](https://github.com/iOfficeAI/AionCore/issues/557)) ([41c2c94](https://github.com/iOfficeAI/AionCore/commit/41c2c9426eefb2ce29de4a9f5b4e10c862a63994))
+
+## [0.1.40](https://github.com/iOfficeAI/AionCore/compare/v0.1.39...v0.1.40) (2026-06-30)
+
+
+### Features
+
+* **team:** add run state snapshot endpoint ([#549](https://github.com/iOfficeAI/AionCore/issues/549)) ([2c7cfe8](https://github.com/iOfficeAI/AionCore/commit/2c7cfe8a3eb49c8be790a7733ccad2f8a49f19bd))
+
+
+### Bug Fixes
+
+* **acp:** preserve selectors for partial config snapshots ([#548](https://github.com/iOfficeAI/AionCore/issues/548)) ([0cb3a9a](https://github.com/iOfficeAI/AionCore/commit/0cb3a9a5925b273ec1b6610c04469f8724ad14fb))
+* **cron:** restore create command heading ([#547](https://github.com/iOfficeAI/AionCore/issues/547)) ([1a30f77](https://github.com/iOfficeAI/AionCore/commit/1a30f7710de2c98856f7256811543c1121dddc76))
+* **cron:** run jobs through conversation service ([#546](https://github.com/iOfficeAI/AionCore/issues/546)) ([b36fb5c](https://github.com/iOfficeAI/AionCore/commit/b36fb5c471b19edefd0b63dc2acf3e3d4c2c52ae))
+* **skills:** repair butler endpoint drift + add cron scheduling ([#550](https://github.com/iOfficeAI/AionCore/issues/550)) ([88bcff3](https://github.com/iOfficeAI/AionCore/commit/88bcff3c08ebcd5e5dff8f16ba9c68fa313ef55f))
+* **windows:** handle runtime process lifecycle ([399f920](https://github.com/iOfficeAI/AionCore/commit/399f920c31ab4d738ffa32b5ebcff9416ba44e6f))
+
 ## [0.1.39](https://github.com/iOfficeAI/AionCore/compare/v0.1.38...v0.1.39) (2026-06-29)
 
 

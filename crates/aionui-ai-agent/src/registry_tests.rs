@@ -4,23 +4,27 @@ use aionui_db::{
 };
 use std::sync::Arc;
 
-#[test]
-fn probe_resolved_command_accepts_bare_npx_when_managed_runtime_is_supported() {
+#[tokio::test]
+async fn probe_resolved_command_keeps_bridge_but_version_probe_targets_primary_cli() {
     if !probe_node_runtime_supported().is_supported() {
         return;
     }
 
-    let meta = AgentMetadata {
+    let mut meta = AgentMetadata {
         id: "agent-1".into(),
         icon: None,
         name: "Test ACP".into(),
         name_i18n: None,
         description: None,
         description_i18n: None,
-        backend: Some("custom".into()),
+        backend: Some("pi".into()),
         agent_type: AgentType::Acp,
-        agent_source: AgentSource::Custom,
-        agent_source_info: AgentSourceInfo::default(),
+        agent_source: AgentSource::Builtin,
+        agent_source_info: AgentSourceInfo {
+            binary_name: Some("cargo".into()),
+            bridge_binary: Some("npx".into()),
+            ..Default::default()
+        },
         enabled: true,
         available: false,
         command: Some("npx".into()),
@@ -49,6 +53,21 @@ fn probe_resolved_command_accepts_bare_npx_when_managed_runtime_is_supported() {
 
     let resolved = probe_resolved_command(&meta).expect("probe");
     assert_eq!(resolved, PathBuf::from("npx"));
+    assert_eq!(crate::cli_probe::command_name(&meta), Some("cargo"));
+
+    meta.available = true;
+    meta.resolved_command = Some(resolved);
+    let (meta, reason) = validate_cli_availability(meta, None).await;
+    assert!(reason.is_none());
+    assert_eq!(meta.resolved_command, Some(PathBuf::from("npx")));
+
+    let mut missing_primary = meta;
+    missing_primary.agent_source_info.binary_name = Some("aionui-definitely-missing-product-cli".into());
+    let reason = probe_resolved_command(&missing_primary).expect_err("npx must not replace the product CLI check");
+    assert!(matches!(
+        reason,
+        UnavailableReason::PrimaryMissing { binary } if binary == "aionui-definitely-missing-product-cli"
+    ));
 }
 
 #[test]
@@ -197,6 +216,7 @@ async fn management_rows_derive_missing_diagnostics_from_probe_reason() {
 
     let registry = AgentRegistry::new(repo);
     registry.hydrate().await.unwrap();
+    registry.refresh_availability().await;
 
     let row = registry
         .list_management_rows()
@@ -222,6 +242,130 @@ async fn management_rows_derive_missing_diagnostics_from_probe_reason() {
         row_json["last_check_error_details"]["command"].as_str(),
         Some("definitely-missing-cli")
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn builtin_non_codex_with_broken_wrapper_is_not_installed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let temp = tempfile::tempdir().unwrap();
+    let command_path = temp.path().join("gemini");
+    std::fs::write(
+        &command_path,
+        "#!/bin/sh\nprintf 'native binary missing\\n' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&command_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&command_path, permissions).unwrap();
+    let command = command_path.to_string_lossy().to_string();
+    let source_info = serde_json::json!({ "binary_name": command }).to_string();
+
+    repo.upsert(&UpsertAgentMetadataParams {
+        id: "agent-broken-gemini",
+        icon: None,
+        name: "Broken Gemini",
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: Some("gemini"),
+        agent_type: "acp",
+        agent_source: "builtin",
+        agent_source_info: Some(&source_info),
+        enabled: true,
+        command: Some(&command),
+        args: Some("[]"),
+        env: Some("[]"),
+        native_skills_dirs: None,
+        behavior_policy: None,
+        yolo_id: None,
+        agent_capabilities: None,
+        auth_methods: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        available_commands: None,
+        sort_order: 100,
+    })
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+
+    let row = registry
+        .list_management_rows()
+        .await
+        .into_iter()
+        .find(|item| item.id == "agent-broken-gemini")
+        .unwrap();
+    assert!(!row.installed);
+    assert_eq!(row.status, AgentManagementStatus::Missing);
+    assert_eq!(row.last_check_error_code.as_deref(), Some("primary_unusable"));
+    assert!(
+        row.last_check_error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("native binary missing"))
+    );
+}
+
+#[tokio::test]
+async fn management_rows_mark_installed_agents_without_health_check_unchecked() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let temp = tempfile::tempdir().unwrap();
+    let command_path = temp.path().join("unchecked-cli");
+    std::fs::write(&command_path, "#!/bin/sh\nexit 0\n").unwrap();
+    let command = command_path.to_string_lossy().to_string();
+    let source_info = serde_json::json!({ "binary_name": command }).to_string();
+
+    repo.upsert(&UpsertAgentMetadataParams {
+        id: "agent-unchecked-cli",
+        icon: None,
+        name: "Unchecked CLI Agent",
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: Some("custom"),
+        agent_type: "acp",
+        agent_source: "custom",
+        agent_source_info: Some(&source_info),
+        enabled: true,
+        command: Some(&command),
+        args: Some("[]"),
+        env: Some("[]"),
+        native_skills_dirs: None,
+        behavior_policy: None,
+        yolo_id: None,
+        agent_capabilities: None,
+        auth_methods: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        available_commands: None,
+        sort_order: 100,
+    })
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+
+    let row = registry
+        .list_management_rows()
+        .await
+        .into_iter()
+        .find(|item| item.id == "agent-unchecked-cli")
+        .unwrap();
+
+    let row_json = serde_json::to_value(&row).unwrap();
+    assert_eq!(row_json["status"].as_str(), Some("unchecked"));
+    assert!(row.installed);
+    assert!(row.last_check_status.is_none());
+    assert!(row.last_check_error_code.is_none());
 }
 
 #[tokio::test]
@@ -300,7 +444,9 @@ async fn management_rows_project_runtime_catalogs_from_agent_metadata() {
         available_models: Some(
             r#"{"current_model_id":"claude-opus","current_model_label":"Claude Opus","available_models":[{"id":"claude-opus","label":"Claude Opus"}]}"#,
         ),
-        available_commands: Some(r#"[{"name":"review","description":"Review changes"}]"#),
+        available_commands: Some(
+            r#"{"available_commands":[{"name":"review","description":"Review the current diff"}]}"#,
+        ),
         sort_order: 100,
     })
     .await
@@ -326,9 +472,10 @@ async fn management_rows_project_runtime_catalogs_from_agent_metadata() {
         row_json["config_options"]["config_options"][0]["current_value"].as_str(),
         Some("claude-opus")
     );
-    assert_eq!(row_json["agent_capabilities"]["loadSession"].as_bool(), Some(true));
-    assert_eq!(row_json["auth_methods"][0]["id"].as_str(), Some("oauth"));
-    assert_eq!(row_json["available_commands"][0]["name"].as_str(), Some("review"));
+    assert_eq!(
+        row_json["available_commands"]["available_commands"][0]["name"].as_str(),
+        Some("review")
+    );
 }
 
 #[tokio::test]

@@ -30,6 +30,7 @@ mod skill;
 mod system;
 mod team;
 mod team_mcp;
+mod team_tools;
 mod websocket;
 
 pub use acp::{
@@ -59,7 +60,8 @@ pub use assistant::{
     AssistantDetailResponse, AssistantEngineResponse, AssistantPreferencesResponse, AssistantProfileResponse,
     AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource, AssistantStateResponse,
     CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest,
-    UpdateAssistantRequest,
+    UpdateAssistantRequest, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    is_local_avatar_value,
 };
 pub use auth::{
     AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser, QrLoginRequest,
@@ -81,14 +83,15 @@ pub use conversation::{
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
     ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchItem, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
     UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{
-    CreateCronJobRequest, CronAgentConfigReadDto, CronAgentConfigWriteDto, CronJobExecutedEvent, CronJobMetadataDto,
-    CronJobPayloadDto, CronJobRemovedPayload, CronJobResponse, CronJobStateDto, CronJobTargetDto, CronScheduleDto,
-    HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest, UpdateCronJobRequest,
+    CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
+    CronAgentConfigWriteDto, CronJobExecutedEvent, CronJobMetadataDto, CronJobPayloadDto, CronJobRemovedPayload,
+    CronJobResponse, CronJobStateDto, CronJobTargetDto, CronScheduleDto, HasSkillResponse, ListCronJobsQuery,
+    RunNowResponse, SaveCronSkillRequest, UpdateConversationCronRequest, UpdateCronJobRequest,
 };
 pub use custom_agent::{
     AgentOverridesResponse, CustomAgentAdvancedOverrides, CustomAgentUpsertRequest, DeleteCustomAgentResponse,
@@ -167,19 +170,29 @@ pub use skill::{
     WriteAssistantRuleRequest,
 };
 pub use system::{
-    ClientPreferencesResponse, SystemSettingsResponse, UpdateClientPreferencesRequest, UpdateSettingsRequest,
+    ClientPreferencesResponse, FeedbackDiagnosticsContextResponse, FeedbackDiagnosticsPrivacyResponse,
+    FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse, SystemSettingsResponse,
+    UpdateClientPreferencesRequest, UpdateSettingsRequest,
 };
 pub use team::{
     AddAgentRequest, AgentWorkspaceLeaseResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest,
     CreateTeamHttpRequest, CreateTeamRequest, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
     SendAgentMessageRequest, SendTeamMessageRequest, TeamAgentInput, TeamAgentRemovedPayload, TeamAgentRenamedPayload,
-    TeamAgentResponse, TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload, TeamListResponse,
-    TeamMcpPhase, TeamMcpRuntimeConfig, TeamMcpStatusPayload, TeamResponse, TeamRunAckResponse, TeamRunPayload,
-    TeamRunSource, TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageDelivery,
-    TeamSendMessageQueuedResponse, TeamSendMessageReason, TeamSendMessageStatus, TeamSendMessageTargetQueueState,
-    TeamSessionBinding, TeamSlotRuntimeHealth, TeamSlotWorkPayload, TeamWorkspaceMode, TeammateMessagePayload,
+    TeamAgentResponse, TeamAgentRuntimeStatus, TeamAgentRuntimeStatusPayload, TeamAgentSpawnedPayload,
+    TeamAgentStatusPayload, TeamChildTurnPayload, TeamListResponse, TeamMcpRuntimeConfig, TeamMessageEnqueueStatus,
+    TeamResponse, TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStateResponse, TeamRunStatus,
+    TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase,
+    TeamSessionStatus, TeamSessionStatusPayload, TeamSlotBlockedReason, TeamSlotWorkPayload, TeamSlotWorkState,
+    TeamWorkspaceMode, TeammateMessagePayload,
 };
 pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
+pub use team_tools::{
+    TEAM_DESCRIBE_ASSISTANT_DESCRIPTION, TEAM_LIST_ASSISTANTS_DESCRIPTION, TEAM_SPAWN_AGENT_DESCRIPTION,
+    TEAM_TOOLS_SCHEMA_VERSION, TeamToolCall, TeamToolCliEnvelope, TeamToolCliMeta, TeamToolContextResponse,
+    TeamToolDescriptor, TeamToolErrorCode, TeamToolErrorPayload, TeamToolName, TeamToolPermission, TeamToolRole,
+    TeamToolRuntimeCallRequest, TeamToolRuntimeCallResponse, TeamToolTransport, cli_command_for_tool,
+    team_tool_descriptor, team_tool_descriptors, team_tool_descriptors_for_role, tool_name_for_cli_path,
+};
 pub use websocket::WebSocketMessage;
 
 #[cfg(test)]

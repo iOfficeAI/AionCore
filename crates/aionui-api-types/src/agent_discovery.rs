@@ -45,7 +45,7 @@ pub struct AgentSourceInfo {
     /// Primary CLI binary checked for availability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_name: Option<String>,
-    /// Extra binary required when the row spawns via a bridge (e.g. `bun`).
+    /// Extra binary required when the row spawns via a bridge (e.g. `npx`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge_binary: Option<String>,
     /// Hub package identifier when `agent_source = "extension"`.
@@ -83,6 +83,15 @@ pub struct BehaviorPolicy {
 
     #[serde(default)]
     pub supports_team: bool,
+
+    /// Explicitly override team-mode inference for protocol outliers.
+    ///
+    /// ACP normally requires stdio MCP support, so the presence of
+    /// `mcp_capabilities` is enough to infer team support. Some adapters accept
+    /// `mcpServers` but do not wire them into the wrapped agent; those adapters
+    /// must set this to `Some(false)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_capable_override: Option<bool>,
 }
 
 /// Handshake-derived fields captured from the ACP init/session-response.
@@ -116,6 +125,7 @@ pub enum AgentManagementStatus {
     Missing,
     Online,
     Offline,
+    Unchecked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,8 +296,8 @@ pub struct AgentMetadata {
     pub sort_order: i64,
 
     /// Whether this agent supports team mode. Derived at hydrate time from
-    /// the hard whitelist + persisted `agent_capabilities` MCP declarations.
-    /// Not a persisted column.
+    /// the behavior policy, hard whitelist, and persisted `agent_capabilities`
+    /// MCP declarations. Not a persisted column.
     #[serde(default)]
     pub team_capable: bool,
 
@@ -494,6 +504,8 @@ mod tests {
     fn agent_management_status_serializes_snake_case() {
         let value = serde_json::to_value(AgentManagementStatus::Offline).unwrap();
         assert_eq!(value, json!("offline"));
+        let value = serde_json::to_value(AgentManagementStatus::Unchecked).unwrap();
+        assert_eq!(value, json!("unchecked"));
     }
 }
 
@@ -527,11 +539,22 @@ mod behavior_policy_tests {
     fn supports_team_defaults_false_and_roundtrips() {
         let empty: BehaviorPolicy = serde_json::from_str("{}").unwrap();
         assert!(!empty.supports_team);
+        assert_eq!(empty.team_capable_override, None);
 
         let with_team: BehaviorPolicy = serde_json::from_str(r#"{"supports_team":true}"#).unwrap();
         assert!(with_team.supports_team);
 
         let serialized = serde_json::to_string(&with_team).unwrap();
         assert!(serialized.contains("\"supports_team\":true"));
+        assert!(!serialized.contains("team_capable_override"));
+    }
+
+    #[test]
+    fn team_capable_override_roundtrips_explicit_false() {
+        let policy: BehaviorPolicy = serde_json::from_str(r#"{"team_capable_override":false}"#).unwrap();
+        assert_eq!(policy.team_capable_override, Some(false));
+
+        let serialized = serde_json::to_string(&policy).unwrap();
+        assert!(serialized.contains("\"team_capable_override\":false"));
     }
 }

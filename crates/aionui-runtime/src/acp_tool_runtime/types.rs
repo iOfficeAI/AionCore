@@ -20,8 +20,8 @@ impl ManagedAcpToolId {
 
     pub fn version(self) -> &'static str {
         match self {
-            Self::CodexAcp => "1.1.4",
-            Self::ClaudeAgentAcp => "0.39.0",
+            Self::CodexAcp => "1.1.2",
+            Self::ClaudeAgentAcp => "0.58.1",
         }
     }
 
@@ -224,8 +224,8 @@ mod tests {
 
     #[test]
     fn managed_acp_tool_versions_match_current_pins() {
-        assert_eq!(ManagedAcpToolId::CodexAcp.version(), "1.1.4");
-        assert_eq!(ManagedAcpToolId::ClaudeAgentAcp.version(), "0.39.0");
+        assert_eq!(ManagedAcpToolId::CodexAcp.version(), "1.1.2");
+        assert_eq!(ManagedAcpToolId::ClaudeAgentAcp.version(), "0.58.1");
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use aionui_ai_agent::protocol::events::{ErrorEventData, TipType};
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
-use crate::response_middleware::{ICronService, ISkillLoadService, MessageMiddleware, MiddlewareResult};
+use crate::response_middleware::{ISkillLoadService, MessageMiddleware, MiddlewareResult};
 use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
 use aionui_api_types::{AgentErrorCode, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
@@ -99,7 +99,6 @@ pub struct StreamRelay {
     turn_id: String,
     user_id: String,
     broadcaster: Arc<dyn EventBroadcaster>,
-    cron_service: Option<Arc<dyn ICronService>>,
     skill_resolver: Option<Arc<dyn SkillResolver>>,
     allowed_skill_names: Vec<String>,
     runtime_state: Option<Arc<ConversationRuntimeStateService>>,
@@ -117,7 +116,6 @@ impl StreamRelay {
         user_id: String,
         repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
-        cron_service: Option<Arc<dyn ICronService>>,
     ) -> Self {
         let adapter = StreamPersistenceAdapter::new(conversation_id.clone(), msg_id.clone(), repo, None);
         Self {
@@ -126,7 +124,6 @@ impl StreamRelay {
             turn_id,
             user_id,
             broadcaster,
-            cron_service,
             skill_resolver: None,
             allowed_skill_names: Vec::new(),
             runtime_state: None,
@@ -206,10 +203,12 @@ impl StreamRelay {
     ) -> RelayOutcome {
         let started_at = now_ms();
         info!(
+            target: "aionui_feedback_diagnostics",
+            diagnostic_event = "feedback.runtime.turn_start",
             conversation_id = %self.conversation_id,
             turn_id = %self.turn_id,
             msg_id = %self.msg_id,
-            "StreamRelay started"
+            "feedback.runtime.turn_start"
         );
 
         let mut full_text_buffer = String::new();
@@ -278,9 +277,14 @@ impl StreamRelay {
                     if !first_agent_event_logged {
                         first_agent_event_logged = true;
                         info!(
-                            event_type = Self::event_kind(&event),
+                            target: "aionui_feedback_diagnostics",
+                            diagnostic_event = "feedback.runtime.turn_first_agent_event",
+                            conversation_id = %self.conversation_id,
+                            turn_id = %self.turn_id,
+                            msg_id = %self.msg_id,
+                            event_type = %Self::event_kind(&event),
                             elapsed_ms = now_ms().saturating_sub(started_at),
-                            "StreamRelay received first agent event"
+                            "feedback.runtime.turn_first_agent_event"
                         );
                     }
 
@@ -296,9 +300,14 @@ impl StreamRelay {
                             if !first_visible_output_logged && !data.content.is_empty() {
                                 first_visible_output_logged = true;
                                 info!(
+                                    target: "aionui_feedback_diagnostics",
+                                    diagnostic_event = "feedback.runtime.turn_first_visible_output",
+                                    conversation_id = %self.conversation_id,
+                                    turn_id = %self.turn_id,
+                                    msg_id = %self.msg_id,
                                     event_type = "Thinking",
                                     elapsed_ms = now_ms().saturating_sub(started_at),
-                                    "StreamRelay received first visible output"
+                                    "feedback.runtime.turn_first_visible_output"
                                 );
                             }
                             if !data.content.is_empty() {
@@ -318,9 +327,14 @@ impl StreamRelay {
                             if !first_visible_output_logged && !data.content.is_empty() {
                                 first_visible_output_logged = true;
                                 info!(
+                                    target: "aionui_feedback_diagnostics",
+                                    diagnostic_event = "feedback.runtime.turn_first_visible_output",
+                                    conversation_id = %self.conversation_id,
+                                    turn_id = %self.turn_id,
+                                    msg_id = %self.msg_id,
                                     event_type = "Text",
                                     elapsed_ms = now_ms().saturating_sub(started_at),
-                                    "StreamRelay received first visible output"
+                                    "feedback.runtime.turn_first_visible_output"
                                 );
                             }
                             if !data.content.is_empty() {
@@ -351,26 +365,22 @@ impl StreamRelay {
                                 "Error"
                             };
                             let terminal = Self::terminal_from_event(&event);
-                            match &terminal {
-                                RelayTerminal::Error { code, retryable } => {
-                                    info!(
-                                        event_type,
-                                        elapsed_ms,
-                                        text_len = full_text_buffer.len(),
-                                        error_code = ?code,
-                                        retryable = ?retryable,
-                                        "StreamRelay received terminal event"
-                                    );
-                                }
-                                RelayTerminal::Finish | RelayTerminal::ChannelClosed => {
-                                    info!(
-                                        event_type,
-                                        elapsed_ms,
-                                        text_len = full_text_buffer.len(),
-                                        "StreamRelay received terminal event"
-                                    );
-                                }
-                            }
+                            info!(
+                                target: "aionui_feedback_diagnostics",
+                                diagnostic_event = "feedback.runtime.turn_terminal",
+                                conversation_id = %self.conversation_id,
+                                turn_id = %self.turn_id,
+                                msg_id = %self.msg_id,
+                                event_type = %event_type,
+                                elapsed_ms,
+                                text_len = full_text_buffer.len(),
+                                error_code = ?terminal.code(),
+                                retryable = ?terminal.retryable(),
+                                saw_visible_output = attempt.saw_visible_output,
+                                saw_tool_or_side_effect = attempt.saw_tool_or_side_effect,
+                                persisted_assistant_output = !full_text_buffer.is_empty(),
+                                "feedback.runtime.turn_terminal"
+                            );
 
                             let defer_clean_error = self.defer_clean_terminal_errors
                                 && matches!(
@@ -485,9 +495,20 @@ impl StreamRelay {
                 Err(broadcast::error::RecvError::Closed) => {
                     let elapsed_ms = now_ms() - started_at;
                     warn!(
+                        target: "aionui_feedback_diagnostics",
+                        diagnostic_event = "feedback.runtime.turn_terminal",
+                        conversation_id = %self.conversation_id,
+                        turn_id = %self.turn_id,
+                        msg_id = %self.msg_id,
+                        event_type = "ChannelClosed",
                         elapsed_ms,
                         text_len = full_text_buffer.len(),
-                        "StreamRelay channel closed without terminal event"
+                        error_code = ?RelayTerminal::ChannelClosed.code(),
+                        retryable = ?RelayTerminal::ChannelClosed.retryable(),
+                        saw_visible_output = attempt.saw_visible_output,
+                        saw_tool_or_side_effect = attempt.saw_tool_or_side_effect,
+                        persisted_assistant_output = !full_text_buffer.is_empty(),
+                        "feedback.runtime.turn_terminal"
                     );
 
                     let deleting = self.is_deleting();
@@ -700,17 +721,12 @@ impl StreamRelay {
     }
 
     async fn process_final_text(&self, text: &str) -> MiddlewareResult {
-        let middleware = MessageMiddleware::new_with_skill_loader(
-            self.cron_service
-                .as_ref()
-                .map(|service| Box::new(SharedCronService(Arc::clone(service))) as Box<dyn ICronService>),
-            self.skill_resolver.as_ref().map(|resolver| {
-                Box::new(SharedSkillResolver {
-                    resolver: Arc::clone(resolver),
-                    allowed_skill_names: self.allowed_skill_names.clone(),
-                }) as Box<dyn ISkillLoadService>
-            }),
-        );
+        let middleware = MessageMiddleware::new_with_skill_loader(self.skill_resolver.as_ref().map(|resolver| {
+            Box::new(SharedSkillResolver {
+                resolver: Arc::clone(resolver),
+                allowed_skill_names: self.allowed_skill_names.clone(),
+            }) as Box<dyn ISkillLoadService>
+        }));
 
         middleware.process(text, &self.user_id, &self.conversation_id).await
     }
@@ -750,37 +766,6 @@ impl StreamRelay {
     }
 }
 
-struct SharedCronService(Arc<dyn ICronService>);
-
-#[async_trait::async_trait]
-impl ICronService for SharedCronService {
-    async fn create_job(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-        params: &crate::response_middleware::CronCreateParams,
-    ) -> crate::response_middleware::CronCommandResult {
-        self.0.create_job(user_id, conversation_id, params).await
-    }
-
-    async fn update_job(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-        params: &crate::response_middleware::CronUpdateParams,
-    ) -> crate::response_middleware::CronCommandResult {
-        self.0.update_job(user_id, conversation_id, params).await
-    }
-
-    async fn list_jobs(&self, user_id: &str, conversation_id: &str) -> crate::response_middleware::CronCommandResult {
-        self.0.list_jobs(user_id, conversation_id).await
-    }
-
-    async fn delete_job(&self, user_id: &str, job_id: &str) -> crate::response_middleware::CronCommandResult {
-        self.0.delete_job(user_id, job_id).await
-    }
-}
-
 struct SharedSkillResolver {
     resolver: Arc<dyn SkillResolver>,
     allowed_skill_names: Vec<String>,
@@ -809,10 +794,43 @@ mod tests {
     use aionui_ai_agent::protocol::events::{ErrorEventData, FinishEventData, TextEventData, ThinkingEventData};
     use aionui_db::DbError;
     use aionui_db::models::MessageRow;
+    use std::io::Write;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tracing::Level;
+    use tracing_subscriber::fmt;
 
     // ── run() async tests ─────────────────────────────────────────
+
+    #[derive(Clone)]
+    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedLogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs(level: Level, f: impl FnOnce()) -> String {
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let make_writer = {
+            let buffer = Arc::clone(&buffer);
+            move || SharedLogBuffer(Arc::clone(&buffer))
+        };
+        let subscriber = fmt::Subscriber::builder()
+            .with_max_level(level)
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buffer.lock().expect("log buffer lock").clone()).expect("utf8 logs")
+    }
 
     #[derive(Default)]
     struct RecordingSkillResolverForRelay {
@@ -879,7 +897,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -927,7 +944,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let mut ws_rx = bus.subscribe();
@@ -983,7 +999,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1015,6 +1030,47 @@ mod tests {
         assert_eq!(content["type"], "error");
     }
 
+    #[test]
+    fn stream_relay_emits_feedback_runtime_terminal_log() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let captured = capture_logs(Level::INFO, || {
+            runtime.block_on(async {
+                let repo = Arc::new(RecordingRepo::new());
+                let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+                let (tx, rx) = broadcast::channel(64);
+
+                let relay = StreamRelay::new(
+                    "conv-1".into(),
+                    "asst-1".into(),
+                    "turn-1".into(),
+                    "user-1".into(),
+                    repo,
+                    bus,
+                );
+
+                tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
+                    "Something went wrong",
+                    None,
+                )))
+                .unwrap();
+                drop(tx);
+
+                relay.consume(rx).await;
+            });
+        });
+
+        assert!(captured.contains("aionui_feedback_diagnostics"), "{captured}");
+        assert!(captured.contains("feedback.runtime.turn_terminal"), "{captured}");
+        assert!(captured.contains("conversation_id=conv-1"), "{captured}");
+        assert!(captured.contains("turn_id=turn-1"), "{captured}");
+        assert!(captured.contains("msg_id=asst-1"), "{captured}");
+        assert!(captured.contains("event_type=Error"), "{captured}");
+        assert!(captured.contains("text_len=0"), "{captured}");
+    }
+
     #[tokio::test]
     async fn clean_retryable_error_can_be_deferred_for_replay() {
         let repo = Arc::new(RecordingRepo::new());
@@ -1029,7 +1085,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         )
         .with_turn_completion(false)
         .with_defer_clean_terminal_errors(true);
@@ -1081,7 +1136,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         )
         .with_turn_completion(false)
         .with_defer_clean_terminal_errors(true);
@@ -1129,7 +1183,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         )
         .with_turn_completion(false)
         .with_defer_clean_terminal_errors(true);
@@ -1176,7 +1229,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1221,7 +1273,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let mut ws_rx = bus.subscribe();
@@ -1285,7 +1336,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1327,7 +1377,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1381,7 +1430,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let mut ws_rx = bus.subscribe();
@@ -1445,7 +1493,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let mut ws_rx = bus.subscribe();
@@ -1507,7 +1554,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1543,7 +1589,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         // Subscribe to the bus before relay runs
@@ -1578,57 +1623,6 @@ mod tests {
         assert_eq!(stream_event.data["turn_id"], "turn-1");
     }
 
-    #[tokio::test]
-    async fn run_finalizes_with_cleaned_replacement_event() {
-        let repo = Arc::new(RecordingRepo::new());
-        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
-        let (tx, _) = broadcast::channel(64);
-        let relay = StreamRelay::new(
-            "conv-1".into(),
-            "asst-1".into(),
-            "turn-1".into(),
-            "user-1".into(),
-            repo.clone(),
-            bus.clone(),
-            Some(Arc::new(MockCronService)),
-        );
-
-        let mut ws_rx = bus.subscribe();
-        let rx = tx.subscribe();
-        tx.send(AgentStreamEvent::Text(TextEventData {
-            content: "Hello [CRON_LIST]".into(),
-        }))
-        .unwrap();
-        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
-
-        let outcome = relay.consume(rx).await;
-        assert_eq!(outcome.system_responses, vec!["[System: listed]".to_string()]);
-
-        let inserts = repo.take_inserts();
-        assert_eq!(inserts.len(), 1);
-        let updates = repo.take_updates();
-        let final_update = updates
-            .iter()
-            .find(|(id, update)| id == "asst-1" && update.content.is_some())
-            .expect("expected cleaned final text update");
-        let content: serde_json::Value = serde_json::from_str(final_update.1.content.as_deref().unwrap()).unwrap();
-        assert_eq!(content["content"].as_str().map(str::trim), Some("Hello"));
-
-        let mut ws_events = vec![];
-        while let Ok(evt) = ws_rx.try_recv() {
-            ws_events.push(evt);
-        }
-
-        let replacement = ws_events
-            .iter()
-            .find(|evt| evt.name == "message.stream" && evt.data["type"] == "content" && evt.data["replace"] == true);
-        assert!(replacement.is_some());
-        assert_eq!(
-            replacement.unwrap().data["data"]["content"].as_str().map(str::trim),
-            Some("Hello")
-        );
-    }
-
     // ── Tool persistence tests ────────────────────────────────────
 
     #[tokio::test]
@@ -1646,7 +1640,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1720,7 +1713,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1817,7 +1809,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1902,7 +1893,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus.clone(),
-            None,
         );
 
         let rx = tx.subscribe();
@@ -1951,7 +1941,6 @@ mod tests {
             "user-1".into(),
             repo,
             bus,
-            None,
         );
         let mut active_text = Some(TextSegmentState {
             id: "missing-segment".into(),
@@ -1999,7 +1988,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus,
-            None,
         )
         .with_runtime_state(runtime_state);
         let rx = tx.subscribe();
@@ -2029,7 +2017,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus,
-            None,
         );
 
         let outcome = relay
@@ -2060,7 +2047,6 @@ mod tests {
             "user-1".into(),
             repo.clone(),
             bus,
-            None,
         );
         let mut active_thinking = Some(ThinkingSegmentState {
             id: "thinking-1".into(),
@@ -2078,53 +2064,6 @@ mod tests {
     }
 
     // ── Helpers ──────────────────────────────────────────────────
-
-    struct MockCronService;
-
-    #[async_trait::async_trait]
-    impl ICronService for MockCronService {
-        async fn create_job(
-            &self,
-            _user_id: &str,
-            _conversation_id: &str,
-            _params: &crate::response_middleware::CronCreateParams,
-        ) -> crate::response_middleware::CronCommandResult {
-            crate::response_middleware::CronCommandResult {
-                success: true,
-                message: "created".into(),
-            }
-        }
-
-        async fn update_job(
-            &self,
-            _user_id: &str,
-            _conversation_id: &str,
-            _params: &crate::response_middleware::CronUpdateParams,
-        ) -> crate::response_middleware::CronCommandResult {
-            crate::response_middleware::CronCommandResult {
-                success: true,
-                message: "updated".into(),
-            }
-        }
-
-        async fn list_jobs(
-            &self,
-            _user_id: &str,
-            _conversation_id: &str,
-        ) -> crate::response_middleware::CronCommandResult {
-            crate::response_middleware::CronCommandResult {
-                success: true,
-                message: "listed".into(),
-            }
-        }
-
-        async fn delete_job(&self, _user_id: &str, _job_id: &str) -> crate::response_middleware::CronCommandResult {
-            crate::response_middleware::CronCommandResult {
-                success: true,
-                message: "deleted".into(),
-            }
-        }
-    }
 
     /// Recording repo that captures insert/update calls for assertions.
     struct RecordingRepo {

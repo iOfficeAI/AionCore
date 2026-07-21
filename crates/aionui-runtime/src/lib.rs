@@ -1,21 +1,16 @@
 #![warn(clippy::disallowed_types)]
 
-//! Bundled runtime (bun) resolver for aioncore.
-//!
-//! Embeds the bun runtime at build time (zstd-compressed) and extracts it
-//! to the user's OS cache directory on first call. Callers use
-//! [`resolve_bun`] to obtain a usable executable path and [`bun_bin_dir`]
-//! to prepend the runtime directory to child-process `PATH`.
+//! Managed runtime and subprocess infrastructure for aioncore.
 
 pub mod acp_tool_runtime;
 mod agent_env;
 mod cache;
-mod embed;
-mod extract;
 mod http_client;
 mod lease;
 pub mod managed_resources;
+pub mod managed_resources_contract;
 pub mod node_runtime;
+mod registry_npx_lock;
 mod resolver;
 mod shell_env;
 
@@ -36,14 +31,11 @@ pub use node_runtime::{
     doctor_snapshot_for_test, ensure_node_runtime, ensure_node_runtime_with_reporter, ensure_runtime_command,
     ensure_runtime_command_with_reporter, probe_node_runtime_supported, probe_runtime_command,
 };
-pub use resolver::{ResolveError, bun_bin_dir, resolve_bun, resolve_command_in, resolve_command_path};
+pub use registry_npx_lock::{RegistryNpxLockError, pin_registry_npx_args, should_skip_registry_npx_version_probe};
+pub use resolver::{resolve_command_in, resolve_command_path};
 pub use shell_env::enhance_process_path;
 mod spawn;
 pub use spawn::{Builder, kill_process_tree, kill_process_tree_by_id};
-
-#[cfg(test)]
-#[path = "../build_support.rs"]
-mod build_support_tests;
 
 #[cfg(test)]
 mod test_support;

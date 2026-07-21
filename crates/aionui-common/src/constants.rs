@@ -30,32 +30,72 @@ pub const UPLOAD_MAX_SIZE: usize = 30 * 1024 * 1024;
 
 // --- Team mode ---
 
-/// Hard-coded backends that always support team mode, regardless of ACP capability detection.
-pub const TEAM_CAPABLE_BACKENDS: &[&str] = &["claude", "codex", "gemini", "aionrs", "codebuddy"];
+/// Runtime backend that supports Team MCP without ACP capability metadata.
+pub const AIONRS_RUNTIME_BACKEND: &str = "aionrs";
 
-/// Determine if an agent supports team mode based on its persisted `agent_capabilities` JSON.
-///
-/// Returns `true` if:
-/// 1. The backend is in the hard whitelist, OR
-/// 2. The `agent_capabilities` JSON contains an `mcp_capabilities` / `mcpCapabilities` / `mcp`
-///    field (per ACP spec, presence of any MCP transport implies stdio support).
+/// Determine if an agent supports team mode through MCP or CLI fallback.
 pub fn is_team_capable(backend: &str, agent_capabilities: Option<&serde_json::Value>) -> bool {
-    if TEAM_CAPABLE_BACKENDS.contains(&backend) {
-        return true;
+    if backend.trim().is_empty() {
+        return false;
     }
-    has_mcp_capability(agent_capabilities)
+    supports_team_mcp(backend, agent_capabilities) || supports_team_cli_fallback(agent_capabilities)
 }
 
-/// Check whether `agent_capabilities` JSON declares any MCP transport.
-/// Per ACP spec: stdio is the baseline; if any transport is declared, the agent supports MCP.
-pub fn has_mcp_capability(agent_capabilities: Option<&serde_json::Value>) -> bool {
+/// Determine if an agent supports Team MCP injection.
+pub fn supports_team_mcp(backend: &str, agent_capabilities: Option<&serde_json::Value>) -> bool {
+    if backend == AIONRS_RUNTIME_BACKEND {
+        return true;
+    }
+    has_enabled_team_mcp_transport(agent_capabilities)
+}
+
+/// Determine if an agent is eligible for shell/CLI fallback.
+pub fn supports_team_cli_fallback(agent_capabilities: Option<&serde_json::Value>) -> bool {
     let Some(caps) = agent_capabilities else {
+        return true;
+    };
+    !explicit_false(caps, &["shell"])
+        && !explicit_false(caps, &["cli"])
+        && !explicit_false(caps, &["supports_shell"])
+        && !explicit_false(caps, &["supportsShell"])
+        && !explicit_false(caps, &["supports_cli"])
+        && !explicit_false(caps, &["supportsCli"])
+        && !explicit_false(caps, &["execution", "shell"])
+        && !explicit_false(caps, &["execution", "cli"])
+}
+
+fn explicit_false(value: &serde_json::Value, path: &[&str]) -> bool {
+    let mut cursor = value;
+    for key in path {
+        let Some(next) = cursor.get(*key) else {
+            return false;
+        };
+        cursor = next;
+    }
+    cursor.as_bool() == Some(false)
+}
+
+/// Check whether `agent_capabilities` JSON declares MCP capability metadata.
+pub fn has_mcp_capability(agent_capabilities: Option<&serde_json::Value>) -> bool {
+    mcp_capability_object(agent_capabilities).is_some()
+}
+
+fn has_enabled_team_mcp_transport(agent_capabilities: Option<&serde_json::Value>) -> bool {
+    let Some(caps) = mcp_capability_object(agent_capabilities) else {
         return false;
     };
+    bool_field(caps, "stdio") || bool_field(caps, "http")
+}
+
+fn mcp_capability_object(agent_capabilities: Option<&serde_json::Value>) -> Option<&serde_json::Value> {
+    let caps = agent_capabilities?;
     caps.get("mcp_capabilities")
         .or_else(|| caps.get("mcpCapabilities"))
         .or_else(|| caps.get("mcp"))
-        .is_some()
+}
+
+fn bool_field(value: &serde_json::Value, key: &str) -> bool {
+    value.get(key).and_then(serde_json::Value::as_bool) == Some(true)
 }
 
 // --- Image processing ---
@@ -64,3 +104,69 @@ pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".gif
 /// Remote image download size limit (5 MB).
 pub const REMOTE_IMAGE_MAX_SIZE: usize = 5 * 1024 * 1024;
 pub const REMOTE_IMAGE_MAX_REDIRECTS: u32 = 5;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn has_mcp_capability_requires_mcp_capability_field() {
+        assert!(!has_mcp_capability(None));
+        assert!(!has_mcp_capability(Some(&json!({}))));
+
+        assert!(has_mcp_capability(Some(&json!({
+            "mcp_capabilities": { "http": false, "sse": false }
+        }))));
+        assert!(has_mcp_capability(Some(&json!({
+            "mcp_capabilities": {}
+        }))));
+
+        assert!(has_mcp_capability(Some(&json!({
+            "mcp_capabilities": { "stdio": true }
+        }))));
+        assert!(has_mcp_capability(Some(&json!({
+            "mcpCapabilities": { "http": true, "sse": false }
+        }))));
+        assert!(has_mcp_capability(Some(&json!({
+            "mcp": { "http": false, "sse": true }
+        }))));
+    }
+
+    #[test]
+    fn team_mcp_builtin_backend_does_not_require_capability_metadata() {
+        assert!(supports_team_mcp("aionrs", None));
+        assert!(supports_team_mcp("aionrs", Some(&json!({}))));
+    }
+
+    #[test]
+    fn acp_backends_require_stdio_or_http_capability_for_team_mcp() {
+        assert!(supports_team_mcp(
+            "claude",
+            Some(&json!({ "mcp_capabilities": { "stdio": true } }))
+        ));
+        assert!(supports_team_mcp(
+            "codex",
+            Some(&json!({ "mcp_capabilities": { "http": true, "sse": false } }))
+        ));
+
+        assert!(!supports_team_mcp(
+            "gemini",
+            Some(&json!({ "mcp_capabilities": { "http": false, "sse": true } }))
+        ));
+        assert!(!supports_team_mcp(
+            "codebuddy",
+            Some(&json!({ "mcp_capabilities": { "http": false, "sse": false } }))
+        ));
+        assert!(!supports_team_mcp("acp", None));
+        assert!(!supports_team_mcp("claude", Some(&json!({ "mcp_capabilities": {} }))));
+    }
+
+    #[test]
+    fn cli_fallback_is_default_unless_capabilities_disable_shell_or_cli() {
+        assert!(supports_team_cli_fallback(None));
+        assert!(supports_team_cli_fallback(Some(&json!({}))));
+        assert!(!supports_team_cli_fallback(Some(&json!({"shell": false}))));
+        assert!(!supports_team_cli_fallback(Some(&json!({"execution": {"cli": false}}))));
+    }
+}

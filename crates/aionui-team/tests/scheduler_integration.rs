@@ -145,6 +145,7 @@ async fn aw2_wake_complete_finalize_executes_actions() {
         SchedulerAction::SendMessage {
             to: "w2".into(),
             message: "Please review when done".into(),
+            files: Vec::new(),
         },
     ];
 
@@ -196,6 +197,7 @@ async fn dl1_lead_finalize_stays_idle_no_auto_wake() {
     let actions = vec![SchedulerAction::SendMessage {
         to: "w1".into(),
         message: "Go work".into(),
+        files: Vec::new(),
     }];
 
     let wake_signal = h.mgr.finalize_turn("lead", &actions).await.unwrap();
@@ -259,6 +261,7 @@ async fn ae1_send_message_action_writes_mailbox() {
             &SchedulerAction::SendMessage {
                 to: "w1".into(),
                 message: "Hello worker".into(),
+                files: Vec::new(),
             },
         )
         .await
@@ -449,10 +452,12 @@ async fn full_workflow_lead_delegate_workers_idle_lead_rewake() {
         SchedulerAction::SendMessage {
             to: "w1".into(),
             message: "Implement X".into(),
+            files: Vec::new(),
         },
         SchedulerAction::SendMessage {
             to: "w2".into(),
             message: "Write tests for X".into(),
+            files: Vec::new(),
         },
         SchedulerAction::IdleNotification {
             summary: Some("Delegated".into()),
@@ -559,6 +564,7 @@ async fn broadcast_message_sends_to_all_except_sender() {
             &SchedulerAction::SendMessage {
                 to: "*".into(),
                 message: "Attention everyone".into(),
+                files: Vec::new(),
             },
         )
         .await

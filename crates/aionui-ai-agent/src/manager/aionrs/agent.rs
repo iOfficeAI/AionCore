@@ -1,14 +1,18 @@
+use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use aion_agent::bootstrap::AgentBootstrap;
 use aion_agent::engine::AgentEngine;
 use aion_agent::output::OutputSink;
 use aion_agent::session::Session;
-use aion_config::config::{CliArgs, Config};
+use aion_config::compat::ProviderCompat;
+use aion_config::config::{CliArgs, Config, McpServerConfig, ProviderType};
 use aion_mcp::manager::McpManager;
-use aion_protocol::commands::SessionMode;
+use aion_protocol::commands::{ApprovalScope, SessionMode};
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
 use aionui_api_types::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentModeResponse, ConfigOptionConfirmation,
@@ -17,17 +21,85 @@ use aionui_api_types::{
 use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms};
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, broadcast};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::agent_runtime::AgentRuntime;
+use crate::agent_task::IAgentTask;
 use crate::capability::backend_output_sink::BackendOutputSink;
 use crate::capability::backend_protocol_sink::BackendProtocolSink;
+use crate::capability::image_input::resolve_image_input_capability;
+use crate::dev_prompt_dump::{AgentFinalInputDump, dump_agent_final_input};
 use crate::error::AgentError;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
 use crate::types::{AionrsResolvedConfig, SendMessageData};
 
-use super::error::aionrs_engine_error_to_send_error;
+use super::content::build_content_blocks;
+use super::error::{aionrs_engine_error_to_send_error, aionrs_runtime_error_summary};
+
+fn resolve_aionui_config(cli_args: &CliArgs) -> Result<Config, AgentError> {
+    let mut config =
+        Config::resolve(cli_args).map_err(|e| AgentError::internal(format!("Config resolve failed: {e}")))?;
+
+    // AionUi owns the embedded runtime policy. Standalone aionrs max-token
+    // settings must not leak in from global or workspace config files.
+    config.max_tokens = None;
+    let default_transport = match config.provider {
+        ProviderType::Anthropic | ProviderType::Vertex => ProviderCompat::anthropic_defaults().transport,
+        ProviderType::OpenAI => ProviderCompat::openai_defaults().transport,
+        ProviderType::Bedrock => ProviderCompat::bedrock_defaults().transport,
+    };
+    config.compat.transport.default_max_tokens = default_transport.default_max_tokens;
+    config.compat.transport.model_max_tokens = default_transport.model_max_tokens;
+
+    Ok(config)
+}
+
+#[derive(Clone, Debug)]
+struct AionrsFinalInputDumpContext {
+    dump_dir: PathBuf,
+    provider: String,
+    model: String,
+    base_url: Option<String>,
+    system_prompt: Option<String>,
+    session_mode: Option<String>,
+    skills: Vec<String>,
+    mcp_servers: HashMap<String, McpServerConfig>,
+    runtime_env: Vec<(String, String)>,
+}
+
+fn build_aionrs_final_input_dump_value(
+    conversation_id: &str,
+    workspace: &str,
+    context: &AionrsFinalInputDumpContext,
+    data: &SendMessageData,
+) -> Value {
+    serde_json::json!({
+        "kind": "aionrs-final-input",
+        "backend": "aionrs",
+        "conversation_id": conversation_id,
+        "session_id": "none",
+        "msg_id": data.msg_id,
+        "turn_id": data.turn_id.as_deref().unwrap_or("none"),
+        "input": {
+            "system_prompt": context.system_prompt.as_deref(),
+            "user_content": &data.content,
+        },
+        "resolved_context": {
+            "provider": &context.provider,
+            "model": &context.model,
+            "base_url": context.base_url.as_deref(),
+            "workspace": {
+                "path": workspace,
+            },
+            "session_mode": context.session_mode.as_deref(),
+            "skills": &context.skills,
+            "mcp_servers": serde_json::to_value(&context.mcp_servers).unwrap_or(Value::Null),
+            "runtime_env": &context.runtime_env,
+        },
+    })
+}
 
 pub struct AionrsAgentManager {
     runtime: AgentRuntime,
@@ -43,7 +115,8 @@ pub struct AionrsAgentManager {
     #[allow(dead_code)] // intentional: lifetime-extension only; see Drop impl
     mcp_managers: Vec<Arc<McpManager>>,
     approval_manager: Arc<ToolApprovalManager>,
-    confirmations: Arc<std::sync::RwLock<Vec<Confirmation>>>,
+    confirmations: Arc<RwLock<Vec<Confirmation>>>,
+    final_input_dump: Option<AionrsFinalInputDumpContext>,
     /// Signalled by `cancel()` to abort an in-flight `engine.run()` via
     /// `tokio::select!` in `send_message()`.
     cancel_notify: Arc<Notify>,
@@ -70,30 +143,62 @@ impl AionrsAgentManager {
     ) -> Result<Self, AgentError> {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
+        let runtime_env = config_extra.runtime_env.clone();
+        let image_input_capability = resolve_image_input_capability(
+            &config_extra.provider,
+            config_extra.base_url.as_deref(),
+            &config_extra.model,
+        );
+        info!(
+            conversation_id = %conversation_id,
+            provider = %config_extra.provider,
+            model = %config_extra.model,
+            image_input_capability = ?image_input_capability,
+            "Resolved image input capability for Aionrs model"
+        );
+        let final_input_dump = config_extra
+            .prompt_dump_dir
+            .clone()
+            .map(|dump_dir| AionrsFinalInputDumpContext {
+                dump_dir,
+                provider: config_extra.provider.clone(),
+                model: config_extra.model.clone(),
+                base_url: config_extra.base_url.clone(),
+                system_prompt: config_extra.system_prompt.clone(),
+                session_mode: config_extra.session_mode.clone(),
+                skills: config_extra.skills.clone(),
+                mcp_servers: config_extra.extra_mcp_servers.clone(),
+                runtime_env: config_extra.runtime_env.clone(),
+            });
 
         let cli_args = CliArgs {
             provider: Some(config_extra.provider.clone()),
             api_key: Some(config_extra.api_key.clone()),
             base_url: config_extra.base_url.clone(),
             model: Some(config_extra.model.clone()),
-            max_tokens: Some(config_extra.max_tokens),
+            max_tokens: None,
             max_turns: config_extra.max_turns,
             max_tool_call_malformed_turns: config_extra.max_tool_call_malformed_turns,
             max_tool_call_failure_turns: config_extra.max_tool_call_failure_turns,
             system_prompt: config_extra.system_prompt.clone(),
             profile: None,
             auto_approve: config_extra.session_mode.as_deref() == Some("yolo"),
+            thinking: None,
+            thinking_budget: None,
             project_dir: Some(PathBuf::from(&workspace)),
         };
 
-        let mut config =
-            Config::resolve(&cli_args).map_err(|e| AgentError::internal(format!("Config resolve failed: {e}")))?;
+        let mut config = resolve_aionui_config(&cli_args)?;
 
         // Backend-specific overrides
         config.bedrock = config_extra.bedrock_config;
         config.session.enabled = true;
         config.session.directory = config_extra.session_directory.to_string_lossy().into_owned();
+        config.compat.image_input = Some(image_input_capability);
 
+        if let Some(mode) = config_extra.compat_overrides.openai_api_mode {
+            config.compat.transport.openai_api_mode = Some(mode);
+        }
         if let Some(field) = config_extra.compat_overrides.max_tokens_field {
             config.compat.transport.max_tokens_field = Some(field);
         }
@@ -108,7 +213,7 @@ impl AionrsAgentManager {
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
-        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink);
+        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
         if let Some(session) = resume_session {
             info!(
                 conversation_id = %conversation_id,
@@ -145,7 +250,7 @@ impl AionrsAgentManager {
             );
         }
 
-        let confirmations = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let confirmations = Arc::new(RwLock::new(Vec::new()));
         let protocol_sink = BackendProtocolSink::new(runtime.event_sender(), confirmations.clone());
         engine.set_approval_manager(approval_manager.clone());
         engine.set_protocol_writer(Arc::new(protocol_sink));
@@ -170,6 +275,7 @@ impl AionrsAgentManager {
             mcp_managers: result.mcp_managers,
             approval_manager,
             confirmations,
+            final_input_dump,
             cancel_notify: Arc::new(Notify::new()),
             turn_finished_notify: Arc::new(Notify::new()),
         })
@@ -196,10 +302,56 @@ impl AionrsAgentManager {
 
         was_running
     }
+
+    fn dump_aionrs_final_input(&self, data: &SendMessageData) {
+        let Some(context) = self.final_input_dump.as_ref() else {
+            return;
+        };
+
+        let value = build_aionrs_final_input_dump_value(
+            self.runtime.conversation_id(),
+            self.runtime.workspace(),
+            context,
+            data,
+        );
+        let input = value.get("input").cloned().unwrap_or(Value::Null);
+        let resolved_context = value.get("resolved_context").cloned().unwrap_or(Value::Null);
+
+        match dump_agent_final_input(
+            &context.dump_dir,
+            AgentFinalInputDump {
+                kind: "aionrs-final-input",
+                backend: "aionrs",
+                conversation_id: self.runtime.conversation_id(),
+                session_id: None,
+                msg_id: Some(data.msg_id.as_str()),
+                turn_id: data.turn_id.as_deref(),
+                input,
+                resolved_context,
+            },
+        ) {
+            Ok(path) => {
+                debug!(
+                    conversation_id = %self.runtime.conversation_id(),
+                    msg_id = %data.msg_id,
+                    path = %path.display(),
+                    "DEV agent final input dump written"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    conversation_id = %self.runtime.conversation_id(),
+                    msg_id = %data.msg_id,
+                    error = %error,
+                    "DEV agent final input dump failed"
+                );
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
-impl crate::agent_task::IAgentTask for AionrsAgentManager {
+impl IAgentTask for AionrsAgentManager {
     fn agent_type(&self) -> AgentType {
         AgentType::Aionrs
     }
@@ -234,11 +386,24 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
         );
         self.runtime.bump_activity();
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
+        self.dump_aionrs_final_input(&data);
+
+        // Keep attachment paths in the provider-independent history. Images
+        // are loaded on demand by aionrs's ViewImage tool.
+        debug!(
+            attachment_count = data.files.len(),
+            "Building structured Aionrs content blocks"
+        );
+        let content_blocks = build_content_blocks(&data.content, &data.files);
+        debug!(
+            block_count = content_blocks.len(),
+            "Built structured Aionrs content blocks"
+        );
 
         let mut engine = self.engine.lock().await;
 
         let result = tokio::select! {
-            res = engine.run(&data.content, &data.msg_id) => Some(res),
+            res = engine.run_with_blocks(content_blocks, &data.msg_id) => Some(res),
             _ = self.cancel_notify.notified() => {
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
@@ -263,11 +428,26 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
                 Ok(())
             }
             Some(Err(e)) => {
+                let summary = aionrs_runtime_error_summary(&e);
                 error!(
                     conversation_id = %self.runtime.conversation_id(),
                     elapsed_ms,
                     error = %ErrorChain(&e),
                     "Aionrs engine.run() failed, emitting Error"
+                );
+                error!(
+                    target: "aionui_feedback_diagnostics",
+                    diagnostic_event = "feedback.runtime.aionrs_error",
+                    conversation_id = %self.runtime.conversation_id(),
+                    msg_id = %data.msg_id,
+                    turn_id = data.turn_id.as_deref().unwrap_or("none"),
+                    elapsed_ms,
+                    error_kind = summary.kind,
+                    provider_error_class = summary.provider_error_class,
+                    http_status = summary.http_status,
+                    failure_count = summary.failure_count,
+                    failure_limit = summary.failure_limit,
+                    "feedback.runtime.aionrs_error"
                 );
                 let send_error = aionrs_engine_error_to_send_error(&e);
                 self.runtime.emit_error_data(send_error.stream_error().clone());
@@ -294,10 +474,7 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
 }
 
 impl AionrsAgentManager {
-    pub fn kill_and_wait(
-        &self,
-        reason: Option<AgentKillReason>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    pub fn kill_and_wait(&self, reason: Option<AgentKillReason>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let was_running = self.request_stop(reason, "kill");
         let turn_finished_notify = Arc::clone(&self.turn_finished_notify);
         let runtime = self.runtime.clone();
@@ -305,7 +482,7 @@ impl AionrsAgentManager {
 
         Box::pin(async move {
             if was_running
-                && tokio::time::timeout(Duration::from_secs(5), async {
+                && timeout(Duration::from_secs(5), async {
                     while runtime.status() == Some(ConversationStatus::Running) {
                         turn_finished_notify.notified().await;
                     }
@@ -351,9 +528,9 @@ impl AionrsAgentManager {
             );
         } else {
             let scope = if always_allow {
-                aion_protocol::commands::ApprovalScope::Always
+                ApprovalScope::Always
             } else {
-                aion_protocol::commands::ApprovalScope::Once
+                ApprovalScope::Once
             };
             self.approval_manager.approve(call_id, scope);
         }
@@ -461,214 +638,5 @@ fn parse_session_mode(s: &str) -> SessionMode {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::agent_task::IAgentTask;
-
-    async fn assert_no_stop_signal(agent: &AionrsAgentManager) {
-        let notified = agent.cancel_notify.notified();
-        tokio::pin!(notified);
-
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), &mut notified)
-                .await
-                .is_err(),
-            "idle stop must not leave a stale cancellation signal for the next turn"
-        );
-    }
-
-    fn make_test_config() -> AionrsResolvedConfig {
-        AionrsResolvedConfig {
-            provider: "anthropic".into(),
-            api_key: "sk-test-key".into(),
-            model: "claude-sonnet-4-20250514".into(),
-            base_url: None,
-            system_prompt: None,
-            max_tokens: 4096,
-            max_turns: None,
-            max_tool_call_malformed_turns: None,
-            max_tool_call_failure_turns: None,
-            compat_overrides: Default::default(),
-            session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
-            session_mode: None,
-            extra_mcp_servers: std::collections::HashMap::new(),
-            bedrock_config: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn aionrs_agent_returns_correct_type() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
-            .await
-            .unwrap();
-        assert_eq!(agent.agent_type(), AgentType::Aionrs);
-        assert_eq!(agent.workspace(), "/project");
-        assert_eq!(agent.conversation_id(), "conv-1");
-    }
-
-    #[tokio::test]
-    async fn aionrs_agent_initial_status_is_pending() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
-            .await
-            .unwrap();
-        assert_eq!(agent.status(), Some(ConversationStatus::Pending));
-    }
-
-    #[tokio::test]
-    async fn aionrs_agent_subscribe_returns_receiver() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
-            .await
-            .unwrap();
-        let _rx = agent.subscribe();
-    }
-
-    #[tokio::test]
-    async fn aionrs_agent_kill_succeeds() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
-            .await
-            .unwrap();
-        assert!(agent.kill(None).is_ok());
-        // Idle kill only clears transient state; task-manager removal owns lifecycle cleanup.
-        assert_eq!(agent.status(), Some(ConversationStatus::Pending));
-    }
-
-    #[tokio::test]
-    async fn aionrs_agent_kill_with_reason_succeeds() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
-            .await
-            .unwrap();
-        assert!(agent.kill(Some(AgentKillReason::IdleTimeout)).is_ok());
-    }
-
-    #[tokio::test]
-    async fn aionrs_agent_kill_running_turn_sends_stop_signal() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
-            .await
-            .unwrap();
-        agent.runtime.reset_for_new_turn(ConversationStatus::Running);
-
-        let notified = agent.cancel_notify.notified();
-        tokio::pin!(notified);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), &mut notified)
-                .await
-                .is_err()
-        );
-
-        agent
-            .kill(Some(AgentKillReason::ConversationDeleted))
-            .expect("kill should request stop");
-
-        tokio::time::timeout(std::time::Duration::from_millis(50), &mut notified)
-            .await
-            .expect("running kill should wake in-flight turn");
-    }
-
-    #[tokio::test]
-    async fn aionrs_agent_kill_and_wait_waits_for_running_turn_terminal() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
-            .await
-            .unwrap();
-        agent.runtime.reset_for_new_turn(ConversationStatus::Running);
-
-        let wait = agent.kill_and_wait(Some(AgentKillReason::ConversationDeleted));
-        tokio::pin!(wait);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), &mut wait)
-                .await
-                .is_err(),
-            "kill_and_wait must not return before a running turn reaches a terminal event"
-        );
-
-        agent.runtime.emit_finish(None);
-        agent.turn_finished_notify.notify_waiters();
-
-        tokio::time::timeout(std::time::Duration::from_millis(50), &mut wait)
-            .await
-            .expect("kill_and_wait should return after terminal notification");
-    }
-
-    #[tokio::test]
-    async fn aionrs_agent_kill_idle_turn_does_not_leave_stale_stop_signal() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
-            .await
-            .unwrap();
-
-        agent
-            .kill(Some(AgentKillReason::ConversationDeleted))
-            .expect("idle kill should be harmless");
-
-        assert_no_stop_signal(&agent).await;
-    }
-
-    #[tokio::test]
-    async fn aionrs_agent_confirmations_initially_empty() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
-            .await
-            .unwrap();
-        assert!(agent.get_confirmations().is_empty());
-    }
-
-    #[tokio::test]
-    async fn aionrs_agent_get_slash_commands_does_not_wait_for_engine_lock() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
-            .await
-            .unwrap();
-
-        let _engine_guard = agent.engine.lock().await;
-        let commands = tokio::time::timeout(std::time::Duration::from_millis(50), agent.get_slash_commands())
-            .await
-            .expect("slash command metadata should not wait for an active engine run")
-            .unwrap();
-
-        assert!(!commands.is_empty());
-    }
-
-    #[tokio::test]
-    async fn aionrs_agent_check_approval_returns_false_by_default() {
-        let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
-            .await
-            .unwrap();
-        assert!(!agent.check_approval("any_action", None));
-    }
-
-    #[tokio::test]
-    async fn stop_only_signals_in_flight_run() {
-        let agent = AionrsAgentManager::new("conv-stop".into(), "/project".into(), make_test_config(), None)
-            .await
-            .unwrap();
-        let mut rx = agent.subscribe();
-
-        agent.cancel().await.unwrap();
-
-        assert_eq!(agent.status(), Some(ConversationStatus::Pending));
-        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
-        assert_no_stop_signal(&agent).await;
-    }
-
-    #[tokio::test]
-    async fn runtime_can_emit_error_and_finish() {
-        let agent = AionrsAgentManager::new("conv-err".into(), "/project".into(), make_test_config(), None)
-            .await
-            .unwrap();
-        let mut rx = agent.subscribe();
-
-        agent.runtime.emit_error("test error");
-        // emit_error sets status to Finished, so emit_finish is a no-op here.
-        // We emit directly for the Finish broadcast path test:
-        agent
-            .runtime
-            .emit(AgentStreamEvent::Finish(crate::protocol::events::FinishEventData {
-                session_id: None,
-            }));
-
-        match rx.try_recv().unwrap() {
-            AgentStreamEvent::Error(data) => assert_eq!(data.message, "test error"),
-            other => panic!("Expected Error, got {:?}", other),
-        }
-        match rx.try_recv().unwrap() {
-            AgentStreamEvent::Finish(_) => {}
-            other => panic!("Expected Finish, got {:?}", other),
-        }
-    }
-}
+#[path = "agent_test.rs"]
+mod agent_test;

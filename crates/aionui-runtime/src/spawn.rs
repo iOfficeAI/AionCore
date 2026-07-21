@@ -19,9 +19,8 @@
 //!   so the child doesn't inherit debug/agent state that belongs to the
 //!   parent (matches v1 `acpConnectors.ts::getCleanAgentEnv`).
 //!
-//! Enhanced `PATH` (including the bundled bun directory) is handled
-//! once at process startup by [`crate::enhance_process_path`]; Builder
-//! does not re-inject it.
+//! Enhanced `PATH` is handled once at process startup by
+//! [`crate::enhance_process_path`]; Builder does not re-inject it.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -296,7 +295,7 @@ fn shell_wrap_windows_script(program: &OsStr) -> Option<ProgramPlan> {
     if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
         return Some(ProgramPlan {
             program: "cmd".into(),
-            args_prefix: vec!["/c".into(), program.into()],
+            args_prefix: vec!["/d".into(), "/c".into(), program.into()],
         });
     }
 
@@ -368,21 +367,17 @@ async fn kill_windows_process_tree(pid: u32) -> io::Result<()> {
         return Ok(());
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-            "taskkill failed for pid {pid} (exit {:?}): {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        ),
-    ))
+    Err(io::Error::other(format!(
+        "taskkill failed for pid {pid} (exit {:?}): {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    )))
 }
 
 /// Resolve `program` through `resolve_command_path` so callers don't have
 /// to. If the input already contains a path separator (relative or
 /// absolute) we leave it alone — only bare command names go through
-/// the resolver, where the bundled-bun shim and Windows `.cmd / .ps1 /
-/// .bat` fallbacks live.
+/// the resolver, where Windows `.cmd / .ps1 / .bat` fallbacks live.
 fn resolve_program(program: &OsStr) -> OsString {
     if let Some(s) = program.to_str()
         && !s.is_empty()
@@ -496,7 +491,7 @@ mod tests {
 
     #[test]
     fn display_renders_shell_style_command() {
-        let mut b = Builder::new("/usr/local/bin/bun");
+        let mut b = Builder::new("/usr/local/bin/node");
         b.current_dir("/tmp/work dir")
             .env("FOO", "bar baz")
             .args(["x", "--flag", "with space"]);
@@ -516,7 +511,7 @@ mod tests {
         );
         assert!(preview.contains("-u CLAUDECODE"), "missing -u CLAUDECODE: {preview}");
         assert!(
-            preview.contains(r#""/usr/local/bin/bun""#),
+            preview.contains(r#""/usr/local/bin/node""#),
             "program missing: {preview}"
         );
         assert!(preview.contains(r#""--flag""#), "arg --flag missing: {preview}");
@@ -555,6 +550,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                OsString::from("/d"),
                 OsString::from("/c"),
                 OsString::from(r"C:\Users\me\AppData\Roaming\npm\opencode.cmd"),
                 OsString::from("run"),
@@ -571,6 +567,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                OsString::from("/d"),
                 OsString::from("/c"),
                 OsString::from(r"C:\Users\me\AppData\Roaming\npm\opencode.bat"),
                 OsString::from("--version"),

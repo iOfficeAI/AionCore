@@ -38,8 +38,8 @@ use aionui_db::{
     SqliteApprovalRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
     SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteDevelopmentOperationsRepository,
-    SqliteDevelopmentRepository, SqliteProjectRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteSettingsRepository, SqliteTeamRepository,
+    SqliteDevelopmentRepository, SqliteFeedbackDiagnosticsRepository, SqliteProjectRepository,
+    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteTeamRepository,
 };
 use aionui_development::{
     ApprovalOption, ApprovalRequestInput, ApprovalResolver, ApprovalRouterState, ApprovalService, ApprovalSource,
@@ -69,12 +69,13 @@ use aionui_project::{
 use aionui_realtime::{NoopMessageRouter, WsHandlerState};
 use aionui_shell::ShellRouterState;
 use aionui_system::{
-    ClientPrefService, ConnectionTestRouterState, ConnectionTestService, ModelFetchService, ProtocolDetectionService,
-    ProviderService, RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService,
+    ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
+    ProtocolDetectionService, ProviderService, RuntimePrepareService, SettingsService, SystemRouterState,
+    VersionCheckService,
 };
 use aionui_team::{
-    AgentTurnCancellationPort, AgentTurnExecutionPort, TeamConversationProvisioningPort, TeamProjectionMessageStore,
-    TeamRouterState, TeamSessionService,
+    AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogEntry, TeamAssistantCatalogPort,
+    TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState, TeamSessionService,
 };
 
 use crate::config::derive_encryption_key;
@@ -975,6 +976,11 @@ pub async fn build_module_states(
         RouterBuildError::new("router.assistant.bootstrap", "failed to bootstrap assistant storage").with_source(error)
     })?;
     let cron = build_cron_state(services);
+    // Cron builds its own ConversationService (not a clone of the shared one),
+    // so wire the assistant rule dispatcher here — otherwise scheduled runs
+    // resolve empty rules. Mirrors the interactive path in build_conversation_state.
+    cron.conversation_service
+        .with_assistant_dispatcher(assistant.service.clone() as Arc<dyn AssistantRuleDispatcher>);
     cron.cron_service.init().await;
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -1000,7 +1006,12 @@ pub async fn build_module_states(
     );
 
     let team_state = build_module_state_phase(&boot, "team", || {
-        build_team_state(services, Some(cron.cron_service.clone()), backend_binary_path.clone())
+        build_team_state(
+            services,
+            Some(cron.cron_service.clone()),
+            backend_binary_path.clone(),
+            assistant.service.clone(),
+        )
     });
 
     let (channel_state, channel_components) =
@@ -1219,7 +1230,6 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
     #[async_trait::async_trait]
     impl AssistantAgentCatalogPort for RegistryAssistantAgentCatalog {
         async fn list_management_agents(&self) -> Result<Vec<aionui_api_types::AgentManagementRow>, AssistantError> {
-            self.registry.refresh_availability().await;
             Ok(self.registry.list_management_rows().await)
         }
     }
@@ -1272,12 +1282,18 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
 
     SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),
-        client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(pool))),
+        client_pref_service: ClientPrefService::with_keep_awake_controller(
+            Arc::new(SqliteClientPreferenceRepository::new(pool.clone())),
+            Arc::new(aionui_system::SystemKeepAwakeController::new()),
+        ),
         provider_service: ProviderService::new(provider_repo.clone(), encryption_key),
         model_fetch_service: ModelFetchService::new(provider_repo, encryption_key, http_client.clone()),
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
         version_check_service: VersionCheckService::new(http_client, env!("CARGO_PKG_VERSION").to_owned()),
         runtime_prepare_service: RuntimePrepareService::new(services.event_bus.clone()),
+        feedback_diagnostics_service: FeedbackDiagnosticsService::new(Arc::new(
+            SqliteFeedbackDiagnosticsRepository::new(pool),
+        )),
     }
 }
 
@@ -1293,11 +1309,11 @@ pub fn build_conversation_state(
     }
     if let Some(cron_service) = cron_service {
         conversation_service.with_delete_hook(cron_service.clone());
-        conversation_service.with_cron_service(Some(cron_service));
     }
     ConversationRouterState {
         service: conversation_service,
         task_manager: services.worker_task_manager.clone(),
+        active_leases: services.active_lease_registry.clone(),
     }
 }
 
@@ -1590,7 +1606,46 @@ pub fn build_team_state(
     services: &AppServices,
     _cron_service: Option<Arc<aionui_cron::service::CronService>>,
     backend_binary_path: Arc<std::path::PathBuf>,
+    assistant_service: Arc<AssistantService>,
 ) -> TeamRouterState {
+    #[derive(Clone)]
+    struct AssistantServiceTeamCatalog {
+        assistant_service: Arc<AssistantService>,
+    }
+
+    #[async_trait::async_trait]
+    impl TeamAssistantCatalogPort for AssistantServiceTeamCatalog {
+        async fn list_team_selectable_assistants(
+            &self,
+        ) -> Result<Vec<TeamAssistantCatalogEntry>, aionui_team::TeamError> {
+            let assistants = self.assistant_service.list().await.map_err(|error| {
+                aionui_team::TeamError::InvalidRequest(format!("assistant catalog unavailable: {error}"))
+            })?;
+
+            Ok(assistants
+                .into_iter()
+                .filter(|assistant| assistant.team_selectable)
+                .filter_map(|assistant| {
+                    let agent = assistant.agent?;
+                    let backend = agent
+                        .acp_backend
+                        .unwrap_or_else(|| agent.r#type.serde_name().to_owned());
+                    Some(TeamAssistantCatalogEntry {
+                        assistant_id: assistant.id,
+                        name: assistant.name,
+                        backend,
+                        description: assistant.description.unwrap_or_default(),
+                        skills: assistant
+                            .enabled_skills
+                            .into_iter()
+                            .chain(assistant.custom_skill_names)
+                            .collect(),
+                    })
+                })
+                .collect())
+        }
+    }
+
     let pool = services.database.pool().clone();
     let team_repo: Arc<dyn aionui_db::ITeamRepository> = Arc::new(aionui_db::SqliteTeamRepository::new(pool.clone()));
     let conv_service = services.conversation_service.clone();
@@ -1611,9 +1666,10 @@ pub fn build_team_state(
             )),
             services.data_dir.join("team-worktrees"),
         ));
-    let service = TeamSessionService::new_with_workspace_manager(
+    let service = TeamSessionService::new_with_workspace_manager_and_prompt_dump(
         team_repo,
         Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
+        Arc::new(AssistantServiceTeamCatalog { assistant_service }),
         Arc::new(SqliteAssistantDefinitionRepository::new(
             services.database.pool().clone(),
         )),
@@ -1627,8 +1683,12 @@ pub fn build_team_state(
         cancellation_port,
         backend_binary_path,
         workspace_manager,
+        aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
-    TeamRouterState { service }
+    TeamRouterState {
+        service,
+        active_leases: services.active_lease_registry.clone(),
+    }
 }
 
 /// Build the default `CronRouterState` from application services.
@@ -1654,7 +1714,8 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         agent_metadata_repo.clone(),
         acp_session_repo,
     )
-    .with_runtime_state(services.conversation_runtime_state.clone());
+    .with_runtime_state(services.conversation_runtime_state.clone())
+    .with_runtime_helper_context(services.runtime_helper_bin(), services.runtime_base_url());
     conv_service.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
         services.database.pool().clone(),
     )));
@@ -1681,11 +1742,11 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     let tick_service_ref: Arc<CronServiceTickRef> = Arc::new(CronServiceTickRef::default());
     let tick_ref = tick_service_ref.clone();
     let scheduler = Arc::new(aionui_cron::scheduler::CronScheduler::new(Arc::new(
-        move |job_id: String| {
+        move |tick: aionui_cron::scheduler::ScheduledTick| {
             let svc = tick_ref.0.lock().unwrap().clone();
             tokio::spawn(async move {
                 if let Some(svc) = svc {
-                    svc.tick(&job_id).await;
+                    svc.tick(&tick.job_id, tick.scheduled_at).await;
                 }
             });
         },
@@ -1820,14 +1881,16 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use crate::AppConfig;
-    use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
+    use aionui_ai_agent::types::{AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, BuildTaskOptions, SendMessageData};
     use aionui_ai_agent::{
         AgentError, AgentInstance, AgentSendError, AgentStreamEvent, IAgentTask, IMockAgent, IWorkerTaskManager,
         WorkerTaskManagerImpl,
     };
+    use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
     use aionui_channel::types::PluginType;
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs};
     use aionui_db::models::{AssistantSessionRow, UpsertAssistantDefinitionParams};
@@ -1884,6 +1947,8 @@ mod tests {
 
     impl IMockAgent for ChannelStateNoopAgent {}
 
+    type CapturedRuntimeEnv = Arc<Mutex<Vec<Vec<(String, String)>>>>;
+
     fn mock_worker_task_manager() -> Arc<dyn IWorkerTaskManager> {
         let factory = Arc::new(|opts: BuildTaskOptions| {
             Box::pin(async move {
@@ -1897,6 +1962,40 @@ mod tests {
         Arc::new(WorkerTaskManagerImpl::new(factory))
     }
 
+    fn capturing_worker_task_manager(captured_env: CapturedRuntimeEnv) -> Arc<dyn IWorkerTaskManager> {
+        let factory = Arc::new(move |opts: BuildTaskOptions| {
+            let captured_env = captured_env.clone();
+            Box::pin(async move {
+                let conversation_id = opts.conversation_id().to_owned();
+                let workspace = opts.context.workspace.path.clone();
+                captured_env.lock().unwrap().push(opts.context.runtime_env.clone());
+                Ok(AgentInstance::Mock(Arc::new(ChannelStateNoopAgent {
+                    conversation_id,
+                    workspace,
+                })))
+            }) as futures_util::future::BoxFuture<'static, Result<AgentInstance, AgentError>>
+        });
+
+        Arc::new(WorkerTaskManagerImpl::new(factory))
+    }
+
+    async fn wait_for_captured_env(captured_env: &CapturedRuntimeEnv) -> Vec<(String, String)> {
+        for _ in 0..50 {
+            if let Some(env) = captured_env.lock().unwrap().first().cloned() {
+                return env;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("expected task options to be captured");
+    }
+
+    fn make_send_message_request() -> SendMessageRequest {
+        serde_json::from_value(serde_json::json!({
+            "content": "Check runtime env"
+        }))
+        .unwrap()
+    }
+
     fn channel_state_assistant_definition() -> UpsertAssistantDefinitionParams<'static> {
         UpsertAssistantDefinitionParams {
             id: "asstdef-channel-state-aionrs",
@@ -1904,8 +2003,6 @@ mod tests {
             source: "generated",
             owner_type: "system",
             source_ref: Some("bare-channel-aionrs"),
-            source_version: None,
-            source_hash: None,
             name: "Bare Channel Aionrs",
             name_i18n: "{}",
             description: Some("Channel state regression assistant"),
@@ -1913,15 +2010,16 @@ mod tests {
             avatar_type: "emoji",
             avatar_value: Some("A"),
             agent_id: "632f31d2",
-            rule_resource_type: "inline",
+            rule_resource_type: "user_file",
             rule_resource_ref: None,
-            rule_inline_content: Some(""),
             recommended_prompts: "[]",
             recommended_prompts_i18n: "{}",
             default_model_mode: "auto",
             default_model_value: None,
             default_permission_mode: "auto",
             default_permission_value: None,
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
             default_skills_mode: "auto",
             default_skill_ids: "[]",
             custom_skill_names: "[]",
@@ -2010,6 +2108,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.conversation_id, first.conversation_id);
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_cron_state_conversation_service_injects_runtime_helper_context() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config = AppConfig {
+            data_dir: tmp.path().join("data"),
+            work_dir: tmp.path().join("work"),
+            ..Default::default()
+        };
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let captured_env = Arc::new(Mutex::new(Vec::new()));
+        let task_manager = capturing_worker_task_manager(captured_env.clone());
+        let services = AppServices::from_config(db, &config)
+            .await
+            .unwrap()
+            .with_worker_task_manager(task_manager.clone());
+        let cron = build_cron_state(&services);
+        let conversation = cron
+            .conversation_service
+            .create(
+                "system_default_user",
+                serde_json::from_value::<CreateConversationRequest>(serde_json::json!({
+                    "type": "acp",
+                    "extra": {
+                        "workspace": workspace,
+                        "custom_workspace": true
+                    }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        cron.conversation_service
+            .send_message(
+                "system_default_user",
+                &conversation.id,
+                make_send_message_request(),
+                &task_manager,
+            )
+            .await
+            .unwrap();
+
+        let env = wait_for_captured_env(&captured_env).await;
+        assert!(
+            env.iter()
+                .any(|(key, value)| key == AIONUI_HELPER_BIN_ENV && !value.is_empty()),
+            "cron conversation runtime env should include AIONUI_HELPER_BIN"
+        );
+        assert!(
+            env.contains(&(AIONUI_BASE_URL_ENV.to_owned(), config.local_base_url())),
+            "cron conversation runtime env should include AIONUI_BASE_URL"
+        );
 
         services.database.close().await;
     }

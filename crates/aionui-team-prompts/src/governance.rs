@@ -13,7 +13,7 @@ Priority order:
 When assistant rules conflict with Team collaboration, role, permission, task-board, or reporting behavior, Team Governance and the Team role prompt win.
 
 Required Team behavior:
-- Use `team_*` MCP tools for Team coordination.
+- Use the Team tool interface provided in Team Tool Usage for all Team coordination.
 - Use `team_send_message` for Team reporting instead of ordinary assistant replies.
 - Use `team_task_update` and `team_task_list` for task-board state.
 - Follow role permissions. Lead-only tools cannot be used by teammates.
@@ -32,7 +32,7 @@ mod tests {
         assert!(TEAM_GOVERNANCE_PROMPT.contains("assistant rules"));
         assert!(TEAM_GOVERNANCE_PROMPT.contains("Team Governance and the Team role prompt win"));
         assert!(TEAM_GOVERNANCE_PROMPT.contains("Lead-only tools"));
-        assert!(TEAM_GOVERNANCE_PROMPT.contains("team_send_message"));
+        assert!(TEAM_GOVERNANCE_PROMPT.contains("Team tool interface provided in Team Tool Usage"));
     }
 
     #[test]

@@ -95,15 +95,18 @@ fn make_aionrs_config() -> AionrsResolvedConfig {
         model: "claude-sonnet-4-20250514".into(),
         base_url: None,
         system_prompt: None,
-        max_tokens: 4096,
+        max_tokens: None,
         max_turns: None,
         max_tool_call_malformed_turns: None,
         max_tool_call_failure_turns: None,
         compat_overrides: Default::default(),
         session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
         session_mode: None,
+        skills: Vec::new(),
         extra_mcp_servers: Default::default(),
         bedrock_config: None,
+        runtime_env: Vec::new(),
+        prompt_dump_dir: None,
     }
 }
 
@@ -214,6 +217,7 @@ async fn collect_idle_ignores_aionrs_agent_type() {
                 use_model: None,
             },
             skills: vec![],
+            runtime_env: vec![],
             team: None,
             kind,
         })
