@@ -502,6 +502,9 @@ pub struct TeamAgentRenamedPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TeamAgentRuntimeStatus {
+    /// Never triggered — the teammate has not yet been lazily woken and does
+    /// not block team Ready.
+    Dormant,
     Pending,
     Ready,
     Failed,
@@ -1495,5 +1498,15 @@ mod tests {
             TeamSessionBinding::team_id_marker_from_extra_str(extra).as_deref(),
             Some("team-9")
         );
+    }
+
+    #[test]
+    fn team_agent_runtime_status_dormant_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(TeamAgentRuntimeStatus::Dormant).unwrap(),
+            json!("dormant")
+        );
+        let parsed: TeamAgentRuntimeStatus = serde_json::from_value(json!("dormant")).unwrap();
+        assert_eq!(parsed, TeamAgentRuntimeStatus::Dormant);
     }
 }
