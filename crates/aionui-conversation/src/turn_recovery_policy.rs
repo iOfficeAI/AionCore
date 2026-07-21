@@ -1,4 +1,4 @@
-use aionui_api_types::AgentErrorCode;
+use aionui_api_types::{AgentErrorCode, AgentErrorOwnership};
 use aionui_common::{AgentKillReason, AgentType};
 use tracing::info;
 
@@ -41,6 +41,7 @@ impl TurnRecoveryPolicy {
             && outcome.terminal.is_error()
             && retryable == Some(true)
             && error_code != Some(AgentErrorCode::UserLlmProviderModelNotFound)
+            && (session_recovery_signal.is_some() || !is_provider_turn_error(error_code, outcome))
             && safe_to_auto_replay
             && !already_replayed
         {
@@ -71,6 +72,41 @@ impl TurnRecoveryPolicy {
 
         decision
     }
+}
+
+fn is_provider_turn_error(error_code: Option<AgentErrorCode>, outcome: &RelayOutcome) -> bool {
+    if matches!(
+        outcome
+            .attempt
+            .terminal_error
+            .as_ref()
+            .and_then(|error| error.ownership),
+        Some(AgentErrorOwnership::UserLlmProvider)
+    ) {
+        return true;
+    }
+
+    matches!(
+        error_code,
+        Some(
+            AgentErrorCode::UserLlmProviderAuthFailed
+                | AgentErrorCode::UserLlmProviderAwsSsoExpired
+                | AgentErrorCode::UserLlmProviderPermissionDenied
+                | AgentErrorCode::UserLlmProviderBillingRequired
+                | AgentErrorCode::UserLlmProviderConfigError
+                | AgentErrorCode::UserLlmProviderModelNotFound
+                | AgentErrorCode::UserLlmProviderUnsupportedModel
+                | AgentErrorCode::UserLlmProviderEndpointNotFound
+                | AgentErrorCode::UserLlmProviderInvalidRequest
+                | AgentErrorCode::UserLlmProviderInvalidToolSchema
+                | AgentErrorCode::UserLlmProviderContextTooLarge
+                | AgentErrorCode::UserLlmProviderRateLimited
+                | AgentErrorCode::UserLlmProviderTimeout
+                | AgentErrorCode::UserLlmProviderNetworkError
+                | AgentErrorCode::UserLlmProviderEmptyResponse
+                | AgentErrorCode::UserLlmProviderGatewayError
+        )
+    )
 }
 
 fn classify_session_recovery_signal(outcome: &RelayOutcome) -> Option<SessionRecoverySignal> {
@@ -157,6 +193,37 @@ mod tests {
                 session_recovery_signal: Some(SessionRecoverySignal::CompactFailed),
             }
         );
+    }
+
+    #[test]
+    fn provider_turn_network_error_does_not_auto_replay() {
+        let mut outcome = retryable_clean_error();
+        outcome.terminal = RelayTerminal::Error {
+            code: Some(AgentErrorCode::UserLlmProviderNetworkError),
+            retryable: Some(true),
+        };
+        outcome.attempt.terminal_error = Some(AgentStreamErrorData::classified(
+            "The model provider could not be reached",
+            AgentErrorCode::UserLlmProviderNetworkError,
+            AgentErrorOwnership::UserLlmProvider,
+            Some(
+                "Agent internal error (code -32603): reqwest error stream: error sending request for url (https://cli-chat-proxy.grok.com/v1/responses)"
+                    .into(),
+            ),
+            true,
+            false,
+            None,
+        ));
+
+        let decision = TurnRecoveryPolicy::decide(
+            AgentType::Acp,
+            Some("grok"),
+            &outcome,
+            RuntimeLifecycleState::Active,
+            false,
+        );
+
+        assert_eq!(decision, TurnRecoveryDecision::None);
     }
 
     #[test]

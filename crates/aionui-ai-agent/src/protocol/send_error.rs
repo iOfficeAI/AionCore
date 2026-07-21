@@ -838,8 +838,8 @@ fn classify_provider_text(lower: &str) -> Option<ClassifiedError> {
             "The model provider could not be reached",
             AgentErrorCode::UserLlmProviderNetworkError,
             true,
-            AgentErrorResolutionKind::CheckProviderBaseUrl,
-            Some(AgentErrorResolutionTarget::ProviderSettings),
+            AgentErrorResolutionKind::Retry,
+            None,
         ));
     }
     if contains_any(
@@ -1865,13 +1865,13 @@ mod tests {
             "Aionrs agent error: API error: Connection error: error decoding response body",
             AgentErrorCode::UserLlmProviderNetworkError,
             AgentErrorOwnership::UserLlmProvider,
-            AgentErrorResolutionKind::CheckProviderBaseUrl,
+            AgentErrorResolutionKind::Retry,
         );
         assert_classification(
             "Aionrs agent error: API error: error sending request for url",
             AgentErrorCode::UserLlmProviderNetworkError,
             AgentErrorOwnership::UserLlmProvider,
-            AgentErrorResolutionKind::CheckProviderBaseUrl,
+            AgentErrorResolutionKind::Retry,
         );
         assert_classification(
             "Autocompact failed: Empty response from LLM",
