@@ -58,7 +58,8 @@ impl<'a> SessionContextBuilder<'a> {
         seed: Option<AionrsRuntimePermissionSeed>,
     ) -> Result<BuildTaskOptions, ConversationError> {
         Ok(BuildTaskOptions::new(
-            self.build_with_workspace_override(row, workspace_override, seed).await?,
+            self.build_with_workspace_override(row, workspace_override, seed)
+                .await?,
         ))
     }
 
@@ -390,9 +391,7 @@ fn build_aionrs_context(
     // resolved permission is intentionally NOT read back (centralized team
     // governance — same safety principle as `fixed`). Only non-team sessions
     // consult the persisted runtime permission.
-    if !belongs_to_team
-        && let Some(seed) = permission_seed
-    {
+    if !belongs_to_team && let Some(seed) = permission_seed {
         apply_runtime_permission_seed(seed, row, &mut config);
     }
     AionrsSessionBuildContext {
@@ -410,25 +409,20 @@ fn apply_runtime_permission_seed(
     row: &ConversationRow,
     config: &mut AionrsBuildExtra,
 ) {
-    match seed.default_permission_mode.as_str() {
-        // `auto`: remember and reuse the runtime selection. The resolved value
-        // is authoritative and MUST override the create-time seed.
-        "auto" => {
-            if let Some(resolved) = seed
-                .resolved_permission_value
-                .filter(|value| !value.is_empty())
-            {
-                debug!(
-                    conversation_id = %row.id,
-                    "session_context: aionrs rebuild seeded from resolved runtime permission"
-                );
-                config.session_mode = Some(resolved);
-            }
-        }
-        // `fixed` (and any unknown mode): keep the create-time seed
-        // (== create-time default_permission_value); never adopt the runtime
-        // residue — anti-privilege-escalation gate.
-        _ => {}
+    // `fixed` (and any unknown mode): keep the create-time seed
+    // (== create-time default_permission_value); never adopt the runtime
+    // residue — anti-privilege-escalation gate.
+    if seed.default_permission_mode != "auto" {
+        return;
+    }
+    // `auto`: remember and reuse the runtime selection. The resolved value is
+    // authoritative and MUST override the create-time seed.
+    if let Some(resolved) = seed.resolved_permission_value.filter(|value| !value.is_empty()) {
+        debug!(
+            conversation_id = %row.id,
+            "session_context: aionrs rebuild seeded from resolved runtime permission"
+        );
+        config.session_mode = Some(resolved);
     }
 }
 
