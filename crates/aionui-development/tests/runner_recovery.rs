@@ -8,7 +8,7 @@ use aionui_db::{
 use aionui_development::{
     CleanupTarget, CommandExecutionInput, DevelopmentResourceController, DevelopmentRunner, ResourceLeaseCoordinator,
     ResourceLeaseInput, RunnerContext, SecretAccessContext, SecretCreateInput, SecretGrantInput,
-    SecretReferenceRequest, SecretService, default_policy,
+    SecretReferenceRequest, SecretService, SystemDevelopmentResourceController, default_policy,
 };
 use async_trait::async_trait;
 
@@ -337,4 +337,181 @@ async fn stale_reconciliation_and_recovery_decisions_are_persisted_without_sensi
     .unwrap();
     assert!(!serialized.contains("command"));
     assert!(!serialized.contains("secret"));
+}
+
+async fn docker_container_ids(filter: &str) -> Vec<String> {
+    let mut command = aionui_runtime::Builder::clean_cli("docker");
+    command.args(["ps", "--all", "--quiet", "--filter", filter]);
+    let output = command
+        .output()
+        .await
+        .expect("Docker must be installed for live acceptance");
+    assert!(
+        output.status.success(),
+        "Docker query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires a live Docker daemon and the alpine:3.20 image"]
+async fn live_docker_runner_executes_redacts_and_removes_timed_out_containers() {
+    let (coordinator, repo, _db) = setup().await;
+    let runner = DevelopmentRunner::new(repo.clone(), coordinator, Arc::new(SystemDevelopmentResourceController));
+    let workspace = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(workspace.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    let mut policy = default_policy("system_default_user", "project-runner");
+    policy.isolation_mode = "docker".into();
+    policy.container_image = Some("alpine:3.20".into());
+    policy.allowed_secret_keys_json = "[\"LIVE_SECRET\"]".into();
+    let secret = "live-docker-secret-must-not-leak";
+
+    let output = runner
+        .execute(
+            CommandExecutionInput {
+                execution_id: "live-docker-success",
+                run_id: "run-runner",
+                command: "printf 'container-ok:%s' \"$LIVE_SECRET\"; printf artifact > result.txt",
+                working_directory: workspace.path(),
+                timeout_seconds: 15,
+                policy: &policy,
+                runtime_profile: None,
+                environment: [("LIVE_SECRET".into(), secret.into())].into(),
+            },
+            &RunnerContext {
+                user_id: "system_default_user".into(),
+                project_id: "project-runner".into(),
+                run_id: "run-runner".into(),
+                task_id: Some("task-live-docker".into()),
+                turn_id: Some("turn-live-docker".into()),
+                gate_id: Some("gate-live-docker".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.status, "passed", "Docker runner stderr: {}", output.stderr);
+    assert_eq!(output.stdout, "container-ok:[REDACTED]");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("result.txt")).unwrap(),
+        "artifact"
+    );
+    assert!(!serde_json::to_string(&output).unwrap().contains(secret));
+    assert!(docker_container_ids("name=aion-live-docker-success").await.is_empty());
+
+    let timed_out = runner
+        .execute(
+            CommandExecutionInput {
+                execution_id: "live-docker-timeout",
+                run_id: "run-runner",
+                command: "sleep 30",
+                working_directory: workspace.path(),
+                timeout_seconds: 1,
+                policy: &policy,
+                runtime_profile: None,
+                environment: Default::default(),
+            },
+            &RunnerContext {
+                user_id: "system_default_user".into(),
+                project_id: "project-runner".into(),
+                run_id: "run-runner".into(),
+                task_id: Some("task-live-timeout".into()),
+                turn_id: Some("turn-live-timeout".into()),
+                gate_id: Some("gate-live-timeout".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(timed_out.status, "timed_out");
+    assert!(docker_container_ids("name=aion-live-docker-timeout").await.is_empty());
+
+    let leases = repo
+        .list_resource_leases("system_default_user", "run-runner", false)
+        .await
+        .unwrap();
+    assert!(leases.iter().all(|lease| lease.status == "released"));
+}
+
+#[tokio::test]
+#[ignore = "requires a live Docker daemon and the Dev Container CLI"]
+async fn live_devcontainer_runner_executes_then_cancellation_removes_the_service() {
+    let (coordinator, repo, _db) = setup().await;
+    let runner = DevelopmentRunner::new(
+        repo.clone(),
+        coordinator.clone(),
+        Arc::new(SystemDevelopmentResourceController),
+    );
+    let workspace = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(workspace.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    let config_dir = workspace.path().join(".devcontainer");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("devcontainer.json"),
+        r#"{"image":"alpine:3.20","remoteUser":"root"}"#,
+    )
+    .unwrap();
+    let mut policy = default_policy("system_default_user", "project-runner");
+    policy.isolation_mode = "devcontainer".into();
+    policy.devcontainer_config_path = Some(".devcontainer/devcontainer.json".into());
+
+    let output = runner
+        .execute(
+            CommandExecutionInput {
+                execution_id: "live-devcontainer",
+                run_id: "run-runner",
+                command: "printf devcontainer-ok; printf artifact > result.txt",
+                working_directory: workspace.path(),
+                timeout_seconds: 60,
+                policy: &policy,
+                runtime_profile: None,
+                environment: Default::default(),
+            },
+            &RunnerContext {
+                user_id: "system_default_user".into(),
+                project_id: "project-runner".into(),
+                run_id: "run-runner".into(),
+                task_id: Some("task-live-devcontainer".into()),
+                turn_id: Some("turn-live-devcontainer".into()),
+                gate_id: Some("gate-live-devcontainer".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.status, "passed");
+    assert!(output.stdout.ends_with("devcontainer-ok"));
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("result.txt")).unwrap(),
+        "artifact"
+    );
+
+    let folder_filter = format!("label=devcontainer.local_folder={}", workspace.path().display());
+    assert_eq!(docker_container_ids(&folder_filter).await.len(), 1);
+    coordinator
+        .cancel_run(
+            "system_default_user",
+            "run-runner",
+            &SystemDevelopmentResourceController,
+        )
+        .await
+        .unwrap();
+    assert!(docker_container_ids(&folder_filter).await.is_empty());
+
+    let leases = repo
+        .list_resource_leases("system_default_user", "run-runner", false)
+        .await
+        .unwrap();
+    assert!(leases.iter().all(|lease| lease.status == "released"));
 }
