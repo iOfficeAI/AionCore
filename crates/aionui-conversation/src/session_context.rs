@@ -41,28 +41,40 @@ impl<'a> SessionContextBuilder<'a> {
         }
     }
 
-    pub(crate) async fn build_options(&self, row: &ConversationRow) -> Result<BuildTaskOptions, ConversationError> {
-        Ok(BuildTaskOptions::new(self.build(row).await?))
+    pub(crate) async fn build_options(
+        &self,
+        row: &ConversationRow,
+        seed: Option<AionrsRuntimePermissionSeed>,
+    ) -> Result<BuildTaskOptions, ConversationError> {
+        Ok(BuildTaskOptions::new(
+            self.build_with_workspace_override(row, None, seed).await?,
+        ))
     }
 
     pub(crate) async fn build_options_with_workspace_override(
         &self,
         row: &ConversationRow,
         workspace_override: Option<&str>,
+        seed: Option<AionrsRuntimePermissionSeed>,
     ) -> Result<BuildTaskOptions, ConversationError> {
         Ok(BuildTaskOptions::new(
-            self.build_with_workspace_override(row, workspace_override).await?,
+            self.build_with_workspace_override(row, workspace_override, seed).await?,
         ))
     }
 
+    /// Test-only convenience wrapper. Production entry points thread a real
+    /// permission seed via `build_options*`; tests exercise the default
+    /// (no-seed) path.
+    #[cfg(test)]
     async fn build(&self, row: &ConversationRow) -> Result<AgentSessionContext, ConversationError> {
-        self.build_with_workspace_override(row, None).await
+        self.build_with_workspace_override(row, None, None).await
     }
 
     async fn build_with_workspace_override(
         &self,
         row: &ConversationRow,
         workspace_override: Option<&str>,
+        seed: Option<AionrsRuntimePermissionSeed>,
     ) -> Result<AgentSessionContext, ConversationError> {
         let agent_type: AgentType = string_to_enum(&row.r#type)?;
         reject_deprecated_runtime_kind(row, &agent_type)?;
@@ -73,7 +85,7 @@ impl<'a> SessionContextBuilder<'a> {
         let team = TeamSessionBinding::from_extra_value(&extra).map_err(|e| ConversationError::BadRequest {
             reason: format!("Invalid Team runtime context: {e}"),
         })?;
-        let kind = self.build_kind(row, &agent_type, extra, team.clone()).await?;
+        let kind = self.build_kind(row, &agent_type, extra, team.clone(), seed).await?;
 
         Ok(AgentSessionContext {
             conversation: ConversationContext {
@@ -162,6 +174,7 @@ impl<'a> SessionContextBuilder<'a> {
         agent_type: &AgentType,
         extra: serde_json::Value,
         team: Option<TeamSessionBinding>,
+        seed: Option<AionrsRuntimePermissionSeed>,
     ) -> Result<AgentSessionKind, ConversationError> {
         match agent_type {
             AgentType::Acp => self
@@ -169,7 +182,7 @@ impl<'a> SessionContextBuilder<'a> {
                 .await
                 .map(|context| AgentSessionKind::Acp(Box::new(context))),
             AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(
-                row, extra, team,
+                row, extra, team, seed,
             )))),
             AgentType::Gemini
             | AgentType::Codex
