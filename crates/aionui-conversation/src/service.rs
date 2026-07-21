@@ -3217,11 +3217,6 @@ pub(crate) fn agent_error_top_level_code(error: &AgentError) -> &'static str {
 }
 
 impl ConversationService {
-    /// Build typed agent runtime context from a conversation database row.
-    ///
-    /// Raw `conversation.extra` parsing lives in [`SessionContextBuilder`]
-    /// so the task manager and concrete agent factories consume typed
-    /// session context instead of the DB envelope.
     /// Loads the persisted runtime permission gate inputs for an aionrs
     /// rebuild. Returns `None` for non-aionrs conversations and for aionrs
     /// conversations without a persisted assistant snapshot (assistant-less
@@ -3250,6 +3245,11 @@ impl ConversationService {
         }))
     }
 
+    /// Build typed agent runtime context from a conversation database row.
+    ///
+    /// Raw `conversation.extra` parsing lives in [`SessionContextBuilder`]
+    /// so the task manager and concrete agent factories consume typed
+    /// session context instead of the DB envelope.
     pub(crate) async fn build_task_options(
         &self,
         row: &aionui_db::models::ConversationRow,
