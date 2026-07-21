@@ -6454,3 +6454,83 @@ async fn lazy_attach_failure_preserves_unread_and_skips_leader_on_human_delivery
         "a human-direct lazy attach failure must not notify the leader"
     );
 }
+
+#[tokio::test]
+async fn agent_triggered_attach_failure_notifies_leader() {
+    use futures_util::FutureExt;
+
+    // Positive counterpart to the human-direct/manual-add "must NOT notify"
+    // tests: an agent-triggered attach failure (here a leader-initiated spawn,
+    // which flows through the single attach path with
+    // notify_leader_on_failure=true) MUST wake the leader so it can re-delegate
+    // the work it just handed out (spec 5.4c).
+    //
+    // The lead attaches cleanly during cold start; only the spawned teammate's
+    // attach is armed to fail.
+    let fail_next = Arc::new(AtomicBool::new(false));
+    let factory_fail_next = Arc::clone(&fail_next);
+    let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
+        let should_fail = factory_fail_next.swap(false, Ordering::SeqCst);
+        async move {
+            if should_fail {
+                return Err(AgentError::internal("simulated spawned teammate attach failure"));
+            }
+            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
+                mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
+            )))
+        }
+        .boxed()
+    });
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_assistants_and_conversation_repo(
+        factory,
+        seeded_agent_metadata_repo(),
+        Arc::new(SingleAssistantDefinitionRepo {
+            row: word_creator_definition(),
+        }),
+        Arc::new(EmptyAssistantOverlayRepo),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Agent-triggered failure notifies leader".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let lead_slot_id = created.leader_assistant_id.clone().expect("leader slot");
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    // Arm the failure, then have the leader spawn a teammate whose attach fails.
+    fail_next.store(true, Ordering::SeqCst);
+    let spawned = svc
+        .spawn_agent_in_session(
+            &created.id,
+            &lead_slot_id,
+            SpawnAgentRequest {
+                name: "Writer".into(),
+                assistant_id: Some("word-creator".into()),
+            },
+        )
+        .await
+        .expect("spawn returns before the background attach completes");
+
+    // Agent/leader-triggered failure MUST notify the leader: its mailbox gets a
+    // "failed to start its runtime" message from the failed slot so it can
+    // re-delegate.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let leader_messages = team_repo.get_history(&created.id, &lead_slot_id, None).await.unwrap();
+            if leader_messages.iter().any(|message| {
+                message.from_agent_id == spawned.slot_id && message.content.contains("failed to start its runtime")
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("an agent-triggered attach failure must notify the leader (notify_leader_on_failure=true)");
+}
