@@ -1232,7 +1232,10 @@ pub async fn build_session_instance(
         let backend_static: &'static str = if backend_label == "claude" { "claude" } else { "codex" };
         let value = build_session_cli_config_dump_value(backend_static, &session_config);
         let input = value.get("input").cloned().unwrap_or(serde_json::Value::Null);
-        let resolved_context = value.get("resolved_context").cloned().unwrap_or(serde_json::Value::Null);
+        let resolved_context = value
+            .get("resolved_context")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         match crate::dev_prompt_dump::dump_agent_final_input(
             dir,
             crate::dev_prompt_dump::AgentFinalInputDump {
@@ -4965,8 +4968,15 @@ mod pump_tests {
             ..Default::default()
         };
         let backend: Arc<dyn SessionBackend> = Arc::new(StaticCapsBackend);
-        let task =
-            SessionAgentTask::new_with_preload(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None, &stale, None);
+        let task = SessionAgentTask::new_with_preload(
+            AgentType::Acp,
+            "conv-1".into(),
+            "/w".into(),
+            backend,
+            None,
+            &stale,
+            None,
+        );
         let m = task.get_model().await.unwrap().model_info.expect("model_info");
         assert_eq!(
             m.available_models.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
