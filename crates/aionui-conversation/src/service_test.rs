@@ -7465,3 +7465,54 @@ async fn aionrs_rebuild_fixed_mode_blocks_runtime_escalation() {
 
     assert_eq!(aionrs_session_mode(&options).as_deref(), Some("default"));
 }
+
+#[tokio::test]
+async fn cron_required_runtime_mode_wins_over_resolved_permission_seed() {
+    // AC#5 (hard): the per-turn `required_runtime_mode` override runs AFTER
+    // rebuild and MUST keep priority over the rebuild permission seed. Even for
+    // an `auto` aionrs session whose snapshot resolved value is yolo, a cron
+    // turn pinned to "default" applies "default" to the agent — the seed must
+    // not bypass or reorder this override.
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let row = seed_aionrs_conversation_with_snapshot(&repo, "default", "auto", Some("yolo")).await;
+    broadcaster.take_events();
+
+    let agent = Arc::new(
+        MockAgent::new(&row.id)
+            .with_mode("yolo")
+            .with_config_options(vec![AcpConfigOptionDto {
+                id: "mode".to_owned(),
+                name: Some("Mode".to_owned()),
+                label: None,
+                description: None,
+                category: Some("mode".to_owned()),
+                option_type: "select".to_owned(),
+                current_value: Some("yolo".to_owned()),
+                options: Vec::new(),
+            }]),
+    );
+    task_mgr.insert_agent(&row.id, AgentInstance::Mock(agent.clone()));
+
+    let outcome = svc
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".to_owned(),
+            conversation_id: row.id.clone(),
+            content: "run scheduled task".to_owned(),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+            required_runtime_mode: Some("default".to_owned()),
+            persist_user_message: true,
+            user_message_hidden: true,
+            on_started: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
+    assert_eq!(
+        agent.set_config_option_calls.lock().unwrap().as_slice(),
+        &[("mode".to_owned(), "default".to_owned())],
+        "cron required-runtime-mode must override the rebuild permission seed"
+    );
+}
