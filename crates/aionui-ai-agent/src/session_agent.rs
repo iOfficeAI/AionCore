@@ -1224,6 +1224,41 @@ pub async fn build_session_instance(
         .flatten()
         .filter(|s| !s.is_empty());
 
+    // DEV (`--dump-prompts`): dump the resolved SessionConfig BEFORE it moves
+    // into open_session. Best-effort — a failure only warns, never fails open.
+    // Borrows `prompt_dump_dir`; the send-side `SessionPromptDump` consumes it
+    // (via `.map`) later, after open_session (which only moves `session_config`).
+    if let Some(dir) = prompt_dump_dir.as_ref() {
+        let backend_static: &'static str = if backend_label == "claude" { "claude" } else { "codex" };
+        let value = build_session_cli_config_dump_value(backend_static, &session_config);
+        let input = value.get("input").cloned().unwrap_or(serde_json::Value::Null);
+        let resolved_context = value.get("resolved_context").cloned().unwrap_or(serde_json::Value::Null);
+        match crate::dev_prompt_dump::dump_agent_final_input(
+            dir,
+            crate::dev_prompt_dump::AgentFinalInputDump {
+                kind: "session-cli-config",
+                backend: backend_static,
+                conversation_id: &conversation_id,
+                session_id: None,
+                msg_id: None,
+                turn_id: None,
+                input,
+                resolved_context,
+            },
+        ) {
+            Ok(path) => tracing::debug!(
+                conversation_id = %conversation_id,
+                path = %path.display(),
+                "DEV session-cli config dump written"
+            ),
+            Err(error) => tracing::warn!(
+                conversation_id = %conversation_id,
+                error = %error,
+                "DEV session-cli config dump failed"
+            ),
+        }
+    }
+
     let backend = connection
         .open_session(spec, session_config)
         .await
@@ -1271,6 +1306,67 @@ pub async fn build_session_instance(
         prompt_dump,
     );
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
+}
+
+/// Build the `session-cli-config` dump payload from the resolved `SessionConfig`
+/// captured just before `open_session`. Symmetric with the ACP path's
+/// `build_acp_final_input_dump_value`: returns `{ "input", "resolved_context" }`.
+/// `SessionConfig` has no `Serialize`, so fields are mapped by hand. Contents
+/// are RAW (dev-only, `--dump-prompts`): secrets in `spawn_env` / MCP env are
+/// not redacted, matching the existing acp dump.
+fn build_session_cli_config_dump_value(backend: &str, cfg: &aionui_session::SessionConfig) -> serde_json::Value {
+    use aionui_session::McpTransport;
+    let mcp_servers: Vec<serde_json::Value> = cfg
+        .init
+        .mcp_servers
+        .iter()
+        .map(|s| {
+            let transport = match &s.transport {
+                McpTransport::Stdio { command, args, env } => serde_json::json!({
+                    "type": "stdio",
+                    "command": command,
+                    "args": args,
+                    "env": env.iter().map(|(k, v)| serde_json::json!({ "name": k, "value": v })).collect::<Vec<_>>(),
+                }),
+                McpTransport::Http { url, headers } => serde_json::json!({
+                    "type": "http",
+                    "url": url,
+                    "headers": headers.iter().map(|(k, v)| serde_json::json!({ "name": k, "value": v })).collect::<Vec<_>>(),
+                }),
+                McpTransport::Sse { url, headers } => serde_json::json!({
+                    "type": "sse",
+                    "url": url,
+                    "headers": headers.iter().map(|(k, v)| serde_json::json!({ "name": k, "value": v })).collect::<Vec<_>>(),
+                }),
+            };
+            serde_json::json!({ "name": s.name, "transport": transport })
+        })
+        .collect();
+
+    let spawn_env: Vec<serde_json::Value> = cfg
+        .spawn_env
+        .iter()
+        .map(|e| serde_json::json!({ "name": e.name, "value": e.value }))
+        .collect();
+
+    serde_json::json!({
+        "input": {
+            "backend": backend,
+            "mode": cfg.mode,
+            "model": cfg.model,
+            "cli_program": cfg.cli_program.as_ref().map(|p| p.to_string_lossy()),
+            "sandbox_mode": cfg.sandbox_mode,
+            "approval_policy": cfg.approval_policy,
+            "resume": cfg.init.resume,
+        },
+        "resolved_context": {
+            "preset_context": cfg.init.preset_context,
+            "skills": cfg.init.skills,
+            "mcp_servers": mcp_servers,
+            "spawn_env": spawn_env,
+            "extra_args": cfg.extra_args,
+        }
+    })
 }
 
 /// Convert a neutral `SessionMcpServer` (already stdio-launch-resolved by
@@ -2507,6 +2603,53 @@ mod build_mapping_tests {
             current_model_id: model.map(ModelId::new),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn session_cli_config_dump_value_captures_resolved_surface() {
+        use aionui_session::{McpServerSpec, McpTransport, SessionConfig, SessionInit};
+        let cfg = SessionConfig {
+            model: Some("opus".into()),
+            mode: Some("plan".into()),
+            sandbox_mode: Some("danger-full-access".into()),
+            approval_policy: Some("never".into()),
+            cli_program: Some(std::path::PathBuf::from("/opt/claude")),
+            spawn_env: vec![aionui_common::EnvVar {
+                name: "ANTHROPIC_AUTH_TOKEN".into(),
+                value: "raw-token".into(),
+            }],
+            init: SessionInit {
+                preset_context: Some("SYSTEM PROMPT BODY".into()),
+                skills: vec!["writer".into()],
+                mcp_servers: vec![McpServerSpec {
+                    name: "team".into(),
+                    transport: McpTransport::Stdio {
+                        command: "node".into(),
+                        args: vec!["srv.js".into()],
+                        env: vec![("K".into(), "V".into())],
+                    },
+                }],
+                resume: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let v = build_session_cli_config_dump_value("claude", &cfg);
+        assert_eq!(v["input"]["backend"], "claude");
+        assert_eq!(v["input"]["model"], "opus");
+        assert_eq!(v["input"]["mode"], "plan");
+        assert_eq!(v["input"]["sandbox_mode"], "danger-full-access");
+        assert_eq!(v["input"]["approval_policy"], "never");
+        assert_eq!(v["input"]["cli_program"], "/opt/claude");
+        assert_eq!(v["input"]["resume"], true);
+        // RAW, no redaction (dev-only), matching the acp dump behavior.
+        assert_eq!(v["resolved_context"]["preset_context"], "SYSTEM PROMPT BODY");
+        assert_eq!(v["resolved_context"]["skills"][0], "writer");
+        assert_eq!(v["resolved_context"]["spawn_env"][0]["name"], "ANTHROPIC_AUTH_TOKEN");
+        assert_eq!(v["resolved_context"]["spawn_env"][0]["value"], "raw-token");
+        assert_eq!(v["resolved_context"]["mcp_servers"][0]["name"], "team");
+        assert_eq!(v["resolved_context"]["mcp_servers"][0]["transport"]["type"], "stdio");
     }
 
     // Minimal catalog row for spec_mode_model's mode-normalize step. `backend` +
