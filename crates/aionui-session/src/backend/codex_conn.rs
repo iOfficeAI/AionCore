@@ -450,6 +450,25 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
     HandshakeParams(params)
 }
 
+/// `thread/resume` params = the full `thread/start` override surface + the
+/// threadId. LIVE-confirmed (0.144.1, `samples/codex-cli/0.144.1/_probe_resume_mcp.py`
+/// → `_all_resume_mcp.jsonl`): a bare `thread/resume {threadId}` does NOT restore
+/// the thread/start overrides from the rollout — the MCP inventory comes back
+/// EMPTY (`mcpServerStatus/list`) and approvalPolicy resets to the default
+/// (`on-request`; the thread was started with `never`). Re-sending the surface is
+/// consumed: `config.mcp_servers` relaunches the servers (startupStatus
+/// starting→ready + inventory restored) and `approvalPolicy` echoes back applied.
+/// `ThreadResumeParams` (schema-full 0.137.0) accepts the same field names as
+/// thread/start (`approvalPolicy`/`sandbox`/`cwd`/`config`/`baseInstructions`);
+/// sandbox/baseInstructions had no direct oracle in the probe — re-sending the
+/// start-time values is at worst a no-op, while dropping them is a confirmed loss
+/// on the probed axes.
+fn thread_resume_params(config: &SessionConfig, thread_id: &str) -> HandshakeParams {
+    let HandshakeParams(mut params) = thread_start_params(config);
+    params["threadId"] = json!(thread_id);
+    HandshakeParams(params)
+}
+
 /// Serialize neutral [`McpServerSpec`]s into codex's `config.mcp_servers` MAP
 /// (keyed by name), the shape codex's config loader expects (verified live +
 /// against `codex mcp add` TOML output). DISTINCT from the ACP wire: codex stdio
@@ -993,10 +1012,13 @@ impl CodexSessionBackend {
         match resume_thread_id {
             Some(tid) => {
                 *self.thread_binding.lock().await = Some(tid.to_string());
-                self.write_frame(json!({
-                    "jsonrpc": "2.0", "id": self.next_rpc_id(), "method": "thread/resume",
-                    "params": { "threadId": tid }
-                }))
+                // Resume re-sends the full thread/start override surface — a bare
+                // {threadId} resume silently drops the user's MCP servers and
+                // resets approvalPolicy to its default (LIVE 0.144.1, see
+                // `thread_resume_params`).
+                self.write_frame(
+                    thread_resume_params(&self.wake.config, tid).into_frame(self.next_rpc_id(), "thread/resume"),
+                )
                 .await?;
             }
             None => {
@@ -5799,6 +5821,52 @@ mod tests {
         assert_eq!(mcp["remote"]["url"], "https://mcp.example/api");
         // preset → baseInstructions.
         assert_eq!(frame["params"]["baseInstructions"], "You are a helpful assistant.");
+    }
+
+    /// thread/resume re-sends the FULL thread/start override surface + threadId.
+    /// LIVE-confirmed (0.144.1, `samples/codex-cli/0.144.1/_probe_resume_mcp.py`):
+    /// a bare `{threadId}` resume drops the user's MCP servers (inventory EMPTY)
+    /// and resets approvalPolicy to its default — the rollout does NOT restore
+    /// thread/start overrides. Re-sent params are consumed (servers relaunch,
+    /// approvalPolicy echoes applied).
+    #[test]
+    fn thread_resume_resends_full_start_surface_with_thread_id() {
+        use crate::backend::{McpServerSpec, McpTransport, SessionInit};
+        let config = SessionConfig {
+            cwd: Some("/work".into()),
+            approval_policy: Some("never".into()),
+            sandbox_mode: Some("danger-full-access".into()),
+            init: SessionInit {
+                mcp_servers: vec![McpServerSpec {
+                    name: "fs".into(),
+                    transport: McpTransport::Stdio {
+                        command: "/usr/bin/node".into(),
+                        args: vec!["s.js".into()],
+                        env: vec![],
+                    },
+                }],
+                preset_context: Some("preset".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let frame = thread_resume_params(&config, "th-1").into_frame(2, "thread/resume");
+        assert_eq!(frame["method"], "thread/resume");
+        assert_eq!(frame["params"]["threadId"], "th-1");
+        assert_eq!(frame["params"]["cwd"], "/work");
+        assert_eq!(frame["params"]["approvalPolicy"], "never");
+        assert_eq!(frame["params"]["sandbox"], "danger-full-access");
+        assert_eq!(
+            frame["params"]["config"]["mcp_servers"]["fs"]["command"],
+            "/usr/bin/node"
+        );
+        assert_eq!(frame["params"]["baseInstructions"], "preset");
+        // Empty init resume: still threadId + the policy defaults, no config /
+        // baseInstructions keys (mirrors the bare thread/start shape).
+        let bare = thread_resume_params(&SessionConfig::default(), "th-2").into_frame(3, "thread/resume");
+        assert_eq!(bare["params"]["threadId"], "th-2");
+        assert!(bare["params"].get("config").is_none());
+        assert!(bare["params"].get("baseInstructions").is_none());
     }
 
     /// R4 live spawn: open_session MUST route through the INJECTED Spawner (S14,
