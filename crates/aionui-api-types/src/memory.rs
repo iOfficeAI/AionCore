@@ -523,22 +523,27 @@ mod tests {
 
     #[test]
     fn entry_response_rejects_unknown_kind() {
-        let value = json!({
+        let valid = json!({
             "id": "mem_1",
             "user_id": "user_1",
-            "kind": "unsupported",
+            "kind": "decision",
             "stable_key": "decision:one",
             "fingerprint": "fp_1",
             "content": "Use the established plan.",
             "state": "active",
             "pinned": false,
             "user_edited": false,
+            "sources": [],
             "schema_version": 1,
             "created_at": 1,
             "updated_at": 1,
         });
 
-        assert!(serde_json::from_value::<MemoryEntryResponse>(value).is_err());
+        assert!(serde_json::from_value::<MemoryEntryResponse>(valid.clone()).is_ok());
+
+        let mut unsupported_kind = valid;
+        unsupported_kind["kind"] = json!("unsupported");
+        assert!(serde_json::from_value::<MemoryEntryResponse>(unsupported_kind).is_err());
     }
 
     #[test]
