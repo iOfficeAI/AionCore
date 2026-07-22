@@ -719,10 +719,19 @@ name = "aionui-memory"
 version = "0.1.50"
 dependencies = [
  "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
  "aionui-db",
+ "async-trait",
+ "axum",
+ "http-body-util",
  "regex",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

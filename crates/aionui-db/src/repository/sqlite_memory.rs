@@ -1,3 +1,4 @@
+use aionui_common::TimestampMs;
 use sqlx::{SqliteConnection, SqlitePool};
 
 struct InsertEntryOptions<'a> {
@@ -14,8 +15,8 @@ use crate::models::{
 use crate::repository::memory::{
     ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
     CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, IMemoryRepository, MemoryCandidateQueryRow,
-    MemoryEntryQueryRow, RenewMemoryLeaseRow, UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow,
-    UpdateMemorySettingsRow,
+    MemoryEntryQueryRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, TransitionMemoryJobRow,
+    UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow, UpdateMemorySettingsRow,
 };
 
 const MAX_MEMORY_CANDIDATES: u32 = 200;
@@ -523,6 +524,102 @@ impl IMemoryRepository for SqliteMemoryRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    async fn release_lease(&self, input: ReleaseMemoryLeaseRow) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE memory_jobs SET state = 'pending', lease_owner = NULL, lease_expires_at = NULL,
+             next_attempt_at = NULL, updated_at = ?
+             WHERE id = ? AND user_id = ? AND state = 'running' AND lease_owner = ? AND lease_expires_at > ?",
+        )
+        .bind(input.now)
+        .bind(&input.job_id)
+        .bind(&input.user_id)
+        .bind(&input.worker_id)
+        .bind(input.now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn transition_running_job(&self, input: TransitionMemoryJobRow) -> Result<Option<MemoryJobRow>, DbError> {
+        let result = sqlx::query(
+            "UPDATE memory_jobs SET state = ?, next_attempt_at = ?, last_error_code = ?,
+             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+             WHERE id = ? AND user_id = ? AND state = 'running' AND lease_owner = ? AND lease_expires_at > ?",
+        )
+        .bind(&input.state)
+        .bind(input.next_attempt_at)
+        .bind(&input.error_code)
+        .bind(input.now)
+        .bind(&input.job_id)
+        .bind(&input.user_id)
+        .bind(&input.worker_id)
+        .bind(input.now)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.get_job(&input.user_id, &input.job_id).await
+    }
+
+    async fn cancel_jobs(
+        &self,
+        user_id: &str,
+        conversation_id: Option<&str>,
+        now: TimestampMs,
+    ) -> Result<u64, DbError> {
+        let result = match conversation_id {
+            Some(conversation_id) => {
+                sqlx::query(
+                    "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_expires_at = NULL,
+                     next_attempt_at = NULL, last_error_code = 'canceled', updated_at = ?
+                     WHERE user_id = ? AND conversation_id = ? AND state IN ('pending','running','retry_wait','blocked')",
+                )
+                .bind(now)
+                .bind(user_id)
+                .bind(conversation_id)
+                .execute(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_expires_at = NULL,
+                     next_attempt_at = NULL, last_error_code = 'canceled', updated_at = ?
+                     WHERE user_id = ? AND state IN ('pending','running','retry_wait','blocked')",
+                )
+                .bind(now)
+                .bind(user_id)
+                .execute(&self.pool)
+                .await?
+            }
+        };
+        Ok(result.rows_affected())
+    }
+
+    async fn unblock_jobs(&self, user_id: &str, now: TimestampMs) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE memory_jobs SET state = 'pending', next_attempt_at = NULL, last_error_code = NULL, updated_at = ?
+             WHERE user_id = ? AND state = 'blocked'",
+        )
+        .bind(now)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn recover_expired_jobs(&self, now: TimestampMs) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE memory_jobs SET state = 'pending', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+             WHERE state = 'running' AND lease_expires_at <= ?",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     async fn get_job(&self, user_id: &str, job_id: &str) -> Result<Option<MemoryJobRow>, DbError> {

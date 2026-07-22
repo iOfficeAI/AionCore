@@ -56,6 +56,25 @@ pub struct RenewMemoryLeaseRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseMemoryLeaseRow {
+    pub user_id: String,
+    pub job_id: String,
+    pub worker_id: String,
+    pub now: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionMemoryJobRow {
+    pub user_id: String,
+    pub job_id: String,
+    pub worker_id: String,
+    pub state: String,
+    pub next_attempt_at: Option<TimestampMs>,
+    pub error_code: Option<String>,
+    pub now: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitMemorySourceRow {
     pub conversation_id: String,
     pub turn_id: String,
@@ -172,6 +191,12 @@ pub trait IMemoryRepository: Send + Sync {
     async fn enqueue_completed_turn(&self, input: EnqueueMemoryTurnRow) -> Result<Option<MemoryJobRow>, DbError>;
     async fn claim_next_job(&self, input: ClaimMemoryJobRow) -> Result<Option<MemoryJobRow>, DbError>;
     async fn renew_lease(&self, input: RenewMemoryLeaseRow) -> Result<bool, DbError>;
+    async fn release_lease(&self, input: ReleaseMemoryLeaseRow) -> Result<bool, DbError>;
+    async fn transition_running_job(&self, input: TransitionMemoryJobRow) -> Result<Option<MemoryJobRow>, DbError>;
+    async fn cancel_jobs(&self, user_id: &str, conversation_id: Option<&str>, now: TimestampMs)
+    -> Result<u64, DbError>;
+    async fn unblock_jobs(&self, user_id: &str, now: TimestampMs) -> Result<u64, DbError>;
+    async fn recover_expired_jobs(&self, now: TimestampMs) -> Result<u64, DbError>;
     async fn get_job(&self, user_id: &str, job_id: &str) -> Result<Option<MemoryJobRow>, DbError>;
     async fn commit_update(&self, input: CommitMemoryUpdateRow) -> Result<CommitMemoryUpdateResult, DbError>;
     async fn get_conversation_memory(
