@@ -380,7 +380,8 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
     let http_client = reqwest::Client::new();
 
     SystemRouterState {
-        settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),
+        settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone())))
+            .with_provider_repo(provider_repo.clone()),
         client_pref_service: ClientPrefService::with_keep_awake_controller(
             Arc::new(SqliteClientPreferenceRepository::new(pool.clone())),
             Arc::new(aionui_system::SystemKeepAwakeController::new()),
