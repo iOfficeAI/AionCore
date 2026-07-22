@@ -1115,18 +1115,28 @@ impl TeamSessionService {
             match outcome {
                 AttachOutcome::Ready | AttachOutcome::Removed => {}
                 AttachOutcome::Failed(failure) => {
-                    self.broadcast_session_status(
-                        team_id,
-                        TeamSessionStatus::Failed,
-                        Some(TeamSessionPhase::AttachingAgents),
-                        |payload| payload.error = Some(failure.public_reason.clone()),
-                    );
-                    return Err(TeamError::MemberRuntimeFailed {
-                        team_id: team_id.to_owned(),
-                        slot_id: agent.slot_id,
-                        conversation_id: agent.conversation_id,
-                        public_reason: failure.public_reason,
-                    });
+                    // Session-level Failed / the whole-team error are leader-scoped
+                    // (spec 5.4/5.5): only a leader failure raises the full-screen
+                    // failure card and blocks the team. A teammate reconciliation
+                    // failure stays inline — its `agentRuntimeStatusChanged=failed`
+                    // already fired in `attach_member_runtime` — and the team stays
+                    // usable because the leader is ready. `ensure_session` (invoked
+                    // on mount, model switches, and before sends via warmupSession)
+                    // must not fail just because an unrelated teammate is broken.
+                    if agent.role == TeammateRole::Lead {
+                        self.broadcast_session_status(
+                            team_id,
+                            TeamSessionStatus::Failed,
+                            Some(TeamSessionPhase::AttachingAgents),
+                            |payload| payload.error = Some(failure.public_reason.clone()),
+                        );
+                        return Err(TeamError::MemberRuntimeFailed {
+                            team_id: team_id.to_owned(),
+                            slot_id: agent.slot_id,
+                            conversation_id: agent.conversation_id,
+                            public_reason: failure.public_reason,
+                        });
+                    }
                 }
                 AttachOutcome::SessionStopped => {
                     return Err(TeamError::InvalidRequest(

@@ -3853,8 +3853,131 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
     );
 }
 
+// The full-screen overlay (warming + failure card) is leader-scoped (spec
+// 5.4/5.5). A whole-team `ensure_session` — invoked on page mount, model
+// switches, and before sends via `warmupSession` — reconciles non-dormant
+// members. If it retries an already-failed TEAMMATE and the retry fails again,
+// the team must stay usable (leader ready): `ensure_session` returns Ok, no
+// session `failed` is broadcast, and the teammate failure stays inline. Only a
+// LEADER reconciliation failure may fail the whole team.
 #[tokio::test]
-async fn failed_member_returns_conflict_and_removal_restores_ready() {
+async fn reensure_with_failed_teammate_keeps_team_usable_and_inline() {
+    use futures_util::FutureExt;
+
+    // Lead builds once (cold start); every later build fails, so the teammate's
+    // attach fails on add AND on the explicit re-ensure retry.
+    let build_count = Arc::new(AtomicUsize::new(0));
+    let factory_count = Arc::clone(&build_count);
+    let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
+        let build_index = factory_count.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if build_index >= 1 {
+                return Err(AgentError::internal("teammate build keeps failing"));
+            }
+            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
+                mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
+            )))
+        }
+        .boxed()
+    });
+    let (svc, _team_repo, _task_manager, recorder) = setup_with_factory_and_recording_broadcaster(factory);
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Re-ensure with broken teammate".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: Some("acp".into()),
+                    model: "claude".into(),
+                    assistant_id: None,
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    let failed = svc
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Broken".into(),
+                role: "teammate".into(),
+                backend: Some("acp".into()),
+                model: "claude".into(),
+                assistant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let runtime_failed = recorder
+                .events_by_name("team.agentRuntimeStatusChanged")
+                .iter()
+                .any(|event| {
+                    event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(failed.slot_id.as_str())
+                        && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+                });
+            if runtime_failed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the added teammate must fail inline first");
+
+    recorder.clear();
+
+    // Explicit full re-ensure (e.g. switching the leader's model, page remount)
+    // retries the still-broken teammate. `join_all` inside reconciliation means
+    // the teammate's failed attach has completed by the time this returns.
+    svc.ensure_session("user1", &created.id)
+        .await
+        .expect("a teammate reconciliation failure must not fail the whole team");
+
+    let session_failed = recorder
+        .events_by_name("team.sessionStatusChanged")
+        .into_iter()
+        .find(|event| {
+            event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
+                && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+        });
+    assert!(
+        session_failed.is_none(),
+        "a teammate reconciliation failure must not raise the full-screen failure card (session `failed`), got {session_failed:?}"
+    );
+    assert!(
+        recorder
+            .events_by_name("team.sessionStatusChanged")
+            .iter()
+            .any(|event| {
+                event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
+                    && event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready")
+            }),
+        "the team stays ready after a teammate reconciliation failure (leader ready = usable)"
+    );
+    assert!(
+        recorder
+            .events_by_name("team.agentRuntimeStatusChanged")
+            .iter()
+            .any(|event| {
+                event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(failed.slot_id.as_str())
+                    && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+            }),
+        "the teammate failure stays inline via agentRuntimeStatusChanged"
+    );
+}
+
+#[tokio::test]
+async fn failed_member_stays_inline_and_removal_restores_ready() {
     use futures_util::FutureExt;
 
     let build_count = Arc::new(AtomicUsize::new(0));
@@ -3911,8 +4034,7 @@ async fn failed_member_returns_conflict_and_removal_restores_ready() {
         .unwrap();
     // The dynamic teammate's attach failure surfaces inline (spec 5.4②): its
     // per-member runtime status goes `failed`. The session lifecycle stays Ready
-    // (leader still ready); the deterministic session-level failure is reported
-    // only by the explicit `ensure_session` retry below (which returns Err).
+    // (leader still ready) — a teammate failure is never a whole-team failure.
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let runtime_failed = recorder
@@ -3931,22 +4053,12 @@ async fn failed_member_returns_conflict_and_removal_restores_ready() {
     .await
     .expect("dynamic teammate failure must surface inline as a failed runtime status");
 
-    let error = svc
-        .ensure_session("user1", &created.id)
+    // A whole-team re-ensure retries the still-broken teammate but must keep the
+    // team usable (leader ready): it returns Ok and the failure stays inline,
+    // rather than reporting a session-level conflict (spec 5.4/5.5).
+    svc.ensure_session("user1", &created.id)
         .await
-        .expect_err("failed-member retry should report one deterministic failure");
-    assert!(matches!(
-        error,
-        TeamError::MemberRuntimeFailed {
-            ref team_id,
-            ref slot_id,
-            ref conversation_id,
-            ref public_reason,
-        } if team_id == &created.id
-            && slot_id == &failed.slot_id
-            && conversation_id == &failed.conversation_id
-            && public_reason == "Agent runtime failed to start"
-    ));
+        .expect("a teammate reconciliation failure must not fail the whole team");
 
     task_manager.reset_calls();
     recorder.clear();
