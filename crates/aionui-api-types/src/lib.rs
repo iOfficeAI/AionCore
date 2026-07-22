@@ -153,8 +153,10 @@ pub use skill::{
     WriteAssistantRuleRequest,
 };
 pub use system::{
-    ClientPreferencesResponse, FeedbackDiagnosticsContextResponse, FeedbackDiagnosticsPrivacyResponse,
-    FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse, SystemSettingsResponse,
+    AppOperationsModelHealth, AppOperationsModelReasonCode, AppOperationsModelRef, AppOperationsModelResponse,
+    AppOperationsModelSetting, ClientPreferencesResponse, FeedbackDiagnosticsContextResponse,
+    FeedbackDiagnosticsPrivacyResponse, FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery,
+    FeedbackDiagnosticsResponse, SystemSettingsResponse, UpdateAppOperationsModelRequest,
     UpdateClientPreferencesRequest, UpdateSettingsRequest,
 };
 pub use team::{
