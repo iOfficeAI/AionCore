@@ -715,6 +715,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aionui-memory"
+version = "0.1.50"
+dependencies = [
+ "aionui-api-types",
+ "aionui-db",
+ "regex",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "aionui-office"
 version = "0.1.50"
 dependencies = [
