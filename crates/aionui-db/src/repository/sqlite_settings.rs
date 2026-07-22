@@ -76,18 +76,11 @@ impl ISettingsRepository for SqliteSettingsRepository {
         .execute(&self.pool)
         .await?;
 
-        Ok(SystemSettings {
-            id: 1,
-            language: language.to_string(),
-            notification_enabled,
-            cron_notification_enabled,
-            command_queue_enabled,
-            save_upload_to_workspace,
-            app_operations_model_mode: "auto".to_string(),
-            app_operations_provider_id: None,
-            app_operations_model_id: None,
-            updated_at: now,
-        })
+        let row = sqlx::query_as::<_, SystemSettings>("SELECT * FROM system_settings WHERE id = 1")
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(row)
     }
 
     async fn upsert_app_operations_model(
@@ -164,6 +157,20 @@ mod tests {
         assert_eq!(app_model.provider_id.as_deref(), Some("provider-1"));
         assert_eq!(app_model.model_id.as_deref(), Some("model-1"));
         assert_eq!(system.language, "ja-JP");
+    }
+
+    #[tokio::test]
+    async fn upsert_settings_returns_existing_fixed_app_operations_model() {
+        let (repo, _db) = setup().await;
+        repo.upsert_app_operations_model("fixed", Some("provider-1"), Some("model-1"))
+            .await
+            .unwrap();
+
+        let system = repo.upsert_settings("ja-JP", true, false, false, false).await.unwrap();
+
+        assert_eq!(system.app_operations_model_mode, "fixed");
+        assert_eq!(system.app_operations_provider_id.as_deref(), Some("provider-1"));
+        assert_eq!(system.app_operations_model_id.as_deref(), Some("model-1"));
     }
 
     #[tokio::test]
