@@ -155,7 +155,7 @@ pub(crate) async fn acp_probe_command_spec(spec: CommandSpec) -> TryConnectCusto
     loop {
         match acp_probe_command_spec_once(spec.clone()).await {
             ProbeOutcome::Fail(error) => {
-                if let Some(cache_entry) = corrupt_npx_cache_repair.try_repair(&error) {
+                if let Some(cache_entry) = corrupt_npx_cache_repair.try_repair(&spec, &error) {
                     tracing::info!(
                         npm_npx_cache_entry = %cache_entry.display(),
                         "Cleared corrupt npm npx cache after ACP probe startup crash; retrying probe once"

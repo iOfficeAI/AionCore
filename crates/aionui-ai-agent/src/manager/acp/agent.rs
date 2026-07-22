@@ -157,7 +157,7 @@ async fn spawn_and_connect_acp(
                 signal,
                 stderr,
             }) => {
-                if let Some(cache_entry) = corrupt_npx_cache_repair.try_repair(&stderr) {
+                if let Some(cache_entry) = corrupt_npx_cache_repair.try_repair(&params.command_spec, &stderr) {
                     info!(
                         conversation_id = %params.conversation_id,
                         backend = params.metadata.backend.as_deref().unwrap_or("-"),
