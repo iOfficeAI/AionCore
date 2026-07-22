@@ -4602,6 +4602,8 @@ async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_
                 hidden: false,
                 files: vec![],
                 inject_skills: vec![],
+                memory_retrieval_id: None,
+                excluded_memory_ids: vec![],
             },
             &task_mgr,
         )

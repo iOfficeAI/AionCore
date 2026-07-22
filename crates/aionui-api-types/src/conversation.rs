@@ -99,6 +99,10 @@ pub struct SendMessageRequest {
     pub inject_skills: Vec<String>,
     #[serde(default)]
     pub hidden: bool,
+    #[serde(default)]
+    pub memory_retrieval_id: Option<String>,
+    #[serde(default)]
+    pub excluded_memory_ids: Vec<String>,
 }
 
 /// Response for `POST /api/conversations/:id/messages`.

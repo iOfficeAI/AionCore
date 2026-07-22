@@ -2815,6 +2815,8 @@ impl ConversationService {
                     files: request.files,
                     inject_skills: request.inject_skills,
                     hidden: request.user_message_hidden,
+                    memory_retrieval_id: None,
+                    excluded_memory_ids: vec![],
                 },
                 required_runtime_mode: request.required_runtime_mode,
                 build_options: build_opts,
