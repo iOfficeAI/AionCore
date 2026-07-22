@@ -107,17 +107,13 @@ impl DeliveryProviderRegistry {
 
     pub fn name_for_repository(&self, repository: Option<&str>) -> Result<&'static str, DevelopmentError> {
         let repository = repository.unwrap_or_default().to_ascii_lowercase();
-        let name = if repository.contains("gitlab") {
-            "gitlab"
-        } else if repository.contains("github") {
-            "github"
-        } else {
+        if !repository.contains("github") {
             return Err(DevelopmentError::BadRequest(
-                "repository host is not a supported GitHub or GitLab provider".into(),
+                "repository host is not a supported GitHub provider".into(),
             ));
-        };
-        self.get(name)?;
-        Ok(name)
+        }
+        self.get("github")?;
+        Ok("github")
     }
 }
 

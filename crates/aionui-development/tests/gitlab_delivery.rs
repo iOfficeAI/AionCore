@@ -120,10 +120,8 @@ async fn github_and_gitlab_share_the_same_delivery_contract() {
 }
 
 #[test]
-fn repository_urls_select_only_supported_providers() {
-    let github = Arc::new(ContractProvider::named("github"));
-    let gitlab = Arc::new(ContractProvider::named("gitlab"));
-    let registry = DeliveryProviderRegistry::new(github).with_provider(gitlab);
+fn repository_urls_select_only_github() {
+    let registry = DeliveryProviderRegistry::new(Arc::new(ContractProvider::named("github")));
 
     assert_eq!(
         registry
@@ -131,15 +129,11 @@ fn repository_urls_select_only_supported_providers() {
             .unwrap(),
         "github"
     );
+    let unsupported = registry
+        .name_for_repository(Some("https://example.invalid/acme/app.git"))
+        .unwrap_err();
     assert_eq!(
-        registry
-            .name_for_repository(Some("https://gitlab.example/acme/app.git"))
-            .unwrap(),
-        "gitlab"
-    );
-    assert!(
-        registry
-            .name_for_repository(Some("https://unknown.example/acme/app.git"))
-            .is_err()
+        unsupported.to_string(),
+        "Invalid development request: repository host is not a supported GitHub provider"
     );
 }
