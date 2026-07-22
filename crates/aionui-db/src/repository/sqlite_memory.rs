@@ -978,6 +978,19 @@ impl IMemoryRepository for SqliteMemoryRepository {
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
         let result = async {
             Self::ensure_conversation_on(&mut connection, &command.user_id, &command.conversation_id).await?;
+            sqlx::query(
+                "INSERT INTO memory_settings (user_id,updated_at) VALUES (?,?)
+                 ON CONFLICT(user_id) DO NOTHING",
+            )
+            .bind(&command.user_id)
+            .bind(command.now)
+            .execute(&mut *connection)
+            .await?;
+            let default_capture: bool =
+                sqlx::query_scalar("SELECT default_capture FROM memory_settings WHERE user_id = ?")
+                    .bind(&command.user_id)
+                    .fetch_one(&mut *connection)
+                    .await?;
             let current_capture: Option<Option<bool>> = sqlx::query_scalar(
                 "SELECT capture_enabled FROM conversation_memory_policies WHERE user_id = ? AND conversation_id = ?",
             )
@@ -985,7 +998,9 @@ impl IMemoryRepository for SqliteMemoryRepository {
             .bind(&command.conversation_id)
             .fetch_optional(&mut *connection)
             .await?;
-            let capture_changed = current_capture.flatten() != command.capture_enabled;
+            let previous_effective_capture = current_capture.flatten().unwrap_or(default_capture);
+            let next_effective_capture = command.capture_enabled.unwrap_or(default_capture);
+            let capture_changed = previous_effective_capture != next_effective_capture;
             sqlx::query(
                 "INSERT INTO conversation_memory_policies
                     (user_id,conversation_id,capture_enabled,recall_enabled,lifecycle_epoch,updated_at)
@@ -3442,6 +3457,21 @@ mod tests {
             .unwrap()
     }
 
+    async fn insert_job_in_state(repo: &SqliteMemoryRepository, job_id: &str, state: &str) {
+        sqlx::query(
+            "INSERT INTO memory_jobs
+                (id,user_id,conversation_id,through_turn_id,operation_version,queue_digest,input_hash,
+                 expected_revision,state,attempt_count,invalid_output_count,created_at,updated_at)
+             VALUES (?,?,'conv_a','turn-policy','memory-operation-v1','digest','hash',0,?,0,0,10,10)",
+        )
+        .bind(job_id)
+        .bind(USER_A)
+        .bind(state)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+    }
+
     fn claim(user_id: &str, worker_id: &str, now: i64) -> ClaimMemoryJobRow {
         ClaimMemoryJobRow {
             user_id: user_id.into(),
@@ -3704,6 +3734,74 @@ mod tests {
         assert!(!effective.recall_enabled);
         assert_eq!(effective.capture_override, Some(false));
         assert_eq!(effective.recall_override, None);
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_policy_fences_only_effective_capture_changes() {
+        for direction in ["inherit-to-explicit", "explicit-to-inherit"] {
+            for state in ["pending", "running", "retry_wait", "blocked", "failed"] {
+                let (repo, _, _db) = setup().await;
+                if direction == "explicit-to-inherit" {
+                    repo.update_conversation_policy(UpdateConversationMemoryPolicyRow {
+                        user_id: USER_A.into(),
+                        conversation_id: "conv_a".into(),
+                        capture_enabled: Some(true),
+                        recall_enabled: None,
+                        now: 5,
+                    })
+                    .await
+                    .unwrap();
+                }
+                let before_epoch: i64 = sqlx::query_scalar(
+                    "SELECT COALESCE(lifecycle_epoch,0) FROM conversation_memory_policies
+                     WHERE user_id = ? AND conversation_id = 'conv_a'",
+                )
+                .bind(USER_A)
+                .fetch_optional(&repo.pool)
+                .await
+                .unwrap()
+                .unwrap_or(0);
+                let job_id = format!("job-{direction}-{state}");
+                insert_job_in_state(&repo, &job_id, state).await;
+
+                repo.update_conversation_policy(UpdateConversationMemoryPolicyRow {
+                    user_id: USER_A.into(),
+                    conversation_id: "conv_a".into(),
+                    capture_enabled: (direction == "inherit-to-explicit").then_some(true),
+                    recall_enabled: None,
+                    now: 20,
+                })
+                .await
+                .unwrap();
+
+                let stored = repo.get_job(USER_A, &job_id).await.unwrap().unwrap();
+                assert_eq!(stored.state, state, "{direction} must preserve {state}");
+                let policy = repo.effective_policy(USER_A, "conv_a").await.unwrap();
+                assert!(policy.capture_enabled);
+                assert_eq!(
+                    policy.conversation_epoch, before_epoch,
+                    "{direction} must not fence equivalent effective capture for {state}",
+                );
+            }
+        }
+
+        let (repo, _, _db) = setup().await;
+        insert_job_in_state(&repo, "job-effective-disable", "failed").await;
+        let disabled = repo
+            .update_conversation_policy(UpdateConversationMemoryPolicyRow {
+                user_id: USER_A.into(),
+                conversation_id: "conv_a".into(),
+                capture_enabled: Some(false),
+                recall_enabled: None,
+                now: 30,
+            })
+            .await
+            .unwrap();
+        assert!(!disabled.capture_enabled);
+        assert_eq!(disabled.conversation_epoch, 1);
+        let canceled = repo.get_job(USER_A, "job-effective-disable").await.unwrap().unwrap();
+        assert_eq!(canceled.state, "canceled");
+        assert_eq!(canceled.last_error_code.as_deref(), Some("canceled"));
     }
 
     #[tokio::test]
