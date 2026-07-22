@@ -6,7 +6,7 @@ use aionui_api_types::{
     WebSocketMessage,
 };
 use aionui_realtime::EventBroadcaster;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::types::{TeamAgent, TeammateStatus};
 
@@ -111,6 +111,18 @@ impl TeamEventEmitter {
             status,
             error,
         };
+        // Per-member runtime status (dormant/pending/ready/failed) drives the
+        // inline column badge and send-box gate. It is a low-volume, important
+        // per-member lifecycle change, so log at info for production
+        // diagnosability (production runs at info). The reason is the sanitized
+        // public failure text, never a raw payload.
+        info!(
+            team_id = %payload.team_id,
+            slot_id = %payload.slot_id,
+            status = ?payload.status,
+            error = payload.error.as_deref().unwrap_or(""),
+            "team member runtime status broadcast"
+        );
         let event = WebSocketMessage::new(
             TEAM_AGENT_RUNTIME_STATUS_CHANGED_EVENT,
             serde_json::to_value(payload).expect("serialize agent runtime status payload"),

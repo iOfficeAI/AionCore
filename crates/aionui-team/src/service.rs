@@ -1218,6 +1218,18 @@ impl TeamSessionService {
             error: None,
         };
         customize(&mut payload);
+        // Session-level status drives the full-screen warmup overlay (leader-only,
+        // spec 5.4/5.5). This is a low-volume lifecycle boundary per team, so log
+        // at info for production diagnosability — the reason is already the
+        // sanitized public failure text, never a raw payload.
+        info!(
+            team_id = %payload.team_id,
+            status = ?payload.status,
+            phase = ?payload.phase,
+            server_count = ?payload.server_count,
+            error = payload.error.as_deref().unwrap_or(""),
+            "team session status broadcast"
+        );
         let event = WebSocketMessage::new(
             TEAM_SESSION_STATUS_CHANGED_EVENT,
             serde_json::to_value(payload).expect("serialize team session status payload"),
