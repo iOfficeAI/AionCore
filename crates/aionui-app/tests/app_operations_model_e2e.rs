@@ -6,6 +6,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
+use wiremock::MockServer;
 
 use common::{body_json, build_app, get_request, get_with_token, json_with_token, setup_and_login};
 
@@ -224,6 +225,7 @@ async fn app_operations_fixed_rejects_unknown_model() {
 
 #[tokio::test]
 async fn app_operations_check_returns_unavailable_without_probing_disabled_fixed_provider() {
+    let provider_server = MockServer::start().await;
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let provider_response = app
@@ -235,7 +237,7 @@ async fn app_operations_check_returns_unavailable_without_probing_disabled_fixed
                 "id": "disabled-operations-provider",
                 "platform": "openai",
                 "name": "Disabled Operations Provider",
-                "base_url": "http://127.0.0.1:9",
+                "base_url": provider_server.uri(),
                 "api_key": "test-key",
                 "models": ["model-a"]
             }),
@@ -276,17 +278,18 @@ async fn app_operations_check_returns_unavailable_without_probing_disabled_fixed
         .unwrap();
     assert_eq!(disable_response.status(), StatusCode::OK);
 
-    let response = app
-        .oneshot(json_with_token(
-            "POST",
-            APP_OPERATIONS_MODEL_CHECK_PATH,
-            json!({}),
-            &token,
-            &csrf,
-        ))
-        .await
+    let check_request = Request::builder()
+        .method("POST")
+        .uri(APP_OPERATIONS_MODEL_CHECK_PATH)
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-csrf-token", &csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(Body::empty())
         .unwrap();
+    let response = app.oneshot(check_request).await.unwrap();
 
+    let provider_requests = provider_server.received_requests().await.unwrap();
+    assert_eq!(provider_requests.len(), 0, "disabled provider must not be probed");
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response).await;
     assert_eq!(json["data"]["health"], "unavailable");
