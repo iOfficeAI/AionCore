@@ -307,7 +307,7 @@ impl MemoryService {
                 content: validate_content(content)?,
             },
             ResolveMemoryEntryConflictRequest::KeepSeparate => ResolveMemoryConflictActionRow::KeepSeparate {
-                tombstone_id: generate_prefixed_id("memory-tombstone"),
+                tombstone_id_prefix: generate_prefixed_id("memory-tombstone"),
             },
         };
         let entries = self

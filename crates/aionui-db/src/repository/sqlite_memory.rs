@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use aionui_common::TimestampMs;
 use sha2::{Digest, Sha256};
 use sqlx::{SqliteConnection, SqlitePool};
@@ -2840,8 +2842,13 @@ impl IMemoryRepository for SqliteMemoryRepository {
                     .execute(&mut *connection)
                     .await?;
                 }
-                ResolveMemoryConflictActionRow::KeepSeparate { tombstone_id } => {
+                ResolveMemoryConflictActionRow::KeepSeparate { tombstone_id_prefix } => {
+                    let mut prior_identities = Vec::new();
+                    let mut seen_fingerprints = HashSet::new();
                     for member in &members {
+                        if seen_fingerprints.insert(member.fingerprint.clone()) {
+                            prior_identities.push(member.clone());
+                        }
                         let stable_key = format!(
                             "resolved-{}",
                             memory_entry_content_hash(Some(&format!("{group_id}:{}", member.id))),
@@ -2866,25 +2873,43 @@ impl IMemoryRepository for SqliteMemoryRepository {
                         .execute(&mut *connection)
                         .await?;
                     }
-                    sqlx::query(
-                        "INSERT INTO memory_entries
-                         (id,user_id,project_id,workspace_key,kind,stable_key,fingerprint,content,state,pinned,
-                          user_edited,revision,schema_version,deleted_at,created_at,updated_at)
-                         VALUES (?,?,?,?,?,?,?,NULL,'deleted',0,0,0,?,?,?,?)",
-                    )
-                    .bind(tombstone_id)
-                    .bind(&input.user_id)
-                    .bind(&anchor.project_id)
-                    .bind(&anchor.workspace_key)
-                    .bind(&anchor.kind)
-                    .bind(&anchor.stable_key)
-                    .bind(&anchor.fingerprint)
-                    .bind(anchor.schema_version)
-                    .bind(input.now)
-                    .bind(input.now)
-                    .bind(input.now)
-                    .execute(&mut *connection)
-                    .await?;
+                    for (index, identity) in prior_identities.into_iter().enumerate() {
+                        let already_tombstoned: bool = sqlx::query_scalar(
+                            "SELECT EXISTS(SELECT 1 FROM memory_entries
+                             WHERE user_id = ? AND fingerprint = ? AND state = 'deleted')",
+                        )
+                        .bind(&input.user_id)
+                        .bind(&identity.fingerprint)
+                        .fetch_one(&mut *connection)
+                        .await?;
+                        if already_tombstoned {
+                            continue;
+                        }
+                        let tombstone_id = if index == 0 {
+                            tombstone_id_prefix.clone()
+                        } else {
+                            format!("{tombstone_id_prefix}-{index}")
+                        };
+                        sqlx::query(
+                            "INSERT INTO memory_entries
+                             (id,user_id,project_id,workspace_key,kind,stable_key,fingerprint,content,state,pinned,
+                              user_edited,revision,schema_version,deleted_at,created_at,updated_at)
+                             VALUES (?,?,?,?,?,?,?,NULL,'deleted',0,0,0,?,?,?,?)",
+                        )
+                        .bind(tombstone_id)
+                        .bind(&input.user_id)
+                        .bind(&identity.project_id)
+                        .bind(&identity.workspace_key)
+                        .bind(&identity.kind)
+                        .bind(&identity.stable_key)
+                        .bind(&identity.fingerprint)
+                        .bind(identity.schema_version)
+                        .bind(input.now)
+                        .bind(input.now)
+                        .bind(input.now)
+                        .execute(&mut *connection)
+                        .await?;
+                    }
                 }
             }
             let mut output = Vec::with_capacity(members.len());
@@ -3291,7 +3316,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 (user_id, cursor, completed, started_at, completed_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(user_id) DO UPDATE SET cursor = excluded.cursor, completed = excluded.completed,
-                started_at = excluded.started_at, completed_at = excluded.completed_at, updated_at = excluded.updated_at",
+                started_at = excluded.started_at, completed_at = excluded.completed_at, updated_at = excluded.updated_at
+             WHERE memory_import_state.completed = 0",
         )
         .bind(&state.user_id)
         .bind(&state.cursor)
@@ -3301,7 +3327,9 @@ impl IMemoryRepository for SqliteMemoryRepository {
         .bind(state.updated_at)
         .execute(&self.pool)
         .await?;
-        Ok(state)
+        self.get_import_state(&state.user_id)
+            .await?
+            .ok_or_else(|| DbError::NotFound("Memory import state was not persisted".into()))
     }
 }
 
@@ -3314,9 +3342,9 @@ mod tests {
         CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, ExpectedMemoryEntryRow,
         FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, MemoryCandidateQueryRow,
         MemoryReconciliationSnapshotRow, MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow,
-        SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow,
-        UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow, UpdateMemorySettingsRow, derive_memory_fingerprint,
-        memory_entry_content_hash,
+        ResolveMemoryConflictActionRow, ResolveMemoryConflictRow, SplitMemoryJobRow, TransitionMemoryJobRow,
+        UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow,
+        UpdateMemorySettingsRow, derive_memory_fingerprint, memory_entry_content_hash,
     };
     use crate::repository::{IConversationRepository, IMemoryRepository, SqliteConversationRepository};
     use crate::{DbError, init_database_memory};
@@ -5111,6 +5139,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_memory_keep_separate_tombstones_every_prior_identity_and_blocks_replay() {
+        let (repo, _, _db) = setup().await;
+        for (id, fingerprint, content) in [
+            ("separate-version-a", "fp-separate-a", "Version A"),
+            ("separate-version-b", "fp-separate-b", "Version B"),
+        ] {
+            sqlx::query(
+                "INSERT INTO memory_entries
+                    (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,revision,
+                     conflict_group_id,schema_version,created_at,updated_at)
+                 VALUES (?,?,'decision',?,?,?,'conflict',0,0,0,'separate-group',1,10,10)",
+            )
+            .bind(id)
+            .bind(USER_A)
+            .bind(format!("key-{id}"))
+            .bind(fingerprint)
+            .bind(content)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        }
+
+        let resolved = repo
+            .resolve_conflict(ResolveMemoryConflictRow {
+                user_id: USER_A.into(),
+                entry_id: "separate-version-a".into(),
+                action: ResolveMemoryConflictActionRow::KeepSeparate {
+                    tombstone_id_prefix: "separate-tombstone".into(),
+                },
+                now: 20,
+            })
+            .await
+            .unwrap();
+        assert!(
+            resolved
+                .iter()
+                .all(|entry| entry.state == "active" && entry.user_edited)
+        );
+        let tombstoned_fingerprints: Vec<String> = sqlx::query_scalar(
+            "SELECT fingerprint FROM memory_entries WHERE user_id = ? AND state = 'deleted'
+             AND fingerprint IN ('fp-separate-a','fp-separate-b') ORDER BY fingerprint",
+        )
+        .bind(USER_A)
+        .fetch_all(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(tombstoned_fingerprints, ["fp-separate-a", "fp-separate-b"]);
+
+        claimed_job(&repo, "job-replay-separate", "conv_a", "turn-replay-separate").await;
+        let replay = repo
+            .commit_update(commit(
+                "job-replay-separate",
+                "conv_a",
+                "turn-replay-separate",
+                0,
+                vec![
+                    entry(
+                        "replayed-version-a",
+                        "fp-separate-a",
+                        vec![source("conv_a", "turn-replay-separate")],
+                    ),
+                    entry(
+                        "replayed-version-b",
+                        "fp-separate-b",
+                        vec![source("conv_a", "turn-replay-separate")],
+                    ),
+                ],
+                30,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(replay, CommitMemoryUpdateResult::Committed { ref added_ids, .. } if added_ids.is_empty()));
+        assert!(repo.get_entry(USER_A, "replayed-version-a").await.unwrap().is_none());
+        assert!(repo.get_entry(USER_A, "replayed-version-b").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn sqlite_memory_update_entry_rejects_zero_row_cas_after_tombstone() {
         let (repo, _, _db) = setup().await;
         claimed_job(&repo, "job-update-race", "conv_a", "turn-1").await;
@@ -5406,6 +5511,20 @@ mod tests {
         assert!(import_state.completed);
         assert_eq!(import_state.started_at, Some(15));
         assert_eq!(import_state.completed_at, Some(50));
+        let stale_import_write = repo
+            .upsert_import_state(MemoryImportStateRow {
+                user_id: USER_A.into(),
+                cursor: Some("stale-page-after-clear".into()),
+                completed: false,
+                started_at: Some(15),
+                completed_at: None,
+                updated_at: 55,
+            })
+            .await
+            .unwrap();
+        assert_eq!(stale_import_write.cursor.as_deref(), Some("legacy-cursor-7"));
+        assert!(stale_import_write.completed);
+        assert_eq!(stale_import_write.completed_at, Some(50));
 
         assert!(repo.get_import_state(USER_B).await.unwrap().is_none());
         repo.clear_memory(USER_B, 60).await.unwrap();

@@ -373,7 +373,7 @@ pub struct UpdateMemoryEntryRow {
 pub enum ResolveMemoryConflictActionRow {
     Select { selected_entry_id: String },
     Merge { content: String },
-    KeepSeparate { tombstone_id: String },
+    KeepSeparate { tombstone_id_prefix: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
