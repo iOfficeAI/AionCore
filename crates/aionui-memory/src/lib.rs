@@ -4,10 +4,12 @@ pub mod app_operations_port;
 pub mod error;
 mod evidence;
 pub mod jobs;
+mod reconciliation;
 pub mod routes;
 pub mod sanitizer;
 pub mod service;
 pub mod state;
+mod validation;
 
 pub use app_operations_port::AppOperationsReadinessPort;
 pub use error::MemoryError;

@@ -734,6 +734,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]

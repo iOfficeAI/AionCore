@@ -3,31 +3,28 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    CompleteMemoryJobRequest, MemoryCandidateMutation, MemoryEntryKind, MemoryJobFailureCode, MemoryJobResponse,
-    MemorySourceMessageRole, MemorySummary, MemoryUpdateInput, NormalizedMemoryJobFailure,
+    CompleteMemoryJobRequest, MemoryJobFailureCode, MemoryJobResponse, MemorySourceMessageRole, MemorySummary,
+    MemoryUpdateInput, NormalizedMemoryJobFailure,
 };
 use aionui_common::{generate_prefixed_id, now_ms};
-use aionui_db::models::MemoryJobRow;
+use aionui_db::models::{MemoryEntryRow, MemoryJobRow};
 use aionui_db::{
-    ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
-    CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, FinalizeMemoryJobSnapshotResult,
-    FinalizeMemoryJobSnapshotRow, IConversationRepository, IMemoryRepository, MemoryCandidateQueryRow,
-    MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, SplitMemoryJobRow,
-    TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow, UpdateMemoryLifecycleRow,
+    ClaimMemoryJobRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow,
+    FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, IConversationRepository, IMemoryRepository,
+    MemoryCandidateQueryRow, MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow,
+    SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow, UpdateMemoryLifecycleRow,
 };
-use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::{
     AppOperationsReadinessPort, EvidenceBuildRequest, MemoryError, MemoryTurnOutcome,
     evidence::EvidenceBuilder,
     jobs::{ClaimedMemoryJob, job_response},
+    reconciliation::Reconciler,
     sanitizer::{
-        MAX_EVIDENCE_BYTES, MAX_EVIDENCE_MESSAGES, MAX_EVIDENCE_TURNS, MAX_EXISTING_ENTRIES, MAX_MUTATION_COUNT,
-        MAX_STRING_LENGTH, MAX_SUMMARY_BYTES, MAX_SUMMARY_ITEMS, OPERATION_VERSION, sanitize_text,
-        strip_user_context_sentences,
+        MAX_EVIDENCE_BYTES, MAX_EVIDENCE_MESSAGES, MAX_EVIDENCE_TURNS, MAX_EXISTING_ENTRIES, OPERATION_VERSION,
     },
+    validation::ProposalValidator,
 };
 
 const RETRY_DELAYS_MS: [i64; 5] = [30_000, 120_000, 600_000, 3_600_000, 21_600_000];
@@ -445,6 +442,17 @@ impl MemoryService {
         job_id: &str,
         lease_token: &str,
     ) -> Result<MemoryUpdateInput, MemoryError> {
+        self.load_job_evidence_with_entries(user_id, job_id, lease_token)
+            .await
+            .map(|(input, _entries)| input)
+    }
+
+    async fn load_job_evidence_with_entries(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        lease_token: &str,
+    ) -> Result<(MemoryUpdateInput, Vec<MemoryEntryRow>), MemoryError> {
         let jobs = self.job_dependencies()?;
         valid_lease_token(lease_token)?;
         let job = jobs
@@ -551,7 +559,7 @@ impl MemoryService {
             previous_summary,
             summary_cursor: job.from_turn_id.clone(),
             claimed_turn_ids,
-            existing_entries,
+            existing_entries: existing_entries.clone(),
         })?;
         for turn in &input.source_turns {
             let turn = jobs
@@ -578,7 +586,7 @@ impl MemoryService {
         {
             return Err(MemoryError::LeaseLost);
         }
-        Ok(input)
+        Ok((input, existing_entries))
     }
 
     pub async fn get_job(&self, user_id: &str, job_id: &str) -> Result<MemoryJobResponse, MemoryError> {
@@ -630,151 +638,40 @@ impl MemoryService {
             .map_err(map_db_error)?
             .ok_or(MemoryError::NotFound)?;
         if request.expected_revision != u64::try_from(job.expected_revision).map_err(|_| MemoryError::Internal)? {
+            self.requeue_stale_completion(user_id, &job, worker_id, &request.lease_token)
+                .await?;
             return Err(MemoryError::StaleRevision);
         }
         if job.lease_owner.as_deref() != Some(worker_id) {
             return Err(MemoryError::LeaseLost);
         }
-        let evidence = self.load_job_evidence(user_id, job_id, &request.lease_token).await?;
-        if request.output.mutations.len() > MAX_MUTATION_COUNT {
-            return Err(MemoryError::InvalidInput);
-        }
-        if !valid_metadata(&request.task_result_provenance.provider_id)
-            || !valid_metadata(&request.task_result_provenance.model_id)
-            || !valid_metadata(&request.task_result_provenance.prompt_version)
-        {
-            return Err(MemoryError::InvalidInput);
-        }
-        let summary = sanitize_output_summary(request.output.summary)?;
-        let summary_json = serde_json::to_string(&summary).map_err(|_| MemoryError::InvalidInput)?;
-        if summary_json.len() > MAX_SUMMARY_BYTES {
-            return Err(MemoryError::InvalidInput);
-        }
-        let valid_targets = evidence
-            .existing_entries
-            .iter()
-            .map(|entry| entry.id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        let turns = evidence
-            .source_turns
-            .iter()
-            .map(|turn| (turn.turn_id.as_str(), turn))
-            .collect::<std::collections::HashMap<_, _>>();
-        let mut entries = Vec::with_capacity(request.output.mutations.len());
-        for mutation in request.output.mutations {
-            let (kind, stable_key, content, source_turn_ids, transition) = match mutation {
-                MemoryCandidateMutation::Create {
-                    kind,
-                    stable_key,
-                    content,
-                    source_turn_ids,
-                } => (
-                    kind,
-                    stable_key,
-                    content,
-                    source_turn_ids,
-                    CommitMemoryEntryTransition::Create,
-                ),
-                MemoryCandidateMutation::Refine {
-                    target_entry_id,
-                    kind,
-                    stable_key,
-                    content,
-                    source_turn_ids,
-                } => {
-                    if !valid_targets.contains(target_entry_id.as_str()) {
-                        return Err(MemoryError::InvalidInput);
-                    }
-                    let transition = CommitMemoryEntryTransition::Refine {
-                        target_entry_id: target_entry_id.clone(),
-                    };
-                    (kind, stable_key, content, source_turn_ids, transition)
-                }
-                MemoryCandidateMutation::Supersede {
-                    target_entry_id,
-                    kind,
-                    stable_key,
-                    content,
-                    source_turn_ids,
-                } => {
-                    if !valid_targets.contains(target_entry_id.as_str()) {
-                        return Err(MemoryError::InvalidInput);
-                    }
-                    let transition = CommitMemoryEntryTransition::Supersede {
-                        target_entry_id: target_entry_id.clone(),
-                    };
-                    (kind, stable_key, content, source_turn_ids, transition)
-                }
-                MemoryCandidateMutation::Conflict {
-                    target_entry_id,
-                    kind,
-                    stable_key,
-                    content,
-                    source_turn_ids,
-                } => {
-                    if !valid_targets.contains(target_entry_id.as_str()) {
-                        return Err(MemoryError::InvalidInput);
-                    }
-                    let transition = CommitMemoryEntryTransition::Conflict {
-                        target_entry_id: target_entry_id.clone(),
-                        conflict_group_id: generate_prefixed_id("memory-conflict"),
-                    };
-                    (kind, stable_key, content, source_turn_ids, transition)
-                }
-            };
-            let stable_key = stable_key
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_lowercase();
-            let content = strip_user_context_sentences(&sanitize_text(&content));
-            if stable_key.is_empty()
-                || stable_key.len() > MAX_STRING_LENGTH
-                || content.trim().is_empty()
-                || content.len() > MAX_STRING_LENGTH
-                || source_turn_ids.is_empty()
-            {
+        let (evidence, stored_entries) = self
+            .load_job_evidence_with_entries(user_id, job_id, &request.lease_token)
+            .await?;
+        let proposal = match ProposalValidator::validate(request.output, request.task_result_provenance, &evidence) {
+            Ok(proposal) => proposal,
+            Err(MemoryError::InvalidInput) => {
+                self.record_invalid_completion(user_id, &job, worker_id, &request.lease_token)
+                    .await?;
                 return Err(MemoryError::InvalidInput);
             }
-            if source_turn_ids.iter().collect::<std::collections::HashSet<_>>().len() != source_turn_ids.len() {
+            Err(error) => return Err(error),
+        };
+        let entries = match Reconciler::reconcile(
+            user_id,
+            &job.conversation_id,
+            &evidence,
+            &stored_entries,
+            proposal.candidates,
+        ) {
+            Ok(entries) => entries,
+            Err(MemoryError::InvalidInput) => {
+                self.record_invalid_completion(user_id, &job, worker_id, &request.lease_token)
+                    .await?;
                 return Err(MemoryError::InvalidInput);
             }
-            let mut sources = Vec::with_capacity(source_turn_ids.len());
-            for turn_id in source_turn_ids {
-                let turn = turns.get(turn_id.as_str()).ok_or(MemoryError::InvalidInput)?;
-                sources.push(CommitMemorySourceRow {
-                    conversation_id: job.conversation_id.clone(),
-                    turn_id,
-                    message_ids_json: serde_json::to_string(
-                        &turn
-                            .messages
-                            .iter()
-                            .map(|message| &message.message_id)
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(|_| MemoryError::Internal)?,
-                });
-            }
-            let kind = kind_name(&kind);
-            let fingerprint = structured_hash(&(
-                user_id,
-                evidence.conversation.project_id.as_deref(),
-                evidence.conversation.workspace_key.as_deref(),
-                kind,
-                stable_key.as_str(),
-            ))?;
-            entries.push(CommitMemoryEntryRow {
-                id: generate_prefixed_id("memory-entry"),
-                project_id: evidence.conversation.project_id.clone(),
-                workspace_key: evidence.conversation.workspace_key.clone(),
-                kind: kind.into(),
-                stable_key,
-                fingerprint,
-                content,
-                transition,
-                sources,
-            });
-        }
+            Err(error) => return Err(error),
+        };
         match jobs
             .memory
             .commit_update(CommitMemoryUpdateRow {
@@ -785,11 +682,11 @@ impl MemoryService {
                 through_turn_id: job.through_turn_id,
                 project_id: evidence.conversation.project_id,
                 workspace_key: evidence.conversation.workspace_key,
-                summary_json,
+                summary_json: proposal.summary_json,
                 schema_version: 1,
-                prompt_version: Some(request.task_result_provenance.prompt_version),
-                writer_provider_id: Some(request.task_result_provenance.provider_id),
-                writer_model_id: Some(request.task_result_provenance.model_id),
+                prompt_version: Some(proposal.provenance.prompt_version),
+                writer_provider_id: Some(proposal.provenance.provider_id),
+                writer_model_id: Some(proposal.provenance.model_id),
                 lease_owner: worker_id.into(),
                 lease_token: request.lease_token,
                 expected_attempt_count: job.attempt_count,
@@ -904,6 +801,67 @@ impl MemoryService {
         self.jobs.as_deref().ok_or(MemoryError::Internal)
     }
 
+    async fn record_invalid_completion(
+        &self,
+        user_id: &str,
+        job: &MemoryJobRow,
+        worker_id: &str,
+        lease_token: &str,
+    ) -> Result<(), MemoryError> {
+        let now = now_ms();
+        let (state, next_attempt_at, increment_attempt, increment_invalid_output) = failure_transition(
+            &MemoryJobFailureCode::InvalidOutput,
+            job.attempt_count,
+            job.invalid_output_count,
+            now,
+        );
+        self.job_dependencies()?
+            .memory
+            .transition_running_job(TransitionMemoryJobRow {
+                user_id: user_id.into(),
+                job_id: job.id.clone(),
+                worker_id: worker_id.into(),
+                lease_token: lease_token.into(),
+                state: state.into(),
+                next_attempt_at,
+                error_code: Some("invalid_output".into()),
+                increment_attempt,
+                increment_invalid_output,
+                now,
+            })
+            .await
+            .map_err(map_db_error)?
+            .ok_or(MemoryError::LeaseLost)?;
+        Ok(())
+    }
+
+    async fn requeue_stale_completion(
+        &self,
+        user_id: &str,
+        job: &MemoryJobRow,
+        worker_id: &str,
+        lease_token: &str,
+    ) -> Result<(), MemoryError> {
+        self.job_dependencies()?
+            .memory
+            .transition_running_job(TransitionMemoryJobRow {
+                user_id: user_id.into(),
+                job_id: job.id.clone(),
+                worker_id: worker_id.into(),
+                lease_token: lease_token.into(),
+                state: "pending".into(),
+                next_attempt_at: None,
+                error_code: Some("stale_revision".into()),
+                increment_attempt: false,
+                increment_invalid_output: false,
+                now: now_ms(),
+            })
+            .await
+            .map_err(map_db_error)?
+            .ok_or(MemoryError::LeaseLost)?;
+        Ok(())
+    }
+
     async fn requeue_snapshot_change(
         &self,
         user_id: &str,
@@ -949,64 +907,6 @@ fn valid_lease_token(lease_token: &str) -> Result<(), MemoryError> {
     (!lease_token.trim().is_empty() && lease_token.len() <= 200)
         .then_some(())
         .ok_or(MemoryError::InvalidInput)
-}
-
-fn structured_hash(value: &impl Serialize) -> Result<String, MemoryError> {
-    let material = serde_json::to_vec(value).map_err(|_| MemoryError::Internal)?;
-    Ok(Sha256::digest(material)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
-
-fn kind_name(kind: &MemoryEntryKind) -> &'static str {
-    match kind {
-        MemoryEntryKind::Decision => "decision",
-        MemoryEntryKind::Outcome => "outcome",
-        MemoryEntryKind::Artifact => "artifact",
-        MemoryEntryKind::Issue => "issue",
-        MemoryEntryKind::NextStep => "next_step",
-        MemoryEntryKind::WorkConstraint => "work_constraint",
-    }
-}
-
-fn sanitize_output_summary(summary: MemorySummary) -> Result<MemorySummary, MemoryError> {
-    let goal = strip_user_context_sentences(&sanitize_text(&summary.goal));
-    let sanitize_values = |values: Vec<String>| -> Result<Vec<String>, MemoryError> {
-        values
-            .into_iter()
-            .map(|value| {
-                let value = strip_user_context_sentences(&sanitize_text(&value));
-                (!value.trim().is_empty() && value.len() <= MAX_STRING_LENGTH)
-                    .then_some(value)
-                    .ok_or(MemoryError::InvalidInput)
-            })
-            .collect()
-    };
-    let summary = MemorySummary {
-        goal,
-        current_state: sanitize_values(summary.current_state)?,
-        decisions: sanitize_values(summary.decisions)?,
-        artifacts: sanitize_values(summary.artifacts)?,
-        issues: sanitize_values(summary.issues)?,
-        next_steps: sanitize_values(summary.next_steps)?,
-        work_constraints: sanitize_values(summary.work_constraints)?,
-    };
-    let item_count = usize::from(!summary.goal.is_empty())
-        + summary.current_state.len()
-        + summary.decisions.len()
-        + summary.artifacts.len()
-        + summary.issues.len()
-        + summary.next_steps.len()
-        + summary.work_constraints.len();
-    if summary.goal.len() > MAX_STRING_LENGTH || item_count > MAX_SUMMARY_ITEMS {
-        return Err(MemoryError::InvalidInput);
-    }
-    Ok(summary)
-}
-
-fn valid_metadata(value: &str) -> bool {
-    !value.trim().is_empty() && value.len() <= MAX_STRING_LENGTH
 }
 
 fn failure_transition(
@@ -1061,8 +961,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use aionui_api_types::{
-        CompleteMemoryJobRequest, MemoryJobFailureCode, MemoryJobState, MemorySummary, MemoryTaskResultProvenance,
-        MemoryUpdateOutput, NormalizedMemoryJobFailure,
+        CompleteMemoryJobRequest, MemoryCandidateMutation, MemoryEntryKind, MemoryJobFailureCode, MemoryJobState,
+        MemorySummary, MemoryTaskResultProvenance, MemoryUpdateOutput, NormalizedMemoryJobFailure,
     };
     use aionui_db::models::{ConversationRow, MessageRow};
     use aionui_db::{
@@ -1070,7 +970,8 @@ mod tests {
         SqliteMemoryRepository, UpdateMemorySettingsRow, init_database_memory,
     };
 
-    use super::{MemoryService, RETRY_DELAYS_MS, failure_transition, sanitize_output_summary};
+    use super::{MemoryService, RETRY_DELAYS_MS, failure_transition};
+    use crate::validation::sanitize_summary;
     use crate::{AppOperationsReadinessPort, EvidenceBuildRequest, MemoryError, MemoryTurnOutcome};
 
     const USER_ID: &str = "system_default_user";
@@ -1154,7 +1055,7 @@ mod tests {
 
     #[test]
     fn output_summary_removes_user_context_sentences() {
-        let summary = sanitize_output_summary(MemorySummary {
+        let summary = sanitize_summary(MemorySummary {
             goal: "My name is Ada. Ship the release.".into(),
             current_state: vec!["I prefer concise responses. Tests pass.".into()],
             decisions: Vec::new(),
@@ -1753,16 +1654,365 @@ mod tests {
             fixture.memory.get_job(USER_ID, &job.id).await.unwrap().unwrap().state,
             "succeeded"
         );
+        let memory = fixture
+            .memory
+            .get_conversation_memory(USER_ID, "conversation-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(memory.through_turn_id, "turn-1");
+        assert_eq!(memory.writer_provider_id.as_deref(), Some("provider-1"));
+        assert_eq!(memory.writer_model_id.as_deref(), Some("model-1"));
+        assert_eq!(memory.prompt_version.as_deref(), Some("memory-prompt-v1"));
+    }
+
+    #[tokio::test]
+    async fn invalid_duplicate_targets_retry_once_without_writes() {
+        let fixture = fixture(true).await;
+        fixture.persist_turn("turn-1", 10).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-1", MemoryTurnOutcome::Completed)
+            .await;
+        let first = fixture
+            .service
+            .claim_job(USER_ID, "worker-first", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .service
+            .complete_job(
+                USER_ID,
+                &first.id,
+                "worker-first",
+                completion_with_mutations(&first, vec![create_mutation("Release Plan", "Initial plan", "turn-1")]),
+            )
+            .await
+            .unwrap();
+        let target = fixture.memory.list_entries(USER_ID).await.unwrap().pop().unwrap();
+
+        fixture.persist_turn("turn-2", 20).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-2", MemoryTurnOutcome::Completed)
+            .await;
+        let second = fixture
+            .service
+            .claim_job(USER_ID, "worker-second", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let duplicate_target = vec![
+            refine_mutation(&target.id, "Release Plan", "First rewrite", "turn-2"),
+            refine_mutation(&target.id, "Release Plan", "Second rewrite", "turn-2"),
+        ];
+
         assert_eq!(
             fixture
-                .memory
-                .get_conversation_memory(USER_ID, "conversation-1")
-                .await
-                .unwrap()
-                .unwrap()
-                .through_turn_id,
-            "turn-1",
+                .service
+                .complete_job(
+                    USER_ID,
+                    &second.id,
+                    "worker-second",
+                    completion_with_mutations(&second, duplicate_target),
+                )
+                .await,
+            Err(MemoryError::InvalidInput),
         );
+        let stored_target = fixture.memory.get_entry(USER_ID, &target.id).await.unwrap().unwrap();
+        assert_eq!(stored_target.content.as_deref(), Some("Initial plan"));
+        let failed_attempt = fixture.memory.get_job(USER_ID, &second.id).await.unwrap().unwrap();
+        assert_eq!(failed_attempt.state, "retry_wait");
+        assert_eq!(failed_attempt.invalid_output_count, 1);
+
+        sqlx::query("UPDATE memory_jobs SET next_attempt_at = 0 WHERE id = ?")
+            .bind(&second.id)
+            .execute(fixture._db.pool())
+            .await
+            .unwrap();
+        let retry = fixture
+            .service
+            .claim_job(USER_ID, "worker-retry", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fixture
+                .service
+                .complete_job(
+                    USER_ID,
+                    &retry.id,
+                    "worker-retry",
+                    completion_with_mutations(
+                        &retry,
+                        vec![
+                            refine_mutation(&target.id, "Release Plan", "First rewrite", "turn-2"),
+                            refine_mutation(&target.id, "Release Plan", "Second rewrite", "turn-2"),
+                        ],
+                    ),
+                )
+                .await,
+            Err(MemoryError::InvalidInput),
+        );
+        let terminal = fixture.memory.get_job(USER_ID, &retry.id).await.unwrap().unwrap();
+        assert_eq!(terminal.state, "failed");
+        assert_eq!(terminal.invalid_output_count, 2);
+    }
+
+    #[tokio::test]
+    async fn normalized_duplicate_create_refines_one_entry_and_accumulates_sources() {
+        let fixture = fixture(true).await;
+        fixture.persist_turn("turn-1", 10).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-1", MemoryTurnOutcome::Completed)
+            .await;
+        let first = fixture
+            .service
+            .claim_job(USER_ID, "worker-first", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .service
+            .complete_job(
+                USER_ID,
+                &first.id,
+                "worker-first",
+                completion_with_mutations(
+                    &first,
+                    vec![create_mutation(
+                        "Caf\u{e9}\u{2014}Release.Plan",
+                        "Initial plan",
+                        "turn-1",
+                    )],
+                ),
+            )
+            .await
+            .unwrap();
+
+        fixture.persist_turn("turn-2", 20).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-2", MemoryTurnOutcome::Completed)
+            .await;
+        let second = fixture
+            .service
+            .claim_job(USER_ID, "worker-second", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .service
+            .complete_job(
+                USER_ID,
+                &second.id,
+                "worker-second",
+                completion_with_mutations(
+                    &second,
+                    vec![create_mutation("CAFE\u{301} release plan", "Refined plan", "turn-2")],
+                ),
+            )
+            .await
+            .unwrap();
+
+        let entries = fixture.memory.list_entries(USER_ID).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].stable_key, "caf\u{e9} release plan");
+        assert_eq!(entries[0].content.as_deref(), Some("Refined plan"));
+        assert_eq!(entries[0].sources.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_conflicts_instead_of_overwriting_a_protected_entry() {
+        let fixture = fixture(true).await;
+        fixture.persist_turn("turn-1", 10).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-1", MemoryTurnOutcome::Completed)
+            .await;
+        let first = fixture
+            .service
+            .claim_job(USER_ID, "worker-first", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .service
+            .complete_job(
+                USER_ID,
+                &first.id,
+                "worker-first",
+                completion_with_mutations(&first, vec![create_mutation("release", "Protected plan", "turn-1")]),
+            )
+            .await
+            .unwrap();
+        let target = fixture.memory.list_entries(USER_ID).await.unwrap().pop().unwrap();
+        fixture
+            .memory
+            .update_entry(aionui_db::UpdateMemoryEntryRow {
+                user_id: USER_ID.into(),
+                id: target.id.clone(),
+                content: None,
+                pinned: Some(true),
+                project_id: None,
+                workspace_key: None,
+                now: 15,
+            })
+            .await
+            .unwrap();
+
+        fixture.persist_turn("turn-2", 20).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-2", MemoryTurnOutcome::Completed)
+            .await;
+        let second = fixture
+            .service
+            .claim_job(USER_ID, "worker-second", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .service
+            .complete_job(
+                USER_ID,
+                &second.id,
+                "worker-second",
+                completion_with_mutations(
+                    &second,
+                    vec![create_mutation("RELEASE", "Different automatic plan", "turn-2")],
+                ),
+            )
+            .await
+            .unwrap();
+
+        let entries = fixture.memory.list_entries(USER_ID).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        let protected = entries.iter().find(|entry| entry.id == target.id).unwrap();
+        assert_eq!(protected.state, "active");
+        assert_eq!(protected.content.as_deref(), Some("Protected plan"));
+        let candidate = entries.iter().find(|entry| entry.id != target.id).unwrap();
+        assert_eq!(candidate.state, "conflict");
+        assert!(candidate.conflict_group_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn normalized_tombstoned_fingerprint_cannot_be_resurrected() {
+        let fixture = fixture(true).await;
+        fixture.persist_turn("turn-1", 10).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-1", MemoryTurnOutcome::Completed)
+            .await;
+        let first = fixture
+            .service
+            .claim_job(USER_ID, "worker-first", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .service
+            .complete_job(
+                USER_ID,
+                &first.id,
+                "worker-first",
+                completion_with_mutations(&first, vec![create_mutation("Caf\u{e9}-release", "Original", "turn-1")]),
+            )
+            .await
+            .unwrap();
+        let deleted_id = fixture.memory.list_entries(USER_ID).await.unwrap().pop().unwrap().id;
+        fixture.memory.delete_entry(USER_ID, &deleted_id, 15).await.unwrap();
+
+        fixture.persist_turn("turn-2", 20).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-2", MemoryTurnOutcome::Completed)
+            .await;
+        let second = fixture
+            .service
+            .claim_job(USER_ID, "worker-second", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .service
+            .complete_job(
+                USER_ID,
+                &second.id,
+                "worker-second",
+                completion_with_mutations(
+                    &second,
+                    vec![create_mutation("CAFE\u{301} release", "Resurrected", "turn-2")],
+                ),
+            )
+            .await
+            .unwrap();
+
+        let entries = fixture.memory.list_entries(USER_ID).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, deleted_id);
+        assert_eq!(entries[0].state, "deleted");
+        assert_eq!(entries[0].content, None);
+    }
+
+    #[tokio::test]
+    async fn stale_completion_requeues_the_remaining_range_without_partial_writes() {
+        let fixture = fixture(true).await;
+        fixture.persist_turn("turn-1", 10).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-1", MemoryTurnOutcome::Completed)
+            .await;
+        let claimed = fixture
+            .service
+            .claim_job(USER_ID, "worker-stale", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let external_summary = serde_json::to_string(&MemorySummary {
+            goal: "External summary".into(),
+            current_state: Vec::new(),
+            decisions: Vec::new(),
+            artifacts: Vec::new(),
+            issues: Vec::new(),
+            next_steps: Vec::new(),
+            work_constraints: Vec::new(),
+        })
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_memories
+                (user_id, conversation_id, summary_json, through_turn_id, revision, source, schema_version,
+                 created_at, updated_at)
+             VALUES (?, 'conversation-1', ?, 'external-turn', 1, 'memory_update', 1, 15, 15)",
+        )
+        .bind(USER_ID)
+        .bind(external_summary)
+        .execute(fixture._db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fixture
+                .service
+                .complete_job(
+                    USER_ID,
+                    &claimed.id,
+                    "worker-stale",
+                    completion_with_mutations(
+                        &claimed,
+                        vec![create_mutation("stale candidate", "Must not persist", "turn-1")],
+                    ),
+                )
+                .await,
+            Err(MemoryError::StaleRevision),
+        );
+        assert!(fixture.memory.list_entries(USER_ID).await.unwrap().is_empty());
+        let retry = fixture.memory.get_job(USER_ID, &claimed.id).await.unwrap().unwrap();
+        assert_eq!(retry.state, "pending");
+        assert_eq!(retry.through_turn_id, "turn-1");
+        assert_eq!(retry.attempt_count, 0);
     }
 
     #[tokio::test]
@@ -2198,6 +2448,39 @@ mod tests {
             memory,
             readiness,
             _db: db,
+        }
+    }
+
+    fn completion_with_mutations(
+        job: &crate::ClaimedMemoryJob,
+        mutations: Vec<MemoryCandidateMutation>,
+    ) -> CompleteMemoryJobRequest {
+        let mut completion = empty_completion(job);
+        completion.output.mutations = mutations;
+        completion
+    }
+
+    fn create_mutation(stable_key: &str, content: &str, turn_id: &str) -> MemoryCandidateMutation {
+        MemoryCandidateMutation::Create {
+            kind: MemoryEntryKind::Decision,
+            stable_key: stable_key.into(),
+            content: content.into(),
+            source_turn_ids: vec![turn_id.into()],
+        }
+    }
+
+    fn refine_mutation(
+        target_entry_id: &str,
+        stable_key: &str,
+        content: &str,
+        turn_id: &str,
+    ) -> MemoryCandidateMutation {
+        MemoryCandidateMutation::Refine {
+            target_entry_id: target_entry_id.into(),
+            kind: MemoryEntryKind::Decision,
+            stable_key: stable_key.into(),
+            content: content.into(),
+            source_turn_ids: vec![turn_id.into()],
         }
     }
 

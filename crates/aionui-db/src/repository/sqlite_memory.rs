@@ -1952,6 +1952,19 @@ impl IMemoryRepository for SqliteMemoryRepository {
             .fetch_optional(&mut *connection)
             .await?;
             if current_revision.unwrap_or(0) != input.expected_revision {
+                Self::transition_running_on(
+                    &mut connection,
+                    &job,
+                    QueueTransition {
+                        state: "pending",
+                        next_attempt_at: None,
+                        error_code: Some("stale_revision"),
+                        increment_attempt: false,
+                        increment_invalid_output: false,
+                        now: input.now,
+                    },
+                )
+                .await?;
                 return Ok(CommitMemoryUpdateResult::StaleRevision {
                     current_revision: current_revision.unwrap_or(0),
                 });
@@ -1987,6 +2000,19 @@ impl IMemoryRepository for SqliteMemoryRepository {
                     .bind(&input.user_id)
                     .bind(&input.conversation_id)
                     .fetch_one(&mut *connection)
+                    .await?;
+                    Self::transition_running_on(
+                        &mut connection,
+                        &job,
+                        QueueTransition {
+                            state: "pending",
+                            next_attempt_at: None,
+                            error_code: Some("stale_revision"),
+                            increment_attempt: false,
+                            increment_invalid_output: false,
+                            now: input.now,
+                        },
+                    )
                     .await?;
                     return Ok(CommitMemoryUpdateResult::StaleRevision {
                         current_revision: revision,
@@ -2194,10 +2220,6 @@ impl IMemoryRepository for SqliteMemoryRepository {
         .await;
 
         match result {
-            Ok(CommitMemoryUpdateResult::StaleRevision { current_revision }) => {
-                sqlx::query("ROLLBACK").execute(&mut *connection).await?;
-                Ok(CommitMemoryUpdateResult::StaleRevision { current_revision })
-            }
             Ok(value) => {
                 sqlx::query("COMMIT").execute(&mut *connection).await?;
                 Ok(value)
@@ -3877,7 +3899,10 @@ mod tests {
             .unwrap();
         assert_eq!(stale, CommitMemoryUpdateResult::StaleRevision { current_revision: 2 });
         assert!(repo.get_entry(USER_A, "stale-entry").await.unwrap().is_none());
-        assert_eq!(repo.get_job(USER_A, "job-2").await.unwrap().unwrap().state, "running");
+        let retry = repo.get_job(USER_A, "job-2").await.unwrap().unwrap();
+        assert_eq!(retry.state, "pending");
+        assert_eq!(retry.last_error_code.as_deref(), Some("stale_revision"));
+        assert_eq!(retry.attempt_count, 0);
     }
 
     #[tokio::test]
