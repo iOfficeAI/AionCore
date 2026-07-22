@@ -308,6 +308,15 @@ impl SettingsService {
                 None,
             ));
         }
+        if !provider_supports_text(&provider)? {
+            return Ok(AppOperationsModelResponse {
+                setting,
+                resolved_model: None,
+                health: AppOperationsModelHealth::Unavailable,
+                reason_code: None,
+                checked_at: None,
+            });
+        }
 
         let health = model_health(&provider, model_id)?;
         let checked_at = health.as_ref().and_then(|value| value.last_check);
@@ -363,9 +372,11 @@ fn provider_supports_text(provider: &Provider) -> Result<bool, SystemError> {
     }) {
         return Ok(false);
     }
-    Ok(capabilities
-        .iter()
-        .any(|capability| capability.capability_type == ModelType::Text))
+    Ok(capabilities.iter().any(|capability| {
+        capability.capability_type == ModelType::Text
+            || (capability.capability_type == ModelType::ExcludeFromPrimary
+                && capability.is_user_selected == Some(false))
+    }))
 }
 
 fn ready_response(
@@ -527,6 +538,27 @@ mod tests {
             model_enabled: Option<&str>,
             model_health: Option<&str>,
         ) {
+            create_provider_with_capabilities(
+                repo,
+                id,
+                models,
+                enabled,
+                model_enabled,
+                model_health,
+                r#"[{"type":"text"}]"#,
+            )
+            .await;
+        }
+
+        async fn create_provider_with_capabilities(
+            repo: &SqliteProviderRepository,
+            id: &str,
+            models: &str,
+            enabled: bool,
+            model_enabled: Option<&str>,
+            model_health: Option<&str>,
+            capabilities: &str,
+        ) {
             repo.create(CreateProviderParams {
                 id: Some(id),
                 platform: "openai",
@@ -535,7 +567,7 @@ mod tests {
                 api_key_encrypted: "non-secret-encrypted-test-value",
                 models,
                 enabled,
-                capabilities: r#"[{"type":"text"}]"#,
+                capabilities,
                 context_limit: None,
                 model_protocols: None,
                 model_enabled,
@@ -570,6 +602,59 @@ mod tests {
             assert_eq!(resolved.provider_id, "provider-1");
             assert_eq!(resolved.model_id, "model-a");
             assert_eq!(response.reason_code, None);
+        }
+
+        #[tokio::test]
+        async fn auto_treats_empty_capability_metadata_as_compatible() {
+            let (service, _, provider_repo) = setup_app_operations().await;
+            create_provider_with_capabilities(&provider_repo, "provider-1", r#"["model-a"]"#, true, None, None, "[]")
+                .await;
+
+            let response = service.get_app_operations_model().await.unwrap();
+
+            assert_eq!(response.health, AppOperationsModelHealth::Ready);
+            assert_eq!(response.resolved_model.unwrap().provider_id, "provider-1");
+        }
+
+        #[tokio::test]
+        async fn auto_skips_provider_with_active_exclude_from_primary() {
+            let (service, _, provider_repo) = setup_app_operations().await;
+            create_provider_with_capabilities(
+                &provider_repo,
+                "provider-1",
+                r#"["model-a"]"#,
+                true,
+                None,
+                None,
+                r#"[{"type":"text"},{"type":"excludeFromPrimary","is_user_selected":true}]"#,
+            )
+            .await;
+            create_provider(&provider_repo, "provider-2", r#"["model-b"]"#, true, None, None).await;
+
+            let response = service.get_app_operations_model().await.unwrap();
+
+            assert_eq!(response.health, AppOperationsModelHealth::Ready);
+            assert_eq!(response.resolved_model.unwrap().provider_id, "provider-2");
+        }
+
+        #[tokio::test]
+        async fn auto_treats_deselected_exclude_from_primary_as_compatible() {
+            let (service, _, provider_repo) = setup_app_operations().await;
+            create_provider_with_capabilities(
+                &provider_repo,
+                "provider-1",
+                r#"["model-a"]"#,
+                true,
+                None,
+                None,
+                r#"[{"type":"excludeFromPrimary","is_user_selected":false}]"#,
+            )
+            .await;
+
+            let response = service.get_app_operations_model().await.unwrap();
+
+            assert_eq!(response.health, AppOperationsModelHealth::Ready);
+            assert_eq!(response.resolved_model.unwrap().provider_id, "provider-1");
         }
 
         #[tokio::test]
@@ -651,6 +736,43 @@ mod tests {
             );
             let stored = settings_repo.get_app_operations_model().await.unwrap();
             assert_eq!(stored.mode, "fixed");
+            assert_eq!(stored.provider_id.as_deref(), Some("provider-1"));
+            assert_eq!(stored.model_id.as_deref(), Some("model-a"));
+        }
+
+        #[tokio::test]
+        async fn fixed_retains_excluded_pair_but_reports_unavailable_without_reason() {
+            let (service, settings_repo, provider_repo) = setup_app_operations().await;
+            create_provider_with_capabilities(
+                &provider_repo,
+                "provider-1",
+                r#"["model-a"]"#,
+                true,
+                None,
+                None,
+                r#"[{"type":"text"},{"type":"excludeFromPrimary"}]"#,
+            )
+            .await;
+
+            let response = service
+                .update_app_operations_model(AppOperationsModelSetting::Fixed {
+                    provider_id: "provider-1".into(),
+                    model_id: "model-a".into(),
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.setting,
+                AppOperationsModelSetting::Fixed {
+                    provider_id: "provider-1".into(),
+                    model_id: "model-a".into(),
+                }
+            );
+            assert_eq!(response.resolved_model, None);
+            assert_eq!(response.health, AppOperationsModelHealth::Unavailable);
+            assert_eq!(response.reason_code, None);
+            let stored = settings_repo.get_app_operations_model().await.unwrap();
             assert_eq!(stored.provider_id.as_deref(), Some("provider-1"));
             assert_eq!(stored.model_id.as_deref(), Some("model-a"));
         }
