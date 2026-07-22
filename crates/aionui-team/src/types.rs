@@ -150,8 +150,48 @@ pub struct Team {
     pub agents: Vec<TeamAgent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_conversation_id: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+}
+
+impl Team {
+    pub fn from_row(row: &TeamRow) -> Result<Self, serde_json::Error> {
+        let agents: Vec<TeamAgent> = serde_json::from_str(&row.agents)?;
+        Ok(Self {
+            id: row.id.clone(),
+            name: row.name.clone(),
+            workspace: row.workspace.clone(),
+            agents,
+            lead_agent_id: row.lead_agent_id.clone(),
+            origin_conversation_id: row.origin_conversation_id.clone(),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
+
+    pub fn to_response(&self) -> TeamResponse {
+        TeamResponse {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            workspace: self.workspace.clone(),
+            assistants: self.agents.iter().map(|a| a.to_response()).collect(),
+            leader_assistant_id: self.lead_agent_id.clone(),
+            origin_conversation_id: self.origin_conversation_id.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+
+    /// The source conversation used to promote a solo conversation into this
+    /// team. Its conversation_id must be preserved when the team is removed.
+    pub fn origin_conversation_id(&self) -> Option<String> {
+        self.agents
+            .iter()
+            .find(|agent| Some(&agent.slot_id) == self.lead_agent_id.as_ref())
+            .map(|agent| agent.conversation_id.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,33 +311,6 @@ pub struct TeamTask {
 // ---------------------------------------------------------------------------
 
 use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
-
-impl Team {
-    pub fn from_row(row: &TeamRow) -> Result<Self, serde_json::Error> {
-        let agents: Vec<TeamAgent> = serde_json::from_str(&row.agents)?;
-        Ok(Self {
-            id: row.id.clone(),
-            name: row.name.clone(),
-            workspace: row.workspace.clone(),
-            agents,
-            lead_agent_id: row.lead_agent_id.clone(),
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        })
-    }
-
-    pub fn to_response(&self) -> TeamResponse {
-        TeamResponse {
-            id: self.id.clone(),
-            name: self.name.clone(),
-            workspace: self.workspace.clone(),
-            assistants: self.agents.iter().map(|a| a.to_response()).collect(),
-            leader_assistant_id: self.lead_agent_id.clone(),
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-        }
-    }
-}
 
 impl MailboxMessage {
     pub fn from_row(row: &MailboxMessageRow) -> Option<Self> {
@@ -643,6 +656,7 @@ mod tests {
             agents_version: "1.0.1".into(),
             created_at: 1000,
             updated_at: 2000,
+            origin_conversation_id: None,
         };
         let team = Team::from_row(&row).unwrap();
         assert_eq!(team.id, "t1");
@@ -670,6 +684,7 @@ mod tests {
                 cli_path: None,
             }],
             lead_agent_id: Some("s1".into()),
+            origin_conversation_id: Some("origin-1".into()),
             created_at: 1000,
             updated_at: 2000,
         };
@@ -679,6 +694,7 @@ mod tests {
         assert_eq!(resp.assistants.len(), 1);
         assert_eq!(resp.assistants[0].slot_id, "s1");
         assert_eq!(resp.leader_assistant_id.as_deref(), Some("s1"));
+        assert_eq!(resp.origin_conversation_id.as_deref(), Some("origin-1"));
         assert_eq!(resp.created_at, 1000);
         assert_eq!(resp.updated_at, 2000);
     }
@@ -697,6 +713,7 @@ mod tests {
             agents_version: "1.0.1".into(),
             created_at: 0,
             updated_at: 0,
+            origin_conversation_id: None,
         };
         assert!(Team::from_row(&row).is_err());
     }

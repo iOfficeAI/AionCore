@@ -9,10 +9,11 @@ use std::time::Instant;
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::{
-    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus,
-    TeamSessionStatusPayload, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
-    TeamToolTransport, WebSocketMessage,
+    AdHocTeamAssociationResponse, AdHocTeamAssociationStatus, AdHocTeamFromConversationResponse, AddAgentRequest,
+    CreateAdHocTeamFromConversationRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse,
+    TeamAgentRuntimeStatus, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding,
+    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamToolCall, TeamToolContextResponse,
+    TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -411,6 +412,7 @@ impl TeamSessionService {
             lead_agent_id: lead_agent_id.clone(),
             session_mode: None,
             agents_version: "1.0.1".into(),
+            origin_conversation_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -422,6 +424,7 @@ impl TeamSessionService {
             workspace: team_workspace,
             agents,
             lead_agent_id,
+            origin_conversation_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -466,6 +469,239 @@ impl TeamSessionService {
         self.build_team_response(&team).await
     }
 
+    pub async fn create_ad_hoc_team_from_conversation(
+        &self,
+        user_id: &str,
+        req: CreateAdHocTeamFromConversationRequest,
+    ) -> Result<AdHocTeamFromConversationResponse, TeamError> {
+        let origin_conversation_id = req.conversation_id;
+
+        // Verify source conversation ownership and capture runtime metadata.
+        let metadata = self
+            .conversation_port
+            .conversation_metadata(&origin_conversation_id)
+            .await?
+            .ok_or_else(|| TeamError::Forbidden(format!("conversation not found: {origin_conversation_id}")))?;
+        if metadata.user_id != user_id {
+            return Err(TeamError::Forbidden(format!(
+                "conversation not owned by current user: {origin_conversation_id}"
+            )));
+        }
+
+        let leader_assistant_id = metadata.assistant_id.ok_or_else(|| {
+            TeamError::InvalidRequest(format!(
+                "source conversation {origin_conversation_id} has no assistant_id"
+            ))
+        })?;
+
+        // Resolve leader backend/model from the assistant definition/catalog; fall back
+        // to the source conversation's own backend/model only when catalog data is absent.
+        let (leader_backend, leader_model) = self
+            .resolve_spawn_backend_and_model(
+                Some(&leader_assistant_id),
+                metadata.model.as_deref(),
+                metadata.backend.as_deref().unwrap_or("claude"),
+                metadata.model.as_deref().unwrap_or("claude"),
+            )
+            .await?;
+        let leader_workspace = metadata.workspace.clone();
+        let leader_name = self
+            .assistant_catalog
+            .resolve_team_selectable_assistant(&leader_assistant_id)
+            .await?
+            .map(|assistant| assistant.name)
+            .unwrap_or_else(|| "Lead".into());
+
+        // Reuse existing ad-hoc team from this conversation if present.
+        if let Some(row) = self
+            .repo
+            .get_team_by_origin_conversation_id(user_id, &origin_conversation_id)
+            .await?
+        {
+            let mut team = Team::from_row(&row)?;
+            let leader_slot_id = team.lead_agent_id.clone().unwrap_or_default();
+            let mut target_slot_id = team
+                .agents
+                .iter()
+                .find(|agent| agent.role == TeammateRole::Teammate)
+                .map(|agent| agent.slot_id.clone());
+
+            // Ensure the requested target assistant is present; dynamically add it if missing.
+            if let Some(target_assistant_id) = req.target_assistant_id.as_deref().filter(|value| !value.is_empty()) {
+                let already_present = team
+                    .agents
+                    .iter()
+                    .filter(|agent| agent.role == TeammateRole::Teammate)
+                    .any(|agent| agent.assistant_id.as_deref() == Some(target_assistant_id));
+                if !already_present {
+                    let (target_backend, target_model) = self
+                        .resolve_spawn_backend_and_model(
+                            Some(target_assistant_id),
+                            None,
+                            &leader_backend,
+                            &leader_model,
+                        )
+                        .await?;
+                    let target_name = self
+                        .assistant_catalog
+                        .resolve_team_selectable_assistant(target_assistant_id)
+                        .await?
+                        .map(|assistant| assistant.name)
+                        .unwrap_or_else(|| "Target".into());
+                    let added = self
+                        .add_agent(
+                            user_id,
+                            &team.id,
+                            AddAgentRequest {
+                                name: target_name,
+                                role: "teammate".into(),
+                                backend: Some(target_backend),
+                                model: target_model,
+                                assistant_id: Some(target_assistant_id.into()),
+                            },
+                        )
+                        .await?;
+                    team.agents.push(TeamAgent {
+                        slot_id: added.slot_id.clone(),
+                        name: added.name.clone(),
+                        role: TeammateRole::Teammate,
+                        conversation_id: added.conversation_id.clone(),
+                        backend: added.backend.clone(),
+                        model: added.model.clone(),
+                        assistant_id: added.assistant_id.clone(),
+                        status: None,
+                        conversation_type: None,
+                        cli_path: None,
+                    });
+                    target_slot_id = Some(added.slot_id);
+                }
+            }
+
+            return Ok(AdHocTeamFromConversationResponse {
+                team_id: team.id,
+                origin_conversation_id: origin_conversation_id.clone(),
+                leader_slot_id,
+                target_slot_id,
+                created: false,
+            });
+        }
+
+        let mut inputs: Vec<aionui_api_types::TeamAgentInput> = vec![aionui_api_types::TeamAgentInput {
+            name: leader_name,
+            role: "lead".into(),
+            backend: Some(leader_backend.clone()),
+            model: leader_model.clone(),
+            assistant_id: Some(leader_assistant_id),
+            conversation_id: Some(origin_conversation_id.clone()),
+        }];
+
+        let mut target_slot_id = None;
+        if let Some(target_assistant_id) = req.target_assistant_id.as_deref().filter(|value| !value.is_empty()) {
+            let (target_backend, target_model) = self
+                .resolve_spawn_backend_and_model(Some(target_assistant_id), None, &leader_backend, &leader_model)
+                .await?;
+            let target_name = self
+                .assistant_catalog
+                .resolve_team_selectable_assistant(target_assistant_id)
+                .await?
+                .map(|assistant| assistant.name)
+                .unwrap_or_else(|| "Target".into());
+            inputs.push(aionui_api_types::TeamAgentInput {
+                name: target_name,
+                role: "teammate".into(),
+                backend: Some(target_backend),
+                model: target_model,
+                assistant_id: Some(target_assistant_id.into()),
+                conversation_id: None,
+            });
+        }
+
+        let team_id = generate_id();
+        let now = now_ms();
+        let provisioned = self
+            .provisioner()
+            .provision_initial_agents(user_id, &team_id, &inputs, leader_workspace.as_deref())
+            .await?;
+        let agents = provisioned.agents;
+        let lead_agent_id = provisioned.lead_agent_id;
+        let team_workspace = provisioned.team_workspace;
+        let agents_json = serde_json::to_string(&agents)?;
+
+        if let Some(lead_slot_id) = lead_agent_id.as_ref() {
+            target_slot_id = agents
+                .iter()
+                .find(|agent| agent.slot_id != *lead_slot_id && agent.role == TeammateRole::Teammate)
+                .map(|agent| agent.slot_id.clone());
+        }
+
+        let team_name = req
+            .name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| "Ad-hoc Team".into());
+
+        let row = TeamRow {
+            id: team_id.clone(),
+            user_id: user_id.to_owned(),
+            name: team_name,
+            workspace: team_workspace.clone(),
+            workspace_mode: req.workspace_mode.as_deref().unwrap_or("shared").into(),
+            agents: agents_json,
+            lead_agent_id: lead_agent_id.clone(),
+            session_mode: None,
+            agents_version: "1.0.1".into(),
+            origin_conversation_id: Some(origin_conversation_id.clone()),
+            created_at: now,
+            updated_at: now,
+        };
+        self.repo.create_team(&row).await?;
+
+        self.broadcast_team_created(&team_id, &row.name);
+
+        info!(
+            team_id = %team_id,
+            origin_conversation_id = %origin_conversation_id,
+            agent_count = agents.len(),
+            "Ad-hoc team created from conversation"
+        );
+
+        Ok(AdHocTeamFromConversationResponse {
+            team_id,
+            origin_conversation_id: origin_conversation_id.clone(),
+            leader_slot_id: lead_agent_id.unwrap_or_default(),
+            target_slot_id,
+            created: true,
+        })
+    }
+
+    pub async fn get_ad_hoc_team_by_conversation(
+        &self,
+        user_id: &str,
+        origin_conversation_id: &str,
+    ) -> Result<AdHocTeamAssociationResponse, TeamError> {
+        let Some(row) = self
+            .repo
+            .get_team_by_origin_conversation_id(user_id, origin_conversation_id)
+            .await?
+        else {
+            return Ok(AdHocTeamAssociationResponse {
+                team_id: String::new(),
+                origin_conversation_id: origin_conversation_id.to_owned(),
+                status: AdHocTeamAssociationStatus::Active,
+                team: None,
+            });
+        };
+        let team = Team::from_row(&row)?;
+        let team_response = self.build_team_response(&team).await.ok();
+        Ok(AdHocTeamAssociationResponse {
+            team_id: team.id,
+            origin_conversation_id: origin_conversation_id.to_owned(),
+            status: AdHocTeamAssociationStatus::Active,
+            team: team_response,
+        })
+    }
+
     pub async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
 
@@ -487,6 +723,18 @@ impl TeamSessionService {
         .await;
 
         for agent in &team.agents {
+            let is_origin_conversation = team
+                .origin_conversation_id()
+                .as_deref()
+                .is_some_and(|origin_id| origin_id == agent.conversation_id);
+            if is_origin_conversation {
+                info!(
+                    team_id = %team_id,
+                    conversation_id = %agent.conversation_id,
+                    "Skipping deletion of origin conversation during team removal"
+                );
+                continue;
+            }
             let _ = self
                 .conversation_port
                 .delete_team_conversation(user_id, &agent.conversation_id)

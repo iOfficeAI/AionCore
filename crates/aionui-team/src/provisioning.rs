@@ -76,6 +76,16 @@ pub struct TeamConversationCreateResult {
     pub workspace: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationMetadata {
+    pub conversation_id: String,
+    pub user_id: String,
+    pub assistant_id: Option<String>,
+    pub backend: Option<String>,
+    pub model: Option<String>,
+    pub workspace: Option<String>,
+}
+
 #[async_trait]
 pub trait TeamConversationProvisioningPort: Send + Sync {
     async fn create_team_conversation(
@@ -86,6 +96,12 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
     async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
+
+    /// Return ownership and runtime metadata for a source conversation.
+    ///
+    /// Used by ad-hoc team creation to verify `user_id` ownership and to derive
+    /// the leader backend/model/workspace from the original conversation state.
+    async fn conversation_metadata(&self, conversation_id: &str) -> Result<Option<ConversationMetadata>, TeamError>;
 
     async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, TeamError>;
 
@@ -180,8 +196,24 @@ impl TeamAgentProvisioner {
         let leader_backend = self
             .resolve_requested_backend(leader_input.backend.as_deref(), leader_assistant_id.as_deref())
             .await?;
-        let leader_conversation = self
-            .create_team_conversation_for_agent(
+
+        // If the caller supplied an existing conversation_id for the lead, reuse it
+        // instead of creating a new team conversation. This is the promotion path
+        // from a solo conversation to a team lead.
+        let leader_conversation = if let Some(ref existing_conversation_id) = leader_input.conversation_id {
+            self.bind_existing_conversation_as_leader(
+                user_id,
+                team_id,
+                &leader_slot_id,
+                existing_conversation_id,
+                &leader_backend,
+                &leader_input.model,
+                leader_assistant_id.as_deref(),
+                shared_workspace,
+            )
+            .await?
+        } else {
+            self.create_team_conversation_for_agent(
                 user_id,
                 team_id,
                 &leader_slot_id,
@@ -193,7 +225,8 @@ impl TeamAgentProvisioner {
                 shared_workspace,
                 None,
             )
-            .await?;
+            .await?
+        };
 
         let team_workspace = match shared_workspace {
             Some(workspace) => workspace.to_owned(),
@@ -605,6 +638,59 @@ impl TeamAgentProvisioner {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn bind_existing_conversation_as_leader(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        conversation_id: &str,
+        backend: &str,
+        model: &str,
+        assistant_id: Option<&str>,
+        workspace: Option<&str>,
+    ) -> Result<ProvisionedConversation, TeamError> {
+        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, backend).await?;
+        let agent_type = if acp_metadata.is_some() {
+            AgentType::Acp
+        } else {
+            parse_agent_type(backend)?
+        };
+        let mut extra = self.build_team_extra(
+            team_id,
+            slot_id,
+            TeammateRole::Lead,
+            backend,
+            model,
+            assistant_id,
+            workspace,
+            agent_type,
+            acp_metadata.as_ref(),
+            None,
+        );
+        if agent_type != AgentType::Aionrs {
+            extra["current_model_id"] = serde_json::Value::String(model.to_owned());
+        }
+
+        self.conversation_port
+            .patch_runtime_config(conversation_id, extra)
+            .await?;
+
+        let resolved_workspace = self.conversation_port.conversation_workspace(conversation_id).await?;
+
+        info!(
+            team_id,
+            slot_id,
+            conversation_id = %conversation_id,
+            outcome = "bound",
+            "Team lead conversation reused from existing conversation"
+        );
+        Ok(ProvisionedConversation {
+            conversation_id: conversation_id.to_owned(),
+            workspace: resolved_workspace,
+        })
+    }
+
     async fn resolve_initial_leader_workspace(
         &self,
         team_id: &str,
@@ -677,6 +763,9 @@ impl TeamAgentProvisioner {
         if let Some(assistant_id) = assistant_id {
             extra["assistant_id"] = serde_json::Value::String(assistant_id.to_owned());
         }
+        if role == TeammateRole::Teammate {
+            extra["team_id"] = serde_json::Value::String(team_id.to_owned());
+        }
         if let Some(workspace) = workspace {
             inherit_team_workspace(&mut extra, workspace);
         }
@@ -744,6 +833,13 @@ mod tests {
         }
 
         async fn conversation_assistant_id(&self, _conversation_id: &str) -> Result<Option<String>, TeamError> {
+            Ok(None)
+        }
+
+        async fn conversation_metadata(
+            &self,
+            _conversation_id: &str,
+        ) -> Result<Option<ConversationMetadata>, TeamError> {
             Ok(None)
         }
 

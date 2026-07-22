@@ -41,6 +41,7 @@ fn make_team_for_user(id: &str, user_id: &str, name: &str) -> TeamRow {
         lead_agent_id: Some("a1".into()),
         session_mode: None,
         agents_version: "1.0.1".into(),
+        origin_conversation_id: None,
         created_at: now,
         updated_at: now,
     }
@@ -99,6 +100,26 @@ async fn get_nonexistent_team_returns_none() {
     assert!(result.is_none());
 }
 
+#[tokio::test]
+async fn get_team_by_origin_conversation_id_returns_matching_team() {
+    let (repo, _db) = repo().await;
+    let mut team = make_team_for_user("t1", "user-a", "Team Alpha");
+    team.origin_conversation_id = Some("conv-origin".into());
+    repo.create_team(&team).await.unwrap();
+
+    let found = repo
+        .get_team_by_origin_conversation_id("user-a", "conv-origin")
+        .await
+        .unwrap()
+        .expect("team exists");
+    assert_eq!(found.id, "t1");
+
+    let not_found = repo
+        .get_team_by_origin_conversation_id("user-b", "conv-origin")
+        .await
+        .unwrap();
+    assert!(not_found.is_none());
+}
 #[tokio::test]
 async fn list_teams_empty() {
     let (repo, _db) = repo().await;
@@ -247,6 +268,67 @@ async fn delete_nonexistent_team_returns_not_found() {
     let (repo, _db) = repo().await;
     let result = repo.delete_team("nonexistent").await;
     assert!(matches!(result, Err(DbError::NotFound(_))));
+}
+
+#[tokio::test]
+async fn create_team_with_duplicate_origin_conversation_id_returns_conflict() {
+    let (repo, _db) = repo().await;
+    let mut first = make_team_for_user("t1", "user-a", "First");
+    first.origin_conversation_id = Some("conv-origin".into());
+    repo.create_team(&first).await.unwrap();
+
+    let mut second = make_team_for_user("t2", "user-a", "Second");
+    second.origin_conversation_id = Some("conv-origin".into());
+    let result = repo.create_team(&second).await;
+
+    assert!(
+        matches!(result, Err(DbError::Conflict(_))),
+        "expected Conflict error for duplicate origin_conversation_id, got {:?}",
+        result
+    );
+}
+
+#[tokio::test]
+async fn create_team_with_same_null_origin_conversation_id_is_allowed() {
+    let (repo, _db) = repo().await;
+    let first = make_team_for_user("t1", "user-a", "First");
+    assert!(first.origin_conversation_id.is_none());
+    repo.create_team(&first).await.unwrap();
+
+    let second = make_team_for_user("t2", "user-a", "Second");
+    assert!(second.origin_conversation_id.is_none());
+    repo.create_team(&second).await.unwrap();
+
+    let teams = repo.list_teams_by_user("user-a").await.unwrap();
+    assert_eq!(teams.len(), 2);
+}
+
+#[tokio::test]
+async fn update_team_origin_conversation_id_conflict_returns_conflict() {
+    let (repo, _db) = repo().await;
+    let mut first = make_team_for_user("t1", "user-a", "First");
+    first.origin_conversation_id = Some("conv-origin".into());
+    repo.create_team(&first).await.unwrap();
+
+    let mut second = make_team_for_user("t2", "user-a", "Second");
+    second.origin_conversation_id = None;
+    repo.create_team(&second).await.unwrap();
+
+    let result = repo
+        .update_team(
+            "t2",
+            &UpdateTeamParams {
+                origin_conversation_id: Some("conv-origin".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(DbError::Conflict(_))),
+        "expected Conflict error when updating origin_conversation_id to duplicate, got {:?}",
+        result
+    );
 }
 
 // ── Mailbox Tests ────────────────────────────────────────────────────

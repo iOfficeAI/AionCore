@@ -35,6 +35,13 @@ impl ITeamRepository for MockTeamRepo {
     async fn get_team(&self, _id: &str) -> Result<Option<TeamRow>, DbError> {
         Ok(None)
     }
+    async fn get_team_by_origin_conversation_id(
+        &self,
+        _user_id: &str,
+        _origin_conversation_id: &str,
+    ) -> Result<Option<TeamRow>, DbError> {
+        Ok(None)
+    }
     async fn update_team(&self, _id: &str, _p: &UpdateTeamParams) -> Result<(), DbError> {
         Ok(())
     }

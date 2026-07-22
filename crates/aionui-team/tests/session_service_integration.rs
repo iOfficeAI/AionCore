@@ -12,8 +12,9 @@ use aionui_ai_agent::task_manager::AgentFactory;
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{
-    AcpBuildExtra, AcpConfigOptionDto, AcpConfigSelectOptionDto, AddAgentRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, TeamAgentInput, WebSocketMessage,
+    AcpBuildExtra, AcpConfigOptionDto, AcpConfigSelectOptionDto, AddAgentRequest,
+    CreateAdHocTeamFromConversationRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentInput,
+    WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
@@ -426,6 +427,57 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         }))
     }
 
+    async fn conversation_metadata(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<aionui_team::provisioning::ConversationMetadata>, aionui_team::TeamError> {
+        let assistant_id = self.conversation_assistant_id(conversation_id).await?;
+        let extra = self.repo.get_extra(conversation_id);
+        let workspace = extra.as_ref().and_then(|value| {
+            value
+                .get("workspace")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        });
+        let backend = extra.as_ref().and_then(|value| {
+            value
+                .get("backend")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        });
+        let model = extra.as_ref().and_then(|value| {
+            value
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        });
+
+        let user_id = self
+            .repo
+            .get(conversation_id)
+            .await?
+            .map(|row| row.user_id)
+            .unwrap_or_default();
+        if user_id.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(aionui_team::provisioning::ConversationMetadata {
+            conversation_id: conversation_id.to_owned(),
+            user_id,
+            assistant_id,
+            backend,
+            model,
+            workspace,
+        }))
+    }
+
     async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, aionui_team::TeamError> {
         if self
             .fail_team_temp_create
@@ -690,6 +742,7 @@ struct FullMockTeamRepo {
     fail_workspace_update: std::sync::Mutex<bool>,
     fail_agent_update: std::sync::Mutex<bool>,
     fail_message_writes: std::sync::Mutex<bool>,
+    fail_create_team_conflict: std::sync::Mutex<Option<String>>,
 }
 
 impl FullMockTeamRepo {
@@ -700,6 +753,7 @@ impl FullMockTeamRepo {
             fail_workspace_update: std::sync::Mutex::new(false),
             fail_agent_update: std::sync::Mutex::new(false),
             fail_message_writes: std::sync::Mutex::new(false),
+            fail_create_team_conflict: std::sync::Mutex::new(None),
         }
     }
 
@@ -714,11 +768,23 @@ impl FullMockTeamRepo {
     fn fail_message_writes(&self) {
         *self.fail_message_writes.lock().unwrap() = true;
     }
+
+    fn fail_create_team_with_conflict(&self, origin_conversation_id: &str) {
+        *self.fail_create_team_conflict.lock().unwrap() = Some(origin_conversation_id.to_owned());
+    }
 }
 
 #[async_trait::async_trait]
 impl ITeamRepository for FullMockTeamRepo {
     async fn create_team(&self, row: &aionui_db::models::TeamRow) -> Result<(), DbError> {
+        if let Some(ref conflict_origin) = *self.fail_create_team_conflict.lock().unwrap() {
+            if row.origin_conversation_id.as_deref() == Some(conflict_origin.as_str()) {
+                return Err(DbError::Conflict(format!(
+                    "team with origin conversation id '{}' already exists",
+                    conflict_origin
+                )));
+            }
+        }
         self.teams.lock().unwrap().push(row.clone());
         Ok(())
     }
@@ -737,6 +803,19 @@ impl ITeamRepository for FullMockTeamRepo {
     }
     async fn get_team(&self, id: &str) -> Result<Option<aionui_db::models::TeamRow>, DbError> {
         Ok(self.teams.lock().unwrap().iter().find(|t| t.id == id).cloned())
+    }
+    async fn get_team_by_origin_conversation_id(
+        &self,
+        user_id: &str,
+        origin_conversation_id: &str,
+    ) -> Result<Option<aionui_db::models::TeamRow>, DbError> {
+        Ok(self
+            .teams
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.user_id == user_id && t.origin_conversation_id.as_deref() == Some(origin_conversation_id))
+            .cloned())
     }
     async fn update_team(&self, id: &str, params: &aionui_db::UpdateTeamParams) -> Result<(), DbError> {
         if params.workspace.is_some() && *self.fail_workspace_update.lock().unwrap() {
@@ -1320,6 +1399,80 @@ impl IProviderRepository for EmptyProviderRepo {
     }
     async fn delete(&self, _id: &str) -> Result<(), DbError> {
         Err(DbError::NotFound("not implemented".into()))
+    }
+}
+
+struct ManyAssistantDefinitionRepo {
+    rows: Vec<AssistantDefinitionRow>,
+}
+
+impl ManyAssistantDefinitionRepo {
+    fn with_definitions(rows: Vec<AssistantDefinitionRow>) -> Self {
+        Self { rows }
+    }
+}
+
+#[async_trait::async_trait]
+impl IAssistantDefinitionRepository for ManyAssistantDefinitionRepo {
+    async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        Ok(self.rows.clone())
+    }
+
+    async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(self.rows.iter().find(|row| row.assistant_id == assistant_id).cloned())
+    }
+
+    async fn get_by_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(self.rows.iter().find(|row| row.id == definition_id).cloned())
+    }
+
+    async fn get_by_source_ref(
+        &self,
+        _source: &str,
+        _source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn upsert(&self, _params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError> {
+        Err(DbError::Init("not implemented".into()))
+    }
+
+    async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
+        Ok(false)
+    }
+}
+
+struct ManyAssistantOverlayRepo {
+    rows: Vec<AssistantOverlayRow>,
+}
+
+impl ManyAssistantOverlayRepo {
+    fn with_overlays(rows: Vec<AssistantOverlayRow>) -> Self {
+        Self { rows }
+    }
+}
+
+#[async_trait::async_trait]
+impl IAssistantOverlayRepository for ManyAssistantOverlayRepo {
+    async fn get(&self, definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
+        Ok(self
+            .rows
+            .iter()
+            .find(|row| row.assistant_definition_id == definition_id)
+            .cloned())
+    }
+
+    async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
+        Ok(self.rows.clone())
+    }
+
+    async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
+        Err(DbError::Init("not implemented".into()))
+    }
+
+    async fn delete(&self, _definition_id: &str) -> Result<bool, DbError> {
+        Ok(false)
     }
 }
 
@@ -2169,6 +2322,7 @@ async fn renew_active_lease_allows_empty_team_without_unrelated_lease() {
             agents_version: "1.0.1".into(),
             created_at: aionui_common::now_ms(),
             updated_at: aionui_common::now_ms(),
+            origin_conversation_id: None,
         })
         .await
         .expect("insert empty team");
@@ -2222,6 +2376,522 @@ async fn force_team_workspace(repo: &Arc<FullMockTeamRepo>, team_id: &str, works
     )
     .await
     .expect("force workspace");
+}
+
+fn setup_ad_hoc_team_service(
+    factory: AgentFactory,
+) -> (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<CountingTaskManager>,
+    Arc<MockConversationRepo>,
+) {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::with_rows(vec![
+        AgentMetadataRow {
+            id: "assistant-lead".into(),
+            icon: None,
+            name: "Lead Assistant".into(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("acp".into()),
+            agent_type: "acp".into(),
+            agent_source: "builtin".into(),
+            agent_source_info: None,
+            enabled: true,
+            command: None,
+            args: None,
+            env: None,
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            command_override: None,
+            env_override: None,
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        },
+        AgentMetadataRow {
+            id: "assistant-target".into(),
+            icon: None,
+            name: "Target Assistant".into(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("acp".into()),
+            agent_type: "acp".into(),
+            agent_source: "builtin".into(),
+            agent_source_info: None,
+            enabled: true,
+            command: None,
+            args: None,
+            env: None,
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            command_override: None,
+            env_override: None,
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        },
+    ]));
+    let assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository> =
+        Arc::new(ManyAssistantDefinitionRepo::with_definitions(vec![
+            AssistantDefinitionRow {
+                id: "def-lead".into(),
+                assistant_id: "assistant-lead".into(),
+                source: "builtin".into(),
+                owner_type: "system".into(),
+                source_ref: None,
+                source_version: None,
+                source_hash: None,
+                name: "Lead Assistant".into(),
+                name_i18n: String::new(),
+                description: Some("lead assistant".into()),
+                description_i18n: String::new(),
+                avatar_type: "icon".into(),
+                avatar_value: None,
+                agent_id: "assistant-lead".into(),
+                rule_resource_type: String::new(),
+                rule_resource_ref: None,
+                rule_inline_content: None,
+                recommended_prompts: String::new(),
+                recommended_prompts_i18n: String::new(),
+                default_model_mode: "default".into(),
+                default_model_value: None,
+                default_permission_mode: "default".into(),
+                default_permission_value: None,
+                default_thought_level_mode: "default".into(),
+                default_thought_level_value: None,
+                default_skills_mode: "default".into(),
+                default_skill_ids: String::new(),
+                custom_skill_names: String::new(),
+                default_disabled_builtin_skill_ids: String::new(),
+                default_mcps_mode: "default".into(),
+                default_mcp_ids: String::new(),
+                created_at: aionui_common::now_ms(),
+                updated_at: aionui_common::now_ms(),
+                deleted_at: None,
+            },
+            AssistantDefinitionRow {
+                id: "def-target".into(),
+                assistant_id: "assistant-target".into(),
+                source: "builtin".into(),
+                owner_type: "system".into(),
+                source_ref: None,
+                source_version: None,
+                source_hash: None,
+                name: "Target Assistant".into(),
+                name_i18n: String::new(),
+                description: Some("target assistant".into()),
+                description_i18n: String::new(),
+                avatar_type: "icon".into(),
+                avatar_value: None,
+                agent_id: "assistant-target".into(),
+                rule_resource_type: String::new(),
+                rule_resource_ref: None,
+                rule_inline_content: None,
+                recommended_prompts: String::new(),
+                recommended_prompts_i18n: String::new(),
+                default_model_mode: "default".into(),
+                default_model_value: None,
+                default_permission_mode: "default".into(),
+                default_permission_value: None,
+                default_thought_level_mode: "default".into(),
+                default_thought_level_value: None,
+                default_skills_mode: "default".into(),
+                default_skill_ids: String::new(),
+                custom_skill_names: String::new(),
+                default_disabled_builtin_skill_ids: String::new(),
+                default_mcps_mode: "default".into(),
+                default_mcp_ids: String::new(),
+                created_at: aionui_common::now_ms(),
+                updated_at: aionui_common::now_ms(),
+                deleted_at: None,
+            },
+        ]));
+    let assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository> =
+        Arc::new(ManyAssistantOverlayRepo::with_overlays(vec![]));
+    setup_with_factory_metadata_assistants_and_conversation_repo(
+        factory,
+        agent_metadata_repo,
+        assistant_definition_repo,
+        assistant_overlay_repo,
+    )
+}
+
+fn seed_conversation(conv_repo: &Arc<MockConversationRepo>, user_id: &str, conversation_id: &str, assistant_id: &str) {
+    let now = aionui_common::now_ms();
+    let extra = if assistant_id.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::json!({ "assistant_id": assistant_id })
+    };
+    let row = ConversationRow {
+        id: conversation_id.to_owned(),
+        user_id: user_id.to_owned(),
+        name: "Source Conversation".into(),
+        r#type: aionui_common::AgentType::Acp.serde_name().to_owned(),
+        pinned: false,
+        pinned_at: None,
+        source: None,
+        channel_chat_id: None,
+        extra: serde_json::to_string(&extra).unwrap(),
+        model: None,
+        status: Some("active".into()),
+        created_at: now,
+        updated_at: now,
+    };
+    futures::executor::block_on(conv_repo.create(&row)).expect("seed conversation");
+}
+
+// ===========================================================================
+// Test: Ad-hoc team from conversation
+// ===========================================================================
+
+#[tokio::test]
+async fn ad_hoc_team_from_conversation_creates_leader_and_target() {
+    let (svc, team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-1";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+
+    let resp = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: Some("assistant-target".to_owned()),
+                name: Some("Ad-hoc Squad".to_owned()),
+                workspace_mode: Some("shared".to_owned()),
+            },
+        )
+        .await
+        .expect("create ad-hoc team from conversation");
+
+    assert!(resp.created, "first call must create a new team");
+    assert_eq!(resp.origin_conversation_id, conversation_id);
+    assert!(!resp.leader_slot_id.is_empty(), "leader slot must be set");
+    assert!(
+        resp.target_slot_id.is_some(),
+        "target slot must be set when target_assistant_id is provided"
+    );
+    assert_ne!(resp.target_slot_id, Some(resp.leader_slot_id.clone()));
+
+    let stored = team_repo
+        .get_team(&resp.team_id)
+        .await
+        .unwrap()
+        .expect("team persisted");
+    assert_eq!(stored.origin_conversation_id.as_deref(), Some(conversation_id));
+    assert_eq!(stored.name, "Ad-hoc Squad");
+}
+
+#[tokio::test]
+async fn ad_hoc_team_from_conversation_reuses_existing_association() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-2";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+
+    let first = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: None,
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .expect("create first");
+
+    let second = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: None,
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .expect("create second");
+
+    assert!(first.created);
+    assert!(!second.created, "second call must reuse existing team");
+    assert_eq!(first.team_id, second.team_id);
+    assert_eq!(first.leader_slot_id, second.leader_slot_id);
+}
+
+#[tokio::test]
+async fn ad_hoc_team_from_conversation_rejects_missing_assistant_id() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-3";
+    seed_conversation(&conv_repo, "user1", conversation_id, "");
+
+    let err = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: None,
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, TeamError::InvalidRequest(ref msg) if msg.contains("has no assistant_id")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_ad_hoc_team_by_conversation_returns_association_with_team() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-4";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+
+    let created = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: Some("assistant-target".to_owned()),
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .expect("create");
+
+    let assoc = svc
+        .get_ad_hoc_team_by_conversation("user1", conversation_id)
+        .await
+        .expect("get association");
+
+    assert_eq!(assoc.team_id, created.team_id);
+    assert_eq!(assoc.origin_conversation_id, conversation_id);
+    assert_eq!(assoc.status, aionui_api_types::AdHocTeamAssociationStatus::Active);
+    let team = assoc.team.expect("team payload present");
+    assert_eq!(team.id, created.team_id);
+    assert_eq!(team.assistants.len(), 2);
+}
+
+#[tokio::test]
+async fn get_ad_hoc_team_by_conversation_returns_none_for_unknown() {
+    let svc = setup();
+    let assoc = svc
+        .get_ad_hoc_team_by_conversation("user1", "conv-unknown")
+        .await
+        .expect("should return Ok with empty association");
+    assert_eq!(assoc.origin_conversation_id, "conv-unknown");
+    assert_eq!(assoc.status, aionui_api_types::AdHocTeamAssociationStatus::Active);
+    assert!(
+        assoc.team.is_none(),
+        "expected no team payload when no association exists"
+    );
+    assert!(
+        assoc.team_id.is_empty(),
+        "expected empty team_id placeholder when no association exists"
+    );
+}
+
+#[tokio::test]
+async fn create_ad_hoc_team_from_conversation_rejects_cross_user_conversation() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-cross-user";
+    seed_conversation(&conv_repo, "user-owner", conversation_id, "assistant-lead");
+
+    let err = svc
+        .create_ad_hoc_team_from_conversation(
+            "user-attacker",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user-attacker".to_owned(),
+                target_assistant_id: None,
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, TeamError::Forbidden(ref msg) if msg.contains("not owned")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_ad_hoc_team_from_conversation_reuses_existing_and_adds_missing_target() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-reuse-target";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+
+    let first = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: None,
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .expect("create without target");
+    assert!(first.created);
+    assert!(first.target_slot_id.is_none());
+
+    let second = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: Some("assistant-target".to_owned()),
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .expect("reuse with added target");
+    assert!(!second.created);
+    assert_eq!(second.team_id, first.team_id);
+    assert!(
+        second.target_slot_id.is_some(),
+        "target assistant should be dynamically added on reuse"
+    );
+}
+
+#[tokio::test]
+async fn create_ad_hoc_team_from_conversation_returns_conflict_on_origin_binding_race() {
+    let (svc, team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-binding-race";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+    team_repo.fail_create_team_with_conflict(conversation_id);
+
+    let err = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: Some("assistant-target".to_owned()),
+                name: Some("Race Test".to_owned()),
+                workspace_mode: Some("shared".to_owned()),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, TeamError::Database(DbError::Conflict(ref msg)) if msg.contains("origin conversation id")),
+        "expected Conflict error for duplicate origin binding, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_ad_hoc_team_from_conversation_reuses_source_conversation_as_lead() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-reuse-source";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+    let before_count = conv_repo.conversation_count();
+
+    let resp = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: Some("assistant-target".to_owned()),
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .expect("create ad-hoc team from conversation");
+
+    let assoc = svc
+        .get_ad_hoc_team_by_conversation("user1", conversation_id)
+        .await
+        .expect("get association")
+        .team
+        .expect("team payload");
+    let leader = assoc
+        .assistants
+        .iter()
+        .find(|agent| agent.slot_id == resp.leader_slot_id)
+        .expect("leader agent in response");
+
+    assert_eq!(
+        leader.conversation_id, conversation_id,
+        "lead agent must reuse the source conversation_id"
+    );
+    assert_eq!(
+        conv_repo.conversation_count(),
+        before_count + 1,
+        "promotion must create exactly one target conversation, not a new lead conversation"
+    );
+
+    // Lifecycle: removing the promoted team must preserve the origin conversation
+    // while deleting the dynamically-created teammate conversation.
+    svc.remove_team("user1", &resp.team_id).await.unwrap();
+    assert!(
+        conv_repo.get(conversation_id).await.unwrap().is_some(),
+        "origin conversation must survive team removal"
+    );
+    let target_conversation_id = assoc
+        .assistants
+        .iter()
+        .find(|agent| Some(agent.slot_id.clone()) == resp.target_slot_id)
+        .map(|agent| agent.conversation_id.clone())
+        .expect("target agent");
+    assert!(
+        conv_repo.get(&target_conversation_id).await.unwrap().is_none(),
+        "target conversation must be deleted when team is removed"
+    );
 }
 
 // ===========================================================================
@@ -6291,5 +6961,478 @@ async fn d115_remove_team_kills_every_agent_process() {
         tm.active_count(),
         0,
         "every agent worker must be torn down after remove_team"
+    );
+}
+
+// ===========================================================================
+// Test: Ad-hoc team HTTP routes
+// ===========================================================================
+
+fn ad_hoc_router_for_user(svc: Arc<TeamSessionService>, user_id: &str) -> axum::Router {
+    use aionui_auth::CurrentUser;
+    use aionui_team::{TeamRouterState, team_routes};
+
+    let state = TeamRouterState {
+        service: svc,
+        active_leases: Arc::new(aionui_ai_agent::ActiveLeaseRegistry::new()),
+    };
+    team_routes(state).layer(axum::Extension(CurrentUser {
+        id: user_id.into(),
+        username: user_id.into(),
+    }))
+}
+
+async fn send_route_request(
+    router: &mut axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let request_body = body.map(|value| Body::from(serde_json::to_vec(&value).unwrap()));
+    let request = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(request_body.unwrap_or_else(|| Body::from(Vec::new())))
+        .unwrap();
+    router.clone().oneshot(request).await.unwrap()
+}
+
+async fn route_response_json(response: axum::response::Response) -> serde_json::Value {
+    use http_body_util::BodyExt;
+
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn route_create_ad_hoc_team_from_conversation_returns_201_with_payload() {
+    let (svc, _team_repo, _tm, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    seed_conversation(&conv_repo, "user1", "conv-route-create", "assistant-lead");
+    let mut router = ad_hoc_router_for_user(svc, "user1");
+
+    let response = send_route_request(
+        &mut router,
+        "POST",
+        "/api/teams/from-conversation",
+        Some(serde_json::json!({
+            "conversation_id": "conv-route-create",
+            "user_id": "user1",
+            "target_assistant_id": "assistant-target",
+            "name": "HTTP Ad-hoc",
+            "workspace_mode": "shared"
+        })),
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let json = route_response_json(response).await;
+    assert!(json["success"].as_bool().unwrap());
+    let data = json["data"].as_object().unwrap();
+    assert_eq!(data["origin_conversation_id"], "conv-route-create");
+    assert!(data["created"].as_bool().unwrap());
+    assert!(!data["leader_slot_id"].as_str().unwrap().is_empty());
+    assert!(data["target_slot_id"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn route_get_ad_hoc_team_by_conversation_returns_association() {
+    let (svc, _team_repo, _tm, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    seed_conversation(&conv_repo, "user1", "conv-route-get", "assistant-lead");
+    let mut router = ad_hoc_router_for_user(svc.clone(), "user1");
+
+    send_route_request(
+        &mut router,
+        "POST",
+        "/api/teams/from-conversation",
+        Some(serde_json::json!({
+            "conversation_id": "conv-route-get",
+            "user_id": "user1",
+            "target_assistant_id": "assistant-target"
+        })),
+    )
+    .await;
+
+    let response = send_route_request(
+        &mut router,
+        "GET",
+        "/api/teams/by-conversation?conversation_id=conv-route-get",
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let json = route_response_json(response).await;
+    assert!(json["success"].as_bool().unwrap());
+    let data = json["data"].as_object().unwrap();
+    assert_eq!(data["origin_conversation_id"], "conv-route-get");
+    assert!(data["team"].is_object());
+}
+
+#[tokio::test]
+async fn route_get_ad_hoc_team_by_conversation_returns_empty_for_unassociated() {
+    let svc = setup();
+    let mut router = ad_hoc_router_for_user(svc, "user1");
+
+    let response = send_route_request(
+        &mut router,
+        "GET",
+        "/api/teams/by-conversation?conversation_id=conv-route-unassociated",
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let json = route_response_json(response).await;
+    assert!(json["success"].as_bool().unwrap());
+    let data = json["data"].as_object().unwrap();
+    assert!(data.get("team").is_none());
+    assert_eq!(data.get("team_id").unwrap().as_str().unwrap(), "");
+}
+
+#[tokio::test]
+async fn route_create_ad_hoc_team_from_conversation_rejects_cross_user() {
+    let (svc, _team_repo, _tm, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    seed_conversation(&conv_repo, "user1", "conv-route-cross", "assistant-lead");
+    let mut router = ad_hoc_router_for_user(svc, "user-attacker");
+
+    let response = send_route_request(
+        &mut router,
+        "POST",
+        "/api/teams/from-conversation",
+        Some(serde_json::json!({
+            "conversation_id": "conv-route-cross",
+            "user_id": "user-attacker"
+        })),
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    let json = route_response_json(response).await;
+    assert!(!json["success"].as_bool().unwrap());
+}
+
+// ── team_id marker in conversation extra ─────────────────────────────
+
+#[tokio::test]
+async fn teammate_conversation_extra_has_team_id_marker_for_sidebar_filtering() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "FilterMarker".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let got = svc.get_team("user1", &created.id).await.unwrap();
+    let leader = got.assistants.iter().find(|a| a.role == "lead").unwrap();
+    let teammate = got.assistants.iter().find(|a| a.role == "teammate").unwrap();
+
+    let leader_extra = conv_repo.get_extra(&leader.conversation_id).unwrap();
+    let teammate_extra = conv_repo.get_extra(&teammate.conversation_id).unwrap();
+
+    // Leader must have teamId (session binding) but NOT team_id (sidebar visible)
+    assert_eq!(
+        leader_extra.get("teamId").and_then(serde_json::Value::as_str),
+        Some(created.id.as_str()),
+        "leader must carry teamId for session binding"
+    );
+    assert!(
+        leader_extra.get("team_id").is_none(),
+        "leader must NOT carry team_id so it stays visible in sidebar"
+    );
+
+    // Teammate must have BOTH teamId and team_id (hidden from sidebar)
+    assert_eq!(
+        teammate_extra.get("teamId").and_then(serde_json::Value::as_str),
+        Some(created.id.as_str()),
+        "teammate must carry teamId for session binding"
+    );
+    assert_eq!(
+        teammate_extra.get("team_id").and_then(serde_json::Value::as_str),
+        Some(created.id.as_str()),
+        "teammate must carry team_id so sidebar can filter it out"
+    );
+}
+
+#[tokio::test]
+async fn route_create_ad_hoc_team_from_conversation_rejects_unknown_conversation() {
+    let svc = setup();
+    let mut router = ad_hoc_router_for_user(svc, "user1");
+
+    let response = send_route_request(
+        &mut router,
+        "POST",
+        "/api/teams/from-conversation",
+        Some(serde_json::json!({
+            "conversation_id": "conv-route-unknown",
+            "user_id": "user1"
+        })),
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    let json = route_response_json(response).await;
+    assert!(!json["success"].as_bool().unwrap());
+}
+
+// ===========================================================================
+// Helper: ad-hoc team service setup that exposes RecordingBroadcaster
+// ===========================================================================
+
+fn setup_ad_hoc_team_service_with_broadcaster(
+    factory: AgentFactory,
+) -> (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<CountingTaskManager>,
+    Arc<MockConversationRepo>,
+    Arc<RecordingBroadcaster>,
+) {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::with_rows(vec![
+        AgentMetadataRow {
+            id: "assistant-lead".into(),
+            icon: None,
+            name: "Lead Assistant".into(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("acp".into()),
+            agent_type: "acp".into(),
+            agent_source: "builtin".into(),
+            agent_source_info: None,
+            enabled: true,
+            command: None,
+            args: None,
+            env: None,
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            command_override: None,
+            env_override: None,
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        },
+        AgentMetadataRow {
+            id: "assistant-target".into(),
+            icon: None,
+            name: "Target Assistant".into(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("acp".into()),
+            agent_type: "acp".into(),
+            agent_source: "builtin".into(),
+            agent_source_info: None,
+            enabled: true,
+            command: None,
+            args: None,
+            env: None,
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            command_override: None,
+            env_override: None,
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        },
+    ]));
+    let assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository> =
+        Arc::new(ManyAssistantDefinitionRepo::with_definitions(vec![
+            AssistantDefinitionRow {
+                id: "def-lead".into(),
+                assistant_id: "assistant-lead".into(),
+                source: "builtin".into(),
+                owner_type: "system".into(),
+                source_ref: None,
+                source_version: None,
+                source_hash: None,
+                name: "Lead Assistant".into(),
+                name_i18n: String::new(),
+                description: Some("lead assistant".into()),
+                description_i18n: String::new(),
+                avatar_type: "icon".into(),
+                avatar_value: None,
+                agent_id: "assistant-lead".into(),
+                rule_resource_type: String::new(),
+                rule_resource_ref: None,
+                rule_inline_content: None,
+                recommended_prompts: String::new(),
+                recommended_prompts_i18n: String::new(),
+                default_model_mode: "default".into(),
+                default_model_value: None,
+                default_permission_mode: "default".into(),
+                default_permission_value: None,
+                default_thought_level_mode: "default".into(),
+                default_thought_level_value: None,
+                default_skills_mode: "default".into(),
+                default_skill_ids: String::new(),
+                custom_skill_names: String::new(),
+                default_disabled_builtin_skill_ids: String::new(),
+                default_mcps_mode: "default".into(),
+                default_mcp_ids: String::new(),
+                created_at: aionui_common::now_ms(),
+                updated_at: aionui_common::now_ms(),
+                deleted_at: None,
+            },
+            AssistantDefinitionRow {
+                id: "def-target".into(),
+                assistant_id: "assistant-target".into(),
+                source: "builtin".into(),
+                owner_type: "system".into(),
+                source_ref: None,
+                source_version: None,
+                source_hash: None,
+                name: "Target Assistant".into(),
+                name_i18n: String::new(),
+                description: Some("target assistant".into()),
+                description_i18n: String::new(),
+                avatar_type: "icon".into(),
+                avatar_value: None,
+                agent_id: "assistant-target".into(),
+                rule_resource_type: String::new(),
+                rule_resource_ref: None,
+                rule_inline_content: None,
+                recommended_prompts: String::new(),
+                recommended_prompts_i18n: String::new(),
+                default_model_mode: "default".into(),
+                default_model_value: None,
+                default_permission_mode: "default".into(),
+                default_permission_value: None,
+                default_thought_level_mode: "default".into(),
+                default_thought_level_value: None,
+                default_skills_mode: "default".into(),
+                default_skill_ids: String::new(),
+                custom_skill_names: String::new(),
+                default_disabled_builtin_skill_ids: String::new(),
+                default_mcps_mode: "default".into(),
+                default_mcp_ids: String::new(),
+                created_at: aionui_common::now_ms(),
+                updated_at: aionui_common::now_ms(),
+                deleted_at: None,
+            },
+        ]));
+    let assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository> =
+        Arc::new(ManyAssistantOverlayRepo::with_overlays(vec![]));
+    let team_repo = Arc::new(FullMockTeamRepo::new());
+    let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
+    let conv_repo = Arc::new(MockConversationRepo::new());
+    let broadcaster = Arc::new(RecordingBroadcaster::new());
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
+    let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+    let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+    let task_manager = Arc::new(CountingTaskManager::new(factory));
+    let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
+    let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let assistant_catalog: Arc<dyn TeamAssistantCatalogPort> = Arc::new(TestTeamAssistantCatalog {
+        agent_metadata_repo: agent_metadata_repo.clone(),
+        assistant_definition_repo: assistant_definition_repo.clone(),
+        assistant_overlay_repo: assistant_overlay_repo.clone(),
+    });
+    let svc = TeamSessionService::new(
+        team_repo_dyn,
+        agent_metadata_repo,
+        assistant_catalog,
+        assistant_definition_repo,
+        assistant_overlay_repo,
+        provider_repo,
+        conversation_port,
+        projection_store,
+        broadcaster_dyn,
+        task_manager_dyn,
+        noop_turn_port(),
+        noop_cancellation_port(),
+        backend_binary_path,
+    );
+    (svc, team_repo, task_manager, conv_repo, broadcaster)
+}
+
+// ===========================================================================
+// Test: ad-hoc team creation broadcasts team.created + team.listChanged events
+// ===========================================================================
+
+#[tokio::test]
+async fn ad_hoc_team_from_conversation_broadcasts_team_created_event() {
+    let (svc, _team_repo, _task_manager, conv_repo, broadcaster) =
+        setup_ad_hoc_team_service_with_broadcaster(success_factory());
+    let conversation_id = "conv-adhoc-broadcast";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+
+    let resp = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: Some("assistant-target".to_owned()),
+                name: Some("Broadcast Test Team".to_owned()),
+                workspace_mode: Some("shared".to_owned()),
+            },
+        )
+        .await
+        .expect("create ad-hoc team from conversation");
+
+    assert!(resp.created);
+
+    let created_events = broadcaster.events_by_name("team.created");
+    assert_eq!(
+        created_events.len(),
+        1,
+        "team.created must be broadcast exactly once after ad-hoc team creation"
+    );
+    assert_eq!(
+        created_events[0].data["team_id"], resp.team_id,
+        "team.created payload must contain the created team_id"
+    );
+
+    let list_changed_events = broadcaster.events_by_name("team.listChanged");
+    assert!(
+        list_changed_events.len() >= 1,
+        "team.listChanged must be broadcast after ad-hoc team creation"
     );
 }
