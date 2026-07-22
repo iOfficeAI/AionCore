@@ -9,7 +9,10 @@ use serde_json::Value;
 
 use crate::{
     MemoryError,
-    sanitizer::{MAX_EXISTING_ENTRIES, MAX_STRING_LENGTH, is_user_context_content, sanitize_text},
+    sanitizer::{
+        MAX_EXISTING_ENTRIES, MAX_STRING_LENGTH, MAX_SUMMARY_BYTES, MAX_SUMMARY_ITEMS, sanitize_text,
+        strip_user_context_sentences,
+    },
 };
 
 pub use crate::sanitizer::{MAX_EVIDENCE_BYTES, MAX_EVIDENCE_MESSAGES, MAX_EVIDENCE_TURNS};
@@ -35,15 +38,15 @@ pub struct EvidenceBuilder;
 impl EvidenceBuilder {
     /// Reconstructs a task input from canonical rows and trusted conversation metadata.
     pub fn build(&self, request: EvidenceBuildRequest) -> Result<MemoryUpdateInput, MemoryError> {
-        if request.claimed_turn_ids.len() > MAX_EVIDENCE_TURNS || request.existing_entries.len() > MAX_EXISTING_ENTRIES
-        {
+        if !valid_identifier(&request.conversation.id) || !valid_identifier(&request.conversation.user_id) {
             return Err(MemoryError::InvalidInput);
         }
 
         let turn_ids = selected_turn_ids(&request.claimed_turn_ids, request.summary_cursor.as_deref())?;
         let scope = scope_from_conversation(&request.conversation)?;
-        let source_turns = source_turns_from_rows(&request.messages, &turn_ids)?;
-        let existing_entries = existing_entries_from_rows(request.existing_entries)?;
+        let source_turns = source_turns_from_rows(&request.conversation, &request.messages, &turn_ids)?;
+        let existing_entries = existing_entries_from_rows(request.existing_entries, &request.conversation, &scope)?;
+        let previous_summary = request.previous_summary.map(sanitize_summary).transpose()?.flatten();
 
         Ok(MemoryUpdateInput {
             conversation: MemoryUpdateConversationInput {
@@ -51,7 +54,7 @@ impl EvidenceBuilder {
                 project_id: scope.project_id,
                 workspace_key: scope.workspace_key,
             },
-            previous_summary: request.previous_summary.and_then(sanitize_summary),
+            previous_summary,
             existing_entries,
             source_turns,
         })
@@ -65,7 +68,9 @@ struct ConversationScope {
 }
 
 fn selected_turn_ids(claimed_turn_ids: &[String], summary_cursor: Option<&str>) -> Result<Vec<String>, MemoryError> {
-    if claimed_turn_ids.iter().any(|turn_id| !valid_string(turn_id)) {
+    if claimed_turn_ids.iter().any(|turn_id| !valid_identifier(turn_id))
+        || claimed_turn_ids.iter().collect::<BTreeSet<_>>().len() != claimed_turn_ids.len()
+    {
         return Err(MemoryError::InvalidInput);
     }
 
@@ -79,8 +84,7 @@ fn selected_turn_ids(claimed_turn_ids: &[String], summary_cursor: Option<&str>) 
     };
 
     let selected = claimed_turn_ids[start..].to_vec();
-    let unique = selected.iter().collect::<BTreeSet<_>>();
-    if unique.len() != selected.len() {
+    if selected.len() > MAX_EVIDENCE_TURNS {
         return Err(MemoryError::InvalidInput);
     }
     Ok(selected)
@@ -137,30 +141,34 @@ fn normalize_workspace_key(workspace: String) -> Result<String, MemoryError> {
 }
 
 fn source_turns_from_rows(
+    conversation: &ConversationRow,
     messages: &[MessageRow],
     turn_ids: &[String],
 ) -> Result<Vec<MemorySourceTurnInput>, MemoryError> {
-    let mut grouped = BTreeMap::<String, Vec<MemorySourceMessageInput>>::new();
-    let selected_turn_ids = turn_ids.iter().collect::<BTreeSet<_>>();
+    let mut grouped = BTreeMap::<String, Vec<(i64, String, MemorySourceMessageInput)>>::new();
+    let selected_turn_ids = turn_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let mut message_count = 0_usize;
     let mut evidence_bytes = 0_usize;
 
     for message in messages {
+        if message.conversation_id != conversation.id {
+            return Err(MemoryError::InvalidInput);
+        }
         let Some(turn_id) = message.turn_id.as_deref() else {
             continue;
         };
-        if !selected_turn_ids.contains(&turn_id.to_owned()) || should_exclude_message(message) {
+        if !selected_turn_ids.contains(turn_id) || should_exclude_message(message) {
             continue;
         }
 
         let Some(content) = visible_text_content(message)? else {
             continue;
         };
-        let content = sanitize_text(&content);
-        if content.trim().is_empty() || is_user_context_content(&content) {
+        let content = strip_user_context_sentences(&sanitize_text(&content));
+        if content.trim().is_empty() {
             continue;
         }
-        if !valid_string(&content) {
+        if !valid_string(&content) || !valid_identifier(&message.id) {
             return Err(MemoryError::InvalidInput);
         }
 
@@ -171,22 +179,26 @@ fn source_turns_from_rows(
         }
 
         let role = message_role(message).ok_or(MemoryError::InvalidInput)?;
-        grouped
-            .entry(turn_id.to_owned())
-            .or_default()
-            .push(MemorySourceMessageInput {
+        grouped.entry(turn_id.to_owned()).or_default().push((
+            message.created_at,
+            message.id.clone(),
+            MemorySourceMessageInput {
                 message_id: message.id.clone(),
                 role,
                 content,
-            });
+            },
+        ));
     }
 
     Ok(turn_ids
         .iter()
         .filter_map(|turn_id| {
-            grouped.remove(turn_id).map(|messages| MemorySourceTurnInput {
-                turn_id: turn_id.clone(),
-                messages,
+            grouped.remove(turn_id).map(|mut messages| {
+                messages.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+                MemorySourceTurnInput {
+                    turn_id: turn_id.clone(),
+                    messages: messages.into_iter().map(|(_, _, message)| message).collect(),
+                }
             })
         })
         .collect())
@@ -197,10 +209,7 @@ fn should_exclude_message(message: &MessageRow) -> bool {
         return true;
     }
     let message_type = message.r#type.trim().to_ascii_lowercase();
-    message_type != "text"
-        || message_type.contains("tool")
-        || message_type.contains("permission")
-        || message_type.contains("file")
+    message_type != "text" || message.status.as_deref() != Some("finish")
 }
 
 fn visible_text_content(message: &MessageRow) -> Result<Option<String>, MemoryError> {
@@ -216,28 +225,52 @@ fn message_role(message: &MessageRow) -> Option<MemorySourceMessageRole> {
     }
 }
 
-fn existing_entries_from_rows(rows: Vec<MemoryEntryRow>) -> Result<Vec<ExistingMemoryEntryInput>, MemoryError> {
-    rows.into_iter()
-        .filter(|row| row.state == "active")
-        .filter_map(|mut row| row.content.take().map(|content| (row, content)))
-        .filter_map(|(row, content)| {
-            let content = sanitize_text(&content);
-            (!content.trim().is_empty() && !is_user_context_content(&content)).then_some((row, content))
-        })
-        .map(|(row, content)| {
-            if !valid_string(&row.id) || !valid_string(&row.stable_key) || !valid_string(&content) {
-                return Err(MemoryError::InvalidInput);
-            }
-            Ok(ExistingMemoryEntryInput {
-                id: row.id,
-                kind: entry_kind(&row.kind)?,
-                stable_key: row.stable_key,
-                content,
-                pinned: row.pinned,
-                user_edited: row.user_edited,
-            })
-        })
-        .collect()
+fn existing_entries_from_rows(
+    rows: Vec<MemoryEntryRow>,
+    conversation: &ConversationRow,
+    scope: &ConversationScope,
+) -> Result<Vec<ExistingMemoryEntryInput>, MemoryError> {
+    let mut entries = Vec::new();
+    for row in rows {
+        if row.user_id != conversation.user_id || !entry_scope_is_compatible(&row, scope) {
+            return Err(MemoryError::InvalidInput);
+        }
+        if row.state != "active" {
+            continue;
+        }
+        let Some(content) = row.content else {
+            continue;
+        };
+        let content = strip_user_context_sentences(&sanitize_text(&content));
+        if content.trim().is_empty() {
+            continue;
+        }
+        if !valid_identifier(&row.id) || !valid_string(&row.stable_key) || !valid_string(&content) {
+            return Err(MemoryError::InvalidInput);
+        }
+        entries.push(ExistingMemoryEntryInput {
+            id: row.id,
+            kind: entry_kind(&row.kind)?,
+            stable_key: row.stable_key,
+            content,
+            pinned: row.pinned,
+            user_edited: row.user_edited,
+        });
+    }
+    if entries.len() > MAX_EXISTING_ENTRIES {
+        return Err(MemoryError::InvalidInput);
+    }
+    Ok(entries)
+}
+
+fn entry_scope_is_compatible(row: &MemoryEntryRow, scope: &ConversationScope) -> bool {
+    row.project_id
+        .as_deref()
+        .is_none_or(|project_id| scope.project_id.as_deref() == Some(project_id))
+        && row
+            .workspace_key
+            .as_deref()
+            .is_none_or(|workspace_key| scope.workspace_key.as_deref() == Some(workspace_key))
 }
 
 fn entry_kind(kind: &str) -> Result<MemoryEntryKind, MemoryError> {
@@ -252,51 +285,78 @@ fn entry_kind(kind: &str) -> Result<MemoryEntryKind, MemoryError> {
     }
 }
 
-fn sanitize_summary(summary: MemorySummary) -> Option<MemorySummary> {
-    let goal = sanitized_summary_value(summary.goal);
-    let current_state = sanitize_summary_values(summary.current_state);
-    let decisions = sanitize_summary_values(summary.decisions);
-    let artifacts = sanitize_summary_values(summary.artifacts);
-    let issues = sanitize_summary_values(summary.issues);
-    let next_steps = sanitize_summary_values(summary.next_steps);
-    let work_constraints = sanitize_summary_values(summary.work_constraints);
-    (!goal.is_empty()
+fn sanitize_summary(summary: MemorySummary) -> Result<Option<MemorySummary>, MemoryError> {
+    let goal = sanitized_summary_value(summary.goal)?.unwrap_or_default();
+    let current_state = sanitize_summary_values(summary.current_state)?;
+    let decisions = sanitize_summary_values(summary.decisions)?;
+    let artifacts = sanitize_summary_values(summary.artifacts)?;
+    let issues = sanitize_summary_values(summary.issues)?;
+    let next_steps = sanitize_summary_values(summary.next_steps)?;
+    let work_constraints = sanitize_summary_values(summary.work_constraints)?;
+    let summary_bytes = goal.len()
+        + current_state.iter().map(String::len).sum::<usize>()
+        + decisions.iter().map(String::len).sum::<usize>()
+        + artifacts.iter().map(String::len).sum::<usize>()
+        + issues.iter().map(String::len).sum::<usize>()
+        + next_steps.iter().map(String::len).sum::<usize>()
+        + work_constraints.iter().map(String::len).sum::<usize>();
+    let summary_items = usize::from(!goal.is_empty())
+        + current_state.len()
+        + decisions.len()
+        + artifacts.len()
+        + issues.len()
+        + next_steps.len()
+        + work_constraints.len();
+    if summary_items > MAX_SUMMARY_ITEMS || summary_bytes > MAX_SUMMARY_BYTES {
+        return Err(MemoryError::InvalidInput);
+    }
+    if !goal.is_empty()
         || !current_state.is_empty()
         || !decisions.is_empty()
         || !artifacts.is_empty()
         || !issues.is_empty()
         || !next_steps.is_empty()
-        || !work_constraints.is_empty())
-    .then_some(MemorySummary {
-        goal,
-        current_state,
-        decisions,
-        artifacts,
-        issues,
-        next_steps,
-        work_constraints,
-    })
+        || !work_constraints.is_empty()
+    {
+        Ok(Some(MemorySummary {
+            goal,
+            current_state,
+            decisions,
+            artifacts,
+            issues,
+            next_steps,
+            work_constraints,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
-fn sanitize_summary_values(values: Vec<String>) -> Vec<String> {
+fn sanitize_summary_values(values: Vec<String>) -> Result<Vec<String>, MemoryError> {
     values
         .into_iter()
         .map(sanitized_summary_value)
-        .filter(|value| !value.is_empty())
+        .filter_map(Result::transpose)
         .collect()
 }
 
-fn sanitized_summary_value(value: String) -> String {
-    let value = sanitize_text(&value);
-    if valid_string(&value) && !is_user_context_content(&value) {
-        value
+fn sanitized_summary_value(value: String) -> Result<Option<String>, MemoryError> {
+    let value = strip_user_context_sentences(&sanitize_text(&value));
+    if value.trim().is_empty() {
+        Ok(None)
+    } else if valid_string(&value) {
+        Ok(Some(value))
     } else {
-        String::new()
+        Err(MemoryError::InvalidInput)
     }
 }
 
 fn valid_string(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= MAX_STRING_LENGTH
+}
+
+fn valid_identifier(value: &str) -> bool {
+    valid_string(value)
 }
 
 #[cfg(test)]
@@ -395,7 +455,10 @@ mod tests {
             claimed_turn_ids: vec!["turn-1".into()],
             existing_entries: Vec::new(),
         };
-        assert!(builder.build(too_many_messages).is_err());
+        assert_eq!(
+            builder.build(too_many_messages).unwrap_err(),
+            crate::MemoryError::InvalidInput
+        );
 
         let too_many_bytes = EvidenceBuildRequest {
             conversation: conversation(json!({})),
@@ -410,7 +473,10 @@ mod tests {
             claimed_turn_ids: vec!["turn-1".into()],
             existing_entries: Vec::new(),
         };
-        assert!(builder.build(too_many_bytes).is_err());
+        assert_eq!(
+            builder.build(too_many_bytes).unwrap_err(),
+            crate::MemoryError::InvalidInput
+        );
     }
 
     #[test]
@@ -437,6 +503,224 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["turn-b", "turn-a"]
         );
+    }
+
+    #[test]
+    fn rejects_mixed_canonical_rows_and_scope_incompatible_entries() {
+        let builder = EvidenceBuilder::default();
+        let request = EvidenceBuildRequest {
+            conversation: conversation(json!({ "project_id": "project-a", "workspace": "/work/a" })),
+            messages: vec![MessageRow {
+                conversation_id: "other-conversation".into(),
+                ..text_message("foreign-message", "turn-1", "right", "foreign evidence")
+            }],
+            previous_summary: None,
+            summary_cursor: None,
+            claimed_turn_ids: vec!["turn-1".into()],
+            existing_entries: Vec::new(),
+        };
+        assert_eq!(builder.build(request).unwrap_err(), crate::MemoryError::InvalidInput);
+
+        let mut foreign_entry = active_entry("foreign-entry");
+        foreign_entry.user_id = "other-user".into();
+        let request = EvidenceBuildRequest {
+            conversation: conversation(json!({ "project_id": "project-a", "workspace": "/work/a" })),
+            messages: Vec::new(),
+            previous_summary: None,
+            summary_cursor: None,
+            claimed_turn_ids: Vec::new(),
+            existing_entries: vec![foreign_entry],
+        };
+        assert_eq!(builder.build(request).unwrap_err(), crate::MemoryError::InvalidInput);
+
+        let mut foreign_scope = active_entry("foreign-scope");
+        foreign_scope.project_id = Some("project-b".into());
+        let request = EvidenceBuildRequest {
+            conversation: conversation(json!({ "project_id": "project-a", "workspace": "/work/a" })),
+            messages: Vec::new(),
+            previous_summary: None,
+            summary_cursor: None,
+            claimed_turn_ids: Vec::new(),
+            existing_entries: vec![foreign_scope],
+        };
+        assert_eq!(builder.build(request).unwrap_err(), crate::MemoryError::InvalidInput);
+    }
+
+    #[test]
+    fn removes_user_context_sentences_but_keeps_work_local_preferences_and_http_outcomes() {
+        let output = EvidenceBuilder::default()
+            .build(EvidenceBuildRequest {
+                conversation: conversation(json!({})),
+                messages: vec![text_message(
+                    "mixed-context",
+                    "turn-1",
+                    "right",
+                    "My name is Ada. Call me Ada; I prefer concise responses. Prefer option B for deployment. Always respond with HTTP 503.",
+                )],
+                previous_summary: None,
+                summary_cursor: None,
+                claimed_turn_ids: vec!["turn-1".into()],
+                existing_entries: Vec::new(),
+            })
+            .unwrap();
+
+        let evidence = &output.source_turns[0].messages[0].content;
+        for excluded in ["My name is Ada", "Call me Ada", "I prefer concise responses"] {
+            assert!(!evidence.contains(excluded));
+        }
+        assert!(evidence.contains("Prefer option B for deployment"));
+        assert!(evidence.contains("Always respond with HTTP 503"));
+    }
+
+    #[test]
+    fn rejects_duplicate_claims_and_applies_limits_after_cursor_and_safe_filtering() {
+        let builder = EvidenceBuilder::default();
+        let duplicate_cursor = EvidenceBuildRequest {
+            conversation: conversation(json!({})),
+            messages: Vec::new(),
+            previous_summary: None,
+            summary_cursor: Some("turn-0".into()),
+            claimed_turn_ids: vec!["turn-0".into(), "turn-0".into(), "turn-1".into()],
+            existing_entries: Vec::new(),
+        };
+        assert_eq!(
+            builder.build(duplicate_cursor).unwrap_err(),
+            crate::MemoryError::InvalidInput
+        );
+
+        let before_cursor = (0..=MAX_EVIDENCE_TURNS)
+            .map(|index| format!("old-{index}"))
+            .chain(std::iter::once("cursor".into()))
+            .chain(std::iter::once("selected".into()))
+            .collect::<Vec<_>>();
+        let output = builder
+            .build(EvidenceBuildRequest {
+                conversation: conversation(json!({})),
+                messages: vec![text_message("selected", "selected", "right", "safe")],
+                previous_summary: None,
+                summary_cursor: Some("cursor".into()),
+                claimed_turn_ids: before_cursor,
+                existing_entries: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(output.source_turns.len(), 1);
+
+        let excluded_messages = (0..=MAX_EVIDENCE_MESSAGES)
+            .map(|index| raw_message(&format!("tool-{index}"), "turn-1", "tool_call", "raw payload"))
+            .collect::<Vec<_>>();
+        let output = builder
+            .build(EvidenceBuildRequest {
+                conversation: conversation(json!({})),
+                messages: excluded_messages,
+                previous_summary: None,
+                summary_cursor: None,
+                claimed_turn_ids: vec!["turn-1".into()],
+                existing_entries: Vec::new(),
+            })
+            .unwrap();
+        assert!(output.source_turns.is_empty());
+    }
+
+    #[test]
+    fn orders_final_messages_and_rejects_non_final_or_cumulative_oversize_evidence() {
+        let builder = EvidenceBuilder::default();
+        let ordered = builder
+            .build(EvidenceBuildRequest {
+                conversation: conversation(json!({})),
+                messages: vec![
+                    message_at("later", "turn-1", "right", "later", 2, "finish"),
+                    message_at("first", "turn-1", "left", "first", 1, "finish"),
+                    message_at("pending", "turn-1", "left", "partial", 3, "pending"),
+                    message_at("work", "turn-1", "left", "stream", 4, "work"),
+                    message_at("error", "turn-1", "left", "provider log", 5, "error"),
+                ],
+                previous_summary: None,
+                summary_cursor: None,
+                claimed_turn_ids: vec!["turn-1".into()],
+                existing_entries: Vec::new(),
+            })
+            .unwrap();
+        let messages = &ordered.source_turns[0].messages;
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "later"]
+        );
+
+        let cumulative = (0..9)
+            .map(|index| {
+                message_at(
+                    &format!("large-{index}"),
+                    "turn-1",
+                    "right",
+                    &"x".repeat(8_000),
+                    index,
+                    "finish",
+                )
+            })
+            .collect();
+        let result = builder.build(EvidenceBuildRequest {
+            conversation: conversation(json!({})),
+            messages: cumulative,
+            previous_summary: None,
+            summary_cursor: None,
+            claimed_turn_ids: vec!["turn-1".into()],
+            existing_entries: Vec::new(),
+        });
+        assert_eq!(result.unwrap_err(), crate::MemoryError::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_aggregate_summary_or_identifier_overflow_but_ignores_inactive_entries_for_limits() {
+        let builder = EvidenceBuilder::default();
+        let summary_overflow = builder.build(EvidenceBuildRequest {
+            conversation: conversation(json!({})),
+            messages: Vec::new(),
+            previous_summary: Some(MemorySummary {
+                goal: "goal".into(),
+                current_state: (0..9).map(|_| "x".repeat(8_000)).collect(),
+                decisions: Vec::new(),
+                artifacts: Vec::new(),
+                issues: Vec::new(),
+                next_steps: Vec::new(),
+                work_constraints: Vec::new(),
+            }),
+            summary_cursor: None,
+            claimed_turn_ids: Vec::new(),
+            existing_entries: Vec::new(),
+        });
+        assert_eq!(summary_overflow.unwrap_err(), crate::MemoryError::InvalidInput);
+
+        let oversized_id = builder.build(EvidenceBuildRequest {
+            conversation: conversation(json!({})),
+            messages: vec![text_message(&"m".repeat(8_193), "turn-1", "right", "safe")],
+            previous_summary: None,
+            summary_cursor: None,
+            claimed_turn_ids: vec!["turn-1".into()],
+            existing_entries: Vec::new(),
+        });
+        assert_eq!(oversized_id.unwrap_err(), crate::MemoryError::InvalidInput);
+
+        let inactive_entries = (0..=64)
+            .map(|index| {
+                let mut entry = active_entry(&format!("inactive-{index}"));
+                entry.state = "superseded".into();
+                entry
+            })
+            .collect();
+        let output = builder
+            .build(EvidenceBuildRequest {
+                conversation: conversation(json!({})),
+                messages: Vec::new(),
+                previous_summary: None,
+                summary_cursor: None,
+                claimed_turn_ids: Vec::new(),
+                existing_entries: inactive_entries,
+            })
+            .unwrap();
+        assert!(output.existing_entries.is_empty());
     }
 
     fn conversation(extra: serde_json::Value) -> ConversationRow {
@@ -480,6 +764,13 @@ mod tests {
             hidden: false,
             created_at: 1,
         }
+    }
+
+    fn message_at(id: &str, turn_id: &str, position: &str, content: &str, created_at: i64, status: &str) -> MessageRow {
+        let mut message = text_message(id, turn_id, position, content);
+        message.created_at = created_at;
+        message.status = Some(status.into());
+        message
     }
 
     trait WithPosition {

@@ -3,8 +3,10 @@
 pub mod error;
 pub mod evidence;
 pub mod sanitizer;
+pub mod service;
 pub mod state;
 
 pub use error::MemoryError;
 pub use evidence::{EvidenceBuildRequest, EvidenceBuilder};
+pub use service::MemoryService;
 pub use state::MemoryRouterState;
