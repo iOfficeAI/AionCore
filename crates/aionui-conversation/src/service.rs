@@ -50,7 +50,7 @@ use crate::convert::{
     row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
 };
 use crate::error::ConversationError;
-use crate::session_context::SessionContextBuilder;
+use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
@@ -3217,6 +3217,34 @@ pub(crate) fn agent_error_top_level_code(error: &AgentError) -> &'static str {
 }
 
 impl ConversationService {
+    /// Loads the persisted runtime permission gate inputs for an aionrs
+    /// rebuild. Returns `None` for non-aionrs conversations and for aionrs
+    /// conversations without a persisted assistant snapshot (assistant-less
+    /// sessions are out of scope — spec §5). This is the only place a
+    /// `conversation_repo` handle is needed, so the seed is computed here and
+    /// threaded into `SessionContextBuilder` (spec §7.3, A-2).
+    async fn load_aionrs_permission_seed(
+        &self,
+        row: &aionui_db::models::ConversationRow,
+    ) -> Result<Option<AionrsRuntimePermissionSeed>, ConversationError> {
+        if row.r#type != AgentType::Aionrs.serde_name() {
+            return Ok(None);
+        }
+        let snapshot = self
+            .conversation_repo
+            .get_assistant_snapshot(&row.id)
+            .await
+            .map_err(|e| {
+                ConversationError::internal(format!(
+                    "Failed to load assistant snapshot for aionrs permission seed: {e}"
+                ))
+            })?;
+        Ok(snapshot.map(|snapshot| AionrsRuntimePermissionSeed {
+            default_permission_mode: snapshot.default_permission_mode,
+            resolved_permission_value: snapshot.resolved_permission_value,
+        }))
+    }
+
     /// Build typed agent runtime context from a conversation database row.
     ///
     /// Raw `conversation.extra` parsing lives in [`SessionContextBuilder`]
@@ -3227,8 +3255,9 @@ impl ConversationService {
         row: &aionui_db::models::ConversationRow,
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
+        let seed = self.load_aionrs_permission_seed(row).await?;
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options(row)
+            .build_options(row, seed)
             .await
     }
 
@@ -3238,8 +3267,9 @@ impl ConversationService {
         workspace_override: Option<&str>,
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
+        let seed = self.load_aionrs_permission_seed(row).await?;
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options_with_workspace_override(row, workspace_override)
+            .build_options_with_workspace_override(row, workspace_override, seed)
             .await
     }
 

@@ -160,6 +160,10 @@ pub enum AcpError {
 
     /// Initialize handshake timed out.
     InitTimeout { timeout_secs: u64 },
+
+    /// A config/mode/model RPC did not return within CONFIG_RPC_TIMEOUT_SECS.
+    /// Distinct from `InitTimeout`, which covers only the initialize handshake.
+    RequestTimeout { method: String, timeout_secs: u64 },
 }
 
 /// Format the human-readable suffix for `StartupCrash` / `Disconnected`.
@@ -253,6 +257,9 @@ impl std::fmt::Display for AcpError {
             AcpError::InitTimeout { timeout_secs } => {
                 write!(f, "Initialize handshake timed out after {timeout_secs}s")
             }
+            AcpError::RequestTimeout { method, timeout_secs } => {
+                write!(f, "Agent request '{method}' timed out after {timeout_secs}s")
+            }
         }
     }
 }
@@ -268,6 +275,7 @@ impl AcpError {
                 | AcpError::Disconnected { .. }
                 | AcpError::AgentInternal { .. }
                 | AcpError::InitTimeout { .. }
+                | AcpError::RequestTimeout { .. }
         )
     }
 
@@ -517,6 +525,31 @@ mod tests {
         assert!(!AcpError::MethodNotFound { method: "foo".into() }.is_retryable());
         assert!(!AcpError::InvalidParams { message: "bad".into() }.is_retryable());
         assert!(!AcpError::NotConnected.is_retryable());
+    }
+
+    #[test]
+    fn request_timeout_is_retryable() {
+        assert!(
+            AcpError::RequestTimeout {
+                method: "session/setConfigOption".into(),
+                timeout_secs: 10,
+            }
+            .is_retryable(),
+            "config RPC timeout must be retryable so the user can immediately retry"
+        );
+    }
+
+    #[test]
+    fn request_timeout_display_names_method_and_timeout_without_sensitive_payload() {
+        let display = AcpError::RequestTimeout {
+            method: "session/setConfigOption".into(),
+            timeout_secs: 10,
+        }
+        .to_string();
+        assert!(display.contains("timed out after 10s"), "got {display}");
+        assert!(display.contains("session/setConfigOption"), "got {display}");
+        // Display must stay a single, redacted line — no payload, no newline.
+        assert!(!display.contains('\n'), "must be single line; got {display}");
     }
 
     #[test]

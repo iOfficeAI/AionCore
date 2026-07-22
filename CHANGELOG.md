@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.1.50](https://github.com/iOfficeAI/AionCore/compare/v0.1.49...v0.1.50) (2026-07-21)
+
+
+### Features
+
+* **assets:** update Kimi logo to official brand mark ([#646](https://github.com/iOfficeAI/AionCore/issues/646)) ([1c41b50](https://github.com/iOfficeAI/AionCore/commit/1c41b50d93b5cdb188792d9c6e794fb0e0a950a0))
+* **provider:** add per-model capability settings ([0f60d7e](https://github.com/iOfficeAI/AionCore/commit/0f60d7edda96f3a3a43d27765a8e800f53c6d294))
+* **provider:** add per-model capability settings ([ba3e9ff](https://github.com/iOfficeAI/AionCore/commit/ba3e9ff1a893bf7111173b8e9301a0c2f140a2c1))
+
+
+### Bug Fixes
+
+* **acp:** bound config RPC timeout and release lease without tearing down connection ([#654](https://github.com/iOfficeAI/AionCore/issues/654)) ([c9a0051](https://github.com/iOfficeAI/AionCore/commit/c9a005163df4dfef48bdbdd01f67be04cae120dd))
+* **agent:** reflect auth failures from real turns into agent availability ([#655](https://github.com/iOfficeAI/AionCore/issues/655)) ([769eecb](https://github.com/iOfficeAI/AionCore/commit/769eecb761b3c5ee3f5cb055e972168aeea014d5))
+* **agent:** reject and clear launch-path override for npx-bridged agents ([#651](https://github.com/iOfficeAI/AionCore/issues/651)) ([0724757](https://github.com/iOfficeAI/AionCore/commit/07247577c3be21b7e0aa39ead24e3afddbd13c2e))
+* **agent:** surface sign-in hint on empty ACP turns from auth-gated agents ([#653](https://github.com/iOfficeAI/AionCore/issues/653)) ([7a8c26e](https://github.com/iOfficeAI/AionCore/commit/7a8c26e31509a3794e272596e0c100168de65c7b))
+* **ai-agent:** enable official kimi k2.7 code image input ([c4b2795](https://github.com/iOfficeAI/AionCore/commit/c4b279583a0bf1d127d867a1d403a1f195bbed91))
+* **ai-agent:** enable official kimi k2.7 code image input ([4bff331](https://github.com/iOfficeAI/AionCore/commit/4bff3311231e9b526a5ad27ddc74b200a8b83b3d))
+* **ci:** validate migrations against latest release ([5e21e3c](https://github.com/iOfficeAI/AionCore/commit/5e21e3c570705d0b1793d79ab3edc2572c84d610))
+* **conversation:** rebuild aionrs sessions from persisted runtime permission ([#661](https://github.com/iOfficeAI/AionCore/issues/661)) ([239c989](https://github.com/iOfficeAI/AionCore/commit/239c989a09c53ba85bebf714680fc924c8771f06))
+* **db:** prevent duplicate migration versions ([af88855](https://github.com/iOfficeAI/AionCore/commit/af88855a5e1610797689debd81755136f740cc2d))
+* **db:** prevent duplicate migration versions ([39b74ba](https://github.com/iOfficeAI/AionCore/commit/39b74ba1befeb052a673edaf9f05313c774fc1d7))
+* **provider:** preserve automatic vision detection ([08696fd](https://github.com/iOfficeAI/AionCore/commit/08696fd0b46794497c7bf70473874753a66c1925))
+* **startup:** make concurrent aioncore startup safe over one data directory ([#657](https://github.com/iOfficeAI/AionCore/issues/657)) ([2a64b55](https://github.com/iOfficeAI/AionCore/commit/2a64b55e1ab52f789dcb3a715ef0a940b35a20b3))
+
+
+### Documentation
+
+* de-stale AGENTS.md and guard against symbol-anchored rules ([#649](https://github.com/iOfficeAI/AionCore/issues/649)) ([9bd188c](https://github.com/iOfficeAI/AionCore/commit/9bd188cd89990413bc9e70cc9392ac1a1c5fdc91))
+
 ## [0.1.49](https://github.com/iOfficeAI/AionCore/compare/v0.1.48...v0.1.49) (2026-07-20)
 
 

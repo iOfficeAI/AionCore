@@ -80,6 +80,16 @@ fn embedded_allowlist_resolves_regression_models_without_network() {
 }
 
 #[test]
+fn embedded_allowlist_resolves_official_kimi_k2_7_code() {
+    for base_url in ["https://api.moonshot.cn/v1", "https://api.moonshot.ai/v1"] {
+        assert_eq!(
+            resolve_image_input_capability("openai", Some(base_url), "kimi-k2.7-code"),
+            ImageInputCapability::Supported
+        );
+    }
+}
+
+#[test]
 fn resolves_supported_and_unlisted_models_on_the_same_provider() {
     let catalog = catalog();
 

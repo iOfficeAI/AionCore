@@ -615,11 +615,11 @@ impl AcpAgentManager {
             return Err(AgentError::bad_request("value must not be empty"));
         }
 
-        let guard = {
+        let guard_opt = {
             let mut session = self.session.write().await;
             session.try_begin_config_set()
         };
-        let Some(guard) = guard else {
+        let Some(_guard) = guard_opt else {
             tracing::info!(
                 conversation_id = %self.params.conversation_id,
                 agent_backend = ?self.params.metadata.backend,
@@ -630,14 +630,12 @@ impl AcpAgentManager {
             return Err(AgentError::conflict("ACP config update is already in progress"));
         };
 
-        let result = self.set_config_option_confirmed_inner(option_id, value).await;
-
-        {
-            let mut session = self.session.write().await;
-            session.end_config_set(guard);
-        }
-
-        result
+        // `_guard` owns an Arc<AtomicBool> clone (not a borrow of the session
+        // lock released above), so it lives independently until this function
+        // returns. Its Drop resets the lease on every exit path — Ok, Err, the
+        // inner RPC timing out, and this future being cancelled or unwinding —
+        // so a hung config RPC can no longer wedge the lease (ELECTRON-3MS).
+        self.set_config_option_confirmed_inner(option_id, value).await
     }
 
     async fn set_config_option_confirmed_inner(
