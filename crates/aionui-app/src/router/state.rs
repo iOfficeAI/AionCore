@@ -44,7 +44,7 @@ use aionui_db::{
 use aionui_development::{
     ApprovalOption, ApprovalRequestInput, ApprovalResolver, ApprovalRouterState, ApprovalService, ApprovalSource,
     DeliveryService, DeploymentService, DevelopmentOperationsService, DevelopmentRouterState, DevelopmentRunner,
-    DevelopmentService, DevelopmentWorkspacePort, GhCliDeliveryProvider, GitLabCliDeliveryProvider, PortabilityService,
+    DevelopmentService, DevelopmentWorkspacePort, GhCliDeliveryProvider, PortabilityService,
     PrepareDevelopmentWorkspace, PreparedDevelopmentWorkspace, PricingService, ResolveApprovalContext,
     ResourceLeaseCoordinator, RetentionService, SecretService, SystemDevelopmentResourceController,
     UnconfiguredDeploymentProvider,
@@ -1187,7 +1187,6 @@ fn build_development_state(services: &AppServices) -> DevelopmentRouterState {
                 project_repo.clone(),
                 Arc::new(GhCliDeliveryProvider),
             )
-            .with_provider(Arc::new(GitLabCliDeliveryProvider))
             .with_operations(operations_service.clone()),
         ),
         deployment_service: Arc::new(

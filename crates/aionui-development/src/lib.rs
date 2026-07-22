@@ -50,7 +50,7 @@ pub use operations::{
 pub use policy::{DevelopmentPolicyRules, PolicyDecision, PolicyEngine, PolicyOperation};
 pub use pricing::{ModelPriceInput, PricingService, UsageDimension, UsageMeasurement};
 pub use providers::GitHubCliDeliveryProvider as GhCliDeliveryProvider;
-pub use providers::{GitHubCliDeliveryProvider, GitLabCliDeliveryProvider};
+pub use providers::GitHubCliDeliveryProvider;
 pub use resources::{
     CleanupTarget, DevelopmentResourceController, ResourceLeaseCoordinator, ResourceLeaseInput,
     SystemDevelopmentResourceController,

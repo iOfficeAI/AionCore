@@ -114,9 +114,8 @@ async fn assert_provider_contract(provider: Arc<ContractProvider>) {
 }
 
 #[tokio::test]
-async fn github_and_gitlab_share_the_same_delivery_contract() {
+async fn github_implements_the_delivery_contract() {
     assert_provider_contract(Arc::new(ContractProvider::named("github"))).await;
-    assert_provider_contract(Arc::new(ContractProvider::named("gitlab"))).await;
 }
 
 #[test]
