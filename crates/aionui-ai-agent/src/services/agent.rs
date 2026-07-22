@@ -14,20 +14,28 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
-use aionui_api_types::{AgentLogoEntry, AgentManagementRow, ProviderHealthCheckRequest, ProviderHealthCheckResponse};
+use aionui_api_types::{
+    AgentLogoEntry, AgentManagementRow, AppOperationsModelHealth, AppOperationsModelResponse, HealthStatus,
+    ProviderHealthCheckRequest, ProviderHealthCheckResponse,
+};
+use aionui_common::now_ms;
 use aionui_db::IProviderRepository;
 use aionui_realtime::EventBroadcaster;
+use aionui_system::SettingsService;
+use tracing::info;
 
 use super::availability::{AgentAvailabilityFeedbackPort, AgentAvailabilityService};
-use super::provider_health::ProviderHealthCheckService;
+use super::provider_health::{ProviderHealthCheckService, ProviderHealthChecker};
 use crate::error::AgentError;
 use crate::registry::AgentRegistry;
 
 pub struct AgentService {
     registry: Arc<AgentRegistry>,
     broadcaster: Arc<dyn EventBroadcaster>,
-    provider_health: ProviderHealthCheckService,
+    provider_health: Arc<dyn ProviderHealthChecker>,
+    app_operations_settings: SettingsService,
     availability: AgentAvailabilityService,
 }
 
@@ -38,14 +46,31 @@ impl AgentService {
         provider_repo: Arc<dyn IProviderRepository>,
         encryption_key: [u8; 32],
         data_dir: PathBuf,
+        app_operations_settings: SettingsService,
     ) -> Arc<Self> {
-        let provider_health = ProviderHealthCheckService::new(provider_repo.clone(), encryption_key, data_dir.clone());
+        let provider_health = Arc::new(ProviderHealthCheckService::new(
+            provider_repo.clone(),
+            encryption_key,
+            data_dir.clone(),
+        ));
         let availability = AgentAvailabilityService::new(registry.clone(), provider_repo);
         Arc::new(Self {
             registry,
             broadcaster,
             provider_health,
+            app_operations_settings,
             availability,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn with_provider_health_checker(&self, provider_health: Arc<dyn ProviderHealthChecker>) -> Arc<Self> {
+        Arc::new(Self {
+            registry: self.registry.clone(),
+            broadcaster: self.broadcaster.clone(),
+            provider_health,
+            app_operations_settings: self.app_operations_settings.clone(),
+            availability: self.availability.clone(),
         })
     }
 
@@ -111,6 +136,59 @@ impl AgentService {
         req: ProviderHealthCheckRequest,
     ) -> Result<ProviderHealthCheckResponse, AgentError> {
         self.provider_health.health_check(req).await
+    }
+
+    pub async fn check_app_operations_model(&self) -> Result<AppOperationsModelResponse, AgentError> {
+        let started = Instant::now();
+        let result = self.check_app_operations_model_inner().await;
+        let status = result
+            .as_ref()
+            .map(|response| app_operations_health_label(response.health))
+            .unwrap_or("error");
+        info!(
+            status,
+            duration_ms = started.elapsed().as_millis(),
+            "App Operations model health check completed"
+        );
+        result
+    }
+
+    async fn check_app_operations_model_inner(&self) -> Result<AppOperationsModelResponse, AgentError> {
+        let current = self
+            .app_operations_settings
+            .get_app_operations_model()
+            .await
+            .map_err(|_| AgentError::internal("Failed to resolve App Operations model"))?;
+        let Some(resolved) = current.resolved_model else {
+            return Ok(current);
+        };
+
+        let response = self
+            .provider_health
+            .health_check(ProviderHealthCheckRequest {
+                provider_id: resolved.provider_id.clone(),
+                model: resolved.model_id.clone(),
+            })
+            .await?;
+        let status = match response.status {
+            HealthStatus::Healthy => HealthStatus::Healthy,
+            HealthStatus::Unhealthy | HealthStatus::Unknown => HealthStatus::Unhealthy,
+        };
+        self.app_operations_settings
+            .record_app_operations_health(
+                &resolved.provider_id,
+                &resolved.model_id,
+                status,
+                now_ms(),
+                response.elapsed_ms.try_into().unwrap_or(i64::MAX),
+            )
+            .await
+            .map_err(|_| AgentError::internal("Failed to record App Operations model health"))?;
+
+        self.app_operations_settings
+            .get_app_operations_model()
+            .await
+            .map_err(|_| AgentError::internal("Failed to refresh App Operations model health"))
     }
 
     pub async fn set_agent_overrides(
@@ -189,6 +267,15 @@ impl AgentService {
             },
             env_override,
         })
+    }
+}
+
+fn app_operations_health_label(health: AppOperationsModelHealth) -> &'static str {
+    match health {
+        AppOperationsModelHealth::Ready => "ready",
+        AppOperationsModelHealth::Checking => "checking",
+        AppOperationsModelHealth::SetupRequired => "setup_required",
+        AppOperationsModelHealth::Unavailable => "unavailable",
     }
 }
 

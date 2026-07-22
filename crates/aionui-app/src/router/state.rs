@@ -255,13 +255,16 @@ pub async fn build_module_states(
 
     let pool = services.database.pool().clone();
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
+    let settings_service = SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone())))
+        .with_provider_repo(provider_repo.clone());
     let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
         services.event_bus.clone(),
-        provider_repo,
+        provider_repo.clone(),
         encryption_key,
         services.data_dir.clone(),
+        settings_service.clone(),
     );
     services
         .conversation_service
@@ -273,7 +276,9 @@ pub async fn build_module_states(
         "startup: module states bundle started"
     );
     let states = ModuleStates {
-        system: build_module_state_phase(&boot, "system", || build_system_state(services)),
+        system: build_module_state_phase(&boot, "system", || {
+            build_system_state(services, provider_repo, settings_service)
+        }),
         conversation: build_module_state_phase(&boot, "conversation", || {
             build_conversation_state(
                 services,
@@ -373,15 +378,17 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
 }
 
 /// Build the default `SystemRouterState` from application services.
-pub fn build_system_state(services: &AppServices) -> SystemRouterState {
+pub fn build_system_state(
+    services: &AppServices,
+    provider_repo: Arc<dyn IProviderRepository>,
+    settings_service: SettingsService,
+) -> SystemRouterState {
     let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
     let pool = services.database.pool().clone();
-    let provider_repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let http_client = reqwest::Client::new();
 
     SystemRouterState {
-        settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone())))
-            .with_provider_repo(provider_repo.clone()),
+        settings_service,
         client_pref_service: ClientPrefService::with_keep_awake_controller(
             Arc::new(SqliteClientPreferenceRepository::new(pool.clone())),
             Arc::new(aionui_system::SystemKeepAwakeController::new()),

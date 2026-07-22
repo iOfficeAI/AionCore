@@ -10,6 +10,7 @@ use tower::ServiceExt;
 use common::{body_json, build_app, get_request, get_with_token, json_with_token, setup_and_login};
 
 const APP_OPERATIONS_MODEL_PATH: &str = "/api/app-operations/model";
+const APP_OPERATIONS_MODEL_CHECK_PATH: &str = "/api/app-operations/model/check";
 
 #[tokio::test]
 async fn app_operations_get_requires_authentication() {
@@ -32,6 +33,42 @@ async fn app_operations_put_requires_csrf() {
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {token}"))
         .body(Body::from(r#"{"mode":"auto"}"#))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "CSRF_INVALID");
+}
+
+#[tokio::test]
+async fn app_operations_check_requires_authentication() {
+    let (app, _) = build_app().await;
+    let req = Request::builder()
+        .method("POST")
+        .uri(APP_OPERATIONS_MODEL_CHECK_PATH)
+        .header("x-csrf-token", "test-csrf-token")
+        .header("cookie", "aionui-csrf-token=test-csrf-token")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn app_operations_check_requires_csrf() {
+    let (mut app, services) = build_app().await;
+    let (token, _) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let req = Request::builder()
+        .method("POST")
+        .uri(APP_OPERATIONS_MODEL_CHECK_PATH)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
@@ -183,4 +220,76 @@ async fn app_operations_fixed_rejects_unknown_model() {
         })
     );
     assert_eq!(get_json["data"]["health"], "ready");
+}
+
+#[tokio::test]
+async fn app_operations_check_returns_unavailable_without_probing_disabled_fixed_provider() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let provider_response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/providers",
+            json!({
+                "id": "disabled-operations-provider",
+                "platform": "openai",
+                "name": "Disabled Operations Provider",
+                "base_url": "http://127.0.0.1:9",
+                "api_key": "test-key",
+                "models": ["model-a"]
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(provider_response.status(), StatusCode::CREATED);
+
+    let setting_response = app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            APP_OPERATIONS_MODEL_PATH,
+            json!({
+                "mode": "fixed",
+                "provider_id": "disabled-operations-provider",
+                "model_id": "model-a"
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(setting_response.status(), StatusCode::OK);
+
+    let disable_response = app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            "/api/providers/disabled-operations-provider",
+            json!({ "enabled": false }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(disable_response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(json_with_token(
+            "POST",
+            APP_OPERATIONS_MODEL_CHECK_PATH,
+            json!({}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["data"]["health"], "unavailable");
+    assert_eq!(json["data"]["reason_code"], "provider_disabled");
+    assert!(json["data"].get("resolved_model").is_none());
 }
