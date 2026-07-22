@@ -43,11 +43,11 @@ pub(crate) fn eligible_completed_turn(
         return false;
     }
 
-    let latest_message_at = messages.iter().map(|message| message.created_at).max();
-    if latest_message_at.is_none()
+    let earliest_message_at = messages.iter().map(|message| message.created_at).min();
+    if earliest_message_at.is_none()
         || policy
             .reset_at
-            .is_some_and(|reset_at| latest_message_at.is_none_or(|created_at| created_at <= reset_at))
+            .is_some_and(|reset_at| earliest_message_at.is_none_or(|created_at| created_at <= reset_at))
     {
         return false;
     }
@@ -305,7 +305,25 @@ mod tests {
             consent_version,
             consented_at: consent_version.map(|_| 1),
             reset_at,
+            global_epoch: 0,
+            conversation_epoch: 0,
         }
+    }
+
+    #[test]
+    fn turn_crossing_reset_boundary_is_not_eligible() {
+        let conversation = make_conversation("gemini", "{}", Some("aionui"));
+        let messages = [
+            user_message(false, "text", "finish", 9),
+            assistant_message(false, "text", "finish", 11),
+        ];
+
+        assert!(!eligible_completed_turn(
+            &conversation,
+            &make_policy(Some(1), Some(10)),
+            &messages,
+            MemoryTurnOutcome::Completed,
+        ));
     }
 
     fn user_message(hidden: bool, kind: &str, status: &str, created_at: i64) -> MessageRow {

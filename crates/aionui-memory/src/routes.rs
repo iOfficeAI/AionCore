@@ -171,6 +171,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::memory_routes;
+    use crate::service::MAX_LEASE_DURATION_MS;
     use crate::{AppOperationsReadinessPort, MemoryError, MemoryRouterState, MemoryService, MemoryTurnOutcome};
 
     struct UsableReadiness;
@@ -204,6 +205,47 @@ mod tests {
             .unwrap();
         failure.extensions_mut().insert(current_user());
         assert_eq!(router.oneshot(failure).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn internal_routes_reject_zero_and_overlong_leases_before_accessing_dependencies() {
+        let router = memory_routes(MemoryRouterState {
+            service: Arc::new(MemoryService::new()),
+        });
+        for lease_duration_ms in [0, MAX_LEASE_DURATION_MS + 1] {
+            let mut claim = Request::post("/api/memory/internal/jobs/claim")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "worker_id": "worker-1",
+                        "lease_duration_ms": lease_duration_ms,
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            claim.extensions_mut().insert(current_user());
+            assert_eq!(
+                router.clone().oneshot(claim).await.unwrap().status(),
+                StatusCode::BAD_REQUEST,
+            );
+
+            let mut renew = Request::post("/api/memory/internal/jobs/job-1/lease")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "worker_id": "worker-1",
+                        "lease_token": "lease-1",
+                        "lease_duration_ms": lease_duration_ms,
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            renew.extensions_mut().insert(current_user());
+            assert_eq!(
+                router.clone().oneshot(renew).await.unwrap().status(),
+                StatusCode::BAD_REQUEST,
+            );
+        }
     }
 
     #[tokio::test]

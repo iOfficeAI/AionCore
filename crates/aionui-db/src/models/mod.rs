@@ -35,7 +35,7 @@ pub use mcp_server::McpServerRow;
 pub(crate) use memory::MemoryEntryDbRow;
 pub use memory::{
     ConversationMemoryRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow, MemoryEntryRow, MemoryImportStateRow,
-    MemoryJobRow, MemoryRetrievalRow, MemorySettingsRow, MemorySourceRow,
+    MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow, MemorySettingsRow, MemorySourceRow,
 };
 pub use message::MessageRow;
 pub use oauth_token::OAuthTokenRow;

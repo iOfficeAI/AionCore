@@ -9,6 +9,7 @@ pub struct MemorySettingsRow {
     pub consent_version: Option<i64>,
     pub consented_at: Option<TimestampMs>,
     pub reset_at: Option<TimestampMs>,
+    pub lifecycle_epoch: i64,
     pub updated_at: TimestampMs,
 }
 
@@ -24,6 +25,8 @@ pub struct EffectiveMemoryPolicyRow {
     pub consent_version: Option<i64>,
     pub consented_at: Option<TimestampMs>,
     pub reset_at: Option<TimestampMs>,
+    pub global_epoch: i64,
+    pub conversation_epoch: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -128,9 +131,12 @@ pub struct MemoryJobRow {
     pub user_id: String,
     pub conversation_id: String,
     pub from_turn_id: Option<String>,
-    pub turn_ids_json: String,
     pub through_turn_id: String,
     pub operation_version: String,
+    pub global_epoch: i64,
+    pub conversation_epoch: i64,
+    pub turn_count: i64,
+    pub queue_digest: String,
     pub input_hash: String,
     pub expected_revision: i64,
     pub state: String,
@@ -143,6 +149,14 @@ pub struct MemoryJobRow {
     pub last_error_code: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MemoryJobTurnRow {
+    pub job_id: String,
+    pub position: i64,
+    pub turn_id: String,
+    pub turn_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]

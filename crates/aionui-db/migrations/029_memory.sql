@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS memory_settings (
     consent_version  INTEGER,
     consented_at     INTEGER,
     reset_at         INTEGER,
+    lifecycle_epoch  INTEGER NOT NULL DEFAULT 0 CHECK(lifecycle_epoch >= 0),
     updated_at       INTEGER NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS conversation_memory_policies (
     capture_enabled  INTEGER CHECK(capture_enabled IN (0, 1)),
     recall_enabled   INTEGER CHECK(recall_enabled IN (0, 1)),
     reset_at         INTEGER,
+    lifecycle_epoch  INTEGER NOT NULL DEFAULT 0 CHECK(lifecycle_epoch >= 0),
     updated_at       INTEGER NOT NULL,
     PRIMARY KEY (user_id, conversation_id),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -104,9 +106,12 @@ CREATE TABLE IF NOT EXISTS memory_jobs (
     user_id            TEXT NOT NULL,
     conversation_id    TEXT NOT NULL,
     from_turn_id       TEXT,
-    turn_ids_json      TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(turn_ids_json) AND json_type(turn_ids_json) = 'array'),
     through_turn_id    TEXT NOT NULL,
     operation_version  TEXT NOT NULL,
+    global_epoch       INTEGER NOT NULL DEFAULT 0 CHECK(global_epoch >= 0),
+    conversation_epoch INTEGER NOT NULL DEFAULT 0 CHECK(conversation_epoch >= 0),
+    turn_count         INTEGER NOT NULL DEFAULT 0 CHECK(turn_count >= 0),
+    queue_digest       TEXT NOT NULL,
     input_hash         TEXT NOT NULL,
     expected_revision  INTEGER NOT NULL CHECK(expected_revision >= 0),
     state              TEXT NOT NULL CHECK(state IN ('pending', 'running', 'retry_wait', 'blocked', 'succeeded', 'failed', 'canceled')),
@@ -120,6 +125,21 @@ CREATE TABLE IF NOT EXISTS memory_jobs (
     created_at         INTEGER NOT NULL,
     updated_at         INTEGER NOT NULL,
     UNIQUE (user_id, conversation_id, through_turn_id, operation_version),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS memory_job_turns (
+    job_id             TEXT NOT NULL,
+    user_id            TEXT NOT NULL,
+    conversation_id    TEXT NOT NULL,
+    operation_version  TEXT NOT NULL,
+    position           INTEGER NOT NULL CHECK(position >= 0),
+    turn_id            TEXT NOT NULL,
+    turn_hash          TEXT NOT NULL,
+    PRIMARY KEY (job_id, position),
+    UNIQUE (user_id, conversation_id, operation_version, turn_id),
+    FOREIGN KEY (job_id) REFERENCES memory_jobs(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
@@ -173,6 +193,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_jobs_one_next
     ON memory_jobs(user_id, conversation_id) WHERE state IN ('pending', 'retry_wait', 'blocked');
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_jobs_lease_token
     ON memory_jobs(lease_token) WHERE lease_token IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memory_job_turns_job_position
+    ON memory_job_turns(job_id, position);
 CREATE INDEX IF NOT EXISTS idx_memory_retrievals_expiry
     ON memory_retrievals(expires_at);
 CREATE INDEX IF NOT EXISTS idx_memory_import_pending

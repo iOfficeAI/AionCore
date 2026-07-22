@@ -12,7 +12,7 @@ use aionui_db::{
     ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
     CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, IConversationRepository, IMemoryRepository,
     MemoryCandidateQueryRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, SplitMemoryJobRow, TransitionMemoryJobRow,
-    UpdateConversationMemoryPolicyRow, UpdateMemorySettingsRow,
+    UpdateConversationMemoryLifecycleRow, UpdateMemoryLifecycleRow,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -29,6 +29,8 @@ use crate::{
 };
 
 const RETRY_DELAYS_MS: [i64; 5] = [30_000, 120_000, 600_000, 3_600_000, 21_600_000];
+/// Maximum worker lease duration accepted by Memory routes.
+pub const MAX_LEASE_DURATION_MS: u64 = 15 * 60 * 1_000;
 
 #[derive(Clone)]
 struct JobDependencies {
@@ -145,11 +147,7 @@ impl MemoryService {
             .await
             .map_err(map_db_error)?;
         let turn_ids = vec![turn_id.to_owned()];
-        let input_hash = evidence_input_hash(
-            previous.as_ref().map(|memory| memory.through_turn_id.as_str()),
-            &turn_ids,
-            &messages,
-        )?;
+        let turn_hash = evidence_input_hash(None, &turn_ids, &messages)?;
         let enqueued = jobs
             .memory
             .enqueue_completed_turn(EnqueueMemoryTurnRow {
@@ -157,27 +155,18 @@ impl MemoryService {
                 user_id: user_id.into(),
                 conversation_id: conversation_id.into(),
                 from_turn_id: previous.as_ref().map(|memory| memory.through_turn_id.clone()),
-                turn_ids_json: serde_json::to_string(&turn_ids).map_err(|_| MemoryError::Internal)?,
                 through_turn_id: turn_id.into(),
                 operation_version: OPERATION_VERSION.into(),
-                input_hash,
+                turn_hash,
+                expected_global_epoch: policy.global_epoch,
+                expected_conversation_epoch: policy.conversation_epoch,
+                required_consent_version: super::jobs::MEMORY_DISCLOSURE_VERSION,
                 expected_revision: previous.as_ref().map_or(0, |memory| memory.revision),
                 now: now_ms(),
             })
             .await
             .map_err(map_db_error)?;
-        if let Some(enqueued) = enqueued {
-            let queued_turn_ids = parse_turn_ids(&enqueued.turn_ids_json)?;
-            let queued_messages = self
-                .load_exact_messages(user_id, conversation_id, &queued_turn_ids)
-                .await?;
-            let input_hash = evidence_input_hash(enqueued.from_turn_id.as_deref(), &queued_turn_ids, &queued_messages)?;
-            jobs.memory
-                .update_job_input_hash(user_id, &enqueued.id, &enqueued.turn_ids_json, &input_hash, now_ms())
-                .await
-                .map_err(map_db_error)?;
-        }
-        Ok(true)
+        Ok(enqueued.is_some())
     }
 
     async fn bound_claimed_job(
@@ -187,7 +176,12 @@ impl MemoryService {
         row: &mut MemoryJobRow,
     ) -> Result<(), MemoryError> {
         let jobs = self.job_dependencies()?;
-        let turn_ids = parse_turn_ids(&row.turn_ids_json)?;
+        let queued = jobs
+            .memory
+            .list_job_turns(user_id, &row.id, (crate::sanitizer::MAX_EVIDENCE_TURNS + 1) as u32)
+            .await
+            .map_err(map_db_error)?;
+        let turn_ids = queued.iter().map(|turn| turn.turn_id.clone()).collect::<Vec<_>>();
         if turn_ids.is_empty() {
             return Err(MemoryError::InvalidInput);
         }
@@ -222,32 +216,15 @@ impl MemoryService {
             bounded_count -= 1;
         }
 
-        let running_turn_ids = turn_ids[..bounded_count].to_vec();
-        let running_messages = messages_for_turns(&all_messages, &running_turn_ids);
-        let running_hash = evidence_input_hash(row.from_turn_id.as_deref(), &running_turn_ids, &running_messages)?;
-        if bounded_count < turn_ids.len() {
-            let pending_turn_ids = turn_ids[bounded_count..].to_vec();
-            let pending_messages = messages_for_turns(&all_messages, &pending_turn_ids);
-            let pending_hash = evidence_input_hash(
-                running_turn_ids.last().map(String::as_str),
-                &pending_turn_ids,
-                &pending_messages,
-            )?;
+        if i64::try_from(bounded_count).map_err(|_| MemoryError::Internal)? < row.turn_count {
             let split = jobs
                 .memory
                 .split_claimed_job(SplitMemoryJobRow {
                     user_id: user_id.into(),
                     job_id: row.id.clone(),
                     lease_token: lease_token.into(),
-                    running_turn_ids_json: serde_json::to_string(&running_turn_ids)
-                        .map_err(|_| MemoryError::Internal)?,
-                    running_through_turn_id: running_turn_ids.last().cloned().ok_or(MemoryError::InvalidInput)?,
-                    running_input_hash: running_hash.clone(),
+                    prefix_count: bounded_count.try_into().map_err(|_| MemoryError::Internal)?,
                     pending_job_id: generate_prefixed_id("memory-job"),
-                    pending_turn_ids_json: serde_json::to_string(&pending_turn_ids)
-                        .map_err(|_| MemoryError::Internal)?,
-                    pending_through_turn_id: pending_turn_ids.last().cloned().ok_or(MemoryError::InvalidInput)?,
-                    pending_input_hash: pending_hash,
                     now: now_ms(),
                 })
                 .await
@@ -255,19 +232,12 @@ impl MemoryService {
             if !split {
                 return Err(MemoryError::LeaseLost);
             }
-            row.turn_ids_json = serde_json::to_string(&running_turn_ids).map_err(|_| MemoryError::Internal)?;
-            row.through_turn_id = running_turn_ids.last().cloned().ok_or(MemoryError::InvalidInput)?;
-            row.input_hash = running_hash;
-        } else if row.input_hash != running_hash {
-            let updated = jobs
+            *row = jobs
                 .memory
-                .update_job_input_hash(user_id, &row.id, &row.turn_ids_json, &running_hash, now_ms())
+                .get_job(user_id, &row.id)
                 .await
-                .map_err(map_db_error)?;
-            if !updated {
-                return Err(MemoryError::LeaseLost);
-            }
-            row.input_hash = running_hash;
+                .map_err(map_db_error)?
+                .ok_or(MemoryError::LeaseLost)?;
         }
         Ok(())
     }
@@ -300,14 +270,15 @@ impl MemoryService {
         worker_id: &str,
         lease_ms: u64,
     ) -> Result<Option<ClaimedMemoryJob>, MemoryError> {
-        let jobs = self.job_dependencies()?;
         valid_worker_id(worker_id)?;
         let lease_duration_ms = valid_lease_ms(lease_ms)?;
+        let jobs = self.job_dependencies()?;
         if !jobs.readiness.is_usable().await? {
             jobs.memory.block_jobs(user_id, now_ms()).await.map_err(map_db_error)?;
             return Ok(None);
         }
         let now = now_ms();
+        now.checked_add(lease_duration_ms).ok_or(MemoryError::InvalidInput)?;
         jobs.memory.unblock_jobs(user_id, now).await.map_err(map_db_error)?;
         let lease_token = generate_prefixed_id("memory-lease");
         let Some(mut row) = jobs
@@ -347,11 +318,12 @@ impl MemoryService {
         lease_token: &str,
         lease_ms: u64,
     ) -> Result<i64, MemoryError> {
-        let jobs = self.job_dependencies()?;
         valid_worker_id(worker_id)?;
         valid_lease_token(lease_token)?;
-        let now = now_ms();
         let lease_duration_ms = valid_lease_ms(lease_ms)?;
+        let jobs = self.job_dependencies()?;
+        let now = now_ms();
+        let lease_expires_at = now.checked_add(lease_duration_ms).ok_or(MemoryError::InvalidInput)?;
         let renewed = jobs
             .memory
             .renew_lease(RenewMemoryLeaseRow {
@@ -364,7 +336,7 @@ impl MemoryService {
             })
             .await
             .map_err(map_db_error)?;
-        renewed.then_some(now + lease_duration_ms).ok_or(MemoryError::LeaseLost)
+        renewed.then_some(lease_expires_at).ok_or(MemoryError::LeaseLost)
     }
 
     pub async fn release_job(
@@ -460,7 +432,17 @@ impl MemoryService {
             .map_err(map_db_error)?
             .filter(|row| row.user_id == user_id)
             .ok_or(MemoryError::NotFound)?;
-        let claimed_turn_ids = parse_turn_ids(&job.turn_ids_json)?;
+        let claimed_turn_ids = jobs
+            .memory
+            .list_job_turns(user_id, job_id, (crate::sanitizer::MAX_EVIDENCE_TURNS + 1) as u32)
+            .await
+            .map_err(map_db_error)?
+            .into_iter()
+            .map(|turn| turn.turn_id)
+            .collect::<Vec<_>>();
+        if i64::try_from(claimed_turn_ids.len()).map_err(|_| MemoryError::Internal)? != job.turn_count {
+            return Err(MemoryError::InvalidInput);
+        }
         let messages = self
             .load_exact_messages(user_id, &job.conversation_id, &claimed_turn_ids)
             .await?;
@@ -738,19 +720,14 @@ impl MemoryService {
     pub async fn set_global_capture_enabled(&self, user_id: &str, enabled: bool) -> Result<(), MemoryError> {
         let jobs = self.job_dependencies()?;
         jobs.memory
-            .update_settings(UpdateMemorySettingsRow {
+            .update_memory_lifecycle(UpdateMemoryLifecycleRow {
                 user_id: user_id.into(),
                 enabled: None,
                 default_capture: Some(enabled),
-                default_recall: None,
-                consent_version: None,
                 now: now_ms(),
             })
             .await
             .map_err(map_db_error)?;
-        if !enabled {
-            self.cancel_all_jobs(user_id).await?;
-        }
         Ok(())
     }
 
@@ -758,19 +735,14 @@ impl MemoryService {
     pub async fn set_memory_enabled(&self, user_id: &str, enabled: bool) -> Result<(), MemoryError> {
         let jobs = self.job_dependencies()?;
         jobs.memory
-            .update_settings(UpdateMemorySettingsRow {
+            .update_memory_lifecycle(UpdateMemoryLifecycleRow {
                 user_id: user_id.into(),
                 enabled: Some(enabled),
                 default_capture: None,
-                default_recall: None,
-                consent_version: None,
                 now: now_ms(),
             })
             .await
             .map_err(map_db_error)?;
-        if !enabled {
-            self.cancel_all_jobs(user_id).await?;
-        }
         Ok(())
     }
 
@@ -783,18 +755,14 @@ impl MemoryService {
     ) -> Result<(), MemoryError> {
         let jobs = self.job_dependencies()?;
         jobs.memory
-            .update_conversation_policy(UpdateConversationMemoryPolicyRow {
+            .update_conversation_memory_lifecycle(UpdateConversationMemoryLifecycleRow {
                 user_id: user_id.into(),
                 conversation_id: conversation_id.into(),
-                capture_enabled: Some(enabled),
-                recall_enabled: None,
+                capture_enabled: enabled,
                 now: now_ms(),
             })
             .await
             .map_err(map_db_error)?;
-        if !enabled {
-            self.cancel_conversation_jobs(user_id, conversation_id).await?;
-        }
         Ok(())
     }
 
@@ -831,7 +799,9 @@ impl MemoryService {
 
 fn valid_lease_ms(lease_ms: u64) -> Result<i64, MemoryError> {
     let lease_ms: i64 = lease_ms.try_into().map_err(|_| MemoryError::InvalidInput)?;
-    (lease_ms > 0).then_some(lease_ms).ok_or(MemoryError::InvalidInput)
+    (lease_ms > 0 && lease_ms <= MAX_LEASE_DURATION_MS as i64)
+        .then_some(lease_ms)
+        .ok_or(MemoryError::InvalidInput)
 }
 
 fn valid_worker_id(worker_id: &str) -> Result<(), MemoryError> {
@@ -844,18 +814,6 @@ fn valid_lease_token(lease_token: &str) -> Result<(), MemoryError> {
     (!lease_token.trim().is_empty() && lease_token.len() <= 200)
         .then_some(())
         .ok_or(MemoryError::InvalidInput)
-}
-
-fn parse_turn_ids(value: &str) -> Result<Vec<String>, MemoryError> {
-    let turn_ids: Vec<String> = serde_json::from_str(value).map_err(|_| MemoryError::Internal)?;
-    if turn_ids
-        .iter()
-        .any(|turn_id| turn_id.trim().is_empty() || turn_id.len() > MAX_STRING_LENGTH)
-        || turn_ids.iter().collect::<std::collections::HashSet<_>>().len() != turn_ids.len()
-    {
-        return Err(MemoryError::InvalidInput);
-    }
-    Ok(turn_ids)
 }
 
 fn messages_for_turns(messages: &[MessageRow], turn_ids: &[String]) -> Vec<MessageRow> {
