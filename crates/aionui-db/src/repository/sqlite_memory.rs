@@ -12,17 +12,38 @@ use crate::DbError;
 use crate::models::{
     ConversationMemoryRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow, MemoryEntryDbRow, MemoryEntryRow,
     MemoryImportStateRow, MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow, MemorySettingsRow, MemorySourceRow,
+    MessageRow,
 };
 use crate::repository::memory::{
-    ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
-    CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, IMemoryRepository, MemoryCandidateQueryRow,
-    MemoryEntryQueryRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, SplitMemoryJobRow, TransitionMemoryJobRow,
-    UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow,
-    UpdateMemoryLifecycleRow, UpdateMemorySettingsRow,
+    BoundedMemoryTurnMessagesRow, ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition,
+    CommitMemorySourceRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, IMemoryRepository,
+    MemoryCandidateQueryRow, MemoryEntryQueryRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, SplitMemoryJobRow,
+    TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow,
+    UpdateMemoryEntryRow, UpdateMemoryLifecycleRow, UpdateMemorySettingsRow,
 };
 
 const MAX_MEMORY_CANDIDATES: u32 = 200;
 const QUEUE_DIGEST_MULTIPLIER: u128 = 0x100000001b3;
+const TURN_SNAPSHOT_VERSION: &str = "memory-turn-snapshot-v1";
+const SNAPSHOT_CHUNK_BYTES: i64 = 16 * 1024;
+
+#[derive(sqlx::FromRow)]
+struct CanonicalMessageMetadataRow {
+    id: String,
+    msg_id: Option<String>,
+    r#type: String,
+    position: Option<String>,
+    status: Option<String>,
+    hidden: bool,
+    created_at: i64,
+    content_bytes: i64,
+}
+
+struct CanonicalTurnSnapshot {
+    hash: String,
+    message_count: i64,
+    content_bytes: i64,
+}
 
 struct QueueTransition<'a> {
     state: &'a str,
@@ -107,30 +128,191 @@ impl SqliteMemoryRepository {
             .collect())
     }
 
+    fn update_framed(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+
+    async fn canonical_turn_snapshot_on(
+        connection: &mut SqliteConnection,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<CanonicalTurnSnapshot, DbError> {
+        let mut hasher = Sha256::new();
+        Self::update_framed(&mut hasher, TURN_SNAPSHOT_VERSION.as_bytes());
+        Self::update_framed(&mut hasher, conversation_id.as_bytes());
+        Self::update_framed(&mut hasher, turn_id.as_bytes());
+        let mut message_count = 0_i64;
+        let mut content_bytes = 0_i64;
+        loop {
+            let metadata: Option<CanonicalMessageMetadataRow> = sqlx::query_as(
+                "SELECT id,msg_id,type,position,status,hidden,created_at,length(CAST(content AS BLOB)) AS content_bytes
+                 FROM messages WHERE conversation_id = ? AND turn_id = ?
+                 ORDER BY created_at,id LIMIT 1 OFFSET ?",
+            )
+            .bind(conversation_id)
+            .bind(turn_id)
+            .bind(message_count)
+            .fetch_optional(&mut *connection)
+            .await?;
+            let Some(metadata) = metadata else { break };
+            let structured = serde_json::to_vec(&(
+                metadata.id.as_str(),
+                metadata.msg_id.as_deref(),
+                metadata.r#type.as_str(),
+                metadata.position.as_deref(),
+                metadata.status.as_deref(),
+                metadata.hidden,
+                metadata.created_at,
+                metadata.content_bytes,
+            ))
+            .map_err(|error| DbError::Init(error.to_string()))?;
+            Self::update_framed(&mut hasher, &structured);
+            let mut offset = 1_i64;
+            while offset <= metadata.content_bytes {
+                let chunk: Vec<u8> =
+                    sqlx::query_scalar("SELECT substr(CAST(content AS BLOB), ?, ?) FROM messages WHERE id = ?")
+                        .bind(offset)
+                        .bind(SNAPSHOT_CHUNK_BYTES)
+                        .bind(&metadata.id)
+                        .fetch_one(&mut *connection)
+                        .await?;
+                if chunk.is_empty() {
+                    return Err(DbError::Conflict(
+                        "Canonical message content changed while hashing".into(),
+                    ));
+                }
+                hasher.update(&chunk);
+                offset = offset
+                    .checked_add(
+                        i64::try_from(chunk.len()).map_err(|_| DbError::Conflict("Message size overflow".into()))?,
+                    )
+                    .ok_or_else(|| DbError::Conflict("Message size overflow".into()))?;
+            }
+            message_count = message_count
+                .checked_add(1)
+                .ok_or_else(|| DbError::Conflict("Message count overflow".into()))?;
+            content_bytes = content_bytes
+                .checked_add(metadata.content_bytes)
+                .ok_or_else(|| DbError::Conflict("Message size overflow".into()))?;
+        }
+        Ok(CanonicalTurnSnapshot {
+            hash: hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect(),
+            message_count,
+            content_bytes,
+        })
+    }
+
+    fn conversation_is_excluded(kind: &str, source: Option<&str>, extra: &str) -> bool {
+        let kind = kind.trim().to_ascii_lowercase();
+        let source = source.unwrap_or_default().trim().to_ascii_lowercase();
+        if matches!(
+            kind.as_str(),
+            "health_check" | "health-check" | "internal" | "ephemeral"
+        ) || matches!(source.as_str(), "health_check" | "health-check" | "internal")
+        {
+            return true;
+        }
+        let Ok(serde_json::Value::Object(extra)) = serde_json::from_str(extra) else {
+            return true;
+        };
+        ["health_check", "internal", "ephemeral"]
+            .into_iter()
+            .any(|key| extra.get(key).and_then(serde_json::Value::as_bool) == Some(true))
+    }
+
+    async fn job_snapshot_matches_on(connection: &mut SqliteConnection, job: &MemoryJobRow) -> Result<bool, DbError> {
+        let turns: Vec<MemoryJobTurnRow> = sqlx::query_as(
+            "SELECT job_id,position,turn_id,turn_hash FROM memory_job_turns
+             WHERE job_id = ? ORDER BY position LIMIT 33",
+        )
+        .bind(&job.id)
+        .fetch_all(&mut *connection)
+        .await?;
+        if turns.len() as i64 != job.turn_count || turns.len() > 32 {
+            return Ok(false);
+        }
+        for turn in turns {
+            let snapshot = Self::canonical_turn_snapshot_on(connection, &job.conversation_id, &turn.turn_id).await?;
+            if snapshot.hash != turn.turn_hash {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     async fn transition_running_on(
         connection: &mut SqliteConnection,
         running: &MemoryJobRow,
         transition: QueueTransition<'_>,
     ) -> Result<MemoryJobRow, DbError> {
-        let successor: Option<MemoryJobRow> = if matches!(transition.state, "pending" | "retry_wait" | "blocked") {
-            sqlx::query_as(
-                "SELECT * FROM memory_jobs WHERE user_id = ? AND conversation_id = ?
+        let successor: Option<MemoryJobRow> =
+            if matches!(transition.state, "pending" | "retry_wait" | "blocked" | "failed") {
+                sqlx::query_as(
+                    "SELECT * FROM memory_jobs WHERE user_id = ? AND conversation_id = ?
                  AND state IN ('pending','retry_wait','blocked') LIMIT 1",
-            )
-            .bind(&running.user_id)
-            .bind(&running.conversation_id)
-            .fetch_optional(&mut *connection)
-            .await?
-        } else {
-            None
-        };
+                )
+                .bind(&running.user_id)
+                .bind(&running.conversation_id)
+                .fetch_optional(&mut *connection)
+                .await?
+            } else {
+                None
+            };
         let attempt_count = running.attempt_count + i64::from(transition.increment_attempt);
         let invalid_output_count = running.invalid_output_count + i64::from(transition.increment_invalid_output);
         if let Some(successor) = successor {
-            let parking_offset = running
+            let combined_count = running
                 .turn_count
                 .checked_add(successor.turn_count)
                 .ok_or_else(|| DbError::Conflict("Memory queue length overflow".into()))?;
+            let digest = Self::concat_queue_digest(
+                Self::parse_queue_digest(&running.queue_digest)?,
+                Self::parse_queue_digest(&successor.queue_digest)?,
+                successor.turn_count,
+            )?;
+            let input_hash = Self::input_hash(
+                &running.operation_version,
+                running.global_epoch,
+                running.conversation_epoch,
+                running.from_turn_id.as_deref(),
+                combined_count,
+                digest,
+            )?;
+            if transition.state == "failed" {
+                sqlx::query("UPDATE memory_job_turns SET job_id = ?,position = position + ? WHERE job_id = ?")
+                    .bind(&running.id)
+                    .bind(running.turn_count)
+                    .bind(&successor.id)
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("DELETE FROM memory_jobs WHERE id = ?")
+                    .bind(&successor.id)
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query(
+                    "UPDATE memory_jobs SET through_turn_id = ?,turn_count = ?,queue_digest = ?,input_hash = ?,
+                     state = 'failed',attempt_count = ?,invalid_output_count = ?,next_attempt_at = NULL,
+                     last_error_code = ?,lease_owner = NULL,lease_token = NULL,lease_expires_at = NULL,updated_at = ?
+                     WHERE id = ?",
+                )
+                .bind(&successor.through_turn_id)
+                .bind(combined_count)
+                .bind(Self::queue_digest(digest))
+                .bind(input_hash)
+                .bind(attempt_count)
+                .bind(invalid_output_count)
+                .bind(transition.error_code)
+                .bind(transition.now)
+                .bind(&running.id)
+                .execute(&mut *connection)
+                .await?;
+                return Ok(sqlx::query_as("SELECT * FROM memory_jobs WHERE id = ?")
+                    .bind(&running.id)
+                    .fetch_one(&mut *connection)
+                    .await?);
+            }
+            let parking_offset = combined_count;
             sqlx::query("UPDATE memory_job_turns SET position = position + ? WHERE job_id = ?")
                 .bind(parking_offset)
                 .bind(&successor.id)
@@ -148,20 +330,7 @@ impl SqliteMemoryRepository {
                 .bind(parking_offset)
                 .execute(&mut *connection)
                 .await?;
-            let digest = Self::concat_queue_digest(
-                Self::parse_queue_digest(&running.queue_digest)?,
-                Self::parse_queue_digest(&successor.queue_digest)?,
-                successor.turn_count,
-            )?;
-            let turn_count = parking_offset;
-            let input_hash = Self::input_hash(
-                &running.operation_version,
-                running.global_epoch,
-                running.conversation_epoch,
-                running.from_turn_id.as_deref(),
-                turn_count,
-                digest,
-            )?;
+            let turn_count = combined_count;
             sqlx::query(
                 "UPDATE memory_jobs SET from_turn_id = ?, operation_version = ?, global_epoch = ?,
                  conversation_epoch = ?, turn_count = ?, queue_digest = ?, input_hash = ?, expected_revision = ?,
@@ -639,6 +808,13 @@ impl IMemoryRepository for SqliteMemoryRepository {
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
         let result = async {
             Self::ensure_conversation_on(&mut connection, &input.user_id, &input.conversation_id).await?;
+            let conversation: (Option<String>, String, Option<String>, String) = sqlx::query_as(
+                "SELECT status,type,source,extra FROM conversations WHERE id = ? AND user_id = ?",
+            )
+            .bind(&input.conversation_id)
+            .bind(&input.user_id)
+            .fetch_one(&mut *connection)
+            .await?;
             let settings: (bool, bool, Option<i64>, Option<i64>, i64) = sqlx::query_as(
                 "SELECT enabled,default_capture,consent_version,reset_at,lifecycle_epoch
                  FROM memory_settings WHERE user_id = ?",
@@ -671,6 +847,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 || settings.2 != Some(input.required_consent_version)
                 || settings.4 != input.expected_global_epoch
                 || conversation_epoch != input.expected_conversation_epoch
+                || conversation.0.as_deref() != Some("finished")
+                || Self::conversation_is_excluded(&conversation.1, conversation.2.as_deref(), &conversation.3)
                 || earliest_at.is_none()
                 || !has_user_work
                 || !has_assistant_outcome
@@ -691,6 +869,9 @@ impl IMemoryRepository for SqliteMemoryRepository {
             if duplicate {
                 return Ok(None);
             }
+            let snapshot =
+                Self::canonical_turn_snapshot_on(&mut connection, &input.conversation_id, &input.through_turn_id)
+                    .await?;
             let running = sqlx::query_as::<_, MemoryJobRow>(
                 "SELECT * FROM memory_jobs WHERE user_id = ? AND conversation_id = ? AND state = 'running' LIMIT 1",
             ).bind(&input.user_id).bind(&input.conversation_id).fetch_optional(&mut *connection).await?;
@@ -702,16 +883,30 @@ impl IMemoryRepository for SqliteMemoryRepository {
             .bind(&input.conversation_id)
             .fetch_optional(&mut *connection)
             .await?;
+            let current_memory: Option<(String, i64)> = sqlx::query_as(
+                "SELECT through_turn_id,revision FROM conversation_memories WHERE user_id = ? AND conversation_id = ?",
+            )
+            .bind(&input.user_id)
+            .bind(&input.conversation_id)
+            .fetch_optional(&mut *connection)
+            .await?;
+            let base_from_turn_id = running
+                .as_ref()
+                .map(|job| job.through_turn_id.clone())
+                .or_else(|| current_memory.as_ref().map(|memory| memory.0.clone()));
+            let base_revision = running
+                .as_ref()
+                .map_or_else(|| current_memory.as_ref().map_or(0, |memory| memory.1), |job| job.expected_revision);
             if let Some(pending) = pending {
                 let digest = Self::append_queue_digest(
-                    Self::parse_queue_digest(&pending.queue_digest)?, &input.through_turn_id, &input.turn_hash,
+                    Self::parse_queue_digest(&pending.queue_digest)?, &input.through_turn_id, &snapshot.hash,
                 );
                 let turn_count = pending
                     .turn_count
                     .checked_add(1)
                     .ok_or_else(|| DbError::Conflict("Memory queue length overflow".into()))?;
                 let input_hash = Self::input_hash(
-                    &input.operation_version, settings.4, conversation_epoch, pending.from_turn_id.as_deref(),
+                    &input.operation_version, settings.4, conversation_epoch, base_from_turn_id.as_deref(),
                     turn_count, digest,
                 )?;
                 sqlx::query(
@@ -720,18 +915,19 @@ impl IMemoryRepository for SqliteMemoryRepository {
                      VALUES (?,?,?,?,?,?,?)",
                 ).bind(&pending.id).bind(&input.user_id).bind(&input.conversation_id)
                 .bind(&input.operation_version).bind(pending.turn_count).bind(&input.through_turn_id)
-                .bind(&input.turn_hash).execute(&mut *connection).await?;
+                .bind(&snapshot.hash).execute(&mut *connection).await?;
                 sqlx::query(
-                    "UPDATE memory_jobs SET through_turn_id = ?, operation_version = ?, global_epoch = ?,
+                    "UPDATE memory_jobs SET from_turn_id = ?,through_turn_id = ?, operation_version = ?, global_epoch = ?,
                      conversation_epoch = ?, turn_count = ?, queue_digest = ?, input_hash = ?, expected_revision = ?,
                      state = 'pending', next_attempt_at = NULL, last_error_code = NULL, updated_at = ?
                      WHERE id = ? AND user_id = ?",
                 )
+                .bind(&base_from_turn_id)
                 .bind(&input.through_turn_id)
                 .bind(&input.operation_version)
                 .bind(settings.4).bind(conversation_epoch).bind(turn_count).bind(Self::queue_digest(digest))
                 .bind(input_hash)
-                .bind(input.expected_revision)
+                .bind(base_revision)
                 .bind(input.now)
                 .bind(&pending.id)
                 .bind(&input.user_id)
@@ -742,9 +938,9 @@ impl IMemoryRepository for SqliteMemoryRepository {
                     .fetch_optional(&mut *connection)
                     .await?);
             }
-            let from_turn_id = running.as_ref().map(|job| job.through_turn_id.clone()).or(input.from_turn_id);
-            let expected_revision = running.as_ref().map_or(input.expected_revision, |job| job.expected_revision);
-            let digest = Self::append_queue_digest(0, &input.through_turn_id, &input.turn_hash);
+            let from_turn_id = base_from_turn_id;
+            let expected_revision = base_revision;
+            let digest = Self::append_queue_digest(0, &input.through_turn_id, &snapshot.hash);
             let input_hash = Self::input_hash(
                 &input.operation_version, settings.4, conversation_epoch, from_turn_id.as_deref(), 1, digest,
             )?;
@@ -771,7 +967,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
                  (job_id,user_id,conversation_id,operation_version,position,turn_id,turn_hash)
                  VALUES (?,?,?,?,0,?,?)",
             ).bind(&input.id).bind(&input.user_id).bind(&input.conversation_id)
-            .bind(&input.operation_version).bind(&input.through_turn_id).bind(&input.turn_hash)
+            .bind(&input.operation_version).bind(&input.through_turn_id).bind(&snapshot.hash)
             .execute(&mut *connection).await?;
             Ok(sqlx::query_as("SELECT * FROM memory_jobs WHERE id = ?")
                 .bind(&input.id)
@@ -871,6 +1067,146 @@ impl IMemoryRepository for SqliteMemoryRepository {
         .bind(limit.max(1))
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    async fn load_job_turn_messages_bounded(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        turn_id: &str,
+        max_messages: u32,
+        max_bytes: u64,
+    ) -> Result<BoundedMemoryTurnMessagesRow, DbError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let result = async {
+            let stored: Option<(String, String)> = sqlx::query_as(
+                "SELECT turns.turn_hash,jobs.conversation_id FROM memory_job_turns turns
+                 JOIN memory_jobs jobs ON jobs.id = turns.job_id
+                 WHERE turns.job_id = ? AND turns.turn_id = ? AND jobs.user_id = ?",
+            )
+            .bind(job_id)
+            .bind(turn_id)
+            .bind(user_id)
+            .fetch_optional(&mut *connection)
+            .await?;
+            let Some((stored_hash, conversation_id)) = stored else {
+                return Err(DbError::NotFound(format!("Memory job turn '{turn_id}' not found")));
+            };
+            let snapshot = Self::canonical_turn_snapshot_on(&mut connection, &conversation_id, turn_id).await?;
+            let max_bytes: i64 = max_bytes
+                .try_into()
+                .map_err(|_| DbError::Conflict("Memory evidence byte limit overflow".into()))?;
+            let limit_exceeded = snapshot.message_count > i64::from(max_messages) || snapshot.content_bytes > max_bytes;
+            let messages = if limit_exceeded {
+                Vec::new()
+            } else {
+                sqlx::query_as::<_, MessageRow>(
+                    "SELECT * FROM messages WHERE conversation_id = ? AND turn_id = ? ORDER BY created_at,id",
+                )
+                .bind(&conversation_id)
+                .bind(turn_id)
+                .fetch_all(&mut *connection)
+                .await?
+            };
+            Ok(BoundedMemoryTurnMessagesRow {
+                messages,
+                message_count: snapshot.message_count,
+                content_bytes: snapshot.content_bytes,
+                snapshot_matches: snapshot.hash == stored_hash,
+                snapshot_hash: snapshot.hash,
+                limit_exceeded,
+            })
+        }
+        .await;
+        match result {
+            Ok(row) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(row)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn refresh_claimed_job_snapshot(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        lease_token: &str,
+        now: TimestampMs,
+        max_turns: u32,
+    ) -> Result<Option<MemoryJobRow>, DbError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let result = async {
+            let job: Option<MemoryJobRow> = sqlx::query_as(
+                "SELECT * FROM memory_jobs WHERE id = ? AND user_id = ? AND state = 'running'
+                 AND lease_token = ? AND lease_expires_at > ?",
+            )
+            .bind(job_id)
+            .bind(user_id)
+            .bind(lease_token)
+            .bind(now)
+            .fetch_optional(&mut *connection)
+            .await?;
+            let Some(job) = job else { return Ok(None) };
+            let turns: Vec<MemoryJobTurnRow> = sqlx::query_as(
+                "SELECT job_id,position,turn_id,turn_hash FROM memory_job_turns
+                 WHERE job_id = ? ORDER BY position LIMIT ?",
+            )
+            .bind(job_id)
+            .bind(i64::from(max_turns) + 1)
+            .fetch_all(&mut *connection)
+            .await?;
+            if turns.len() > max_turns as usize || turns.len() as i64 != job.turn_count {
+                return Err(DbError::Conflict("Memory claimed batch exceeds snapshot bound".into()));
+            }
+            let mut digest = 0_u128;
+            for turn in turns {
+                let snapshot =
+                    Self::canonical_turn_snapshot_on(&mut connection, &job.conversation_id, &turn.turn_id).await?;
+                sqlx::query("UPDATE memory_job_turns SET turn_hash = ? WHERE job_id = ? AND position = ?")
+                    .bind(&snapshot.hash)
+                    .bind(job_id)
+                    .bind(turn.position)
+                    .execute(&mut *connection)
+                    .await?;
+                digest = Self::append_queue_digest(digest, &turn.turn_id, &snapshot.hash);
+            }
+            let input_hash = Self::input_hash(
+                &job.operation_version,
+                job.global_epoch,
+                job.conversation_epoch,
+                job.from_turn_id.as_deref(),
+                job.turn_count,
+                digest,
+            )?;
+            sqlx::query("UPDATE memory_jobs SET queue_digest = ?,input_hash = ?,updated_at = ? WHERE id = ?")
+                .bind(Self::queue_digest(digest))
+                .bind(input_hash)
+                .bind(now)
+                .bind(job_id)
+                .execute(&mut *connection)
+                .await?;
+            Ok(sqlx::query_as("SELECT * FROM memory_jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_optional(&mut *connection)
+                .await?)
+        }
+        .await;
+        match result {
+            Ok(row) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(row)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
     }
 
     async fn split_claimed_job(&self, input: SplitMemoryJobRow) -> Result<bool, DbError> {
@@ -1375,6 +1711,22 @@ impl IMemoryRepository for SqliteMemoryRepository {
                     "Memory job '{}' lease or cursor changed",
                     input.job_id
                 )));
+            }
+            if !Self::job_snapshot_matches_on(&mut connection, &job).await? {
+                Self::transition_running_on(
+                    &mut connection,
+                    &job,
+                    QueueTransition {
+                        state: "pending",
+                        next_attempt_at: None,
+                        error_code: Some("snapshot_changed"),
+                        increment_attempt: false,
+                        increment_invalid_output: false,
+                        now: input.now,
+                    },
+                )
+                .await?;
+                return Ok(CommitMemoryUpdateResult::SnapshotChanged);
             }
 
             let current_revision: Option<i64> = sqlx::query_scalar(
@@ -2119,14 +2471,11 @@ mod tests {
             id: id.into(),
             user_id: USER_A.into(),
             conversation_id: conversation_id.into(),
-            from_turn_id: None,
             through_turn_id: through_turn_id.into(),
             operation_version: "memory-operation-v1".into(),
-            turn_hash: format!("turn-hash-{through_turn_id}"),
             expected_global_epoch: 0,
             expected_conversation_epoch: 0,
             required_consent_version: 1,
-            expected_revision: 0,
             now,
         }
     }
@@ -2453,6 +2802,114 @@ mod tests {
             .unwrap()
         );
         assert_merged_successor(&repo, &running.id, &successor.id, "pending", 0).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_terminal_failures_absorb_successor_without_skipping_predecessor_turns() {
+        for error_code in ["invalid_input", "invalid_output", "exhausted_retry"] {
+            let (repo, _, _db) = setup().await;
+            let (running, successor) = running_with_successor(&repo).await;
+            let failed = repo
+                .transition_running_job(TransitionMemoryJobRow {
+                    user_id: USER_A.into(),
+                    job_id: running.id.clone(),
+                    worker_id: "worker".into(),
+                    lease_token: "lease-running".into(),
+                    state: "failed".into(),
+                    next_attempt_at: None,
+                    error_code: Some(error_code.into()),
+                    increment_attempt: true,
+                    increment_invalid_output: error_code == "invalid_output",
+                    now: 30,
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(failed.id, running.id, "{error_code}");
+            assert_eq!(failed.state, "failed", "{error_code}");
+            assert!(repo.get_job(USER_A, &successor.id).await.unwrap().is_none());
+            assert_eq!(failed.turn_count, 3);
+            assert_eq!(
+                repo.list_job_turns(USER_A, &failed.id, 10)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|turn| turn.turn_id)
+                    .collect::<Vec<_>>(),
+                ["turn-1", "turn-2", "turn-3"],
+                "{error_code}",
+            );
+
+            sqlx::query("UPDATE memory_jobs SET state = 'pending' WHERE id = ? AND state = 'failed'")
+                .bind(&failed.id)
+                .execute(&repo.pool)
+                .await
+                .unwrap();
+            let retried = repo
+                .claim_next_job(claim(USER_A, "manual-retry", 40))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retried.id, failed.id, "{error_code}");
+            assert_eq!(retried.turn_count, 3, "{error_code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_enqueue_after_commit_uses_transaction_current_cursor_and_revision() {
+        let (repo, _, _db) = setup().await;
+        claimed_job(&repo, "job-first", "conv_a", "turn-1").await;
+        repo.commit_update(commit("job-first", "conv_a", "turn-1", 0, Vec::new(), 20))
+            .await
+            .unwrap();
+
+        enqueue_turn(&repo, "job-second", "conv_a", "turn-2", 30).await;
+        let second = repo.get_job(USER_A, "job-second").await.unwrap().unwrap();
+        assert_eq!(second.from_turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(second.expected_revision, 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_enqueue_stores_the_repository_canonical_snapshot_hash() {
+        let (repo, _, _db) = setup().await;
+        let job = enqueue_turn(&repo, "job-snapshot", "conv_a", "turn-1", 10)
+            .await
+            .unwrap();
+        let stored_hash: String =
+            sqlx::query_scalar("SELECT turn_hash FROM memory_job_turns WHERE job_id = ? AND position = 0")
+                .bind(job.id)
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_ne!(stored_hash, "turn-hash-turn-1");
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_commit_snapshot_drift_requeues_without_partial_writes() {
+        let (repo, _, _db) = setup().await;
+        claimed_job(&repo, "job-drift", "conv_a", "turn-1").await;
+        sqlx::query("UPDATE messages SET status = 'error' WHERE id = 'msg-conv_a-turn-1-assistant'")
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.commit_update(commit("job-drift", "conv_a", "turn-1", 0, Vec::new(), 20))
+                .await
+                .unwrap(),
+            CommitMemoryUpdateResult::SnapshotChanged,
+        );
+        assert_eq!(
+            repo.get_job(USER_A, "job-drift").await.unwrap().unwrap().state,
+            "pending",
+        );
+        assert!(repo.get_conversation_memory(USER_A, "conv_a").await.unwrap().is_none());
+        let change_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_change_sets WHERE job_id = 'job-drift'")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(change_count, 0);
     }
 
     #[tokio::test]

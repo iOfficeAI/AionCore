@@ -1,5 +1,8 @@
 use aionui_api_types::{MemoryJobResponse, MemoryJobState};
-use aionui_db::models::{ConversationRow, EffectiveMemoryPolicyRow, MemoryJobRow, MessageRow};
+use aionui_db::models::MemoryJobRow;
+#[cfg(test)]
+use aionui_db::models::{ConversationRow, EffectiveMemoryPolicyRow, MessageRow};
+#[cfg(test)]
 use serde_json::Value;
 
 /// Conversation-orchestrator outcome observed after canonical persistence.
@@ -27,6 +30,7 @@ impl std::ops::Deref for ClaimedMemoryJob {
 
 pub(crate) const MEMORY_DISCLOSURE_VERSION: i64 = 1;
 
+#[cfg(test)]
 pub(crate) fn eligible_completed_turn(
     conversation: &ConversationRow,
     policy: &EffectiveMemoryPolicyRow,
@@ -57,6 +61,7 @@ pub(crate) fn eligible_completed_turn(
     has_visible_user_work && has_visible_assistant_outcome
 }
 
+#[cfg(test)]
 fn is_excluded_conversation(conversation: &ConversationRow) -> bool {
     let kind = conversation.r#type.trim().to_ascii_lowercase();
     let source = conversation
@@ -80,6 +85,7 @@ fn is_excluded_conversation(conversation: &ConversationRow) -> bool {
         .any(|key| extra.get(key).and_then(Value::as_bool) == Some(true))
 }
 
+#[cfg(test)]
 fn visible_text(message: &MessageRow, position: &str) -> bool {
     !message.hidden
         && message.position.as_deref() == Some(position)
@@ -91,6 +97,7 @@ fn visible_text(message: &MessageRow, position: &str) -> bool {
             .is_some_and(|content| !content.trim().is_empty())
 }
 
+#[cfg(test)]
 fn visible_assistant_outcome(message: &MessageRow) -> bool {
     if message.hidden || message.position.as_deref() != Some("left") || message.status.as_deref() != Some("finish") {
         return false;

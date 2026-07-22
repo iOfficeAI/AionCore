@@ -3,7 +3,7 @@ use aionui_common::TimestampMs;
 use crate::DbError;
 use crate::models::{
     ConversationMemoryRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow, MemoryEntryRow, MemoryImportStateRow,
-    MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow, MemorySettingsRow,
+    MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow, MemorySettingsRow, MessageRow,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,15 +30,22 @@ pub struct EnqueueMemoryTurnRow {
     pub id: String,
     pub user_id: String,
     pub conversation_id: String,
-    pub from_turn_id: Option<String>,
     pub through_turn_id: String,
     pub operation_version: String,
-    pub turn_hash: String,
     pub expected_global_epoch: i64,
     pub expected_conversation_epoch: i64,
     pub required_consent_version: i64,
-    pub expected_revision: i64,
     pub now: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedMemoryTurnMessagesRow {
+    pub messages: Vec<MessageRow>,
+    pub message_count: i64,
+    pub content_bytes: i64,
+    pub snapshot_hash: String,
+    pub snapshot_matches: bool,
+    pub limit_exceeded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +187,7 @@ pub enum CommitMemoryUpdateResult {
     StaleRevision {
         current_revision: i64,
     },
+    SnapshotChanged,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -227,6 +235,22 @@ pub trait IMemoryRepository: Send + Sync {
     async fn enqueue_completed_turn(&self, input: EnqueueMemoryTurnRow) -> Result<Option<MemoryJobRow>, DbError>;
     async fn claim_next_job(&self, input: ClaimMemoryJobRow) -> Result<Option<MemoryJobRow>, DbError>;
     async fn list_job_turns(&self, user_id: &str, job_id: &str, limit: u32) -> Result<Vec<MemoryJobTurnRow>, DbError>;
+    async fn load_job_turn_messages_bounded(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        turn_id: &str,
+        max_messages: u32,
+        max_bytes: u64,
+    ) -> Result<BoundedMemoryTurnMessagesRow, DbError>;
+    async fn refresh_claimed_job_snapshot(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        lease_token: &str,
+        now: TimestampMs,
+        max_turns: u32,
+    ) -> Result<Option<MemoryJobRow>, DbError>;
     async fn split_claimed_job(&self, input: SplitMemoryJobRow) -> Result<bool, DbError>;
     async fn update_memory_lifecycle(&self, input: UpdateMemoryLifecycleRow) -> Result<(), DbError>;
     async fn update_conversation_memory_lifecycle(

@@ -7,7 +7,7 @@ use aionui_api_types::{
     MemorySummary, MemoryUpdateInput, NormalizedMemoryJobFailure,
 };
 use aionui_common::{generate_prefixed_id, now_ms};
-use aionui_db::models::{MemoryJobRow, MessageRow};
+use aionui_db::models::MemoryJobRow;
 use aionui_db::{
     ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
     CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, IConversationRepository, IMemoryRepository,
@@ -21,10 +21,11 @@ use tracing::{debug, warn};
 use crate::{
     AppOperationsReadinessPort, EvidenceBuildRequest, MemoryError, MemoryTurnOutcome,
     evidence::EvidenceBuilder,
-    jobs::{ClaimedMemoryJob, eligible_completed_turn, job_response},
+    jobs::{ClaimedMemoryJob, job_response},
     sanitizer::{
-        MAX_EXISTING_ENTRIES, MAX_MUTATION_COUNT, MAX_STRING_LENGTH, MAX_SUMMARY_BYTES, MAX_SUMMARY_ITEMS,
-        OPERATION_VERSION, SANITIZER_VERSION, sanitize_text, strip_user_context_sentences,
+        MAX_EVIDENCE_BYTES, MAX_EVIDENCE_MESSAGES, MAX_EVIDENCE_TURNS, MAX_EXISTING_ENTRIES, MAX_MUTATION_COUNT,
+        MAX_STRING_LENGTH, MAX_SUMMARY_BYTES, MAX_SUMMARY_ITEMS, OPERATION_VERSION, sanitize_text,
+        strip_user_context_sentences,
     },
 };
 
@@ -121,47 +122,25 @@ impl MemoryService {
         outcome: MemoryTurnOutcome,
     ) -> Result<bool, MemoryError> {
         let jobs = self.job_dependencies()?;
-        let conversation = jobs
-            .conversations
-            .get(conversation_id)
-            .await
-            .map_err(map_db_error)?
-            .filter(|row| row.user_id == user_id)
-            .ok_or(MemoryError::NotFound)?;
-        let messages = jobs
-            .conversations
-            .list_messages_by_turn(user_id, conversation_id, turn_id)
-            .await
-            .map_err(map_db_error)?;
+        if outcome != MemoryTurnOutcome::Completed {
+            return Ok(false);
+        }
         let policy = jobs
             .memory
             .effective_policy(user_id, conversation_id)
             .await
             .map_err(map_db_error)?;
-        if !eligible_completed_turn(&conversation, &policy, &messages, outcome) {
-            return Ok(false);
-        }
-        let previous = jobs
-            .memory
-            .get_conversation_memory(user_id, conversation_id)
-            .await
-            .map_err(map_db_error)?;
-        let turn_ids = vec![turn_id.to_owned()];
-        let turn_hash = evidence_input_hash(None, &turn_ids, &messages)?;
         let enqueued = jobs
             .memory
             .enqueue_completed_turn(EnqueueMemoryTurnRow {
                 id: generate_prefixed_id("memory-job"),
                 user_id: user_id.into(),
                 conversation_id: conversation_id.into(),
-                from_turn_id: previous.as_ref().map(|memory| memory.through_turn_id.clone()),
                 through_turn_id: turn_id.into(),
                 operation_version: OPERATION_VERSION.into(),
-                turn_hash,
                 expected_global_epoch: policy.global_epoch,
                 expected_conversation_epoch: policy.conversation_epoch,
                 required_consent_version: super::jobs::MEMORY_DISCLOSURE_VERSION,
-                expected_revision: previous.as_ref().map_or(0, |memory| memory.revision),
                 now: now_ms(),
             })
             .await
@@ -192,28 +171,71 @@ impl MemoryService {
             .map_err(map_db_error)?
             .filter(|conversation| conversation.user_id == user_id)
             .ok_or(MemoryError::NotFound)?;
-        let all_messages = self
-            .load_exact_messages(user_id, &row.conversation_id, &turn_ids)
-            .await?;
-
-        let mut bounded_count = turn_ids.len().min(crate::sanitizer::MAX_EVIDENCE_TURNS);
-        while bounded_count > 1 {
-            let bounded_turn_ids = turn_ids[..bounded_count].to_vec();
-            let bounded_messages = messages_for_turns(&all_messages, &bounded_turn_ids);
+        let mut bounded_count = 0_usize;
+        let mut message_count = 0_usize;
+        let mut content_bytes = 0_usize;
+        let mut all_messages = Vec::new();
+        for turn_id in turn_ids.iter().take(MAX_EVIDENCE_TURNS) {
+            let remaining_messages = MAX_EVIDENCE_MESSAGES.saturating_sub(message_count);
+            let remaining_bytes = MAX_EVIDENCE_BYTES.saturating_sub(content_bytes);
+            let turn = jobs
+                .memory
+                .load_job_turn_messages_bounded(
+                    user_id,
+                    &row.id,
+                    turn_id,
+                    remaining_messages.try_into().map_err(|_| MemoryError::Internal)?,
+                    remaining_bytes.try_into().map_err(|_| MemoryError::Internal)?,
+                )
+                .await
+                .map_err(map_db_error)?;
+            if turn.limit_exceeded {
+                break;
+            }
+            let next_message_count: usize = turn.message_count.try_into().map_err(|_| MemoryError::Internal)?;
+            let next_content_bytes: usize = turn.content_bytes.try_into().map_err(|_| MemoryError::Internal)?;
+            let mut prospective_messages = all_messages.clone();
+            prospective_messages.extend(turn.messages.iter().cloned());
+            let prospective_turn_ids = turn_ids[..=bounded_count].to_vec();
             if self
                 .build_evidence(EvidenceBuildRequest {
                     conversation: conversation.clone(),
-                    messages: bounded_messages,
+                    messages: prospective_messages,
                     previous_summary: None,
                     summary_cursor: row.from_turn_id.clone(),
-                    claimed_turn_ids: bounded_turn_ids,
+                    claimed_turn_ids: prospective_turn_ids,
                     existing_entries: Vec::new(),
                 })
-                .is_ok()
+                .is_err()
             {
                 break;
             }
-            bounded_count -= 1;
+            all_messages.extend(turn.messages);
+            message_count += next_message_count;
+            content_bytes += next_content_bytes;
+            bounded_count += 1;
+        }
+        if bounded_count == 0 {
+            let worker_id = row.lease_owner.clone().ok_or(MemoryError::LeaseLost)?;
+            let failed = jobs
+                .memory
+                .transition_running_job(TransitionMemoryJobRow {
+                    user_id: user_id.into(),
+                    job_id: row.id.clone(),
+                    worker_id,
+                    lease_token: lease_token.into(),
+                    state: "failed".into(),
+                    next_attempt_at: None,
+                    error_code: Some("invalid_input".into()),
+                    increment_attempt: true,
+                    increment_invalid_output: false,
+                    now: now_ms(),
+                })
+                .await
+                .map_err(map_db_error)?
+                .ok_or(MemoryError::LeaseLost)?;
+            *row = failed;
+            return Err(MemoryError::InvalidInput);
         }
 
         if i64::try_from(bounded_count).map_err(|_| MemoryError::Internal)? < row.turn_count {
@@ -232,36 +254,14 @@ impl MemoryService {
             if !split {
                 return Err(MemoryError::LeaseLost);
             }
-            *row = jobs
-                .memory
-                .get_job(user_id, &row.id)
-                .await
-                .map_err(map_db_error)?
-                .ok_or(MemoryError::LeaseLost)?;
         }
+        *row = jobs
+            .memory
+            .refresh_claimed_job_snapshot(user_id, &row.id, lease_token, now_ms(), MAX_EVIDENCE_TURNS as u32)
+            .await
+            .map_err(map_db_error)?
+            .ok_or(MemoryError::LeaseLost)?;
         Ok(())
-    }
-
-    async fn load_exact_messages(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-        turn_ids: &[String],
-    ) -> Result<Vec<MessageRow>, MemoryError> {
-        let jobs = self.job_dependencies()?;
-        let mut messages = Vec::new();
-        for turn_id in turn_ids {
-            let mut turn_messages = jobs
-                .conversations
-                .list_messages_by_turn(user_id, conversation_id, turn_id)
-                .await
-                .map_err(map_db_error)?;
-            if turn_messages.is_empty() {
-                return Err(MemoryError::InvalidInput);
-            }
-            messages.append(&mut turn_messages);
-        }
-        Ok(messages)
     }
 
     pub async fn claim_job(
@@ -443,9 +443,42 @@ impl MemoryService {
         if i64::try_from(claimed_turn_ids.len()).map_err(|_| MemoryError::Internal)? != job.turn_count {
             return Err(MemoryError::InvalidInput);
         }
-        let messages = self
-            .load_exact_messages(user_id, &job.conversation_id, &claimed_turn_ids)
-            .await?;
+        let mut messages = Vec::new();
+        let mut message_count = 0_usize;
+        let mut content_bytes = 0_usize;
+        for turn_id in &claimed_turn_ids {
+            let turn = jobs
+                .memory
+                .load_job_turn_messages_bounded(
+                    user_id,
+                    job_id,
+                    turn_id,
+                    MAX_EVIDENCE_MESSAGES
+                        .saturating_sub(message_count)
+                        .try_into()
+                        .map_err(|_| MemoryError::Internal)?,
+                    MAX_EVIDENCE_BYTES
+                        .saturating_sub(content_bytes)
+                        .try_into()
+                        .map_err(|_| MemoryError::Internal)?,
+                )
+                .await
+                .map_err(map_db_error)?;
+            if !turn.snapshot_matches {
+                self.requeue_snapshot_change(user_id, &job, lease_token).await?;
+                return Err(MemoryError::LeaseLost);
+            }
+            if turn.limit_exceeded {
+                return Err(MemoryError::InvalidInput);
+            }
+            message_count = message_count
+                .checked_add(turn.message_count.try_into().map_err(|_| MemoryError::Internal)?)
+                .ok_or(MemoryError::Internal)?;
+            content_bytes = content_bytes
+                .checked_add(turn.content_bytes.try_into().map_err(|_| MemoryError::Internal)?)
+                .ok_or(MemoryError::Internal)?;
+            messages.extend(turn.messages);
+        }
         let previous = jobs
             .memory
             .get_conversation_memory(user_id, &job.conversation_id)
@@ -480,10 +513,27 @@ impl MemoryService {
             conversation,
             messages,
             previous_summary,
-            summary_cursor: job.from_turn_id,
+            summary_cursor: job.from_turn_id.clone(),
             claimed_turn_ids,
             existing_entries,
         })?;
+        for turn in &input.source_turns {
+            let turn = jobs
+                .memory
+                .load_job_turn_messages_bounded(
+                    user_id,
+                    job_id,
+                    &turn.turn_id,
+                    MAX_EVIDENCE_MESSAGES as u32,
+                    MAX_EVIDENCE_BYTES as u64,
+                )
+                .await
+                .map_err(map_db_error)?;
+            if !turn.snapshot_matches {
+                self.requeue_snapshot_change(user_id, &job, lease_token).await?;
+                return Err(MemoryError::LeaseLost);
+            }
+        }
         if !jobs
             .memory
             .validate_lease(user_id, job_id, lease_token, now_ms())
@@ -695,6 +745,7 @@ impl MemoryService {
         {
             CommitMemoryUpdateResult::Committed { .. } => Ok(()),
             CommitMemoryUpdateResult::StaleRevision { .. } => Err(MemoryError::StaleRevision),
+            CommitMemoryUpdateResult::SnapshotChanged => Err(MemoryError::LeaseLost),
         }
     }
 
@@ -795,6 +846,33 @@ impl MemoryService {
     fn job_dependencies(&self) -> Result<&JobDependencies, MemoryError> {
         self.jobs.as_deref().ok_or(MemoryError::Internal)
     }
+
+    async fn requeue_snapshot_change(
+        &self,
+        user_id: &str,
+        job: &MemoryJobRow,
+        lease_token: &str,
+    ) -> Result<(), MemoryError> {
+        let worker_id = job.lease_owner.clone().ok_or(MemoryError::LeaseLost)?;
+        self.job_dependencies()?
+            .memory
+            .transition_running_job(TransitionMemoryJobRow {
+                user_id: user_id.into(),
+                job_id: job.id.clone(),
+                worker_id,
+                lease_token: lease_token.into(),
+                state: "pending".into(),
+                next_attempt_at: None,
+                error_code: Some("snapshot_changed".into()),
+                increment_attempt: false,
+                increment_invalid_output: false,
+                now: now_ms(),
+            })
+            .await
+            .map_err(map_db_error)?
+            .ok_or(MemoryError::LeaseLost)?;
+        Ok(())
+    }
 }
 
 fn valid_lease_ms(lease_ms: u64) -> Result<i64, MemoryError> {
@@ -814,67 +892,6 @@ fn valid_lease_token(lease_token: &str) -> Result<(), MemoryError> {
     (!lease_token.trim().is_empty() && lease_token.len() <= 200)
         .then_some(())
         .ok_or(MemoryError::InvalidInput)
-}
-
-fn messages_for_turns(messages: &[MessageRow], turn_ids: &[String]) -> Vec<MessageRow> {
-    let selected = turn_ids
-        .iter()
-        .map(String::as_str)
-        .collect::<std::collections::HashSet<_>>();
-    messages
-        .iter()
-        .filter(|message| {
-            message
-                .turn_id
-                .as_deref()
-                .is_some_and(|turn_id| selected.contains(turn_id))
-        })
-        .cloned()
-        .collect()
-}
-
-#[derive(Serialize)]
-struct EvidenceHashInput<'a> {
-    operation_version: &'static str,
-    sanitizer_version: &'static str,
-    summary_cursor: Option<&'a str>,
-    turn_ids: &'a [String],
-    messages: Vec<CanonicalMessageHashInput<'a>>,
-}
-
-#[derive(Serialize)]
-struct CanonicalMessageHashInput<'a> {
-    id: &'a str,
-    message_type: &'a str,
-    status: Option<&'a str>,
-    hidden: bool,
-    position: Option<&'a str>,
-    content: &'a str,
-}
-
-fn evidence_input_hash(
-    summary_cursor: Option<&str>,
-    turn_ids: &[String],
-    messages: &[MessageRow],
-) -> Result<String, MemoryError> {
-    let material = EvidenceHashInput {
-        operation_version: OPERATION_VERSION,
-        sanitizer_version: SANITIZER_VERSION,
-        summary_cursor,
-        turn_ids,
-        messages: messages
-            .iter()
-            .map(|message| CanonicalMessageHashInput {
-                id: &message.id,
-                message_type: &message.r#type,
-                status: message.status.as_deref(),
-                hidden: message.hidden,
-                position: message.position.as_deref(),
-                content: &message.content,
-            })
-            .collect(),
-    };
-    structured_hash(&material)
 }
 
 fn structured_hash(value: &impl Serialize) -> Result<String, MemoryError> {
@@ -992,8 +1009,8 @@ mod tests {
     };
     use aionui_db::models::{ConversationRow, MessageRow};
     use aionui_db::{
-        IConversationRepository, IMemoryRepository, SqliteConversationRepository, SqliteMemoryRepository,
-        UpdateMemorySettingsRow, init_database_memory,
+        ClaimMemoryJobRow, IConversationRepository, IMemoryRepository, SqliteConversationRepository,
+        SqliteMemoryRepository, UpdateMemorySettingsRow, init_database_memory,
     };
 
     use super::{MemoryService, RETRY_DELAYS_MS, failure_transition, sanitize_output_summary};
@@ -1193,6 +1210,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_refreshes_hash_after_canonical_message_mutation() {
+        let fixture = fixture(true).await;
+        fixture.persist_turn("turn-1", 10).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-1", MemoryTurnOutcome::Completed)
+            .await;
+        let before: String = sqlx::query_scalar(
+            "SELECT input_hash FROM memory_jobs WHERE user_id = ? AND conversation_id = 'conversation-1'",
+        )
+        .bind(USER_ID)
+        .fetch_one(fixture._db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE messages SET content = '{\"content\":\"Changed work\"}' WHERE id = 'turn-1-user'")
+            .execute(fixture._db.pool())
+            .await
+            .unwrap();
+
+        let claimed = fixture
+            .service
+            .claim_job(USER_ID, "worker-refresh", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(claimed.input_hash, before);
+    }
+
+    #[tokio::test]
+    async fn evidence_snapshot_drift_requeues_the_current_job() {
+        let fixture = fixture(true).await;
+        fixture.persist_turn("turn-1", 10).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-1", MemoryTurnOutcome::Completed)
+            .await;
+        let claimed = fixture
+            .service
+            .claim_job(USER_ID, "worker-evidence", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE messages SET hidden = 1 WHERE id = 'turn-1-assistant'")
+            .execute(fixture._db.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fixture
+                .service
+                .load_job_evidence(USER_ID, &claimed.id, &claimed.lease_token)
+                .await,
+            Err(MemoryError::LeaseLost),
+        );
+        assert_eq!(
+            fixture
+                .memory
+                .get_job(USER_ID, &claimed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "pending",
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_snapshot_drift_requeues_without_committing() {
+        let fixture = fixture(true).await;
+        fixture.persist_turn("turn-1", 10).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-1", MemoryTurnOutcome::Completed)
+            .await;
+        let claimed = fixture
+            .service
+            .claim_job(USER_ID, "worker-complete", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .service
+            .load_job_evidence(USER_ID, &claimed.id, &claimed.lease_token)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE messages SET content = '{\"content\":\"Changed after evidence\"}'
+             WHERE id = 'turn-1-assistant'",
+        )
+        .execute(fixture._db.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            fixture
+                .service
+                .complete_job(USER_ID, &claimed.id, "worker-complete", empty_completion(&claimed))
+                .await,
+            Err(MemoryError::LeaseLost | MemoryError::Conflict)
+        ));
+        assert_eq!(
+            fixture
+                .memory
+                .get_job(USER_ID, &claimed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "pending",
+        );
+        assert!(
+            fixture
+                .memory
+                .get_conversation_memory(USER_ID, "conversation-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn unsplittable_message_count_turn_fails_terminally_with_successor_attached() {
+        assert_unsplittable_turn_fails_with_successor(129, 8, "messages").await;
+    }
+
+    #[tokio::test]
+    async fn unsplittable_byte_count_turn_fails_terminally_with_successor_attached() {
+        assert_unsplittable_turn_fails_with_successor(2, 40 * 1024, "bytes").await;
+    }
+
+    async fn assert_unsplittable_turn_fails_with_successor(message_count: usize, content_bytes: usize, suffix: &str) {
+        let fixture = fixture(true).await;
+        fixture
+            .persist_dense_turn("turn-oversized", 10, message_count, content_bytes)
+            .await;
+        fixture
+            .service
+            .on_turn_completed(
+                USER_ID,
+                "conversation-1",
+                "turn-oversized",
+                MemoryTurnOutcome::Completed,
+            )
+            .await;
+        let mut running = fixture
+            .memory
+            .claim_next_job(ClaimMemoryJobRow {
+                user_id: USER_ID.into(),
+                worker_id: format!("worker-{suffix}"),
+                lease_token: format!("lease-{suffix}"),
+                now: aionui_common::now_ms(),
+                lease_duration_ms: 30_000,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        fixture.persist_turn("turn-successor", 100_000).await;
+        fixture
+            .service
+            .on_turn_completed(
+                USER_ID,
+                "conversation-1",
+                "turn-successor",
+                MemoryTurnOutcome::Completed,
+            )
+            .await;
+
+        assert_eq!(
+            fixture
+                .service
+                .bound_claimed_job(USER_ID, &format!("lease-{suffix}"), &mut running)
+                .await,
+            Err(MemoryError::InvalidInput),
+        );
+        let failed = fixture.memory.get_job(USER_ID, &running.id).await.unwrap().unwrap();
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.turn_count, 2);
+        assert_eq!(
+            fixture
+                .memory
+                .list_job_turns(USER_ID, &failed.id, 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|turn| turn.turn_id)
+                .collect::<Vec<_>>(),
+            ["turn-oversized", "turn-successor"],
+        );
+    }
+
+    #[tokio::test]
     async fn message_and_byte_limits_split_only_at_exact_turn_boundaries() {
         let message_fixture = fixture(true).await;
         for (turn_id, created_at) in [("turn-1", 10), ("turn-2", 1_000)] {
@@ -1355,7 +1563,7 @@ mod tests {
             Err(MemoryError::LeaseLost),
         );
 
-        fixture
+        let failed = fixture
             .service
             .record_job_failure(
                 USER_ID,
@@ -1369,13 +1577,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let next = fixture
-            .service
-            .claim_job(USER_ID, "worker-2", 30_000)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(next.through_turn_id, "turn-3");
+        assert_eq!(failed.id, running.id);
+        assert_eq!(failed.state, MemoryJobState::Failed);
+        assert_eq!(failed.through_turn_id, "turn-3");
+        assert!(
+            fixture
+                .service
+                .claim_job(USER_ID, "worker-2", 30_000)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

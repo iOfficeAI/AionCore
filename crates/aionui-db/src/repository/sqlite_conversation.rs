@@ -12,6 +12,9 @@ use crate::repository::conversation::{
     MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
 };
 
+const MAX_EXACT_TURN_MESSAGES: i64 = 128;
+const MAX_EXACT_TURN_BYTES: i64 = 64 * 1024;
+
 /// SQLite-backed implementation of [`IConversationRepository`].
 #[derive(Clone, Debug)]
 pub struct SqliteConversationRepository {
@@ -657,23 +660,52 @@ impl IConversationRepository for SqliteConversationRepository {
         conv_id: &str,
         turn_id: &str,
     ) -> Result<Vec<MessageRow>, DbError> {
-        let owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ? AND user_id = ?)")
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let result = async {
+            let owned: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ? AND user_id = ?)")
+                    .bind(conv_id)
+                    .bind(user_id)
+                    .fetch_one(&mut *connection)
+                    .await?;
+            if !owned {
+                return Err(DbError::NotFound(format!(
+                    "Conversation '{conv_id}' not found for user"
+                )));
+            }
+            let (message_count, content_bytes): (i64, i64) = sqlx::query_as(
+                "SELECT COUNT(*),COALESCE(SUM(length(CAST(content AS BLOB))),0)
+                 FROM messages WHERE conversation_id = ? AND turn_id = ?",
+            )
             .bind(conv_id)
-            .bind(user_id)
-            .fetch_one(&self.pool)
+            .bind(turn_id)
+            .fetch_one(&mut *connection)
             .await?;
-        if !owned {
-            return Err(DbError::NotFound(format!(
-                "Conversation '{conv_id}' not found for user"
-            )));
+            if message_count > MAX_EXACT_TURN_MESSAGES || content_bytes > MAX_EXACT_TURN_BYTES {
+                return Err(DbError::Conflict(
+                    "Exact turn exceeds bounded Memory evidence limits".into(),
+                ));
+            }
+            Ok(sqlx::query_as::<_, MessageRow>(
+                "SELECT * FROM messages WHERE conversation_id = ? AND turn_id = ? ORDER BY created_at, id",
+            )
+            .bind(conv_id)
+            .bind(turn_id)
+            .fetch_all(&mut *connection)
+            .await?)
         }
-        Ok(sqlx::query_as::<_, MessageRow>(
-            "SELECT * FROM messages WHERE conversation_id = ? AND turn_id = ? ORDER BY created_at, id",
-        )
-        .bind(conv_id)
-        .bind(turn_id)
-        .fetch_all(&self.pool)
-        .await?)
+        .await;
+        match result {
+            Ok(messages) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(messages)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
     }
 
     async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError> {
