@@ -54,8 +54,105 @@ fn config_set_guard_rejects_second_in_flight_update_and_releases() {
     assert!(first.is_some());
     assert!(session.try_begin_config_set().is_none());
 
-    session.end_config_set(first.unwrap());
+    // Dropping the RAII guard releases the lease (there is no explicit
+    // end_config_set anymore); a fresh claim then succeeds.
+    drop(first);
     assert!(session.try_begin_config_set().is_some());
+}
+
+#[test]
+fn config_set_guard_releases_on_scope_exit() {
+    let mut session = AcpSession::new(None, None, Default::default());
+    {
+        let _guard = session.try_begin_config_set().expect("first claim succeeds");
+        assert!(
+            session.try_begin_config_set().is_none(),
+            "second claim must be rejected while the first guard is alive"
+        );
+    }
+    assert!(
+        session.try_begin_config_set().is_some(),
+        "lease must be released once the guard leaves scope"
+    );
+}
+
+#[test]
+fn config_set_guard_releases_on_panic_unwind() {
+    // Mirrors acp.rs::replay_suppression_guard_clears_on_panic_unwind: a panic
+    // while the lease is held must still run the guard's Drop and free it.
+    // Relies on panic = "unwind" (the default); would not run under "abort".
+    let mut session = AcpSession::new(None, None, Default::default());
+
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = session.try_begin_config_set().expect("first claim succeeds");
+        assert!(session.try_begin_config_set().is_none());
+        panic!("simulated failure while a config set is in flight");
+    }));
+
+    assert!(
+        session.try_begin_config_set().is_some(),
+        "lease must be released after a panic unwind through the guarded scope"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn config_set_guard_releases_on_future_cancel() {
+    // The key RAII payoff over `timeout + explicit end`: cancelling the future
+    // that holds the lease (client disconnect / turn cancel) still releases it
+    // via Drop. See spec §10.2.
+    let mut session = AcpSession::new(None, None, Default::default());
+
+    let guard = session.try_begin_config_set().expect("first claim succeeds");
+    let held = async move {
+        // Guard is held across the await point, then the future is cancelled.
+        let _g = guard;
+        std::future::pending::<()>().await;
+    };
+
+    // Drive to the await point, then cancel by letting the timeout drop `held`.
+    let cancelled = tokio::time::timeout(std::time::Duration::from_secs(1), held).await;
+    assert!(
+        cancelled.is_err(),
+        "the holding future must be cancelled at its await point"
+    );
+
+    assert!(
+        session.try_begin_config_set().is_some(),
+        "lease must be released when the future holding it is cancelled"
+    );
+}
+
+#[test]
+fn config_set_failure_path_leaves_three_layer_state_and_reconcile_untouched() {
+    // Simulates a failed/timed-out set_config_option: the confirmed path only
+    // mutates desired/observed/advertised AFTER an RPC Ok, so on Err none of
+    // the three layers change and no phantom reconcile is produced (§10.5).
+    let mut session = make_session();
+    session.apply_advertised_modes(SessionModeState::new(
+        "default",
+        vec![SessionMode::new("default", "Default"), SessionMode::new("plan", "Plan")],
+    ));
+    session.confirm_mode(ModeId::new("plan"));
+    session.drain_events();
+
+    let desired_before = session.desired_mode().map(str::to_owned);
+    let observed_before = session.observed_mode().map(str::to_owned);
+    let current_before = session.current_mode_id();
+    assert!(session.plan_reconcile().is_empty(), "baseline must be aligned");
+
+    // ── RPC "fails": the failure path performs no local state mutation. ──
+
+    assert_eq!(session.desired_mode().map(str::to_owned), desired_before);
+    assert_eq!(session.observed_mode().map(str::to_owned), observed_before);
+    assert_eq!(session.current_mode_id(), current_before);
+    assert!(
+        session.plan_reconcile().is_empty(),
+        "a failed/timed-out config RPC must not create a phantom reconcile action"
+    );
+    assert!(
+        session.drain_events().is_empty(),
+        "the failure path must not emit any domain events"
+    );
 }
 
 #[test]

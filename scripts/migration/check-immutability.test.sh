@@ -73,6 +73,11 @@ printf '%s\n' '-- 003 new migration' > "$added_repo/crates/aionui-db/migrations/
 run_in_repo "$added_repo" 0 "Migration immutability check passed" \
     env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
 
+duplicate_repo="$(init_case_repo duplicate)"
+printf '%s\n' '-- duplicate 002 migration' > "$duplicate_repo/crates/aionui-db/migrations/002_duplicate_change.sql"
+run_in_repo "$duplicate_repo" 1 "Duplicate database migration versions are not allowed" \
+    env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
+
 override_repo="$(init_case_repo override)"
 printf '%s\n' '-- modified with explicit override' >> "$override_repo/crates/aionui-db/migrations/001_initial_schema.sql"
 run_in_repo "$override_repo" 0 "skipping migration immutability check" \

@@ -1,15 +1,39 @@
 $ErrorActionPreference = "Stop"
 
-if ($env:AIONCORE_ALLOW_MAIN_MIGRATION_EDIT -eq "1") {
-    Write-Output "AIONCORE_ALLOW_MAIN_MIGRATION_EDIT=1; skipping migration immutability check"
-    exit 0
-}
-
 $repoRoot = (git rev-parse --show-toplevel)
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 Set-Location $repoRoot
+
+$migrationDir = Join-Path $repoRoot "crates/aionui-db/migrations"
+$duplicateVersions = Get-ChildItem -LiteralPath $migrationDir -File -Filter "*.sql" |
+    ForEach-Object {
+        if ($_.Name -match '^([0-9]+)_') {
+            [PSCustomObject]@{ Version = [int64]$Matches[1]; Name = $_.Name }
+        }
+    } |
+    Group-Object Version |
+    Where-Object { $_.Count -gt 1 } |
+    Sort-Object Name
+
+if ($duplicateVersions) {
+    [Console]::Error.WriteLine("Duplicate database migration versions are not allowed.")
+    [Console]::Error.WriteLine("")
+    [Console]::Error.WriteLine("Rename the later migration to the next unused numeric prefix.")
+    [Console]::Error.WriteLine("")
+    [Console]::Error.WriteLine("Duplicate versions:")
+    foreach ($duplicate in $duplicateVersions) {
+        $names = ($duplicate.Group | ForEach-Object { $_.Name }) -join ", "
+        [Console]::Error.WriteLine("$($duplicate.Name): $names")
+    }
+    exit 1
+}
+
+if ($env:AIONCORE_ALLOW_MAIN_MIGRATION_EDIT -eq "1") {
+    Write-Output "AIONCORE_ALLOW_MAIN_MIGRATION_EDIT=1; skipping migration immutability check"
+    exit 0
+}
 
 $baseRef = $env:AIONCORE_MIGRATION_BASE_REF
 if ([string]::IsNullOrWhiteSpace($baseRef)) {

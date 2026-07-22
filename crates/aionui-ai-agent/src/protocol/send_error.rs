@@ -363,6 +363,15 @@ impl AgentSendError {
                 false,
                 None,
             ),
+            AcpError::RequestTimeout { .. } => Self::new(
+                "The selected Agent did not respond to the request in time",
+                AgentErrorCode::UserAgentDisconnected,
+                AgentErrorOwnership::UserAgent,
+                Some(detail),
+                true,  // retryable — the user can immediately retry the config change
+                false, // feedback_recommended
+                None,
+            ),
             AcpError::AgentInternal { .. } => unknown_upstream_error(detail),
         }
     }
@@ -829,8 +838,8 @@ fn classify_provider_text(lower: &str) -> Option<ClassifiedError> {
             "The model provider could not be reached",
             AgentErrorCode::UserLlmProviderNetworkError,
             true,
-            AgentErrorResolutionKind::CheckProviderBaseUrl,
-            Some(AgentErrorResolutionTarget::ProviderSettings),
+            AgentErrorResolutionKind::Retry,
+            None,
         ));
     }
     if contains_any(
@@ -1498,6 +1507,17 @@ mod tests {
     }
 
     #[test]
+    fn request_timeout_maps_to_retryable_user_agent_disconnected() {
+        let err = AgentSendError::from(AcpError::RequestTimeout {
+            method: "session/setConfigOption".into(),
+            timeout_secs: 10,
+        });
+        assert_eq!(err.code(), Some(AgentErrorCode::UserAgentDisconnected));
+        assert_eq!(err.ownership(), Some(AgentErrorOwnership::UserAgent));
+        assert_eq!(err.stream_error().retryable, Some(true));
+    }
+
+    #[test]
     fn classifies_acp_internal_provider_failure_from_structured_message() {
         assert_acp_classification(
             AcpError::AgentInternal {
@@ -1845,13 +1865,13 @@ mod tests {
             "Aionrs agent error: API error: Connection error: error decoding response body",
             AgentErrorCode::UserLlmProviderNetworkError,
             AgentErrorOwnership::UserLlmProvider,
-            AgentErrorResolutionKind::CheckProviderBaseUrl,
+            AgentErrorResolutionKind::Retry,
         );
         assert_classification(
             "Aionrs agent error: API error: error sending request for url",
             AgentErrorCode::UserLlmProviderNetworkError,
             AgentErrorOwnership::UserLlmProvider,
-            AgentErrorResolutionKind::CheckProviderBaseUrl,
+            AgentErrorResolutionKind::Retry,
         );
         assert_classification(
             "Autocompact failed: Empty response from LLM",

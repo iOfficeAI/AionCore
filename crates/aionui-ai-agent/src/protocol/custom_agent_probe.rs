@@ -26,6 +26,7 @@ use tracing::{debug, warn};
 use crate::capability::cli_process::CliAgentProcess;
 use crate::protocol::acp::AcpProtocol;
 use crate::protocol::error::AcpError;
+use crate::protocol::npx_cache_repair::CorruptNpxCacheRepair;
 use crate::services::{DynamicAgentProbe, DynamicProbeFailure, DynamicProbeSession, DynamicProbeSessionFactory};
 
 use agent_client_protocol::schema::{
@@ -195,20 +196,37 @@ impl Drop for ProbeProcessGuard<'_> {
 /// (e.g. gemini logged out) surface as [`TryConnectCustomAgentResponse::FailAuth`]
 /// rather than appearing online.
 pub(crate) async fn acp_probe_command_spec(spec: CommandSpec) -> TryConnectCustomAgentResponse {
+    let mut corrupt_npx_cache_repair = CorruptNpxCacheRepair::default();
+
+    loop {
+        match acp_probe_command_spec_once(spec.clone()).await {
+            ProbeOutcome::Fail(error) => {
+                if let Some(cache_entry) = corrupt_npx_cache_repair.try_repair(&spec, &error) {
+                    tracing::info!(
+                        npm_npx_cache_entry = %cache_entry.display(),
+                        "Cleared corrupt npm npx cache after ACP probe startup crash; retrying probe once"
+                    );
+                    continue;
+                }
+
+                return TryConnectCustomAgentResponse::FailAcp { error };
+            }
+            outcome => return outcome.into_response(),
+        }
+    }
+}
+
+async fn acp_probe_command_spec_once(spec: CommandSpec) -> ProbeOutcome {
     let proc = match CliAgentProcess::spawn_for_sdk(spec).await {
         Ok(proc) => proc,
-        Err(e) => {
-            return TryConnectCustomAgentResponse::FailAcp {
-                error: format!("spawn failed: {e}"),
-            };
-        }
+        Err(e) => return ProbeOutcome::Fail(format!("spawn failed: {e}")),
     };
 
     // From here on, the process tree is reaped on every exit path, including
     // cancellation when an outer timeout drops this future.
     let _guard = ProbeProcessGuard { proc: &proc };
 
-    run_handshake(&proc).await.into_response()
+    run_handshake(&proc).await
 }
 
 /// Run the full six-stage dynamic probe against a pre-built ACP command.

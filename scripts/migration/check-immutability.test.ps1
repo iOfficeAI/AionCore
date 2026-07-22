@@ -123,6 +123,10 @@ try {
     Set-Content -LiteralPath (Join-Path $addedRepo "crates/aionui-db/migrations/003_new_change.sql") -Value "-- 003 new migration"
     Invoke-InRepo $addedRepo 0 "Migration immutability check passed" @{ AIONCORE_MIGRATION_BASE_REF = "main" }
 
+    $duplicateRepo = New-CaseRepo "duplicate"
+    Set-Content -LiteralPath (Join-Path $duplicateRepo "crates/aionui-db/migrations/002_duplicate_change.sql") -Value "-- duplicate 002 migration"
+    Invoke-InRepo $duplicateRepo 1 "Duplicate database migration versions are not allowed" @{ AIONCORE_MIGRATION_BASE_REF = "main" }
+
     $overrideRepo = New-CaseRepo "override"
     Add-Content -LiteralPath (Join-Path $overrideRepo "crates/aionui-db/migrations/001_initial_schema.sql") -Value "-- modified with explicit override"
     Invoke-InRepo $overrideRepo 0 "skipping migration immutability check" @{

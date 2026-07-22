@@ -7,9 +7,10 @@ use crate::error::AgentError;
 use crate::factory::acp_assembler::AcpSessionParams;
 use crate::manager::acp::{AcpSession, AcpSessionEvent, PermissionRouter, SessionNewPreludeHook};
 use crate::manager::process_registry::{register_session_process, unregister_agent_process};
-use crate::protocol::acp::AcpProtocol;
+use crate::protocol::acp::{AcpProtocol, PermissionRequest};
 use crate::protocol::error::{AcpError, CloseReason};
 use crate::protocol::events::AgentStreamEvent;
+use crate::protocol::npx_cache_repair::CorruptNpxCacheRepair;
 use crate::protocol::send_error::AgentSendError;
 use crate::registry::CatalogSender;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, SessionId as DomainSessionId};
@@ -84,6 +85,13 @@ use super::mode_normalize::normalize_requested_mode_for_available_values;
 const ACP_KILL_GRACE_MS: u64 = 500;
 const OBSERVED_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10);
 
+struct AcpStartupConnection {
+    process: Arc<CliAgentProcess>,
+    protocol: AcpProtocol,
+    permission_rx: mpsc::Receiver<PermissionRequest>,
+    notification_rx: mpsc::Receiver<SessionNotification>,
+}
+
 /// Decompose a child `ExitStatus` (or its absence) into the
 /// `(exit_code, signal)` pair that `AcpError::StartupCrash` /
 /// `AcpError::Disconnected` carry.
@@ -108,6 +116,156 @@ pub(super) fn exit_status_parts(exit: Option<std::process::ExitStatus>) -> (Opti
         }
     }
     (status.code(), None)
+}
+
+enum AcpStartupConnectError {
+    Agent(AgentError),
+    StartupCrash {
+        exit_code: Option<i32>,
+        signal: Option<String>,
+        stderr: String,
+    },
+}
+
+impl AcpStartupConnectError {
+    fn into_agent_error(self) -> AgentError {
+        match self {
+            Self::Agent(error) => error,
+            Self::StartupCrash {
+                exit_code,
+                signal,
+                stderr,
+            } => AgentError::from(AcpError::StartupCrash {
+                exit_code,
+                signal,
+                stderr,
+            }),
+        }
+    }
+}
+
+async fn spawn_and_connect_acp(
+    params: &AcpSessionParams,
+    runtime: &AgentRuntime,
+) -> Result<AcpStartupConnection, AgentError> {
+    let mut corrupt_npx_cache_repair = CorruptNpxCacheRepair::default();
+
+    loop {
+        match spawn_and_connect_acp_once(params, runtime).await {
+            Ok(connection) => return Ok(connection),
+            Err(AcpStartupConnectError::StartupCrash {
+                exit_code,
+                signal,
+                stderr,
+            }) => {
+                if let Some(cache_entry) = corrupt_npx_cache_repair.try_repair(&params.command_spec, &stderr) {
+                    info!(
+                        conversation_id = %params.conversation_id,
+                        backend = params.metadata.backend.as_deref().unwrap_or("-"),
+                        npm_npx_cache_entry = %cache_entry.display(),
+                        "Cleared corrupt npm npx cache after ACP startup crash; retrying startup once"
+                    );
+                    continue;
+                }
+
+                return Err(AgentError::from(AcpError::StartupCrash {
+                    exit_code,
+                    signal,
+                    stderr,
+                }));
+            }
+            Err(error) => return Err(error.into_agent_error()),
+        }
+    }
+}
+
+async fn spawn_and_connect_acp_once(
+    params: &AcpSessionParams,
+    runtime: &AgentRuntime,
+) -> Result<AcpStartupConnection, AcpStartupConnectError> {
+    let mut command_spec = params.command_spec.clone();
+    ensure_runner_env(
+        &mut command_spec.env,
+        "AIONUI_EXECUTION_LEASE_ID",
+        format!("conversation:{}", params.conversation_id),
+    );
+    ensure_runner_env(
+        &mut command_spec.env,
+        "AIONUI_EXECUTION_TURN_ID",
+        params.conversation_id.clone(),
+    );
+    ensure_runner_env(&mut command_spec.env, "AIONUI_RUNNER_ENVIRONMENT_KIND", "host".into());
+    ensure_runner_env(
+        &mut command_spec.env,
+        "AIONUI_RUNNER_ENVIRONMENT_ID",
+        "host:local".into(),
+    );
+    let process = Arc::new(
+        CliAgentProcess::spawn_for_sdk_in_data_dir(command_spec, &params.data_dir)
+            .await
+            .map_err(AcpStartupConnectError::Agent)?,
+    );
+    register_session_process(
+        &params.data_dir,
+        Arc::clone(&process),
+        params.conversation_id.clone(),
+        AgentType::Acp,
+        params.metadata.backend.clone(),
+        Some(format!(
+            "{} {}",
+            params.command_spec.command.display(),
+            params.command_spec.args.join(" ")
+        )),
+    )
+    .map_err(AcpStartupConnectError::Agent)?;
+    let (stdin, stdout) = process.take_stdio().await.ok_or_else(|| {
+        error!(conversation_id = %params.conversation_id, "Failed to take stdio from CLI process");
+        let _ = unregister_agent_process(&params.data_dir, process.pid());
+        AcpStartupConnectError::Agent(AgentError::internal("Failed to take stdio from CLI process"))
+    })?;
+
+    let (notification_tx, notification_rx) = mpsc::channel::<SessionNotification>(256);
+    let (permission_tx, permission_rx) = mpsc::channel(32);
+
+    // Race the handshake against process exit. The SDK's stdout EOF
+    // detection can lag (observed: 30s on Windows when the agent dies
+    // 70ms in — ELECTRON-1BT), so we explicitly watch the child. If
+    // it dies before init completes, surface a `StartupCrash` carrying
+    // the buffered stderr instead of waiting out the timeout.
+    let connect_fut = AcpProtocol::connect(stdin, stdout, runtime.event_sender(), permission_tx, notification_tx);
+    tokio::pin!(connect_fut);
+    let protocol = tokio::select! {
+        biased;
+        exit = process.wait_for_exit() => {
+            let stderr = process.peek_stderr_tail(64).await;
+            let (exit_code, signal) = exit_status_parts(exit);
+            error!(
+                conversation_id = %params.conversation_id,
+                exit_code = ?exit_code,
+                signal = ?signal,
+                stderr = %stderr,
+                "Agent process exited before ACP handshake completed"
+            );
+            let _ = unregister_agent_process(&params.data_dir, process.pid());
+            return Err(AcpStartupConnectError::StartupCrash { exit_code, signal, stderr });
+        }
+        res = &mut connect_fut => res.map_err(|e| {
+            error!(
+                conversation_id = %params.conversation_id,
+                error = %ErrorChain(&e),
+                "Failed to establish ACP protocol connection"
+            );
+            let _ = unregister_agent_process(&params.data_dir, process.pid());
+            AcpStartupConnectError::Agent(AgentError::from(e))
+        })?,
+    };
+
+    Ok(AcpStartupConnection {
+        process,
+        protocol,
+        permission_rx,
+        notification_rx,
+    })
 }
 
 fn initial_mode_from_params(params: &AcpSessionParams) -> Option<ModeId> {
@@ -407,82 +565,19 @@ impl AcpAgentManager {
         ),
         AgentError,
     > {
-        let mut command_spec = params.command_spec.clone();
-        ensure_runner_env(
-            &mut command_spec.env,
-            "AIONUI_EXECUTION_LEASE_ID",
-            format!("conversation:{}", params.conversation_id),
-        );
-        ensure_runner_env(
-            &mut command_spec.env,
-            "AIONUI_EXECUTION_TURN_ID",
-            params.conversation_id.clone(),
-        );
-        ensure_runner_env(&mut command_spec.env, "AIONUI_RUNNER_ENVIRONMENT_KIND", "host".into());
-        ensure_runner_env(
-            &mut command_spec.env,
-            "AIONUI_RUNNER_ENVIRONMENT_ID",
-            "host:local".into(),
-        );
-        let process = Arc::new(CliAgentProcess::spawn_for_sdk_in_data_dir(command_spec, &params.data_dir).await?);
-        register_session_process(
-            &params.data_dir,
-            Arc::clone(&process),
-            params.conversation_id.clone(),
-            AgentType::Acp,
-            params.metadata.backend.clone(),
-            Some(format!(
-                "{} {}",
-                params.command_spec.command.display(),
-                params.command_spec.args.join(" ")
-            )),
-        )?;
-        let (stdin, stdout) = process.take_stdio().await.ok_or_else(|| {
-            error!(conversation_id = %params.conversation_id, "Failed to take stdio from CLI process");
-            let _ = unregister_agent_process(&params.data_dir, process.pid());
-            AgentError::internal("Failed to take stdio from CLI process")
-        })?;
-
         // Dedicated channel for raw SDK SessionNotifications → session tracker.
         // This channel is separate from event_tx so the tracker never re-applies
         // events that were broadcast for the UI (e.g. from emit_snapshot_events).
-        let (notification_tx, notification_rx) = mpsc::channel::<SessionNotification>(256);
         let (domain_event_tx, domain_event_rx) = mpsc::channel(256);
-        let (permission_tx, permission_rx) = mpsc::channel(32);
         let runtime = AgentRuntime::new(params.conversation_id.clone(), params.workspace.path.clone(), 256);
 
-        // Race the handshake against process exit. The SDK's stdout EOF
-        // detection can lag (observed: 30s on Windows when the agent dies
-        // 70ms in — ELECTRON-1BT), so we explicitly watch the child. If
-        // it dies before init completes, surface a `StartupCrash` carrying
-        // the buffered stderr instead of waiting out the timeout.
-        let connect_fut = AcpProtocol::connect(stdin, stdout, runtime.event_sender(), permission_tx, notification_tx);
-        tokio::pin!(connect_fut);
-        let protocol = tokio::select! {
-            biased;
-            exit = process.wait_for_exit() => {
-                let stderr = process.peek_stderr_tail(64).await;
-                let (exit_code, signal) = exit_status_parts(exit);
-                error!(
-                    conversation_id = %params.conversation_id,
-                    exit_code = ?exit_code,
-                    signal = ?signal,
-                    stderr_bytes = stderr.len(),
-                    "Agent process exited before ACP handshake completed"
-                );
-                let _ = unregister_agent_process(&params.data_dir, process.pid());
-                return Err(AgentError::from(AcpError::StartupCrash { exit_code, signal, stderr }));
-            }
-            res = &mut connect_fut => res.map_err(|e| {
-                error!(
-                    conversation_id = %params.conversation_id,
-                    error = %ErrorChain(&e),
-                    "Failed to establish ACP protocol connection"
-                );
-                let _ = unregister_agent_process(&params.data_dir, process.pid());
-                AgentError::from(e)
-            })?,
-        };
+        let startup = spawn_and_connect_acp(&params, &runtime).await?;
+        let AcpStartupConnection {
+            process,
+            protocol,
+            permission_rx,
+            notification_rx,
+        } = startup;
         let permission_router = Arc::new(PermissionRouter::new(permission_rx));
 
         let snapshot = params.session_snapshot.as_ref();
@@ -642,11 +737,11 @@ impl AcpAgentManager {
             return Err(AgentError::bad_request("value must not be empty"));
         }
 
-        let guard = {
+        let guard_opt = {
             let mut session = self.session.write().await;
             session.try_begin_config_set()
         };
-        let Some(guard) = guard else {
+        let Some(_guard) = guard_opt else {
             tracing::info!(
                 conversation_id = %self.params.conversation_id,
                 agent_backend = ?self.params.metadata.backend,
@@ -657,14 +752,12 @@ impl AcpAgentManager {
             return Err(AgentError::conflict("ACP config update is already in progress"));
         };
 
-        let result = self.set_config_option_confirmed_inner(option_id, value).await;
-
-        {
-            let mut session = self.session.write().await;
-            session.end_config_set(guard);
-        }
-
-        result
+        // `_guard` owns an Arc<AtomicBool> clone (not a borrow of the session
+        // lock released above), so it lives independently until this function
+        // returns. Its Drop resets the lease on every exit path — Ok, Err, the
+        // inner RPC timing out, and this future being cancelled or unwinding —
+        // so a hung config RPC can no longer wedge the lease (ELECTRON-3MS).
+        self.set_config_option_confirmed_inner(option_id, value).await
     }
 
     async fn set_config_option_confirmed_inner(

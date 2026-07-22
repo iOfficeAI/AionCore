@@ -32,6 +32,11 @@ pub struct TurnAttemptSummary {
     pub persisted_assistant_output: bool,
     pub terminal_error: Option<ErrorEventData>,
     pub terminal_error_deferred: bool,
+    /// The turn ended benignly (a Finish, not an Error) but the agent signalled
+    /// that it needs sign-in — an `ACP_EMPTY_TURN_NEEDS_AUTH` tip. Lets the turn
+    /// orchestrator reflect "needs auth" into the agent's availability even
+    /// though the turn itself is not an error.
+    pub needs_auth: bool,
 }
 
 impl TurnAttemptSummary {
@@ -43,6 +48,7 @@ impl TurnAttemptSummary {
         self.saw_visible_output |= other.saw_visible_output;
         self.saw_tool_or_side_effect |= other.saw_tool_or_side_effect;
         self.persisted_assistant_output |= other.persisted_assistant_output;
+        self.needs_auth |= other.needs_auth;
         if other.terminal_error.is_some() {
             self.terminal_error = other.terminal_error.clone();
         }
@@ -475,6 +481,9 @@ impl StreamRelay {
                         AgentStreamEvent::Tips(data) => {
                             if matches!(data.tip_type, TipType::Success | TipType::Warning | TipType::Info) {
                                 attempt.saw_visible_output = true;
+                            }
+                            if data.code.as_deref() == Some("ACP_EMPTY_TURN_NEEDS_AUTH") {
+                                attempt.needs_auth = true;
                             }
                             self.forward_to_websocket(&event);
                             if matches!(data.tip_type, TipType::Success | TipType::Warning | TipType::Info) {
@@ -927,6 +936,77 @@ mod tests {
 
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Hello World");
+    }
+
+    #[tokio::test]
+    async fn needs_auth_tip_sets_summary_flag_on_finish() {
+        use aionui_ai_agent::protocol::events::{TipType, TipsEventData};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+
+        // An agent that connected but isn't signed in: needs-auth tip, then a
+        // benign end_turn (Finish). Terminal stays non-error, but the summary
+        // must flag needs_auth so the orchestrator can reflect it into availability.
+        tx.send(AgentStreamEvent::Tips(TipsEventData {
+            content: String::new(),
+            tip_type: TipType::Info,
+            code: Some("ACP_EMPTY_TURN_NEEDS_AUTH".into()),
+            params: Some(serde_json::json!({ "hint": "Run `kilo auth login` in the terminal" })),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert_eq!(
+            outcome.terminal,
+            RelayTerminal::Finish,
+            "needs-auth empty turn is a benign finish"
+        );
+        assert!(outcome.attempt.needs_auth, "needs-auth tip must set the summary flag");
+    }
+
+    #[tokio::test]
+    async fn plain_empty_turn_tip_does_not_set_needs_auth() {
+        use aionui_ai_agent::protocol::events::{TipType, TipsEventData};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Tips(TipsEventData {
+            content: String::new(),
+            tip_type: TipType::Info,
+            code: Some("ACP_EMPTY_TURN".into()),
+            params: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert!(
+            !outcome.attempt.needs_auth,
+            "a plain empty turn must NOT be treated as needs-auth"
+        );
     }
 
     #[tokio::test]

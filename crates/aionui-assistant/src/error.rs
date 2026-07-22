@@ -17,6 +17,13 @@ pub enum AssistantError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// Assistant storage bootstrap lost a concurrent-startup race and exhausted
+    /// its retries (Sentry 135525166 Option B). Distinct from a genuine failure
+    /// so the router can emit a benign, recoverable boundary stage. Constructed
+    /// only by the bootstrap retry path — never by `From<DbError>`.
+    #[error("Concurrent bootstrap contention: {0}")]
+    ConcurrentBootstrapContention(String),
 }
 
 impl From<DbError> for AssistantError {

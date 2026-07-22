@@ -30,9 +30,25 @@ static DB_MIGRATOR: Migrator = sqlx::migrate!();
 // Historical special-case for the MCP schema reconciliation fallback.
 // Keep this pinned to migration version 7 even as newer migrations land.
 const MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION: i64 = 7;
-const LEGACY_ROADMAP_MIGRATION_START: i64 = 17;
-const LEGACY_ROADMAP_MIGRATION_END: i64 = 34;
-const LEGACY_ROADMAP_MIGRATION_SHIFT: i64 = 9;
+#[derive(Clone, Copy)]
+struct LegacyRoadmapMigrationLayout {
+    start: i64,
+    end: i64,
+    shift: i64,
+}
+
+const LEGACY_ROADMAP_MIGRATION_LAYOUTS: [LegacyRoadmapMigrationLayout; 2] = [
+    LegacyRoadmapMigrationLayout {
+        start: 17,
+        end: 34,
+        shift: 11,
+    },
+    LegacyRoadmapMigrationLayout {
+        start: 26,
+        end: 43,
+        shift: 2,
+    },
+];
 const LEGACY_ROADMAP_CHECKSUM_ALIASES: &[(i64, &str)] = &[
     (
         20,
@@ -401,40 +417,52 @@ async fn reconcile_legacy_roadmap_migration_versions(pool: &SqlitePool) -> Resul
         return Ok(());
     }
 
+    for layout in LEGACY_ROADMAP_MIGRATION_LAYOUTS {
+        if reconcile_legacy_roadmap_migration_layout(pool, layout).await? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn reconcile_legacy_roadmap_migration_layout(
+    pool: &SqlitePool,
+    layout: LegacyRoadmapMigrationLayout,
+) -> Result<bool, DbError> {
     let rows: Vec<(i64, String, Vec<u8>, bool)> = sqlx::query_as(
         "SELECT version, description, checksum, success FROM _sqlx_migrations \
          WHERE version BETWEEN ? AND ? ORDER BY version",
     )
-    .bind(LEGACY_ROADMAP_MIGRATION_START)
-    .bind(LEGACY_ROADMAP_MIGRATION_END)
+    .bind(layout.start)
+    .bind(layout.end)
     .fetch_all(pool)
     .await
     .map_err(DbError::Query)?;
 
     let Some(first) = rows.first() else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(first_target) = DB_MIGRATOR
         .iter()
-        .find(|migration| migration.version == first.0 + LEGACY_ROADMAP_MIGRATION_SHIFT)
+        .find(|migration| migration.version == first.0 + layout.shift)
     else {
-        return Ok(());
+        return Ok(false);
     };
-    if first.0 != LEGACY_ROADMAP_MIGRATION_START
+    if first.0 != layout.start
         || first.1 != first_target.description.as_ref()
         || first.2.as_slice() != first_target.checksum.as_ref()
     {
-        return Ok(());
+        return Ok(false);
     }
 
-    let mut expected_version = LEGACY_ROADMAP_MIGRATION_START;
+    let mut expected_version = layout.start;
     for (version, description, checksum, success) in &rows {
         if *version != expected_version {
             return Err(DbError::Init(format!(
                 "Legacy roadmap migration history is not contiguous at version {expected_version}"
             )));
         }
-        let target_version = version + LEGACY_ROADMAP_MIGRATION_SHIFT;
+        let target_version = version + layout.shift;
         let Some(target) = DB_MIGRATOR.iter().find(|migration| migration.version == target_version) else {
             return Err(DbError::Init(format!(
                 "Legacy roadmap migration {version} has no current target version {target_version}"
@@ -454,14 +482,14 @@ async fn reconcile_legacy_roadmap_migration_versions(pool: &SqlitePool) -> Resul
     let last_legacy_version = expected_version - 1;
     let mut transaction = pool.begin().await.map_err(DbError::Query)?;
     sqlx::query("UPDATE _sqlx_migrations SET version = version + 1000 WHERE version BETWEEN ? AND ?")
-        .bind(LEGACY_ROADMAP_MIGRATION_START)
+        .bind(layout.start)
         .bind(last_legacy_version)
         .execute(&mut *transaction)
         .await
         .map_err(DbError::Query)?;
 
-    for version in LEGACY_ROADMAP_MIGRATION_START..=last_legacy_version {
-        let target_version = version + LEGACY_ROADMAP_MIGRATION_SHIFT;
+    for version in layout.start..=last_legacy_version {
+        let target_version = version + layout.shift;
         let target = DB_MIGRATOR
             .iter()
             .find(|migration| migration.version == target_version)
@@ -478,12 +506,12 @@ async fn reconcile_legacy_roadmap_migration_versions(pool: &SqlitePool) -> Resul
     transaction.commit().await.map_err(DbError::Query)?;
     info!(
         "Reconciled legacy roadmap migration versions {}-{} to {}-{}",
-        LEGACY_ROADMAP_MIGRATION_START,
+        layout.start,
         last_legacy_version,
-        LEGACY_ROADMAP_MIGRATION_START + LEGACY_ROADMAP_MIGRATION_SHIFT,
-        last_legacy_version + LEGACY_ROADMAP_MIGRATION_SHIFT
+        layout.start + layout.shift,
+        last_legacy_version + layout.shift
     );
-    Ok(())
+    Ok(true)
 }
 
 fn legacy_roadmap_checksum_matches(version: i64, legacy_checksum: &[u8], current_checksum: &[u8]) -> bool {

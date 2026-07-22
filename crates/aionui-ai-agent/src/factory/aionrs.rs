@@ -4,8 +4,10 @@ use std::sync::Arc;
 use aion_agent::session::SessionManager;
 use aion_config::compat::OpenAiApiMode;
 use aion_config::config::{McpServerConfig, TransportType};
+use aion_types::message::ImageInputCapability;
 use aionui_api_types::{
-    AionrsBuildExtra, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
+    AionrsBuildExtra, ModelImageInputCapability, ModelOpenAiApiMode, ModelSettings, SessionMcpServer,
+    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
 };
 use aionui_common::ProviderWithModel;
 use aionui_db::IMcpServerRepository;
@@ -95,18 +97,27 @@ pub(super) async fn build(
         .to_owned();
 
     let provider = map_aionrs_provider(&row.platform, &model_id, row.model_protocols.as_deref())?;
+    let model_overrides = resolve_model_compat_overrides(&model_id, &row.model_settings)?;
 
-    let (base_url, compat_overrides) =
-        resolve_aionrs_url_and_compat(&row.platform, &row.base_url, &provider, &model_id, row.is_full_url);
+    let (base_url, mut compat_overrides) = resolve_aionrs_url_and_compat_with_mode(
+        &row.platform,
+        &row.base_url,
+        &provider,
+        &model_id,
+        row.is_full_url,
+        model_overrides.openai_api_mode,
+    );
+    compat_overrides.image_input = model_overrides.image_input;
 
-    if compat_overrides.openai_api_mode == Some(OpenAiApiMode::Responses) {
+    if provider == "openai" {
         info!(
             conversation_id = %ctx.conversation_id,
             platform = %row.platform,
             provider = %provider,
             model = %model_id,
             is_full_url = row.is_full_url,
-            api_mode = "responses",
+            api_mode = ?compat_overrides.openai_api_mode.unwrap_or_default(),
+            api_mode_source = if model_overrides.openai_api_mode.is_some() { "user" } else { "automatic" },
             "Resolved Aionrs OpenAI transport"
         );
     }
@@ -253,26 +264,49 @@ pub(crate) fn map_aionrs_provider(
 /// OpenAI-compatible providers use Chat Completions by default; official
 /// OpenAI GPT-5.6 models use Responses. Anthropic-compatible providers append
 /// `/v1/messages`.
-pub(crate) fn resolve_aionrs_url_and_compat(
+#[cfg(test)]
+fn resolve_aionrs_url_and_compat(
     platform: &str,
     raw_base_url: &str,
     mapped_provider: &str,
     model_id: &str,
     is_full_url: bool,
 ) -> (Option<String>, AionrsCompatOverrides) {
+    resolve_aionrs_url_and_compat_with_mode(platform, raw_base_url, mapped_provider, model_id, is_full_url, None)
+}
+
+pub(crate) fn resolve_aionrs_url_and_compat_with_mode(
+    platform: &str,
+    raw_base_url: &str,
+    mapped_provider: &str,
+    model_id: &str,
+    is_full_url: bool,
+    openai_api_mode_override: Option<OpenAiApiMode>,
+) -> (Option<String>, AionrsCompatOverrides) {
     let mut compat = AionrsCompatOverrides::default();
-    let use_responses = uses_openai_responses_api(platform, mapped_provider, model_id);
+    let openai_api_mode = resolve_openai_api_mode(platform, mapped_provider, model_id, openai_api_mode_override);
+    let use_responses = openai_api_mode == Some(OpenAiApiMode::Responses);
 
     if is_full_url {
         let trimmed = raw_base_url.trim_end_matches('/');
-        if use_responses && let Some(responses_url) = rewrite_chat_completions_url_to_responses(trimmed) {
-            compat.openai_api_mode = Some(OpenAiApiMode::Responses);
+        if let Some(mode) = openai_api_mode
+            && let Some(resolved_url) = rewrite_openai_api_url(trimmed, mode)
+        {
+            compat.openai_api_mode = Some(mode);
             compat.api_path = Some(String::new());
-            return (Some(responses_url), compat);
+            return (Some(resolved_url), compat);
+        }
+        // Automatic detection must not change the request body for an
+        // unrecognized complete endpoint. An explicit user selection still
+        // controls the wire format while preserving the user-owned URL.
+        if openai_api_mode_override.is_some() {
+            compat.openai_api_mode = openai_api_mode;
         }
         compat.api_path = Some(String::new());
         return (Some(trimmed.to_owned()), compat);
     }
+
+    compat.openai_api_mode = openai_api_mode;
 
     if platform == "gemini" {
         let trimmed = raw_base_url.trim_end_matches('/');
@@ -283,10 +317,6 @@ pub(crate) fn resolve_aionrs_url_and_compat(
 
     let trimmed = raw_base_url.trim_end_matches('/');
     let base_url = Some(trimmed.to_owned()).filter(|u| !u.is_empty());
-
-    if use_responses {
-        compat.openai_api_mode = Some(OpenAiApiMode::Responses);
-    }
 
     match mapped_provider {
         "openai" if base_url.is_some() => {
@@ -309,6 +339,20 @@ pub(crate) fn resolve_aionrs_url_and_compat(
     (base_url, compat)
 }
 
+fn resolve_openai_api_mode(
+    platform: &str,
+    mapped_provider: &str,
+    model_id: &str,
+    openai_api_mode_override: Option<OpenAiApiMode>,
+) -> Option<OpenAiApiMode> {
+    if mapped_provider != "openai" || platform == "gemini" {
+        return None;
+    }
+
+    openai_api_mode_override
+        .or_else(|| uses_openai_responses_api(platform, mapped_provider, model_id).then_some(OpenAiApiMode::Responses))
+}
+
 fn uses_openai_responses_api(platform: &str, mapped_provider: &str, model_id: &str) -> bool {
     if mapped_provider != "openai" || platform == "gemini" {
         return false;
@@ -318,10 +362,46 @@ fn uses_openai_responses_api(platform: &str, mapped_provider: &str, model_id: &s
     model == "gpt-5.6" || model.starts_with("gpt-5.6-")
 }
 
-fn rewrite_chat_completions_url_to_responses(url: &str) -> Option<String> {
-    url.strip_suffix("/chat/completions")
-        .map(|prefix| format!("{prefix}/responses"))
-        .or_else(|| url.ends_with("/responses").then(|| url.to_owned()))
+fn rewrite_openai_api_url(url: &str, mode: OpenAiApiMode) -> Option<String> {
+    match mode {
+        OpenAiApiMode::ChatCompletions => url
+            .strip_suffix("/responses")
+            .map(|prefix| format!("{prefix}/chat/completions"))
+            .or_else(|| url.ends_with("/chat/completions").then(|| url.to_owned())),
+        OpenAiApiMode::Responses => url
+            .strip_suffix("/chat/completions")
+            .map(|prefix| format!("{prefix}/responses"))
+            .or_else(|| url.ends_with("/responses").then(|| url.to_owned())),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ModelCompatOverrides {
+    pub(crate) image_input: Option<ImageInputCapability>,
+    pub(crate) openai_api_mode: Option<OpenAiApiMode>,
+}
+
+pub(crate) fn resolve_model_compat_overrides(
+    model_id: &str,
+    model_settings_json: &str,
+) -> Result<ModelCompatOverrides, AgentError> {
+    let settings = serde_json::from_str::<HashMap<String, ModelSettings>>(model_settings_json).map_err(|error| {
+        AgentError::bad_request(format!("Invalid model settings config for model '{model_id}': {error}"))
+    })?;
+    let Some(settings) = settings.get(model_id) else {
+        return Ok(ModelCompatOverrides::default());
+    };
+
+    Ok(ModelCompatOverrides {
+        image_input: settings.image_input.map(|value| match value {
+            ModelImageInputCapability::Supported => ImageInputCapability::Supported,
+            ModelImageInputCapability::Unsupported => ImageInputCapability::Unsupported,
+        }),
+        openai_api_mode: settings.openai_api_mode.map(|value| match value {
+            ModelOpenAiApiMode::ChatCompletions => OpenAiApiMode::ChatCompletions,
+            ModelOpenAiApiMode::Responses => OpenAiApiMode::Responses,
+        }),
+    })
 }
 
 fn resolve_model_protocol(model_id: &str, model_protocols: Option<&str>) -> Result<String, AgentError> {
@@ -665,6 +745,10 @@ fn team_mcp_to_config(cfg: &TeamMcpStdioConfig) -> HashMap<String, McpServerConf
 
     HashMap::from([(TEAM_MCP_SERVER_NAME.to_owned(), server)])
 }
+
+#[cfg(test)]
+#[path = "aionrs_model_settings_test.rs"]
+mod model_settings_test;
 
 #[cfg(test)]
 mod tests {
