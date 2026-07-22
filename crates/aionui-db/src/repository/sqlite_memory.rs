@@ -592,37 +592,6 @@ impl SqliteMemoryRepository {
         Ok(entries)
     }
 
-    async fn entry_target_protection_on(
-        connection: &mut SqliteConnection,
-        user_id: &str,
-        entry_id: &str,
-    ) -> Result<(bool, bool), DbError> {
-        let protection: Option<(bool, bool)> = sqlx::query_as(
-            "SELECT pinned, user_edited FROM memory_entries
-             WHERE id = ? AND user_id = ? AND state <> 'deleted'",
-        )
-        .bind(entry_id)
-        .bind(user_id)
-        .fetch_optional(&mut *connection)
-        .await?;
-        protection.ok_or_else(|| DbError::NotFound(format!("Memory entry '{entry_id}' not found")))
-    }
-
-    async fn ensure_automatic_target_mutable_on(
-        connection: &mut SqliteConnection,
-        user_id: &str,
-        entry_id: &str,
-    ) -> Result<(), DbError> {
-        let (pinned, user_edited) = Self::entry_target_protection_on(connection, user_id, entry_id).await?;
-        if pinned || user_edited {
-            Err(DbError::Conflict(format!(
-                "Protected Memory entry '{entry_id}' cannot be changed automatically"
-            )))
-        } else {
-            Ok(())
-        }
-    }
-
     async fn validate_sources_on(
         connection: &mut SqliteConnection,
         user_id: &str,
@@ -731,6 +700,69 @@ impl SqliteMemoryRepository {
             .bind(now)
             .execute(&mut *connection)
             .await?;
+        }
+        Ok(())
+    }
+
+    async fn requeue_stale_reconciliation_on(
+        connection: &mut SqliteConnection,
+        job: &MemoryJobRow,
+        now: i64,
+    ) -> Result<CommitMemoryUpdateResult, DbError> {
+        sqlx::query("ROLLBACK TO SAVEPOINT memory_reconciliation")
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT memory_reconciliation")
+            .execute(&mut *connection)
+            .await?;
+        Self::transition_running_on(
+            connection,
+            job,
+            QueueTransition {
+                state: "pending",
+                next_attempt_at: None,
+                error_code: Some("stale_reconciliation"),
+                increment_attempt: false,
+                increment_invalid_output: false,
+                now,
+            },
+        )
+        .await?;
+        Ok(CommitMemoryUpdateResult::StaleReconciliation)
+    }
+
+    async fn active_fingerprint_collision_on(
+        connection: &mut SqliteConnection,
+        user_id: &str,
+        fingerprint: &str,
+        excluded_id: Option<&str>,
+    ) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM memory_entries
+                WHERE user_id = ? AND fingerprint = ? AND state = 'active'
+                  AND (? IS NULL OR id <> ?)
+            )",
+        )
+        .bind(user_id)
+        .bind(fingerprint)
+        .bind(excluded_id)
+        .bind(excluded_id)
+        .fetch_one(&mut *connection)
+        .await?)
+    }
+
+    async fn ensure_transition_target_owner_on(
+        connection: &mut SqliteConnection,
+        user_id: &str,
+        entry_id: &str,
+    ) -> Result<(), DbError> {
+        let owner: Option<String> = sqlx::query_scalar("SELECT user_id FROM memory_entries WHERE id = ?")
+            .bind(entry_id)
+            .fetch_optional(&mut *connection)
+            .await?;
+        if owner.as_deref() != Some(user_id) {
+            return Err(DbError::NotFound(format!("Memory entry '{entry_id}' not found")));
         }
         Ok(())
     }
@@ -1970,6 +2002,10 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 });
             }
 
+            sqlx::query("SAVEPOINT memory_reconciliation")
+                .execute(&mut *connection)
+                .await?;
+
             let revision = input.expected_revision + 1;
             if current_revision.is_some() {
                 let updated = sqlx::query(
@@ -2046,6 +2082,16 @@ impl IMemoryRepository for SqliteMemoryRepository {
             let mut superseded_ids = Vec::new();
             let mut conflict_ids = Vec::new();
             for entry in &input.entries {
+                let target = match &entry.transition {
+                    CommitMemoryEntryTransition::Create => None,
+                    CommitMemoryEntryTransition::Refine { target }
+                    | CommitMemoryEntryTransition::Supersede { target }
+                    | CommitMemoryEntryTransition::Conflict { target, .. }
+                    | CommitMemoryEntryTransition::AttachSource { target } => Some(target),
+                };
+                if let Some(target) = target {
+                    Self::ensure_transition_target_owner_on(&mut connection, &input.user_id, &target.id).await?;
+                }
                 let tombstoned: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM memory_entries WHERE user_id = ? AND fingerprint = ? AND state = 'deleted')",
                 )
@@ -2060,6 +2106,16 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 Self::validate_sources_on(&mut connection, &input.user_id, &entry.sources).await?;
                 let entry_id = match &entry.transition {
                     CommitMemoryEntryTransition::Create => {
+                        if Self::active_fingerprint_collision_on(
+                            &mut connection,
+                            &input.user_id,
+                            &entry.fingerprint,
+                            None,
+                        )
+                        .await?
+                        {
+                            return Self::requeue_stale_reconciliation_on(&mut connection, &job, input.now).await;
+                        }
                         Self::insert_entry_on(
                             &mut connection,
                             &input.user_id,
@@ -2076,13 +2132,24 @@ impl IMemoryRepository for SqliteMemoryRepository {
                         added_ids.push(entry.id.clone());
                         entry.id.clone()
                     }
-                    CommitMemoryEntryTransition::Refine { target_entry_id } => {
-                        Self::ensure_automatic_target_mutable_on(&mut connection, &input.user_id, target_entry_id)
-                            .await?;
-                        sqlx::query(
+                    CommitMemoryEntryTransition::Refine { target } => {
+                        if Self::active_fingerprint_collision_on(
+                            &mut connection,
+                            &input.user_id,
+                            &entry.fingerprint,
+                            Some(&target.id),
+                        )
+                        .await?
+                        {
+                            return Self::requeue_stale_reconciliation_on(&mut connection, &job, input.now).await;
+                        }
+                        let updated = sqlx::query(
                             "UPDATE memory_entries SET project_id = ?, workspace_key = ?, kind = ?, stable_key = ?,
-                             fingerprint = ?, content = ?, updated_at = ?
-                             WHERE id = ? AND user_id = ? AND state <> 'deleted'",
+                             fingerprint = ?, content = ?, revision = revision + 1, updated_at = ?
+                             WHERE id = ? AND user_id = ? AND state = 'active' AND revision = ?
+                               AND fingerprint = ? AND project_id IS ? AND workspace_key IS ?
+                               AND content IS ?
+                               AND pinned = 0 AND user_edited = 0",
                         )
                         .bind(&entry.project_id)
                         .bind(&entry.workspace_key)
@@ -2091,32 +2158,59 @@ impl IMemoryRepository for SqliteMemoryRepository {
                         .bind(&entry.fingerprint)
                         .bind(&entry.content)
                         .bind(input.now)
-                        .bind(target_entry_id)
+                        .bind(&target.id)
                         .bind(&input.user_id)
+                        .bind(target.revision)
+                        .bind(&target.fingerprint)
+                        .bind(&target.project_id)
+                        .bind(&target.workspace_key)
+                        .bind(&target.content)
                         .execute(&mut *connection)
                         .await?;
-                        refined_ids.push(target_entry_id.clone());
-                        target_entry_id.clone()
+                        if updated.rows_affected() != 1 {
+                            return Self::requeue_stale_reconciliation_on(&mut connection, &job, input.now).await;
+                        }
+                        refined_ids.push(target.id.clone());
+                        target.id.clone()
                     }
-                    CommitMemoryEntryTransition::Supersede { target_entry_id } => {
-                        Self::ensure_automatic_target_mutable_on(&mut connection, &input.user_id, target_entry_id)
-                            .await?;
-                        sqlx::query(
-                            "UPDATE memory_entries SET state = 'superseded', updated_at = ?
-                             WHERE id = ? AND user_id = ? AND state <> 'deleted'",
+                    CommitMemoryEntryTransition::Supersede { target } => {
+                        if Self::active_fingerprint_collision_on(
+                            &mut connection,
+                            &input.user_id,
+                            &entry.fingerprint,
+                            Some(&target.id),
+                        )
+                        .await?
+                        {
+                            return Self::requeue_stale_reconciliation_on(&mut connection, &job, input.now).await;
+                        }
+                        let updated = sqlx::query(
+                            "UPDATE memory_entries SET state = 'superseded', revision = revision + 1, updated_at = ?
+                             WHERE id = ? AND user_id = ? AND state = 'active' AND revision = ?
+                               AND fingerprint = ? AND project_id IS ? AND workspace_key IS ?
+                               AND content IS ?
+                               AND pinned = 0 AND user_edited = 0",
                         )
                         .bind(input.now)
-                        .bind(target_entry_id)
+                        .bind(&target.id)
                         .bind(&input.user_id)
+                        .bind(target.revision)
+                        .bind(&target.fingerprint)
+                        .bind(&target.project_id)
+                        .bind(&target.workspace_key)
+                        .bind(&target.content)
                         .execute(&mut *connection)
                         .await?;
+                        if updated.rows_affected() != 1 {
+                            return Self::requeue_stale_reconciliation_on(&mut connection, &job, input.now).await;
+                        }
                         Self::insert_entry_on(
                             &mut connection,
                             &input.user_id,
                             entry,
                             InsertEntryOptions {
                                 state: "active",
-                                supersedes_id: Some(target_entry_id),
+                                supersedes_id: Some(&target.id),
                                 conflict_group_id: None,
                             },
                             input.schema_version,
@@ -2124,27 +2218,54 @@ impl IMemoryRepository for SqliteMemoryRepository {
                         )
                         .await?;
                         added_ids.push(entry.id.clone());
-                        superseded_ids.push(target_entry_id.clone());
+                        superseded_ids.push(target.id.clone());
                         entry.id.clone()
                     }
                     CommitMemoryEntryTransition::Conflict {
-                        target_entry_id,
+                        target,
                         conflict_group_id,
                     } => {
-                        let (pinned, user_edited) =
-                            Self::entry_target_protection_on(&mut connection, &input.user_id, target_entry_id).await?;
+                        let snapshot: Option<(bool, bool)> = sqlx::query_as(
+                            "SELECT pinned,user_edited FROM memory_entries
+                             WHERE id = ? AND user_id = ? AND state = ? AND revision = ?
+                               AND fingerprint = ? AND project_id IS ? AND workspace_key IS ?
+                               AND content IS ?",
+                        )
+                        .bind(&target.id)
+                        .bind(&input.user_id)
+                        .bind(&target.state)
+                        .bind(target.revision)
+                        .bind(&target.fingerprint)
+                        .bind(&target.project_id)
+                        .bind(&target.workspace_key)
+                        .bind(&target.content)
+                        .fetch_optional(&mut *connection)
+                        .await?;
+                        let Some((pinned, user_edited)) = snapshot else {
+                            return Self::requeue_stale_reconciliation_on(&mut connection, &job, input.now).await;
+                        };
                         if !pinned && !user_edited {
-                            sqlx::query(
-                                "UPDATE memory_entries SET state = 'conflict', conflict_group_id = ?, updated_at = ?
-                                 WHERE id = ? AND user_id = ? AND state <> 'deleted'",
+                            let updated = sqlx::query(
+                                "UPDATE memory_entries SET state = 'conflict', conflict_group_id = ?,
+                                 revision = revision + 1, updated_at = ?
+                                 WHERE id = ? AND user_id = ? AND state = ? AND revision = ?
+                                   AND fingerprint = ? AND project_id IS ? AND workspace_key IS ?",
                             )
                             .bind(conflict_group_id)
                             .bind(input.now)
-                            .bind(target_entry_id)
+                            .bind(&target.id)
                             .bind(&input.user_id)
+                            .bind(&target.state)
+                            .bind(target.revision)
+                            .bind(&target.fingerprint)
+                            .bind(&target.project_id)
+                            .bind(&target.workspace_key)
                             .execute(&mut *connection)
                             .await?;
-                            conflict_ids.push(target_entry_id.clone());
+                            if updated.rows_affected() != 1 {
+                                return Self::requeue_stale_reconciliation_on(&mut connection, &job, input.now).await;
+                            }
+                            conflict_ids.push(target.id.clone());
                         }
                         Self::insert_entry_on(
                             &mut connection,
@@ -2161,6 +2282,38 @@ impl IMemoryRepository for SqliteMemoryRepository {
                         .await?;
                         conflict_ids.push(entry.id.clone());
                         entry.id.clone()
+                    }
+                    CommitMemoryEntryTransition::AttachSource { target } => {
+                        if target.fingerprint != entry.fingerprint
+                            || target.project_id != entry.project_id
+                            || target.workspace_key != entry.workspace_key
+                            || target.content.as_deref() != Some(entry.content.as_str())
+                        {
+                            return Self::requeue_stale_reconciliation_on(&mut connection, &job, input.now).await;
+                        }
+                        let matches: bool = sqlx::query_scalar(
+                            "SELECT EXISTS(
+                                SELECT 1 FROM memory_entries
+                                WHERE id = ? AND user_id = ? AND state = ? AND revision = ?
+                                  AND fingerprint = ? AND project_id IS ? AND workspace_key IS ?
+                                  AND content IS ? AND (pinned = 1 OR user_edited = 1)
+                            )",
+                        )
+                        .bind(&target.id)
+                        .bind(&input.user_id)
+                        .bind(&target.state)
+                        .bind(target.revision)
+                        .bind(&target.fingerprint)
+                        .bind(&target.project_id)
+                        .bind(&target.workspace_key)
+                        .bind(&target.content)
+                        .fetch_one(&mut *connection)
+                        .await?;
+                        if !matches {
+                            return Self::requeue_stale_reconciliation_on(&mut connection, &job, input.now).await;
+                        }
+                        refined_ids.push(target.id.clone());
+                        target.id.clone()
                     }
                 };
                 Self::upsert_sources_on(&mut connection, &entry_id, &entry.sources, input.now).await?;
@@ -2184,6 +2337,9 @@ impl IMemoryRepository for SqliteMemoryRepository {
             .bind(input.now)
             .execute(&mut *connection)
             .await?;
+            sqlx::query("RELEASE SAVEPOINT memory_reconciliation")
+                .execute(&mut *connection)
+                .await?;
             sqlx::query(
                 "UPDATE memory_jobs SET state = 'succeeded', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
                  WHERE id = ? AND user_id = ? AND state = 'running'",
@@ -2324,6 +2480,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
                     pinned = COALESCE(?, pinned),
                     project_id = CASE WHEN ? THEN ? ELSE project_id END,
                     workspace_key = CASE WHEN ? THEN ? ELSE workspace_key END,
+                    revision = revision + 1,
                     updated_at = ?
                  WHERE id = ? AND user_id = ? AND state <> 'deleted'",
             )
@@ -2387,7 +2544,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
             .await?;
         sqlx::query(
             "UPDATE memory_entries SET content = NULL, state = 'deleted', pinned = 0, user_edited = 0,
-             supersedes_id = NULL, conflict_group_id = NULL, deleted_at = ?, updated_at = ?
+             supersedes_id = NULL, conflict_group_id = NULL, revision = revision + 1, deleted_at = ?, updated_at = ?
              WHERE id = ? AND user_id = ?",
         )
         .bind(now)
@@ -2567,6 +2724,51 @@ impl IMemoryRepository for SqliteMemoryRepository {
         self.entry_rows_with_sources(rows).await
     }
 
+    async fn reconciliation_entries(
+        &self,
+        user_id: &str,
+        fingerprints: &[String],
+        target_ids: &[String],
+    ) -> Result<Vec<MemoryEntryRow>, DbError> {
+        const MAX_LOOKUPS: usize = 32;
+        if fingerprints.len() > MAX_LOOKUPS || target_ids.len() > MAX_LOOKUPS {
+            return Err(DbError::Conflict(
+                "Memory reconciliation lookup exceeds its bound".into(),
+            ));
+        }
+        self.ensure_user(user_id).await?;
+        let mut rows = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for fingerprint in fingerprints {
+            let matches = sqlx::query_as::<_, MemoryEntryDbRow>(
+                "SELECT * FROM memory_entries WHERE user_id = ? AND fingerprint = ? ORDER BY id",
+            )
+            .bind(user_id)
+            .bind(fingerprint)
+            .fetch_all(&self.pool)
+            .await?;
+            for row in matches {
+                if seen.insert(row.id.clone()) {
+                    rows.push(row);
+                }
+            }
+        }
+        for target_id in target_ids {
+            let row =
+                sqlx::query_as::<_, MemoryEntryDbRow>("SELECT * FROM memory_entries WHERE user_id = ? AND id = ?")
+                    .bind(user_id)
+                    .bind(target_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            if let Some(row) = row
+                && seen.insert(row.id.clone())
+            {
+                rows.push(row);
+            }
+        }
+        self.entry_rows_with_sources(rows).await
+    }
+
     async fn create_retrieval(&self, retrieval: MemoryRetrievalRow) -> Result<MemoryRetrievalRow, DbError> {
         self.ensure_conversation(&retrieval.user_id, &retrieval.conversation_id)
             .await?;
@@ -2646,10 +2848,11 @@ mod tests {
     use crate::models::{ConversationRow, MessageRow};
     use crate::repository::memory::{
         ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
-        CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, FinalizeMemoryJobSnapshotResult,
-        FinalizeMemoryJobSnapshotRow, MemoryCandidateQueryRow, MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow,
-        RenewMemoryLeaseRow, SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow,
-        UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow, UpdateMemorySettingsRow,
+        CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, ExpectedMemoryEntryRow,
+        FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, MemoryCandidateQueryRow,
+        MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, SplitMemoryJobRow,
+        TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow,
+        UpdateMemoryEntryRow, UpdateMemorySettingsRow,
     };
     use crate::repository::{IConversationRepository, IMemoryRepository, SqliteConversationRepository};
     use crate::{DbError, init_database_memory};
@@ -2765,6 +2968,14 @@ mod tests {
         }
     }
 
+    fn enqueued_source(conversation_id: &str, turn_id: &str) -> CommitMemorySourceRow {
+        CommitMemorySourceRow {
+            conversation_id: conversation_id.into(),
+            turn_id: turn_id.into(),
+            message_ids_json: format!(r#"["msg-{conversation_id}-{turn_id}-user"]"#),
+        }
+    }
+
     fn entry(id: &str, fingerprint: &str, sources: Vec<CommitMemorySourceRow>) -> CommitMemoryEntryRow {
         CommitMemoryEntryRow {
             id: id.into(),
@@ -2776,6 +2987,24 @@ mod tests {
             content: format!("content for {id}"),
             transition: CommitMemoryEntryTransition::Create,
             sources,
+        }
+    }
+
+    fn expected_entry(
+        id: &str,
+        fingerprint: &str,
+        revision: i64,
+        state: &str,
+        content: Option<&str>,
+    ) -> ExpectedMemoryEntryRow {
+        ExpectedMemoryEntryRow {
+            id: id.into(),
+            revision,
+            state: state.into(),
+            fingerprint: fingerprint.into(),
+            project_id: None,
+            workspace_key: None,
+            content: content.map(str::to_owned),
         }
     }
 
@@ -2834,6 +3063,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(claimed.id, job_id);
+    }
+
+    async fn claim_cross_conversation_jobs(
+        repo: &SqliteMemoryRepository,
+        suffix: &str,
+    ) -> (crate::models::MemoryJobRow, crate::models::MemoryJobRow) {
+        let first_turn = format!("turn-first-{suffix}");
+        let second_turn = format!("turn-second-{suffix}");
+        enqueue_turn(repo, &format!("job-first-{suffix}"), "conv_a", &first_turn, 30).await;
+        enqueue_turn(repo, &format!("job-second-{suffix}"), "conv_a2", &second_turn, 30).await;
+        let first = repo
+            .claim_next_job(ClaimMemoryJobRow {
+                user_id: USER_A.into(),
+                worker_id: format!("worker-first-{suffix}"),
+                lease_token: format!("lease-first-{suffix}"),
+                now: 31,
+                lease_duration_ms: 100,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let second = repo
+            .claim_next_job(ClaimMemoryJobRow {
+                user_id: USER_A.into(),
+                worker_id: format!("worker-second-{suffix}"),
+                lease_token: format!("lease-second-{suffix}"),
+                now: 31,
+                lease_duration_ms: 100,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        (first, second)
     }
 
     async fn running_with_successor(
@@ -3906,6 +4168,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_memory_entry_revision_fences_cross_conversation_refine_races() {
+        let (repo, _, _db) = setup().await;
+        claimed_job(&repo, "job-entry-base", "conv_a", "turn-base").await;
+        repo.commit_update(commit(
+            "job-entry-base",
+            "conv_a",
+            "turn-base",
+            0,
+            vec![entry(
+                "shared-entry",
+                "fp-shared-entry",
+                vec![source("conv_a", "turn-base")],
+            )],
+            20,
+        ))
+        .await
+        .unwrap();
+
+        let (first, second) = claim_cross_conversation_jobs(&repo, "refine").await;
+        let mut first_entry = entry(
+            "first-candidate",
+            "fp-shared-entry",
+            vec![enqueued_source("conv_a", "turn-first-refine")],
+        );
+        first_entry.content = "first refine wins".into();
+        first_entry.transition = CommitMemoryEntryTransition::Refine {
+            target: expected_entry(
+                "shared-entry",
+                "fp-shared-entry",
+                0,
+                "active",
+                Some("content for shared-entry"),
+            ),
+        };
+        let mut first_commit = commit(
+            &first.id,
+            "conv_a",
+            "turn-first-refine",
+            first.expected_revision,
+            vec![first_entry],
+            40,
+        );
+        first_commit.lease_owner = "worker-first-refine".into();
+        first_commit.lease_token = first.lease_token.unwrap();
+        repo.commit_update(first_commit).await.unwrap();
+
+        let mut stale_entry = entry(
+            "stale-candidate",
+            "fp-shared-entry",
+            vec![enqueued_source("conv_a2", "turn-second-refine")],
+        );
+        stale_entry.content = "stale refine must not win".into();
+        stale_entry.transition = CommitMemoryEntryTransition::Refine {
+            target: expected_entry(
+                "shared-entry",
+                "fp-shared-entry",
+                0,
+                "active",
+                Some("content for shared-entry"),
+            ),
+        };
+        let mut stale_commit = commit(
+            &second.id,
+            "conv_a2",
+            "turn-second-refine",
+            second.expected_revision,
+            vec![stale_entry],
+            41,
+        );
+        stale_commit.lease_owner = "worker-second-refine".into();
+        stale_commit.lease_token = second.lease_token.unwrap();
+        let result = repo.commit_update(stale_commit).await.unwrap();
+
+        assert!(!matches!(result, CommitMemoryUpdateResult::Committed { .. }));
+        let stored = repo.get_entry(USER_A, "shared-entry").await.unwrap().unwrap();
+        assert_eq!(stored.content.as_deref(), Some("first refine wins"));
+        assert_eq!(stored.sources.len(), 2);
+        let retry = repo.get_job(USER_A, &second.id).await.unwrap().unwrap();
+        assert_eq!(retry.state, "pending");
+        assert_eq!(retry.attempt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_entry_revision_fences_supersede_then_stale_refine() {
+        let (repo, _, _db) = setup().await;
+        claimed_job(&repo, "job-entry-base", "conv_a", "turn-base").await;
+        repo.commit_update(commit(
+            "job-entry-base",
+            "conv_a",
+            "turn-base",
+            0,
+            vec![entry(
+                "shared-entry",
+                "fp-shared-entry",
+                vec![source("conv_a", "turn-base")],
+            )],
+            20,
+        ))
+        .await
+        .unwrap();
+
+        let (first, second) = claim_cross_conversation_jobs(&repo, "supersede").await;
+        let mut replacement = entry(
+            "replacement-entry",
+            "fp-replacement-entry",
+            vec![enqueued_source("conv_a", "turn-first-supersede")],
+        );
+        replacement.transition = CommitMemoryEntryTransition::Supersede {
+            target: expected_entry(
+                "shared-entry",
+                "fp-shared-entry",
+                0,
+                "active",
+                Some("content for shared-entry"),
+            ),
+        };
+        let mut first_commit = commit(
+            &first.id,
+            "conv_a",
+            "turn-first-supersede",
+            first.expected_revision,
+            vec![replacement],
+            40,
+        );
+        first_commit.lease_owner = "worker-first-supersede".into();
+        first_commit.lease_token = first.lease_token.unwrap();
+        repo.commit_update(first_commit).await.unwrap();
+
+        let mut stale_entry = entry(
+            "stale-candidate",
+            "fp-shared-entry",
+            vec![enqueued_source("conv_a2", "turn-second-supersede")],
+        );
+        stale_entry.content = "stale refine must not touch superseded target".into();
+        stale_entry.transition = CommitMemoryEntryTransition::Refine {
+            target: expected_entry(
+                "shared-entry",
+                "fp-shared-entry",
+                0,
+                "active",
+                Some("content for shared-entry"),
+            ),
+        };
+        let mut stale_commit = commit(
+            &second.id,
+            "conv_a2",
+            "turn-second-supersede",
+            second.expected_revision,
+            vec![stale_entry],
+            41,
+        );
+        stale_commit.lease_owner = "worker-second-supersede".into();
+        stale_commit.lease_token = second.lease_token.unwrap();
+        let result = repo.commit_update(stale_commit).await.unwrap();
+
+        assert!(!matches!(result, CommitMemoryUpdateResult::Committed { .. }));
+        let target = repo.get_entry(USER_A, "shared-entry").await.unwrap().unwrap();
+        assert_eq!(target.state, "superseded");
+        assert_ne!(
+            target.content.as_deref(),
+            Some("stale refine must not touch superseded target")
+        );
+        assert_eq!(
+            repo.get_job(USER_A, &second.id).await.unwrap().unwrap().state,
+            "pending"
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_memory_source_deletion_removes_exclusive_automatic_entries_only() {
         let (repo, _, _db) = setup().await;
         claimed_job(&repo, "job-source", "conv_a", "turn-1").await;
@@ -4151,11 +4582,17 @@ mod tests {
         claimed_job(&repo, "job-transition", "conv_a", "turn-2").await;
         let mut replacement = entry("new-decision", "fp-new-decision", vec![source("conv_a", "turn-2")]);
         replacement.transition = CommitMemoryEntryTransition::Supersede {
-            target_entry_id: "old-decision".into(),
+            target: expected_entry(
+                "old-decision",
+                "fp-old-decision",
+                0,
+                "active",
+                Some("content for old-decision"),
+            ),
         };
         let mut contradiction = entry("new-issue", "fp-new-issue", vec![source("conv_a", "turn-2")]);
         contradiction.transition = CommitMemoryEntryTransition::Conflict {
-            target_entry_id: "old-issue".into(),
+            target: expected_entry("old-issue", "fp-old-issue", 0, "active", Some("content for old-issue")),
             conflict_group_id: "conflict-1".into(),
         };
         repo.commit_update(commit(
@@ -4235,15 +4672,24 @@ mod tests {
                     vec![source("conv_a", "turn-2")],
                 );
                 candidate.content = format!("automatic {transition} content");
+                let expected = ExpectedMemoryEntryRow {
+                    id: target_id.clone(),
+                    revision: protected.revision,
+                    state: protected.state.clone(),
+                    fingerprint: protected.fingerprint.clone(),
+                    project_id: protected.project_id.clone(),
+                    workspace_key: protected.workspace_key.clone(),
+                    content: protected.content.clone(),
+                };
                 candidate.transition = match transition {
                     "refine" => CommitMemoryEntryTransition::Refine {
-                        target_entry_id: target_id.clone(),
+                        target: expected.clone(),
                     },
                     "supersede" => CommitMemoryEntryTransition::Supersede {
-                        target_entry_id: target_id.clone(),
+                        target: expected.clone(),
                     },
                     "conflict" => CommitMemoryEntryTransition::Conflict {
-                        target_entry_id: target_id.clone(),
+                        target: expected,
                         conflict_group_id: format!("group-{protection}"),
                     },
                     _ => unreachable!(),
@@ -4287,7 +4733,7 @@ mod tests {
                         2
                     );
                 } else {
-                    assert!(matches!(result, Err(DbError::Conflict(_))), "{protection} {transition}");
+                    assert_eq!(result.unwrap(), CommitMemoryUpdateResult::StaleReconciliation);
                     assert!(repo.get_entry(USER_A, &candidate_id).await.unwrap().is_none());
                     assert_eq!(
                         repo.get_conversation_memory(USER_A, "conv_a")
@@ -4297,11 +4743,149 @@ mod tests {
                             .revision,
                         1
                     );
-                    assert_eq!(repo.get_job(USER_A, &job_id).await.unwrap().unwrap().state, "running");
+                    assert_eq!(repo.get_job(USER_A, &job_id).await.unwrap().unwrap().state, "pending");
                     assert_eq!(repo.list_change_sets(USER_A, 10).await.unwrap().len(), 1);
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_protected_identical_content_only_attaches_a_source() {
+        let (repo, _, _db) = setup().await;
+        claimed_job(&repo, "job-protected-source-base", "conv_a", "turn-1").await;
+        repo.commit_update(commit(
+            "job-protected-source-base",
+            "conv_a",
+            "turn-1",
+            0,
+            vec![entry(
+                "protected-source-target",
+                "fp-protected-source",
+                vec![source("conv_a", "turn-1")],
+            )],
+            20,
+        ))
+        .await
+        .unwrap();
+        let protected = repo
+            .update_entry(UpdateMemoryEntryRow {
+                user_id: USER_A.into(),
+                id: "protected-source-target".into(),
+                content: None,
+                pinned: Some(true),
+                project_id: None,
+                workspace_key: None,
+                now: 21,
+            })
+            .await
+            .unwrap();
+
+        claimed_job(&repo, "job-protected-source", "conv_a", "turn-2").await;
+        let mut candidate = entry(
+            "unused-protected-candidate",
+            "fp-protected-source",
+            vec![source("conv_a", "turn-2")],
+        );
+        candidate.content = protected.content.clone().unwrap();
+        candidate.transition = CommitMemoryEntryTransition::AttachSource {
+            target: ExpectedMemoryEntryRow {
+                id: protected.id.clone(),
+                revision: protected.revision,
+                state: protected.state.clone(),
+                fingerprint: protected.fingerprint.clone(),
+                project_id: protected.project_id.clone(),
+                workspace_key: protected.workspace_key.clone(),
+                content: protected.content.clone(),
+            },
+        };
+        let result = repo
+            .commit_update(commit(
+                "job-protected-source",
+                "conv_a",
+                "turn-2",
+                1,
+                vec![candidate],
+                30,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            CommitMemoryUpdateResult::Committed {
+                ref refined_ids,
+                ..
+            } if refined_ids == &["protected-source-target"]
+        ));
+        let attached = repo
+            .get_entry(USER_A, "protected-source-target")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(attached.content, protected.content);
+        assert_eq!(attached.state, "active");
+        assert_eq!(attached.revision, protected.revision);
+        assert_eq!(attached.sources.len(), 2);
+        assert!(
+            repo.get_entry(USER_A, "unused-protected-candidate")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_reconciliation_lookup_finds_rows_beyond_the_evidence_window() {
+        let (repo, _, db) = setup().await;
+        for index in 0..65 {
+            sqlx::query(
+                "INSERT INTO memory_entries
+                    (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited,
+                     schema_version, created_at, updated_at)
+                 VALUES (?, ?, 'decision', ?, ?, ?, 'active', 0, 0, 1, ?, ?)",
+            )
+            .bind(format!("lookup-entry-{index:02}"))
+            .bind(USER_A)
+            .bind(format!("lookup key {index:02}"))
+            .bind(format!("lookup-fingerprint-{index:02}"))
+            .bind(format!("lookup content {index:02}"))
+            .bind(index)
+            .bind(index)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO memory_entries
+                (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited,
+                 schema_version, deleted_at, created_at, updated_at)
+             VALUES ('lookup-tombstone', ?, 'decision', 'deleted key', 'lookup-deleted-fingerprint', NULL,
+                     'deleted', 0, 0, 1, 70, 70, 70)",
+        )
+        .bind(USER_A)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let rows = repo
+            .reconciliation_entries(
+                USER_A,
+                &["lookup-fingerprint-00".into(), "lookup-deleted-fingerprint".into()],
+                &["lookup-entry-64".into()],
+            )
+            .await
+            .unwrap();
+        let ids = rows
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            ids,
+            ["lookup-entry-00", "lookup-entry-64", "lookup-tombstone"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
     }
 
     #[tokio::test]
@@ -4321,7 +4905,7 @@ mod tests {
         claimed_job(&repo, "job-foreign-target", "conv_a", "turn-1").await;
         let mut foreign_target = entry("candidate", "fp-candidate", vec![source("conv_a", "turn-1")]);
         foreign_target.transition = CommitMemoryEntryTransition::Supersede {
-            target_entry_id: "foreign-entry".into(),
+            target: expected_entry("foreign-entry", "fp-foreign", 0, "active", Some("foreign")),
         };
         assert!(matches!(
             repo.commit_update(commit(

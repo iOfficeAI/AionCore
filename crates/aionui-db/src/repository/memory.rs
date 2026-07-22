@@ -186,20 +186,34 @@ pub struct CommitMemoryEntryRow {
     pub sources: Vec<CommitMemorySourceRow>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedMemoryEntryRow {
+    pub id: String,
+    pub revision: i64,
+    pub state: String,
+    pub fingerprint: String,
+    pub project_id: Option<String>,
+    pub workspace_key: Option<String>,
+    pub content: Option<String>,
+}
+
 /// Validated lifecycle transition derived by AionCore business logic.
 /// The repository applies it atomically but does not classify model output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitMemoryEntryTransition {
     Create,
     Refine {
-        target_entry_id: String,
+        target: ExpectedMemoryEntryRow,
     },
     Supersede {
-        target_entry_id: String,
+        target: ExpectedMemoryEntryRow,
     },
     Conflict {
-        target_entry_id: String,
+        target: ExpectedMemoryEntryRow,
         conflict_group_id: String,
+    },
+    AttachSource {
+        target: ExpectedMemoryEntryRow,
     },
 }
 
@@ -263,6 +277,7 @@ pub enum CommitMemoryUpdateResult {
     StaleRevision {
         current_revision: i64,
     },
+    StaleReconciliation,
     SnapshotChanged,
 }
 
@@ -371,6 +386,12 @@ pub trait IMemoryRepository: Send + Sync {
     ) -> Result<(), DbError>;
     async fn clear_memory(&self, user_id: &str, now: TimestampMs) -> Result<(), DbError>;
     async fn retrieval_candidates(&self, query: MemoryCandidateQueryRow) -> Result<Vec<MemoryEntryRow>, DbError>;
+    async fn reconciliation_entries(
+        &self,
+        user_id: &str,
+        fingerprints: &[String],
+        target_ids: &[String],
+    ) -> Result<Vec<MemoryEntryRow>, DbError>;
     async fn create_retrieval(&self, retrieval: MemoryRetrievalRow) -> Result<MemoryRetrievalRow, DbError>;
     async fn get_retrieval(&self, user_id: &str, retrieval_id: &str) -> Result<Option<MemoryRetrievalRow>, DbError>;
     async fn get_import_state(&self, user_id: &str) -> Result<Option<MemoryImportStateRow>, DbError>;

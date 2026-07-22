@@ -46,7 +46,7 @@ pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::memory::{
     BoundedMemoryTurnMessagesRow, ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition,
     CommitMemorySourceRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow,
-    FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, MEMORY_EVIDENCE_MAX_BYTES,
+    ExpectedMemoryEntryRow, FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, MEMORY_EVIDENCE_MAX_BYTES,
     MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow, MemoryEntryQueryRow, MemoryEvidenceMessageKind,
     MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, SplitMemoryJobRow,
     TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow,

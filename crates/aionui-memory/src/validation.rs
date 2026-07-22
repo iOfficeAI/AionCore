@@ -213,22 +213,32 @@ pub(crate) fn normalize_stable_key(value: &str) -> Result<String, MemoryError> {
     if value.is_empty() || value.len() > MAX_STRING_LENGTH {
         return Err(MemoryError::InvalidInput);
     }
-    let normalized = value.nfkc().flat_map(char::to_lowercase);
+    let sanitized = sanitize_text(value);
+    if sanitized.contains("[REDACTED") {
+        return Err(MemoryError::InvalidInput);
+    }
+    let sanitized = strip_user_context_sentences(&sanitized);
+    if sanitized.trim().is_empty() {
+        return Err(MemoryError::InvalidInput);
+    }
+    let normalized = sanitized.nfkc().flat_map(char::to_lowercase);
     let mut output = String::with_capacity(value.len());
     let mut pending_separator = false;
+    let mut has_alphanumeric_base = false;
     for character in normalized {
         if character.is_alphanumeric() || is_combining_mark(character) {
             if pending_separator && !output.is_empty() {
                 output.push(' ');
             }
             output.push(character);
+            has_alphanumeric_base |= character.is_alphanumeric();
             pending_separator = false;
         } else if !output.is_empty() {
             pending_separator = true;
         }
     }
     let output = output.nfc().collect::<String>();
-    if output.is_empty() || output.len() > MAX_STRING_LENGTH {
+    if !has_alphanumeric_base || output.is_empty() || output.len() > MAX_STRING_LENGTH {
         return Err(MemoryError::InvalidInput);
     }
     Ok(output)
@@ -347,6 +357,17 @@ mod tests {
             normalize_stable_key("cafe\u{301}\tRELEASE_plan").unwrap(),
             "caf\u{e9} release plan",
         );
+        assert_eq!(
+            normalize_stable_key("Project Phoenix / release-42").unwrap(),
+            "project phoenix release 42",
+        );
+    }
+
+    #[test]
+    fn stable_keys_reject_secrets_user_context_and_combining_marks_without_a_base() {
+        for invalid in ["password=hunter2", "my name is Ada", "\u{301}\u{302}"] {
+            assert_eq!(normalize_stable_key(invalid), Err(MemoryError::InvalidInput));
+        }
     }
 
     #[test]

@@ -645,7 +645,7 @@ impl MemoryService {
         if job.lease_owner.as_deref() != Some(worker_id) {
             return Err(MemoryError::LeaseLost);
         }
-        let (evidence, stored_entries) = self
+        let (evidence, _evidence_entries) = self
             .load_job_evidence_with_entries(user_id, job_id, &request.lease_token)
             .await?;
         let proposal = match ProposalValidator::validate(request.output, request.task_result_provenance, &evidence) {
@@ -657,6 +657,12 @@ impl MemoryService {
             }
             Err(error) => return Err(error),
         };
+        let lookup = Reconciler::lookup(user_id, &evidence, &proposal.candidates)?;
+        let stored_entries = jobs
+            .memory
+            .reconciliation_entries(user_id, &lookup.fingerprints, &lookup.target_ids)
+            .await
+            .map_err(map_db_error)?;
         let entries = match Reconciler::reconcile(
             user_id,
             &job.conversation_id,
@@ -698,9 +704,35 @@ impl MemoryService {
             .map_err(map_db_error)?
         {
             CommitMemoryUpdateResult::Committed { .. } => Ok(()),
-            CommitMemoryUpdateResult::StaleRevision { .. } => Err(MemoryError::StaleRevision),
+            CommitMemoryUpdateResult::StaleRevision { .. } | CommitMemoryUpdateResult::StaleReconciliation => {
+                Err(MemoryError::StaleRevision)
+            }
             CommitMemoryUpdateResult::SnapshotChanged => Err(MemoryError::LeaseLost),
         }
+    }
+
+    /// Accounts for an authenticated completion envelope that could not be deserialized.
+    pub async fn record_malformed_completion(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        worker_id: &str,
+        lease_token: &str,
+    ) -> Result<(), MemoryError> {
+        let jobs = self.job_dependencies()?;
+        valid_worker_id(worker_id)?;
+        valid_lease_token(lease_token)?;
+        let job = jobs
+            .memory
+            .get_job(user_id, job_id)
+            .await
+            .map_err(map_db_error)?
+            .ok_or(MemoryError::NotFound)?;
+        if job.lease_owner.as_deref() != Some(worker_id) || job.lease_token.as_deref() != Some(lease_token) {
+            return Err(MemoryError::LeaseLost);
+        }
+        self.record_invalid_completion(user_id, &job, worker_id, lease_token)
+            .await
     }
 
     pub async fn cancel_conversation_jobs(&self, user_id: &str, conversation_id: &str) -> Result<(), MemoryError> {
@@ -1691,6 +1723,13 @@ mod tests {
             .await
             .unwrap();
         let target = fixture.memory.list_entries(USER_ID).await.unwrap().pop().unwrap();
+        let baseline_summary = fixture
+            .memory
+            .get_conversation_memory(USER_ID, "conversation-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let baseline_change_sets = fixture.memory.list_change_sets(USER_ID, 10).await.unwrap();
 
         fixture.persist_turn("turn-2", 20).await;
         fixture
@@ -1722,8 +1761,25 @@ mod tests {
         );
         let stored_target = fixture.memory.get_entry(USER_ID, &target.id).await.unwrap().unwrap();
         assert_eq!(stored_target.content.as_deref(), Some("Initial plan"));
+        assert_eq!(stored_target.revision, target.revision);
+        assert_eq!(stored_target.sources.len(), 1);
+        assert_eq!(
+            fixture
+                .memory
+                .get_conversation_memory(USER_ID, "conversation-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            baseline_summary.revision,
+        );
+        assert_eq!(
+            fixture.memory.list_change_sets(USER_ID, 10).await.unwrap().len(),
+            baseline_change_sets.len(),
+        );
         let failed_attempt = fixture.memory.get_job(USER_ID, &second.id).await.unwrap().unwrap();
         assert_eq!(failed_attempt.state, "retry_wait");
+        assert_eq!(failed_attempt.attempt_count, 1);
         assert_eq!(failed_attempt.invalid_output_count, 1);
 
         sqlx::query("UPDATE memory_jobs SET next_attempt_at = 0 WHERE id = ?")
@@ -1757,7 +1813,17 @@ mod tests {
         );
         let terminal = fixture.memory.get_job(USER_ID, &retry.id).await.unwrap().unwrap();
         assert_eq!(terminal.state, "failed");
+        assert_eq!(terminal.attempt_count, 2);
         assert_eq!(terminal.invalid_output_count, 2);
+        let unchanged_target = fixture.memory.get_entry(USER_ID, &target.id).await.unwrap().unwrap();
+        assert_eq!(unchanged_target.content.as_deref(), Some("Initial plan"));
+        assert_eq!(unchanged_target.revision, target.revision);
+        assert_eq!(unchanged_target.sources.len(), 1);
+        assert_eq!(fixture.memory.list_entries(USER_ID).await.unwrap().len(), 1);
+        assert_eq!(
+            fixture.memory.list_change_sets(USER_ID, 10).await.unwrap().len(),
+            baseline_change_sets.len(),
+        );
     }
 
     #[tokio::test]
@@ -2009,10 +2075,20 @@ mod tests {
             Err(MemoryError::StaleRevision),
         );
         assert!(fixture.memory.list_entries(USER_ID).await.unwrap().is_empty());
+        let summary = fixture
+            .memory
+            .get_conversation_memory(USER_ID, "conversation-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.revision, 1);
+        assert_eq!(summary.through_turn_id, "external-turn");
+        assert!(fixture.memory.list_change_sets(USER_ID, 10).await.unwrap().is_empty());
         let retry = fixture.memory.get_job(USER_ID, &claimed.id).await.unwrap().unwrap();
         assert_eq!(retry.state, "pending");
         assert_eq!(retry.through_turn_id, "turn-1");
         assert_eq!(retry.attempt_count, 0);
+        assert_eq!(retry.invalid_output_count, 0);
     }
 
     #[tokio::test]

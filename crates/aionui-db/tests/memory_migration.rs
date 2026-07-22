@@ -113,6 +113,16 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
     ] {
         assert!(job_columns.contains(column), "missing memory_jobs column {column}");
     }
+    let entry_columns: HashSet<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('memory_entries')")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert!(
+        entry_columns.contains("revision"),
+        "missing memory_entries revision column"
+    );
 
     let indexes: HashSet<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'index'")
         .fetch_all(pool)
@@ -124,6 +134,7 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
         "idx_messages_conversation_turn_created",
         "idx_memory_entries_user_state_scope_updated",
         "idx_memory_entries_fingerprint",
+        "idx_memory_entries_one_active_fingerprint",
         "idx_memory_sources_conversation",
         "idx_memory_jobs_claim",
         "idx_memory_jobs_one_running",
@@ -150,6 +161,41 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
     .execute(pool)
     .await;
     assert!(invalid_tombstone.is_err());
+
+    sqlx::query(
+        "INSERT INTO memory_entries
+         (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited, schema_version, created_at, updated_at)
+         VALUES ('active-identity', 'system_default_user', 'decision', 'key', 'shared-fp', 'active', 'active', 0, 0, 1, 1, 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let duplicate_active = sqlx::query(
+        "INSERT INTO memory_entries
+         (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited, schema_version, created_at, updated_at)
+         VALUES ('duplicate-active', 'system_default_user', 'decision', 'key', 'shared-fp', 'duplicate', 'active', 0, 0, 1, 1, 1)",
+    )
+    .execute(pool)
+    .await;
+    assert!(duplicate_active.is_err());
+    for (id, state, content, deleted_at) in [
+        ("conflict-identity", "conflict", Some("conflict"), None),
+        ("deleted-identity", "deleted", None, Some(2_i64)),
+    ] {
+        sqlx::query(
+            "INSERT INTO memory_entries
+             (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited,
+              schema_version, deleted_at, created_at, updated_at)
+             VALUES (?, 'system_default_user', 'decision', 'key', 'shared-fp', ?, ?, 0, 0, 1, ?, 1, 1)",
+        )
+        .bind(id)
+        .bind(content)
+        .bind(state)
+        .bind(deleted_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 
     let invalid_job_state = sqlx::query(
         "INSERT INTO memory_jobs

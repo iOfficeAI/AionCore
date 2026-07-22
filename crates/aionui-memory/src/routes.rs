@@ -105,7 +105,17 @@ async fn complete(
     body: Result<Json<CompleteMemoryJobRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let worker_id = worker_id(&headers)?;
-    let Json(request) = body.map_err(ApiError::from)?;
+    let Json(request) = match body {
+        Ok(request) => request,
+        Err(_) => {
+            let lease_token = lease_token(&headers)?;
+            state
+                .service
+                .record_malformed_completion(&user.id, &id, worker_id, lease_token)
+                .await?;
+            return Err(MemoryError::InvalidInput.into());
+        }
+    };
     state.service.complete_job(&user.id, &id, worker_id, request).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -360,6 +370,133 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND,
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_completion_envelopes_consume_the_invalid_output_retry_budget() {
+        let db = init_database_memory().await.unwrap();
+        let conversations = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+        let memory = Arc::new(SqliteMemoryRepository::new(db.pool().clone()));
+        conversations
+            .create(&ConversationRow {
+                id: "conversation-malformed".into(),
+                user_id: "system_default_user".into(),
+                name: "Conversation".into(),
+                r#type: "gemini".into(),
+                extra: "{}".into(),
+                model: None,
+                status: Some("finished".into()),
+                source: Some("aionui".into()),
+                channel_chat_id: None,
+                pinned: false,
+                pinned_at: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        memory
+            .update_settings(UpdateMemorySettingsRow {
+                user_id: "system_default_user".into(),
+                enabled: Some(true),
+                default_capture: Some(true),
+                default_recall: None,
+                consent_version: Some(1),
+                now: 1,
+            })
+            .await
+            .unwrap();
+        for (id, position, content, created_at) in [
+            ("malformed-user", "right", "Do the work", 10),
+            ("malformed-assistant", "left", "Work completed", 11),
+        ] {
+            conversations
+                .insert_message(&MessageRow {
+                    id: id.into(),
+                    conversation_id: "conversation-malformed".into(),
+                    turn_id: Some("turn-malformed".into()),
+                    msg_id: None,
+                    r#type: "text".into(),
+                    content: serde_json::json!({ "content": content }).to_string(),
+                    position: Some(position.into()),
+                    status: Some("finish".into()),
+                    hidden: false,
+                    created_at,
+                })
+                .await
+                .unwrap();
+        }
+        let service = Arc::new(MemoryService::with_job_dependencies(
+            memory.clone(),
+            conversations,
+            Arc::new(UsableReadiness),
+        ));
+        service
+            .on_turn_completed(
+                "system_default_user",
+                "conversation-malformed",
+                "turn-malformed",
+                MemoryTurnOutcome::Completed,
+            )
+            .await;
+        let first = service
+            .claim_job("system_default_user", "worker-malformed", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let router = memory_routes(MemoryRouterState {
+            service: service.clone(),
+        });
+
+        let malformed_request = |lease_token: &str, body: &'static str| {
+            let mut request = Request::post(format!("/api/memory/internal/jobs/{}/complete", first.id))
+                .header("content-type", "application/json")
+                .header("x-memory-worker-id", "worker-malformed")
+                .header("x-memory-lease-token", lease_token)
+                .body(Body::from(body))
+                .unwrap();
+            request.extensions_mut().insert(current_user());
+            request
+        };
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(malformed_request(&first.lease_token, "{"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST,
+        );
+        let retry = memory.get_job("system_default_user", &first.id).await.unwrap().unwrap();
+        assert_eq!(retry.state, "retry_wait");
+        assert_eq!(retry.attempt_count, 1);
+        assert_eq!(retry.invalid_output_count, 1);
+
+        sqlx::query("UPDATE memory_jobs SET next_attempt_at = 0 WHERE id = ?")
+            .bind(&first.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let second = service
+            .claim_job("system_default_user", "worker-malformed", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            router
+                .oneshot(malformed_request(
+                    &second.lease_token,
+                    r#"{"expected_revision":0,"lease_token":"unused","output":{"summary":{}}}"#,
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST,
+        );
+        let failed = memory.get_job("system_default_user", &first.id).await.unwrap().unwrap();
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.attempt_count, 2);
+        assert_eq!(failed.invalid_output_count, 2);
     }
 
     fn current_user() -> CurrentUser {

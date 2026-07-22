@@ -760,6 +760,7 @@ mod tests {
     fn active_entry(id: &str) -> MemoryEntryRow {
         MemoryEntryRow {
             id: id.into(),
+            revision: 0,
             user_id: "user-1".into(),
             project_id: None,
             workspace_key: None,

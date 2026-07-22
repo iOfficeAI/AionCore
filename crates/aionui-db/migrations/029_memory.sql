@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     state             TEXT NOT NULL CHECK(state IN ('active', 'superseded', 'conflict', 'deleted')),
     pinned            INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN (0, 1)),
     user_edited       INTEGER NOT NULL DEFAULT 0 CHECK(user_edited IN (0, 1)),
+    revision          INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
     supersedes_id     TEXT,
     conflict_group_id TEXT,
     schema_version    INTEGER NOT NULL CHECK(schema_version > 0),
@@ -179,6 +180,8 @@ CREATE INDEX IF NOT EXISTS idx_memory_entries_kind_created
     ON memory_entries(user_id, kind, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_entries_fingerprint
     ON memory_entries(user_id, fingerprint);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_entries_one_active_fingerprint
+    ON memory_entries(user_id, fingerprint) WHERE state = 'active';
 CREATE INDEX IF NOT EXISTS idx_memory_sources_conversation
     ON memory_sources(conversation_id, turn_id, memory_entry_id);
 CREATE INDEX IF NOT EXISTS idx_memory_change_sets_user_created
