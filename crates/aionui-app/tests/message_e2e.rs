@@ -38,6 +38,7 @@ async fn insert_message(
     let msg = aionui_db::models::MessageRow {
         id: msg_id.into(),
         conversation_id: conv_id.into(),
+        turn_id: None,
         msg_id: None,
         r#type: "text".into(),
         content: serde_json::json!({"content": content}).to_string(),
@@ -76,6 +77,7 @@ async fn insert_acp_tool_message(
     let msg = aionui_db::models::MessageRow {
         id: msg_id.into(),
         conversation_id: conv_id.into(),
+        turn_id: None,
         msg_id: Some(msg_id.into()),
         r#type: "acp_tool_call".into(),
         content: serde_json::json!({
@@ -416,6 +418,7 @@ async fn t8_7_messages_exclude_legacy_cron_rows() {
         let msg = aionui_db::models::MessageRow {
             id: id.into(),
             conversation_id: conv_id.clone(),
+            turn_id: None,
             msg_id: None,
             r#type: ty.into(),
             content: content.to_string(),

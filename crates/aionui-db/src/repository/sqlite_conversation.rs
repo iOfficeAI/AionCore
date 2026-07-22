@@ -26,12 +26,13 @@ impl SqliteConversationRepository {
     async fn insert_message_once(&self, message: &MessageRow) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO messages \
-                (id, conversation_id, msg_id, type, content, position, \
+                (id, conversation_id, turn_id, msg_id, type, content, position, \
                  status, hidden, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&message.id)
         .bind(&message.conversation_id)
+        .bind(&message.turn_id)
         .bind(&message.msg_id)
         .bind(&message.r#type)
         .bind(&message.content)
@@ -48,10 +49,11 @@ impl SqliteConversationRepository {
     async fn upsert_message_once(&self, message: &MessageRow) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO messages \
-                (id, conversation_id, msg_id, type, content, position, \
+                (id, conversation_id, turn_id, msg_id, type, content, position, \
                  status, hidden, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET \
+                turn_id = COALESCE(messages.turn_id, excluded.turn_id), \
                 content = CASE \
                     WHEN messages.status IN ('finish', 'error') AND excluded.status = 'work' THEN \
                         CASE messages.type \
@@ -78,6 +80,7 @@ impl SqliteConversationRepository {
         )
         .bind(&message.id)
         .bind(&message.conversation_id)
+        .bind(&message.turn_id)
         .bind(&message.msg_id)
         .bind(&message.r#type)
         .bind(&message.content)
@@ -648,6 +651,31 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(row)
     }
 
+    async fn list_messages_by_turn(
+        &self,
+        user_id: &str,
+        conv_id: &str,
+        turn_id: &str,
+    ) -> Result<Vec<MessageRow>, DbError> {
+        let owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ? AND user_id = ?)")
+            .bind(conv_id)
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await?;
+        if !owned {
+            return Err(DbError::NotFound(format!(
+                "Conversation '{conv_id}' not found for user"
+            )));
+        }
+        Ok(sqlx::query_as::<_, MessageRow>(
+            "SELECT * FROM messages WHERE conversation_id = ? AND turn_id = ? ORDER BY created_at, id",
+        )
+        .bind(conv_id)
+        .bind(turn_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError> {
         self.insert_message_once(message).await.map_err(DbError::from)
     }
@@ -1058,6 +1086,7 @@ mod tests {
         MessageRow {
             id: aionui_common::generate_prefixed_id("msg"),
             conversation_id: conv_id.to_string(),
+            turn_id: None,
             msg_id: Some("client_msg_1".to_string()),
             r#type: "text".to_string(),
             content: r#"{"content":"Hello world"}"#.to_string(),

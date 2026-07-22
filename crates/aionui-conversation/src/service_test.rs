@@ -2373,6 +2373,7 @@ async fn list_artifacts_includes_legacy_cron_trigger_messages() {
     repo.insert_message(&MessageRow {
         id: "legacy-msg-1".into(),
         conversation_id: conv.id.clone(),
+        turn_id: None,
         msg_id: Some("legacy-trigger-1".into()),
         r#type: "cron_trigger".into(),
         content: json!({
@@ -3457,7 +3458,7 @@ async fn run_agent_turn_injects_conversation_runtime_context() {
 
 #[tokio::test]
 async fn send_message_returns_msg_id_and_turn_id_and_summary_tracks_turn() {
-    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
     let slow_task_mgr = Arc::new(SlowBuildTaskManager::new(Duration::from_millis(500)));
     let task_mgr: Arc<dyn IWorkerTaskManager> = slow_task_mgr.clone();
 
@@ -3483,6 +3484,16 @@ async fn send_message_returns_msg_id_and_turn_id_and_summary_tracks_turn() {
     assert_eq!(runtime.turn_id.as_deref(), Some(response.turn_id.as_str()));
     assert!(runtime.is_processing);
     assert!(!runtime.can_send_message);
+
+    let persisted = repo
+        .messages
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|message| message.id == response.msg_id)
+        .cloned()
+        .unwrap();
+    assert_eq!(persisted.turn_id.as_deref(), Some(response.turn_id.as_str()));
 }
 
 #[tokio::test]
@@ -4546,6 +4557,7 @@ async fn latest_conversation_error_message_prefers_error_detail() {
     repo.insert_message(&MessageRow {
         id: "msg_error".into(),
         conversation_id: conv.id.clone(),
+        turn_id: None,
         msg_id: None,
         r#type: "tips".into(),
         content: serde_json::json!({
@@ -4873,6 +4885,7 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
     repo.insert_message(&MessageRow {
         id: "visible-stale".into(),
         conversation_id: conv.id.clone(),
+        turn_id: None,
         msg_id: Some("visible-stale".into()),
         r#type: "text".into(),
         content: json!({ "content": "partial output" }).to_string(),
@@ -4886,6 +4899,7 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
     repo.insert_message(&MessageRow {
         id: "empty-stale".into(),
         conversation_id: conv.id.clone(),
+        turn_id: None,
         msg_id: Some("empty-stale".into()),
         r#type: "thinking".into(),
         content: json!({ "content": "" }).to_string(),
@@ -7344,6 +7358,7 @@ async fn insert_raw_message_persists_row_and_broadcasts_stream() {
     let row = MessageRow {
         id: "msg-mirror-1".into(),
         conversation_id: conv.id.clone(),
+        turn_id: None,
         msg_id: Some("msg-mirror-1".into()),
         r#type: "text".into(),
         content: serde_json::json!({

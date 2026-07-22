@@ -1,0 +1,197 @@
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::path::Path;
+
+use sqlx::migrate::Migrator;
+use sqlx::sqlite::SqlitePoolOptions;
+
+async fn run_migrations_through(pool: &sqlx::SqlitePool, max_version: i64) {
+    let full = Migrator::new(Path::new("migrations")).await.unwrap();
+    let migrations = full
+        .migrations
+        .iter()
+        .filter(|migration| migration.version <= max_version)
+        .cloned()
+        .collect::<Vec<_>>();
+    let migrator = Migrator {
+        migrations: Cow::Owned(migrations),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    let mut connection = pool.acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    migrator.run(&mut *connection).await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON; PRAGMA legacy_alter_table = OFF")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn migration_029_upgrades_028_and_preserves_legacy_messages_with_null_turn_id() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 28).await;
+    sqlx::query(
+        "INSERT INTO users (id, username, email, password_hash, created_at, updated_at)
+         VALUES ('system_default_user', 'system', 'system@aionui.local', '', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at)
+         VALUES ('legacy-conv', 'system_default_user', 'Legacy', 'gemini', '{}', 'finished', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO messages (id, conversation_id, type, content, hidden, created_at)
+         VALUES ('legacy-msg', 'legacy-conv', 'text', '{}', 0, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    run_migrations_through(&pool, 29).await;
+
+    let turn_id: Option<String> = sqlx::query_scalar("SELECT turn_id FROM messages WHERE id = 'legacy-msg'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(turn_id, None);
+}
+
+#[tokio::test]
+async fn migration_029_creates_normalized_tables_constraints_and_required_indexes() {
+    let database = aionui_db::init_database_memory().await.unwrap();
+    let pool = database.pool();
+    let expected_tables = [
+        "memory_settings",
+        "conversation_memory_policies",
+        "conversation_memories",
+        "memory_entries",
+        "memory_sources",
+        "memory_change_sets",
+        "memory_jobs",
+        "memory_retrievals",
+        "memory_import_state",
+    ];
+    let tables: HashSet<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    for table in expected_tables {
+        assert!(tables.contains(table), "missing table {table}");
+    }
+
+    let indexes: HashSet<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'index'")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    for index in [
+        "idx_messages_conversation_turn_created",
+        "idx_memory_entries_user_state_scope_updated",
+        "idx_memory_entries_fingerprint",
+        "idx_memory_sources_conversation",
+        "idx_memory_jobs_claim",
+        "idx_memory_jobs_one_running",
+        "idx_memory_jobs_one_next",
+        "idx_memory_retrievals_expiry",
+    ] {
+        assert!(indexes.contains(index), "missing index {index}");
+    }
+
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at)
+         VALUES ('conv-constraints', 'system_default_user', 'Constraints', 'gemini', '{}', 'finished', 1, 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let invalid_tombstone = sqlx::query(
+        "INSERT INTO memory_entries
+         (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited, schema_version, created_at, updated_at)
+         VALUES ('bad', 'system_default_user', 'decision', 'key', 'fp', 'secret', 'deleted', 0, 0, 1, 1, 1)",
+    )
+    .execute(pool)
+    .await;
+    assert!(invalid_tombstone.is_err());
+
+    let invalid_job_state = sqlx::query(
+        "INSERT INTO memory_jobs
+         (id, user_id, conversation_id, through_turn_id, operation_version, input_hash, expected_revision, state,
+          attempt_count, created_at, updated_at)
+         VALUES ('bad-job', 'system_default_user', 'conv-constraints', 'turn', 'v1', 'hash', 0, 'unknown', 0, 1, 1)",
+    )
+    .execute(pool)
+    .await;
+    assert!(invalid_job_state.is_err());
+
+    for (id, state, turn) in [
+        ("running-1", "running", "turn-running-1"),
+        ("pending-1", "pending", "turn-pending-1"),
+    ] {
+        sqlx::query(
+            "INSERT INTO memory_jobs
+             (id, user_id, conversation_id, through_turn_id, operation_version, input_hash, expected_revision, state,
+              attempt_count, created_at, updated_at)
+             VALUES (?, 'system_default_user', 'conv-constraints', ?, 'v1', ?, 0, ?, 0, 1, 1)",
+        )
+        .bind(id)
+        .bind(turn)
+        .bind(format!("hash-{id}"))
+        .bind(state)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    let second_running = sqlx::query(
+        "INSERT INTO memory_jobs
+         (id, user_id, conversation_id, through_turn_id, operation_version, input_hash, expected_revision, state,
+          attempt_count, created_at, updated_at)
+         VALUES ('running-2', 'system_default_user', 'conv-constraints', 'turn-running-2', 'v1', 'hash-running-2',
+                 0, 'running', 0, 2, 2)",
+    )
+    .execute(pool)
+    .await;
+    assert!(second_running.is_err());
+    let second_next = sqlx::query(
+        "INSERT INTO memory_jobs
+         (id, user_id, conversation_id, through_turn_id, operation_version, input_hash, expected_revision, state,
+          attempt_count, created_at, updated_at)
+         VALUES ('retry-2', 'system_default_user', 'conv-constraints', 'turn-retry-2', 'v1', 'hash-retry-2',
+                 0, 'retry_wait', 0, 2, 2)",
+    )
+    .execute(pool)
+    .await;
+    assert!(second_next.is_err());
+}
+
+#[test]
+fn migration_versions_are_unique_and_memory_owns_029() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let full = Migrator::new(Path::new("migrations")).await.unwrap();
+        let versions = full
+            .migrations
+            .iter()
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>();
+        assert_eq!(versions.iter().filter(|version| **version == 29).count(), 1);
+        assert_eq!(versions.iter().copied().collect::<HashSet<_>>().len(), versions.len());
+    });
+}

@@ -285,6 +285,7 @@ impl JobExecutor {
         let row = MessageRow {
             id: ConversationService::mint_msg_id(),
             conversation_id: conversation_id.to_owned(),
+            turn_id: None,
             msg_id: None,
             r#type: "tips".into(),
             content: serde_json::json!({

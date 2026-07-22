@@ -10,6 +10,7 @@ impl ConversationService {
     pub(crate) async fn persist_send_failure_tip(
         &self,
         conversation_id: &str,
+        turn_id: &str,
         err: &AgentSendError,
         top_level_code: Option<&'static str>,
     ) -> Option<MessageRow> {
@@ -37,6 +38,7 @@ impl ConversationService {
         let row = MessageRow {
             id: Self::mint_msg_id(),
             conversation_id: conversation_id.to_owned(),
+            turn_id: Some(turn_id.to_owned()),
             msg_id: None,
             r#type: "tips".into(),
             content: serde_json::json!({

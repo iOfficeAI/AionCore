@@ -138,6 +138,7 @@ fn make_message(conv_id: &str, content: &str, offset_ms: i64) -> MessageRow {
     MessageRow {
         id: generate_prefixed_id("msg"),
         conversation_id: conv_id.to_string(),
+        turn_id: None,
         msg_id: Some(generate_prefixed_id("client")),
         r#type: "text".to_string(),
         content: format!(r#"{{"content":"{content}"}}"#),
@@ -152,6 +153,7 @@ fn make_acp_tool_message(conv_id: &str, id: &str, output: &str, offset_ms: i64) 
     MessageRow {
         id: id.to_string(),
         conversation_id: conv_id.to_string(),
+        turn_id: None,
         msg_id: Some(id.to_string()),
         r#type: "acp_tool_call".to_string(),
         content: json!({
@@ -624,6 +626,7 @@ async fn t9_5_preview_text_extracts_from_json_content() {
     let complex_msg = MessageRow {
         id: generate_prefixed_id("msg"),
         conversation_id: conv.id.clone(),
+        turn_id: None,
         msg_id: None,
         r#type: "text".to_string(),
         content: r#"[{"type":"text","content":"Design document for search"},{"type":"text","content":"feature implementation"}]"#.to_string(),

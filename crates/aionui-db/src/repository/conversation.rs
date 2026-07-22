@@ -88,6 +88,16 @@ pub trait IConversationRepository: Send + Sync {
         Ok(None)
     }
 
+    /// Returns messages linked to one exact durable turn after verifying user ownership.
+    async fn list_messages_by_turn(
+        &self,
+        _user_id: &str,
+        _conv_id: &str,
+        _turn_id: &str,
+    ) -> Result<Vec<MessageRow>, DbError> {
+        Ok(Vec::new())
+    }
+
     /// Inserts a new message row.
     async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError>;
 

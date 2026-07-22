@@ -876,6 +876,7 @@ async fn t7_1_reset_conversation() {
     let msg = aionui_db::models::MessageRow {
         id: "msg-1".into(),
         conversation_id: id.clone(),
+        turn_id: None,
         msg_id: None,
         r#type: "text".into(),
         content: r#"{"content":"hello"}"#.into(),
@@ -967,6 +968,7 @@ async fn team_owned_conversation_rejects_ordinary_send_but_allows_history_reads(
     let msg = aionui_db::models::MessageRow {
         id: "team-history-msg-1".into(),
         conversation_id: id.clone(),
+        turn_id: None,
         msg_id: Some("team-history-msg-1".into()),
         r#type: "text".into(),
         content: r#"{"content":"history remains readable"}"#.into(),

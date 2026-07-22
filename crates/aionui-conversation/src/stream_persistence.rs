@@ -67,6 +67,7 @@ pub(crate) struct FinalTextOverride {
 #[derive(Clone)]
 pub(crate) struct StreamPersistenceAdapter {
     conversation_id: String,
+    turn_id: Option<String>,
     msg_id: String,
     repo: Arc<dyn IConversationRepository>,
     persistence: Option<RuntimePersistenceCoordinator>,
@@ -75,12 +76,14 @@ pub(crate) struct StreamPersistenceAdapter {
 impl StreamPersistenceAdapter {
     pub fn new(
         conversation_id: String,
+        turn_id: Option<String>,
         msg_id: String,
         repo: Arc<dyn IConversationRepository>,
         persistence: Option<RuntimePersistenceCoordinator>,
     ) -> Self {
         Self {
             conversation_id,
+            turn_id,
             msg_id,
             repo,
             persistence,
@@ -158,6 +161,7 @@ impl StreamPersistenceAdapter {
             let row = MessageRow {
                 id: segment.id.clone(),
                 conversation_id: self.conversation_id.clone(),
+                turn_id: self.turn_id.clone(),
                 msg_id: Some(segment.id.clone()),
                 r#type: "text".into(),
                 content,
@@ -197,6 +201,7 @@ impl StreamPersistenceAdapter {
             let row = MessageRow {
                 id: segment.id.clone(),
                 conversation_id: self.conversation_id.clone(),
+                turn_id: self.turn_id.clone(),
                 msg_id: Some(segment.id.clone()),
                 r#type: "text".into(),
                 content,
@@ -276,6 +281,7 @@ impl StreamPersistenceAdapter {
             let row = MessageRow {
                 id: self.msg_id.clone(),
                 conversation_id: self.conversation_id.clone(),
+                turn_id: self.turn_id.clone(),
                 msg_id: Some(self.msg_id.clone()),
                 r#type: "text".into(),
                 content: json!({ "content": final_text }).to_string(),
@@ -302,6 +308,7 @@ impl StreamPersistenceAdapter {
         let row = MessageRow {
             id: ConversationService::mint_msg_id(),
             conversation_id: self.conversation_id.clone(),
+            turn_id: self.turn_id.clone(),
             msg_id: None,
             r#type: "tips".into(),
             content,
@@ -335,6 +342,7 @@ impl StreamPersistenceAdapter {
         let row = MessageRow {
             id: ConversationService::mint_msg_id(),
             conversation_id: self.conversation_id.clone(),
+            turn_id: self.turn_id.clone(),
             msg_id: None,
             r#type: "tips".into(),
             content,
@@ -365,6 +373,7 @@ impl StreamPersistenceAdapter {
         let row = MessageRow {
             id: segment.id.clone(),
             conversation_id: self.conversation_id.clone(),
+            turn_id: self.turn_id.clone(),
             msg_id: Some(segment.id),
             r#type: "thinking".into(),
             content,
@@ -403,6 +412,7 @@ impl StreamPersistenceAdapter {
         let row = MessageRow {
             id: data.call_id.clone(),
             conversation_id: self.conversation_id.clone(),
+            turn_id: self.turn_id.clone(),
             msg_id: Some(data.call_id.clone()),
             r#type: "tool_call".into(),
             content,
@@ -453,6 +463,7 @@ impl StreamPersistenceAdapter {
         let row = MessageRow {
             id: tool_call_id.clone(),
             conversation_id: self.conversation_id.clone(),
+            turn_id: self.turn_id.clone(),
             msg_id: Some(tool_call_id.clone()),
             r#type: "acp_tool_call".into(),
             content,
@@ -502,6 +513,7 @@ impl StreamPersistenceAdapter {
             let row = MessageRow {
                 id: group_id.clone(),
                 conversation_id: self.conversation_id.clone(),
+                turn_id: self.turn_id.clone(),
                 msg_id: Some(group_id),
                 r#type: "tool_group".into(),
                 content,

@@ -7,6 +7,7 @@ mod conversation;
 mod conversation_artifact;
 mod cron_job;
 mod mcp_server;
+mod memory;
 mod message;
 mod oauth_token;
 mod provider;
@@ -31,6 +32,11 @@ pub use conversation::{ConversationAssistantSnapshotRow, ConversationRow, Upsert
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
 pub use mcp_server::McpServerRow;
+pub(crate) use memory::MemoryEntryDbRow;
+pub use memory::{
+    ConversationMemoryRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow, MemoryEntryRow, MemoryImportStateRow,
+    MemoryJobRow, MemoryRetrievalRow, MemorySettingsRow, MemorySourceRow,
+};
 pub use message::MessageRow;
 pub use oauth_token::OAuthTokenRow;
 pub use provider::Provider;

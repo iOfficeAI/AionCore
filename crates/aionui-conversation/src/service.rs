@@ -2620,6 +2620,7 @@ impl ConversationService {
         let user_msg = aionui_db::models::MessageRow {
             id: user_msg_id.clone(),
             conversation_id: conversation_id.to_owned(),
+            turn_id: Some(turn_id.clone()),
             msg_id: Some(user_msg_id.clone()),
             r#type: "text".into(),
             content: serde_json::json!({ "content": req.content }).to_string(),
@@ -2743,6 +2744,7 @@ impl ConversationService {
             let user_msg = aionui_db::models::MessageRow {
                 id: user_msg_id.clone(),
                 conversation_id: request.conversation_id.clone(),
+                turn_id: Some(turn_id.clone()),
                 msg_id: Some(user_msg_id),
                 r#type: "text".into(),
                 content: serde_json::json!({ "content": request.content }).to_string(),
@@ -2864,7 +2866,7 @@ impl ConversationService {
         top_level_code: Option<&'static str>,
     ) {
         let Some(row) = self
-            .persist_send_failure_tip(conversation_id, err, top_level_code)
+            .persist_send_failure_tip(conversation_id, turn_id, err, top_level_code)
             .await
         else {
             return;

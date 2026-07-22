@@ -123,7 +123,13 @@ impl StreamRelay {
         repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
     ) -> Self {
-        let adapter = StreamPersistenceAdapter::new(conversation_id.clone(), msg_id.clone(), repo, None);
+        let adapter = StreamPersistenceAdapter::new(
+            conversation_id.clone(),
+            Some(turn_id.clone()),
+            msg_id.clone(),
+            repo,
+            None,
+        );
         Self {
             conversation_id,
             msg_id,
@@ -2048,7 +2054,7 @@ mod tests {
         repo.set_not_found(true);
         let repo: Arc<dyn IConversationRepository> = repo;
         let bus: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
-        let adapter = StreamPersistenceAdapter::new("deleted-conv".into(), "msg-1".into(), repo, None);
+        let adapter = StreamPersistenceAdapter::new("deleted-conv".into(), None, "msg-1".into(), repo, None);
 
         adapter.complete_conversation(&bus, "turn-1", None).await;
     }
