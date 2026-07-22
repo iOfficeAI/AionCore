@@ -23,7 +23,7 @@ impl CorruptNpxCacheRepair {
 }
 
 pub(crate) fn repair_corrupt_npx_cache(command_spec: &CommandSpec, stderr: &str) -> Option<PathBuf> {
-    if let Some(cache_entry) = computed_corrupt_npx_cache_entry(command_spec)
+    if let Some(cache_entry) = computed_existing_npx_cache_entry(command_spec)
         && clear_npx_cache_entry(&cache_entry, MissingEntryPolicy::Skip).is_some()
     {
         return Some(cache_entry);
@@ -33,11 +33,8 @@ pub(crate) fn repair_corrupt_npx_cache(command_spec: &CommandSpec, stderr: &str)
     clear_npx_cache_entry(&cache_entry, MissingEntryPolicy::Repaired)
 }
 
-fn computed_corrupt_npx_cache_entry(command_spec: &CommandSpec) -> Option<PathBuf> {
+fn computed_existing_npx_cache_entry(command_spec: &CommandSpec) -> Option<PathBuf> {
     let npx_cache_entry = computed_npx_cache_entry(command_spec)?;
-    if npx_cache_entry.join("package.json").exists() {
-        return None;
-    }
     if !npx_cache_entry.exists() {
         return None;
     }
@@ -508,7 +505,7 @@ npm error enoent Could not read package.json
     }
 
     #[test]
-    fn repairs_computed_corrupt_npx_cache_entry_without_stderr_path() {
+    fn repairs_computed_npx_cache_entry_without_stderr_path() {
         let temp = tempfile::tempdir().unwrap();
         let spec = npx_command_spec(temp.path(), &["-y", "@xai-official/grok@0.2.102", "agent", "stdio"]);
         let cache_entry = temp.path().join("_npx").join("c16927192d2e8dc3");
@@ -521,7 +518,7 @@ npm error enoent Could not read package.json
     }
 
     #[test]
-    fn does_not_repair_computed_npx_cache_entry_when_package_json_exists() {
+    fn repairs_computed_npx_cache_entry_even_when_package_json_exists() {
         let temp = tempfile::tempdir().unwrap();
         let spec = npx_command_spec(temp.path(), &["-y", "@xai-official/grok@0.2.102", "agent", "stdio"]);
         let cache_entry = temp.path().join("_npx").join("c16927192d2e8dc3");
@@ -530,7 +527,7 @@ npm error enoent Could not read package.json
 
         let repaired = repair_corrupt_npx_cache(&spec, "agent exited before initialize");
 
-        assert!(repaired.is_none());
-        assert!(cache_entry.exists());
+        assert_eq!(repaired, Some(cache_entry.clone()));
+        assert!(!cache_entry.exists());
     }
 }
