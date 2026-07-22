@@ -2,6 +2,9 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::{future::Future, pin::Pin};
+
 use aionui_api_types::{
     CompleteMemoryJobRequest, MemoryJobFailureCode, MemoryJobResponse, MemorySourceMessageRole, MemorySummary,
     MemoryUpdateInput, NormalizedMemoryJobFailure,
@@ -32,6 +35,9 @@ const RETRY_DELAYS_MS: [i64; 5] = [30_000, 120_000, 600_000, 3_600_000, 21_600_0
 /// Maximum worker lease duration accepted by Memory routes.
 pub const MAX_LEASE_DURATION_MS: u64 = 15 * 60 * 1_000;
 
+#[cfg(test)]
+type BeforeReconciliationLookupHook = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 #[derive(Clone)]
 struct JobDependencies {
     memory: Arc<dyn IMemoryRepository>,
@@ -44,6 +50,8 @@ struct JobDependencies {
 pub struct MemoryService {
     evidence_builder: Arc<EvidenceBuilder>,
     jobs: Option<Arc<JobDependencies>>,
+    #[cfg(test)]
+    before_reconciliation_lookup: Option<BeforeReconciliationLookupHook>,
 }
 
 impl Default for MemoryService {
@@ -58,6 +66,8 @@ impl MemoryService {
         Self {
             evidence_builder: Arc::new(EvidenceBuilder),
             jobs: None,
+            #[cfg(test)]
+            before_reconciliation_lookup: None,
         }
     }
 
@@ -73,6 +83,8 @@ impl MemoryService {
                 conversations,
                 readiness,
             })),
+            #[cfg(test)]
+            before_reconciliation_lookup: None,
         }
     }
 
@@ -703,6 +715,10 @@ impl MemoryService {
             Err(error) => return Err(error),
         };
         let lookup = Reconciler::lookup(user_id, &evidence, &proposal.candidates)?;
+        #[cfg(test)]
+        if let Some(hook) = &self.before_reconciliation_lookup {
+            hook().await;
+        }
         let stored_entries = jobs
             .memory
             .reconciliation_entries(user_id, &lookup.fingerprints, &lookup.target_ids)
@@ -721,6 +737,11 @@ impl MemoryService {
                 self.record_invalid_completion(user_id, &job, worker_id, &request.lease_token)
                     .await?;
                 return Err(MemoryError::InvalidInput);
+            }
+            Err(MemoryError::StaleRevision) => {
+                self.requeue_stale_completion(user_id, &job, worker_id, &request.lease_token)
+                    .await?;
+                return Err(MemoryError::StaleRevision);
             }
             Err(error) => return Err(error),
         };
@@ -2235,6 +2256,87 @@ mod tests {
             assert_eq!(stored.state, state);
             assert_ne!(stored.content.as_deref(), Some("must not overwrite"));
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_target_drift_between_finalization_and_lookup_requeues() {
+        let mut fixture = fixture(true).await;
+        fixture.persist_turn("turn-seed", 10).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-seed", MemoryTurnOutcome::Completed)
+            .await;
+        let seed = fixture
+            .service
+            .claim_job(USER_ID, "worker-seed-race", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .service
+            .complete_job(
+                USER_ID,
+                &seed.id,
+                "worker-seed-race",
+                completion_with_mutations(
+                    &seed,
+                    vec![create_mutation("race target", "original content", "turn-seed")],
+                ),
+            )
+            .await
+            .unwrap();
+        let target = fixture.memory.list_entries(USER_ID).await.unwrap().pop().unwrap();
+
+        fixture.persist_turn("turn-next", 30).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-next", MemoryTurnOutcome::Completed)
+            .await;
+        let job = fixture
+            .service
+            .claim_job(USER_ID, "worker-race", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let pool = fixture._db.pool().clone();
+        let target_id = target.id.clone();
+        fixture.service.before_reconciliation_lookup = Some(Arc::new(move || {
+            let pool = pool.clone();
+            let target_id = target_id.clone();
+            Box::pin(async move {
+                sqlx::query("UPDATE memory_entries SET state = 'superseded', revision = revision + 1 WHERE id = ?")
+                    .bind(target_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            })
+        }));
+
+        assert_eq!(
+            fixture
+                .service
+                .complete_job(
+                    USER_ID,
+                    &job.id,
+                    "worker-race",
+                    completion_with_mutations(
+                        &job,
+                        vec![refine_mutation(
+                            &target.id,
+                            "race target",
+                            "must not overwrite",
+                            "turn-next",
+                        )],
+                    ),
+                )
+                .await,
+            Err(MemoryError::StaleRevision),
+        );
+        let pending = fixture.memory.get_job(USER_ID, &job.id).await.unwrap().unwrap();
+        assert_eq!(pending.state, "pending");
+        assert_eq!(pending.attempt_count, 0);
+        assert_eq!(pending.last_error_code.as_deref(), Some("stale_revision"));
+        assert_eq!(pending.reconciliation_snapshot_json, None);
     }
 
     #[tokio::test]

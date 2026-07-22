@@ -2074,10 +2074,6 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 .await?;
                 return Ok(CommitMemoryUpdateResult::SnapshotChanged);
             }
-            if !Self::reconciliation_snapshot_matches_on(&mut connection, &job).await? {
-                return Self::requeue_stale_reconciliation_on(&mut connection, &job, input.now).await;
-            }
-
             let current_revision: Option<i64> = sqlx::query_scalar(
                 "SELECT revision FROM conversation_memories WHERE user_id = ? AND conversation_id = ?",
             )
@@ -2107,6 +2103,9 @@ impl IMemoryRepository for SqliteMemoryRepository {
             sqlx::query("SAVEPOINT memory_reconciliation")
                 .execute(&mut *connection)
                 .await?;
+            if !Self::reconciliation_snapshot_matches_on(&mut connection, &job).await? {
+                return Self::requeue_stale_reconciliation_on(&mut connection, &job, input.now).await;
+            }
 
             let revision = input.expected_revision + 1;
             if current_revision.is_some() {
@@ -4043,6 +4042,76 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(unchanged, persisted);
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_commit_requeues_entry_drift_after_snapshot_finalization() {
+        let (repo, _, _db) = setup().await;
+        sqlx::query(
+            "INSERT INTO memory_entries
+                (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited,
+                 schema_version, created_at, updated_at)
+             VALUES ('snapshot-drift-entry', ?, 'decision', 'snapshot key', 'snapshot-drift-fingerprint',
+                     'private memory content', 'active', 0, 0, 1, 1, 1)",
+        )
+        .bind(USER_A)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        claimed_job(&repo, "snapshot-drift-job", "conv_a", "turn-1").await;
+        let job = repo.get_job(USER_A, "snapshot-drift-job").await.unwrap().unwrap();
+        let turn = repo
+            .load_job_turn_messages_bounded(USER_A, &job.id, "turn-1", 128, 64 * 1024)
+            .await
+            .unwrap();
+        let finalized = repo
+            .finalize_claimed_job_snapshot(FinalizeMemoryJobSnapshotRow {
+                user_id: USER_A.into(),
+                job_id: job.id.clone(),
+                lease_token: job.lease_token.clone().unwrap(),
+                expected_global_epoch: job.global_epoch,
+                expected_conversation_epoch: job.conversation_epoch,
+                turn_snapshots: vec![MemoryTurnSnapshotExpectationRow {
+                    turn_id: "turn-1".into(),
+                    snapshot_hash: turn.snapshot_hash,
+                }],
+                reconciliation_snapshot: Some(vec![MemoryReconciliationSnapshotRow {
+                    id: "snapshot-drift-entry".into(),
+                    revision: 0,
+                    state: "active".into(),
+                    fingerprint: "snapshot-drift-fingerprint".into(),
+                    project_id: None,
+                    workspace_key: None,
+                    pinned: false,
+                    user_edited: false,
+                    content_hash: memory_entry_content_hash(Some("private memory content")),
+                }]),
+                require_existing_reconciliation_snapshot: false,
+                now: 12,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(finalized, FinalizeMemoryJobSnapshotResult::Finalized(_)));
+
+        sqlx::query(
+            "UPDATE memory_entries SET content = 'changed after finalization', revision = revision + 1
+             WHERE id = 'snapshot-drift-entry'",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.commit_update(commit("snapshot-drift-job", "conv_a", "turn-1", 0, Vec::new(), 20,))
+                .await
+                .unwrap(),
+            CommitMemoryUpdateResult::StaleReconciliation,
+        );
+        let job = repo.get_job(USER_A, "snapshot-drift-job").await.unwrap().unwrap();
+        assert_eq!(job.state, "pending");
+        assert_eq!(job.last_error_code.as_deref(), Some("stale_reconciliation"));
+        assert_eq!(job.reconciliation_snapshot_json, None);
+        assert!(repo.get_conversation_memory(USER_A, "conv_a").await.unwrap().is_none());
     }
 
     #[tokio::test]
