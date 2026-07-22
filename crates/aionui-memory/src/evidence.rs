@@ -33,11 +33,11 @@ pub struct EvidenceBuildRequest {
 
 /// Builds size-bounded, sanitized evidence without accepting renderer-supplied transcripts.
 #[derive(Debug, Clone, Default)]
-pub struct EvidenceBuilder;
+pub(crate) struct EvidenceBuilder;
 
 impl EvidenceBuilder {
     /// Reconstructs a task input from canonical rows and trusted conversation metadata.
-    pub fn build(&self, request: EvidenceBuildRequest) -> Result<MemoryUpdateInput, MemoryError> {
+    pub(crate) fn build(&self, request: EvidenceBuildRequest) -> Result<MemoryUpdateInput, MemoryError> {
         if !valid_identifier(&request.conversation.id) || !valid_identifier(&request.conversation.user_id) {
             return Err(MemoryError::InvalidInput);
         }
@@ -441,8 +441,8 @@ mod tests {
             existing_entries: Vec::new(),
         };
         assert_eq!(
-            builder.build(too_many_turns.clone()).unwrap_err(),
-            builder.build(too_many_turns).unwrap_err()
+            builder.build(too_many_turns).unwrap_err(),
+            crate::MemoryError::InvalidInput
         );
 
         let too_many_messages = EvidenceBuildRequest {
