@@ -401,6 +401,20 @@ pub struct TeamSendMessageQueuedResponse {
     pub target: TeamSlotWorkPayload,
 }
 
+/// Per-slot work-state broadcast, emitted whenever a single slot's work state
+/// transitions — independently of any team run.
+///
+/// `team.run*` events carry `slot_work` only for slots bound to the active
+/// tracked run, so a slot that starts/finishes work outside a run (e.g. a
+/// leader self-wake draining its mailbox for a membership-change notice) would
+/// otherwise leave the frontend's per-slot view stale until a full reconcile.
+/// This event closes that gap: the frontend updates the one slot verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamSlotWorkChangedPayload {
+    pub team_id: String,
+    pub slot_work: TeamSlotWorkPayload,
+}
+
 // ---------------------------------------------------------------------------
 // E. Team management — Response DTOs
 // ---------------------------------------------------------------------------

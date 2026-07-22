@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use aionui_api_types::{
     TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentRuntimeStatus, TeamAgentRuntimeStatusPayload,
-    TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload, TeamRunPayload, WebSocketMessage,
+    TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload, TeamRunPayload, TeamSlotWorkChangedPayload,
+    WebSocketMessage,
 };
 use aionui_realtime::EventBroadcaster;
 use tracing::debug;
@@ -31,6 +32,7 @@ pub const TEAM_RUN_FAILED_EVENT: &str = "team.runFailed";
 pub const TEAM_CHILD_TURN_STARTED_EVENT: &str = "team.childTurnStarted";
 pub const TEAM_CHILD_TURN_COMPLETED_EVENT: &str = "team.childTurnCompleted";
 pub const TEAM_CHILD_TURN_CANCELLED_EVENT: &str = "team.childTurnCancelled";
+pub const TEAM_SLOT_WORK_CHANGED_EVENT: &str = "team.slotWorkChanged";
 
 pub struct TeamEventEmitter {
     team_id: String,
@@ -134,6 +136,22 @@ impl TeamEventEmitter {
         let event = WebSocketMessage::new(
             event_name,
             serde_json::to_value(payload).expect("serialize team run payload"),
+        );
+        self.broadcaster.broadcast(event);
+    }
+
+    pub fn broadcast_slot_work(&self, payload: TeamSlotWorkChangedPayload) {
+        debug!(
+            event_name = TEAM_SLOT_WORK_CHANGED_EVENT,
+            team_id = %payload.team_id,
+            slot_id = %payload.slot_work.slot_id,
+            state = ?payload.slot_work.state,
+            active_turn_id = ?payload.slot_work.active_turn_id,
+            "team websocket event emitted"
+        );
+        let event = WebSocketMessage::new(
+            TEAM_SLOT_WORK_CHANGED_EVENT,
+            serde_json::to_value(payload).expect("serialize team slot work payload"),
         );
         self.broadcaster.broadcast(event);
     }
@@ -375,6 +393,39 @@ mod tests {
         assert_eq!(payload.team_run_id, "run-1");
         assert_eq!(payload.slot_id, "worker-1");
         assert_eq!(payload.status, aionui_api_types::TeamRunStatus::Running);
+    }
+
+    #[test]
+    fn slot_work_changed_event_has_correct_shape() {
+        let (emitter, bc) = make_emitter();
+        emitter.broadcast_slot_work(aionui_api_types::TeamSlotWorkChangedPayload {
+            team_id: "team-1".into(),
+            slot_work: aionui_api_types::TeamSlotWorkPayload {
+                slot_id: "lead-1".into(),
+                role: aionui_api_types::TeamRunTargetRole::Lead,
+                state: aionui_api_types::TeamSlotWorkState::Idle,
+                queued_foreground_count: 0,
+                queued_background_count: 0,
+                active_turn_id: None,
+                active_turn_started_at_ms: None,
+                active_turn_elapsed_ms: None,
+                active_turn_slow: None,
+                active_turn_slow_threshold_ms: None,
+                blocked_reason: None,
+                team_run_id: None,
+            },
+        });
+
+        let events = bc.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "team.slotWorkChanged");
+
+        let payload: aionui_api_types::TeamSlotWorkChangedPayload =
+            serde_json::from_value(events[0].data.clone()).unwrap();
+        assert_eq!(payload.team_id, "team-1");
+        assert_eq!(payload.slot_work.slot_id, "lead-1");
+        assert_eq!(payload.slot_work.state, aionui_api_types::TeamSlotWorkState::Idle);
+        assert_eq!(payload.slot_work.active_turn_id, None);
     }
 
     #[test]

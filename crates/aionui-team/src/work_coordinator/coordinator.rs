@@ -217,6 +217,7 @@ impl SlotWorkCoordinator {
         let summaries = Self::run_summaries_locked(&state, lease.team_run_id.iter().cloned());
         drop(state);
         self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(Some(slot_snapshot.clone()));
 
         info!(
             team_id = %self.team_id,
@@ -255,12 +256,14 @@ impl SlotWorkCoordinator {
                     .values()
                     .any(|candidate| candidate.lease.team_run_id.as_ref() == Some(team_run_id))
         });
+        let slot_snapshot = Self::slot_snapshot_locked(&state, &lease.slot_id);
         let summaries = Self::run_summaries_locked(&state, lease.team_run_id.iter().cloned());
         drop(state);
         if remove_empty_run {
             self.run_causality.abort_binding(&record.binding);
         }
         self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
         debug!(
             team_id = %self.team_id,
             session_generation = %self.session_generation,
@@ -447,9 +450,11 @@ impl SlotWorkCoordinator {
             turn_id: None,
             started_at_ms: None,
         });
+        let slot_snapshot = Self::slot_snapshot_locked(&state, slot_id);
         let summaries = Self::run_summaries_locked(&state, team_run_ids);
         drop(state);
         self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
         info!(
             team_id = %self.team_id,
             session_generation = %self.session_generation,
@@ -500,9 +505,11 @@ impl SlotWorkCoordinator {
             active.turn_id = Some(turn_id.to_owned());
             active.started_at_ms = Some(now_ms());
         }
+        let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
         let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
         drop(state);
         self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
         if cancel_immediately {
             StartCommitResult::CancelImmediately
         } else {
@@ -526,9 +533,11 @@ impl SlotWorkCoordinator {
         for intent_id in batch.intent_ids.iter().rev() {
             slot.queue_mut(batch.highest_priority).push_front(intent_id.clone());
         }
+        let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
         let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
         drop(state);
         self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
         debug!(
             team_id = %self.team_id,
             session_generation = %self.session_generation,
@@ -757,6 +766,7 @@ impl SlotWorkCoordinator {
         let slot = Self::slot_snapshot_locked(&state, slot_id).expect("constrained slot exists");
         drop(state);
         self.publish_run_summaries(affected_run_summaries.clone());
+        self.publish_slot_work_snapshot(Some(slot.clone()));
         RuntimeConstraintUpdate {
             slot,
             terminal_message_ids,
@@ -917,9 +927,11 @@ impl SlotWorkCoordinator {
             .get_mut(&batch.slot_id)
             .expect("current batch slot exists")
             .active = None;
+        let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
         let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
         drop(state);
         self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
         info!(
             team_id = %self.team_id,
             session_generation = %self.session_generation,
