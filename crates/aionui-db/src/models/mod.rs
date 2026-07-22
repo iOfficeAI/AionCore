@@ -36,6 +36,6 @@ pub use oauth_token::OAuthTokenRow;
 pub use provider::Provider;
 pub use remote_agent::RemoteAgentRow;
 pub use skill::{SkillImportRecordRow, SkillRow};
-pub use system_settings::SystemSettings;
+pub use system_settings::{AppOperationsModelSettingRow, SystemSettings};
 pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};
 pub use user::User;
