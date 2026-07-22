@@ -160,53 +160,81 @@ fn nvm_version_bins(home: &Path) -> Vec<PathBuf> {
 
 #[cfg(unix)]
 fn login_shell_path() -> Option<String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
     use std::time::Duration;
-    use wait_timeout::ChildExt;
 
     let shell = std::env::var("SHELL").ok()?;
-    if !Path::new(&shell).is_absolute() {
-        tracing::debug!(%shell, "SHELL is not absolute, skipping login shell probe");
+    let shell = Path::new(&shell);
+    if !shell.is_absolute() {
+        tracing::debug!(shell = %shell.display(), "SHELL is not absolute, skipping login shell probe");
         return None;
     }
 
-    let mut child = match Command::new(&shell)
-        .args(["-l", "-i", "-c", "printf %s \"$PATH\""])
+    login_shell_path_from(shell, Duration::from_secs(3))
+}
+
+#[cfg(unix)]
+fn login_shell_path_from(shell: &Path, timeout: std::time::Duration) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use wait_timeout::ChildExt;
+
+    let mut command = Command::new(shell);
+    command
+        .args(["-l", "-i", "-c", "printf %s \"$PATH\"; exit"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    // Interactive shells perform job-control checks against any inherited
+    // controlling terminal. A background worker process group can otherwise
+    // enter a SIGTTIN loop before it evaluates `-c` (for example under
+    // nextest). A fresh session has no controlling terminal.
+    // SAFETY: `setsid` is async-signal-safe and the closure captures nothing.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
-            tracing::debug!(%shell, error = %e, "login shell spawn failed");
+            tracing::debug!(shell = %shell.display(), error = %e, "login shell spawn failed");
             return None;
         }
     };
 
-    // Take stdout handle before waiting to prevent pipe-buffer deadlock.
-    // If the PATH string is long enough to fill the pipe buffer, the child
-    // will block on write while we block on wait — causing a deadlock and
-    // the 3s timeout to fire. Reading stdout first drains the buffer.
+    // Drain stdout concurrently so a large PATH cannot fill the pipe while
+    // the timeout still governs a shell that never exits. Reading here on
+    // the current thread would block before `wait_timeout` can run.
     let mut stdout_handle = child.stdout.take()?;
-    let mut stdout = String::new();
-    stdout_handle.read_to_string(&mut stdout).ok()?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut stdout = String::new();
+        stdout_handle.read_to_string(&mut stdout).map(|_| stdout)
+    });
 
-    let status = match child.wait_timeout(Duration::from_secs(3)) {
+    let status = match child.wait_timeout(timeout) {
         Ok(Some(s)) => s,
         Ok(None) => {
             let _ = child.kill();
             let _ = child.wait();
-            tracing::warn!("login shell PATH probe timed out after 3s");
+            let _ = stdout_reader.join();
+            tracing::warn!(timeout_ms = timeout.as_millis(), "login shell PATH probe timed out");
             return None;
         }
         Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
             tracing::debug!(error = %e, "login shell wait_timeout errored");
             return None;
         }
     };
 
+    let stdout = stdout_reader.join().ok()?.ok()?;
     if !status.success() {
         tracing::debug!(?status, "login shell exited non-zero");
         return None;
@@ -375,6 +403,29 @@ mod tests {
         assert!(result.is_some(), "login shell probe should return Some");
         let path = result.unwrap();
         assert!(!path.is_empty(), "login shell PATH should not be empty");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_path_enforces_timeout_while_stdout_is_open() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let shell = dir.path().join("never-exits.sh");
+        std::fs::write(&shell, "#!/bin/sh\nprintf /tmp/fake-path\nwhile :; do :; done\n").unwrap();
+        let mut permissions = std::fs::metadata(&shell).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&shell, permissions).unwrap();
+
+        let started = Instant::now();
+        let result = login_shell_path_from(&shell, Duration::from_millis(100));
+
+        assert!(result.is_none(), "timed-out probes must not return a PATH");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "probe timeout was not enforced"
+        );
     }
 
     #[cfg(unix)]
