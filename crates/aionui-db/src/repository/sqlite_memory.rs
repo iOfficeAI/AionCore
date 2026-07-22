@@ -3098,13 +3098,32 @@ impl IMemoryRepository for SqliteMemoryRepository {
             .bind(now)
             .execute(&mut *connection)
             .await?;
+            sqlx::query(
+                "UPDATE conversation_memory_policies SET reset_at = ?,
+                 lifecycle_epoch = lifecycle_epoch + 1, updated_at = ? WHERE user_id = ?",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(user_id)
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query(
+                "INSERT INTO memory_import_state
+                    (user_id,cursor,completed,started_at,completed_at,updated_at)
+                 VALUES (?,NULL,1,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+                    completed = 1,completed_at = excluded.completed_at,updated_at = excluded.updated_at",
+            )
+            .bind(user_id)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *connection)
+            .await?;
             for table in [
                 "memory_retrievals",
                 "memory_change_sets",
                 "conversation_memories",
-                "conversation_memory_policies",
                 "memory_entries",
-                "memory_import_state",
                 "memory_jobs",
             ] {
                 sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
@@ -3289,7 +3308,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
 #[cfg(test)]
 mod tests {
     use super::SqliteMemoryRepository;
-    use crate::models::{ConversationRow, MessageRow};
+    use crate::models::{ConversationRow, MemoryImportStateRow, MessageRow};
     use crate::repository::memory::{
         ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
         CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, ExpectedMemoryEntryRow,
@@ -5325,7 +5344,38 @@ mod tests {
         .await
         .unwrap();
         repo.delete_entry(USER_A, "entry-clear", 21).await.unwrap();
-        enqueue_turn(&repo, "job-pending", "conv_a2", "turn-2", 22).await;
+        enqueue_turn(&repo, "job-pending", "conv_a", "turn-2", 22).await;
+        let stale_worker = repo
+            .claim_next_job(ClaimMemoryJobRow {
+                user_id: USER_A.into(),
+                worker_id: "worker-before-clear".into(),
+                lease_token: "lease-before-clear".into(),
+                now: 23,
+                lease_duration_ms: 100,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale_worker.id, "job-pending");
+        repo.update_conversation_policy(UpdateConversationMemoryPolicyRow {
+            user_id: USER_A.into(),
+            conversation_id: "conv_a2".into(),
+            capture_enabled: Some(false),
+            recall_enabled: Some(false),
+            now: 21,
+        })
+        .await
+        .unwrap();
+        repo.upsert_import_state(MemoryImportStateRow {
+            user_id: USER_A.into(),
+            cursor: Some("legacy-cursor-7".into()),
+            completed: false,
+            started_at: Some(15),
+            completed_at: None,
+            updated_at: 22,
+        })
+        .await
+        .unwrap();
 
         repo.clear_memory(USER_A, 50).await.unwrap();
         assert_eq!(repo.get_settings(USER_A).await.unwrap().reset_at, Some(50));
@@ -5333,6 +5383,37 @@ mod tests {
         assert!(repo.get_conversation_memory(USER_A, "conv_a").await.unwrap().is_none());
         assert!(repo.get_job(USER_A, "job-clear").await.unwrap().is_none());
         assert!(repo.get_job(USER_A, "job-pending").await.unwrap().is_none());
+        assert!(
+            !repo
+                .renew_lease(RenewMemoryLeaseRow {
+                    user_id: USER_A.into(),
+                    job_id: "job-pending".into(),
+                    worker_id: "worker-before-clear".into(),
+                    lease_token: "lease-before-clear".into(),
+                    now: 51,
+                    lease_duration_ms: 100,
+                })
+                .await
+                .unwrap()
+        );
+        let policy = repo.effective_policy(USER_A, "conv_a2").await.unwrap();
+        assert_eq!(policy.capture_override, Some(false));
+        assert_eq!(policy.recall_override, Some(false));
+        assert!(!policy.capture_enabled && !policy.recall_enabled);
+        assert_eq!(policy.reset_at, Some(50));
+        let import_state = repo.get_import_state(USER_A).await.unwrap().unwrap();
+        assert_eq!(import_state.cursor.as_deref(), Some("legacy-cursor-7"));
+        assert!(import_state.completed);
+        assert_eq!(import_state.started_at, Some(15));
+        assert_eq!(import_state.completed_at, Some(50));
+
+        assert!(repo.get_import_state(USER_B).await.unwrap().is_none());
+        repo.clear_memory(USER_B, 60).await.unwrap();
+        let preimport_clear = repo.get_import_state(USER_B).await.unwrap().unwrap();
+        assert_eq!(preimport_clear.cursor, None);
+        assert!(preimport_clear.completed);
+        assert_eq!(preimport_clear.started_at, Some(60));
+        assert_eq!(preimport_clear.completed_at, Some(60));
     }
 
     #[tokio::test]
