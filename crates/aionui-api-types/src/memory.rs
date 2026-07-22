@@ -305,12 +305,15 @@ pub struct ClaimMemoryJobRequest {
 pub struct ClaimMemoryJobResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<MemoryJobResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RenewMemoryJobLeaseRequest {
     pub worker_id: String,
+    pub lease_token: String,
     pub lease_duration_ms: u64,
 }
 
@@ -323,6 +326,7 @@ pub struct RenewMemoryJobLeaseResponse {
 #[serde(deny_unknown_fields)]
 pub struct ReleaseMemoryJobLeaseRequest {
     pub worker_id: String,
+    pub lease_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -443,6 +447,7 @@ pub struct MemoryJobEvidenceResponse {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CompleteMemoryJobRequest {
+    pub lease_token: String,
     pub expected_revision: u64,
     pub output: MemoryUpdateOutput,
     pub task_result_provenance: MemoryTaskResultProvenance,
@@ -483,6 +488,7 @@ pub struct NormalizedMemoryJobFailure {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RecordMemoryJobFailureRequest {
+    pub lease_token: String,
     pub failure: NormalizedMemoryJobFailure,
 }
 
@@ -561,6 +567,7 @@ mod tests {
     #[test]
     fn worker_submission_accepts_result_provenance_but_rejects_provider_selection_fields() {
         let valid = json!({
+            "lease_token": "opaque-token",
             "expected_revision": 1,
             "output": {
                 "summary": {

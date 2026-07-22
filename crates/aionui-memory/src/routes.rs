@@ -18,6 +18,7 @@ use crate::MemoryError;
 pub use crate::state::MemoryRouterState;
 
 const WORKER_ID_HEADER: &str = "x-memory-worker-id";
+const LEASE_TOKEN_HEADER: &str = "x-memory-lease-token";
 
 pub fn memory_routes(state: MemoryRouterState) -> Router {
     Router::new()
@@ -36,11 +37,14 @@ async fn claim(
     body: Result<Json<ClaimMemoryJobRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ClaimMemoryJobResponse>>, ApiError> {
     let Json(request) = body.map_err(ApiError::from)?;
-    let job = state
+    let claimed = state
         .service
         .claim_job(&user.id, &request.worker_id, request.lease_duration_ms)
         .await?;
-    Ok(Json(ApiResponse::ok(ClaimMemoryJobResponse { job })))
+    let (job, lease_token) = claimed
+        .map(|claimed| (Some(claimed.job), Some(claimed.lease_token)))
+        .unwrap_or((None, None));
+    Ok(Json(ApiResponse::ok(ClaimMemoryJobResponse { job, lease_token })))
 }
 
 async fn renew_lease(
@@ -52,7 +56,13 @@ async fn renew_lease(
     let Json(request) = body.map_err(ApiError::from)?;
     let lease_expires_at = state
         .service
-        .renew_job_lease(&user.id, &id, &request.worker_id, request.lease_duration_ms)
+        .renew_job_lease(
+            &user.id,
+            &id,
+            &request.worker_id,
+            &request.lease_token,
+            request.lease_duration_ms,
+        )
         .await?;
     Ok(Json(ApiResponse::ok(RenewMemoryJobLeaseResponse { lease_expires_at })))
 }
@@ -64,7 +74,10 @@ async fn release(
     body: Result<Json<ReleaseMemoryJobLeaseRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ReleaseMemoryJobLeaseResponse>>, ApiError> {
     let Json(request) = body.map_err(ApiError::from)?;
-    let released = state.service.release_job(&user.id, &id, &request.worker_id).await?;
+    let released = state
+        .service
+        .release_job(&user.id, &id, &request.worker_id, &request.lease_token)
+        .await?;
     Ok(Json(ApiResponse::ok(ReleaseMemoryJobLeaseResponse { released })))
 }
 
@@ -75,8 +88,12 @@ async fn evidence(
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<MemoryJobEvidenceResponse>>, ApiError> {
     let worker_id = worker_id(&headers)?;
-    let input = state.service.load_job_evidence(&user.id, &id, worker_id).await?;
+    let lease_token = lease_token(&headers)?;
     let job = state.service.get_job(&user.id, &id).await?;
+    if job.lease_owner.as_deref() != Some(worker_id) {
+        return Err(MemoryError::LeaseLost.into());
+    }
+    let input = state.service.load_job_evidence(&user.id, &id, lease_token).await?;
     Ok(Json(ApiResponse::ok(MemoryJobEvidenceResponse { job, input })))
 }
 
@@ -104,9 +121,17 @@ async fn fail(
     let Json(request) = body.map_err(ApiError::from)?;
     let job = state
         .service
-        .record_job_failure(&user.id, &id, worker_id, request.failure)
+        .record_job_failure(&user.id, &id, worker_id, &request.lease_token, request.failure)
         .await?;
     Ok(Json(ApiResponse::ok(RecordMemoryJobFailureResponse { job })))
+}
+
+fn lease_token(headers: &HeaderMap) -> Result<&str, ApiError> {
+    headers
+        .get(LEASE_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty() && value.len() <= 200)
+        .ok_or_else(|| ApiError::BadRequest("missing or invalid memory lease token".into()))
 }
 
 fn worker_id(headers: &HeaderMap) -> Result<&str, ApiError> {
@@ -136,12 +161,26 @@ mod tests {
     use std::sync::Arc;
 
     use aionui_auth::CurrentUser;
+    use aionui_db::models::{ConversationRow, MessageRow};
+    use aionui_db::{
+        IConversationRepository, IMemoryRepository, SqliteConversationRepository, SqliteMemoryRepository,
+        UpdateMemorySettingsRow, init_database_memory,
+    };
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
     use super::memory_routes;
-    use crate::{MemoryRouterState, MemoryService};
+    use crate::{AppOperationsReadinessPort, MemoryError, MemoryRouterState, MemoryService, MemoryTurnOutcome};
+
+    struct UsableReadiness;
+
+    #[async_trait::async_trait]
+    impl AppOperationsReadinessPort for UsableReadiness {
+        async fn is_usable(&self) -> Result<bool, MemoryError> {
+            Ok(true)
+        }
+    }
 
     #[tokio::test]
     async fn internal_routes_require_normalized_failure_codes_and_worker_identity() {
@@ -165,6 +204,120 @@ mod tests {
             .unwrap();
         failure.extensions_mut().insert(current_user());
         assert_eq!(router.oneshot(failure).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn internal_routes_accept_the_current_token_and_reject_spoofed_or_cross_user_access() {
+        let db = init_database_memory().await.unwrap();
+        let conversations = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+        let memory = Arc::new(SqliteMemoryRepository::new(db.pool().clone()));
+        conversations
+            .create(&ConversationRow {
+                id: "conversation-1".into(),
+                user_id: "system_default_user".into(),
+                name: "Conversation".into(),
+                r#type: "gemini".into(),
+                extra: "{}".into(),
+                model: None,
+                status: Some("finished".into()),
+                source: Some("aionui".into()),
+                channel_chat_id: None,
+                pinned: false,
+                pinned_at: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        memory
+            .update_settings(UpdateMemorySettingsRow {
+                user_id: "system_default_user".into(),
+                enabled: Some(true),
+                default_capture: Some(true),
+                default_recall: None,
+                consent_version: Some(1),
+                now: 1,
+            })
+            .await
+            .unwrap();
+        for (id, position, content, created_at) in [
+            ("user", "right", "Do the work", 10),
+            ("assistant", "left", "Work completed", 11),
+        ] {
+            conversations
+                .insert_message(&MessageRow {
+                    id: id.into(),
+                    conversation_id: "conversation-1".into(),
+                    turn_id: Some("turn-1".into()),
+                    msg_id: None,
+                    r#type: "text".into(),
+                    content: serde_json::json!({ "content": content }).to_string(),
+                    position: Some(position.into()),
+                    status: Some("finish".into()),
+                    hidden: false,
+                    created_at,
+                })
+                .await
+                .unwrap();
+        }
+        let service = Arc::new(MemoryService::with_job_dependencies(
+            memory,
+            conversations,
+            Arc::new(UsableReadiness),
+        ));
+        service
+            .on_turn_completed(
+                "system_default_user",
+                "conversation-1",
+                "turn-1",
+                MemoryTurnOutcome::Completed,
+            )
+            .await;
+        let claimed = service
+            .claim_job("system_default_user", "worker-1", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let router = memory_routes(MemoryRouterState { service });
+
+        let evidence_request = |user_id: &str, token: &str| {
+            let mut request = Request::get(format!("/api/memory/internal/jobs/{}/evidence", claimed.id))
+                .header("x-memory-worker-id", "worker-1")
+                .header("x-memory-lease-token", token)
+                .body(Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(CurrentUser {
+                id: user_id.into(),
+                username: "user".into(),
+            });
+            request
+        };
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(evidence_request("system_default_user", &claimed.lease_token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK,
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(evidence_request("system_default_user", "spoofed-token"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT,
+        );
+        assert_eq!(
+            router
+                .oneshot(evidence_request("another-user", &claimed.lease_token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND,
+        );
     }
 
     fn current_user() -> CurrentUser {

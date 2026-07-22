@@ -676,55 +676,6 @@ impl IConversationRepository for SqliteConversationRepository {
         .await?)
     }
 
-    async fn list_messages_for_memory_range(
-        &self,
-        user_id: &str,
-        conv_id: &str,
-        from_turn_id: Option<&str>,
-        through_turn_id: &str,
-    ) -> Result<Vec<MessageRow>, DbError> {
-        let owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ? AND user_id = ?)")
-            .bind(conv_id)
-            .bind(user_id)
-            .fetch_one(&self.pool)
-            .await?;
-        if !owned {
-            return Err(DbError::NotFound(format!(
-                "Conversation '{conv_id}' not found for user"
-            )));
-        }
-        let through_at: Option<i64> =
-            sqlx::query_scalar("SELECT MAX(created_at) FROM messages WHERE conversation_id = ? AND turn_id = ?")
-                .bind(conv_id)
-                .bind(through_turn_id)
-                .fetch_one(&self.pool)
-                .await?;
-        let through_at = through_at.ok_or_else(|| DbError::NotFound(format!("Turn '{through_turn_id}' not found")))?;
-        let from_at = match from_turn_id {
-            Some(turn_id) => Some(
-                sqlx::query_scalar::<_, Option<i64>>(
-                    "SELECT MAX(created_at) FROM messages WHERE conversation_id = ? AND turn_id = ?",
-                )
-                .bind(conv_id)
-                .bind(turn_id)
-                .fetch_one(&self.pool)
-                .await?
-                .ok_or_else(|| DbError::NotFound(format!("Turn '{turn_id}' not found")))?,
-            ),
-            None => None,
-        };
-        Ok(sqlx::query_as::<_, MessageRow>(
-            "SELECT * FROM messages WHERE conversation_id = ? AND turn_id IS NOT NULL
-             AND (? IS NULL OR created_at > ?) AND created_at <= ? ORDER BY created_at, id",
-        )
-        .bind(conv_id)
-        .bind(from_at)
-        .bind(from_at)
-        .bind(through_at)
-        .fetch_all(&self.pool)
-        .await?)
-    }
-
     async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError> {
         self.insert_message_once(message).await.map_err(DbError::from)
     }

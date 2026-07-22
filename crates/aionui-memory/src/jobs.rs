@@ -10,6 +10,21 @@ pub enum MemoryTurnOutcome {
     Canceled,
 }
 
+/// A claimed job paired with the opaque server-issued lease capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedMemoryJob {
+    pub job: MemoryJobResponse,
+    pub lease_token: String,
+}
+
+impl std::ops::Deref for ClaimedMemoryJob {
+    type Target = MemoryJobResponse;
+
+    fn deref(&self) -> &Self::Target {
+        &self.job
+    }
+}
+
 pub(crate) const MEMORY_DISCLOSURE_VERSION: i64 = 1;
 
 pub(crate) fn eligible_completed_turn(
@@ -38,7 +53,7 @@ pub(crate) fn eligible_completed_turn(
     }
 
     let has_visible_user_work = messages.iter().any(|message| visible_text(message, "right"));
-    let has_visible_assistant_outcome = messages.iter().any(|message| visible_text(message, "left"));
+    let has_visible_assistant_outcome = messages.iter().any(visible_assistant_outcome);
     has_visible_user_work && has_visible_assistant_outcome
 }
 
@@ -74,6 +89,21 @@ fn visible_text(message: &MessageRow, position: &str) -> bool {
             .ok()
             .and_then(|value| value.get("content").and_then(Value::as_str).map(str::to_owned))
             .is_some_and(|content| !content.trim().is_empty())
+}
+
+fn visible_assistant_outcome(message: &MessageRow) -> bool {
+    if message.hidden || message.position.as_deref() != Some("left") || message.status.as_deref() != Some("finish") {
+        return false;
+    }
+    let field = match message.r#type.as_str() {
+        "text" | "artifact" => "content",
+        "tool_result_summary" => "summary",
+        _ => return false,
+    };
+    serde_json::from_str::<Value>(&message.content)
+        .ok()
+        .and_then(|value| value.get(field).and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|content| !content.trim().is_empty())
 }
 
 pub(crate) fn job_response(row: MemoryJobRow) -> Result<MemoryJobResponse, crate::MemoryError> {
@@ -226,6 +256,22 @@ mod tests {
                 !eligible_completed_turn(&conversation, &policy, &messages, outcome),
                 "{label} turn should be ineligible",
             );
+        }
+
+        for assistant_type in ["artifact", "tool_result_summary"] {
+            let field = if assistant_type == "artifact" {
+                "content"
+            } else {
+                "summary"
+            };
+            let mut assistant = assistant_message(false, assistant_type, "finish", 11);
+            assistant.content = serde_json::json!({ (field): "Durable assistant outcome" }).to_string();
+            assert!(eligible_completed_turn(
+                &make_conversation("gemini", "{}", Some("aionui")),
+                &make_policy(Some(1), None),
+                &[user_message(false, "text", "finish", 10), assistant],
+                MemoryTurnOutcome::Completed,
+            ));
         }
     }
 

@@ -31,6 +31,7 @@ pub struct EnqueueMemoryTurnRow {
     pub user_id: String,
     pub conversation_id: String,
     pub from_turn_id: Option<String>,
+    pub turn_ids_json: String,
     pub through_turn_id: String,
     pub operation_version: String,
     pub input_hash: String,
@@ -42,6 +43,7 @@ pub struct EnqueueMemoryTurnRow {
 pub struct ClaimMemoryJobRow {
     pub user_id: String,
     pub worker_id: String,
+    pub lease_token: String,
     pub now: TimestampMs,
     pub lease_duration_ms: i64,
 }
@@ -51,6 +53,7 @@ pub struct RenewMemoryLeaseRow {
     pub user_id: String,
     pub job_id: String,
     pub worker_id: String,
+    pub lease_token: String,
     pub now: TimestampMs,
     pub lease_duration_ms: i64,
 }
@@ -60,6 +63,7 @@ pub struct ReleaseMemoryLeaseRow {
     pub user_id: String,
     pub job_id: String,
     pub worker_id: String,
+    pub lease_token: String,
     pub now: TimestampMs,
 }
 
@@ -68,9 +72,12 @@ pub struct TransitionMemoryJobRow {
     pub user_id: String,
     pub job_id: String,
     pub worker_id: String,
+    pub lease_token: String,
     pub state: String,
     pub next_attempt_at: Option<TimestampMs>,
     pub error_code: Option<String>,
+    pub increment_attempt: bool,
+    pub increment_invalid_output: bool,
     pub now: TimestampMs,
 }
 
@@ -126,9 +133,25 @@ pub struct CommitMemoryUpdateRow {
     pub writer_provider_id: Option<String>,
     pub writer_model_id: Option<String>,
     pub lease_owner: String,
+    pub lease_token: String,
     pub expected_attempt_count: i64,
     pub entries: Vec<CommitMemoryEntryRow>,
     pub change_set_id: String,
+    pub now: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitMemoryJobRow {
+    pub user_id: String,
+    pub job_id: String,
+    pub lease_token: String,
+    pub running_turn_ids_json: String,
+    pub running_through_turn_id: String,
+    pub running_input_hash: String,
+    pub pending_job_id: String,
+    pub pending_turn_ids_json: String,
+    pub pending_through_turn_id: String,
+    pub pending_input_hash: String,
     pub now: TimestampMs,
 }
 
@@ -190,6 +213,23 @@ pub trait IMemoryRepository: Send + Sync {
     ) -> Result<EffectiveMemoryPolicyRow, DbError>;
     async fn enqueue_completed_turn(&self, input: EnqueueMemoryTurnRow) -> Result<Option<MemoryJobRow>, DbError>;
     async fn claim_next_job(&self, input: ClaimMemoryJobRow) -> Result<Option<MemoryJobRow>, DbError>;
+    async fn split_claimed_job(&self, input: SplitMemoryJobRow) -> Result<bool, DbError>;
+    async fn update_job_input_hash(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        expected_turn_ids_json: &str,
+        input_hash: &str,
+        now: TimestampMs,
+    ) -> Result<bool, DbError>;
+    async fn validate_lease(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        lease_token: &str,
+        now: TimestampMs,
+    ) -> Result<bool, DbError>;
+    async fn block_jobs(&self, user_id: &str, now: TimestampMs) -> Result<u64, DbError>;
     async fn renew_lease(&self, input: RenewMemoryLeaseRow) -> Result<bool, DbError>;
     async fn release_lease(&self, input: ReleaseMemoryLeaseRow) -> Result<bool, DbError>;
     async fn transition_running_job(&self, input: TransitionMemoryJobRow) -> Result<Option<MemoryJobRow>, DbError>;

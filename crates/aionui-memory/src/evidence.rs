@@ -23,7 +23,7 @@ pub struct EvidenceBuildRequest {
     pub conversation: ConversationRow,
     pub messages: Vec<MessageRow>,
     pub previous_summary: Option<MemorySummary>,
-    /// Canonical summary cursor. Only turn IDs after this cursor are included.
+    /// Canonical summary cursor before the exact queued turns.
     pub summary_cursor: Option<String>,
     /// Ordered canonical turn IDs claimed by the durable job.
     pub claimed_turn_ids: Vec<String>,
@@ -42,7 +42,7 @@ impl EvidenceBuilder {
             return Err(MemoryError::InvalidInput);
         }
 
-        let turn_ids = selected_turn_ids(&request.claimed_turn_ids, request.summary_cursor.as_deref())?;
+        let turn_ids = selected_turn_ids(&request.claimed_turn_ids)?;
         let scope = scope_from_conversation(&request.conversation)?;
         let source_turns = source_turns_from_rows(&request.conversation, &request.messages, &turn_ids)?;
         let existing_entries = existing_entries_from_rows(request.existing_entries, &request.conversation, &scope)?;
@@ -67,27 +67,17 @@ struct ConversationScope {
     workspace_key: Option<String>,
 }
 
-fn selected_turn_ids(claimed_turn_ids: &[String], summary_cursor: Option<&str>) -> Result<Vec<String>, MemoryError> {
+fn selected_turn_ids(claimed_turn_ids: &[String]) -> Result<Vec<String>, MemoryError> {
     if claimed_turn_ids.iter().any(|turn_id| !valid_identifier(turn_id))
         || claimed_turn_ids.iter().collect::<BTreeSet<_>>().len() != claimed_turn_ids.len()
     {
         return Err(MemoryError::InvalidInput);
     }
 
-    let start = match summary_cursor {
-        Some(cursor) => claimed_turn_ids
-            .iter()
-            .position(|turn_id| turn_id == cursor)
-            .map(|index| index + 1)
-            .ok_or(MemoryError::InvalidInput)?,
-        None => 0,
-    };
-
-    let selected = claimed_turn_ids[start..].to_vec();
-    if selected.len() > MAX_EVIDENCE_TURNS {
+    if claimed_turn_ids.len() > MAX_EVIDENCE_TURNS {
         return Err(MemoryError::InvalidInput);
     }
-    Ok(selected)
+    Ok(claimed_turn_ids.to_vec())
 }
 
 fn scope_from_conversation(conversation: &ConversationRow) -> Result<ConversationScope, MemoryError> {
@@ -209,12 +199,17 @@ fn should_exclude_message(message: &MessageRow) -> bool {
         return true;
     }
     let message_type = message.r#type.trim().to_ascii_lowercase();
-    message_type != "text" || message.status.as_deref() != Some("finish")
+    !matches!(message_type.as_str(), "text" | "artifact" | "tool_result_summary")
+        || message.status.as_deref() != Some("finish")
 }
 
 fn visible_text_content(message: &MessageRow) -> Result<Option<String>, MemoryError> {
     let value: Value = serde_json::from_str(&message.content).map_err(|_| MemoryError::InvalidInput)?;
-    Ok(value.get("content").and_then(Value::as_str).map(str::to_owned))
+    Ok(value
+        .get("content")
+        .or_else(|| value.get("summary"))
+        .and_then(Value::as_str)
+        .map(str::to_owned))
 }
 
 fn message_role(message: &MessageRow) -> Option<MemorySourceMessageRole> {
@@ -368,7 +363,7 @@ mod tests {
     use super::{EvidenceBuildRequest, EvidenceBuilder, MAX_EVIDENCE_BYTES, MAX_EVIDENCE_MESSAGES, MAX_EVIDENCE_TURNS};
 
     #[test]
-    fn reconstructs_only_safe_canonical_evidence_after_the_summary_cursor() {
+    fn reconstructs_only_safe_canonical_evidence_from_exact_queued_turns() {
         let request = EvidenceBuildRequest {
             conversation: conversation(json!({
                 "project_id": "project-alpha",
@@ -391,7 +386,7 @@ mod tests {
             ],
             previous_summary: Some(summary()),
             summary_cursor: Some("turn-0".into()),
-            claimed_turn_ids: vec!["turn-0".into(), "turn-1".into(), "turn-2".into()],
+            claimed_turn_ids: vec!["turn-1".into(), "turn-2".into()],
             existing_entries: vec![active_entry("active"), superseded_entry("superseded")],
         };
 
@@ -573,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_claims_and_applies_limits_after_cursor_and_safe_filtering() {
+    fn rejects_duplicate_claims_and_treats_the_summary_cursor_as_prior_state() {
         let builder = EvidenceBuilder::default();
         let duplicate_cursor = EvidenceBuildRequest {
             conversation: conversation(json!({})),
@@ -588,18 +583,13 @@ mod tests {
             crate::MemoryError::InvalidInput
         );
 
-        let before_cursor = (0..=MAX_EVIDENCE_TURNS)
-            .map(|index| format!("old-{index}"))
-            .chain(std::iter::once("cursor".into()))
-            .chain(std::iter::once("selected".into()))
-            .collect::<Vec<_>>();
         let output = builder
             .build(EvidenceBuildRequest {
                 conversation: conversation(json!({})),
                 messages: vec![text_message("selected", "selected", "right", "safe")],
                 previous_summary: None,
                 summary_cursor: Some("cursor".into()),
-                claimed_turn_ids: before_cursor,
+                claimed_turn_ids: vec!["selected".into()],
                 existing_entries: Vec::new(),
             })
             .unwrap();

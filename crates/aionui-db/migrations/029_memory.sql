@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS memory_jobs (
     user_id            TEXT NOT NULL,
     conversation_id    TEXT NOT NULL,
     from_turn_id       TEXT,
+    turn_ids_json      TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(turn_ids_json) AND json_type(turn_ids_json) = 'array'),
     through_turn_id    TEXT NOT NULL,
     operation_version  TEXT NOT NULL,
     input_hash         TEXT NOT NULL,
@@ -112,7 +113,9 @@ CREATE TABLE IF NOT EXISTS memory_jobs (
     attempt_count      INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
     next_attempt_at    INTEGER,
     lease_owner        TEXT,
+    lease_token        TEXT,
     lease_expires_at   INTEGER,
+    invalid_output_count INTEGER NOT NULL DEFAULT 0 CHECK(invalid_output_count >= 0),
     last_error_code    TEXT,
     created_at         INTEGER NOT NULL,
     updated_at         INTEGER NOT NULL,
@@ -168,6 +171,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_jobs_one_running
     ON memory_jobs(user_id, conversation_id) WHERE state = 'running';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_jobs_one_next
     ON memory_jobs(user_id, conversation_id) WHERE state IN ('pending', 'retry_wait', 'blocked');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_jobs_lease_token
+    ON memory_jobs(lease_token) WHERE lease_token IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_memory_retrievals_expiry
     ON memory_retrievals(expires_at);
 CREATE INDEX IF NOT EXISTS idx_memory_import_pending

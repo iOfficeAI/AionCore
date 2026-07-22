@@ -98,17 +98,6 @@ pub trait IConversationRepository: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Returns canonical messages after an optional Memory cursor through an inclusive completed turn.
-    async fn list_messages_for_memory_range(
-        &self,
-        user_id: &str,
-        conv_id: &str,
-        _from_turn_id: Option<&str>,
-        through_turn_id: &str,
-    ) -> Result<Vec<MessageRow>, DbError> {
-        self.list_messages_by_turn(user_id, conv_id, through_turn_id).await
-    }
-
     /// Inserts a new message row.
     async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError>;
 

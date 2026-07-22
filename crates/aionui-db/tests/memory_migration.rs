@@ -95,6 +95,16 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
         assert!(tables.contains(table), "missing table {table}");
     }
 
+    let job_columns: HashSet<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('memory_jobs')")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    for column in ["turn_ids_json", "lease_token", "invalid_output_count"] {
+        assert!(job_columns.contains(column), "missing memory_jobs column {column}");
+    }
+
     let indexes: HashSet<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'index'")
         .fetch_all(pool)
         .await
@@ -133,9 +143,9 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
 
     let invalid_job_state = sqlx::query(
         "INSERT INTO memory_jobs
-         (id, user_id, conversation_id, through_turn_id, operation_version, input_hash, expected_revision, state,
+         (id, user_id, conversation_id, turn_ids_json, through_turn_id, operation_version, input_hash, expected_revision, state,
           attempt_count, created_at, updated_at)
-         VALUES ('bad-job', 'system_default_user', 'conv-constraints', 'turn', 'v1', 'hash', 0, 'unknown', 0, 1, 1)",
+         VALUES ('bad-job', 'system_default_user', 'conv-constraints', '[]', 'turn', 'v1', 'hash', 0, 'unknown', 0, 1, 1)",
     )
     .execute(pool)
     .await;
@@ -157,11 +167,12 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
     ] {
         sqlx::query(
             "INSERT INTO memory_jobs
-             (id, user_id, conversation_id, through_turn_id, operation_version, input_hash, expected_revision, state,
+             (id, user_id, conversation_id, turn_ids_json, through_turn_id, operation_version, input_hash, expected_revision, state,
               attempt_count, created_at, updated_at)
-             VALUES (?, 'system_default_user', 'conv-constraints', ?, 'v1', ?, 0, ?, 0, 1, 1)",
+             VALUES (?, 'system_default_user', 'conv-constraints', json_array(?), ?, 'v1', ?, 0, ?, 0, 1, 1)",
         )
         .bind(id)
+        .bind(turn)
         .bind(turn)
         .bind(format!("hash-{id}"))
         .bind(state)
@@ -170,21 +181,21 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
         .unwrap();
     }
     let second_running = sqlx::query(
-        "INSERT INTO memory_jobs
-         (id, user_id, conversation_id, through_turn_id, operation_version, input_hash, expected_revision, state,
+        r#"INSERT INTO memory_jobs
+         (id, user_id, conversation_id, turn_ids_json, through_turn_id, operation_version, input_hash, expected_revision, state,
           attempt_count, created_at, updated_at)
-         VALUES ('running-2', 'system_default_user', 'conv-constraints', 'turn-running-2', 'v1', 'hash-running-2',
-                 0, 'running', 0, 2, 2)",
+         VALUES ('running-2', 'system_default_user', 'conv-constraints', '["turn-running-2"]', 'turn-running-2', 'v1', 'hash-running-2',
+                 0, 'running', 0, 2, 2)"#,
     )
     .execute(pool)
     .await;
     assert!(second_running.is_err());
     let second_next = sqlx::query(
-        "INSERT INTO memory_jobs
-         (id, user_id, conversation_id, through_turn_id, operation_version, input_hash, expected_revision, state,
+        r#"INSERT INTO memory_jobs
+         (id, user_id, conversation_id, turn_ids_json, through_turn_id, operation_version, input_hash, expected_revision, state,
           attempt_count, created_at, updated_at)
-         VALUES ('retry-2', 'system_default_user', 'conv-constraints', 'turn-retry-2', 'v1', 'hash-retry-2',
-                 0, 'retry_wait', 0, 2, 2)",
+         VALUES ('retry-2', 'system_default_user', 'conv-constraints', '["turn-retry-2"]', 'turn-retry-2', 'v1', 'hash-retry-2',
+                 0, 'retry_wait', 0, 2, 2)"#,
     )
     .execute(pool)
     .await;

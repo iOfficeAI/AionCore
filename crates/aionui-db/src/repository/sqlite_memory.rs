@@ -15,7 +15,7 @@ use crate::models::{
 use crate::repository::memory::{
     ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
     CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, IMemoryRepository, MemoryCandidateQueryRow,
-    MemoryEntryQueryRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, TransitionMemoryJobRow,
+    MemoryEntryQueryRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, SplitMemoryJobRow, TransitionMemoryJobRow,
     UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow, UpdateMemorySettingsRow,
 };
 
@@ -368,14 +368,20 @@ impl IMemoryRepository for SqliteMemoryRepository {
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
         let result = async {
             Self::ensure_conversation_on(&mut connection, &input.user_id, &input.conversation_id).await?;
+            let queued_turn_ids: Vec<String> = serde_json::from_str(&input.turn_ids_json)
+                .map_err(|_| DbError::Conflict("Invalid Memory job turn queue".into()))?;
+            if queued_turn_ids.as_slice() != [input.through_turn_id.as_str()] {
+                return Err(DbError::Conflict("Enqueue must contain exactly its completed turn".into()));
+            }
             let duplicate: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM memory_jobs
-                 WHERE user_id = ? AND conversation_id = ? AND through_turn_id = ? AND operation_version = ?)",
+                "SELECT EXISTS(SELECT 1 FROM memory_jobs jobs, json_each(jobs.turn_ids_json) turns
+                 WHERE jobs.user_id = ? AND jobs.conversation_id = ? AND jobs.operation_version = ?
+                   AND turns.value = ?)",
             )
             .bind(&input.user_id)
             .bind(&input.conversation_id)
-            .bind(&input.through_turn_id)
             .bind(&input.operation_version)
+            .bind(&input.through_turn_id)
             .fetch_one(&mut *connection)
             .await?;
             if duplicate {
@@ -392,10 +398,12 @@ impl IMemoryRepository for SqliteMemoryRepository {
             .await?;
             if let Some(pending) = pending {
                 sqlx::query(
-                    "UPDATE memory_jobs SET through_turn_id = ?, operation_version = ?, input_hash = ?,
+                    "UPDATE memory_jobs SET turn_ids_json = json_insert(turn_ids_json, '$[#]', ?),
+                     through_turn_id = ?, operation_version = ?, input_hash = ?,
                      expected_revision = ?, state = 'pending', next_attempt_at = NULL, last_error_code = NULL, updated_at = ?
                      WHERE id = ? AND user_id = ?",
                 )
+                .bind(&input.through_turn_id)
                 .bind(&input.through_turn_id)
                 .bind(&input.operation_version)
                 .bind(&input.input_hash)
@@ -413,14 +421,15 @@ impl IMemoryRepository for SqliteMemoryRepository {
 
             sqlx::query(
                 "INSERT INTO memory_jobs
-                    (id, user_id, conversation_id, from_turn_id, through_turn_id, operation_version, input_hash,
+                    (id, user_id, conversation_id, from_turn_id, turn_ids_json, through_turn_id, operation_version, input_hash,
                      expected_revision, state, attempt_count, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)",
             )
             .bind(&input.id)
             .bind(&input.user_id)
             .bind(&input.conversation_id)
             .bind(&input.from_turn_id)
+            .bind(&input.turn_ids_json)
             .bind(&input.through_turn_id)
             .bind(&input.operation_version)
             .bind(&input.input_hash)
@@ -477,15 +486,16 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 return Ok(None);
             };
             sqlx::query(
-                "UPDATE memory_jobs SET state = 'running', attempt_count = attempt_count + 1,
+                "UPDATE memory_jobs SET state = 'running',
                  expected_revision = COALESCE((
                     SELECT revision FROM conversation_memories
                     WHERE user_id = memory_jobs.user_id AND conversation_id = memory_jobs.conversation_id
                  ), 0),
-                 lease_owner = ?, lease_expires_at = ?, next_attempt_at = NULL, updated_at = ?
+                 lease_owner = ?, lease_token = ?, lease_expires_at = ?, next_attempt_at = NULL, updated_at = ?
                  WHERE id = ? AND user_id = ?",
             )
             .bind(&input.worker_id)
+            .bind(&input.lease_token)
             .bind(input.now + input.lease_duration_ms)
             .bind(input.now)
             .bind(&job_id)
@@ -510,16 +520,131 @@ impl IMemoryRepository for SqliteMemoryRepository {
         }
     }
 
+    async fn split_claimed_job(&self, input: SplitMemoryJobRow) -> Result<bool, DbError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let result = async {
+            let running: Option<MemoryJobRow> = sqlx::query_as(
+                "SELECT * FROM memory_jobs WHERE id = ? AND user_id = ? AND state = 'running'
+                 AND lease_token = ? AND lease_expires_at > ?",
+            )
+            .bind(&input.job_id).bind(&input.user_id).bind(&input.lease_token).bind(input.now)
+            .fetch_optional(&mut *connection).await?;
+            let Some(running) = running else { return Ok(false); };
+            sqlx::query(
+                "UPDATE memory_jobs SET turn_ids_json = ?, through_turn_id = ?, input_hash = ?, updated_at = ?
+                 WHERE id = ? AND user_id = ? AND state = 'running' AND lease_token = ? AND lease_expires_at > ?",
+            )
+            .bind(&input.running_turn_ids_json).bind(&input.running_through_turn_id)
+            .bind(&input.running_input_hash).bind(input.now).bind(&input.job_id).bind(&input.user_id)
+            .bind(&input.lease_token).bind(input.now).execute(&mut *connection).await?;
+            let existing: Option<MemoryJobRow> = sqlx::query_as(
+                "SELECT * FROM memory_jobs WHERE user_id = ? AND conversation_id = ?
+                 AND state IN ('pending','retry_wait','blocked') LIMIT 1",
+            ).bind(&input.user_id).bind(&running.conversation_id).fetch_optional(&mut *connection).await?;
+            if let Some(existing) = existing {
+                let mut remainder: Vec<String> = serde_json::from_str(&input.pending_turn_ids_json)
+                    .map_err(|_| DbError::Conflict("Invalid pending Memory turn queue".into()))?;
+                let newer: Vec<String> = serde_json::from_str(&existing.turn_ids_json)
+                    .map_err(|_| DbError::Conflict("Invalid existing Memory turn queue".into()))?;
+                for turn_id in newer { if !remainder.contains(&turn_id) { remainder.push(turn_id); } }
+                let through = remainder.last().cloned().ok_or_else(|| DbError::Conflict("Empty pending queue".into()))?;
+                let remainder_json =
+                    serde_json::to_string(&remainder).map_err(|error| DbError::Init(error.to_string()))?;
+                sqlx::query(
+                    "UPDATE memory_jobs SET from_turn_id = ?, turn_ids_json = ?, through_turn_id = ?, input_hash = ?,
+                     state = 'pending', next_attempt_at = NULL, updated_at = ? WHERE id = ?",
+                ).bind(&input.running_through_turn_id).bind(remainder_json)
+                .bind(through).bind(&input.pending_input_hash).bind(input.now).bind(existing.id)
+                .execute(&mut *connection).await?;
+            } else {
+                sqlx::query(
+                    "INSERT INTO memory_jobs
+                     (id,user_id,conversation_id,from_turn_id,turn_ids_json,through_turn_id,operation_version,input_hash,
+                      expected_revision,state,attempt_count,created_at,updated_at)
+                     VALUES (?,?,?,?,?,?,?,?,?,'pending',0,?,?)",
+                ).bind(&input.pending_job_id).bind(&input.user_id).bind(&running.conversation_id)
+                .bind(&input.running_through_turn_id).bind(&input.pending_turn_ids_json)
+                .bind(&input.pending_through_turn_id).bind(&running.operation_version).bind(&input.pending_input_hash)
+                .bind(running.expected_revision).bind(input.now).bind(input.now).execute(&mut *connection).await?;
+            }
+            Ok(true)
+        }.await;
+        match result {
+            Ok(value) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn update_job_input_hash(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        expected_turn_ids_json: &str,
+        input_hash: &str,
+        now: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE memory_jobs SET input_hash = ?, updated_at = ? WHERE id = ? AND user_id = ? AND turn_ids_json = ?",
+        )
+        .bind(input_hash)
+        .bind(now)
+        .bind(job_id)
+        .bind(user_id)
+        .bind(expected_turn_ids_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn validate_lease(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        lease_token: &str,
+        now: TimestampMs,
+    ) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM memory_jobs WHERE id = ? AND user_id = ? AND state = 'running'
+             AND lease_token = ? AND lease_expires_at > ?)",
+        )
+        .bind(job_id)
+        .bind(user_id)
+        .bind(lease_token)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    async fn block_jobs(&self, user_id: &str, now: TimestampMs) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE memory_jobs SET state = 'blocked', next_attempt_at = NULL, updated_at = ?
+             WHERE user_id = ? AND state IN ('pending','retry_wait')",
+        )
+        .bind(now)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     async fn renew_lease(&self, input: RenewMemoryLeaseRow) -> Result<bool, DbError> {
         let result = sqlx::query(
             "UPDATE memory_jobs SET lease_expires_at = ?, updated_at = ?
-             WHERE id = ? AND user_id = ? AND state = 'running' AND lease_owner = ? AND lease_expires_at > ?",
+             WHERE id = ? AND user_id = ? AND state = 'running' AND lease_owner = ? AND lease_token = ? AND lease_expires_at > ?",
         )
         .bind(input.now + input.lease_duration_ms)
         .bind(input.now)
         .bind(&input.job_id)
         .bind(&input.user_id)
         .bind(&input.worker_id)
+        .bind(&input.lease_token)
         .bind(input.now)
         .execute(&self.pool)
         .await?;
@@ -528,14 +653,15 @@ impl IMemoryRepository for SqliteMemoryRepository {
 
     async fn release_lease(&self, input: ReleaseMemoryLeaseRow) -> Result<bool, DbError> {
         let result = sqlx::query(
-            "UPDATE memory_jobs SET state = 'pending', lease_owner = NULL, lease_expires_at = NULL,
+            "UPDATE memory_jobs SET state = 'pending', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
              next_attempt_at = NULL, updated_at = ?
-             WHERE id = ? AND user_id = ? AND state = 'running' AND lease_owner = ? AND lease_expires_at > ?",
+             WHERE id = ? AND user_id = ? AND state = 'running' AND lease_owner = ? AND lease_token = ? AND lease_expires_at > ?",
         )
         .bind(input.now)
         .bind(&input.job_id)
         .bind(&input.user_id)
         .bind(&input.worker_id)
+        .bind(&input.lease_token)
         .bind(input.now)
         .execute(&self.pool)
         .await?;
@@ -545,16 +671,20 @@ impl IMemoryRepository for SqliteMemoryRepository {
     async fn transition_running_job(&self, input: TransitionMemoryJobRow) -> Result<Option<MemoryJobRow>, DbError> {
         let result = sqlx::query(
             "UPDATE memory_jobs SET state = ?, next_attempt_at = ?, last_error_code = ?,
-             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-             WHERE id = ? AND user_id = ? AND state = 'running' AND lease_owner = ? AND lease_expires_at > ?",
+             attempt_count = attempt_count + ?, invalid_output_count = invalid_output_count + ?,
+             lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+             WHERE id = ? AND user_id = ? AND state = 'running' AND lease_owner = ? AND lease_token = ? AND lease_expires_at > ?",
         )
         .bind(&input.state)
         .bind(input.next_attempt_at)
         .bind(&input.error_code)
+        .bind(input.increment_attempt)
+        .bind(input.increment_invalid_output)
         .bind(input.now)
         .bind(&input.job_id)
         .bind(&input.user_id)
         .bind(&input.worker_id)
+        .bind(&input.lease_token)
         .bind(input.now)
         .execute(&self.pool)
         .await?;
@@ -573,7 +703,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
         let result = match conversation_id {
             Some(conversation_id) => {
                 sqlx::query(
-                    "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_expires_at = NULL,
+                    "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
                      next_attempt_at = NULL, last_error_code = 'canceled', updated_at = ?
                      WHERE user_id = ? AND conversation_id = ? AND state IN ('pending','running','retry_wait','blocked')",
                 )
@@ -585,7 +715,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
             }
             None => {
                 sqlx::query(
-                    "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_expires_at = NULL,
+                    "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
                      next_attempt_at = NULL, last_error_code = 'canceled', updated_at = ?
                      WHERE user_id = ? AND state IN ('pending','running','retry_wait','blocked')",
                 )
@@ -612,7 +742,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
 
     async fn recover_expired_jobs(&self, now: TimestampMs) -> Result<u64, DbError> {
         let result = sqlx::query(
-            "UPDATE memory_jobs SET state = 'pending', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+            "UPDATE memory_jobs SET state = 'pending', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
              WHERE state = 'running' AND lease_expires_at <= ?",
         )
         .bind(now)
@@ -643,9 +773,9 @@ impl IMemoryRepository for SqliteMemoryRepository {
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
         let result = async {
             Self::ensure_conversation_on(&mut connection, &input.user_id, &input.conversation_id).await?;
-            let job: Option<(String, String, i64, String, Option<String>, Option<i64>, i64)> = sqlx::query_as(
+            let job: Option<(String, String, i64, String, Option<String>, Option<String>, Option<i64>, i64)> = sqlx::query_as(
                 "SELECT conversation_id, state, expected_revision, through_turn_id, lease_owner,
-                        lease_expires_at, attempt_count
+                        lease_token, lease_expires_at, attempt_count
                  FROM memory_jobs WHERE id = ? AND user_id = ?",
             )
             .bind(&input.job_id)
@@ -658,6 +788,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 job_expected_revision,
                 job_through_turn_id,
                 job_lease_owner,
+                job_lease_token,
                 job_lease_expires_at,
                 job_attempt_count,
             )) = job
@@ -669,6 +800,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 && job_expected_revision == input.expected_revision
                 && job_through_turn_id == input.through_turn_id
                 && job_lease_owner.as_deref() == Some(input.lease_owner.as_str())
+                && job_lease_token.as_deref() == Some(input.lease_token.as_str())
                 && job_lease_expires_at.is_some_and(|expires_at| expires_at > input.now)
                 && job_attempt_count == input.expected_attempt_count;
             if !valid_fence {
@@ -893,12 +1025,23 @@ impl IMemoryRepository for SqliteMemoryRepository {
             .execute(&mut *connection)
             .await?;
             sqlx::query(
-                "UPDATE memory_jobs SET state = 'succeeded', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                "UPDATE memory_jobs SET state = 'succeeded', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
                  WHERE id = ? AND user_id = ? AND state = 'running'",
             )
             .bind(input.now)
             .bind(&input.job_id)
             .bind(&input.user_id)
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query(
+                "UPDATE memory_jobs SET from_turn_id = ?, expected_revision = ?, updated_at = ?
+                 WHERE user_id = ? AND conversation_id = ? AND state IN ('pending','retry_wait','blocked')",
+            )
+            .bind(&input.through_turn_id)
+            .bind(revision)
+            .bind(input.now)
+            .bind(&input.user_id)
+            .bind(&input.conversation_id)
             .execute(&mut *connection)
             .await?;
 
@@ -1156,7 +1299,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 .execute(&mut *connection)
                 .await?;
             sqlx::query(
-                "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
                  WHERE user_id = ? AND conversation_id = ? AND state NOT IN ('succeeded', 'failed', 'canceled')",
             )
             .bind(now)
@@ -1393,8 +1536,9 @@ mod tests {
             user_id: USER_A.into(),
             conversation_id: conversation_id.into(),
             from_turn_id: None,
+            turn_ids_json: format!(r#"["{through_turn_id}"]"#),
             through_turn_id: through_turn_id.into(),
-            operation_version: "memory-v1".into(),
+            operation_version: "memory-operation-v1".into(),
             input_hash: format!("hash-{through_turn_id}"),
             expected_revision: 0,
             now,
@@ -1405,6 +1549,7 @@ mod tests {
         ClaimMemoryJobRow {
             user_id: user_id.into(),
             worker_id: worker_id.into(),
+            lease_token: format!("lease-{worker_id}-{now}"),
             now,
             lease_duration_ms: 10,
         }
@@ -1454,7 +1599,8 @@ mod tests {
             writer_provider_id: Some("provider-result".into()),
             writer_model_id: Some("model-result".into()),
             lease_owner: "worker".into(),
-            expected_attempt_count: 1,
+            lease_token: "lease-worker-11".into(),
+            expected_attempt_count: 0,
             entries,
             change_set_id: format!("changes-{job_id}"),
             now,
@@ -1480,6 +1626,7 @@ mod tests {
             .claim_next_job(ClaimMemoryJobRow {
                 user_id: USER_A.into(),
                 worker_id: "worker".into(),
+                lease_token: "lease-worker-11".into(),
                 now: 11,
                 lease_duration_ms: 100,
             })
@@ -1574,6 +1721,18 @@ mod tests {
             .unwrap();
         assert_eq!(coalesced.id, "job-1");
         assert_eq!(coalesced.through_turn_id, "turn-2");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&coalesced.turn_ids_json).unwrap(),
+            ["turn-1", "turn-2"],
+        );
+        assert!(
+            repo.enqueue_completed_turn(enqueue("delayed-old", "conv_a", "turn-1", 13))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let still_monotonic = repo.get_job(USER_A, "job-1").await.unwrap().unwrap();
+        assert_eq!(still_monotonic.through_turn_id, "turn-2");
         assert_eq!(repo.count_jobs(USER_A, "conv_a", "pending").await.unwrap(), 1);
 
         repo.claim_next_job(claim(USER_A, "worker", 13)).await.unwrap().unwrap();
@@ -1606,6 +1765,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.lease_expires_at, Some(30));
+        assert_eq!(first.attempt_count, 0, "claiming is not a durable failed attempt");
+        let first_token = first.lease_token.clone().expect("server lease token");
         assert!(
             repo.claim_next_job(claim(USER_A, "worker-b", 29))
                 .await
@@ -1619,12 +1780,14 @@ mod tests {
             .unwrap();
         assert_eq!(reclaimed.id, "job-lease");
         assert_eq!(reclaimed.lease_owner.as_deref(), Some("worker-b"));
-        assert_eq!(reclaimed.attempt_count, 2);
+        assert_eq!(reclaimed.attempt_count, 0);
+        assert_ne!(reclaimed.lease_token.as_deref(), Some(first_token.as_str()));
         assert!(
             repo.renew_lease(RenewMemoryLeaseRow {
                 user_id: USER_A.into(),
                 job_id: "job-lease".into(),
                 worker_id: "worker-b".into(),
+                lease_token: reclaimed.lease_token.expect("reclaimed token"),
                 now: 32,
                 lease_duration_ms: 10,
             })
@@ -1656,7 +1819,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(reclaimed.attempt_count, 2);
+        assert_eq!(reclaimed.attempt_count, 0);
 
         let mut old_commit = commit(
             "job-fenced",
@@ -1671,7 +1834,8 @@ mod tests {
             32,
         );
         old_commit.lease_owner = "worker-old".into();
-        old_commit.expected_attempt_count = 1;
+        old_commit.lease_token = "lease-worker-old-20".into();
+        old_commit.expected_attempt_count = 0;
         assert!(matches!(
             repo.commit_update(old_commit).await,
             Err(DbError::Conflict(_))
@@ -1691,7 +1855,8 @@ mod tests {
             32,
         );
         current_commit.lease_owner = "worker-new".into();
-        current_commit.expected_attempt_count = 2;
+        current_commit.lease_token = "lease-worker-new-31".into();
+        current_commit.expected_attempt_count = 0;
         assert!(matches!(
             repo.commit_update(current_commit).await.unwrap(),
             CommitMemoryUpdateResult::Committed { .. }

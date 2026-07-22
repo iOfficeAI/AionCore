@@ -12,6 +12,6 @@ pub mod state;
 pub use app_operations_port::AppOperationsReadinessPort;
 pub use error::MemoryError;
 pub use evidence::EvidenceBuildRequest;
-pub use jobs::MemoryTurnOutcome;
+pub use jobs::{ClaimedMemoryJob, MemoryTurnOutcome};
 pub use service::MemoryService;
 pub use state::MemoryRouterState;
