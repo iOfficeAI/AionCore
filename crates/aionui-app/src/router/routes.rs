@@ -32,7 +32,7 @@ use aionui_mcp::mcp_routes;
 use aionui_office::{office_proxy_routes, office_routes};
 use aionui_realtime::{WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
-use aionui_system::{connection_test_routes, system_routes};
+use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
 use aionui_team::{TeamSessionService, team_routes};
 
 use crate::services::AppServices;
@@ -43,6 +43,7 @@ use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws
 use super::trace::with_access_log;
 
 pub struct RouterRuntime {
+    pub client_pref_service: ClientPrefService,
     pub team_service: Arc<TeamSessionService>,
 }
 
@@ -74,6 +75,7 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     });
 
     let (states, channel_components) = build_module_states(services).await?;
+    let client_pref_service = states.system.client_pref_service.clone();
     let team_service = states.team.service.clone();
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: module states built");
 
@@ -115,7 +117,13 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: router assembly completed"
     );
-    Ok((router, RouterRuntime { team_service }))
+    Ok((
+        router,
+        RouterRuntime {
+            client_pref_service,
+            team_service,
+        },
+    ))
 }
 
 /// Create the application router with custom module states.

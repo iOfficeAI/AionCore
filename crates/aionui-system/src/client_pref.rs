@@ -152,6 +152,15 @@ impl ClientPrefService {
         Ok(())
     }
 
+    pub async fn release_keep_awake_for_shutdown(&self) -> Result<(), SystemError> {
+        self.keep_awake_controller.set_enabled(false).await.map_err(|error| {
+            warn!(error = %error, "Failed to release system keep-awake assertion during shutdown");
+            error
+        })?;
+        info!("System keep-awake assertion released during shutdown");
+        Ok(())
+    }
+
     async fn get_stored_keep_awake(&self) -> Result<bool, SystemError> {
         let rows = self
             .repo
@@ -535,6 +544,21 @@ mod tests {
         assert_eq!(*controller.calls.lock().unwrap(), vec![true, false]);
         let prefs = svc.get_preferences(Some(&[KEEP_AWAKE_KEY])).await.unwrap();
         assert!(!prefs.contains_key(KEEP_AWAKE_KEY));
+    }
+
+    #[tokio::test]
+    async fn keep_awake_shutdown_release_does_not_clear_persisted_preference() {
+        let controller = Arc::new(RecordingKeepAwakeController::default());
+        let svc = setup_with_keep_awake_controller(controller.clone()).await;
+        let mut req = UpdateClientPreferencesRequest::new();
+        req.insert(KEEP_AWAKE_KEY.into(), json!(true));
+        svc.update_preferences(req).await.unwrap();
+
+        svc.release_keep_awake_for_shutdown().await.unwrap();
+
+        assert_eq!(*controller.calls.lock().unwrap(), vec![true, false]);
+        let prefs = svc.get_preferences(Some(&[KEEP_AWAKE_KEY])).await.unwrap();
+        assert_eq!(prefs[KEEP_AWAKE_KEY], json!(true));
     }
 
     #[tokio::test]

@@ -293,6 +293,7 @@ pub(crate) async fn run_server(
     );
     let conversation_runtime_state = services.conversation_runtime_state.clone();
     let worker_task_manager = services.worker_task_manager.clone();
+    let client_pref_service = router_runtime.client_pref_service.clone();
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -320,6 +321,14 @@ pub(crate) async fn run_server(
                         Err(_) => warn!(active_task_count, "worker task manager shutdown timed out"),
                     }
                 }
+            }
+            if let Err(error) = client_pref_service.release_keep_awake_for_shutdown().await {
+                warn!(
+                    code = "BOOTSTRAP_DEGRADED_KEEP_AWAKE_RELEASE",
+                    stage = "shutdown.keep_awake.release",
+                    error = %error,
+                    "keep-awake shutdown release failed"
+                );
             }
             let _ = shutdown_tx.send(true);
         })
