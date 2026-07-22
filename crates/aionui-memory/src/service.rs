@@ -2022,6 +2022,112 @@ mod tests {
         fixture.service.clear_all_memory(USER_ID).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn cancel_conversation_jobs_cancels_failed_barriers_and_rejects_retry() {
+        let fixture = fixture(true).await;
+        fixture.persist_turn("turn-failed-conversation", 10).await;
+        fixture
+            .service
+            .on_turn_completed(
+                USER_ID,
+                "conversation-1",
+                "turn-failed-conversation",
+                MemoryTurnOutcome::Completed,
+            )
+            .await;
+        let claimed = fixture
+            .service
+            .claim_job(USER_ID, "conversation-cancel-worker", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let failed = fixture
+            .service
+            .record_job_failure(
+                USER_ID,
+                &claimed.id,
+                "conversation-cancel-worker",
+                &claimed.lease_token,
+                NormalizedMemoryJobFailure {
+                    code: MemoryJobFailureCode::InvalidInput,
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        fixture
+            .service
+            .cancel_conversation_jobs(USER_ID, "conversation-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .memory
+                .get_job(USER_ID, &failed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "canceled",
+        );
+        assert_eq!(
+            fixture.service.retry_failed_job(USER_ID, &failed.id).await,
+            Err(MemoryError::Conflict),
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_all_jobs_cancels_failed_barriers_and_rejects_retry() {
+        let fixture = fixture(true).await;
+        fixture.persist_turn("turn-failed-all", 10).await;
+        fixture
+            .service
+            .on_turn_completed(
+                USER_ID,
+                "conversation-1",
+                "turn-failed-all",
+                MemoryTurnOutcome::Completed,
+            )
+            .await;
+        let claimed = fixture
+            .service
+            .claim_job(USER_ID, "all-cancel-worker", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let failed = fixture
+            .service
+            .record_job_failure(
+                USER_ID,
+                &claimed.id,
+                "all-cancel-worker",
+                &claimed.lease_token,
+                NormalizedMemoryJobFailure {
+                    code: MemoryJobFailureCode::InvalidInput,
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        fixture.service.cancel_all_jobs(USER_ID).await.unwrap();
+        assert_eq!(
+            fixture
+                .memory
+                .get_job(USER_ID, &failed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "canceled",
+        );
+        assert_eq!(
+            fixture.service.retry_failed_job(USER_ID, &failed.id).await,
+            Err(MemoryError::Conflict),
+        );
+    }
+
     struct Fixture {
         service: MemoryService,
         conversations: Arc<SqliteConversationRepository>,

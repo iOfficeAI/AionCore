@@ -31,7 +31,7 @@ const ELIGIBLE_MESSAGES_CTE: &str = r#"
 WITH candidates AS (
     SELECT id,conversation_id,turn_id,msg_id,type,position,status,hidden,created_at,
         CASE WHEN json_valid(content) THEN
-            CASE WHEN lower(trim(type)) = 'tool_result_summary'
+            CASE WHEN type = 'tool_result_summary'
                 THEN json_extract(content, '$.summary')
                 ELSE json_extract(content, '$.content')
             END
@@ -39,7 +39,7 @@ WITH candidates AS (
     FROM messages
     WHERE conversation_id = ? AND turn_id = ? AND hidden = 0 AND status = 'finish'
       AND position IN ('left','right')
-      AND lower(trim(type)) IN ('text','artifact','tool_result_summary')
+      AND type IN ('text','artifact','tool_result_summary')
 ), eligible AS (
     SELECT * FROM candidates
     WHERE typeof(accepted_content) = 'text'
@@ -66,7 +66,7 @@ struct CanonicalTurnSnapshot {
     hash: String,
     message_count: i64,
     content_bytes: i64,
-    earliest_at: Option<i64>,
+    earliest_all_at: Option<i64>,
     has_user_work: bool,
     has_assistant_outcome: bool,
     absolute_limit_exceeded: bool,
@@ -189,26 +189,25 @@ impl SqliteMemoryRepository {
             .map_err(|_| DbError::Conflict("Message count overflow".into()))?;
         let absolute_limit_exceeded =
             metadata.len() > MEMORY_EVIDENCE_MAX_MESSAGES || content_bytes > MEMORY_EVIDENCE_MAX_BYTES as i64;
-        let aggregate_sql = format!(
-            "{ELIGIBLE_MESSAGES_CTE}
-             SELECT MIN(created_at),
-                    COALESCE(MAX(CASE WHEN position = 'right' AND lower(trim(type)) = 'text' THEN 1 ELSE 0 END),0),
-                    COALESCE(MAX(CASE WHEN position = 'left' THEN 1 ELSE 0 END),0)
-             FROM eligible",
-        );
-        let (earliest_at, has_user_work, has_assistant_outcome): (Option<i64>, bool, bool) =
-            sqlx::query_as(&aggregate_sql)
+        let earliest_all_at: Option<i64> =
+            sqlx::query_scalar("SELECT MIN(created_at) FROM messages WHERE conversation_id = ? AND turn_id = ?")
                 .bind(conversation_id)
                 .bind(turn_id)
                 .fetch_one(&mut *connection)
                 .await?;
+        let has_user_work = absolute_limit_exceeded
+            || metadata
+                .iter()
+                .any(|row| row.position.as_deref() == Some("right") && row.r#type == "text");
+        let has_assistant_outcome =
+            absolute_limit_exceeded || metadata.iter().any(|row| row.position.as_deref() == Some("left"));
         let messages = if absolute_limit_exceeded {
             Vec::new()
         } else {
             let messages_sql = format!(
                 "{ELIGIBLE_MESSAGES_CTE}
                  SELECT id,conversation_id,turn_id,msg_id,type,
-                        CASE WHEN lower(trim(type)) = 'tool_result_summary'
+                        CASE WHEN type = 'tool_result_summary'
                             THEN json_object('summary',accepted_content)
                             ELSE json_object('content',accepted_content)
                         END AS content,
@@ -260,7 +259,7 @@ impl SqliteMemoryRepository {
             hash: hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect(),
             message_count,
             content_bytes,
-            earliest_at,
+            earliest_all_at,
             has_user_work,
             has_assistant_outcome,
             absolute_limit_exceeded,
@@ -965,10 +964,10 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 || conversation_epoch != input.expected_conversation_epoch
                 || conversation.0.as_deref() != Some("finished")
                 || Self::conversation_is_excluded(&conversation.1, conversation.2.as_deref(), &conversation.3)
-                || snapshot.earliest_at.is_none()
+                || snapshot.earliest_all_at.is_none()
                 || !snapshot.has_user_work
                 || !snapshot.has_assistant_outcome
-                || reset_at.is_some_and(|reset| snapshot.earliest_at.is_none_or(|earliest| earliest <= reset))
+                || reset_at.is_some_and(|reset| snapshot.earliest_all_at.is_none_or(|earliest| earliest <= reset))
             {
                 return Ok(None);
             }
@@ -1789,7 +1788,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 sqlx::query(
                     "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
                      next_attempt_at = NULL, last_error_code = 'canceled', updated_at = ?
-                     WHERE user_id = ? AND conversation_id = ? AND state IN ('pending','running','retry_wait','blocked')",
+                     WHERE user_id = ? AND conversation_id = ?
+                       AND state IN ('pending','running','retry_wait','blocked','failed')",
                 )
                 .bind(now)
                 .bind(user_id)
@@ -1801,7 +1801,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 sqlx::query(
                     "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
                      next_attempt_at = NULL, last_error_code = 'canceled', updated_at = ?
-                     WHERE user_id = ? AND state IN ('pending','running','retry_wait','blocked')",
+                     WHERE user_id = ? AND state IN ('pending','running','retry_wait','blocked','failed')",
                 )
                 .bind(now)
                 .bind(user_id)
@@ -3367,6 +3367,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_memory_bounded_snapshot_excludes_padded_noncanonical_type_names() {
+        let (repo, _, _db) = setup().await;
+        let job = enqueue_turn(&repo, "job-padded-types", "conv_a", "turn-1", 10)
+            .await
+            .unwrap();
+        for (index, message_type) in ["\ttext\t", "\u{2003}text\u{2003}"]
+            .into_iter()
+            .cycle()
+            .take(200)
+            .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO messages
+                    (id,conversation_id,turn_id,type,content,position,status,hidden,created_at)
+                 VALUES (?, 'conv_a', 'turn-1', ?, ?, 'left', 'finish', 0, ?)",
+            )
+            .bind(format!("padded-type-row-{index:03}"))
+            .bind(message_type)
+            .bind(serde_json::json!({ "content": "must be excluded" }).to_string())
+            .bind(100 + index as i64)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        }
+
+        let bounded = repo
+            .load_job_turn_messages_bounded(USER_A, &job.id, "turn-1", 128, 64 * 1024)
+            .await
+            .unwrap();
+        assert!(bounded.snapshot_matches);
+        assert!(!bounded.limit_exceeded);
+        assert_eq!(bounded.message_count, 2);
+    }
+
+    #[tokio::test]
     async fn sqlite_memory_finalize_claim_rejects_eligibility_mutation_without_blessing() {
         let (repo, _, _db) = setup().await;
         let job = enqueue_turn(&repo, "job-gap-eligibility", "conv_a", "turn-1", 10)
@@ -3596,6 +3631,76 @@ mod tests {
             Err(DbError::Conflict(_))
         ));
         assert!(repo.get_entry(USER_A, "stale-entry").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_reset_fence_uses_earliest_all_row_even_when_excluded_from_evidence() {
+        let (repo, _, _db) = setup().await;
+        repo.delete_conversation_memory(USER_A, "conv_a", 30).await.unwrap();
+        let excluded_rows = [
+            (
+                "hidden",
+                "text",
+                serde_json::json!({ "content": "hidden" }).to_string(),
+                "finish",
+                true,
+            ),
+            (
+                "tool",
+                "tool_call",
+                serde_json::json!({ "content": "raw" }).to_string(),
+                "finish",
+                false,
+            ),
+            (
+                "error",
+                "text",
+                serde_json::json!({ "content": "failed" }).to_string(),
+                "error",
+                false,
+            ),
+            ("malformed", "text", "not-json".into(), "finish", false),
+        ];
+        for (index, (label, message_type, content, status, hidden)) in excluded_rows.into_iter().enumerate() {
+            let turn_id = format!("turn-excluded-{label}");
+            sqlx::query(
+                "INSERT INTO messages
+                    (id,conversation_id,turn_id,type,content,position,status,hidden,created_at)
+                 VALUES (?, 'conv_a', ?, ?, ?, 'left', ?, ?, ?)",
+            )
+            .bind(format!("pre-reset-{label}"))
+            .bind(&turn_id)
+            .bind(message_type)
+            .bind(content)
+            .bind(status)
+            .bind(hidden)
+            .bind(10 + index as i64)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+            assert!(
+                enqueue_turn(
+                    &repo,
+                    &format!("stale-epoch-{label}"),
+                    "conv_a",
+                    &turn_id,
+                    40 + index as i64
+                )
+                .await
+                .is_none(),
+            );
+            let mut current = enqueue(
+                &format!("must-stay-blocked-{label}"),
+                "conv_a",
+                &turn_id,
+                50 + index as i64,
+            );
+            current.expected_conversation_epoch = 1;
+            assert!(
+                repo.enqueue_completed_turn(current).await.unwrap().is_none(),
+                "pre-reset {label} row must fence the exact turn",
+            );
+        }
     }
 
     #[tokio::test]

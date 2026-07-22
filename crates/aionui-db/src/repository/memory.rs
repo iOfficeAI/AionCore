@@ -22,7 +22,7 @@ pub enum MemoryEvidenceMessageKind {
 impl MemoryEvidenceMessageKind {
     /// Classifies a persisted message type using the canonical Memory allowlist.
     pub fn from_db_type(message_type: &str) -> Option<Self> {
-        match message_type.trim().to_ascii_lowercase().as_str() {
+        match message_type {
             "text" => Some(Self::Text),
             "artifact" => Some(Self::Artifact),
             "tool_result_summary" => Some(Self::ToolResultSummary),
@@ -375,4 +375,20 @@ pub trait IMemoryRepository: Send + Sync {
     async fn get_retrieval(&self, user_id: &str, retrieval_id: &str) -> Result<Option<MemoryRetrievalRow>, DbError>;
     async fn get_import_state(&self, user_id: &str) -> Result<Option<MemoryImportStateRow>, DbError>;
     async fn upsert_import_state(&self, state: MemoryImportStateRow) -> Result<MemoryImportStateRow, DbError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MemoryEvidenceMessageKind;
+
+    #[test]
+    fn memory_evidence_message_kind_requires_exact_canonical_type_names() {
+        assert_eq!(
+            MemoryEvidenceMessageKind::from_db_type("text"),
+            Some(MemoryEvidenceMessageKind::Text),
+        );
+        assert_eq!(MemoryEvidenceMessageKind::from_db_type("\ttext\t"), None);
+        assert_eq!(MemoryEvidenceMessageKind::from_db_type("\u{2003}text\u{2003}"), None);
+        assert_eq!(MemoryEvidenceMessageKind::from_db_type("Text"), None);
+    }
 }
