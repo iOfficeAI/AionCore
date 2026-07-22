@@ -16,7 +16,7 @@ use crate::service::{
 use crate::stream_relay::{RelayOutcome, StreamRelay, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use crate::turn_recovery_policy::{TurnRecoveryDecision, TurnRecoveryPolicy};
-use aionui_api_types::SendMessageRequest;
+use aionui_api_types::{AgentErrorCode, SendMessageRequest};
 
 fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
     match &options.context.kind {
@@ -364,6 +364,7 @@ impl ConversationTurnOrchestrator {
         let mut replayed = false;
         let mut replay_started_at = None;
         let mut final_error_message;
+        let mut auth_failure = false;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
@@ -391,6 +392,10 @@ impl ConversationTurnOrchestrator {
                     break result.status == ConversationTurnStatus::Failed;
                 }
             };
+
+            // Track the final attempt's auth signal so the post-loop availability
+            // write-back can reflect "needs sign-in" (last iteration wins).
+            auth_failure = terminal_is_auth_failure(&attempt_result.outcome);
 
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
             if !attempt_result.outcome.terminal.is_error() {
@@ -483,7 +488,20 @@ impl ConversationTurnOrchestrator {
             }
         };
 
-        if !final_failed {
+        if auth_failure {
+            // The agent connected (detection saw it online) but a real turn hit
+            // an explicit auth signal — write "needs sign-in" back to its
+            // availability so the list stops showing it as plainly usable.
+            record_agent_session_failure(
+                &self.service,
+                availability_agent_id(&input.build_options).as_deref(),
+                "auth_required",
+                final_error_message
+                    .as_deref()
+                    .unwrap_or("Agent requires sign-in to run."),
+            )
+            .await;
+        } else if !final_failed {
             record_agent_session_success(&self.service, availability_agent_id(&input.build_options).as_deref()).await;
         }
 
@@ -513,6 +531,28 @@ fn availability_agent_id(options: &BuildTaskOptions) -> Option<String> {
             .map(str::to_owned),
         AgentSessionKind::Aionrs(_) => None,
     }
+}
+
+/// True when the turn's terminal is an explicit authentication signal: an
+/// `ACP_EMPTY_TURN_NEEDS_AUTH` benign tip (the agent connected but isn't signed
+/// in and returned an empty end_turn), or an Error terminal carrying an
+/// auth/login error code. Used to reflect "needs sign-in" into the agent's
+/// availability even when detection (initialize + session/new, no prompt)
+/// showed it online. Non-auth outcomes — generic empty turns, billing,
+/// rate-limit, context, network — are deliberately excluded so we don't flip an
+/// agent to unavailable for transient or unrelated failures.
+fn terminal_is_auth_failure(outcome: &RelayOutcome) -> bool {
+    if outcome.attempt.needs_auth {
+        return true;
+    }
+    matches!(
+        outcome.terminal.code(),
+        Some(
+            AgentErrorCode::UserAgentAuthRequired
+                | AgentErrorCode::UserLlmProviderAuthFailed
+                | AgentErrorCode::UserLlmProviderAwsSsoExpired
+        )
+    )
 }
 
 async fn apply_required_runtime_mode(agent: &AgentInstance, mode: &str) -> Result<(), AgentError> {
@@ -574,5 +614,70 @@ async fn record_agent_session_success(service: &ConversationService, agent_id: O
             error = %ErrorChain(&error),
             "Failed to record agent availability session success"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stream_relay::RelayTerminal;
+
+    fn finish_outcome(needs_auth: bool) -> RelayOutcome {
+        RelayOutcome {
+            system_responses: vec![],
+            terminal: RelayTerminal::Finish,
+            attempt: TurnAttemptSummary {
+                needs_auth,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn error_outcome(code: AgentErrorCode) -> RelayOutcome {
+        RelayOutcome {
+            system_responses: vec![],
+            terminal: RelayTerminal::Error {
+                code: Some(code),
+                retryable: None,
+            },
+            attempt: TurnAttemptSummary::default(),
+        }
+    }
+
+    #[test]
+    fn needs_auth_empty_turn_is_auth_failure() {
+        assert!(terminal_is_auth_failure(&finish_outcome(true)));
+    }
+
+    #[test]
+    fn plain_finish_is_not_auth_failure() {
+        // A generic empty turn (or any normal finish) must NOT flip availability.
+        assert!(!terminal_is_auth_failure(&finish_outcome(false)));
+    }
+
+    #[test]
+    fn explicit_auth_error_codes_are_auth_failure() {
+        assert!(terminal_is_auth_failure(&error_outcome(
+            AgentErrorCode::UserAgentAuthRequired
+        )));
+        assert!(terminal_is_auth_failure(&error_outcome(
+            AgentErrorCode::UserLlmProviderAuthFailed
+        )));
+        assert!(terminal_is_auth_failure(&error_outcome(
+            AgentErrorCode::UserLlmProviderAwsSsoExpired
+        )));
+    }
+
+    #[test]
+    fn non_auth_errors_are_not_auth_failure() {
+        assert!(!terminal_is_auth_failure(&error_outcome(
+            AgentErrorCode::UnknownUpstreamError
+        )));
+        assert!(!terminal_is_auth_failure(&error_outcome(
+            AgentErrorCode::UserLlmProviderRateLimited
+        )));
+        assert!(!terminal_is_auth_failure(&error_outcome(
+            AgentErrorCode::UserLlmProviderBillingRequired
+        )));
     }
 }

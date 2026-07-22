@@ -29,6 +29,33 @@ pub struct ModelCapability {
     pub is_user_selected: Option<bool>,
 }
 
+/// Explicit OpenAI wire API override for one model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelOpenAiApiMode {
+    ChatCompletions,
+    Responses,
+}
+
+/// Explicit image-input support configured for one model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelImageInputCapability {
+    Supported,
+    Unsupported,
+}
+
+/// User-configured overrides for one model.
+///
+/// Missing values retain automatic capability and protocol resolution.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<ModelImageInputCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_api_mode: Option<ModelOpenAiApiMode>,
+}
+
 /// Health status values for a model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -139,6 +166,8 @@ pub struct ProviderResponse {
     pub model_enabled: Option<HashMap<String, bool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_health: Option<HashMap<String, ModelHealthStatus>>,
+    /// Per-model explicit overrides. An absent entry uses automatic resolution.
+    pub model_settings: HashMap<String, ModelSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bedrock_config: Option<BedrockConfig>,
     #[serde(default)]
@@ -174,6 +203,8 @@ pub struct CreateProviderRequest {
     pub model_enabled: Option<HashMap<String, bool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_health: Option<HashMap<String, ModelHealthStatus>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_settings: HashMap<String, ModelSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bedrock_config: Option<BedrockConfig>,
     #[serde(default)]
@@ -200,6 +231,7 @@ pub struct UpdateProviderRequest {
     pub model_protocols: Option<HashMap<String, String>>,
     pub model_enabled: Option<HashMap<String, bool>>,
     pub model_health: Option<HashMap<String, ModelHealthStatus>>,
+    pub model_settings: Option<HashMap<String, ModelSettings>>,
     pub bedrock_config: Option<BedrockConfig>,
     pub is_full_url: Option<bool>,
 }
@@ -470,6 +502,7 @@ mod tests {
             model_protocols: None,
             model_enabled: Some(HashMap::from([("claude-sonnet-4-20250514".into(), true)])),
             model_health: None,
+            model_settings: HashMap::new(),
             bedrock_config: None,
             is_full_url: false,
             created_at: 1712345678000,
@@ -503,6 +536,7 @@ mod tests {
             model_protocols: None,
             model_enabled: None,
             model_health: None,
+            model_settings: HashMap::new(),
             bedrock_config: None,
             is_full_url: false,
             created_at: 0,
@@ -624,6 +658,7 @@ mod tests {
             model_protocols: None,
             model_enabled: None,
             model_health: None,
+            model_settings: HashMap::new(),
             bedrock_config: None,
             is_full_url: false,
         };

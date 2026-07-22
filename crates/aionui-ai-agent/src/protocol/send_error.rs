@@ -363,6 +363,15 @@ impl AgentSendError {
                 false,
                 None,
             ),
+            AcpError::RequestTimeout { .. } => Self::new(
+                "The selected Agent did not respond to the request in time",
+                AgentErrorCode::UserAgentDisconnected,
+                AgentErrorOwnership::UserAgent,
+                Some(detail),
+                true,  // retryable — the user can immediately retry the config change
+                false, // feedback_recommended
+                None,
+            ),
             AcpError::AgentInternal { .. } => unknown_upstream_error(detail),
         }
     }
@@ -1495,6 +1504,17 @@ mod tests {
                 .map(|resolution| resolution.kind),
             Some(AgentErrorResolutionKind::ReconnectAgent)
         );
+    }
+
+    #[test]
+    fn request_timeout_maps_to_retryable_user_agent_disconnected() {
+        let err = AgentSendError::from(AcpError::RequestTimeout {
+            method: "session/setConfigOption".into(),
+            timeout_secs: 10,
+        });
+        assert_eq!(err.code(), Some(AgentErrorCode::UserAgentDisconnected));
+        assert_eq!(err.ownership(), Some(AgentErrorOwnership::UserAgent));
+        assert_eq!(err.stream_error().retryable, Some(true));
     }
 
     #[test]

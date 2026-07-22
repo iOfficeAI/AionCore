@@ -43,6 +43,10 @@ impl From<AssistantError> for ApiError {
             AssistantError::Forbidden(message) => Self::Forbidden(message),
             AssistantError::Conflict(message) => Self::Conflict(message),
             AssistantError::Internal(message) => Self::Internal(message),
+            // Only produced by startup assistant-storage bootstrap (never on an
+            // HTTP path); treated as a transient internal condition if it ever
+            // surfaces through the API boundary.
+            AssistantError::ConcurrentBootstrapContention(message) => Self::Internal(message),
         }
     }
 }

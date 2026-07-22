@@ -88,6 +88,60 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
         Some(Command::PrepareManagedResources(args)) => Ok(commands::run_prepare_managed_resources(args).await?),
         None => {
             let mut env = bootstrap::init_environment(&cli, &merged_path)?;
+
+            // Acquire the data-dir process-level guard before binding a port or
+            // touching the DB, so a second aioncore yields structurally rather
+            // than racing the assistant bootstrap over the same data directory
+            // (Sentry 135525166). Held (via `_instance_guard`, not a bare `_`,
+            // which would drop and release it immediately) for the whole server
+            // lifetime; the kernel releases the flock on process exit.
+            let db_path = env.config.database_path();
+            let _instance_guard = match aionui_db::DataDirInstanceGuard::try_acquire(&db_path) {
+                Ok(Some(guard)) => {
+                    tracing::info!(stage = "instance_guard.acquire", "acquired data-dir instance guard");
+                    Some(guard)
+                }
+                Ok(None) => {
+                    // A peer already owns the data dir. Wait a bounded window in
+                    // case it is a crash-orphan about to self-exit, then yield.
+                    match bootstrap::wait_for_instance_guard(&db_path) {
+                        Ok(Some(guard)) => Some(guard),
+                        Ok(None) => {
+                            tracing::info!(
+                                stage = "instance_guard.acquire",
+                                "another aioncore owns the data directory; yielding"
+                            );
+                            return Err(MainError::Bootstrap(bootstrap::BootstrapError::new(
+                                bootstrap::BootstrapErrorCode::PeerAlreadyRunning,
+                                "instance_guard.acquire",
+                                "another aioncore already owns this data directory",
+                            )));
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                code = "BOOTSTRAP_DEGRADED_INSTANCE_GUARD",
+                                stage = "instance_guard.acquire",
+                                error = %error,
+                                "data-dir instance guard unavailable; proceeding without structural guard"
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
+                    // flock unavailable (e.g. some network filesystems): proceed
+                    // and rely on Option B bootstrap concurrency safety as the
+                    // last line of defence.
+                    tracing::warn!(
+                        code = "BOOTSTRAP_DEGRADED_INSTANCE_GUARD",
+                        stage = "instance_guard.acquire",
+                        error = %error,
+                        "data-dir instance guard unavailable; proceeding without structural guard"
+                    );
+                    None
+                }
+            };
+
             let listener = commands::bind_http_listener(&mut env.config).await?;
             let database = bootstrap::init_data_layer(&env.config).await?;
             let services = AppServices::from_config(database, &env.config).await.map_err(|error| {

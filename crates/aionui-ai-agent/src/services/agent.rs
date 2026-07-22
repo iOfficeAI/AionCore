@@ -140,6 +140,17 @@ impl AgentService {
             return Err(AgentError::bad_request("Internal Aion CLI does not support overrides"));
         }
 
+        // Launch-path overrides only make sense for direct-CLI rows. Bridge-launched
+        // rows (e.g. `npx`) keep the bridge's own arguments in `args` (such as
+        // `-y <package> acp`); swapping `command` for a launch path would feed those
+        // bridge arguments to the target binary and break startup. Reject the write so
+        // the stored spawn command stays coherent (env overrides remain allowed).
+        if command_override.is_some() && is_bridge_launched_row(&row) {
+            return Err(AgentError::bad_request(
+                "This agent launches through a package runner (npx); its launch path cannot be overridden. Use environment variables instead.",
+            ));
+        }
+
         let env_json = match req.env_override {
             Some(entries) if !entries.is_empty() => Some(
                 serde_json::to_string(&entries)
@@ -178,6 +189,25 @@ impl AgentService {
             },
             env_override,
         })
+    }
+}
+
+/// True when the row is launched through a bridge binary (e.g. `npx`) rather
+/// than a direct CLI. Such rows store the bridge's own arguments in `args`
+/// (e.g. `-y <package> acp`), so replacing `command` with a launch path would
+/// forward those bridge arguments to the target binary. Launch-path overrides
+/// are therefore only valid for direct-CLI rows (`command == binary_name`, no
+/// bridge). Unparseable or absent `agent_source_info` is treated as direct.
+fn is_bridge_launched_row(row: &aionui_db::AgentMetadataRow) -> bool {
+    let Some(raw) = row.agent_source_info.as_deref() else {
+        return false;
+    };
+    let Ok(info) = serde_json::from_str::<aionui_api_types::AgentSourceInfo>(raw) else {
+        return false;
+    };
+    match info.bridge_binary.as_deref() {
+        Some(bridge) => info.binary_name.as_deref() != Some(bridge),
+        None => false,
     }
 }
 
