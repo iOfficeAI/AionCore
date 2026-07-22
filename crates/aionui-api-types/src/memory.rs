@@ -1,6 +1,8 @@
 use aionui_common::{PaginatedResult, TimestampMs};
 use serde::{Deserialize, Serialize};
 
+use crate::system::{AppOperationsModelHealth, AppOperationsModelReasonCode};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemorySettings {
     pub enabled: bool,
@@ -30,7 +32,19 @@ pub struct UpdateMemorySettingsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryStatus {
     pub settings: MemorySettings,
+    pub app_operations_readiness: MemoryAppOperationsReadiness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_update_at: Option<TimestampMs>,
     pub jobs: Vec<MemoryJobHealthSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryAppOperationsReadiness {
+    pub health: AppOperationsModelHealth,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<AppOperationsModelReasonCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<TimestampMs>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +101,7 @@ pub struct MemoryEntryResponse {
     pub state: MemoryEntryState,
     pub pinned: bool,
     pub user_edited: bool,
+    pub sources: Vec<MemoryEntrySourceResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,9 +111,21 @@ pub struct MemoryEntryResponse {
     pub updated_at: TimestampMs,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryEntrySourceResponse {
+    pub memory_entry_id: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub message_ids: Vec<String>,
+    pub first_observed_at: TimestampMs,
+    pub last_observed_at: TimestampMs,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ListMemoryEntriesQuery {
+    #[serde(default)]
+    pub search: Option<String>,
     #[serde(default)]
     pub kind: Option<MemoryEntryKind>,
     #[serde(default)]
@@ -107,6 +134,12 @@ pub struct ListMemoryEntriesQuery {
     pub project_id: Option<String>,
     #[serde(default)]
     pub workspace_key: Option<String>,
+    #[serde(default)]
+    pub source_conversation_id: Option<String>,
+    #[serde(default)]
+    pub created_after: Option<TimestampMs>,
+    #[serde(default)]
+    pub created_before: Option<TimestampMs>,
     #[serde(default)]
     pub cursor: Option<String>,
     #[serde(default)]
@@ -122,6 +155,21 @@ pub struct UpdateMemoryEntryRequest {
     pub content: Option<String>,
     #[serde(default)]
     pub pinned: Option<bool>,
+    /// `Some(Some(value))` sets scope, `Some(None)` clears it, and `None` keeps it unchanged.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub project_id: Option<Option<String>>,
+    /// `Some(Some(value))` sets scope, `Some(None)` clears it, and `None` keeps it unchanged.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub workspace_key: Option<Option<String>>,
+}
+
+/// Deserialize a nullable patch field while retaining whether it was supplied.
+fn deserialize_optional_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,14 +179,16 @@ pub struct DeleteMemoryEntryResponse {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ResolveMemoryEntryConflictRequest {
-    pub selected_entry_id: String,
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResolveMemoryEntryConflictRequest {
+    Select { selected_entry_id: String },
+    Merge { content: String },
+    KeepSeparate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResolveMemoryEntryConflictResponse {
-    pub entry: MemoryEntryResponse,
+    pub entries: Vec<MemoryEntryResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -395,6 +445,16 @@ pub struct MemoryJobEvidenceResponse {
 pub struct CompleteMemoryJobRequest {
     pub expected_revision: u64,
     pub output: MemoryUpdateOutput,
+    pub task_result_provenance: MemoryTaskResultProvenance,
+}
+
+/// Provenance copied from a completed App Operations task result, never caller model selection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryTaskResultProvenance {
+    pub provider_id: String,
+    pub model_id: String,
+    pub prompt_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -435,7 +495,10 @@ pub struct RecordMemoryJobFailureResponse {
 mod tests {
     use serde_json::json;
 
-    use crate::{CompleteMemoryJobRequest, MemoryEntryKind, MemoryEntryResponse, MemorySettings, SendMessageRequest};
+    use crate::{
+        CompleteMemoryJobRequest, ListMemoryEntriesQuery, MemoryEntryKind, MemoryEntryResponse, MemorySettings,
+        MemoryStatus, ResolveMemoryEntryConflictRequest, SendMessageRequest, UpdateMemoryEntryRequest,
+    };
 
     #[test]
     fn settings_serialize_with_snake_case_fields_and_omit_absent_values() {
@@ -491,9 +554,121 @@ mod tests {
     }
 
     #[test]
-    fn worker_submission_rejects_provider_selection_fields() {
-        let value = json!({ "expected_revision": 1, "output": {}, "provider_id": "p" });
-        assert!(serde_json::from_value::<CompleteMemoryJobRequest>(value).is_err());
+    fn worker_submission_accepts_result_provenance_but_rejects_provider_selection_fields() {
+        let valid = json!({
+            "expected_revision": 1,
+            "output": {
+                "summary": {
+                    "goal": "Continue the plan.",
+                    "current_state": [],
+                    "decisions": [],
+                    "artifacts": [],
+                    "issues": [],
+                    "next_steps": [],
+                    "work_constraints": []
+                },
+                "mutations": []
+            },
+            "task_result_provenance": {
+                "provider_id": "provider_1",
+                "model_id": "model_1",
+                "prompt_version": "memory-v1"
+            }
+        });
+        assert!(serde_json::from_value::<CompleteMemoryJobRequest>(valid.clone()).is_ok());
+
+        let mut with_provider = valid.clone();
+        with_provider["provider_id"] = json!("provider_2");
+        assert!(serde_json::from_value::<CompleteMemoryJobRequest>(with_provider).is_err());
+
+        let mut with_model = valid;
+        with_model["model_id"] = json!("model_2");
+        assert!(serde_json::from_value::<CompleteMemoryJobRequest>(with_model).is_err());
+    }
+
+    #[test]
+    fn entries_support_source_provenance_filters_and_scope_edits() {
+        let entry = json!({
+            "id": "mem_1",
+            "user_id": "user_1",
+            "kind": "decision",
+            "stable_key": "decision:one",
+            "fingerprint": "fp_1",
+            "content": "Use the established plan.",
+            "state": "active",
+            "pinned": false,
+            "user_edited": false,
+            "schema_version": 1,
+            "created_at": 1,
+            "updated_at": 1,
+            "sources": [{
+                "memory_entry_id": "mem_1",
+                "conversation_id": "conv_1",
+                "turn_id": "turn_1",
+                "message_ids": ["msg_1"],
+                "first_observed_at": 1,
+                "last_observed_at": 2
+            }]
+        });
+        let entry: MemoryEntryResponse = serde_json::from_value(entry).unwrap();
+        assert_eq!(serde_json::to_value(entry).unwrap()["sources"][0]["turn_id"], "turn_1");
+
+        let query: ListMemoryEntriesQuery = serde_json::from_value(json!({
+            "search": "established plan",
+            "source_conversation_id": "conv_1",
+            "created_after": 1,
+            "created_before": 2
+        }))
+        .unwrap();
+        assert_eq!(query.search.as_deref(), Some("established plan"));
+        assert_eq!(query.source_conversation_id.as_deref(), Some("conv_1"));
+
+        let request: UpdateMemoryEntryRequest = serde_json::from_value(json!({
+            "project_id": null,
+            "workspace_key": "workspace_1"
+        }))
+        .unwrap();
+        assert_eq!(request.project_id, Some(None));
+        assert_eq!(request.workspace_key, Some(Some("workspace_1".into())));
+    }
+
+    #[test]
+    fn conflict_resolution_supports_select_merge_and_keep_separate_actions() {
+        for action in [
+            json!({ "action": "select", "selected_entry_id": "mem_1" }),
+            json!({ "action": "merge", "content": "Merged protected content." }),
+            json!({ "action": "keep_separate" }),
+        ] {
+            assert!(serde_json::from_value::<ResolveMemoryEntryConflictRequest>(action).is_ok());
+        }
+    }
+
+    #[test]
+    fn memory_status_exposes_content_free_readiness_and_last_success() {
+        let status: MemoryStatus = serde_json::from_value(json!({
+            "settings": {
+                "enabled": true,
+                "default_capture": true,
+                "default_recall": true
+            },
+            "jobs": [],
+            "app_operations_readiness": {
+                "health": "ready",
+                "checked_at": 5
+            },
+            "last_successful_update_at": 4
+        }))
+        .unwrap();
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["app_operations_readiness"]["health"], "ready");
+        assert_eq!(value["last_successful_update_at"], 4);
+    }
+
+    #[test]
+    fn content_only_send_request_has_empty_memory_fields() {
+        let request: SendMessageRequest = serde_json::from_value(json!({ "content": "continue" })).unwrap();
+        assert_eq!(request.memory_retrieval_id, None);
+        assert!(request.excluded_memory_ids.is_empty());
     }
 
     #[test]
