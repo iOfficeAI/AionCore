@@ -10,19 +10,19 @@ struct InsertEntryOptions<'a> {
 
 use crate::DbError;
 use crate::models::{
-    ConversationMemoryRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow, MemoryEntryDbRow, MemoryEntryRow,
-    MemoryImportStateRow, MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow, MemorySettingsRow, MemorySourceRow,
-    MessageRow,
+    ConversationMemoryPolicyRow, ConversationMemoryRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow, MemoryEntryDbRow,
+    MemoryEntryRow, MemoryImportStateRow, MemoryJobHealthRow, MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow,
+    MemorySettingsRow, MemorySourceRow, MessageRow,
 };
 use crate::repository::memory::{
     BoundedMemoryTurnMessagesRow, ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition,
     CommitMemorySourceRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow,
     FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, IMemoryRepository, MEMORY_EVIDENCE_MAX_BYTES,
-    MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow, MemoryEntryQueryRow, MemoryReconciliationSnapshotRow,
-    ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, SplitMemoryJobRow, TransitionMemoryJobRow,
-    UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow,
-    UpdateMemoryLifecycleRow, UpdateMemorySettingsRow, derive_memory_fingerprint, memory_entry_content_hash,
-    memory_evidence_content,
+    MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow, MemoryChangeSetQueryRow, MemoryEntryQueryRow,
+    MemoryReconciliationSnapshotRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, ResolveMemoryConflictActionRow,
+    ResolveMemoryConflictRow, SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow,
+    UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow, UpdateMemoryLifecycleRow, UpdateMemorySettingsRow,
+    derive_memory_fingerprint, memory_entry_content_hash, memory_evidence_content,
 };
 
 const MAX_MEMORY_CANDIDATES: u32 = 200;
@@ -946,6 +946,28 @@ impl IMemoryRepository for SqliteMemoryRepository {
         })
     }
 
+    async fn get_conversation_policy(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationMemoryPolicyRow, DbError> {
+        self.ensure_conversation(user_id, conversation_id).await?;
+        Ok(sqlx::query_as(
+            "SELECT conversation_id, capture_enabled, recall_enabled, updated_at
+             FROM conversation_memory_policies WHERE user_id = ? AND conversation_id = ?",
+        )
+        .bind(user_id)
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(ConversationMemoryPolicyRow {
+            conversation_id: conversation_id.into(),
+            capture_enabled: None,
+            recall_enabled: None,
+            updated_at: 0,
+        }))
+    }
+
     async fn update_conversation_policy(
         &self,
         command: UpdateConversationMemoryPolicyRow,
@@ -961,15 +983,13 @@ impl IMemoryRepository for SqliteMemoryRepository {
             .bind(&command.conversation_id)
             .fetch_optional(&mut *connection)
             .await?;
-            let capture_changed = command
-                .capture_enabled
-                .is_some_and(|value| current_capture.flatten() != Some(value));
+            let capture_changed = current_capture.flatten() != command.capture_enabled;
             sqlx::query(
                 "INSERT INTO conversation_memory_policies
                     (user_id,conversation_id,capture_enabled,recall_enabled,lifecycle_epoch,updated_at)
                  VALUES (?,?,?,?,?,?) ON CONFLICT(user_id,conversation_id) DO UPDATE SET
-                    capture_enabled = COALESCE(excluded.capture_enabled,conversation_memory_policies.capture_enabled),
-                    recall_enabled = COALESCE(excluded.recall_enabled,conversation_memory_policies.recall_enabled),
+                    capture_enabled = excluded.capture_enabled,
+                    recall_enabled = excluded.recall_enabled,
                     lifecycle_epoch = conversation_memory_policies.lifecycle_epoch + ?,updated_at = excluded.updated_at",
             )
             .bind(&command.user_id)
@@ -2531,7 +2551,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
                AND (? IS NULL OR entries.created_at <= ?)
                AND (? IS NULL OR lower(COALESCE(entries.content, '')) LIKE '%' || lower(?) || '%')
              ORDER BY entries.pinned DESC, entries.user_edited DESC, entries.updated_at DESC, entries.id
-             LIMIT ?",
+             LIMIT ? OFFSET ?",
         )
         .bind(user_id)
         .bind(&query.kind)
@@ -2551,9 +2571,49 @@ impl IMemoryRepository for SqliteMemoryRepository {
         .bind(&query.search)
         .bind(&query.search)
         .bind(limit)
+        .bind(query.offset)
         .fetch_all(&self.pool)
         .await?;
         self.entry_rows_with_sources(rows).await
+    }
+
+    async fn count_entries(&self, user_id: &str, query: MemoryEntryQueryRow) -> Result<u64, DbError> {
+        self.ensure_user(user_id).await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT entries.id) FROM memory_entries entries
+             LEFT JOIN memory_sources sources ON sources.memory_entry_id = entries.id
+             WHERE entries.user_id = ?
+               AND (? IS NULL OR entries.kind = ?)
+               AND (? IS NULL OR entries.state = ?)
+               AND (? IS NULL OR entries.project_id = ?)
+               AND (? IS NULL OR entries.workspace_key = ?)
+               AND (? IS NULL OR sources.conversation_id = ?)
+               AND (? IS NULL OR entries.created_at >= ?)
+               AND (? IS NULL OR entries.created_at <= ?)
+               AND (? IS NULL OR lower(COALESCE(entries.content, '')) LIKE '%' || lower(?) || '%')",
+        )
+        .bind(user_id)
+        .bind(&query.kind)
+        .bind(&query.kind)
+        .bind(&query.state)
+        .bind(&query.state)
+        .bind(&query.project_id)
+        .bind(&query.project_id)
+        .bind(&query.workspace_key)
+        .bind(&query.workspace_key)
+        .bind(&query.source_conversation_id)
+        .bind(&query.source_conversation_id)
+        .bind(query.created_after)
+        .bind(query.created_after)
+        .bind(query.created_before)
+        .bind(query.created_before)
+        .bind(&query.search)
+        .bind(&query.search)
+        .fetch_one(&self.pool)
+        .await?;
+        count
+            .try_into()
+            .map_err(|_| DbError::Conflict("Memory entry count overflow".into()))
     }
 
     async fn get_entry(&self, user_id: &str, entry_id: &str) -> Result<Option<MemoryEntryRow>, DbError> {
@@ -2649,7 +2709,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
             let updated = sqlx::query(
                 "UPDATE memory_entries SET
                     content = COALESCE(?, content),
-                    user_edited = CASE WHEN ? IS NULL THEN user_edited ELSE 1 END,
+                    user_edited = CASE WHEN ? IS NULL AND ? = 0 THEN user_edited ELSE 1 END,
                     pinned = COALESCE(?, pinned),
                     project_id = ?, workspace_key = ?, fingerprint = ?,
                     revision = revision + 1,
@@ -2658,6 +2718,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
             )
             .bind(&input.content)
             .bind(&input.content)
+            .bind(scope_changed)
             .bind(input.pinned)
             .bind(&project_id)
             .bind(&workspace_key)
@@ -2698,6 +2759,159 @@ impl IMemoryRepository for SqliteMemoryRepository {
         }
     }
 
+    async fn resolve_conflict(&self, input: ResolveMemoryConflictRow) -> Result<Vec<MemoryEntryRow>, DbError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let result = async {
+            let anchor =
+                sqlx::query_as::<_, MemoryEntryDbRow>("SELECT * FROM memory_entries WHERE id = ? AND user_id = ?")
+                    .bind(&input.entry_id)
+                    .bind(&input.user_id)
+                    .fetch_optional(&mut *connection)
+                    .await?
+                    .ok_or_else(|| DbError::NotFound(format!("Memory entry '{}' not found", input.entry_id)))?;
+            if anchor.state != "conflict" {
+                return Err(DbError::Conflict(
+                    "Memory entry is not in an unresolved conflict".into(),
+                ));
+            }
+            let group_id = anchor
+                .conflict_group_id
+                .clone()
+                .ok_or_else(|| DbError::Conflict("Memory conflict is missing its group".into()))?;
+            let members = sqlx::query_as::<_, MemoryEntryDbRow>(
+                "SELECT * FROM memory_entries WHERE user_id = ? AND conflict_group_id = ? AND state = 'conflict'
+                 ORDER BY created_at,id",
+            )
+            .bind(&input.user_id)
+            .bind(&group_id)
+            .fetch_all(&mut *connection)
+            .await?;
+            if members.len() < 2 {
+                return Err(DbError::Conflict(
+                    "Memory conflict no longer has multiple versions".into(),
+                ));
+            }
+            match &input.action {
+                ResolveMemoryConflictActionRow::Select { selected_entry_id } => {
+                    if !members.iter().any(|entry| entry.id == *selected_entry_id) {
+                        return Err(DbError::NotFound(format!(
+                            "Memory entry '{selected_entry_id}' not found"
+                        )));
+                    }
+                    sqlx::query(
+                        "UPDATE memory_entries SET state = 'superseded', conflict_group_id = NULL,
+                         revision = revision + 1, updated_at = ? WHERE user_id = ? AND conflict_group_id = ?",
+                    )
+                    .bind(input.now)
+                    .bind(&input.user_id)
+                    .bind(&group_id)
+                    .execute(&mut *connection)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE memory_entries SET state = 'active', user_edited = 1, conflict_group_id = NULL,
+                         revision = revision + 1, updated_at = ? WHERE id = ? AND user_id = ?",
+                    )
+                    .bind(input.now)
+                    .bind(selected_entry_id)
+                    .bind(&input.user_id)
+                    .execute(&mut *connection)
+                    .await?;
+                }
+                ResolveMemoryConflictActionRow::Merge { content } => {
+                    sqlx::query(
+                        "UPDATE memory_entries SET state = 'superseded', conflict_group_id = NULL,
+                         revision = revision + 1, updated_at = ? WHERE user_id = ? AND conflict_group_id = ?",
+                    )
+                    .bind(input.now)
+                    .bind(&input.user_id)
+                    .bind(&group_id)
+                    .execute(&mut *connection)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE memory_entries SET content = ?, state = 'active', user_edited = 1,
+                         conflict_group_id = NULL, revision = revision + 1, updated_at = ?
+                         WHERE id = ? AND user_id = ?",
+                    )
+                    .bind(content)
+                    .bind(input.now)
+                    .bind(&input.entry_id)
+                    .bind(&input.user_id)
+                    .execute(&mut *connection)
+                    .await?;
+                }
+                ResolveMemoryConflictActionRow::KeepSeparate { tombstone_id } => {
+                    for member in &members {
+                        let stable_key = format!(
+                            "resolved-{}",
+                            memory_entry_content_hash(Some(&format!("{group_id}:{}", member.id))),
+                        );
+                        let fingerprint = derive_memory_fingerprint(
+                            &input.user_id,
+                            member.project_id.as_deref(),
+                            member.workspace_key.as_deref(),
+                            &member.kind,
+                            &stable_key,
+                        );
+                        sqlx::query(
+                            "UPDATE memory_entries SET stable_key = ?, fingerprint = ?, state = 'active',
+                             user_edited = 1, conflict_group_id = NULL, revision = revision + 1, updated_at = ?
+                             WHERE id = ? AND user_id = ?",
+                        )
+                        .bind(stable_key)
+                        .bind(fingerprint)
+                        .bind(input.now)
+                        .bind(&member.id)
+                        .bind(&input.user_id)
+                        .execute(&mut *connection)
+                        .await?;
+                    }
+                    sqlx::query(
+                        "INSERT INTO memory_entries
+                         (id,user_id,project_id,workspace_key,kind,stable_key,fingerprint,content,state,pinned,
+                          user_edited,revision,schema_version,deleted_at,created_at,updated_at)
+                         VALUES (?,?,?,?,?,?,?,NULL,'deleted',0,0,0,?,?,?,?)",
+                    )
+                    .bind(tombstone_id)
+                    .bind(&input.user_id)
+                    .bind(&anchor.project_id)
+                    .bind(&anchor.workspace_key)
+                    .bind(&anchor.kind)
+                    .bind(&anchor.stable_key)
+                    .bind(&anchor.fingerprint)
+                    .bind(anchor.schema_version)
+                    .bind(input.now)
+                    .bind(input.now)
+                    .bind(input.now)
+                    .execute(&mut *connection)
+                    .await?;
+                }
+            }
+            let mut output = Vec::with_capacity(members.len());
+            for member in members {
+                let row =
+                    sqlx::query_as::<_, MemoryEntryDbRow>("SELECT * FROM memory_entries WHERE id = ? AND user_id = ?")
+                        .bind(member.id)
+                        .bind(&input.user_id)
+                        .fetch_one(&mut *connection)
+                        .await?;
+                output.push(Self::entry_with_sources_on(&mut connection, row).await?);
+            }
+            Ok(output)
+        }
+        .await;
+        match result {
+            Ok(rows) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(rows)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
     async fn delete_entry(&self, user_id: &str, entry_id: &str, now: i64) -> Result<(), DbError> {
         self.get_entry(user_id, entry_id)
             .await?
@@ -2723,14 +2937,66 @@ impl IMemoryRepository for SqliteMemoryRepository {
     }
 
     async fn list_change_sets(&self, user_id: &str, limit: u32) -> Result<Vec<MemoryChangeSetRow>, DbError> {
+        Ok(self
+            .query_change_sets(
+                user_id,
+                MemoryChangeSetQueryRow {
+                    conversation_id: None,
+                    limit,
+                    offset: 0,
+                },
+            )
+            .await?
+            .0)
+    }
+
+    async fn query_change_sets(
+        &self,
+        user_id: &str,
+        query: MemoryChangeSetQueryRow,
+    ) -> Result<(Vec<MemoryChangeSetRow>, u64), DbError> {
         self.ensure_user(user_id).await?;
-        Ok(sqlx::query_as(
-            "SELECT * FROM memory_change_sets WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_change_sets WHERE user_id = ? AND (? IS NULL OR conversation_id = ?)",
         )
         .bind(user_id)
-        .bind(limit.min(MAX_MEMORY_CANDIDATES))
+        .bind(&query.conversation_id)
+        .bind(&query.conversation_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let rows = sqlx::query_as(
+            "SELECT * FROM memory_change_sets WHERE user_id = ? AND (? IS NULL OR conversation_id = ?)
+             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(user_id)
+        .bind(&query.conversation_id)
+        .bind(&query.conversation_id)
+        .bind(query.limit.clamp(1, MAX_MEMORY_CANDIDATES))
+        .bind(query.offset)
         .fetch_all(&self.pool)
-        .await?)
+        .await?;
+        Ok((
+            rows,
+            total
+                .try_into()
+                .map_err(|_| DbError::Conflict("Memory change-set count overflow".into()))?,
+        ))
+    }
+
+    async fn memory_job_health(&self, user_id: &str) -> Result<(Option<i64>, Vec<MemoryJobHealthRow>), DbError> {
+        self.ensure_user(user_id).await?;
+        let last_successful =
+            sqlx::query_scalar("SELECT MAX(updated_at) FROM memory_jobs WHERE user_id = ? AND state = 'succeeded'")
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?;
+        let jobs = sqlx::query_as(
+            "SELECT state, COUNT(*) AS count FROM memory_jobs WHERE user_id = ? GROUP BY state ORDER BY state",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok((last_successful, jobs))
     }
 
     async fn delete_conversation_memory(&self, user_id: &str, conversation_id: &str, now: i64) -> Result<(), DbError> {
@@ -2782,7 +3048,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 .await?;
             sqlx::query(
                 "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
-                 reconciliation_snapshot_json = NULL, updated_at = ?
+                 reconciliation_snapshot_json = NULL, next_attempt_at = NULL, last_error_code = 'canceled', updated_at = ?
                  WHERE user_id = ? AND conversation_id = ? AND state NOT IN ('succeeded', 'canceled')",
             )
             .bind(now)

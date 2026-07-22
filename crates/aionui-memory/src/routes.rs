@@ -2,14 +2,19 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::HeaderMap;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 
 use aionui_api_types::{
-    ApiResponse, ClaimMemoryJobRequest, ClaimMemoryJobResponse, CompleteMemoryJobRequest, MemoryJobEvidenceResponse,
-    RecordMemoryJobFailureRequest, RecordMemoryJobFailureResponse, ReleaseMemoryJobLeaseRequest,
+    ApiResponse, ClaimMemoryJobRequest, ClaimMemoryJobResponse, CompleteMemoryJobRequest, ConversationMemoryPolicy,
+    DeleteMemoryEntryResponse, ListMemoryChangeSetsQuery, ListMemoryEntriesQuery, MemoryChangeSetListResponse,
+    MemoryEntryListResponse, MemoryEntryResponse, MemoryEntryState, MemoryJobEvidenceResponse, MemorySettings,
+    MemoryStatus, RecordMemoryJobFailureRequest, RecordMemoryJobFailureResponse, ReleaseMemoryJobLeaseRequest,
     ReleaseMemoryJobLeaseResponse, RenewMemoryJobLeaseRequest, RenewMemoryJobLeaseResponse,
+    ResolveMemoryEntryConflictRequest, ResolveMemoryEntryConflictResponse, RetryMemoryJobResponse,
+    UpdateConversationMemoryPolicyRequest, UpdateMemoryEntryRequest, UpdateMemorySettingsRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -22,6 +27,22 @@ const LEASE_TOKEN_HEADER: &str = "x-memory-lease-token";
 
 pub fn memory_routes(state: MemoryRouterState) -> Router {
     Router::new()
+        .route("/api/memory/settings", get(get_settings).put(update_settings))
+        .route("/api/memory/status", get(status))
+        .route("/api/memory/entries", get(list_entries))
+        .route(
+            "/api/memory/entries/{id}",
+            axum::routing::patch(update_entry).delete(delete_entry),
+        )
+        .route("/api/memory/entries/{id}/resolve-conflict", post(resolve_conflict))
+        .route("/api/memory/change-sets", get(list_change_sets))
+        .route(
+            "/api/conversations/{id}/memory-policy",
+            get(get_conversation_policy).put(update_conversation_policy),
+        )
+        .route("/api/memory/conversations/{id}", delete(forget_conversation))
+        .route("/api/memory", delete(clear_memory))
+        .route("/api/memory/jobs/{id}/retry", post(retry_job))
         .route("/api/memory/internal/jobs/claim", post(claim))
         .route("/api/memory/internal/jobs/{id}/lease", post(renew_lease))
         .route("/api/memory/internal/jobs/{id}/release", post(release))
@@ -29,6 +50,137 @@ pub fn memory_routes(state: MemoryRouterState) -> Router {
         .route("/api/memory/internal/jobs/{id}/complete", post(complete))
         .route("/api/memory/internal/jobs/{id}/fail", post(fail))
         .with_state(state)
+}
+
+async fn get_settings(
+    State(state): State<MemoryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<MemorySettings>>, ApiError> {
+    Ok(Json(ApiResponse::ok(state.service.get_settings(&user.id).await?)))
+}
+
+async fn update_settings(
+    State(state): State<MemoryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<UpdateMemorySettingsRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<MemorySettings>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.update_settings(&user.id, request).await?,
+    )))
+}
+
+async fn status(
+    State(state): State<MemoryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<MemoryStatus>>, ApiError> {
+    Ok(Json(ApiResponse::ok(state.service.status(&user.id).await?)))
+}
+
+async fn list_entries(
+    State(state): State<MemoryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    query: Result<Query<ListMemoryEntriesQuery>, QueryRejection>,
+) -> Result<Json<ApiResponse<MemoryEntryListResponse>>, ApiError> {
+    let Query(query) = query.map_err(|_| MemoryError::InvalidInput)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.list_entries(&user.id, query).await?,
+    )))
+}
+
+async fn update_entry(
+    State(state): State<MemoryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateMemoryEntryRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<MemoryEntryResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.update_entry(&user.id, &id, request).await?,
+    )))
+}
+
+async fn delete_entry(
+    State(state): State<MemoryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<DeleteMemoryEntryResponse>>, ApiError> {
+    state.service.delete_entry(&user.id, &id).await?;
+    Ok(Json(ApiResponse::ok(DeleteMemoryEntryResponse {
+        id,
+        state: MemoryEntryState::Deleted,
+    })))
+}
+
+async fn resolve_conflict(
+    State(state): State<MemoryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<ResolveMemoryEntryConflictRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ResolveMemoryEntryConflictResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.resolve_conflict(&user.id, &id, request).await?,
+    )))
+}
+
+async fn list_change_sets(
+    State(state): State<MemoryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    query: Result<Query<ListMemoryChangeSetsQuery>, QueryRejection>,
+) -> Result<Json<ApiResponse<MemoryChangeSetListResponse>>, ApiError> {
+    let Query(query) = query.map_err(|_| MemoryError::InvalidInput)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.list_change_sets(&user.id, query).await?,
+    )))
+}
+
+async fn get_conversation_policy(
+    State(state): State<MemoryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<ConversationMemoryPolicy>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.get_conversation_policy(&user.id, &id).await?,
+    )))
+}
+
+async fn update_conversation_policy(
+    State(state): State<MemoryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateConversationMemoryPolicyRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ConversationMemoryPolicy>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.update_conversation_policy(&user.id, &id, request).await?,
+    )))
+}
+
+async fn forget_conversation(
+    State(state): State<MemoryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state.service.forget_conversation(&user.id, &id).await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn clear_memory(
+    State(state): State<MemoryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state.service.clear_all_memory(&user.id).await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn retry_job(
+    State(state): State<MemoryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<RetryMemoryJobResponse>>, ApiError> {
+    let job = state.service.retry_failed_job(&user.id, &id).await?;
+    Ok(Json(ApiResponse::ok(RetryMemoryJobResponse { job })))
 }
 
 async fn claim(
@@ -313,7 +465,7 @@ mod tests {
                 .unwrap();
         }
         let service = Arc::new(MemoryService::with_job_dependencies(
-            memory,
+            memory.clone(),
             conversations,
             Arc::new(UsableReadiness),
         ));
@@ -497,6 +649,570 @@ mod tests {
         assert_eq!(failed.state, "failed");
         assert_eq!(failed.attempt_count, 2);
         assert_eq!(failed.invalid_output_count, 2);
+    }
+
+    #[tokio::test]
+    async fn public_settings_and_policy_routes_enforce_ownership_and_validate_filters() {
+        let db = init_database_memory().await.unwrap();
+        let conversations = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+        let memory = Arc::new(SqliteMemoryRepository::new(db.pool().clone()));
+        conversations
+            .create(&ConversationRow {
+                id: "owned-conversation".into(),
+                user_id: "system_default_user".into(),
+                name: "Conversation".into(),
+                r#type: "gemini".into(),
+                extra: "{}".into(),
+                model: None,
+                status: Some("finished".into()),
+                source: Some("aionui".into()),
+                channel_chat_id: None,
+                pinned: false,
+                pinned_at: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        let service = Arc::new(MemoryService::with_job_dependencies(
+            memory.clone(),
+            conversations,
+            Arc::new(UsableReadiness),
+        ));
+        let router = memory_routes(MemoryRouterState { service });
+
+        let mut settings = Request::get("/api/memory/settings").body(Body::empty()).unwrap();
+        settings.extensions_mut().insert(current_user());
+        assert_eq!(router.clone().oneshot(settings).await.unwrap().status(), StatusCode::OK);
+
+        let mut invalid_consent = Request::put("/api/memory/settings")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"consent_version":999}"#))
+            .unwrap();
+        invalid_consent.extensions_mut().insert(current_user());
+        assert_eq!(
+            router.clone().oneshot(invalid_consent).await.unwrap().status(),
+            StatusCode::BAD_REQUEST,
+        );
+        let mut enable_without_consent = Request::put("/api/memory/settings")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"enabled":true}"#))
+            .unwrap();
+        enable_without_consent.extensions_mut().insert(current_user());
+        assert_eq!(
+            router.clone().oneshot(enable_without_consent).await.unwrap().status(),
+            StatusCode::OK,
+        );
+        assert_eq!(
+            memory
+                .get_settings("system_default_user")
+                .await
+                .unwrap()
+                .consent_version,
+            None,
+        );
+        let mut accept_disclosure = Request::put("/api/memory/settings")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"consent_version":1}"#))
+            .unwrap();
+        accept_disclosure.extensions_mut().insert(current_user());
+        assert_eq!(
+            router.clone().oneshot(accept_disclosure).await.unwrap().status(),
+            StatusCode::OK,
+        );
+        assert!(
+            memory
+                .get_settings("system_default_user")
+                .await
+                .unwrap()
+                .consented_at
+                .is_some(),
+        );
+
+        let mut status = Request::get("/api/memory/status").body(Body::empty()).unwrap();
+        status.extensions_mut().insert(current_user());
+        let status_response = router.clone().oneshot(status).await.unwrap();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = axum::body::to_bytes(status_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
+        assert_eq!(status_json["data"]["app_operations_readiness"]["health"], "ready");
+
+        let mut malformed_filter = Request::get("/api/memory/entries?created_after=20&created_before=10")
+            .body(Body::empty())
+            .unwrap();
+        malformed_filter.extensions_mut().insert(current_user());
+        assert_eq!(
+            router.clone().oneshot(malformed_filter).await.unwrap().status(),
+            StatusCode::BAD_REQUEST,
+        );
+
+        let mut cross_user = Request::get("/api/conversations/owned-conversation/memory-policy")
+            .body(Body::empty())
+            .unwrap();
+        cross_user.extensions_mut().insert(CurrentUser {
+            id: "another-user".into(),
+            username: "other".into(),
+        });
+        assert_eq!(
+            router.clone().oneshot(cross_user).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+        );
+
+        let mut policy = Request::put("/api/conversations/owned-conversation/memory-policy")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"capture_enabled":false,"recall_enabled":false}"#))
+            .unwrap();
+        policy.extensions_mut().insert(current_user());
+        assert_eq!(router.clone().oneshot(policy).await.unwrap().status(), StatusCode::OK);
+        let mut get_policy = Request::get("/api/conversations/owned-conversation/memory-policy")
+            .body(Body::empty())
+            .unwrap();
+        get_policy.extensions_mut().insert(current_user());
+        let policy_response = router.clone().oneshot(get_policy).await.unwrap();
+        assert_eq!(policy_response.status(), StatusCode::OK);
+        let policy_body = axum::body::to_bytes(policy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let policy_json: serde_json::Value = serde_json::from_slice(&policy_body).unwrap();
+        assert_eq!(policy_json["data"]["capture_enabled"], false);
+        assert_eq!(policy_json["data"]["recall_enabled"], false);
+
+        let mut inherit = Request::put("/api/conversations/owned-conversation/memory-policy")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        inherit.extensions_mut().insert(current_user());
+        let inherit_response = router.clone().oneshot(inherit).await.unwrap();
+        assert_eq!(inherit_response.status(), StatusCode::OK);
+        let inherit_body = axum::body::to_bytes(inherit_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let inherit_json: serde_json::Value = serde_json::from_slice(&inherit_body).unwrap();
+        assert!(inherit_json["data"].get("capture_enabled").is_none());
+        assert!(inherit_json["data"].get("recall_enabled").is_none());
+    }
+
+    #[tokio::test]
+    async fn public_library_and_lifecycle_routes_preserve_protection_tombstones_and_reset_fences() {
+        let db = init_database_memory().await.unwrap();
+        let conversations = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+        let memory = Arc::new(SqliteMemoryRepository::new(db.pool().clone()));
+        conversations
+            .create(&ConversationRow {
+                id: "conversation-public".into(),
+                user_id: "system_default_user".into(),
+                name: "Conversation".into(),
+                r#type: "gemini".into(),
+                extra: "{}".into(),
+                model: None,
+                status: Some("finished".into()),
+                source: Some("aionui".into()),
+                channel_chat_id: None,
+                pinned: false,
+                pinned_at: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        memory
+            .update_settings(UpdateMemorySettingsRow {
+                user_id: "system_default_user".into(),
+                enabled: Some(true),
+                default_capture: Some(true),
+                default_recall: Some(true),
+                consent_version: Some(1),
+                now: 2,
+            })
+            .await
+            .unwrap();
+        for (id, stable_key, fingerprint, content, state, group) in [
+            ("entry-edit", "edit", "fp-edit", "Original", "active", None),
+            (
+                "forget-exclusive",
+                "exclusive",
+                "fp-exclusive",
+                "Exclusive",
+                "active",
+                None,
+            ),
+            (
+                "forget-protected",
+                "protected",
+                "fp-protected",
+                "Protected",
+                "active",
+                None,
+            ),
+            (
+                "conflict-a",
+                "decision",
+                "fp-conflict",
+                "Version A",
+                "conflict",
+                Some("group-1"),
+            ),
+            (
+                "conflict-b",
+                "decision",
+                "fp-conflict",
+                "Version B",
+                "conflict",
+                Some("group-1"),
+            ),
+            (
+                "select-a",
+                "select",
+                "fp-select",
+                "Select A",
+                "conflict",
+                Some("group-2"),
+            ),
+            (
+                "select-b",
+                "select",
+                "fp-select",
+                "Select B",
+                "conflict",
+                Some("group-2"),
+            ),
+            (
+                "separate-a",
+                "separate",
+                "fp-separate",
+                "Separate A",
+                "conflict",
+                Some("group-3"),
+            ),
+            (
+                "separate-b",
+                "separate",
+                "fp-separate",
+                "Separate B",
+                "conflict",
+                Some("group-3"),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO memory_entries
+                 (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,revision,
+                  conflict_group_id,schema_version,created_at,updated_at)
+                 VALUES (?,'system_default_user','decision',?,?,?,?,0,0,0,?,1,10,10)",
+            )
+            .bind(id)
+            .bind(stable_key)
+            .bind(fingerprint)
+            .bind(content)
+            .bind(state)
+            .bind(group)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO memory_sources
+             (memory_entry_id,conversation_id,turn_id,message_ids_json,first_observed_at,last_observed_at)
+             VALUES ('entry-edit','conversation-public','turn-1','[\"message-1\"]',10,10)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE memory_entries SET pinned = 1 WHERE id = 'forget-protected'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        for entry_id in ["forget-exclusive", "forget-protected"] {
+            sqlx::query(
+                "INSERT INTO memory_sources
+                 (memory_entry_id,conversation_id,turn_id,message_ids_json,first_observed_at,last_observed_at)
+                 VALUES (?,'conversation-public','turn-2','[\"message-2\"]',10,10)",
+            )
+            .bind(entry_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO memory_jobs
+             (id,user_id,conversation_id,through_turn_id,operation_version,queue_digest,input_hash,
+              expected_revision,state,attempt_count,invalid_output_count,created_at,updated_at)
+             VALUES ('job-failed','system_default_user','conversation-public','turn-1','v1','digest','hash',
+                     0,'failed',1,0,10,10)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_change_sets
+             (id,user_id,conversation_id,through_turn_id,job_id,added_ids_json,refined_ids_json,
+              superseded_ids_json,conflict_ids_json,created_at)
+             VALUES ('change-1','system_default_user','conversation-public','turn-1','job-failed',
+                     '[\"entry-edit\"]','[]','[]','[]',10)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let service = Arc::new(MemoryService::with_job_dependencies(
+            memory.clone(),
+            conversations,
+            Arc::new(UsableReadiness),
+        ));
+        let router = memory_routes(MemoryRouterState { service });
+
+        for mut request in [
+            Request::patch("/api/memory/entries/entry-edit")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"pinned":true}"#))
+                .unwrap(),
+            Request::post("/api/memory/entries/conflict-a/resolve-conflict")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"action":"keep_separate"}"#))
+                .unwrap(),
+            Request::post("/api/memory/jobs/job-failed/retry")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            request.extensions_mut().insert(CurrentUser {
+                id: "another-user".into(),
+                username: "other".into(),
+            });
+            assert_eq!(
+                router.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::NOT_FOUND,
+            );
+        }
+
+        let mut list = Request::get("/api/memory/entries?source_conversation_id=conversation-public")
+            .body(Body::empty())
+            .unwrap();
+        list.extensions_mut().insert(current_user());
+        let list_response = router.clone().oneshot(list).await.unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list_json: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+        let edited_item = list_json["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "entry-edit")
+            .unwrap();
+        assert_eq!(edited_item["sources"][0]["message_ids"][0], "message-1");
+
+        let mut edit = Request::patch("/api/memory/entries/entry-edit")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"content":"Edited","pinned":true,"project_id":"project-1"}"#,
+            ))
+            .unwrap();
+        edit.extensions_mut().insert(current_user());
+        assert_eq!(router.clone().oneshot(edit).await.unwrap().status(), StatusCode::OK);
+        let edited = memory
+            .get_entry("system_default_user", "entry-edit")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(edited.content.as_deref(), Some("Edited"));
+        assert!(edited.pinned && edited.user_edited);
+        assert_eq!(edited.project_id.as_deref(), Some("project-1"));
+
+        let mut cross_user_delete = Request::delete("/api/memory/entries/entry-edit")
+            .body(Body::empty())
+            .unwrap();
+        cross_user_delete.extensions_mut().insert(CurrentUser {
+            id: "another-user".into(),
+            username: "other".into(),
+        });
+        assert_eq!(
+            router.clone().oneshot(cross_user_delete).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+        );
+
+        let mut resolve = Request::post("/api/memory/entries/conflict-a/resolve-conflict")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"action":"merge","content":"Merged version"}"#))
+            .unwrap();
+        resolve.extensions_mut().insert(current_user());
+        assert_eq!(router.clone().oneshot(resolve).await.unwrap().status(), StatusCode::OK);
+        let merged = memory
+            .get_entry("system_default_user", "conflict-a")
+            .await
+            .unwrap()
+            .unwrap();
+        let superseded = memory
+            .get_entry("system_default_user", "conflict-b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.state, "active");
+        assert!(merged.user_edited);
+        assert_eq!(superseded.state, "superseded");
+
+        let mut select = Request::post("/api/memory/entries/select-a/resolve-conflict")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"action":"select","selected_entry_id":"select-b"}"#))
+            .unwrap();
+        select.extensions_mut().insert(current_user());
+        assert_eq!(router.clone().oneshot(select).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            memory
+                .get_entry("system_default_user", "select-a")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "superseded",
+        );
+        let selected = memory
+            .get_entry("system_default_user", "select-b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.state, "active");
+        assert!(selected.user_edited);
+
+        let mut keep_separate = Request::post("/api/memory/entries/separate-a/resolve-conflict")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"action":"keep_separate"}"#))
+            .unwrap();
+        keep_separate.extensions_mut().insert(current_user());
+        assert_eq!(
+            router.clone().oneshot(keep_separate).await.unwrap().status(),
+            StatusCode::OK,
+        );
+        let separate_a = memory
+            .get_entry("system_default_user", "separate-a")
+            .await
+            .unwrap()
+            .unwrap();
+        let separate_b = memory
+            .get_entry("system_default_user", "separate-b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(separate_a.state == "active" && separate_a.user_edited);
+        assert!(separate_b.state == "active" && separate_b.user_edited);
+        assert_ne!(separate_a.fingerprint, separate_b.fingerprint);
+        let original_identity_tombstones: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_entries WHERE user_id = 'system_default_user'
+             AND fingerprint = 'fp-separate' AND state = 'deleted' AND content IS NULL",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(original_identity_tombstones, 1);
+
+        let mut changes = Request::get("/api/memory/change-sets?conversation_id=conversation-public")
+            .body(Body::empty())
+            .unwrap();
+        changes.extensions_mut().insert(current_user());
+        assert_eq!(router.clone().oneshot(changes).await.unwrap().status(), StatusCode::OK);
+
+        let mut retry = Request::post("/api/memory/jobs/job-failed/retry")
+            .body(Body::empty())
+            .unwrap();
+        retry.extensions_mut().insert(current_user());
+        assert_eq!(router.clone().oneshot(retry).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            memory
+                .get_job("system_default_user", "job-failed")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "pending",
+        );
+
+        let mut disable = Request::put("/api/memory/settings")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"enabled":false}"#))
+            .unwrap();
+        disable.extensions_mut().insert(current_user());
+        assert_eq!(router.clone().oneshot(disable).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            memory
+                .get_job("system_default_user", "job-failed")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "canceled",
+        );
+        assert!(
+            memory
+                .get_entry("system_default_user", "entry-edit")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let mut delete = Request::delete("/api/memory/entries/entry-edit")
+            .body(Body::empty())
+            .unwrap();
+        delete.extensions_mut().insert(current_user());
+        assert_eq!(router.clone().oneshot(delete).await.unwrap().status(), StatusCode::OK);
+        let tombstone = memory
+            .get_entry("system_default_user", "entry-edit")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tombstone.state, "deleted");
+        assert_eq!(tombstone.content, None);
+        assert!(tombstone.sources.is_empty());
+
+        let mut cross_user_forget = Request::delete("/api/memory/conversations/conversation-public")
+            .body(Body::empty())
+            .unwrap();
+        cross_user_forget.extensions_mut().insert(CurrentUser {
+            id: "another-user".into(),
+            username: "other".into(),
+        });
+        assert_eq!(
+            router.clone().oneshot(cross_user_forget).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+        );
+        let mut forget = Request::delete("/api/memory/conversations/conversation-public")
+            .body(Body::empty())
+            .unwrap();
+        forget.extensions_mut().insert(current_user());
+        assert_eq!(router.clone().oneshot(forget).await.unwrap().status(), StatusCode::OK);
+        assert!(
+            memory
+                .get_entry("system_default_user", "forget-exclusive")
+                .await
+                .unwrap()
+                .is_none(),
+        );
+        let protected = memory
+            .get_entry("system_default_user", "forget-protected")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(protected.pinned && protected.sources.is_empty());
+        assert!(
+            memory
+                .effective_policy("system_default_user", "conversation-public")
+                .await
+                .unwrap()
+                .reset_at
+                .is_some(),
+        );
+
+        let mut clear = Request::delete("/api/memory").body(Body::empty()).unwrap();
+        clear.extensions_mut().insert(current_user());
+        assert_eq!(router.clone().oneshot(clear).await.unwrap().status(), StatusCode::OK);
+        assert!(memory.list_entries("system_default_user").await.unwrap().is_empty());
+        assert!(
+            memory
+                .get_settings("system_default_user")
+                .await
+                .unwrap()
+                .reset_at
+                .is_some()
+        );
     }
 
     fn current_user() -> CurrentUser {

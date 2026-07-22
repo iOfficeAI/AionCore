@@ -6,17 +6,23 @@ use std::sync::Arc;
 use std::{future::Future, pin::Pin};
 
 use aionui_api_types::{
-    CompleteMemoryJobRequest, MemoryJobFailureCode, MemoryJobResponse, MemorySourceMessageRole, MemorySummary,
-    MemoryUpdateInput, NormalizedMemoryJobFailure,
+    AppOperationsModelHealth, CompleteMemoryJobRequest, ConversationMemoryPolicy, ListMemoryChangeSetsQuery,
+    ListMemoryEntriesQuery, MemoryAppOperationsReadiness, MemoryChangeSetListResponse, MemoryEntryListResponse,
+    MemoryEntryResponse, MemoryJobFailureCode, MemoryJobHealthSummary, MemoryJobResponse, MemoryJobState,
+    MemorySettings, MemorySourceMessageRole, MemoryStatus, MemorySummary, MemoryUpdateInput,
+    NormalizedMemoryJobFailure, ResolveMemoryEntryConflictRequest, ResolveMemoryEntryConflictResponse,
+    UpdateConversationMemoryPolicyRequest, UpdateMemoryEntryRequest, UpdateMemorySettingsRequest,
 };
-use aionui_common::{generate_prefixed_id, now_ms};
+use aionui_common::{PaginatedResult, generate_prefixed_id, now_ms};
 use aionui_db::models::{MemoryEntryRow, MemoryJobRow};
 use aionui_db::{
     ClaimMemoryJobRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow,
     FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, IConversationRepository, IMemoryRepository,
-    MemoryCandidateQueryRow, MemoryReconciliationSnapshotRow, MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow,
-    RenewMemoryLeaseRow, SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow,
-    UpdateMemoryLifecycleRow, memory_entry_content_hash,
+    MemoryCandidateQueryRow, MemoryChangeSetQueryRow, MemoryEntryQueryRow, MemoryReconciliationSnapshotRow,
+    MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, ResolveMemoryConflictActionRow,
+    ResolveMemoryConflictRow, SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow,
+    UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow, UpdateMemoryLifecycleRow, UpdateMemorySettingsRow,
+    derive_memory_fingerprint, memory_entry_content_hash,
 };
 use tracing::{debug, warn};
 
@@ -91,6 +97,305 @@ impl MemoryService {
     /// Reconstructs validated, sanitized evidence for the registered Memory task.
     pub fn build_evidence(&self, request: EvidenceBuildRequest) -> Result<MemoryUpdateInput, MemoryError> {
         self.evidence_builder.build(request)
+    }
+
+    pub async fn get_settings(&self, user_id: &str) -> Result<MemorySettings, MemoryError> {
+        let row = self
+            .job_dependencies()?
+            .memory
+            .get_settings(user_id)
+            .await
+            .map_err(map_db_error)?;
+        crate::library::settings_response(row)
+    }
+
+    pub async fn update_settings(
+        &self,
+        user_id: &str,
+        request: UpdateMemorySettingsRequest,
+    ) -> Result<MemorySettings, MemoryError> {
+        if request.enabled.is_none()
+            && request.default_capture.is_none()
+            && request.default_recall.is_none()
+            && request.consent_version.is_none()
+        {
+            return Err(MemoryError::InvalidInput);
+        }
+        let consent_version = request
+            .consent_version
+            .map(|version| i64::try_from(version).map_err(|_| MemoryError::InvalidInput))
+            .transpose()?;
+        if consent_version.is_some_and(|version| version != crate::jobs::MEMORY_DISCLOSURE_VERSION) {
+            return Err(MemoryError::InvalidInput);
+        }
+        let row = self
+            .job_dependencies()?
+            .memory
+            .update_settings(UpdateMemorySettingsRow {
+                user_id: user_id.into(),
+                enabled: request.enabled,
+                default_capture: request.default_capture,
+                default_recall: request.default_recall,
+                consent_version,
+                now: now_ms(),
+            })
+            .await
+            .map_err(map_db_error)?;
+        crate::library::settings_response(row)
+    }
+
+    pub async fn status(&self, user_id: &str) -> Result<MemoryStatus, MemoryError> {
+        let dependencies = self.job_dependencies()?;
+        let settings = self.get_settings(user_id).await?;
+        let ready = dependencies.readiness.is_usable().await?;
+        let (last_successful_update_at, rows) = dependencies
+            .memory
+            .memory_job_health(user_id)
+            .await
+            .map_err(map_db_error)?;
+        let jobs = rows
+            .into_iter()
+            .map(|row| {
+                Ok(MemoryJobHealthSummary {
+                    state: job_state(&row.state)?,
+                    count: row.count.try_into().map_err(|_| MemoryError::Internal)?,
+                })
+            })
+            .collect::<Result<_, MemoryError>>()?;
+        Ok(MemoryStatus {
+            settings,
+            app_operations_readiness: MemoryAppOperationsReadiness {
+                health: if ready {
+                    AppOperationsModelHealth::Ready
+                } else {
+                    AppOperationsModelHealth::Unavailable
+                },
+                reason_code: None,
+                checked_at: None,
+            },
+            last_successful_update_at,
+            jobs,
+        })
+    }
+
+    pub async fn list_entries(
+        &self,
+        user_id: &str,
+        query: ListMemoryEntriesQuery,
+    ) -> Result<MemoryEntryListResponse, MemoryError> {
+        validate_entry_query(&query)?;
+        let offset = parse_cursor(query.cursor.as_deref())?;
+        let limit = query.limit.unwrap_or(50).clamp(1, 100) as usize;
+        if matches!(query.state.as_ref(), Some(aionui_api_types::MemoryEntryState::Deleted)) {
+            return Ok(PaginatedResult {
+                items: Vec::new(),
+                total: 0,
+                has_more: false,
+            });
+        }
+        let offset_u32 = offset.try_into().map_err(|_| MemoryError::InvalidInput)?;
+        let db_query = MemoryEntryQueryRow {
+            search: normalized_filter(query.search)?,
+            kind: query.kind.as_ref().map(crate::library::kind_name).map(str::to_owned),
+            state: query.state.as_ref().map(crate::library::state_name).map(str::to_owned),
+            project_id: normalized_filter(query.project_id)?,
+            workspace_key: normalized_filter(query.workspace_key)?,
+            source_conversation_id: normalized_filter(query.source_conversation_id)?,
+            created_after: query.created_after,
+            created_before: query.created_before,
+            limit: limit.try_into().map_err(|_| MemoryError::Internal)?,
+            offset: offset_u32,
+        };
+        let dependencies = self.job_dependencies()?;
+        let total = dependencies
+            .memory
+            .count_entries(user_id, db_query.clone())
+            .await
+            .map_err(map_db_error)?;
+        let rows = dependencies
+            .memory
+            .query_entries(user_id, db_query)
+            .await
+            .map_err(map_db_error)?;
+        let items: Vec<MemoryEntryResponse> = rows
+            .into_iter()
+            .map(crate::library::entry_response)
+            .collect::<Result<_, _>>()?;
+        let has_more = (offset as u64).saturating_add(items.len() as u64) < total;
+        Ok(PaginatedResult { items, total, has_more })
+    }
+
+    pub async fn update_entry(
+        &self,
+        user_id: &str,
+        entry_id: &str,
+        request: UpdateMemoryEntryRequest,
+    ) -> Result<MemoryEntryResponse, MemoryError> {
+        if request.content.is_none()
+            && request.pinned.is_none()
+            && request.project_id.is_none()
+            && request.workspace_key.is_none()
+        {
+            return Err(MemoryError::InvalidInput);
+        }
+        let content = request.content.map(validate_content).transpose()?;
+        let project_id = normalize_scope_patch(request.project_id)?;
+        let workspace_key = normalize_scope_patch(request.workspace_key)?;
+        let dependencies = self.job_dependencies()?;
+        let current = dependencies
+            .memory
+            .get_entry(user_id, entry_id)
+            .await
+            .map_err(map_db_error)?
+            .ok_or(MemoryError::NotFound)?;
+        if current.state == "deleted" {
+            return Err(MemoryError::Conflict);
+        }
+        let next_project = project_id.clone().unwrap_or_else(|| current.project_id.clone());
+        let next_workspace = workspace_key.clone().unwrap_or_else(|| current.workspace_key.clone());
+        let scope_changed = next_project != current.project_id || next_workspace != current.workspace_key;
+        let new_fingerprint = scope_changed.then(|| {
+            derive_memory_fingerprint(
+                user_id,
+                next_project.as_deref(),
+                next_workspace.as_deref(),
+                &current.kind,
+                &current.stable_key,
+            )
+        });
+        let row = dependencies
+            .memory
+            .update_entry(UpdateMemoryEntryRow {
+                user_id: user_id.into(),
+                id: entry_id.into(),
+                expected_revision: current.revision,
+                expected_state: current.state,
+                content,
+                pinned: request.pinned,
+                project_id,
+                workspace_key,
+                new_fingerprint,
+                now: now_ms(),
+            })
+            .await
+            .map_err(map_db_error)?;
+        crate::library::entry_response(row)
+    }
+
+    pub async fn delete_entry(&self, user_id: &str, entry_id: &str) -> Result<(), MemoryError> {
+        self.job_dependencies()?
+            .memory
+            .delete_entry(user_id, entry_id, now_ms())
+            .await
+            .map_err(map_db_error)
+    }
+
+    pub async fn resolve_conflict(
+        &self,
+        user_id: &str,
+        entry_id: &str,
+        request: ResolveMemoryEntryConflictRequest,
+    ) -> Result<ResolveMemoryEntryConflictResponse, MemoryError> {
+        let action = match request {
+            ResolveMemoryEntryConflictRequest::Select { selected_entry_id } => {
+                if selected_entry_id.trim().is_empty() || selected_entry_id.len() > 200 {
+                    return Err(MemoryError::InvalidInput);
+                }
+                ResolveMemoryConflictActionRow::Select { selected_entry_id }
+            }
+            ResolveMemoryEntryConflictRequest::Merge { content } => ResolveMemoryConflictActionRow::Merge {
+                content: validate_content(content)?,
+            },
+            ResolveMemoryEntryConflictRequest::KeepSeparate => ResolveMemoryConflictActionRow::KeepSeparate {
+                tombstone_id: generate_prefixed_id("memory-tombstone"),
+            },
+        };
+        let entries = self
+            .job_dependencies()?
+            .memory
+            .resolve_conflict(ResolveMemoryConflictRow {
+                user_id: user_id.into(),
+                entry_id: entry_id.into(),
+                action,
+                now: now_ms(),
+            })
+            .await
+            .map_err(map_db_error)?
+            .into_iter()
+            .map(crate::library::entry_response)
+            .collect::<Result<_, _>>()?;
+        Ok(ResolveMemoryEntryConflictResponse { entries })
+    }
+
+    pub async fn list_change_sets(
+        &self,
+        user_id: &str,
+        query: ListMemoryChangeSetsQuery,
+    ) -> Result<MemoryChangeSetListResponse, MemoryError> {
+        if query.limit.is_some_and(|limit| limit == 0 || limit > 100) {
+            return Err(MemoryError::InvalidInput);
+        }
+        let offset = parse_cursor(query.cursor.as_deref())?;
+        let limit = query.limit.unwrap_or(50).clamp(1, 100) as usize;
+        let conversation_id = normalized_filter(query.conversation_id)?;
+        let (rows, total) = self
+            .job_dependencies()?
+            .memory
+            .query_change_sets(
+                user_id,
+                MemoryChangeSetQueryRow {
+                    conversation_id,
+                    limit: limit.try_into().map_err(|_| MemoryError::Internal)?,
+                    offset: offset.try_into().map_err(|_| MemoryError::InvalidInput)?,
+                },
+            )
+            .await
+            .map_err(map_db_error)?;
+        let items: Vec<aionui_api_types::MemoryChangeSetResponse> = rows
+            .into_iter()
+            .map(crate::library::change_set_response)
+            .collect::<Result<_, _>>()?;
+        let has_more = (offset as u64).saturating_add(items.len() as u64) < total;
+        Ok(PaginatedResult { items, total, has_more })
+    }
+
+    pub async fn get_conversation_policy(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationMemoryPolicy, MemoryError> {
+        let row = self
+            .job_dependencies()?
+            .memory
+            .get_conversation_policy(user_id, conversation_id)
+            .await
+            .map_err(map_db_error)?;
+        Ok(ConversationMemoryPolicy {
+            conversation_id: row.conversation_id,
+            capture_enabled: row.capture_enabled,
+            recall_enabled: row.recall_enabled,
+            updated_at: row.updated_at,
+        })
+    }
+
+    pub async fn update_conversation_policy(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        request: UpdateConversationMemoryPolicyRequest,
+    ) -> Result<ConversationMemoryPolicy, MemoryError> {
+        self.job_dependencies()?
+            .memory
+            .update_conversation_policy(UpdateConversationMemoryPolicyRow {
+                user_id: user_id.into(),
+                conversation_id: conversation_id.into(),
+                capture_enabled: request.capture_enabled,
+                recall_enabled: request.recall_enabled,
+                now: now_ms(),
+            })
+            .await
+            .map_err(map_db_error)?;
+        self.get_conversation_policy(user_id, conversation_id).await
     }
 
     /// Best-effort canonical post-persistence trigger. Logs identifiers and status only.
@@ -1006,6 +1311,71 @@ fn valid_lease_token(lease_token: &str) -> Result<(), MemoryError> {
     (!lease_token.trim().is_empty() && lease_token.len() <= 200)
         .then_some(())
         .ok_or(MemoryError::InvalidInput)
+}
+
+fn validate_entry_query(query: &ListMemoryEntriesQuery) -> Result<(), MemoryError> {
+    if query.limit.is_some_and(|limit| limit == 0 || limit > 100)
+        || query
+            .created_after
+            .zip(query.created_before)
+            .is_some_and(|(after, before)| after > before)
+    {
+        return Err(MemoryError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn normalized_filter(value: Option<String>) -> Result<Option<String>, MemoryError> {
+    value
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() || value.len() > 500 {
+                Err(MemoryError::InvalidInput)
+            } else {
+                Ok(value.to_owned())
+            }
+        })
+        .transpose()
+}
+
+fn normalize_scope_patch(value: Option<Option<String>>) -> Result<Option<Option<String>>, MemoryError> {
+    value
+        .map(|value| value.map(|value| normalized_filter(Some(value))).transpose())
+        .transpose()
+        .map(|value| value.map(Option::flatten))
+}
+
+fn validate_content(value: String) -> Result<String, MemoryError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 8_000 {
+        return Err(MemoryError::InvalidInput);
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_cursor(value: Option<&str>) -> Result<usize, MemoryError> {
+    value
+        .map(|value| {
+            if value.is_empty() || value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(MemoryError::InvalidInput);
+            }
+            value.parse().map_err(|_| MemoryError::InvalidInput)
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn job_state(value: &str) -> Result<MemoryJobState, MemoryError> {
+    match value {
+        "pending" => Ok(MemoryJobState::Pending),
+        "running" => Ok(MemoryJobState::Running),
+        "retry_wait" => Ok(MemoryJobState::RetryWait),
+        "blocked" => Ok(MemoryJobState::Blocked),
+        "succeeded" => Ok(MemoryJobState::Succeeded),
+        "failed" => Ok(MemoryJobState::Failed),
+        "canceled" => Ok(MemoryJobState::Canceled),
+        _ => Err(MemoryError::Internal),
+    }
 }
 
 fn failure_transition(

@@ -34,8 +34,9 @@ pub use cron_job::CronJobRow;
 pub use mcp_server::McpServerRow;
 pub(crate) use memory::MemoryEntryDbRow;
 pub use memory::{
-    ConversationMemoryRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow, MemoryEntryRow, MemoryImportStateRow,
-    MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow, MemorySettingsRow, MemorySourceRow,
+    ConversationMemoryPolicyRow, ConversationMemoryRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow, MemoryEntryRow,
+    MemoryImportStateRow, MemoryJobHealthRow, MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow, MemorySettingsRow,
+    MemorySourceRow,
 };
 pub use message::MessageRow;
 pub use oauth_token::OAuthTokenRow;

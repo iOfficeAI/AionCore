@@ -4,8 +4,9 @@ use sha2::{Digest, Sha256};
 
 use crate::DbError;
 use crate::models::{
-    ConversationMemoryRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow, MemoryEntryRow, MemoryImportStateRow,
-    MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow, MemorySettingsRow, MessageRow,
+    ConversationMemoryPolicyRow, ConversationMemoryRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow, MemoryEntryRow,
+    MemoryImportStateRow, MemoryJobHealthRow, MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow, MemorySettingsRow,
+    MessageRow,
 };
 
 /// Maximum accepted messages in one bounded Memory evidence batch.
@@ -344,6 +345,14 @@ pub struct MemoryEntryQueryRow {
     pub created_after: Option<TimestampMs>,
     pub created_before: Option<TimestampMs>,
     pub limit: u32,
+    pub offset: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryChangeSetQueryRow {
+    pub conversation_id: Option<String>,
+    pub limit: u32,
+    pub offset: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +370,21 @@ pub struct UpdateMemoryEntryRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveMemoryConflictActionRow {
+    Select { selected_entry_id: String },
+    Merge { content: String },
+    KeepSeparate { tombstone_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveMemoryConflictRow {
+    pub user_id: String,
+    pub entry_id: String,
+    pub action: ResolveMemoryConflictActionRow,
+    pub now: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryCandidateQueryRow {
     pub user_id: String,
     pub project_id: Option<String>,
@@ -374,6 +398,11 @@ pub trait IMemoryRepository: Send + Sync {
     async fn update_settings(&self, command: UpdateMemorySettingsRow) -> Result<MemorySettingsRow, DbError>;
     async fn effective_policy(&self, user_id: &str, conversation_id: &str)
     -> Result<EffectiveMemoryPolicyRow, DbError>;
+    async fn get_conversation_policy(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationMemoryPolicyRow, DbError>;
     async fn update_conversation_policy(
         &self,
         command: UpdateConversationMemoryPolicyRow,
@@ -429,10 +458,19 @@ pub trait IMemoryRepository: Send + Sync {
     ) -> Result<Option<ConversationMemoryRow>, DbError>;
     async fn list_entries(&self, user_id: &str) -> Result<Vec<MemoryEntryRow>, DbError>;
     async fn query_entries(&self, user_id: &str, query: MemoryEntryQueryRow) -> Result<Vec<MemoryEntryRow>, DbError>;
+    async fn count_entries(&self, user_id: &str, query: MemoryEntryQueryRow) -> Result<u64, DbError>;
     async fn get_entry(&self, user_id: &str, entry_id: &str) -> Result<Option<MemoryEntryRow>, DbError>;
     async fn update_entry(&self, input: UpdateMemoryEntryRow) -> Result<MemoryEntryRow, DbError>;
+    async fn resolve_conflict(&self, input: ResolveMemoryConflictRow) -> Result<Vec<MemoryEntryRow>, DbError>;
     async fn delete_entry(&self, user_id: &str, entry_id: &str, now: TimestampMs) -> Result<(), DbError>;
     async fn list_change_sets(&self, user_id: &str, limit: u32) -> Result<Vec<MemoryChangeSetRow>, DbError>;
+    async fn query_change_sets(
+        &self,
+        user_id: &str,
+        query: MemoryChangeSetQueryRow,
+    ) -> Result<(Vec<MemoryChangeSetRow>, u64), DbError>;
+    async fn memory_job_health(&self, user_id: &str)
+    -> Result<(Option<TimestampMs>, Vec<MemoryJobHealthRow>), DbError>;
     async fn delete_conversation_memory(
         &self,
         user_id: &str,

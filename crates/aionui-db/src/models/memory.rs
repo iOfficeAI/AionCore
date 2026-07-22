@@ -30,6 +30,20 @@ pub struct EffectiveMemoryPolicyRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ConversationMemoryPolicyRow {
+    pub conversation_id: String,
+    pub capture_enabled: Option<bool>,
+    pub recall_enabled: Option<bool>,
+    pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MemoryJobHealthRow {
+    pub state: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct ConversationMemoryRow {
     pub user_id: String,
     pub conversation_id: String,

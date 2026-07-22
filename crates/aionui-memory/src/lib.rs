@@ -4,6 +4,7 @@ pub mod app_operations_port;
 pub mod error;
 mod evidence;
 pub mod jobs;
+mod library;
 mod reconciliation;
 pub mod routes;
 pub mod sanitizer;

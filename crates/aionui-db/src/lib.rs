@@ -31,8 +31,9 @@ pub use models::{
     UpsertOverrideParams,
 };
 pub use models::{
-    ConversationMemoryRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow, MemoryEntryRow, MemoryImportStateRow,
-    MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow, MemorySettingsRow, MemorySourceRow,
+    ConversationMemoryPolicyRow, ConversationMemoryRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow, MemoryEntryRow,
+    MemoryImportStateRow, MemoryJobHealthRow, MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow, MemorySettingsRow,
+    MemorySourceRow,
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
@@ -47,8 +48,9 @@ pub use repository::memory::{
     BoundedMemoryTurnMessagesRow, ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition,
     CommitMemorySourceRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow,
     ExpectedMemoryEntryRow, FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, MEMORY_EVIDENCE_MAX_BYTES,
-    MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow, MemoryEntryQueryRow, MemoryEvidenceMessageKind,
-    MemoryReconciliationSnapshotRow, MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow,
+    MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow, MemoryChangeSetQueryRow, MemoryEntryQueryRow,
+    MemoryEvidenceMessageKind, MemoryReconciliationSnapshotRow, MemoryTurnSnapshotExpectationRow,
+    ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, ResolveMemoryConflictActionRow, ResolveMemoryConflictRow,
     SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow,
     UpdateMemoryEntryRow, UpdateMemoryLifecycleRow, UpdateMemorySettingsRow, derive_memory_fingerprint,
     memory_entry_content_hash, memory_evidence_content,
