@@ -1611,7 +1611,14 @@ pub(crate) async fn attach_member_runtime(
     session
         .work_coordinator
         .set_runtime_constraint(&agent.slot_id, RuntimeConstraint::Starting { operation_id });
-    service.publish_member_runtime_starting_if_current(&session);
+    // Session-level `Starting` drives the full-screen warmup overlay, which is
+    // leader-scoped (spec 5.4/5.5): it only reflects leader bootstrap/failure.
+    // A teammate attach is surfaced inline via its own
+    // `agentRuntimeStatusChanged=pending` (broadcast by the caller), so it must
+    // NOT resurface the overlay on lazy wakeup / add-member / directed retry.
+    if agent.role == TeammateRole::Lead {
+        service.publish_member_runtime_starting_if_current(&session);
+    }
     info!(
         team_id = session.team_id(),
         slot_id = agent.slot_id,

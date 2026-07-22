@@ -3763,24 +3763,27 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
     .await
     .expect("manual add attach failure should mark the slot error");
 
+    // Teammate attach failure is inline (spec 5.4②): the per-member runtime
+    // status goes `failed` (drives the column's failure UI), but the session
+    // lifecycle must NOT fail — the leader is still ready, so the team stays
+    // usable and the full-screen warmup overlay never appears.
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if recorder
-                .events_by_name("team.sessionStatusChanged")
+            let runtime_failed = recorder
+                .events_by_name("team.agentRuntimeStatusChanged")
                 .iter()
                 .any(|event| {
-                    event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
+                    event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(agent.slot_id.as_str())
                         && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
-                        && event.data.get("phase").and_then(serde_json::Value::as_str) == Some("attaching_agents")
-                })
-            {
+                });
+            if runtime_failed {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("dynamic attach failure must fail the team lifecycle");
+    .expect("teammate attach failure must surface inline as a failed runtime status");
 
     assert!(Arc::ptr_eq(
         &original_scheduler,
@@ -3837,6 +3840,16 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
                     && event.data.get("server_count").and_then(serde_json::Value::as_u64) == Some(2)
             }),
         "single-member retry must restore team Ready"
+    );
+    assert!(
+        !recorder
+            .events_by_name("team.sessionStatusChanged")
+            .iter()
+            .any(|event| {
+                event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
+                    && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+            }),
+        "a teammate add-then-retry flow must never fail the session lifecycle; the failure was inline (spec 5.4/5.5)"
     );
 }
 
@@ -3896,20 +3909,27 @@ async fn failed_member_returns_conflict_and_removal_restores_ready() {
         )
         .await
         .unwrap();
+    // The dynamic teammate's attach failure surfaces inline (spec 5.4②): its
+    // per-member runtime status goes `failed`. The session lifecycle stays Ready
+    // (leader still ready); the deterministic session-level failure is reported
+    // only by the explicit `ensure_session` retry below (which returns Err).
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if recorder
-                .events_by_name("team.sessionStatusChanged")
+            let runtime_failed = recorder
+                .events_by_name("team.agentRuntimeStatusChanged")
                 .iter()
-                .any(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed"))
-            {
+                .any(|event| {
+                    event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(failed.slot_id.as_str())
+                        && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+                });
+            if runtime_failed {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("dynamic failure status");
+    .expect("dynamic teammate failure must surface inline as a failed runtime status");
 
     let error = svc
         .ensure_session("user1", &created.id)
@@ -6368,6 +6388,156 @@ async fn attach_agent_runtime_rejects_unknown_slot() {
     assert!(
         matches!(error, TeamError::AgentNotFound(_)),
         "expected AgentNotFound, got {error:?}"
+    );
+}
+
+// The full-screen warmup overlay is driven by session-level status and must
+// reflect the leader only (spec 5.4/5.5): once the team is Ready (leader ready),
+// waking a dormant teammate is an inline, per-column event and must NOT flip the
+// session back to `starting` — otherwise the overlay resurfaces on every lazy
+// wakeup / add-member.
+#[tokio::test]
+async fn waking_dormant_teammate_does_not_resurface_session_starting() {
+    let (svc, _team_repo, _task_manager, recorder) = setup_with_factory_and_recording_broadcaster(success_factory());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Lazy wakeup overlay".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|assistant| assistant.role == "teammate")
+        .expect("teammate")
+        .clone();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    // The team is Ready with the teammate dormant. Drop the bootstrap events so
+    // only the wakeup's session-status broadcasts remain.
+    recorder.clear();
+
+    svc.attach_agent_runtime("user1", &created.id, &worker.slot_id)
+        .await
+        .expect("directed attach should succeed");
+
+    // Wait until the teammate attach has fully completed (ready broadcast).
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let ready = recorder
+                .events_by_name("team.agentRuntimeStatusChanged")
+                .iter()
+                .any(|event| {
+                    event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(worker.slot_id.as_str())
+                        && event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready")
+                });
+            if ready {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("teammate attach must complete");
+
+    let starting = recorder
+        .events_by_name("team.sessionStatusChanged")
+        .into_iter()
+        .find(|event| {
+            event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
+                && event.data.get("status").and_then(serde_json::Value::as_str) == Some("starting")
+        });
+    assert!(
+        starting.is_none(),
+        "waking a dormant teammate must not resurface the warmup overlay (session `starting`); \
+         teammate lifecycle is inline via agentRuntimeStatusChanged, got {starting:?}"
+    );
+}
+
+// A teammate's lazy-attach FAILURE is inline (spec 5.4②): the per-member
+// runtime status goes `failed` and the send box gates that column, but the
+// session-level status must stay Ready (leader still ready = team usable). A
+// teammate failure must never raise the full-screen failure card.
+#[tokio::test]
+async fn failed_teammate_wakeup_does_not_flip_session_to_failed() {
+    use futures_util::FutureExt;
+
+    let fail_next = Arc::new(AtomicBool::new(false));
+    let factory_fail_next = Arc::clone(&fail_next);
+    let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
+        let should_fail = factory_fail_next.swap(false, Ordering::SeqCst);
+        async move {
+            if should_fail {
+                return Err(AgentError::internal("simulated teammate lazy attach failure"));
+            }
+            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
+                mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
+            )))
+        }
+        .boxed()
+    });
+    let (svc, _team_repo, _task_manager, recorder) = setup_with_factory_and_recording_broadcaster(factory);
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Teammate failure stays inline".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|assistant| assistant.role == "teammate")
+        .expect("teammate")
+        .clone();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    // Leader is Ready; drop bootstrap events. Now arm a failure and wake the
+    // dormant teammate — the failure must stay inline.
+    recorder.clear();
+    fail_next.store(true, Ordering::SeqCst);
+    svc.send_message_to_agent("user1", &created.id, &worker.slot_id, "please do X", None)
+        .await
+        .expect("human delivery acks immediately even though the lazy attach will fail");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let failed = recorder
+                .events_by_name("team.agentRuntimeStatusChanged")
+                .iter()
+                .any(|event| {
+                    event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(worker.slot_id.as_str())
+                        && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+                });
+            if failed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("failed lazy attach must broadcast a failed runtime status for the teammate");
+
+    let session_failed = recorder
+        .events_by_name("team.sessionStatusChanged")
+        .into_iter()
+        .find(|event| {
+            event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
+                && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+        });
+    assert!(
+        session_failed.is_none(),
+        "a teammate lazy-attach failure must stay inline and never flip session status to `failed` \
+         (leader still ready = team usable, spec 5.4②), got {session_failed:?}"
     );
 }
 

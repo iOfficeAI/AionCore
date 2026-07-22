@@ -1051,7 +1051,11 @@ impl TeamSessionService {
         session: Arc<TeamSession>,
         work: Vec<MemberRuntimeReconcileWork>,
     ) -> Result<(), TeamError> {
-        if !work.is_empty() {
+        // Session-level `Starting` is leader-scoped (spec 5.4/5.5): only a
+        // leader (re)attach may raise the overlay. Reconciliation that touches
+        // only teammates (Ready-repair, Failed-retry of a non-lead member) keeps
+        // its progress inline via `agentRuntimeStatusChanged`.
+        if work.iter().any(|item| item.agent.role == TeammateRole::Lead) {
             self.publish_member_runtime_starting_if_current(&session);
         }
         let mut waiters = Vec::with_capacity(work.len());
@@ -1373,35 +1377,43 @@ impl TeamSessionService {
             return;
         };
 
-        let mut failed_reason = None;
-        let mut pending = false;
-        for agent in &team.agents {
-            match expected.member_runtimes().snapshot(&agent.slot_id) {
-                MemberRuntimeSnapshot::Ready => {}
-                MemberRuntimeSnapshot::Failed { failure, .. } => {
-                    failed_reason.get_or_insert(failure.public_reason);
-                }
-                // Absent = never triggered = dormant. A dormant teammate does
-                // NOT block team Ready (leader-only warmup, spec 5.2). The
-                // registry snapshot is the sole authority here — we do not read
-                // the coordinator or event_loops.
-                MemberRuntimeSnapshot::Absent => {}
-                // An in-flight attach/remove briefly blocks Ready.
-                MemberRuntimeSnapshot::Attaching { .. } | MemberRuntimeSnapshot::Removing { .. } => pending = true,
-                MemberRuntimeSnapshot::SessionStopped => return,
-            }
-        }
+        // Session-level status is leader-scoped: "Ready = leader ready = team
+        // usable" (spec 5.2). It drives the full-screen warmup overlay, which
+        // must reflect the leader only (spec 5.4/5.5). Teammate runtimes
+        // (dormant/pending/ready/failed) are surfaced per-member via
+        // `agentRuntimeStatusChanged` and must NOT flip the session status, or
+        // the overlay would resurface on lazy wakeup / add-member and a teammate
+        // failure would raise the full-screen failure card.
+        let Some(leader) = team.agents.iter().find(|agent| agent.role == TeammateRole::Lead) else {
+            // No lead in the roster is a malformed team; bootstrap already
+            // reports it. Nothing to publish here.
+            return;
+        };
 
-        if let Some(reason) = failed_reason {
-            self.publish_member_runtime_failed_if_current(expected, &reason);
-        } else if pending {
-            self.publish_member_runtime_starting_if_current(expected);
-        } else {
-            let _ = self.with_published_session(expected, |_| {
-                self.broadcast_session_status(expected.team_id(), TeamSessionStatus::Ready, None, |payload| {
-                    payload.server_count = Some(team.agents.len());
+        match expected.member_runtimes().snapshot(&leader.slot_id) {
+            MemberRuntimeSnapshot::Ready => {
+                let _ = self.with_published_session(expected, |_| {
+                    self.broadcast_session_status(expected.team_id(), TeamSessionStatus::Ready, None, |payload| {
+                        payload.server_count = Some(team.agents.len());
+                    });
                 });
-            });
+            }
+            MemberRuntimeSnapshot::Failed { failure, .. } => {
+                self.publish_member_runtime_failed_if_current(expected, &failure.public_reason);
+            }
+            // An in-flight leader attach/remove (cold start, repair, retry) is
+            // the only case that legitimately raises the overlay again. The lead
+            // cannot be removed, so `Removing` is defensive.
+            MemberRuntimeSnapshot::Attaching { .. } | MemberRuntimeSnapshot::Removing { .. } => {
+                self.publish_member_runtime_starting_if_current(expected);
+            }
+            // The leader is attached at bootstrap and never dormant in steady
+            // state; treat a stray Absent defensively as in-flight rather than
+            // prematurely declaring Ready.
+            MemberRuntimeSnapshot::Absent => {
+                self.publish_member_runtime_starting_if_current(expected);
+            }
+            MemberRuntimeSnapshot::SessionStopped => {}
         }
     }
 
