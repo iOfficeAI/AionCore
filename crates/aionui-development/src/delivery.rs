@@ -704,7 +704,10 @@ impl DeliveryService {
             .filter(|gate| {
                 gate.required
                     && gate.task_id.is_none()
-                    && gate.gate_type == "integration"
+                    // `integration_test` is the public gate/profile identifier.
+                    // Keep accepting legacy `integration` rows created by early
+                    // roadmap builds so upgrades do not strand existing runs.
+                    && matches!(gate.gate_type.as_str(), "integration_test" | "integration")
                     && gate.created_at >= delivery.created_at
             })
             .max_by_key(|gate| gate.created_at);

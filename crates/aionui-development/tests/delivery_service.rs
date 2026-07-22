@@ -188,7 +188,8 @@ async fn pass_final_integration_gate(service: &DeliveryService, repo: &SqliteDev
         id: "gate-final-integration".into(),
         run_id: "run-delivery".into(),
         task_id: None,
-        gate_type: "integration".into(),
+        // Match the public quality-gate API and project command profile name.
+        gate_type: "integration_test".into(),
         command: "cargo test --workspace".into(),
         working_directory: "/tmp".into(),
         exit_code: Some(0),

@@ -208,12 +208,20 @@ fn parse_ci_check(value: &Value) -> ProviderCiCheck {
 }
 
 fn parse_review_comments(value: &Value) -> Vec<ProviderReviewComment> {
-    value
-        .get("comments")
+    let issue_comments = value.get("comments").and_then(Value::as_array).into_iter().flatten();
+    let actionable_reviews = value
+        .get("reviews")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .chain(value.get("reviews").and_then(Value::as_array).into_iter().flatten())
+        .filter(|review| {
+            matches!(
+                review.get("state").and_then(Value::as_str),
+                Some("CHANGES_REQUESTED" | "COMMENTED")
+            )
+        });
+    issue_comments
+        .chain(actionable_reviews)
         .filter_map(|comment| {
             let body = comment.get("body").and_then(Value::as_str)?.trim();
             if body.is_empty() {
@@ -301,5 +309,29 @@ mod tests {
             parse_ci_check(&json!({"name": "unit", "conclusion": "SUCCESS"})).status,
             "passed"
         );
+    }
+
+    #[test]
+    fn approved_review_body_is_not_an_unresolved_rework_comment() {
+        let value = json!({
+            "reviews": [
+                {
+                    "id": "PRR_APPROVED",
+                    "state": "APPROVED",
+                    "body": "The candidate is ready to merge",
+                    "author": {"login": "reviewer"}
+                },
+                {
+                    "id": "PRR_CHANGES",
+                    "state": "CHANGES_REQUESTED",
+                    "body": "Add a regression test",
+                    "author": {"login": "reviewer"}
+                }
+            ]
+        });
+
+        let comments = parse_review_comments(&value);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].id, "PRR_CHANGES");
     }
 }
