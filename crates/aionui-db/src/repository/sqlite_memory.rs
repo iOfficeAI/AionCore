@@ -1,8 +1,10 @@
-use std::cmp::Reverse;
-use std::collections::HashSet;
-
 use sqlx::{SqliteConnection, SqlitePool};
-use unicode_normalization::UnicodeNormalization;
+
+struct InsertEntryOptions<'a> {
+    state: &'a str,
+    supersedes_id: Option<&'a str>,
+    conflict_group_id: Option<&'a str>,
+}
 
 use crate::DbError;
 use crate::models::{
@@ -10,9 +12,10 @@ use crate::models::{
     MemoryImportStateRow, MemoryJobRow, MemoryRetrievalRow, MemorySettingsRow, MemorySourceRow,
 };
 use crate::repository::memory::{
-    ClaimMemoryJobRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, IMemoryRepository,
-    MemoryCandidateQueryRow, MemoryEntryQueryRow, RenewMemoryLeaseRow, UpdateConversationMemoryPolicyRow,
-    UpdateMemoryEntryRow, UpdateMemorySettingsRow,
+    ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
+    CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, IMemoryRepository, MemoryCandidateQueryRow,
+    MemoryEntryQueryRow, RenewMemoryLeaseRow, UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow,
+    UpdateMemorySettingsRow,
 };
 
 const MAX_MEMORY_CANDIDATES: u32 = 200;
@@ -93,6 +96,137 @@ impl SqliteMemoryRepository {
         Ok(entries)
     }
 
+    async fn ensure_entry_target_on(
+        connection: &mut SqliteConnection,
+        user_id: &str,
+        entry_id: &str,
+    ) -> Result<(), DbError> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM memory_entries WHERE id = ? AND user_id = ? AND state <> 'deleted')",
+        )
+        .bind(entry_id)
+        .bind(user_id)
+        .fetch_one(&mut *connection)
+        .await?;
+        if exists {
+            Ok(())
+        } else {
+            Err(DbError::NotFound(format!("Memory entry '{entry_id}' not found")))
+        }
+    }
+
+    async fn validate_sources_on(
+        connection: &mut SqliteConnection,
+        user_id: &str,
+        sources: &[CommitMemorySourceRow],
+    ) -> Result<(), DbError> {
+        for source in sources {
+            Self::ensure_conversation_on(connection, user_id, &source.conversation_id).await?;
+            let turn_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM messages
+                    WHERE conversation_id = ? AND turn_id = ?
+                )",
+            )
+            .bind(&source.conversation_id)
+            .bind(&source.turn_id)
+            .fetch_one(&mut *connection)
+            .await?;
+            if !turn_exists {
+                return Err(DbError::NotFound(format!(
+                    "Memory source turn '{}' not found",
+                    source.turn_id
+                )));
+            }
+            let message_ids: Vec<String> = serde_json::from_str(&source.message_ids_json)
+                .map_err(|error| DbError::Conflict(format!("Invalid Memory source message IDs: {error}")))?;
+            if message_ids.is_empty() {
+                return Err(DbError::Conflict(
+                    "Memory source must reference at least one message".into(),
+                ));
+            }
+            for message_id in message_ids {
+                let message_exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM messages
+                        WHERE id = ? AND conversation_id = ? AND turn_id = ?
+                    )",
+                )
+                .bind(&message_id)
+                .bind(&source.conversation_id)
+                .bind(&source.turn_id)
+                .fetch_one(&mut *connection)
+                .await?;
+                if !message_exists {
+                    return Err(DbError::NotFound(format!(
+                        "Memory source message '{message_id}' not found"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn insert_entry_on(
+        connection: &mut SqliteConnection,
+        user_id: &str,
+        entry: &CommitMemoryEntryRow,
+        options: InsertEntryOptions<'_>,
+        schema_version: i64,
+        now: i64,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO memory_entries
+                (id, user_id, project_id, workspace_key, kind, stable_key, fingerprint, content, state,
+                 pinned, user_edited, supersedes_id, conflict_group_id, schema_version, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)",
+        )
+        .bind(&entry.id)
+        .bind(user_id)
+        .bind(&entry.project_id)
+        .bind(&entry.workspace_key)
+        .bind(&entry.kind)
+        .bind(&entry.stable_key)
+        .bind(&entry.fingerprint)
+        .bind(&entry.content)
+        .bind(options.state)
+        .bind(options.supersedes_id)
+        .bind(options.conflict_group_id)
+        .bind(schema_version)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *connection)
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_sources_on(
+        connection: &mut SqliteConnection,
+        entry_id: &str,
+        sources: &[CommitMemorySourceRow],
+        now: i64,
+    ) -> Result<(), DbError> {
+        for source in sources {
+            sqlx::query(
+                "INSERT INTO memory_sources
+                    (memory_entry_id, conversation_id, turn_id, message_ids_json, first_observed_at, last_observed_at)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(memory_entry_id, conversation_id, turn_id) DO UPDATE SET
+                    message_ids_json = excluded.message_ids_json,
+                    last_observed_at = excluded.last_observed_at",
+            )
+            .bind(entry_id)
+            .bind(&source.conversation_id)
+            .bind(&source.turn_id)
+            .bind(&source.message_ids_json)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *connection)
+            .await?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     async fn count_jobs(&self, user_id: &str, conversation_id: &str, state: &str) -> Result<i64, DbError> {
         Ok(sqlx::query_scalar(
@@ -104,17 +238,6 @@ impl SqliteMemoryRepository {
         .fetch_one(&self.pool)
         .await?)
     }
-}
-
-fn normalized_tokens(value: &str) -> HashSet<String> {
-    value
-        .nfkc()
-        .flat_map(char::to_lowercase)
-        .collect::<String>()
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned)
-        .collect()
 }
 
 #[async_trait::async_trait]
@@ -398,15 +521,39 @@ impl IMemoryRepository for SqliteMemoryRepository {
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
         let result = async {
             Self::ensure_conversation_on(&mut connection, &input.user_id, &input.conversation_id).await?;
-            let job: Option<(String, String)> = sqlx::query_as(
-                "SELECT conversation_id, state FROM memory_jobs WHERE id = ? AND user_id = ?",
+            let job: Option<(String, String, i64, String, Option<String>, Option<i64>, i64)> = sqlx::query_as(
+                "SELECT conversation_id, state, expected_revision, through_turn_id, lease_owner,
+                        lease_expires_at, attempt_count
+                 FROM memory_jobs WHERE id = ? AND user_id = ?",
             )
             .bind(&input.job_id)
             .bind(&input.user_id)
             .fetch_optional(&mut *connection)
             .await?;
-            if !matches!(job, Some((ref conversation_id, ref state)) if conversation_id == &input.conversation_id && state == "running") {
-                return Err(DbError::NotFound(format!("Running Memory job '{}' not found", input.job_id)));
+            let Some((
+                job_conversation_id,
+                job_state,
+                job_expected_revision,
+                job_through_turn_id,
+                job_lease_owner,
+                job_lease_expires_at,
+                job_attempt_count,
+            )) = job
+            else {
+                return Err(DbError::NotFound(format!("Memory job '{}' not found", input.job_id)));
+            };
+            let valid_fence = job_conversation_id == input.conversation_id
+                && job_state == "running"
+                && job_expected_revision == input.expected_revision
+                && job_through_turn_id == input.through_turn_id
+                && job_lease_owner.as_deref() == Some(input.lease_owner.as_str())
+                && job_lease_expires_at.is_some_and(|expires_at| expires_at > input.now)
+                && job_attempt_count == input.expected_attempt_count;
+            if !valid_fence {
+                return Err(DbError::Conflict(format!(
+                    "Memory job '{}' lease or cursor changed",
+                    input.job_id
+                )));
             }
 
             let current_revision: Option<i64> = sqlx::query_scalar(
@@ -482,6 +629,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
 
             let mut added_ids = Vec::new();
             let mut refined_ids = Vec::new();
+            let mut superseded_ids = Vec::new();
+            let mut conflict_ids = Vec::new();
             for entry in &input.entries {
                 let tombstoned: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM memory_entries WHERE user_id = ? AND fingerprint = ? AND state = 'deleted')",
@@ -494,88 +643,115 @@ impl IMemoryRepository for SqliteMemoryRepository {
                     continue;
                 }
 
-                let existing: Option<(String, bool, bool)> = sqlx::query_as(
-                    "SELECT id, pinned, user_edited FROM memory_entries
-                     WHERE user_id = ? AND fingerprint = ? AND state = 'active' ORDER BY created_at LIMIT 1",
-                )
-                .bind(&input.user_id)
-                .bind(&entry.fingerprint)
-                .fetch_optional(&mut *connection)
-                .await?;
-                let entry_id = if let Some((existing_id, pinned, user_edited)) = existing {
-                    if !pinned && !user_edited {
+                Self::validate_sources_on(&mut connection, &input.user_id, &entry.sources).await?;
+                let entry_id = match &entry.transition {
+                    CommitMemoryEntryTransition::Create => {
+                        Self::insert_entry_on(
+                            &mut connection,
+                            &input.user_id,
+                            entry,
+                            InsertEntryOptions {
+                                state: "active",
+                                supersedes_id: None,
+                                conflict_group_id: None,
+                            },
+                            input.schema_version,
+                            input.now,
+                        )
+                        .await?;
+                        added_ids.push(entry.id.clone());
+                        entry.id.clone()
+                    }
+                    CommitMemoryEntryTransition::Refine { target_entry_id } => {
+                        Self::ensure_entry_target_on(&mut connection, &input.user_id, target_entry_id).await?;
                         sqlx::query(
                             "UPDATE memory_entries SET project_id = ?, workspace_key = ?, kind = ?, stable_key = ?,
-                             content = ?, supersedes_id = ?, conflict_group_id = ?, updated_at = ?
-                             WHERE id = ? AND user_id = ?",
+                             fingerprint = ?, content = ?, updated_at = ?
+                             WHERE id = ? AND user_id = ? AND state <> 'deleted'",
                         )
                         .bind(&entry.project_id)
                         .bind(&entry.workspace_key)
                         .bind(&entry.kind)
                         .bind(&entry.stable_key)
+                        .bind(&entry.fingerprint)
                         .bind(&entry.content)
-                        .bind(&entry.supersedes_id)
-                        .bind(&entry.conflict_group_id)
                         .bind(input.now)
-                        .bind(&existing_id)
+                        .bind(target_entry_id)
                         .bind(&input.user_id)
                         .execute(&mut *connection)
                         .await?;
+                        refined_ids.push(target_entry_id.clone());
+                        target_entry_id.clone()
                     }
-                    refined_ids.push(existing_id.clone());
-                    existing_id
-                } else {
-                    sqlx::query(
-                        "INSERT INTO memory_entries
-                            (id, user_id, project_id, workspace_key, kind, stable_key, fingerprint, content, state,
-                             pinned, user_edited, supersedes_id, conflict_group_id, schema_version, created_at, updated_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, 0, ?, ?, ?, ?, ?)",
-                    )
-                    .bind(&entry.id)
-                    .bind(&input.user_id)
-                    .bind(&entry.project_id)
-                    .bind(&entry.workspace_key)
-                    .bind(&entry.kind)
-                    .bind(&entry.stable_key)
-                    .bind(&entry.fingerprint)
-                    .bind(&entry.content)
-                    .bind(&entry.supersedes_id)
-                    .bind(&entry.conflict_group_id)
-                    .bind(input.schema_version)
-                    .bind(input.now)
-                    .bind(input.now)
-                    .execute(&mut *connection)
-                    .await?;
-                    added_ids.push(entry.id.clone());
-                    entry.id.clone()
+                    CommitMemoryEntryTransition::Supersede { target_entry_id } => {
+                        Self::ensure_entry_target_on(&mut connection, &input.user_id, target_entry_id).await?;
+                        sqlx::query(
+                            "UPDATE memory_entries SET state = 'superseded', updated_at = ?
+                             WHERE id = ? AND user_id = ? AND state <> 'deleted'",
+                        )
+                        .bind(input.now)
+                        .bind(target_entry_id)
+                        .bind(&input.user_id)
+                        .execute(&mut *connection)
+                        .await?;
+                        Self::insert_entry_on(
+                            &mut connection,
+                            &input.user_id,
+                            entry,
+                            InsertEntryOptions {
+                                state: "active",
+                                supersedes_id: Some(target_entry_id),
+                                conflict_group_id: None,
+                            },
+                            input.schema_version,
+                            input.now,
+                        )
+                        .await?;
+                        added_ids.push(entry.id.clone());
+                        superseded_ids.push(target_entry_id.clone());
+                        entry.id.clone()
+                    }
+                    CommitMemoryEntryTransition::Conflict {
+                        target_entry_id,
+                        conflict_group_id,
+                    } => {
+                        Self::ensure_entry_target_on(&mut connection, &input.user_id, target_entry_id).await?;
+                        sqlx::query(
+                            "UPDATE memory_entries SET state = 'conflict', conflict_group_id = ?, updated_at = ?
+                             WHERE id = ? AND user_id = ? AND state <> 'deleted'",
+                        )
+                        .bind(conflict_group_id)
+                        .bind(input.now)
+                        .bind(target_entry_id)
+                        .bind(&input.user_id)
+                        .execute(&mut *connection)
+                        .await?;
+                        Self::insert_entry_on(
+                            &mut connection,
+                            &input.user_id,
+                            entry,
+                            InsertEntryOptions {
+                                state: "conflict",
+                                supersedes_id: None,
+                                conflict_group_id: Some(conflict_group_id),
+                            },
+                            input.schema_version,
+                            input.now,
+                        )
+                        .await?;
+                        conflict_ids.push(target_entry_id.clone());
+                        conflict_ids.push(entry.id.clone());
+                        entry.id.clone()
+                    }
                 };
-
-                for source in &entry.sources {
-                    Self::ensure_conversation_on(&mut connection, &input.user_id, &source.conversation_id).await?;
-                    sqlx::query(
-                        "INSERT INTO memory_sources
-                            (memory_entry_id, conversation_id, turn_id, message_ids_json, first_observed_at, last_observed_at)
-                         VALUES (?, ?, ?, ?, ?, ?)
-                         ON CONFLICT(memory_entry_id, conversation_id, turn_id) DO UPDATE SET
-                            message_ids_json = excluded.message_ids_json,
-                            last_observed_at = excluded.last_observed_at",
-                    )
-                    .bind(&entry_id)
-                    .bind(&source.conversation_id)
-                    .bind(&source.turn_id)
-                    .bind(&source.message_ids_json)
-                    .bind(input.now)
-                    .bind(input.now)
-                    .execute(&mut *connection)
-                    .await?;
-                }
+                Self::upsert_sources_on(&mut connection, &entry_id, &entry.sources, input.now).await?;
             }
 
             sqlx::query(
                 "INSERT INTO memory_change_sets
                     (id, user_id, conversation_id, through_turn_id, job_id, added_ids_json, refined_ids_json,
                      superseded_ids_json, conflict_ids_json, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&input.change_set_id)
             .bind(&input.user_id)
@@ -584,6 +760,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
             .bind(&input.job_id)
             .bind(serde_json::to_string(&added_ids).map_err(|error| DbError::Init(error.to_string()))?)
             .bind(serde_json::to_string(&refined_ids).map_err(|error| DbError::Init(error.to_string()))?)
+            .bind(serde_json::to_string(&superseded_ids).map_err(|error| DbError::Init(error.to_string()))?)
+            .bind(serde_json::to_string(&conflict_ids).map_err(|error| DbError::Init(error.to_string()))?)
             .bind(input.now)
             .execute(&mut *connection)
             .await?;
@@ -601,6 +779,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 revision,
                 added_ids,
                 refined_ids,
+                superseded_ids,
+                conflict_ids,
             })
         }
         .await;
@@ -700,9 +880,16 @@ impl IMemoryRepository for SqliteMemoryRepository {
     }
 
     async fn update_entry(&self, input: UpdateMemoryEntryRow) -> Result<MemoryEntryRow, DbError> {
-        self.get_entry(&input.user_id, &input.id)
+        let current = self
+            .get_entry(&input.user_id, &input.id)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("Memory entry '{}' not found", input.id)))?;
+        if current.state == "deleted" {
+            return Err(DbError::Conflict(format!(
+                "Deleted Memory entry '{}' cannot be updated",
+                input.id
+            )));
+        }
         let project_present = input.project_id.is_some();
         let project_id = input.project_id.flatten();
         let workspace_present = input.workspace_key.is_some();
@@ -779,10 +966,14 @@ impl IMemoryRepository for SqliteMemoryRepository {
                  JOIN memory_sources source ON source.memory_entry_id = entries.id
                  WHERE entries.user_id = ? AND source.conversation_id = ?
                    AND entries.pinned = 0 AND entries.user_edited = 0 AND entries.state <> 'deleted'
-                   AND (SELECT COUNT(*) FROM memory_sources all_sources
-                        WHERE all_sources.memory_entry_id = entries.id) = 1",
+                   AND NOT EXISTS (
+                        SELECT 1 FROM memory_sources other_source
+                        WHERE other_source.memory_entry_id = entries.id
+                          AND other_source.conversation_id <> ?
+                   )",
             )
             .bind(user_id)
+            .bind(conversation_id)
             .bind(conversation_id)
             .fetch_all(&mut *connection)
             .await?;
@@ -868,20 +1059,13 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 "conversation_memory_policies",
                 "memory_entries",
                 "memory_import_state",
+                "memory_jobs",
             ] {
                 sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
                     .bind(user_id)
                     .execute(&mut *connection)
                     .await?;
             }
-            sqlx::query(
-                "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-                 WHERE user_id = ? AND state NOT IN ('succeeded', 'failed', 'canceled')",
-            )
-            .bind(now)
-            .bind(user_id)
-            .execute(&mut *connection)
-            .await?;
             Ok(())
         }
         .await;
@@ -920,25 +1104,9 @@ impl IMemoryRepository for SqliteMemoryRepository {
         .bind(&query.workspace_key)
         .bind(&query.project_id)
         .bind(&query.workspace_key)
-        .bind(MAX_MEMORY_CANDIDATES)
+        .bind(query.limit.clamp(1, MAX_MEMORY_CANDIDATES))
         .fetch_all(&self.pool)
         .await?;
-        let prompt_tokens = normalized_tokens(&query.prompt);
-        let mut scored = rows
-            .into_iter()
-            .enumerate()
-            .map(|(position, row)| {
-                let entry_tokens = normalized_tokens(row.content.as_deref().unwrap_or_default());
-                let overlap = prompt_tokens.intersection(&entry_tokens).count();
-                (Reverse(overlap), position, row)
-            })
-            .collect::<Vec<_>>();
-        scored.sort_by_key(|(score, position, _)| (*score, *position));
-        let rows = scored
-            .into_iter()
-            .take(query.limit.clamp(1, MAX_MEMORY_CANDIDATES) as usize)
-            .map(|(_, _, row)| row)
-            .collect();
         self.entry_rows_with_sources(rows).await
     }
 
@@ -1020,9 +1188,9 @@ mod tests {
     use super::SqliteMemoryRepository;
     use crate::models::{ConversationRow, MessageRow};
     use crate::repository::memory::{
-        ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemorySourceRow, CommitMemoryUpdateResult,
-        CommitMemoryUpdateRow, EnqueueMemoryTurnRow, RenewMemoryLeaseRow, UpdateConversationMemoryPolicyRow,
-        UpdateMemorySettingsRow,
+        ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
+        CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, MemoryCandidateQueryRow,
+        RenewMemoryLeaseRow, UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow, UpdateMemorySettingsRow,
     };
     use crate::repository::{IConversationRepository, IMemoryRepository, SqliteConversationRepository};
     use crate::{DbError, init_database_memory};
@@ -1107,8 +1275,7 @@ mod tests {
             stable_key: format!("decision:{id}"),
             fingerprint: fingerprint.into(),
             content: format!("content for {id}"),
-            supersedes_id: None,
-            conflict_group_id: None,
+            transition: CommitMemoryEntryTransition::Create,
             sources,
         }
     }
@@ -1134,6 +1301,8 @@ mod tests {
             prompt_version: Some("memory-v1".into()),
             writer_provider_id: Some("provider-result".into()),
             writer_model_id: Some("model-result".into()),
+            lease_owner: "worker".into(),
+            expected_attempt_count: 1,
             entries,
             change_set_id: format!("changes-{job_id}"),
             now,
@@ -1141,10 +1310,30 @@ mod tests {
     }
 
     async fn claimed_job(repo: &SqliteMemoryRepository, job_id: &str, conversation_id: &str, turn_id: &str) {
+        sqlx::query(
+            "INSERT OR IGNORE INTO messages
+                (id, conversation_id, turn_id, type, content, position, status, hidden, created_at)
+             VALUES (?, ?, ?, 'text', '{}', 'right', 'finish', 0, 10)",
+        )
+        .bind(format!("msg-{turn_id}"))
+        .bind(conversation_id)
+        .bind(turn_id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
         repo.enqueue_completed_turn(enqueue(job_id, conversation_id, turn_id, 10))
             .await
             .unwrap();
-        let claimed = repo.claim_next_job(claim(USER_A, "worker", 11)).await.unwrap().unwrap();
+        let claimed = repo
+            .claim_next_job(ClaimMemoryJobRow {
+                user_id: USER_A.into(),
+                worker_id: "worker".into(),
+                now: 11,
+                lease_duration_ms: 100,
+            })
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(claimed.id, job_id);
     }
 
@@ -1293,6 +1482,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_memory_reclaimed_job_rejects_the_expired_workers_commit() {
+        let (repo, _, _db) = setup().await;
+        sqlx::query(
+            "INSERT INTO messages
+                (id, conversation_id, turn_id, type, content, position, status, hidden, created_at)
+             VALUES ('msg-turn-lease', 'conv_a', 'turn-lease', 'text', '{}', 'right', 'finish', 0, 10)",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        repo.enqueue_completed_turn(enqueue("job-fenced", "conv_a", "turn-lease", 10))
+            .await
+            .unwrap();
+        repo.claim_next_job(claim(USER_A, "worker-old", 20))
+            .await
+            .unwrap()
+            .unwrap();
+        let reclaimed = repo
+            .claim_next_job(claim(USER_A, "worker-new", 31))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reclaimed.attempt_count, 2);
+
+        let mut old_commit = commit(
+            "job-fenced",
+            "conv_a",
+            "turn-lease",
+            0,
+            vec![entry(
+                "stale-worker-entry",
+                "fp-stale-worker",
+                vec![source("conv_a", "turn-lease")],
+            )],
+            32,
+        );
+        old_commit.lease_owner = "worker-old".into();
+        old_commit.expected_attempt_count = 1;
+        assert!(matches!(
+            repo.commit_update(old_commit).await,
+            Err(DbError::Conflict(_))
+        ));
+        assert!(repo.get_entry(USER_A, "stale-worker-entry").await.unwrap().is_none());
+
+        let mut current_commit = commit(
+            "job-fenced",
+            "conv_a",
+            "turn-lease",
+            0,
+            vec![entry(
+                "current-worker-entry",
+                "fp-current-worker",
+                vec![source("conv_a", "turn-lease")],
+            )],
+            32,
+        );
+        current_commit.lease_owner = "worker-new".into();
+        current_commit.expected_attempt_count = 2;
+        assert!(matches!(
+            repo.commit_update(current_commit).await.unwrap(),
+            CommitMemoryUpdateResult::Committed { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn sqlite_memory_expected_revision_rejects_stale_transaction_without_partial_writes() {
         let (repo, _, _db) = setup().await;
         claimed_job(&repo, "job-1", "conv_a", "turn-1").await;
@@ -1313,18 +1567,23 @@ mod tests {
         ));
 
         claimed_job(&repo, "job-2", "conv_a", "turn-2").await;
+        sqlx::query("UPDATE conversation_memories SET revision = 2 WHERE user_id = ? AND conversation_id = 'conv_a'")
+            .bind(USER_A)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
         let stale = repo
             .commit_update(commit(
                 "job-2",
                 "conv_a",
                 "turn-2",
-                0,
+                1,
                 vec![entry("stale-entry", "fp-stale", vec![source("conv_a", "turn-2")])],
                 30,
             ))
             .await
             .unwrap();
-        assert_eq!(stale, CommitMemoryUpdateResult::StaleRevision { current_revision: 1 });
+        assert_eq!(stale, CommitMemoryUpdateResult::StaleRevision { current_revision: 2 });
         assert!(repo.get_entry(USER_A, "stale-entry").await.unwrap().is_none());
         assert_eq!(repo.get_job(USER_A, "job-2").await.unwrap().unwrap().state, "running");
     }
@@ -1333,6 +1592,15 @@ mod tests {
     async fn sqlite_memory_source_deletion_removes_exclusive_automatic_entries_only() {
         let (repo, _, _db) = setup().await;
         claimed_job(&repo, "job-source", "conv_a", "turn-1").await;
+        sqlx::query(
+            "INSERT INTO messages
+                (id, conversation_id, turn_id, type, content, position, status, hidden, created_at)
+             VALUES ('msg-turn-2', 'conv_a', 'turn-2', 'text', '{}', 'right', 'finish', 0, 11),
+                    ('msg-shared-turn', 'conv_a2', 'shared-turn', 'text', '{}', 'right', 'finish', 0, 11)",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
         repo.commit_update(commit(
             "job-source",
             "conv_a",
@@ -1341,9 +1609,14 @@ mod tests {
             vec![
                 entry("exclusive", "fp-exclusive", vec![source("conv_a", "turn-1")]),
                 entry(
+                    "same-conversation-multi-turn",
+                    "fp-same-conversation",
+                    vec![source("conv_a", "turn-1"), source("conv_a", "turn-2")],
+                ),
+                entry(
                     "shared",
                     "fp-shared",
-                    vec![source("conv_a", "turn-1"), source("conv_a2", "turn-2")],
+                    vec![source("conv_a", "turn-1"), source("conv_a2", "shared-turn")],
                 ),
             ],
             20,
@@ -1353,6 +1626,12 @@ mod tests {
 
         repo.delete_conversation_memory(USER_A, "conv_a", 30).await.unwrap();
         assert!(repo.get_entry(USER_A, "exclusive").await.unwrap().is_none());
+        assert!(
+            repo.get_entry(USER_A, "same-conversation-multi-turn")
+                .await
+                .unwrap()
+                .is_none()
+        );
         let shared = repo.get_entry(USER_A, "shared").await.unwrap().unwrap();
         assert_eq!(shared.sources.len(), 1);
         assert_eq!(shared.sources[0].conversation_id, "conv_a2");
@@ -1377,6 +1656,19 @@ mod tests {
         assert_eq!(tombstone.state, "deleted");
         assert_eq!(tombstone.content, None);
         assert!(tombstone.sources.is_empty());
+        assert!(matches!(
+            repo.update_entry(UpdateMemoryEntryRow {
+                user_id: USER_A.into(),
+                id: "entry-delete".into(),
+                content: Some("must stay deleted".into()),
+                pinned: None,
+                project_id: None,
+                workspace_key: None,
+                now: 26,
+            })
+            .await,
+            Err(DbError::Conflict(_))
+        ));
 
         claimed_job(&repo, "job-readd", "conv_a", "turn-2").await;
         let result = repo
@@ -1417,9 +1709,201 @@ mod tests {
         assert_eq!(repo.get_settings(USER_A).await.unwrap().reset_at, Some(50));
         assert!(repo.list_entries(USER_A).await.unwrap().is_empty());
         assert!(repo.get_conversation_memory(USER_A, "conv_a").await.unwrap().is_none());
+        assert!(repo.get_job(USER_A, "job-clear").await.unwrap().is_none());
+        assert!(repo.get_job(USER_A, "job-pending").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_applies_explicit_supersede_and_conflict_transitions_to_change_set() {
+        let (repo, _, _db) = setup().await;
+        claimed_job(&repo, "job-base", "conv_a", "turn-1").await;
+        repo.commit_update(commit(
+            "job-base",
+            "conv_a",
+            "turn-1",
+            0,
+            vec![
+                entry("old-decision", "fp-old-decision", vec![source("conv_a", "turn-1")]),
+                entry("old-issue", "fp-old-issue", vec![source("conv_a", "turn-1")]),
+            ],
+            20,
+        ))
+        .await
+        .unwrap();
+
+        claimed_job(&repo, "job-transition", "conv_a", "turn-2").await;
+        let mut replacement = entry("new-decision", "fp-new-decision", vec![source("conv_a", "turn-2")]);
+        replacement.transition = CommitMemoryEntryTransition::Supersede {
+            target_entry_id: "old-decision".into(),
+        };
+        let mut contradiction = entry("new-issue", "fp-new-issue", vec![source("conv_a", "turn-2")]);
+        contradiction.transition = CommitMemoryEntryTransition::Conflict {
+            target_entry_id: "old-issue".into(),
+            conflict_group_id: "conflict-1".into(),
+        };
+        repo.commit_update(commit(
+            "job-transition",
+            "conv_a",
+            "turn-2",
+            1,
+            vec![replacement, contradiction],
+            30,
+        ))
+        .await
+        .unwrap();
+
+        let old_decision = repo.get_entry(USER_A, "old-decision").await.unwrap().unwrap();
+        let new_decision = repo.get_entry(USER_A, "new-decision").await.unwrap().unwrap();
+        assert_eq!(old_decision.state, "superseded");
+        assert_eq!(new_decision.supersedes_id.as_deref(), Some("old-decision"));
+        let old_issue = repo.get_entry(USER_A, "old-issue").await.unwrap().unwrap();
+        let new_issue = repo.get_entry(USER_A, "new-issue").await.unwrap().unwrap();
+        assert_eq!(old_issue.state, "conflict");
+        assert_eq!(new_issue.state, "conflict");
+        assert_eq!(new_issue.conflict_group_id.as_deref(), Some("conflict-1"));
+
+        let changes = repo.list_change_sets(USER_A, 10).await.unwrap();
+        let changes = changes.iter().find(|row| row.id == "changes-job-transition").unwrap();
         assert_eq!(
-            repo.get_job(USER_A, "job-pending").await.unwrap().unwrap().state,
-            "canceled"
+            serde_json::from_str::<Vec<String>>(&changes.superseded_ids_json).unwrap(),
+            ["old-decision"]
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&changes.conflict_ids_json).unwrap(),
+            ["old-issue", "new-issue"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_rejects_foreign_transition_targets_and_noncanonical_sources_atomically() {
+        let (repo, _, db) = setup().await;
+        sqlx::query(
+            "INSERT INTO memory_entries
+                (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited,
+                 schema_version, created_at, updated_at)
+             VALUES ('foreign-entry', ?, 'decision', 'foreign', 'fp-foreign', 'foreign', 'active', 0, 0, 1, 1, 1)",
+        )
+        .bind(USER_B)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        claimed_job(&repo, "job-foreign-target", "conv_a", "turn-1").await;
+        let mut foreign_target = entry("candidate", "fp-candidate", vec![source("conv_a", "turn-1")]);
+        foreign_target.transition = CommitMemoryEntryTransition::Supersede {
+            target_entry_id: "foreign-entry".into(),
+        };
+        assert!(matches!(
+            repo.commit_update(commit(
+                "job-foreign-target",
+                "conv_a",
+                "turn-1",
+                0,
+                vec![foreign_target],
+                20,
+            ))
+            .await,
+            Err(DbError::NotFound(_))
+        ));
+        assert!(repo.get_conversation_memory(USER_A, "conv_a").await.unwrap().is_none());
+
+        let mut bad_source = entry("bad-source", "fp-bad-source", vec![source("conv_b", "turn-1")]);
+        bad_source.sources[0].message_ids_json = r#"["missing-message"]"#.into();
+        assert!(matches!(
+            repo.commit_update(commit(
+                "job-foreign-target",
+                "conv_a",
+                "turn-1",
+                0,
+                vec![bad_source],
+                21,
+            ))
+            .await,
+            Err(DbError::NotFound(_))
+        ));
+        assert!(repo.get_entry(USER_A, "bad-source").await.unwrap().is_none());
+
+        let missing_turn = entry(
+            "missing-turn-source",
+            "fp-missing-turn",
+            vec![source("conv_a", "missing-turn")],
+        );
+        assert!(matches!(
+            repo.commit_update(commit(
+                "job-foreign-target",
+                "conv_a",
+                "turn-1",
+                0,
+                vec![missing_turn],
+                22,
+            ))
+            .await,
+            Err(DbError::NotFound(_))
+        ));
+
+        sqlx::query(
+            "INSERT INTO messages
+                (id, conversation_id, turn_id, type, content, position, status, hidden, created_at)
+             VALUES ('foreign-message', 'conv_b', 'foreign-turn', 'text', '{}', 'right', 'finish', 0, 10)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let mut foreign_message = entry(
+            "foreign-message-source",
+            "fp-foreign-message",
+            vec![source("conv_a", "turn-1")],
+        );
+        foreign_message.sources[0].message_ids_json = r#"["foreign-message"]"#.into();
+        assert!(matches!(
+            repo.commit_update(commit(
+                "job-foreign-target",
+                "conv_a",
+                "turn-1",
+                0,
+                vec![foreign_message],
+                23,
+            ))
+            .await,
+            Err(DbError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_candidate_query_returns_sql_ordered_bounded_window() {
+        let (repo, _, _db) = setup().await;
+        claimed_job(&repo, "job-candidates", "conv_a", "turn-1").await;
+        let mut exact_project = entry("exact-project", "fp-project", vec![source("conv_a", "turn-1")]);
+        exact_project.project_id = Some("project-1".into());
+        exact_project.content = "no shared prompt tokens".into();
+        let mut exact_workspace = entry("exact-workspace", "fp-workspace", vec![source("conv_a", "turn-1")]);
+        exact_workspace.workspace_key = Some("workspace-1".into());
+        exact_workspace.content = "needle needle needle".into();
+        let mut global = entry("global", "fp-global", vec![source("conv_a", "turn-1")]);
+        global.content = "needle".into();
+        repo.commit_update(commit(
+            "job-candidates",
+            "conv_a",
+            "turn-1",
+            0,
+            vec![global, exact_workspace, exact_project],
+            20,
+        ))
+        .await
+        .unwrap();
+
+        let candidates = repo
+            .retrieval_candidates(MemoryCandidateQueryRow {
+                user_id: USER_A.into(),
+                project_id: Some("project-1".into()),
+                workspace_key: Some("workspace-1".into()),
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            candidates.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["exact-project", "exact-workspace"]
         );
     }
 

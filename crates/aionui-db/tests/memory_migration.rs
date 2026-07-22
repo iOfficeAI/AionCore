@@ -141,6 +141,16 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
     .await;
     assert!(invalid_job_state.is_err());
 
+    let object_change_arrays = sqlx::query(
+        "INSERT INTO memory_change_sets
+            (id, user_id, conversation_id, through_turn_id, job_id, added_ids_json, refined_ids_json,
+             superseded_ids_json, conflict_ids_json, created_at)
+         VALUES ('bad-change-arrays', 'system_default_user', 'conv-constraints', 'turn', 'job', '{}', '[]', '[]', '[]', 1)",
+    )
+    .execute(pool)
+    .await;
+    assert!(object_change_arrays.is_err());
+
     for (id, state, turn) in [
         ("running-1", "running", "turn-running-1"),
         ("pending-1", "pending", "turn-pending-1"),

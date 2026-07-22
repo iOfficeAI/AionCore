@@ -71,9 +71,25 @@ pub struct CommitMemoryEntryRow {
     pub stable_key: String,
     pub fingerprint: String,
     pub content: String,
-    pub supersedes_id: Option<String>,
-    pub conflict_group_id: Option<String>,
+    pub transition: CommitMemoryEntryTransition,
     pub sources: Vec<CommitMemorySourceRow>,
+}
+
+/// Validated lifecycle transition derived by AionCore business logic.
+/// The repository applies it atomically but does not classify model output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitMemoryEntryTransition {
+    Create,
+    Refine {
+        target_entry_id: String,
+    },
+    Supersede {
+        target_entry_id: String,
+    },
+    Conflict {
+        target_entry_id: String,
+        conflict_group_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +106,8 @@ pub struct CommitMemoryUpdateRow {
     pub prompt_version: Option<String>,
     pub writer_provider_id: Option<String>,
     pub writer_model_id: Option<String>,
+    pub lease_owner: String,
+    pub expected_attempt_count: i64,
     pub entries: Vec<CommitMemoryEntryRow>,
     pub change_set_id: String,
     pub now: TimestampMs,
@@ -101,6 +119,8 @@ pub enum CommitMemoryUpdateResult {
         revision: i64,
         added_ids: Vec<String>,
         refined_ids: Vec<String>,
+        superseded_ids: Vec<String>,
+        conflict_ids: Vec<String>,
     },
     StaleRevision {
         current_revision: i64,
@@ -136,7 +156,6 @@ pub struct MemoryCandidateQueryRow {
     pub user_id: String,
     pub project_id: Option<String>,
     pub workspace_key: Option<String>,
-    pub prompt: String,
     pub limit: u32,
 }
 

@@ -44,9 +44,10 @@ pub use repository::cron::{
 };
 pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::memory::{
-    ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemorySourceRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow,
-    EnqueueMemoryTurnRow, MemoryCandidateQueryRow, MemoryEntryQueryRow, RenewMemoryLeaseRow,
-    UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow, UpdateMemorySettingsRow,
+    ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
+    CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, MemoryCandidateQueryRow,
+    MemoryEntryQueryRow, RenewMemoryLeaseRow, UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow,
+    UpdateMemorySettingsRow,
 };
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
