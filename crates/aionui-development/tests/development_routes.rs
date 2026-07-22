@@ -11,7 +11,8 @@ use aionui_db::{
 use aionui_development::{
     DeliveryProvider, DeliveryProviderSnapshot, DeliveryService, DeploymentService, DevelopmentOperationsService,
     DevelopmentRouterState, DevelopmentService, PortabilityService, PricingService, ProviderPullRequest,
-    RetentionService, SecretService, UnconfiguredDeploymentProvider, development_routes,
+    ResourceLeaseCoordinator, RetentionService, SecretService, SystemDevelopmentResourceController,
+    UnconfiguredDeploymentProvider, development_routes,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -101,12 +102,18 @@ async fn app_for(
     let development_repo = Arc::new(SqliteDevelopmentRepository::new(db.pool().clone()));
     let lease_repo = Arc::new(SqliteAgentWorkspaceLeaseRepository::new(db.pool().clone()));
     let operations_repo = Arc::new(SqliteDevelopmentOperationsRepository::new(db.pool().clone()));
-    let operations_service = Arc::new(DevelopmentOperationsService::new(
-        operations_repo.clone(),
-        development_repo.clone(),
-        project_repo.clone(),
-        lease_repo.clone(),
-    ));
+    let operations_service = Arc::new(
+        DevelopmentOperationsService::new(
+            operations_repo.clone(),
+            development_repo.clone(),
+            project_repo.clone(),
+            lease_repo.clone(),
+        )
+        .with_resources(
+            ResourceLeaseCoordinator::new(operations_repo.clone(), "route-instance"),
+            Arc::new(SystemDevelopmentResourceController),
+        ),
+    );
     let service = Arc::new(
         DevelopmentService::new(
             development_repo.clone(),
@@ -494,7 +501,7 @@ async fn routes_create_and_read_a_development_board() {
 
 #[tokio::test]
 async fn timeline_merges_run_and_task_events_and_controls_are_server_validated() {
-    let (app, _project, _db, _provider) = app().await;
+    let (app, _project, db, _provider) = app().await;
     let run = app
         .clone()
         .oneshot(
@@ -571,6 +578,46 @@ async fn timeline_merges_run_and_task_events_and_controls_are_server_validated()
     assert_eq!(paused.status(), StatusCode::OK);
     assert_eq!(json(paused).await["data"]["run_status"], "paused");
 
+    sqlx::query(
+        "INSERT INTO development_recovery_records \
+         (id, user_id, project_id, run_id, recovery_key, finding, decision, status_before, status_after, details_json, created_at) \
+         VALUES ('route-pending-recovery', 'system_default_user', 'project-1', ?, ?, 'stale run', 'retry', \
+                 'paused', NULL, '{\"state\":\"pending\"}', 1)",
+    )
+    .bind(&run_id)
+    .bind(format!("run:{run_id}:stale"))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let bypass = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/development-runs/{run_id}/control"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"action":"retry","task_id":null,"target_slot_id":null}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bypass.status(), StatusCode::CONFLICT);
+    let cancel_bypass = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/development-runs/{run_id}/control"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"action":"cancel","task_id":null,"target_slot_id":null}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancel_bypass.status(), StatusCode::CONFLICT);
+
     let rejected = app
         .oneshot(
             Request::builder()
@@ -583,6 +630,87 @@ async fn timeline_merges_run_and_task_events_and_controls_are_server_validated()
         .await
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn user_reconcile_orphans_expired_resources_before_takeover() {
+    let (app, _project, db, _provider) = app().await;
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/development-runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "execution_mode": "single",
+                        "request_summary": "Recover expired resource",
+                        "acceptance_criteria": ["resource is taken over"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let run_id = json(created).await["data"]["id"].as_str().unwrap().to_owned();
+    sqlx::query("UPDATE development_runs SET status = 'paused', updated_at = 1 WHERE id = ?")
+        .bind(&run_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO execution_resource_leases \
+         (id, user_id, project_id, run_id, environment_id, environment_kind, resource_kind, resource_identifier, \
+          status, accepts_work, owner_instance_id, heartbeat_at, expires_at, cleanup_order, created_at, updated_at) \
+         VALUES ('route-expired-lease', 'system_default_user', 'project-1', ?, 'host:local', 'host', 'service', \
+                 'route-service', 'active', 1, 'dead-instance', 1, 2, 30, 1, 1)",
+    )
+    .bind(&run_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let reconciled = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/development-operations/reconcile")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"stale_after_ms":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reconciled.status(), StatusCode::OK);
+    let lease_status: String =
+        sqlx::query_scalar("SELECT status FROM execution_resource_leases WHERE id = 'route-expired-lease'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(lease_status, "orphaned");
+
+    let takeover = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/development-runs/{run_id}/recovery"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"action":"takeover"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(takeover.status(), StatusCode::OK);
+    let owner: String =
+        sqlx::query_scalar("SELECT owner_instance_id FROM execution_resource_leases WHERE id = 'route-expired-lease'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(owner, "route-instance");
 }
 
 #[tokio::test]

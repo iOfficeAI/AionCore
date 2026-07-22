@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use aionui_db::models::ProjectRow;
 use aionui_db::{
-    IProjectRepository, SqliteAgentWorkspaceLeaseRepository, SqliteDevelopmentRepository, SqliteProjectRepository,
-    init_database_memory,
+    IDevelopmentRepository, IProjectRepository, SqliteAgentWorkspaceLeaseRepository, SqliteDevelopmentRepository,
+    SqliteProjectRepository, init_database_memory,
 };
 use aionui_development::{
     CreateDevelopmentRunInput, DevelopmentService, DevelopmentWorkspacePort, PrepareDevelopmentWorkspace,
@@ -34,7 +34,12 @@ impl DevelopmentWorkspacePort for RecordingWorkspacePort {
     }
 }
 
-async fn setup() -> (DevelopmentService, Arc<RecordingWorkspacePort>, tempfile::TempDir) {
+async fn setup() -> (
+    DevelopmentService,
+    Arc<RecordingWorkspacePort>,
+    Arc<SqliteDevelopmentRepository>,
+    tempfile::TempDir,
+) {
     let db = init_database_memory().await.unwrap();
     sqlx::query(
         "INSERT INTO users (id, username, password_hash, created_at, updated_at) VALUES ('user-1', 'dev', '', 1, 1)",
@@ -72,19 +77,20 @@ async fn setup() -> (DevelopmentService, Arc<RecordingWorkspacePort>, tempfile::
         .await
         .unwrap();
     let workspace = Arc::new(RecordingWorkspacePort::default());
+    let development_repo = Arc::new(SqliteDevelopmentRepository::new(db.pool().clone()));
     let service = DevelopmentService::new(
-        Arc::new(SqliteDevelopmentRepository::new(db.pool().clone())),
+        development_repo.clone(),
         project_repo,
         Arc::new(SqliteAgentWorkspaceLeaseRepository::new(db.pool().clone())),
         tempfile::tempdir().unwrap().keep(),
     )
     .with_workspace(workspace.clone());
-    (service, workspace, project_dir)
+    (service, workspace, development_repo, project_dir)
 }
 
 #[tokio::test]
 async fn single_run_captures_initial_user_diff_and_uses_an_isolated_workspace() {
-    let (service, port, project_dir) = setup().await;
+    let (service, port, _development_repo, project_dir) = setup().await;
     let run = service
         .create_run(
             "user-1",
@@ -116,7 +122,7 @@ async fn single_run_captures_initial_user_diff_and_uses_an_isolated_workspace() 
 
 #[tokio::test]
 async fn cancellation_restores_the_recorded_safe_point_and_persists_cleanup() {
-    let (service, port, _project_dir) = setup().await;
+    let (service, port, _development_repo, _project_dir) = setup().await;
     let run = service
         .create_run(
             "user-1",
@@ -141,4 +147,46 @@ async fn cancellation_restores_the_recorded_safe_point_and_persists_cleanup() {
         port.restored.lock().unwrap().as_slice(),
         &[("lease-1".into(), prepared.safe_point)]
     );
+    assert!(service.cancel_single_workspace("user-1", &run.id).await.is_err());
+    assert_eq!(port.restored.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn cancellation_rejects_integrating_and_terminal_runs_before_restore() {
+    for status in ["integrating", "succeeded", "failed"] {
+        let (service, port, development_repo, _project_dir) = setup().await;
+        let run = service
+            .create_run(
+                "user-1",
+                CreateDevelopmentRunInput {
+                    project_id: "project-1".into(),
+                    team_id: None,
+                    source_channel: None,
+                    source_user_id: None,
+                    execution_mode: "single".into(),
+                    request_summary: format!("Reject cancellation from {status}"),
+                    acceptance_criteria: vec!["workspace is untouched".into()],
+                },
+            )
+            .await
+            .unwrap();
+        service.prepare_single_workspace("user-1", &run.id).await.unwrap();
+        development_repo
+            .update_run_status(&run.id, "user-1", status, None)
+            .await
+            .unwrap();
+
+        assert!(service.cancel_single_workspace("user-1", &run.id).await.is_err());
+        assert!(service.cancel_run("user-1", &run.id).await.is_err());
+        assert!(port.restored.lock().unwrap().is_empty());
+        assert_eq!(
+            development_repo
+                .get_run(&run.id, "user-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            status
+        );
+    }
 }

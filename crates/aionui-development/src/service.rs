@@ -340,6 +340,13 @@ impl DevelopmentService {
     }
 
     pub async fn complete_run(&self, user_id: &str, run_id: &str) -> Result<DevelopmentRunRow, DevelopmentError> {
+        let run = self.get_run(user_id, run_id).await?;
+        if !matches!(run.status.as_str(), "running" | "verifying" | "reviewing" | "rework") {
+            return Err(DevelopmentError::Conflict(format!(
+                "run {} cannot complete from status {}",
+                run.id, run.status
+            )));
+        }
         let snapshot = self.requirements_snapshot(user_id, run_id).await?;
         let missing: Vec<_> = snapshot
             .coverage
@@ -363,12 +370,35 @@ impl DevelopmentService {
                 "one or more required quality gates have not passed".into(),
             ));
         }
+        if !self
+            .development_repo
+            .update_run_status_if_current(run_id, user_id, &run.status, run.updated_at, "integrating", None)
+            .await?
+        {
+            return Err(DevelopmentError::Conflict(
+                "run state changed before completion could be finalized".into(),
+            ));
+        }
+        let completing_run = self.get_run(user_id, run_id).await?;
         if let Some(runner) = &self.runner {
             runner.cleanup_run(user_id, run_id).await?;
         }
-        self.development_repo
-            .update_run_status(run_id, user_id, "succeeded", Some(now_ms()))
-            .await?;
+        if !self
+            .development_repo
+            .update_run_status_if_current(
+                run_id,
+                user_id,
+                &completing_run.status,
+                completing_run.updated_at,
+                "succeeded",
+                Some(now_ms()),
+            )
+            .await?
+        {
+            return Err(DevelopmentError::Conflict(
+                "run state changed while completion was being finalized".into(),
+            ));
+        }
         self.get_run(user_id, run_id).await
     }
 
@@ -1180,12 +1210,24 @@ impl DevelopmentService {
         user_id: &str,
         run_id: &str,
     ) -> Result<aionui_api_types::SingleRunWorkspace, DevelopmentError> {
-        self.get_run(user_id, run_id).await?;
+        let run = self.get_run(user_id, run_id).await?;
+        self.ensure_no_pending_recovery(&run).await?;
+        ensure_run_is_cancellable(&run)?;
         let row = self
             .development_repo
             .get_single_run_workspace(run_id, user_id)
             .await?
             .ok_or_else(|| DevelopmentError::NotFound(format!("single workspace for run {run_id}")))?;
+        if !self
+            .development_repo
+            .update_run_status_if_current(run_id, user_id, &run.status, run.updated_at, "integrating", None)
+            .await?
+        {
+            return Err(DevelopmentError::Conflict(
+                "run state changed before cancellation could begin".into(),
+            ));
+        }
+        let cancelling_run = self.get_run(user_id, run_id).await?;
         if let Some(runner) = &self.runner {
             runner.cleanup_run(user_id, run_id).await?;
         }
@@ -1203,15 +1245,94 @@ impl DevelopmentService {
         self.development_repo
             .update_single_run_workspace(run_id, user_id, None, &cleanup)
             .await?;
-        self.development_repo
-            .update_run_status(run_id, user_id, "cancelled", Some(now_ms()))
-            .await?;
+        if !self
+            .development_repo
+            .update_run_status_if_current(
+                run_id,
+                user_id,
+                &cancelling_run.status,
+                cancelling_run.updated_at,
+                "cancelled",
+                Some(now_ms()),
+            )
+            .await?
+        {
+            return Err(DevelopmentError::Conflict(
+                "run state changed while cancellation was being finalized".into(),
+            ));
+        }
         let updated = self
             .development_repo
             .get_single_run_workspace(run_id, user_id)
             .await?
             .ok_or_else(|| DevelopmentError::NotFound(format!("single workspace for run {run_id}")))?;
         Ok(single_workspace_dto(updated))
+    }
+
+    pub async fn cancel_run(&self, user_id: &str, run_id: &str) -> Result<DevelopmentRunRow, DevelopmentError> {
+        let run = self.get_run(user_id, run_id).await?;
+        self.ensure_no_pending_recovery(&run).await?;
+        ensure_run_is_cancellable(&run)?;
+        if !self
+            .development_repo
+            .update_run_status_if_current(run_id, user_id, &run.status, run.updated_at, "integrating", None)
+            .await?
+        {
+            return Err(DevelopmentError::Conflict(
+                "run state changed before cancellation could begin".into(),
+            ));
+        }
+        let cancelling_run = self.get_run(user_id, run_id).await?;
+        if let Some(runner) = &self.runner {
+            runner.cleanup_run(user_id, run_id).await?;
+        }
+        if !self
+            .development_repo
+            .update_run_status_if_current(
+                run_id,
+                user_id,
+                &cancelling_run.status,
+                cancelling_run.updated_at,
+                "cancelled",
+                Some(now_ms()),
+            )
+            .await?
+        {
+            return Err(DevelopmentError::Conflict(
+                "run state changed while cancellation was being finalized".into(),
+            ));
+        }
+        self.get_run(user_id, run_id).await
+    }
+
+    async fn ensure_no_pending_recovery(&self, run: &DevelopmentRunRow) -> Result<(), DevelopmentError> {
+        let Some(operations) = &self.operations else {
+            return Ok(());
+        };
+        let pending = operations
+            .snapshot(&run.user_id, &run.project_id, Some(&run.id))
+            .await?
+            .recovery
+            .into_iter()
+            .any(|record| {
+                record.status_after.is_none()
+                    && serde_json::from_str::<serde_json::Value>(&record.details_json)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("state")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .as_deref()
+                        == Some("pending")
+            });
+        if pending {
+            return Err(DevelopmentError::Conflict(
+                "run recovery is pending; complete recovery before changing run state".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn validate_lease(
@@ -1265,6 +1386,19 @@ impl DevelopmentService {
         self.development_repo.create_artifact(&row).await?;
         Ok(row)
     }
+}
+
+fn ensure_run_is_cancellable(run: &DevelopmentRunRow) -> Result<(), DevelopmentError> {
+    if matches!(
+        run.status.as_str(),
+        "integrating" | "succeeded" | "failed" | "cancelled"
+    ) {
+        return Err(DevelopmentError::Conflict(format!(
+            "run {} cannot be cancelled from status {}",
+            run.id, run.status
+        )));
+    }
+    Ok(())
 }
 
 fn required_text(value: String, field: &str) -> Result<String, DevelopmentError> {

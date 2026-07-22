@@ -54,6 +54,15 @@ pub trait IDevelopmentOperationsRepository: Send + Sync {
     ) -> Result<bool, DbError>;
 
     async fn append_recovery(&self, row: &DevelopmentRecoveryRecordRow) -> Result<(), DbError>;
+    async fn claim_recovery_and_update_run(
+        &self,
+        row: &DevelopmentRecoveryRecordRow,
+        expected_status: &str,
+        expected_updated_at: TimestampMs,
+        target_status: &str,
+        finished_at: Option<TimestampMs>,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError>;
     async fn list_recovery(
         &self,
         user_id: &str,
@@ -64,6 +73,54 @@ pub trait IDevelopmentOperationsRepository: Send + Sync {
     async fn list_recovery_candidates(&self, updated_before: TimestampMs) -> Result<Vec<DevelopmentRunRow>, DbError>;
 
     async fn upsert_resource_lease(&self, row: &ExecutionResourceLeaseRow) -> Result<(), DbError>;
+    async fn claim_resource_cleanup(
+        &self,
+        lease_id: &str,
+        expected_owner_instance_id: &str,
+        expected_status: &str,
+        expected_updated_at: TimestampMs,
+        cleanup_owner_instance_id: &str,
+        claimed_at: TimestampMs,
+    ) -> Result<Option<ExecutionResourceLeaseRow>, DbError>;
+    async fn finish_resource_cleanup(
+        &self,
+        lease_id: &str,
+        cleanup_owner_instance_id: &str,
+        expected_updated_at: TimestampMs,
+        succeeded: bool,
+        cleanup_result: &str,
+        completed_at: TimestampMs,
+    ) -> Result<bool, DbError>;
+    async fn claim_resource_recovery_decision(
+        &self,
+        lease_id: &str,
+        decision: &str,
+        takeover_owner_instance_id: Option<&str>,
+        updated_at: TimestampMs,
+    ) -> Result<Option<ExecutionResourceLeaseRow>, DbError>;
+    async fn heartbeat_resource_lease(
+        &self,
+        lease_id: &str,
+        owner_instance_id: &str,
+        expected_updated_at: TimestampMs,
+        heartbeat_at: TimestampMs,
+        expires_at: TimestampMs,
+    ) -> Result<Option<ExecutionResourceLeaseRow>, DbError>;
+    async fn complete_resource_lease(
+        &self,
+        lease_id: &str,
+        owner_instance_id: &str,
+        expected_updated_at: TimestampMs,
+        cleanup_result: &str,
+        completed_at: TimestampMs,
+    ) -> Result<bool, DbError>;
+    async fn orphan_resource_lease(
+        &self,
+        lease_id: &str,
+        owner_instance_id: &str,
+        expected_expires_at: TimestampMs,
+        orphaned_at: TimestampMs,
+    ) -> Result<Option<ExecutionResourceLeaseRow>, DbError>;
     async fn get_resource_lease(&self, lease_id: &str) -> Result<Option<ExecutionResourceLeaseRow>, DbError>;
     async fn list_resource_leases(
         &self,
@@ -100,6 +157,18 @@ pub trait IDevelopmentOperationsRepository: Send + Sync {
         occurred_at: TimestampMs,
     ) -> Result<Option<DevelopmentModelPriceRow>, DbError>;
     async fn append_priced_usage(&self, row: &DevelopmentPricedUsageEventRow) -> Result<(), DbError>;
+    async fn append_priced_usage_once(&self, row: &DevelopmentPricedUsageEventRow) -> Result<bool, DbError> {
+        self.append_priced_usage(row).await?;
+        Ok(true)
+    }
+    async fn latest_priced_usage_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<DevelopmentPricedUsageEventRow>, DbError> {
+        let _ = (user_id, conversation_id);
+        Ok(None)
+    }
     async fn summarize_usage_dimension(
         &self,
         user_id: &str,

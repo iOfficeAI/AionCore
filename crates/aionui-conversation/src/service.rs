@@ -318,6 +318,8 @@ pub struct ConversationService {
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
+    turn_observer: Arc<RwLock<Option<Arc<dyn ConversationTurnObserver>>>>,
+    turn_guard: Arc<RwLock<Option<Arc<dyn ConversationTurnGuard>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
@@ -358,6 +360,46 @@ pub enum ConversationAgentTurnStatus {
 }
 
 #[derive(Debug, Clone)]
+pub struct ConversationTurnObservation {
+    pub user_id: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub status: ConversationAgentTurnStatus,
+    pub agent_id: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub team_id: Option<String>,
+    pub slot_id: Option<String>,
+    pub usage: Option<serde_json::Value>,
+    pub duration_ms: i64,
+    pub retry_count: i64,
+    pub occurred_at: i64,
+}
+
+#[async_trait::async_trait]
+pub trait ConversationTurnObserver: Send + Sync {
+    async fn observe(&self, observation: ConversationTurnObservation);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationTurnAdmissionRequest {
+    pub user_id: String,
+    pub conversation_id: String,
+    pub team_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationTurnAdmission {
+    Allowed,
+    Denied { reason: String },
+}
+
+#[async_trait::async_trait]
+pub trait ConversationTurnGuard: Send + Sync {
+    async fn authorize(&self, request: ConversationTurnAdmissionRequest) -> Result<ConversationTurnAdmission, String>;
+}
+
+#[derive(Debug, Clone)]
 pub struct ConversationAgentTurnOutcome {
     pub conversation_id: String,
     pub turn_id: String,
@@ -391,6 +433,8 @@ impl ConversationService {
             assistant_preference_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
+            turn_observer: Arc::new(RwLock::new(None)),
+            turn_guard: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
@@ -459,6 +503,26 @@ impl ConversationService {
         if let Ok(mut guard) = self.agent_availability_feedback.write() {
             *guard = Some(feedback);
         }
+    }
+
+    pub fn with_turn_observer(&self, observer: Arc<dyn ConversationTurnObserver>) {
+        if let Ok(mut guard) = self.turn_observer.write() {
+            *guard = Some(observer);
+        }
+    }
+
+    pub fn with_turn_guard(&self, turn_guard: Arc<dyn ConversationTurnGuard>) {
+        if let Ok(mut guard) = self.turn_guard.write() {
+            *guard = Some(turn_guard);
+        }
+    }
+
+    /// Whether both post-turn observation and pre-turn admission have been
+    /// installed. Schedulers use this as a startup invariant before they begin
+    /// dispatching work from persisted jobs.
+    pub fn has_turn_policy(&self) -> bool {
+        self.turn_observer.read().is_ok_and(|guard| guard.is_some())
+            && self.turn_guard.read().is_ok_and(|guard| guard.is_some())
     }
 
     /// Register a hook to be notified when a conversation is deleted.
@@ -547,6 +611,34 @@ impl ConversationService {
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    pub(crate) fn turn_observer(&self) -> Option<Arc<dyn ConversationTurnObserver>> {
+        self.turn_observer.read().ok().and_then(|guard| guard.as_ref().cloned())
+    }
+
+    async fn authorize_turn(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        team_id: Option<&str>,
+    ) -> Result<(), ConversationError> {
+        let turn_guard = self.turn_guard.read().ok().and_then(|guard| guard.as_ref().cloned());
+        let Some(turn_guard) = turn_guard else {
+            return Ok(());
+        };
+        match turn_guard
+            .authorize(ConversationTurnAdmissionRequest {
+                user_id: user_id.to_owned(),
+                conversation_id: conversation_id.to_owned(),
+                team_id: team_id.map(str::to_owned),
+            })
+            .await
+        {
+            Ok(ConversationTurnAdmission::Allowed) => Ok(()),
+            Ok(ConversationTurnAdmission::Denied { reason }) => Err(ConversationError::Forbidden { reason }),
+            Err(reason) => Err(ConversationError::Internal { reason }),
+        }
     }
 
     pub(crate) fn runtime_persistence(&self) -> RuntimePersistenceCoordinator {
@@ -2617,6 +2709,7 @@ impl ConversationService {
         }
 
         reject_deprecated_runtime_row(&row)?;
+        self.authorize_turn(user_id, conversation_id, None).await?;
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
@@ -2744,6 +2837,9 @@ impl ConversationService {
             })?;
 
         reject_deprecated_runtime_row(&row)?;
+        let team_id = team_id_from_extra(&row.extra);
+        self.authorize_turn(&request.user_id, &request.conversation_id, team_id.as_deref())
+            .await?;
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
@@ -3120,6 +3216,9 @@ impl ConversationService {
             })?;
 
         reject_deprecated_runtime_row(&row)?;
+        let team_id = team_id_from_extra(&row.extra);
+        self.authorize_turn(user_id, conversation_id, team_id.as_deref())
+            .await?;
 
         if let Some(agent) = task_manager.get_task(conversation_id) {
             debug!(conversation_id, phase, "Conversation runtime already active");

@@ -99,6 +99,31 @@ impl IDevelopmentRepository for SqliteDevelopmentRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn update_run_status_if_current(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        expected_status: &str,
+        expected_updated_at: TimestampMs,
+        status: &str,
+        finished_at: Option<TimestampMs>,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE development_runs SET status = ?, finished_at = ?, updated_at = MAX(?, updated_at + 1) \
+             WHERE id = ? AND user_id = ? AND status = ? AND updated_at = ?",
+        )
+        .bind(status)
+        .bind(finished_at)
+        .bind(now_ms())
+        .bind(run_id)
+        .bind(user_id)
+        .bind(expected_status)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn assign_role(&self, row: &DevelopmentRunRoleRow) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO development_run_roles (run_id, slot_id, role, assigned_at) VALUES (?, ?, ?, ?) \

@@ -318,7 +318,7 @@ async fn execute_step(
             std::time::Duration::from_secs(timeout_seconds.max(1) as u64),
         ))
         .map_err(|error| DevelopmentError::BadRequest(format!("{} is unavailable: {error}", spec.program)))?;
-    let process_resource = match context {
+    let mut process_resource = match context {
         Some(context) => {
             let pid = child
                 .id()
@@ -381,11 +381,11 @@ async fn execute_step(
         }
         child.lease().heartbeat();
         if last_persisted_heartbeat.elapsed() >= std::time::Duration::from_secs(5)
-            && let (Some(context), Some(resource)) = (context, process_resource.as_ref())
+            && let (Some(context), Some(resource)) = (context, process_resource.as_mut())
         {
             if let Err(error) = context
                 .resources
-                .heartbeat(&resource.id, timeout_seconds.max(1).saturating_mul(1000))
+                .heartbeat(resource, timeout_seconds.max(1).saturating_mul(1000))
                 .await
             {
                 let _ = child.terminate_tree().await;
@@ -396,7 +396,7 @@ async fn execute_step(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     };
     if let (Some(context), Some(resource)) = (context, process_resource.as_ref()) {
-        context.resources.complete(&resource.id, &status).await?;
+        context.resources.complete(resource, &status).await?;
     }
     Ok(StepOutput {
         status,

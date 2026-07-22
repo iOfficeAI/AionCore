@@ -20,6 +20,15 @@ pub trait IDevelopmentRepository: Send + Sync {
         status: &str,
         finished_at: Option<TimestampMs>,
     ) -> Result<bool, DbError>;
+    async fn update_run_status_if_current(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        expected_status: &str,
+        expected_updated_at: TimestampMs,
+        status: &str,
+        finished_at: Option<TimestampMs>,
+    ) -> Result<bool, DbError>;
 
     async fn assign_role(&self, row: &DevelopmentRunRoleRow) -> Result<(), DbError>;
     async fn list_roles(&self, run_id: &str) -> Result<Vec<DevelopmentRunRoleRow>, DbError>;

@@ -10,7 +10,7 @@ use aionui_db::{
 };
 use aionui_development::{
     DevelopmentOperationsService, DevelopmentPolicyInput, PolicyDecision, PolicyOperation, RecoveryDecisionInput,
-    redact_sensitive,
+    ResourceLeaseCoordinator, ResourceLeaseInput, SystemDevelopmentResourceController, redact_sensitive,
 };
 
 struct Fixture {
@@ -74,6 +74,10 @@ async fn setup(run_started_at: i64) -> Fixture {
         development_repo.clone(),
         project_repo,
         Arc::new(SqliteAgentWorkspaceLeaseRepository::new(db.pool().clone())),
+    )
+    .with_resources(
+        ResourceLeaseCoordinator::new(operations_repo.clone(), "instance-ops"),
+        Arc::new(SystemDevelopmentResourceController),
     );
     Fixture {
         service,
@@ -547,4 +551,179 @@ async fn recovery_scan_and_decisions_are_idempotent_and_audited() {
         .unwrap();
     assert_eq!(snapshot.recovery.len(), 1);
     assert!(snapshot.audit.iter().any(|event| event.action == "recovery.resume"));
+}
+
+#[tokio::test]
+async fn recovery_rejects_healthy_and_succeeded_runs_but_allows_paused_runs() {
+    let fixture = setup(now_ms()).await;
+    let retry = RecoveryDecisionInput { action: "retry".into() };
+
+    assert!(
+        fixture
+            .service
+            .decide_recovery("user-ops", "run-ops", retry.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .development_repo
+            .get_run("run-ops", "user-ops")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
+
+    fixture
+        .development_repo
+        .update_run_status("run-ops", "user-ops", "succeeded", Some(now_ms()))
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .service
+            .decide_recovery("user-ops", "run-ops", retry.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .development_repo
+            .get_run("run-ops", "user-ops")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "succeeded"
+    );
+
+    fixture
+        .development_repo
+        .update_run_status("run-ops", "user-ops", "paused", None)
+        .await
+        .unwrap();
+    let recovered = fixture
+        .service
+        .decide_recovery("user-ops", "run-ops", retry)
+        .await
+        .unwrap();
+    assert_eq!(recovered.status_before.as_deref(), Some("paused"));
+    assert_eq!(recovered.status_after.as_deref(), Some("running"));
+}
+
+#[tokio::test]
+async fn conflicting_run_recovery_decisions_are_atomic_and_preserve_the_winner() {
+    let fixture = setup(now_ms()).await;
+    fixture
+        .development_repo
+        .update_run_status("run-ops", "user-ops", "paused", None)
+        .await
+        .unwrap();
+
+    let (retry_result, rollback_result) = tokio::join!(
+        fixture
+            .service
+            .decide_recovery("user-ops", "run-ops", RecoveryDecisionInput { action: "retry".into() },),
+        fixture.service.decide_recovery(
+            "user-ops",
+            "run-ops",
+            RecoveryDecisionInput {
+                action: "rollback".into(),
+            },
+        )
+    );
+    assert_ne!(retry_result.is_ok(), rollback_result.is_ok());
+
+    let run = fixture
+        .development_repo
+        .get_run("run-ops", "user-ops")
+        .await
+        .unwrap()
+        .unwrap();
+    let recovery = fixture
+        .service
+        .snapshot("user-ops", "project-ops", Some("run-ops"))
+        .await
+        .unwrap()
+        .recovery
+        .into_iter()
+        .find(|row| row.recovery_key == "run:run-ops:stale")
+        .unwrap();
+    match recovery.decision.as_str() {
+        "retry" => assert_eq!(run.status, "running"),
+        "rollback" => assert_eq!(run.status, "cancelled"),
+        decision => panic!("unexpected recovery decision: {decision}"),
+    }
+}
+
+#[tokio::test]
+async fn failed_takeover_keeps_the_run_paused_and_same_action_can_retry() {
+    let fixture = setup(now_ms()).await;
+    fixture
+        .development_repo
+        .update_run_status("run-ops", "user-ops", "paused", None)
+        .await
+        .unwrap();
+    let coordinator = ResourceLeaseCoordinator::new(fixture.operations_repo.clone(), "instance-ops");
+    let mut lease = coordinator
+        .create(ResourceLeaseInput {
+            user_id: "user-ops".into(),
+            project_id: "project-ops".into(),
+            run_id: "run-ops".into(),
+            task_id: None,
+            turn_id: None,
+            gate_id: None,
+            environment_id: "host:local".into(),
+            environment_kind: "host".into(),
+            resource_kind: "service".into(),
+            resource_identifier: "recovery-service".into(),
+            cleanup_order: 30,
+            ttl_ms: 60_000,
+        })
+        .await
+        .unwrap();
+
+    let decision = RecoveryDecisionInput {
+        action: "takeover".into(),
+    };
+    assert!(
+        fixture
+            .service
+            .decide_recovery("user-ops", "run-ops", decision.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .development_repo
+            .get_run("run-ops", "user-ops")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "paused"
+    );
+
+    lease.heartbeat_at = now_ms() - 120_000;
+    lease.expires_at = now_ms() - 60_000;
+    fixture.operations_repo.upsert_resource_lease(&lease).await.unwrap();
+    coordinator.reconcile_stale(now_ms()).await.unwrap();
+    let recovered = fixture
+        .service
+        .decide_recovery("user-ops", "run-ops", decision)
+        .await
+        .unwrap();
+    assert_eq!(recovered.status_after.as_deref(), Some("running"));
+    assert_eq!(
+        fixture
+            .development_repo
+            .get_run("run-ops", "user-ops")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
 }

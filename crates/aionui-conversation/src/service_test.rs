@@ -52,7 +52,10 @@ use tokio::sync::{Notify, broadcast};
 
 use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
-use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
+use crate::{
+    ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError, ConversationTurnAdmission,
+    ConversationTurnAdmissionRequest, ConversationTurnGuard, ConversationTurnObservation, ConversationTurnObserver,
+};
 
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
@@ -183,6 +186,29 @@ struct RecordedAvailabilityFailure {
 struct RecordingAvailabilityFeedback {
     successes: Mutex<Vec<String>>,
     failures: Mutex<Vec<RecordedAvailabilityFailure>>,
+}
+
+#[derive(Default)]
+struct RecordingTurnObserver {
+    observations: Mutex<Vec<ConversationTurnObservation>>,
+}
+
+#[async_trait::async_trait]
+impl ConversationTurnObserver for RecordingTurnObserver {
+    async fn observe(&self, observation: ConversationTurnObservation) {
+        self.observations.lock().unwrap().push(observation);
+    }
+}
+
+struct DenyingTurnGuard;
+
+#[async_trait::async_trait]
+impl ConversationTurnGuard for DenyingTurnGuard {
+    async fn authorize(&self, _request: ConversationTurnAdmissionRequest) -> Result<ConversationTurnAdmission, String> {
+        Ok(ConversationTurnAdmission::Denied {
+            reason: "development run is paused by its budget policy".into(),
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -986,6 +1012,16 @@ fn make_service() -> (
     Arc<dyn IWorkerTaskManager>,
 ) {
     make_service_with_resolver(Arc::new(FixedSkillResolver { names: vec![] }))
+}
+
+#[test]
+fn turn_policy_is_ready_only_after_observer_and_guard_are_both_installed() {
+    let (service, _, _, _) = make_service();
+    assert!(!service.has_turn_policy());
+    service.with_turn_observer(Arc::new(RecordingTurnObserver::default()));
+    assert!(!service.has_turn_policy());
+    service.with_turn_guard(Arc::new(DenyingTurnGuard));
+    assert!(service.has_turn_policy());
 }
 
 fn make_service_with_resolver(
@@ -3332,6 +3368,7 @@ struct ScriptedAgent {
     scripts: Mutex<VecDeque<Vec<AgentStreamEvent>>>,
     sent_contents: Mutex<Vec<String>>,
     send_error: Option<AgentSendError>,
+    usage: Option<serde_json::Value>,
 }
 
 impl ScriptedAgent {
@@ -3345,6 +3382,7 @@ impl ScriptedAgent {
             scripts: Mutex::new(VecDeque::from(scripts)),
             sent_contents: Mutex::new(vec![]),
             send_error: None,
+            usage: None,
         }
     }
 
@@ -3360,6 +3398,11 @@ impl ScriptedAgent {
 
     fn with_send_error(mut self, error: AgentSendError) -> Self {
         self.send_error = Some(error);
+        self
+    }
+
+    fn with_usage(mut self, usage: serde_json::Value) -> Self {
+        self.usage = Some(usage);
         self
     }
 
@@ -3420,7 +3463,12 @@ impl IAgentTask for ScriptedAgent {
     }
 }
 
-impl IMockAgent for ScriptedAgent {}
+#[async_trait::async_trait]
+impl IMockAgent for ScriptedAgent {
+    async fn get_usage(&self) -> Result<Option<serde_json::Value>, AgentError> {
+        Ok(self.usage.clone())
+    }
+}
 
 // ── send_message tests ──────────────────────────────────────────
 
@@ -3480,6 +3528,46 @@ async fn send_message_returns_accepted() {
     assert_eq!(response.msg_id.len(), 8, "msg_id should be an 8-char short hex ID");
     assert!(response.turn_id.starts_with("turn_"), "turn_id must use turn_ prefix");
     assert_ne!(response.msg_id, response.turn_id, "turn_id must not reuse msg_id");
+}
+
+#[tokio::test]
+async fn turn_guard_blocks_messages_agent_turns_and_runtime_recovery_before_side_effects() {
+    let (svc, _broadcaster, repo, task_mgr) = make_service();
+    svc.with_turn_guard(Arc::new(DenyingTurnGuard));
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let send_error = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        send_error,
+        ConversationError::Forbidden { ref reason } if reason.contains("budget policy")
+    ));
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert_eq!(task_mgr.active_count(), 0);
+
+    let turn_error = svc
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            content: "scheduled work".into(),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+            required_runtime_mode: None,
+            persist_user_message: true,
+            user_message_hidden: false,
+            on_started: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(turn_error, ConversationError::Forbidden { .. }));
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+
+    let runtime_error = svc.ensure_runtime("user_1", &conv.id, &task_mgr).await.unwrap_err();
+    assert!(matches!(runtime_error, ConversationError::Forbidden { .. }));
+    assert_eq!(task_mgr.active_count(), 0);
 }
 
 #[tokio::test]
@@ -5261,6 +5349,55 @@ async fn send_message_records_agent_availability_feedback_on_send_success() {
     let successes = feedback.successes.lock().unwrap().clone();
     assert_eq!(successes, vec!["agent-feedback-success".to_owned()]);
     assert!(feedback.failures.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn send_message_reports_completed_agent_turn_usage() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let observer = Arc::new(RecordingTurnObserver::default());
+    svc.with_turn_observer(observer.clone());
+
+    let mut create_req = make_create_req();
+    create_req.extra = json!({
+        "backend": "codex",
+        "agent_id": "agent-budget-1",
+        "agent_source": "builtin",
+        "workspace": ensure_test_workspace_path()
+    });
+    let conv = svc.create("user_1", create_req).await.unwrap();
+    let usage = json!({
+        "size": 258400,
+        "used": 1200,
+        "cost": { "amount": 0.25, "currency": "USD" }
+    });
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(
+            &conv.id,
+            vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+        )
+        .with_usage(usage.clone()),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let response = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let observations = observer.observations.lock().unwrap();
+    assert_eq!(observations.len(), 1);
+    let observation = &observations[0];
+    assert_eq!(observation.user_id, "user_1");
+    assert_eq!(observation.conversation_id, conv.id);
+    assert_eq!(observation.turn_id, response.turn_id);
+    assert_eq!(observation.status, ConversationAgentTurnStatus::Completed);
+    assert_eq!(observation.agent_id.as_deref(), Some("agent-budget-1"));
+    assert_eq!(observation.usage.as_ref(), Some(&usage));
+    assert_eq!(observation.retry_count, 0);
+    assert!(observation.duration_ms >= 0);
 }
 
 #[tokio::test]

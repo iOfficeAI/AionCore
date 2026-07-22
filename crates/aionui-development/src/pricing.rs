@@ -6,7 +6,7 @@ use aionui_db::models::{DevelopmentModelPriceRow, DevelopmentPricedUsageEventRow
 use serde::{Deserialize, Serialize};
 
 use crate::DevelopmentError;
-use crate::operations::DevelopmentOperationsService;
+use crate::operations::{BudgetEvaluation, DevelopmentOperationsService};
 
 pub use aionui_db::UsageDimension;
 
@@ -50,6 +50,13 @@ pub struct PricingService {
     budget: Option<DevelopmentOperationsService>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecordedUsageOutcome {
+    pub row: DevelopmentPricedUsageEventRow,
+    pub budget: Option<BudgetEvaluation>,
+    pub inserted: bool,
+}
+
 impl PricingService {
     pub fn new(operations: Arc<dyn IDevelopmentOperationsRepository>) -> Self {
         Self {
@@ -86,6 +93,27 @@ impl PricingService {
         &self,
         measurement: UsageMeasurement,
     ) -> Result<DevelopmentPricedUsageEventRow, DevelopmentError> {
+        Ok(self.record_inner(measurement, None, None).await?.row)
+    }
+
+    pub async fn record_observed(
+        &self,
+        measurement: UsageMeasurement,
+        event_id: &str,
+        metadata: serde_json::Value,
+    ) -> Result<RecordedUsageOutcome, DevelopmentError> {
+        if event_id.trim().is_empty() {
+            return Err(DevelopmentError::BadRequest("usage event id is required".into()));
+        }
+        self.record_inner(measurement, Some(event_id), Some(metadata)).await
+    }
+
+    async fn record_inner(
+        &self,
+        measurement: UsageMeasurement,
+        event_id: Option<&str>,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<RecordedUsageOutcome, DevelopmentError> {
         validate_measurement(&measurement)?;
         let price = self
             .operations
@@ -108,7 +136,9 @@ impl PricingService {
                 (0, "unknown", "unknown", None, None, None, "estimated")
             };
         let row = DevelopmentPricedUsageEventRow {
-            id: uuid::Uuid::now_v7().to_string(),
+            id: event_id
+                .map(|event_id| format!("observed-agent-turn:{event_id}"))
+                .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
             user_id: measurement.user_id,
             project_id: measurement.project_id,
             run_id: measurement.run_id,
@@ -138,16 +168,26 @@ impl PricingService {
             price_effective_at: effective_at,
             duration_ms: measurement.duration_ms,
             retry_count: measurement.retry_count,
-            metadata_json: "{}".into(),
+            metadata_json: serde_json::to_string(&metadata.unwrap_or_else(|| serde_json::json!({})))
+                .map_err(|error| DevelopmentError::Internal(error.to_string()))?,
             created_at: measurement.occurred_at,
         };
-        self.operations.append_priced_usage(&row).await?;
-        if let (Some(budget), Some(run_id)) = (&self.budget, row.run_id.as_deref()) {
-            budget
-                .evaluate_budget(&row.user_id, run_id, "usage_recorded", row.retry_count)
-                .await?;
-        }
-        Ok(row)
+        let inserted = self.operations.append_priced_usage_once(&row).await?;
+        // Budget enforcement is deliberately retried even when the usage row
+        // already exists. A previous attempt may have committed the append and
+        // then failed while persisting the alert/status transition. Both the
+        // evaluator and runtime actions are idempotent, so a duplicate turn is
+        // the recovery signal rather than a reason to skip enforcement forever.
+        let budget = if let (Some(budget), Some(run_id)) = (&self.budget, row.run_id.as_deref()) {
+            Some(
+                budget
+                    .evaluate_budget(&row.user_id, run_id, "usage_recorded", row.retry_count)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        Ok(RecordedUsageOutcome { row, budget, inserted })
     }
 }
 

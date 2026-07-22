@@ -71,6 +71,34 @@ async fn run_is_scoped_to_owner_and_updates_status() {
 }
 
 #[tokio::test]
+async fn run_status_compare_and_set_rejects_stale_versions() {
+    let (repo, _db) = setup().await;
+    repo.create_run(&run()).await.unwrap();
+    let snapshot = repo.get_run("run-1", "user-1").await.unwrap().unwrap();
+    assert!(
+        repo.update_run_status_if_current("run-1", "user-1", &snapshot.status, snapshot.updated_at, "paused", None,)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repo
+            .update_run_status_if_current(
+                "run-1",
+                "user-1",
+                &snapshot.status,
+                snapshot.updated_at,
+                "succeeded",
+                Some(10),
+            )
+            .await
+            .unwrap()
+    );
+    let persisted = repo.get_run("run-1", "user-1").await.unwrap().unwrap();
+    assert_eq!(persisted.status, "paused");
+    assert!(persisted.updated_at > snapshot.updated_at);
+}
+
+#[tokio::test]
 async fn artifacts_gates_and_findings_roundtrip_by_task() {
     let (repo, db) = setup().await;
     repo.create_run(&run()).await.unwrap();

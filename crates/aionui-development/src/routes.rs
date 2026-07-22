@@ -714,12 +714,37 @@ async fn control_run(
             "retry" | "takeover" => ("running", None),
             _ => return Err(ApiError::BadRequest("unsupported run action".into())),
         };
-        state
+        let pending_recovery = state
+            .operations_repo
+            .list_recovery(&user.id, &run.project_id, Some(&run_id), 200)
+            .await
+            .map_err(DevelopmentError::from)
+            .map_err(ApiError::from)?
+            .into_iter()
+            .any(|record| {
+                record.status_after.is_none()
+                    && serde_json::from_str::<Value>(&record.details_json)
+                        .ok()
+                        .and_then(|value| value.get("state").and_then(Value::as_str).map(str::to_owned))
+                        .as_deref()
+                        == Some("pending")
+            });
+        if pending_recovery {
+            return Err(ApiError::Conflict(
+                "run recovery is pending; use the recovery decision endpoint".into(),
+            ));
+        }
+        let updated = state
             .development_repo
-            .update_run_status(&run_id, &user.id, status, finished_at)
+            .update_run_status_if_current(&run_id, &user.id, &run.status, run.updated_at, status, finished_at)
             .await
             .map_err(DevelopmentError::from)
             .map_err(ApiError::from)?;
+        if !updated {
+            return Err(ApiError::Conflict(
+                "run state changed while applying control action".into(),
+            ));
+        }
     }
     let updated_run = state.service.get_run(&user.id, &run_id).await.map_err(ApiError::from)?;
     let updated_tasks = state

@@ -338,6 +338,63 @@ impl IDevelopmentOperationsRepository for SqliteDevelopmentOperationsRepository 
         Ok(())
     }
 
+    async fn claim_recovery_and_update_run(
+        &self,
+        row: &DevelopmentRecoveryRecordRow,
+        expected_status: &str,
+        expected_updated_at: TimestampMs,
+        target_status: &str,
+        finished_at: Option<TimestampMs>,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let mut transaction = self.pool.begin().await?;
+        let claim = sqlx::query(
+            "INSERT INTO development_recovery_records (id, user_id, project_id, run_id, recovery_key, finding, \
+             decision, status_before, status_after, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(user_id, recovery_key) DO UPDATE SET finding=excluded.finding, \
+             decision=excluded.decision, status_before=excluded.status_before, status_after=excluded.status_after, \
+             details_json=excluded.details_json \
+             WHERE development_recovery_records.decision IN ('manual_required', 'interrupted') \
+                OR development_recovery_records.decision = excluded.decision",
+        )
+        .bind(&row.id)
+        .bind(&row.user_id)
+        .bind(&row.project_id)
+        .bind(&row.run_id)
+        .bind(&row.recovery_key)
+        .bind(&row.finding)
+        .bind(&row.decision)
+        .bind(&row.status_before)
+        .bind(&row.status_after)
+        .bind(&row.details_json)
+        .bind(row.created_at)
+        .execute(&mut *transaction)
+        .await?;
+        if claim.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let run_update = sqlx::query(
+            "UPDATE development_runs SET status = ?, finished_at = ?, updated_at = MAX(?, updated_at + 1) \
+             WHERE id = ? AND user_id = ? AND status = ? AND updated_at = ?",
+        )
+        .bind(target_status)
+        .bind(finished_at)
+        .bind(updated_at)
+        .bind(row.run_id.as_deref())
+        .bind(&row.user_id)
+        .bind(expected_status)
+        .bind(expected_updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        if run_update.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        transaction.commit().await?;
+        Ok(true)
+    }
+
     async fn list_recovery(
         &self,
         user_id: &str,
@@ -375,7 +432,7 @@ impl IDevelopmentOperationsRepository for SqliteDevelopmentOperationsRepository 
 
     async fn list_recovery_candidates(&self, updated_before: TimestampMs) -> Result<Vec<DevelopmentRunRow>, DbError> {
         Ok(sqlx::query_as(
-            "SELECT * FROM development_runs WHERE status IN ('running', 'verifying', 'reviewing') \
+            "SELECT * FROM development_runs WHERE status IN ('running', 'verifying', 'reviewing', 'integrating') \
              AND updated_at <= ? ORDER BY updated_at ASC, id ASC",
         )
         .bind(updated_before)
@@ -391,7 +448,9 @@ impl IDevelopmentOperationsRepository for SqliteDevelopmentOperationsRepository 
              recovery_decision, created_at, updated_at, terminal_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET status=excluded.status, accepts_work=excluded.accepts_work, \
-             owner_instance_id=excluded.owner_instance_id, heartbeat_at=excluded.heartbeat_at, \
+             owner_instance_id=CASE WHEN execution_resource_leases.recovery_decision IS NULL \
+                 THEN excluded.owner_instance_id ELSE execution_resource_leases.owner_instance_id END, \
+             heartbeat_at=excluded.heartbeat_at, \
              expires_at=excluded.expires_at, cleanup_status=excluded.cleanup_status, \
              cleanup_result=excluded.cleanup_result, \
              recovery_decision=COALESCE(execution_resource_leases.recovery_decision, excluded.recovery_decision), \
@@ -423,6 +482,188 @@ impl IDevelopmentOperationsRepository for SqliteDevelopmentOperationsRepository 
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn claim_resource_cleanup(
+        &self,
+        lease_id: &str,
+        expected_owner_instance_id: &str,
+        expected_status: &str,
+        expected_updated_at: TimestampMs,
+        cleanup_owner_instance_id: &str,
+        claimed_at: TimestampMs,
+    ) -> Result<Option<ExecutionResourceLeaseRow>, DbError> {
+        Ok(sqlx::query_as(
+            "UPDATE execution_resource_leases \
+             SET owner_instance_id = ?, status = 'stopping', accepts_work = 0, \
+                 heartbeat_at = ?, expires_at = ? + MAX(expires_at - heartbeat_at, 1), \
+                 cleanup_status = 'stopping', cleanup_result = NULL, terminal_at = NULL, \
+                 updated_at = MAX(?, updated_at + 1) \
+             WHERE id = ? AND owner_instance_id = ? AND status = ? AND updated_at = ? \
+               AND status IN ('active', 'orphaned', 'cleanup_failed') \
+               AND (terminal_at IS NULL OR status = 'cleanup_failed') \
+             RETURNING *",
+        )
+        .bind(cleanup_owner_instance_id)
+        .bind(claimed_at)
+        .bind(claimed_at)
+        .bind(claimed_at)
+        .bind(lease_id)
+        .bind(expected_owner_instance_id)
+        .bind(expected_status)
+        .bind(expected_updated_at)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn finish_resource_cleanup(
+        &self,
+        lease_id: &str,
+        cleanup_owner_instance_id: &str,
+        expected_updated_at: TimestampMs,
+        succeeded: bool,
+        cleanup_result: &str,
+        completed_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let (status, cleanup_status) = if succeeded {
+            ("released", "released")
+        } else {
+            ("cleanup_failed", "failed")
+        };
+        let result = sqlx::query(
+            "UPDATE execution_resource_leases \
+             SET status = ?, accepts_work = 0, cleanup_status = ?, cleanup_result = ?, \
+                 updated_at = MAX(?, updated_at + 1), terminal_at = ? \
+             WHERE id = ? AND owner_instance_id = ? AND status = 'stopping' \
+               AND updated_at = ? AND terminal_at IS NULL",
+        )
+        .bind(status)
+        .bind(cleanup_status)
+        .bind(cleanup_result)
+        .bind(completed_at)
+        .bind(completed_at)
+        .bind(lease_id)
+        .bind(cleanup_owner_instance_id)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn claim_resource_recovery_decision(
+        &self,
+        lease_id: &str,
+        decision: &str,
+        takeover_owner_instance_id: Option<&str>,
+        updated_at: TimestampMs,
+    ) -> Result<Option<ExecutionResourceLeaseRow>, DbError> {
+        let result = if decision == "takeover" {
+            sqlx::query_as(
+                "UPDATE execution_resource_leases \
+                 SET recovery_decision = ?, owner_instance_id = ?, status = 'active', accepts_work = 1, \
+                     heartbeat_at = ?, expires_at = ? + MAX(expires_at - heartbeat_at, 1), \
+                     cleanup_status = NULL, cleanup_result = NULL, terminal_at = NULL, \
+                     updated_at = MAX(?, updated_at + 1) \
+                 WHERE id = ? AND status = 'orphaned' AND terminal_at IS NULL \
+                    AND (recovery_decision IS NULL \
+                    OR (recovery_decision = 'takeover' AND status = 'orphaned')) \
+                 RETURNING *",
+            )
+            .bind(decision)
+            .bind(takeover_owner_instance_id)
+            .bind(updated_at)
+            .bind(updated_at)
+            .bind(updated_at)
+            .bind(lease_id)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "UPDATE execution_resource_leases SET recovery_decision = ?, \
+                 updated_at = MAX(?, updated_at + 1) \
+                 WHERE id = ? AND recovery_decision IS NULL \
+                 RETURNING *",
+            )
+            .bind(decision)
+            .bind(updated_at)
+            .bind(lease_id)
+            .fetch_optional(&self.pool)
+            .await?
+        };
+        Ok(result)
+    }
+
+    async fn heartbeat_resource_lease(
+        &self,
+        lease_id: &str,
+        owner_instance_id: &str,
+        expected_updated_at: TimestampMs,
+        heartbeat_at: TimestampMs,
+        expires_at: TimestampMs,
+    ) -> Result<Option<ExecutionResourceLeaseRow>, DbError> {
+        Ok(sqlx::query_as(
+            "UPDATE execution_resource_leases SET heartbeat_at = ?, expires_at = ?, \
+             updated_at = MAX(?, updated_at + 1) \
+             WHERE id = ? AND owner_instance_id = ? AND updated_at = ? \
+               AND status = 'active' AND accepts_work = 1 AND terminal_at IS NULL \
+             RETURNING *",
+        )
+        .bind(heartbeat_at)
+        .bind(expires_at)
+        .bind(heartbeat_at)
+        .bind(lease_id)
+        .bind(owner_instance_id)
+        .bind(expected_updated_at)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn complete_resource_lease(
+        &self,
+        lease_id: &str,
+        owner_instance_id: &str,
+        expected_updated_at: TimestampMs,
+        cleanup_result: &str,
+        completed_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE execution_resource_leases SET accepts_work = 0, status = 'released', \
+             cleanup_status = 'released', cleanup_result = ?, \
+             updated_at = MAX(?, updated_at + 1), terminal_at = ? \
+             WHERE id = ? AND owner_instance_id = ? AND status = 'active' AND accepts_work = 1 \
+               AND updated_at = ? AND terminal_at IS NULL",
+        )
+        .bind(cleanup_result)
+        .bind(completed_at)
+        .bind(completed_at)
+        .bind(lease_id)
+        .bind(owner_instance_id)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn orphan_resource_lease(
+        &self,
+        lease_id: &str,
+        owner_instance_id: &str,
+        expected_expires_at: TimestampMs,
+        orphaned_at: TimestampMs,
+    ) -> Result<Option<ExecutionResourceLeaseRow>, DbError> {
+        Ok(sqlx::query_as(
+            "UPDATE execution_resource_leases SET status = 'orphaned', accepts_work = 0, \
+             recovery_decision = NULL, updated_at = MAX(?, updated_at + 1) \
+             WHERE id = ? AND owner_instance_id = ? AND expires_at = ? \
+               AND status IN ('active', 'stopping') AND terminal_at IS NULL \
+             RETURNING *",
+        )
+        .bind(orphaned_at)
+        .bind(lease_id)
+        .bind(owner_instance_id)
+        .bind(expected_expires_at)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     async fn get_resource_lease(&self, lease_id: &str) -> Result<Option<ExecutionResourceLeaseRow>, DbError> {
@@ -667,6 +908,61 @@ impl IDevelopmentOperationsRepository for SqliteDevelopmentOperationsRepository 
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn append_priced_usage_once(&self, row: &DevelopmentPricedUsageEventRow) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO development_usage_events (id, user_id, project_id, run_id, task_id, conversation_id, \
+             agent_id, team_id, usage_type, source, confidence, provider, model, input_tokens, output_tokens, \
+             cache_read_tokens, cache_write_tokens, cost_microunits, cost_status, cost_origin, price_source_id, \
+             price_version, price_effective_at, duration_ms, retry_count, metadata_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.user_id)
+        .bind(&row.project_id)
+        .bind(&row.run_id)
+        .bind(&row.task_id)
+        .bind(&row.conversation_id)
+        .bind(&row.agent_id)
+        .bind(&row.team_id)
+        .bind(&row.usage_type)
+        .bind(&row.source)
+        .bind(&row.confidence)
+        .bind(&row.provider)
+        .bind(&row.model)
+        .bind(row.input_tokens)
+        .bind(row.output_tokens)
+        .bind(row.cache_read_tokens)
+        .bind(row.cache_write_tokens)
+        .bind(row.cost_microunits)
+        .bind(&row.cost_status)
+        .bind(&row.cost_origin)
+        .bind(&row.price_source_id)
+        .bind(&row.price_version)
+        .bind(row.price_effective_at)
+        .bind(row.duration_ms)
+        .bind(row.retry_count)
+        .bind(&row.metadata_json)
+        .bind(row.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn latest_priced_usage_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<DevelopmentPricedUsageEventRow>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM development_usage_events WHERE user_id = ? AND conversation_id = ? \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     async fn summarize_usage_dimension(

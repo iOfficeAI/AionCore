@@ -5,6 +5,7 @@ mod deployment;
 mod error;
 mod executor;
 mod export;
+mod observed_usage;
 mod operations;
 mod policy;
 mod pricing;
@@ -43,12 +44,13 @@ pub use executor::{
     PlannedExecutionResource, build_execution_plan, execute_command,
 };
 pub use export::PortabilityService;
+pub use observed_usage::{DevelopmentBudgetAdmission, DevelopmentUsageIngestor, ObservedAgentTurnUsage};
 pub use operations::{
     BudgetEvaluation, DevelopmentOperationsService, DevelopmentOperationsSnapshot, DevelopmentPolicyInput,
     RecoveryDecisionInput, default_policy, redact_sensitive,
 };
 pub use policy::{DevelopmentPolicyRules, PolicyDecision, PolicyEngine, PolicyOperation};
-pub use pricing::{ModelPriceInput, PricingService, UsageDimension, UsageMeasurement};
+pub use pricing::{ModelPriceInput, PricingService, RecordedUsageOutcome, UsageDimension, UsageMeasurement};
 pub use providers::GitHubCliDeliveryProvider as GhCliDeliveryProvider;
 pub use providers::GitHubCliDeliveryProvider;
 pub use resources::{

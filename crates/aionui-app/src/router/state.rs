@@ -44,7 +44,7 @@ use aionui_db::{
 use aionui_development::{
     ApprovalOption, ApprovalRequestInput, ApprovalResolver, ApprovalRouterState, ApprovalService, ApprovalSource,
     DeliveryService, DeploymentService, DevelopmentOperationsService, DevelopmentRouterState, DevelopmentRunner,
-    DevelopmentService, DevelopmentWorkspacePort, GhCliDeliveryProvider, PortabilityService,
+    DevelopmentService, DevelopmentUsageIngestor, DevelopmentWorkspacePort, GhCliDeliveryProvider, PortabilityService,
     PrepareDevelopmentWorkspace, PreparedDevelopmentWorkspace, PricingService, ResolveApprovalContext,
     ResourceLeaseCoordinator, RetentionService, SecretService, SystemDevelopmentResourceController,
     UnconfiguredDeploymentProvider,
@@ -79,6 +79,7 @@ use aionui_team::{
 };
 
 use crate::config::derive_encryption_key;
+use crate::router::development_usage::DevelopmentTurnObserver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
 
@@ -110,7 +111,6 @@ struct ChannelApprovalAdapter {
 struct ChannelDevelopmentAdapter {
     owner_user_id: String,
     project_repo: Arc<dyn IProjectRepository>,
-    development_repo: Arc<dyn IDevelopmentRepository>,
     approval_repo: Arc<dyn IApprovalRepository>,
     service: Arc<DevelopmentService>,
     handoff_signer: DevelopmentHandoffSigner,
@@ -421,8 +421,8 @@ impl ChannelDevelopmentPort for ChannelDevelopmentAdapter {
                         .await
                         .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
                 } else {
-                    self.development_repo
-                        .update_run_status(&run.id, &self.owner_user_id, "cancelled", Some(now_ms()))
+                    self.service
+                        .cancel_run(&self.owner_user_id, &run.id)
                         .await
                         .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
                 }
@@ -1003,11 +1003,7 @@ pub async fn build_module_states(
     // resolve empty rules. Mirrors the interactive path in build_conversation_state.
     cron.conversation_service
         .with_assistant_dispatcher(assistant.service.clone() as Arc<dyn AssistantRuleDispatcher>);
-    cron.cron_service.init().await;
-    tracing::info!(
-        elapsed_ms = boot.elapsed().as_millis(),
-        "startup: cron state initialized"
-    );
+    tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: cron state built");
 
     // The agent catalog already hydrated at startup (see `lib.rs`).
     // Extension-contributed rows will land in `agent_metadata` in a
@@ -1096,6 +1092,40 @@ pub async fn build_module_states(
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"
+    );
+    let usage_ingestor = DevelopmentUsageIngestor::new(
+        Arc::new(SqliteProjectRepository::new(services.database.pool().clone())),
+        states.development.development_repo.clone(),
+        states.development.operations_repo.clone(),
+        states.development.operations_service.as_ref().clone(),
+        states.development.pricing_service.as_ref().clone(),
+    );
+    let usage_observer = Arc::new(DevelopmentTurnObserver::new(
+        usage_ingestor,
+        states.development.operations_service.as_ref().clone(),
+        states.conversation.service.clone(),
+        states.conversation.task_manager.clone(),
+    ));
+    states.conversation.service.with_turn_observer(usage_observer.clone());
+    states.conversation.service.with_turn_guard(usage_observer.clone());
+    states
+        .cron
+        .conversation_service
+        .with_turn_observer(usage_observer.clone());
+    states.cron.conversation_service.with_turn_guard(usage_observer);
+    // Start the scheduler only after its private ConversationService has the
+    // same usage observer and budget admission guard as interactive turns.
+    // Otherwise an overdue job can fire in the startup window unmetered.
+    if !states.cron.conversation_service.has_turn_policy() {
+        return Err(RouterBuildError::new(
+            "router.cron.turn_policy",
+            "cron scheduler cannot start before usage observation and budget admission are installed",
+        ));
+    }
+    states.cron.cron_service.init().await;
+    tracing::info!(
+        elapsed_ms = boot.elapsed().as_millis(),
+        "startup: cron state initialized"
     );
     states
         .conversation
@@ -1510,7 +1540,6 @@ pub async fn build_channel_state(
     let development_port: Arc<dyn ChannelDevelopmentPort> = Arc::new(ChannelDevelopmentAdapter {
         owner_user_id: owner_user_id.clone(),
         project_repo: project_repo.clone(),
-        development_repo: Arc::new(SqliteDevelopmentRepository::new(services.database.pool().clone())),
         approval_repo: Arc::new(SqliteApprovalRepository::new(services.database.pool().clone())),
         service: development_state.service,
         handoff_signer: DevelopmentHandoffSigner::new(encryption_key, "/#/projects"),
@@ -2309,7 +2338,6 @@ mod tests {
         let adapter = ChannelDevelopmentAdapter {
             owner_user_id: "system_default_user".into(),
             project_repo,
-            development_repo,
             approval_repo: Arc::new(SqliteApprovalRepository::new(db.pool().clone())),
             service,
             handoff_signer: DevelopmentHandoffSigner::new([9; 32], "/#/projects"),

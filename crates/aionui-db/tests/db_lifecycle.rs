@@ -566,7 +566,7 @@ async fn legacy_roadmap_migration_ranges_are_reconciled_without_losing_topic_bin
             .fetch_one(db.pool())
             .await
             .unwrap();
-        assert_eq!(migration_count.0, 45);
+        assert_eq!(migration_count.0, 46);
 
         let binding: (String,) = sqlx::query_as(
             "SELECT agent_id FROM telegram_topic_bindings WHERE chat_id = '-1003977604085' AND message_thread_id = 3",

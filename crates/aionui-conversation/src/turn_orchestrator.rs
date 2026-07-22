@@ -11,7 +11,8 @@ use crate::agent_health_policy::{AgentHealthAction, AgentHealthPolicy};
 use crate::runtime_state::RuntimeLifecycleState;
 use crate::runtime_state::TurnClaim;
 use crate::service::{
-    ConversationService, MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
+    ConversationAgentTurnStatus, ConversationService, ConversationTurnObservation,
+    MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
 };
 use crate::stream_relay::{RelayOutcome, StreamRelay, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
@@ -357,6 +358,7 @@ impl ConversationTurnOrchestrator {
     }
 
     pub(crate) async fn run_user_turn(self, input: TurnStartInput) -> ConversationTurnResult {
+        let turn_started_at = now_ms();
         let mut turn_claim = input.turn_claim;
         let conv_id = input.conversation.id.clone();
         let turn_id = input.turn_id.clone();
@@ -512,6 +514,37 @@ impl ConversationTurnOrchestrator {
             .await;
         } else if !final_failed {
             record_agent_session_success(&self.service, availability_agent_id(&input.build_options).as_deref()).await;
+        }
+
+        if let Some(observer) = self.service.turn_observer() {
+            let occurred_at = now_ms();
+            let usage = match self.task_manager.get_task(&conv_id) {
+                Some(agent) => agent.get_usage().await.ok().flatten(),
+                None => None,
+            };
+            let context = &input.build_options.context;
+            let model = context.model.use_model.as_ref().unwrap_or(&context.model.model).clone();
+            observer
+                .observe(ConversationTurnObservation {
+                    user_id: input.user_id.clone(),
+                    conversation_id: conv_id.clone(),
+                    turn_id: turn_id.clone(),
+                    status: if final_failed {
+                        ConversationAgentTurnStatus::Failed
+                    } else {
+                        ConversationAgentTurnStatus::Completed
+                    },
+                    agent_id: availability_agent_id(&input.build_options),
+                    provider: context.model.provider_id.clone(),
+                    model,
+                    team_id: context.team.as_ref().map(|team| team.team_id.clone()),
+                    slot_id: context.team.as_ref().and_then(|team| team.slot_id.clone()),
+                    usage,
+                    duration_ms: occurred_at.saturating_sub(turn_started_at),
+                    retry_count: i64::from(replayed),
+                    occurred_at,
+                })
+                .await;
         }
 
         let was_deleting = turn_claim.release_for_turn(&turn_id);

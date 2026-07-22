@@ -161,39 +161,76 @@ impl ResourceLeaseCoordinator {
         Ok(row)
     }
 
-    pub async fn heartbeat(&self, lease_id: &str, ttl_ms: i64) -> Result<ExecutionResourceLeaseRow, DevelopmentError> {
-        let mut row = self.require_lease(lease_id).await?;
-        if row.status != "active" || row.accepts_work == 0 {
+    pub async fn heartbeat(
+        &self,
+        lease: &mut ExecutionResourceLeaseRow,
+        ttl_ms: i64,
+    ) -> Result<ExecutionResourceLeaseRow, DevelopmentError> {
+        if lease.owner_instance_id != self.instance_id {
+            return Err(DevelopmentError::Conflict(
+                "resource lease is owned by another instance".into(),
+            ));
+        }
+        if lease.status != "active" || lease.accepts_work == 0 || lease.terminal_at.is_some() {
             return Err(DevelopmentError::Conflict(
                 "resource lease no longer accepts work".into(),
             ));
         }
         let now = now_ms();
-        row.heartbeat_at = now;
-        row.expires_at = now.saturating_add(ttl_ms.max(1));
-        row.updated_at = now;
-        self.repo.upsert_resource_lease(&row).await?;
-        Ok(row)
+        let updated = self
+            .repo
+            .heartbeat_resource_lease(
+                &lease.id,
+                &lease.owner_instance_id,
+                lease.updated_at,
+                now,
+                now.saturating_add(ttl_ms.max(1)),
+            )
+            .await?;
+        let Some(current) = updated else {
+            return Err(DevelopmentError::Conflict(
+                "resource lease ownership or status changed during heartbeat".into(),
+            ));
+        };
+        *lease = current.clone();
+        Ok(current)
     }
 
     pub async fn complete(
         &self,
-        lease_id: &str,
+        lease: &ExecutionResourceLeaseRow,
         cleanup_result: &str,
     ) -> Result<ExecutionResourceLeaseRow, DevelopmentError> {
-        let mut row = self.require_lease(lease_id).await?;
-        if matches!(row.status.as_str(), "released" | "cleanup_failed") {
-            return Ok(row);
+        if matches!(lease.status.as_str(), "released" | "cleanup_failed") {
+            return Ok(lease.clone());
         }
-        let now = now_ms();
-        row.accepts_work = 0;
-        row.status = "released".into();
-        row.cleanup_status = Some("released".into());
-        row.cleanup_result = Some(cleanup_result.into());
-        row.updated_at = now;
-        row.terminal_at = Some(now);
-        self.repo.upsert_resource_lease(&row).await?;
-        Ok(row)
+        if lease.owner_instance_id != self.instance_id {
+            return Err(DevelopmentError::Conflict(
+                "resource lease is owned by another instance".into(),
+            ));
+        }
+        if lease.status != "active" || lease.accepts_work != 1 || lease.terminal_at.is_some() {
+            return Err(DevelopmentError::Conflict(
+                "resource lease no longer accepts normal completion".into(),
+            ));
+        }
+        let completed_at = now_ms();
+        let updated = self
+            .repo
+            .complete_resource_lease(
+                &lease.id,
+                &lease.owner_instance_id,
+                lease.updated_at,
+                cleanup_result,
+                completed_at,
+            )
+            .await?;
+        if !updated {
+            return Err(DevelopmentError::Conflict(
+                "resource lease ownership or status changed during completion".into(),
+            ));
+        }
+        self.require_lease(&lease.id).await
     }
 
     pub async fn cancel_run(
@@ -202,37 +239,70 @@ impl ResourceLeaseCoordinator {
         run_id: &str,
         controller: &dyn DevelopmentResourceController,
     ) -> Result<Vec<ExecutionResourceLeaseRow>, DevelopmentError> {
-        let mut leases = self.repo.list_resource_leases(user_id, run_id, true).await?;
-        leases.retain(|lease| {
-            matches!(
-                lease.status.as_str(),
-                "active" | "stopping" | "orphaned" | "cleanup_failed"
-            )
-        });
-        if leases.is_empty() {
+        let candidates = self.repo.list_resource_leases(user_id, run_id, true).await?;
+        let mut claimed = Vec::new();
+        let mut claim_error = None;
+        for lease in candidates {
+            let mut current = lease;
+            let mut acquired = false;
+            for _ in 0..3 {
+                if !matches!(current.status.as_str(), "active" | "orphaned" | "cleanup_failed") {
+                    break;
+                }
+                let claimed_at = now_ms();
+                let updated = self
+                    .repo
+                    .claim_resource_cleanup(
+                        &current.id,
+                        &current.owner_instance_id,
+                        &current.status,
+                        current.updated_at,
+                        &self.instance_id,
+                        claimed_at,
+                    )
+                    .await?;
+                if let Some(claimed_lease) = updated {
+                    claimed.push(claimed_lease);
+                    acquired = true;
+                    break;
+                }
+                current = self.require_lease(&current.id).await?;
+            }
+            if !acquired
+                && matches!(
+                    current.status.as_str(),
+                    "active" | "stopping" | "orphaned" | "cleanup_failed"
+                )
+            {
+                claim_error.get_or_insert_with(|| {
+                    format!(
+                        "resource lease {} could not be fenced for cleanup from status {}",
+                        current.id, current.status
+                    )
+                });
+            }
+        }
+        if claimed.is_empty() {
+            if let Some(error) = claim_error {
+                return Err(DevelopmentError::Conflict(error));
+            }
             return Ok(Vec::new());
         }
-        let now = now_ms();
-        for lease in &mut leases {
-            lease.accepts_work = 0;
-            lease.status = "stopping".into();
-            lease.updated_at = now;
-            self.repo.upsert_resource_lease(lease).await?;
-        }
 
-        let mut first_error = controller.signal_agent(run_id).await.err();
-        for lease in &mut leases {
+        let mut first_error = claim_error;
+        if let Err(error) = controller.signal_agent(run_id).await {
+            first_error.get_or_insert(error);
+        }
+        let mut results = Vec::with_capacity(claimed.len());
+        for lease in claimed {
             let target = CleanupTarget {
                 resource_kind: &lease.resource_kind,
                 resource_identifier: &lease.resource_identifier,
                 environment_id: &lease.environment_id,
             };
-            match controller.cleanup(target).await {
-                Ok(()) => {
-                    lease.status = "released".into();
-                    lease.cleanup_status = Some("released".into());
-                    lease.cleanup_result = Some("ok".into());
-                }
+            let cleanup = controller.cleanup(target).await;
+            let (succeeded, cleanup_result) = match cleanup {
+                Ok(()) => (true, "ok"),
                 Err(error) => {
                     warn!(
                         lease_id = %lease.id,
@@ -240,35 +310,77 @@ impl ResourceLeaseCoordinator {
                         resource_kind = %lease.resource_kind,
                         "execution resource cleanup failed"
                     );
-                    lease.status = "cleanup_failed".into();
-                    lease.cleanup_status = Some("failed".into());
-                    lease.cleanup_result = Some("controller_error".into());
                     first_error.get_or_insert(error);
+                    (false, "controller_error")
                 }
-            }
+            };
             let finished = now_ms();
-            lease.updated_at = finished;
-            lease.terminal_at = Some(finished);
-            self.repo.upsert_resource_lease(lease).await?;
+            let finalized = self
+                .repo
+                .finish_resource_cleanup(
+                    &lease.id,
+                    &self.instance_id,
+                    lease.updated_at,
+                    succeeded,
+                    cleanup_result,
+                    finished,
+                )
+                .await?;
+            if !finalized {
+                first_error.get_or_insert_with(|| {
+                    format!(
+                        "resource lease {} changed owner or recovery epoch during cleanup",
+                        lease.id
+                    )
+                });
+            }
+            results.push(self.require_lease(&lease.id).await?);
         }
         info!(
             run_id,
-            lease_count = leases.len(),
+            lease_count = results.len(),
             "execution resource cleanup completed"
         );
         if let Some(error) = first_error {
             return Err(DevelopmentError::Internal(error));
         }
-        Ok(leases)
+        Ok(results)
     }
 
     pub async fn reconcile_stale(&self, now: i64) -> Result<Vec<ExecutionResourceLeaseRow>, DevelopmentError> {
-        let mut rows = self.repo.list_stale_resource_leases(now).await?;
-        for row in &mut rows {
-            row.status = "orphaned".into();
-            row.accepts_work = 0;
-            row.updated_at = now;
-            self.repo.upsert_resource_lease(row).await?;
+        let candidates = self.repo.list_stale_resource_leases(now).await?;
+        self.reconcile_candidates(candidates, now).await
+    }
+
+    pub async fn reconcile_stale_for_user(
+        &self,
+        user_id: &str,
+        now: i64,
+    ) -> Result<Vec<ExecutionResourceLeaseRow>, DevelopmentError> {
+        let candidates = self
+            .repo
+            .list_stale_resource_leases(now)
+            .await?
+            .into_iter()
+            .filter(|candidate| candidate.user_id == user_id)
+            .collect();
+        self.reconcile_candidates(candidates, now).await
+    }
+
+    async fn reconcile_candidates(
+        &self,
+        candidates: Vec<ExecutionResourceLeaseRow>,
+        now: i64,
+    ) -> Result<Vec<ExecutionResourceLeaseRow>, DevelopmentError> {
+        let mut rows = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let orphaned = self
+                .repo
+                .orphan_resource_lease(&candidate.id, &candidate.owner_instance_id, candidate.expires_at, now)
+                .await?;
+            let Some(row) = orphaned else {
+                continue;
+            };
             warn!(
                 lease_id = %row.id,
                 run_id = %row.run_id,
@@ -276,6 +388,7 @@ impl ResourceLeaseCoordinator {
                 environment_id = %row.environment_id,
                 "stale execution resource lease requires reconciliation"
             );
+            rows.push(row);
         }
         Ok(rows)
     }
@@ -288,22 +401,49 @@ impl ResourceLeaseCoordinator {
         if !matches!(decision, "retry" | "rollback" | "takeover" | "terminate") {
             return Err(DevelopmentError::BadRequest("unsupported recovery decision".into()));
         }
-        let mut row = self.require_lease(lease_id).await?;
+        let row = self.require_lease(lease_id).await?;
+        if decision == "takeover" {
+            if is_active_takeover_owner(&row, &self.instance_id) {
+                return Ok(row);
+            }
+            if row.status != "orphaned" || row.terminal_at.is_some() {
+                return Err(DevelopmentError::Conflict(
+                    "only a non-terminal orphaned resource lease can be taken over".into(),
+                ));
+            }
+        }
         if let Some(existing) = row.recovery_decision.as_deref() {
             if existing != decision {
                 return Err(DevelopmentError::Conflict(format!(
                     "resource lease recovery is already decided as {existing}"
                 )));
             }
-            return Ok(row);
+            if decision != "takeover" {
+                return Ok(row);
+            }
         }
-        row.recovery_decision = Some(decision.into());
-        row.updated_at = now_ms();
-        if decision == "takeover" {
-            row.owner_instance_id = self.instance_id.clone();
+        let takeover_owner = (decision == "takeover").then_some(self.instance_id.as_str());
+        let claimed = self
+            .repo
+            .claim_resource_recovery_decision(lease_id, decision, takeover_owner, now_ms())
+            .await?;
+        if let Some(persisted) = claimed {
+            return Ok(persisted);
         }
-        self.repo.upsert_resource_lease(&row).await?;
-        self.require_lease(lease_id).await
+        let persisted = self.require_lease(lease_id).await?;
+        let is_idempotent = if decision == "takeover" {
+            is_active_takeover_owner(&persisted, &self.instance_id)
+        } else {
+            persisted.recovery_decision.as_deref() == Some(decision)
+        };
+        if !is_idempotent {
+            return Err(DevelopmentError::Conflict(format!(
+                "resource lease recovery is already decided as {} by {}",
+                persisted.recovery_decision.as_deref().unwrap_or("unknown"),
+                persisted.owner_instance_id
+            )));
+        }
+        Ok(persisted)
     }
 
     async fn require_lease(&self, lease_id: &str) -> Result<ExecutionResourceLeaseRow, DevelopmentError> {
@@ -312,6 +452,14 @@ impl ResourceLeaseCoordinator {
             .await?
             .ok_or_else(|| DevelopmentError::NotFound(format!("resource lease {lease_id}")))
     }
+}
+
+fn is_active_takeover_owner(row: &ExecutionResourceLeaseRow, instance_id: &str) -> bool {
+    row.recovery_decision.as_deref() == Some("takeover")
+        && row.owner_instance_id == instance_id
+        && row.status == "active"
+        && row.accepts_work == 1
+        && row.terminal_at.is_none()
 }
 
 fn validate_kind(environment_kind: &str, resource_kind: &str) -> Result<(), DevelopmentError> {

@@ -106,7 +106,7 @@ impl DevelopmentRunner {
         };
         for lease in planned_leases {
             if lease.resource_kind != "service" {
-                self.resources.complete(&lease.id, cleanup_result).await?;
+                self.resources.complete(&lease, cleanup_result).await?;
             }
         }
         result

@@ -405,31 +405,106 @@ impl DevelopmentOperationsService {
     }
 
     async fn apply_budget_action(&self, run: &DevelopmentRunRow, action: &str) -> Result<(), DevelopmentError> {
-        if !matches!(
-            run.status.as_str(),
-            "preflight" | "running" | "waiting_approval" | "verifying" | "reviewing" | "integrating" | "rework"
-        ) {
+        if !budget_action_can_transition(&run.status) {
             return Ok(());
         }
         match action {
             "pause" => {
-                self.development_repo
-                    .update_run_status(&run.id, &run.user_id, "paused", None)
-                    .await?;
+                self.pause_run_if_snapshot_current(run).await?;
             }
             "terminate" => {
-                if let (Some(coordinator), Some(controller)) = (&self.resource_coordinator, &self.resource_controller) {
-                    coordinator
-                        .cancel_run(&run.user_id, &run.id, controller.as_ref())
+                let claimed = self
+                    .development_repo
+                    .update_run_status_if_current(
+                        &run.id,
+                        &run.user_id,
+                        &run.status,
+                        run.updated_at,
+                        "integrating",
+                        None,
+                    )
+                    .await?;
+                if !claimed {
+                    return Ok(());
+                }
+                let Some(claimed_run) = self.development_repo.get_run(&run.id, &run.user_id).await? else {
+                    return Err(DevelopmentError::Internal(
+                        "budget termination claim disappeared".into(),
+                    ));
+                };
+                if let (Some(coordinator), Some(controller)) = (&self.resource_coordinator, &self.resource_controller)
+                    && let Err(error) = coordinator.cancel_run(&run.user_id, &run.id, controller.as_ref()).await
+                {
+                    let _ = self
+                        .development_repo
+                        .update_run_status_if_current(
+                            &run.id,
+                            &run.user_id,
+                            "integrating",
+                            claimed_run.updated_at,
+                            "paused",
+                            None,
+                        )
                         .await?;
+                    return Err(error);
                 }
                 self.development_repo
-                    .update_run_status(&run.id, &run.user_id, "cancelled", Some(now_ms()))
+                    .update_run_status_if_current(
+                        &run.id,
+                        &run.user_id,
+                        "integrating",
+                        claimed_run.updated_at,
+                        "cancelled",
+                        Some(now_ms()),
+                    )
                     .await?;
             }
             "notify" | "downgrade_model" => {}
             _ => return Err(DevelopmentError::Internal("invalid persisted budget action".into())),
         }
+        Ok(())
+    }
+
+    async fn pause_run_if_snapshot_current(&self, run: &DevelopmentRunRow) -> Result<(), DevelopmentError> {
+        self.development_repo
+            .update_run_status_if_current(&run.id, &run.user_id, &run.status, run.updated_at, "paused", None)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn pause_after_runtime_action_failure(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        message: &str,
+    ) -> Result<(), DevelopmentError> {
+        let run = self.require_run(user_id, run_id).await?;
+        if budget_action_can_transition(&run.status) {
+            self.pause_run_if_snapshot_current(&run).await?;
+        }
+        self.upsert_alert(
+            &run,
+            "budget",
+            "critical",
+            message,
+            &format!("budget-runtime-action:{}", run.id),
+        )
+        .await?;
+        self.audit(
+            user_id,
+            "system",
+            "development-policy-engine",
+            "budget.runtime_action_failed",
+            "development_run",
+            run_id,
+            &run.project_id,
+            Some(run_id),
+            None,
+            "denied",
+            json!({"reason": message, "fallback_action": "pause"}),
+            &[],
+        )
+        .await?;
         Ok(())
     }
 
@@ -527,6 +602,12 @@ impl DevelopmentOperationsService {
         user_id: &str,
         stale_after_ms: i64,
     ) -> Result<Vec<DevelopmentRecoveryRecordRow>, DevelopmentError> {
+        if stale_after_ms <= 0 {
+            return Err(DevelopmentError::BadRequest("stale_after_ms must be positive".into()));
+        }
+        if let Some(resources) = &self.resource_coordinator {
+            resources.reconcile_stale_for_user(user_id, now_ms()).await?;
+        }
         self.reconcile_stale_runs_scoped(Some(user_id), stale_after_ms).await
     }
 
@@ -667,15 +748,71 @@ impl DevelopmentOperationsService {
             "resume" | "retry" | "rollback" | "takeover" | "terminate"
         ) {
             return Err(DevelopmentError::BadRequest(
-                "recovery action must be retry, rollback, takeover, or terminate".into(),
+                "recovery action must be resume, retry, rollback, takeover, or terminate".into(),
             ));
         }
         let run = self.require_run(user_id, run_id).await?;
+        let recovery_key = format!("run:{run_id}:stale");
+        let existing = self
+            .operations_repo
+            .list_recovery(user_id, &run.project_id, Some(run_id), 200)
+            .await?
+            .into_iter()
+            .find(|row| row.recovery_key == recovery_key);
+        let has_recovery_context = existing.as_ref().is_some_and(|row| {
+            matches!(row.decision.as_str(), "manual_required" | "interrupted") || row.decision == input.action
+        });
+        if run.status == "succeeded"
+            || (!matches!(run.status.as_str(), "paused" | "cancelled") && !has_recovery_context)
+        {
+            return Err(DevelopmentError::Conflict(format!(
+                "run {} is not awaiting recovery",
+                run.id
+            )));
+        }
         let target = if matches!(input.action.as_str(), "resume" | "retry" | "takeover") {
             "running"
         } else {
             "cancelled"
         };
+        let pending_record = DevelopmentRecoveryRecordRow {
+            id: existing
+                .as_ref()
+                .map(|row| row.id.clone())
+                .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+            user_id: user_id.into(),
+            project_id: run.project_id.clone(),
+            run_id: Some(run_id.into()),
+            recovery_key,
+            finding: existing
+                .as_ref()
+                .map(|row| row.finding.clone())
+                .unwrap_or_else(|| "manual recovery decision".into()),
+            decision: input.action.clone(),
+            status_before: existing
+                .as_ref()
+                .and_then(|row| row.status_before.clone())
+                .or_else(|| Some(run.status.clone())),
+            status_after: None,
+            details_json: json!({"state": "pending"}).to_string(),
+            created_at: existing.as_ref().map(|row| row.created_at).unwrap_or_else(now_ms),
+        };
+        if !self
+            .operations_repo
+            .claim_recovery_and_update_run(&pending_record, &run.status, run.updated_at, "paused", None, now_ms())
+            .await?
+        {
+            return Err(DevelopmentError::Conflict(format!(
+                "run {} changed state or already has a different recovery decision",
+                run.id
+            )));
+        }
+        let recovering_run = self.require_run(user_id, run_id).await?;
+        if recovering_run.status != "paused" {
+            return Err(DevelopmentError::Conflict(
+                "run left its safe recovery state before resources were reconciled".into(),
+            ));
+        }
         if let Some(resources) = &self.resource_coordinator {
             let decision = if input.action == "resume" {
                 "retry"
@@ -692,34 +829,26 @@ impl DevelopmentOperationsService {
             }
         }
         let finished_at = (target == "cancelled").then(now_ms);
-        self.development_repo
-            .update_run_status(run_id, user_id, target, finished_at)
-            .await?;
-        let recovery_key = format!("run:{run_id}:stale");
-        let existing = self
-            .operations_repo
-            .list_recovery(user_id, &run.project_id, Some(run_id), 200)
+        if !self
+            .development_repo
+            .update_run_status_if_current(
+                run_id,
+                user_id,
+                &recovering_run.status,
+                recovering_run.updated_at,
+                target,
+                finished_at,
+            )
             .await?
-            .into_iter()
-            .find(|row| row.recovery_key == recovery_key);
+        {
+            return Err(DevelopmentError::Conflict(
+                "run left its safe recovery state while resources were reconciled".into(),
+            ));
+        }
         let record = DevelopmentRecoveryRecordRow {
-            id: existing
-                .as_ref()
-                .map(|row| row.id.clone())
-                .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
-            user_id: user_id.into(),
-            project_id: run.project_id.clone(),
-            run_id: Some(run_id.into()),
-            recovery_key,
-            finding: existing
-                .as_ref()
-                .map(|row| row.finding.clone())
-                .unwrap_or_else(|| "manual recovery decision".into()),
-            decision: input.action.clone(),
-            status_before: Some(run.status),
             status_after: Some(target.into()),
             details_json: "{}".into(),
-            created_at: existing.map(|row| row.created_at).unwrap_or_else(now_ms),
+            ..pending_record
         };
         self.operations_repo.append_recovery(&record).await?;
         for alert in self
@@ -996,6 +1125,13 @@ fn budget_threshold_reached(policy: &DevelopmentPolicyRow, usage: &DevelopmentUs
     percentage(duration_ms, policy.max_duration_ms) || percentage(usage.cost_microunits, policy.max_cost_microunits)
 }
 
+fn budget_action_can_transition(status: &str) -> bool {
+    matches!(
+        status,
+        "preflight" | "running" | "waiting_approval" | "verifying" | "reviewing" | "rework"
+    )
+}
+
 fn clean_optional(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let value = value.trim();
@@ -1005,4 +1141,117 @@ fn clean_optional(value: Option<String>) -> Option<String> {
 
 pub fn redact_sensitive(value: &str, secret_values: &[String]) -> String {
     crate::secrets::redact_text(value, secret_values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aionui_db::{
+        IDevelopmentRepository, SqliteAgentWorkspaceLeaseRepository, SqliteDevelopmentOperationsRepository,
+        SqliteDevelopmentRepository, SqliteProjectRepository, init_database_memory,
+    };
+
+    async fn budget_action_fixture() -> (DevelopmentOperationsService, Arc<SqliteDevelopmentRepository>) {
+        let db = init_database_memory().await.expect("database");
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+             VALUES ('budget-user', 'budget', '', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .expect("user");
+        sqlx::query(
+            "INSERT INTO projects \
+             (id, user_id, name, local_path, project_type, created_at, updated_at) \
+             VALUES ('budget-project', 'budget-user', 'Budget', '/tmp/budget-project', 'single', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .expect("project");
+        let development_repo = Arc::new(SqliteDevelopmentRepository::new(db.pool().clone()));
+        development_repo
+            .create_run(&DevelopmentRunRow {
+                id: "budget-run".into(),
+                user_id: "budget-user".into(),
+                project_id: "budget-project".into(),
+                team_id: None,
+                source_channel: None,
+                source_user_id: None,
+                execution_mode: "single".into(),
+                status: "running".into(),
+                request_summary: "Budget race".into(),
+                acceptance_criteria: "[]".into(),
+                baseline_commit: None,
+                integration_branch: None,
+                started_at: Some(1),
+                finished_at: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .expect("run");
+        let service = DevelopmentOperationsService::new(
+            Arc::new(SqliteDevelopmentOperationsRepository::new(db.pool().clone())),
+            development_repo.clone(),
+            Arc::new(SqliteProjectRepository::new(db.pool().clone())),
+            Arc::new(SqliteAgentWorkspaceLeaseRepository::new(db.pool().clone())),
+        );
+        (service, development_repo)
+    }
+
+    #[tokio::test]
+    async fn stale_budget_actions_do_not_reopen_a_terminal_run() {
+        for action in ["pause", "terminate"] {
+            let (service, repository) = budget_action_fixture().await;
+            let stale = repository
+                .get_run("budget-run", "budget-user")
+                .await
+                .expect("read stale run")
+                .expect("run exists");
+            repository
+                .update_run_status("budget-run", "budget-user", "succeeded", Some(10))
+                .await
+                .expect("finish run concurrently");
+
+            service
+                .apply_budget_action(&stale, action)
+                .await
+                .expect("stale action is ignored");
+
+            let current = repository
+                .get_run("budget-run", "budget-user")
+                .await
+                .expect("read current run")
+                .expect("run exists");
+            assert_eq!(current.status, "succeeded");
+            assert_eq!(current.finished_at, Some(10));
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_failure_pause_does_not_reopen_a_terminal_run() {
+        let (service, repository) = budget_action_fixture().await;
+        let stale = repository
+            .get_run("budget-run", "budget-user")
+            .await
+            .expect("read stale run")
+            .expect("run exists");
+        repository
+            .update_run_status("budget-run", "budget-user", "cancelled", Some(20))
+            .await
+            .expect("cancel run concurrently");
+
+        service
+            .pause_run_if_snapshot_current(&stale)
+            .await
+            .expect("stale pause is ignored");
+
+        let current = repository
+            .get_run("budget-run", "budget-user")
+            .await
+            .expect("read current run")
+            .expect("run exists");
+        assert_eq!(current.status, "cancelled");
+        assert_eq!(current.finished_at, Some(20));
+    }
 }
