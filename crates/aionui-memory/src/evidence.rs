@@ -4,6 +4,7 @@ use aionui_api_types::{
     ExistingMemoryEntryInput, MemoryEntryKind, MemorySourceMessageInput, MemorySourceMessageRole,
     MemorySourceTurnInput, MemorySummary, MemoryUpdateConversationInput, MemoryUpdateInput,
 };
+use aionui_db::memory_evidence_content;
 use aionui_db::models::{ConversationRow, MemoryEntryRow, MessageRow};
 use serde_json::Value;
 
@@ -147,11 +148,11 @@ fn source_turns_from_rows(
         let Some(turn_id) = message.turn_id.as_deref() else {
             continue;
         };
-        if !selected_turn_ids.contains(turn_id) || should_exclude_message(message) {
+        if !selected_turn_ids.contains(turn_id) {
             continue;
         }
 
-        let Some(content) = visible_text_content(message)? else {
+        let Some(content) = memory_evidence_content(message) else {
             continue;
         };
         let content = strip_user_context_sentences(&sanitize_text(&content));
@@ -192,24 +193,6 @@ fn source_turns_from_rows(
             })
         })
         .collect())
-}
-
-fn should_exclude_message(message: &MessageRow) -> bool {
-    if message.hidden {
-        return true;
-    }
-    let message_type = message.r#type.trim().to_ascii_lowercase();
-    !matches!(message_type.as_str(), "text" | "artifact" | "tool_result_summary")
-        || message.status.as_deref() != Some("finish")
-}
-
-fn visible_text_content(message: &MessageRow) -> Result<Option<String>, MemoryError> {
-    let value: Value = serde_json::from_str(&message.content).map_err(|_| MemoryError::InvalidInput)?;
-    Ok(value
-        .get("content")
-        .or_else(|| value.get("summary"))
-        .and_then(Value::as_str)
-        .map(str::to_owned))
 }
 
 fn message_role(message: &MessageRow) -> Option<MemorySourceMessageRole> {

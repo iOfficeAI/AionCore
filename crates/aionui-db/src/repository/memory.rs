@@ -6,6 +6,56 @@ use crate::models::{
     MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow, MemorySettingsRow, MessageRow,
 };
 
+/// Maximum accepted messages in one bounded Memory evidence batch.
+pub const MEMORY_EVIDENCE_MAX_MESSAGES: usize = 128;
+/// Maximum accepted UTF-8 content bytes in one bounded Memory evidence batch.
+pub const MEMORY_EVIDENCE_MAX_BYTES: usize = 64 * 1024;
+
+/// Canonical message families that may contribute text to Memory evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryEvidenceMessageKind {
+    Text,
+    Artifact,
+    ToolResultSummary,
+}
+
+impl MemoryEvidenceMessageKind {
+    /// Classifies a persisted message type using the canonical Memory allowlist.
+    pub fn from_db_type(message_type: &str) -> Option<Self> {
+        match message_type.trim().to_ascii_lowercase().as_str() {
+            "text" => Some(Self::Text),
+            "artifact" => Some(Self::Artifact),
+            "tool_result_summary" => Some(Self::ToolResultSummary),
+            _ => None,
+        }
+    }
+
+    /// Returns the JSON string field that contains accepted evidence text.
+    pub fn content_field(self) -> &'static str {
+        match self {
+            Self::Text | Self::Artifact => "content",
+            Self::ToolResultSummary => "summary",
+        }
+    }
+}
+
+/// Extracts canonical evidence text when row metadata and JSON content are eligible.
+pub fn memory_evidence_content(message: &MessageRow) -> Option<String> {
+    if message.hidden
+        || message.status.as_deref() != Some("finish")
+        || !matches!(message.position.as_deref(), Some("left" | "right"))
+    {
+        return None;
+    }
+    let kind = MemoryEvidenceMessageKind::from_db_type(&message.r#type)?;
+    let value: serde_json::Value = serde_json::from_str(&message.content).ok()?;
+    value
+        .get(kind.content_field())
+        .and_then(serde_json::Value::as_str)
+        .filter(|content| !content.trim().is_empty())
+        .map(str::to_owned)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateMemorySettingsRow {
     pub user_id: String,
@@ -46,6 +96,32 @@ pub struct BoundedMemoryTurnMessagesRow {
     pub snapshot_hash: String,
     pub snapshot_matches: bool,
     pub limit_exceeded: bool,
+    pub has_user_work: bool,
+    pub has_assistant_outcome: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryTurnSnapshotExpectationRow {
+    pub turn_id: String,
+    pub snapshot_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeMemoryJobSnapshotRow {
+    pub user_id: String,
+    pub job_id: String,
+    pub lease_token: String,
+    pub expected_global_epoch: i64,
+    pub expected_conversation_epoch: i64,
+    pub turn_snapshots: Vec<MemoryTurnSnapshotExpectationRow>,
+    pub now: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizeMemoryJobSnapshotResult {
+    Finalized(Box<MemoryJobRow>),
+    SnapshotChanged,
+    FenceLost,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +309,12 @@ pub trait IMemoryRepository: Send + Sync {
         command: UpdateConversationMemoryPolicyRow,
     ) -> Result<EffectiveMemoryPolicyRow, DbError>;
     async fn enqueue_completed_turn(&self, input: EnqueueMemoryTurnRow) -> Result<Option<MemoryJobRow>, DbError>;
+    async fn retry_failed_job(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        now: TimestampMs,
+    ) -> Result<Option<MemoryJobRow>, DbError>;
     async fn claim_next_job(&self, input: ClaimMemoryJobRow) -> Result<Option<MemoryJobRow>, DbError>;
     async fn list_job_turns(&self, user_id: &str, job_id: &str, limit: u32) -> Result<Vec<MemoryJobTurnRow>, DbError>;
     async fn load_job_turn_messages_bounded(
@@ -243,14 +325,10 @@ pub trait IMemoryRepository: Send + Sync {
         max_messages: u32,
         max_bytes: u64,
     ) -> Result<BoundedMemoryTurnMessagesRow, DbError>;
-    async fn refresh_claimed_job_snapshot(
+    async fn finalize_claimed_job_snapshot(
         &self,
-        user_id: &str,
-        job_id: &str,
-        lease_token: &str,
-        now: TimestampMs,
-        max_turns: u32,
-    ) -> Result<Option<MemoryJobRow>, DbError>;
+        input: FinalizeMemoryJobSnapshotRow,
+    ) -> Result<FinalizeMemoryJobSnapshotResult, DbError>;
     async fn split_claimed_job(&self, input: SplitMemoryJobRow) -> Result<bool, DbError>;
     async fn update_memory_lifecycle(&self, input: UpdateMemoryLifecycleRow) -> Result<(), DbError>;
     async fn update_conversation_memory_lifecycle(

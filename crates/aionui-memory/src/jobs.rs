@@ -3,6 +3,8 @@ use aionui_db::models::MemoryJobRow;
 #[cfg(test)]
 use aionui_db::models::{ConversationRow, EffectiveMemoryPolicyRow, MessageRow};
 #[cfg(test)]
+use aionui_db::{MemoryEvidenceMessageKind, memory_evidence_content};
+#[cfg(test)]
 use serde_json::Value;
 
 /// Conversation-orchestrator outcome observed after canonical persistence.
@@ -87,30 +89,14 @@ fn is_excluded_conversation(conversation: &ConversationRow) -> bool {
 
 #[cfg(test)]
 fn visible_text(message: &MessageRow, position: &str) -> bool {
-    !message.hidden
-        && message.position.as_deref() == Some(position)
-        && message.r#type == "text"
-        && message.status.as_deref() == Some("finish")
-        && serde_json::from_str::<Value>(&message.content)
-            .ok()
-            .and_then(|value| value.get("content").and_then(Value::as_str).map(str::to_owned))
-            .is_some_and(|content| !content.trim().is_empty())
+    message.position.as_deref() == Some(position)
+        && MemoryEvidenceMessageKind::from_db_type(&message.r#type) == Some(MemoryEvidenceMessageKind::Text)
+        && memory_evidence_content(message).is_some()
 }
 
 #[cfg(test)]
 fn visible_assistant_outcome(message: &MessageRow) -> bool {
-    if message.hidden || message.position.as_deref() != Some("left") || message.status.as_deref() != Some("finish") {
-        return false;
-    }
-    let field = match message.r#type.as_str() {
-        "text" | "artifact" => "content",
-        "tool_result_summary" => "summary",
-        _ => return false,
-    };
-    serde_json::from_str::<Value>(&message.content)
-        .ok()
-        .and_then(|value| value.get(field).and_then(Value::as_str).map(str::to_owned))
-        .is_some_and(|content| !content.trim().is_empty())
+    message.position.as_deref() == Some("left") && memory_evidence_content(message).is_some()
 }
 
 pub(crate) fn job_response(row: MemoryJobRow) -> Result<MemoryJobResponse, crate::MemoryError> {

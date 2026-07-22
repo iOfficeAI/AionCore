@@ -1,5 +1,8 @@
 use std::sync::LazyLock;
 
+pub use aionui_db::{
+    MEMORY_EVIDENCE_MAX_BYTES as MAX_EVIDENCE_BYTES, MEMORY_EVIDENCE_MAX_MESSAGES as MAX_EVIDENCE_MESSAGES,
+};
 use regex::Regex;
 
 /// Version carried by evidence-producing operations so future reprocessing can be explicit.
@@ -10,10 +13,6 @@ pub const RETRIEVAL_POLICY_VERSION: &str = "memory-retrieval-v1";
 pub const OPERATION_VERSION: &str = "memory-operation-v1";
 /// Maximum number of selected turns supplied to one task invocation.
 pub const MAX_EVIDENCE_TURNS: usize = 32;
-/// Maximum number of visible text messages supplied to one task invocation.
-pub const MAX_EVIDENCE_MESSAGES: usize = 128;
-/// Maximum UTF-8 bytes supplied as sanitized turn evidence.
-pub const MAX_EVIDENCE_BYTES: usize = 64 * 1024;
 /// Maximum current entries supplied for reconciliation.
 pub const MAX_EXISTING_ENTRIES: usize = 64;
 /// Maximum mutations accepted from a single task output.

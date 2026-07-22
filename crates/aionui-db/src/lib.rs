@@ -46,9 +46,11 @@ pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::memory::{
     BoundedMemoryTurnMessagesRow, ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition,
     CommitMemorySourceRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow,
-    MemoryCandidateQueryRow, MemoryEntryQueryRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, SplitMemoryJobRow,
+    FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, MEMORY_EVIDENCE_MAX_BYTES,
+    MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow, MemoryEntryQueryRow, MemoryEvidenceMessageKind,
+    MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, SplitMemoryJobRow,
     TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow,
-    UpdateMemoryEntryRow, UpdateMemoryLifecycleRow, UpdateMemorySettingsRow,
+    UpdateMemoryEntryRow, UpdateMemoryLifecycleRow, UpdateMemorySettingsRow, memory_evidence_content,
 };
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
