@@ -122,6 +122,10 @@ CREATE TABLE IF NOT EXISTS memory_jobs (
     lease_token        TEXT,
     lease_expires_at   INTEGER,
     invalid_output_count INTEGER NOT NULL DEFAULT 0 CHECK(invalid_output_count >= 0),
+    reconciliation_snapshot_json TEXT CHECK(
+        reconciliation_snapshot_json IS NULL
+        OR (json_valid(reconciliation_snapshot_json) AND json_type(reconciliation_snapshot_json) = 'array')
+    ),
     last_error_code    TEXT,
     created_at         INTEGER NOT NULL,
     updated_at         INTEGER NOT NULL,

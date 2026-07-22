@@ -1,4 +1,6 @@
 use aionui_common::TimestampMs;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::DbError;
 use crate::models::{
@@ -114,13 +116,63 @@ pub struct FinalizeMemoryJobSnapshotRow {
     pub expected_global_epoch: i64,
     pub expected_conversation_epoch: i64,
     pub turn_snapshots: Vec<MemoryTurnSnapshotExpectationRow>,
+    pub reconciliation_snapshot: Option<Vec<MemoryReconciliationSnapshotRow>>,
+    pub require_existing_reconciliation_snapshot: bool,
     pub now: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryReconciliationSnapshotRow {
+    pub id: String,
+    pub revision: i64,
+    pub state: String,
+    pub fingerprint: String,
+    pub project_id: Option<String>,
+    pub workspace_key: Option<String>,
+    pub pinned: bool,
+    pub user_edited: bool,
+    pub content_hash: String,
+}
+
+/// Produces the content-free digest persisted in a job's reconciliation snapshot.
+pub fn memory_entry_content_hash(content: Option<&str>) -> String {
+    let material = serde_json::to_vec(&("memory-entry-content-v1", content))
+        .expect("serializing a static tag and optional string cannot fail");
+    Sha256::digest(material)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Derives the canonical identity fingerprint for an entry owner, scope, kind, and stable key.
+pub fn derive_memory_fingerprint(
+    user_id: &str,
+    project_id: Option<&str>,
+    workspace_key: Option<&str>,
+    kind: &str,
+    stable_key: &str,
+) -> String {
+    let material = serde_json::to_vec(&(
+        "memory-fingerprint-v1",
+        user_id,
+        project_id,
+        workspace_key,
+        kind,
+        stable_key,
+    ))
+    .expect("serializing Memory fingerprint fields cannot fail");
+    Sha256::digest(material)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinalizeMemoryJobSnapshotResult {
     Finalized(Box<MemoryJobRow>),
     SnapshotChanged,
+    ReconciliationChanged,
     FenceLost,
 }
 
@@ -298,10 +350,13 @@ pub struct MemoryEntryQueryRow {
 pub struct UpdateMemoryEntryRow {
     pub user_id: String,
     pub id: String,
+    pub expected_revision: i64,
+    pub expected_state: String,
     pub content: Option<String>,
     pub pinned: Option<bool>,
     pub project_id: Option<Option<String>>,
     pub workspace_key: Option<Option<String>>,
+    pub new_fingerprint: Option<String>,
     pub now: TimestampMs,
 }
 

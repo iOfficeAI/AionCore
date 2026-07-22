@@ -5,7 +5,10 @@ use std::collections::{HashMap, HashSet};
 use aionui_api_types::{MemoryEntryKind, MemoryUpdateInput};
 use aionui_common::generate_prefixed_id;
 use aionui_db::models::MemoryEntryRow;
-use aionui_db::{CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow, ExpectedMemoryEntryRow};
+use aionui_db::{
+    CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow, ExpectedMemoryEntryRow,
+    MemoryReconciliationSnapshotRow, derive_memory_fingerprint, memory_entry_content_hash,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -57,6 +60,7 @@ impl Reconciler {
         user_id: &str,
         conversation_id: &str,
         evidence: &MemoryUpdateInput,
+        evidence_snapshot: &[MemoryReconciliationSnapshotRow],
         stored_entries: &[MemoryEntryRow],
         candidates: Vec<ValidatedCandidate>,
     ) -> Result<Vec<CommitMemoryEntryRow>, MemoryError> {
@@ -65,6 +69,17 @@ impl Reconciler {
             .iter()
             .map(|entry| entry.id.as_str())
             .collect::<HashSet<_>>();
+        let snapshot_by_id = evidence_snapshot
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry))
+            .collect::<HashMap<_, _>>();
+        if snapshot_by_id.len() != evidence_snapshot.len()
+            || supplied_ids.len() != snapshot_by_id.len()
+            || supplied_ids.iter().any(|id| !snapshot_by_id.contains_key(id))
+            || evidence_snapshot.iter().any(|entry| entry.state != "active")
+        {
+            return Err(MemoryError::StaleRevision);
+        }
         let mut existing_by_id = HashMap::new();
         let mut existing_by_fingerprint = HashMap::new();
         let mut tombstoned_fingerprints = HashSet::new();
@@ -100,6 +115,12 @@ impl Reconciler {
         let mut reconciled = Vec::with_capacity(candidates.len());
         let mut targeted_entries = HashSet::new();
         let mut candidate_fingerprints = HashSet::new();
+        let explicit_context = ExplicitTargetContext {
+            user_id,
+            evidence,
+            snapshot_by_id: &snapshot_by_id,
+            existing_by_id: &existing_by_id,
+        };
         for candidate in candidates {
             let kind = kind_name(&candidate.kind);
             let fingerprint = memory_fingerprint(
@@ -161,30 +182,24 @@ impl Reconciler {
                     None => (CommitMemoryEntryTransition::Create, None, None),
                 },
                 ValidatedCandidateAction::Refine { target_entry_id } => reconcile_explicit_target(
-                    user_id,
+                    &explicit_context,
                     target_entry_id,
                     &fingerprint,
                     &candidate.content,
-                    evidence,
-                    &existing_by_id,
                     ExplicitAction::Refine,
                 )?,
                 ValidatedCandidateAction::Supersede { target_entry_id } => reconcile_explicit_target(
-                    user_id,
+                    &explicit_context,
                     target_entry_id,
                     &fingerprint,
                     &candidate.content,
-                    evidence,
-                    &existing_by_id,
                     ExplicitAction::Supersede,
                 )?,
                 ValidatedCandidateAction::Conflict { target_entry_id } => reconcile_explicit_target(
-                    user_id,
+                    &explicit_context,
                     target_entry_id,
                     &fingerprint,
                     &candidate.content,
-                    evidence,
-                    &existing_by_id,
                     ExplicitAction::Conflict,
                 )?,
             };
@@ -231,18 +246,42 @@ enum ExplicitAction {
 type MemoryScope = (Option<String>, Option<String>);
 type ReconciledTarget<'a> = (CommitMemoryEntryTransition, Option<&'a str>, Option<MemoryScope>);
 
+struct ExplicitTargetContext<'a> {
+    user_id: &'a str,
+    evidence: &'a MemoryUpdateInput,
+    snapshot_by_id: &'a HashMap<&'a str, &'a MemoryReconciliationSnapshotRow>,
+    existing_by_id: &'a HashMap<&'a str, &'a MemoryEntryRow>,
+}
+
 fn reconcile_explicit_target<'a>(
-    user_id: &str,
+    context: &ExplicitTargetContext<'_>,
     target_entry_id: &'a str,
     candidate_fingerprint: &str,
     candidate_content: &str,
-    evidence: &MemoryUpdateInput,
-    existing_by_id: &HashMap<&str, &MemoryEntryRow>,
     action: ExplicitAction,
 ) -> Result<ReconciledTarget<'a>, MemoryError> {
-    let target = existing_by_id.get(target_entry_id).ok_or(MemoryError::InvalidInput)?;
-    if target.project_id != evidence.conversation.project_id
-        || target.workspace_key != evidence.conversation.workspace_key
+    let snapshot = context
+        .snapshot_by_id
+        .get(target_entry_id)
+        .ok_or(MemoryError::InvalidInput)?;
+    let target = context
+        .existing_by_id
+        .get(target_entry_id)
+        .ok_or(MemoryError::StaleRevision)?;
+    if target.state != "active"
+        || target.revision != snapshot.revision
+        || target.state != snapshot.state
+        || target.fingerprint != snapshot.fingerprint
+        || target.project_id != snapshot.project_id
+        || target.workspace_key != snapshot.workspace_key
+        || target.pinned != snapshot.pinned
+        || target.user_edited != snapshot.user_edited
+        || memory_entry_content_hash(target.content.as_deref()) != snapshot.content_hash
+    {
+        return Err(MemoryError::StaleRevision);
+    }
+    if target.project_id != context.evidence.conversation.project_id
+        || target.workspace_key != context.evidence.conversation.workspace_key
     {
         return Err(MemoryError::InvalidInput);
     }
@@ -266,7 +305,7 @@ fn reconcile_explicit_target<'a>(
         ExplicitAction::Refine | ExplicitAction::Supersede | ExplicitAction::Conflict => {
             CommitMemoryEntryTransition::Conflict {
                 target: expected_entry(target),
-                conflict_group_id: conflict_group_id(user_id, target_entry_id, candidate_fingerprint)?,
+                conflict_group_id: conflict_group_id(context.user_id, target_entry_id, candidate_fingerprint)?,
             }
         }
     };
@@ -296,8 +335,7 @@ pub(crate) fn memory_fingerprint(
     kind: &MemoryEntryKind,
     stable_key: &str,
 ) -> Result<String, MemoryError> {
-    structured_hash(&(
-        "memory-fingerprint-v1",
+    Ok(derive_memory_fingerprint(
         user_id,
         project_id,
         workspace_key,
@@ -403,11 +441,13 @@ mod tests {
     #[test]
     fn matching_create_refines_but_protected_matching_create_conflicts() {
         let evidence = evidence(false);
+        let entries = stored(false, Some("project-1"));
         let refined = Reconciler::reconcile(
             "user-1",
             "conversation-1",
             &evidence,
-            &stored(false, Some("project-1")),
+            &snapshots(&entries),
+            &entries,
             vec![candidate(ValidatedCandidateAction::Create)],
         )
         .unwrap();
@@ -416,11 +456,13 @@ mod tests {
             CommitMemoryEntryTransition::Refine { ref target } if target.id == "entry-1"
         ));
 
+        let protected_entries = stored(true, Some("project-1"));
         let protected = Reconciler::reconcile(
             "user-1",
             "conversation-1",
             &evidence,
-            &stored(true, Some("project-1")),
+            &snapshots(&protected_entries),
+            &protected_entries,
             vec![candidate(ValidatedCandidateAction::Create)],
         )
         .unwrap();
@@ -433,11 +475,13 @@ mod tests {
     #[test]
     fn explicit_replacement_and_ambiguity_map_without_model_calls() {
         let evidence = evidence(false);
+        let entries = stored(false, Some("project-1"));
         let reconciled = Reconciler::reconcile(
             "user-1",
             "conversation-1",
             &evidence,
-            &stored(false, Some("project-1")),
+            &snapshots(&entries),
+            &entries,
             vec![candidate(ValidatedCandidateAction::Supersede {
                 target_entry_id: "entry-1".into(),
             })],
@@ -452,7 +496,8 @@ mod tests {
             "user-1",
             "conversation-1",
             &evidence,
-            &stored(false, Some("project-1")),
+            &snapshots(&entries),
+            &entries,
             vec![candidate(ValidatedCandidateAction::Conflict {
                 target_entry_id: "entry-1".into(),
             })],
@@ -476,6 +521,7 @@ mod tests {
                 "conversation-1",
                 &evidence,
                 &[],
+                &[],
                 vec![
                     candidate(ValidatedCandidateAction::Create),
                     candidate(ValidatedCandidateAction::Create),
@@ -488,11 +534,13 @@ mod tests {
     #[test]
     fn matching_key_in_a_different_scope_remains_a_create() {
         let evidence = evidence(false);
+        let entries = stored(false, None);
         let reconciled = Reconciler::reconcile(
             "user-1",
             "conversation-1",
             &evidence,
-            &stored(false, None),
+            &snapshots(&entries),
+            &entries,
             vec![candidate(ValidatedCandidateAction::Create)],
         )
         .unwrap();
@@ -509,6 +557,7 @@ mod tests {
             "user-1",
             "conversation-1",
             &evidence,
+            &[],
             &stored(false, Some("project-1")),
             vec![candidate(ValidatedCandidateAction::Create)],
         )
@@ -526,6 +575,7 @@ mod tests {
                 "user-1",
                 "conversation-1",
                 &evidence,
+                &[],
                 &deleted,
                 vec![candidate(ValidatedCandidateAction::Create)],
             )
@@ -543,6 +593,7 @@ mod tests {
             "user-1",
             "conversation-1",
             &evidence,
+            &snapshots(&entries),
             &entries,
             vec![candidate(ValidatedCandidateAction::Create)],
         )
@@ -563,8 +614,15 @@ mod tests {
             target_entry_id: "entry-1".into(),
         });
         proposal.stable_key = "different release identity".into();
-        let reconciled =
-            Reconciler::reconcile("user-1", "conversation-1", &evidence, &entries, vec![proposal]).unwrap();
+        let reconciled = Reconciler::reconcile(
+            "user-1",
+            "conversation-1",
+            &evidence,
+            &snapshots(&entries),
+            &entries,
+            vec![proposal],
+        )
+        .unwrap();
         assert!(matches!(
             reconciled[0].transition,
             CommitMemoryEntryTransition::Conflict { ref target, .. } if target.id == "entry-1"
@@ -574,12 +632,14 @@ mod tests {
     #[test]
     fn explicit_targets_must_match_the_conversation_scope_exactly() {
         let evidence = evidence(false);
+        let entries = stored(false, None);
         assert_eq!(
             Reconciler::reconcile(
                 "user-1",
                 "conversation-1",
                 &evidence,
-                &stored(false, None),
+                &snapshots(&entries),
+                &entries,
                 vec![candidate(ValidatedCandidateAction::Refine {
                     target_entry_id: "entry-1".into(),
                 })],
@@ -592,11 +652,13 @@ mod tests {
     fn conflict_group_is_deterministic_for_repeated_identical_input() {
         let evidence = evidence(true);
         let run = || {
+            let entries = stored(true, Some("project-1"));
             let reconciled = Reconciler::reconcile(
                 "user-1",
                 "conversation-1",
                 &evidence,
-                &stored(true, Some("project-1")),
+                &snapshots(&entries),
+                &entries,
                 vec![candidate(ValidatedCandidateAction::Conflict {
                     target_entry_id: "entry-1".into(),
                 })],
@@ -667,5 +729,22 @@ mod tests {
             updated_at: 1,
             sources: Vec::new(),
         }]
+    }
+
+    fn snapshots(entries: &[MemoryEntryRow]) -> Vec<aionui_db::MemoryReconciliationSnapshotRow> {
+        entries
+            .iter()
+            .map(|entry| aionui_db::MemoryReconciliationSnapshotRow {
+                id: entry.id.clone(),
+                revision: entry.revision,
+                state: entry.state.clone(),
+                fingerprint: entry.fingerprint.clone(),
+                project_id: entry.project_id.clone(),
+                workspace_key: entry.workspace_key.clone(),
+                pinned: entry.pinned,
+                user_edited: entry.user_edited,
+                content_hash: aionui_db::memory_entry_content_hash(entry.content.as_deref()),
+            })
+            .collect()
     }
 }

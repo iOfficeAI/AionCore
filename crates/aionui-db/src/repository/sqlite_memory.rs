@@ -18,9 +18,10 @@ use crate::repository::memory::{
     BoundedMemoryTurnMessagesRow, ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition,
     CommitMemorySourceRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow,
     FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, IMemoryRepository, MEMORY_EVIDENCE_MAX_BYTES,
-    MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow, MemoryEntryQueryRow, ReleaseMemoryLeaseRow,
-    RenewMemoryLeaseRow, SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow,
-    UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow, UpdateMemoryLifecycleRow, UpdateMemorySettingsRow,
+    MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow, MemoryEntryQueryRow, MemoryReconciliationSnapshotRow,
+    ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, SplitMemoryJobRow, TransitionMemoryJobRow,
+    UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow,
+    UpdateMemoryLifecycleRow, UpdateMemorySettingsRow, derive_memory_fingerprint, memory_entry_content_hash,
     memory_evidence_content,
 };
 
@@ -305,6 +306,47 @@ impl SqliteMemoryRepository {
         Ok(true)
     }
 
+    async fn reconciliation_snapshot_matches_on(
+        connection: &mut SqliteConnection,
+        job: &MemoryJobRow,
+    ) -> Result<bool, DbError> {
+        let Some(snapshot_json) = job.reconciliation_snapshot_json.as_deref() else {
+            return Ok(true);
+        };
+        let snapshot: Vec<MemoryReconciliationSnapshotRow> = serde_json::from_str(snapshot_json)
+            .map_err(|error| DbError::Conflict(format!("Invalid Memory reconciliation snapshot: {error}")))?;
+        if snapshot.len() > 64 {
+            return Ok(false);
+        }
+        let mut ids = std::collections::HashSet::new();
+        for expected in snapshot {
+            if !ids.insert(expected.id.clone()) || expected.state != "active" {
+                return Ok(false);
+            }
+            let current =
+                sqlx::query_as::<_, MemoryEntryDbRow>("SELECT * FROM memory_entries WHERE id = ? AND user_id = ?")
+                    .bind(&expected.id)
+                    .bind(&job.user_id)
+                    .fetch_optional(&mut *connection)
+                    .await?;
+            let Some(current) = current else {
+                return Ok(false);
+            };
+            if current.revision != expected.revision
+                || current.state != expected.state
+                || current.fingerprint != expected.fingerprint
+                || current.project_id != expected.project_id
+                || current.workspace_key != expected.workspace_key
+                || current.pinned != expected.pinned
+                || current.user_edited != expected.user_edited
+                || memory_entry_content_hash(current.content.as_deref()) != expected.content_hash
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     async fn absorb_queued_successor_on(
         connection: &mut SqliteConnection,
         barrier: &MemoryJobRow,
@@ -422,7 +464,8 @@ impl SqliteMemoryRepository {
                 sqlx::query(
                     "UPDATE memory_jobs SET through_turn_id = ?,turn_count = ?,queue_digest = ?,input_hash = ?,
                      state = 'failed',attempt_count = ?,invalid_output_count = ?,next_attempt_at = NULL,
-                     last_error_code = ?,lease_owner = NULL,lease_token = NULL,lease_expires_at = NULL,updated_at = ?
+                     last_error_code = ?,lease_owner = NULL,lease_token = NULL,lease_expires_at = NULL,
+                     reconciliation_snapshot_json = NULL,updated_at = ?
                      WHERE id = ?",
                 )
                 .bind(&successor.through_turn_id)
@@ -464,7 +507,8 @@ impl SqliteMemoryRepository {
                 "UPDATE memory_jobs SET from_turn_id = ?, operation_version = ?, global_epoch = ?,
                  conversation_epoch = ?, turn_count = ?, queue_digest = ?, input_hash = ?, expected_revision = ?,
                  state = ?, attempt_count = ?, invalid_output_count = ?, next_attempt_at = ?, last_error_code = ?,
-                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?",
+                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+                 reconciliation_snapshot_json = NULL, updated_at = ? WHERE id = ?",
             )
             .bind(&running.from_turn_id)
             .bind(&running.operation_version)
@@ -495,7 +539,8 @@ impl SqliteMemoryRepository {
 
         sqlx::query(
             "UPDATE memory_jobs SET state = ?, next_attempt_at = ?, last_error_code = ?, attempt_count = ?,
-             invalid_output_count = ?, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+             invalid_output_count = ?, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+             reconciliation_snapshot_json = NULL, updated_at = ?
              WHERE id = ?",
         )
         .bind(transition.state)
@@ -838,7 +883,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
             if lifecycle_changed {
                 sqlx::query(
                     "UPDATE memory_jobs SET state = 'canceled',lease_owner = NULL,lease_token = NULL,
-                     lease_expires_at = NULL,next_attempt_at = NULL,last_error_code = 'canceled',updated_at = ?
+                     lease_expires_at = NULL,reconciliation_snapshot_json = NULL,next_attempt_at = NULL,
+                     last_error_code = 'canceled',updated_at = ?
                      WHERE user_id = ? AND state IN ('pending','running','retry_wait','blocked','failed')",
                 )
                 .bind(command.now)
@@ -938,7 +984,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
             if capture_changed {
                 sqlx::query(
                     "UPDATE memory_jobs SET state = 'canceled',lease_owner = NULL,lease_token = NULL,
-                     lease_expires_at = NULL,next_attempt_at = NULL,last_error_code = 'canceled',updated_at = ?
+                     lease_expires_at = NULL,reconciliation_snapshot_json = NULL,next_attempt_at = NULL,
+                     last_error_code = 'canceled',updated_at = ?
                      WHERE user_id = ? AND conversation_id = ?
                      AND state IN ('pending','running','retry_wait','blocked','failed')",
                 )
@@ -1174,7 +1221,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
             let barrier = Self::absorb_queued_successor_on(&mut connection, &failed, now).await?;
             sqlx::query(
                 "UPDATE memory_jobs SET state = 'pending',next_attempt_at = NULL,last_error_code = NULL,
-                 lease_owner = NULL,lease_token = NULL,lease_expires_at = NULL,updated_at = ? WHERE id = ?",
+                 lease_owner = NULL,lease_token = NULL,lease_expires_at = NULL,
+                 reconciliation_snapshot_json = NULL,updated_at = ? WHERE id = ?",
             )
             .bind(now)
             .bind(&barrier.id)
@@ -1421,6 +1469,51 @@ impl IMemoryRepository for SqliteMemoryRepository {
                     .execute(&mut *connection)
                     .await?;
             }
+            let reconciliation_snapshot_json = if let Some(snapshot) = &input.reconciliation_snapshot {
+                if snapshot.len() > 64 {
+                    return Ok(FinalizeMemoryJobSnapshotResult::ReconciliationChanged);
+                }
+                let mut ids = std::collections::HashSet::new();
+                for expected in snapshot {
+                    if !ids.insert(expected.id.as_str()) || expected.state != "active" {
+                        return Ok(FinalizeMemoryJobSnapshotResult::ReconciliationChanged);
+                    }
+                    let current = sqlx::query_as::<_, MemoryEntryDbRow>(
+                        "SELECT * FROM memory_entries WHERE id = ? AND user_id = ?",
+                    )
+                    .bind(&expected.id)
+                    .bind(&input.user_id)
+                    .fetch_optional(&mut *connection)
+                    .await?;
+                    let Some(current) = current else {
+                        return Ok(FinalizeMemoryJobSnapshotResult::ReconciliationChanged);
+                    };
+                    if current.revision != expected.revision
+                        || current.state != expected.state
+                        || current.fingerprint != expected.fingerprint
+                        || current.project_id != expected.project_id
+                        || current.workspace_key != expected.workspace_key
+                        || current.pinned != expected.pinned
+                        || current.user_edited != expected.user_edited
+                        || memory_entry_content_hash(current.content.as_deref()) != expected.content_hash
+                    {
+                        return Ok(FinalizeMemoryJobSnapshotResult::ReconciliationChanged);
+                    }
+                }
+                Some(serde_json::to_string(snapshot).map_err(|error| DbError::Init(error.to_string()))?)
+            } else {
+                None
+            };
+            if input.require_existing_reconciliation_snapshot && job.reconciliation_snapshot_json.is_none() {
+                return Ok(FinalizeMemoryJobSnapshotResult::ReconciliationChanged);
+            }
+            if let (Some(persisted), Some(current)) = (
+                job.reconciliation_snapshot_json.as_deref(),
+                reconciliation_snapshot_json.as_deref(),
+            ) && persisted != current
+            {
+                return Ok(FinalizeMemoryJobSnapshotResult::ReconciliationChanged);
+            }
             let input_hash = Self::input_hash(
                 &job.operation_version,
                 job.global_epoch,
@@ -1429,13 +1522,17 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 job.turn_count,
                 digest,
             )?;
-            sqlx::query("UPDATE memory_jobs SET queue_digest = ?,input_hash = ?,updated_at = ? WHERE id = ?")
-                .bind(Self::queue_digest(digest))
-                .bind(input_hash)
-                .bind(input.now)
-                .bind(&input.job_id)
-                .execute(&mut *connection)
-                .await?;
+            sqlx::query(
+                "UPDATE memory_jobs SET queue_digest = ?,input_hash = ?,
+                 reconciliation_snapshot_json = COALESCE(reconciliation_snapshot_json, ?),updated_at = ? WHERE id = ?",
+            )
+            .bind(Self::queue_digest(digest))
+            .bind(input_hash)
+            .bind(reconciliation_snapshot_json)
+            .bind(input.now)
+            .bind(&input.job_id)
+            .execute(&mut *connection)
+            .await?;
             let finalized = sqlx::query_as("SELECT * FROM memory_jobs WHERE id = ?")
                 .bind(&input.job_id)
                 .fetch_one(&mut *connection)
@@ -1595,7 +1692,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
             if lifecycle_changed {
                 sqlx::query(
                     "UPDATE memory_jobs SET state = 'canceled',lease_owner = NULL,lease_token = NULL,
-                     lease_expires_at = NULL,next_attempt_at = NULL,last_error_code = 'canceled',updated_at = ?
+                     lease_expires_at = NULL,reconciliation_snapshot_json = NULL,next_attempt_at = NULL,
+                     last_error_code = 'canceled',updated_at = ?
                      WHERE user_id = ? AND state IN ('pending','running','retry_wait','blocked','failed')",
                 )
                 .bind(input.now)
@@ -1645,7 +1743,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
             if lifecycle_changed {
                 sqlx::query(
                     "UPDATE memory_jobs SET state = 'canceled',lease_owner = NULL,lease_token = NULL,
-                     lease_expires_at = NULL,next_attempt_at = NULL,last_error_code = 'canceled',updated_at = ?
+                     lease_expires_at = NULL,reconciliation_snapshot_json = NULL,next_attempt_at = NULL,
+                     last_error_code = 'canceled',updated_at = ?
                      WHERE user_id = ? AND conversation_id = ? AND state IN ('pending','running','retry_wait','blocked','failed')",
                 ).bind(input.now).bind(&input.user_id).bind(&input.conversation_id)
                 .execute(&mut *connection).await?;
@@ -1819,7 +1918,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
             Some(conversation_id) => {
                 sqlx::query(
                     "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
-                     next_attempt_at = NULL, last_error_code = 'canceled', updated_at = ?
+                     reconciliation_snapshot_json = NULL, next_attempt_at = NULL, last_error_code = 'canceled', updated_at = ?
                      WHERE user_id = ? AND conversation_id = ?
                        AND state IN ('pending','running','retry_wait','blocked','failed')",
                 )
@@ -1832,7 +1931,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
             None => {
                 sqlx::query(
                     "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
-                     next_attempt_at = NULL, last_error_code = 'canceled', updated_at = ?
+                     reconciliation_snapshot_json = NULL, next_attempt_at = NULL, last_error_code = 'canceled', updated_at = ?
                      WHERE user_id = ? AND state IN ('pending','running','retry_wait','blocked','failed')",
                 )
                 .bind(now)
@@ -1975,6 +2074,9 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 .await?;
                 return Ok(CommitMemoryUpdateResult::SnapshotChanged);
             }
+            if !Self::reconciliation_snapshot_matches_on(&mut connection, &job).await? {
+                return Self::requeue_stale_reconciliation_on(&mut connection, &job, input.now).await;
+            }
 
             let current_revision: Option<i64> = sqlx::query_scalar(
                 "SELECT revision FROM conversation_memories WHERE user_id = ? AND conversation_id = ?",
@@ -2091,6 +2193,9 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 };
                 if let Some(target) = target {
                     Self::ensure_transition_target_owner_on(&mut connection, &input.user_id, &target.id).await?;
+                    if target.state != "active" {
+                        return Self::requeue_stale_reconciliation_on(&mut connection, &job, input.now).await;
+                    }
                 }
                 let tombstoned: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM memory_entries WHERE user_id = ? AND fingerprint = ? AND state = 'deleted')",
@@ -2341,7 +2446,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 .execute(&mut *connection)
                 .await?;
             sqlx::query(
-                "UPDATE memory_jobs SET state = 'succeeded', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+                "UPDATE memory_jobs SET state = 'succeeded', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+                 reconciliation_snapshot_json = NULL, updated_at = ?
                  WHERE id = ? AND user_id = ? AND state = 'running'",
             )
             .bind(input.now)
@@ -2468,48 +2574,108 @@ impl IMemoryRepository for SqliteMemoryRepository {
     async fn update_entry(&self, input: UpdateMemoryEntryRow) -> Result<MemoryEntryRow, DbError> {
         let mut connection = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
-        let project_present = input.project_id.is_some();
-        let project_id = input.project_id.flatten();
-        let workspace_present = input.workspace_key.is_some();
-        let workspace_key = input.workspace_key.flatten();
         let result = async {
+            let current =
+                sqlx::query_as::<_, MemoryEntryDbRow>("SELECT * FROM memory_entries WHERE id = ? AND user_id = ?")
+                    .bind(&input.id)
+                    .bind(&input.user_id)
+                    .fetch_optional(&mut *connection)
+                    .await?
+                    .ok_or_else(|| DbError::NotFound(format!("Memory entry '{}' not found", input.id)))?;
+            if current.state == "deleted" {
+                return Err(DbError::Conflict(format!(
+                    "Deleted Memory entry '{}' cannot be updated",
+                    input.id
+                )));
+            }
+            if current.revision != input.expected_revision || current.state != input.expected_state {
+                return Err(DbError::Conflict(format!(
+                    "Memory entry '{}' revision or state changed",
+                    input.id
+                )));
+            }
+            let project_id = input.project_id.clone().unwrap_or_else(|| current.project_id.clone());
+            let workspace_key = input
+                .workspace_key
+                .clone()
+                .unwrap_or_else(|| current.workspace_key.clone());
+            let scope_changed = project_id != current.project_id || workspace_key != current.workspace_key;
+            let fingerprint = if scope_changed {
+                let supplied = input
+                    .new_fingerprint
+                    .as_deref()
+                    .ok_or_else(|| DbError::Conflict("Memory scope edits require a rederived fingerprint".into()))?;
+                let derived = derive_memory_fingerprint(
+                    &input.user_id,
+                    project_id.as_deref(),
+                    workspace_key.as_deref(),
+                    &current.kind,
+                    &current.stable_key,
+                );
+                if supplied != derived {
+                    return Err(DbError::Conflict(
+                        "Memory scope fingerprint does not match identity".into(),
+                    ));
+                }
+                let blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM memory_entries
+                        WHERE user_id = ? AND fingerprint = ? AND id <> ?
+                          AND state IN ('active','deleted')
+                    )",
+                )
+                .bind(&input.user_id)
+                .bind(supplied)
+                .bind(&input.id)
+                .fetch_one(&mut *connection)
+                .await?;
+                if blocked {
+                    return Err(DbError::Conflict(
+                        "Memory scope identity is already active or tombstoned".into(),
+                    ));
+                }
+                supplied.to_owned()
+            } else {
+                if input
+                    .new_fingerprint
+                    .as_deref()
+                    .is_some_and(|fingerprint| fingerprint != current.fingerprint)
+                {
+                    return Err(DbError::Conflict(
+                        "Memory fingerprint cannot change without a scope edit".into(),
+                    ));
+                }
+                current.fingerprint.clone()
+            };
             let updated = sqlx::query(
                 "UPDATE memory_entries SET
                     content = COALESCE(?, content),
                     user_edited = CASE WHEN ? IS NULL THEN user_edited ELSE 1 END,
                     pinned = COALESCE(?, pinned),
-                    project_id = CASE WHEN ? THEN ? ELSE project_id END,
-                    workspace_key = CASE WHEN ? THEN ? ELSE workspace_key END,
+                    project_id = ?, workspace_key = ?, fingerprint = ?,
                     revision = revision + 1,
                     updated_at = ?
-                 WHERE id = ? AND user_id = ? AND state <> 'deleted'",
+                 WHERE id = ? AND user_id = ? AND state = ? AND revision = ? AND fingerprint = ?",
             )
             .bind(&input.content)
             .bind(&input.content)
             .bind(input.pinned)
-            .bind(project_present)
-            .bind(project_id)
-            .bind(workspace_present)
-            .bind(workspace_key)
+            .bind(&project_id)
+            .bind(&workspace_key)
+            .bind(&fingerprint)
             .bind(input.now)
             .bind(&input.id)
             .bind(&input.user_id)
+            .bind(&input.expected_state)
+            .bind(input.expected_revision)
+            .bind(&current.fingerprint)
             .execute(&mut *connection)
             .await?;
             if updated.rows_affected() == 0 {
-                let state: Option<String> =
-                    sqlx::query_scalar("SELECT state FROM memory_entries WHERE id = ? AND user_id = ?")
-                        .bind(&input.id)
-                        .bind(&input.user_id)
-                        .fetch_optional(&mut *connection)
-                        .await?;
-                return match state.as_deref() {
-                    Some("deleted") => Err(DbError::Conflict(format!(
-                        "Deleted Memory entry '{}' cannot be updated",
-                        input.id
-                    ))),
-                    _ => Err(DbError::NotFound(format!("Memory entry '{}' not found", input.id))),
-                };
+                return Err(DbError::Conflict(format!(
+                    "Memory entry '{}' revision or state changed",
+                    input.id
+                )));
             }
             let row = sqlx::query_as::<_, MemoryEntryDbRow>(
                 "SELECT * FROM memory_entries WHERE id = ? AND user_id = ? AND state <> 'deleted'",
@@ -2616,7 +2782,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 .execute(&mut *connection)
                 .await?;
             sqlx::query(
-                "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+                "UPDATE memory_jobs SET state = 'canceled', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+                 reconciliation_snapshot_json = NULL, updated_at = ?
                  WHERE user_id = ? AND conversation_id = ? AND state NOT IN ('succeeded', 'canceled')",
             )
             .bind(now)
@@ -2731,6 +2898,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
         target_ids: &[String],
     ) -> Result<Vec<MemoryEntryRow>, DbError> {
         const MAX_LOOKUPS: usize = 32;
+        const MAX_RESULTS: usize = MAX_LOOKUPS * 3;
         if fingerprints.len() > MAX_LOOKUPS || target_ids.len() > MAX_LOOKUPS {
             return Err(DbError::Conflict(
                 "Memory reconciliation lookup exceeds its bound".into(),
@@ -2740,14 +2908,20 @@ impl IMemoryRepository for SqliteMemoryRepository {
         let mut rows = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for fingerprint in fingerprints {
-            let matches = sqlx::query_as::<_, MemoryEntryDbRow>(
-                "SELECT * FROM memory_entries WHERE user_id = ? AND fingerprint = ? ORDER BY id",
-            )
-            .bind(user_id)
-            .bind(fingerprint)
-            .fetch_all(&self.pool)
-            .await?;
-            for row in matches {
+            for state in ["active", "deleted"] {
+                let row = sqlx::query_as::<_, MemoryEntryDbRow>(
+                    "SELECT * FROM memory_entries
+                     WHERE user_id = ? AND fingerprint = ? AND state = ?
+                     ORDER BY updated_at DESC, id LIMIT 1",
+                )
+                .bind(user_id)
+                .bind(fingerprint)
+                .bind(state)
+                .fetch_optional(&self.pool)
+                .await?;
+                let Some(row) = row else {
+                    continue;
+                };
                 if seen.insert(row.id.clone()) {
                     rows.push(row);
                 }
@@ -2766,7 +2940,12 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 rows.push(row);
             }
         }
-        self.entry_rows_with_sources(rows).await
+        if rows.len() > MAX_RESULTS {
+            return Err(DbError::Conflict(
+                "Memory reconciliation result exceeds its bound".into(),
+            ));
+        }
+        Ok(rows.into_iter().map(|row| row.with_sources(Vec::new())).collect())
     }
 
     async fn create_retrieval(&self, retrieval: MemoryRetrievalRow) -> Result<MemoryRetrievalRow, DbError> {
@@ -2850,9 +3029,10 @@ mod tests {
         ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
         CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, ExpectedMemoryEntryRow,
         FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, MemoryCandidateQueryRow,
-        MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, SplitMemoryJobRow,
-        TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow,
-        UpdateMemoryEntryRow, UpdateMemorySettingsRow,
+        MemoryReconciliationSnapshotRow, MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow,
+        SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow,
+        UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow, UpdateMemorySettingsRow, derive_memory_fingerprint,
+        memory_entry_content_hash,
     };
     use crate::repository::{IConversationRepository, IMemoryRepository, SqliteConversationRepository};
     use crate::{DbError, init_database_memory};
@@ -3717,6 +3897,8 @@ mod tests {
                     turn_id: "turn-1".into(),
                     snapshot_hash: validated.snapshot_hash.clone(),
                 }],
+                reconciliation_snapshot: None,
+                require_existing_reconciliation_snapshot: false,
                 now: 20,
             })
             .await
@@ -3771,12 +3953,96 @@ mod tests {
                     turn_id: "turn-1".into(),
                     snapshot_hash: validated.snapshot_hash,
                 }],
+                reconciliation_snapshot: None,
+                require_existing_reconciliation_snapshot: false,
                 now: 20,
             })
             .await
             .unwrap(),
             FinalizeMemoryJobSnapshotResult::SnapshotChanged,
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_finalizes_content_free_entry_snapshot_and_rejects_later_drift() {
+        let (repo, _, _db) = setup().await;
+        sqlx::query(
+            "INSERT INTO memory_entries
+                (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited,
+                 schema_version, created_at, updated_at)
+             VALUES ('snapshot-entry', ?, 'decision', 'snapshot key', 'snapshot-fingerprint',
+                     'private memory content', 'active', 0, 0, 1, 1, 1)",
+        )
+        .bind(USER_A)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        let job = enqueue_turn(&repo, "snapshot-job", "conv_a", "turn-1", 10)
+            .await
+            .unwrap();
+        let claimed = repo
+            .claim_next_job(claim(USER_A, "snapshot-worker", 20))
+            .await
+            .unwrap()
+            .unwrap();
+        let turn = repo
+            .load_job_turn_messages_bounded(USER_A, &job.id, "turn-1", 128, 64 * 1024)
+            .await
+            .unwrap();
+        let entry_snapshot = MemoryReconciliationSnapshotRow {
+            id: "snapshot-entry".into(),
+            revision: 0,
+            state: "active".into(),
+            fingerprint: "snapshot-fingerprint".into(),
+            project_id: None,
+            workspace_key: None,
+            pinned: false,
+            user_edited: false,
+            content_hash: memory_entry_content_hash(Some("private memory content")),
+        };
+        let finalize = |require_existing_reconciliation_snapshot| FinalizeMemoryJobSnapshotRow {
+            user_id: USER_A.into(),
+            job_id: job.id.clone(),
+            lease_token: claimed.lease_token.clone().unwrap(),
+            expected_global_epoch: claimed.global_epoch,
+            expected_conversation_epoch: claimed.conversation_epoch,
+            turn_snapshots: vec![MemoryTurnSnapshotExpectationRow {
+                turn_id: "turn-1".into(),
+                snapshot_hash: turn.snapshot_hash.clone(),
+            }],
+            reconciliation_snapshot: Some(vec![entry_snapshot.clone()]),
+            require_existing_reconciliation_snapshot,
+            now: 21,
+        };
+
+        let finalized = repo.finalize_claimed_job_snapshot(finalize(false)).await.unwrap();
+        let FinalizeMemoryJobSnapshotResult::Finalized(finalized) = finalized else {
+            panic!("expected finalized snapshot");
+        };
+        let persisted = finalized.reconciliation_snapshot_json.unwrap();
+        assert!(!persisted.contains("private memory content"));
+        assert_eq!(
+            serde_json::from_str::<Vec<MemoryReconciliationSnapshotRow>>(&persisted).unwrap(),
+            vec![entry_snapshot.clone()],
+        );
+
+        sqlx::query(
+            "UPDATE memory_entries SET content = 'changed after evidence', revision = revision + 1
+             WHERE id = 'snapshot-entry'",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.finalize_claimed_job_snapshot(finalize(true)).await.unwrap(),
+            FinalizeMemoryJobSnapshotResult::ReconciliationChanged,
+        );
+        let unchanged: String =
+            sqlx::query_scalar("SELECT reconciliation_snapshot_json FROM memory_jobs WHERE id = 'snapshot-job'")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(unchanged, persisted);
     }
 
     #[tokio::test]
@@ -4461,10 +4727,13 @@ mod tests {
             repo.update_entry(UpdateMemoryEntryRow {
                 user_id: USER_A.into(),
                 id: "entry-delete".into(),
+                expected_revision: 1,
+                expected_state: "deleted".into(),
                 content: Some("must stay deleted".into()),
                 pinned: None,
                 project_id: None,
                 workspace_key: None,
+                new_fingerprint: None,
                 now: 26,
             })
             .await,
@@ -4525,15 +4794,185 @@ mod tests {
             repo.update_entry(UpdateMemoryEntryRow {
                 user_id: USER_A.into(),
                 id: "entry-update-race".into(),
+                expected_revision: 0,
+                expected_state: "active".into(),
                 content: Some("must not report success".into()),
                 pinned: None,
                 project_id: None,
                 workspace_key: None,
+                new_fingerprint: None,
                 now: 26,
             })
             .await,
             Err(DbError::Conflict(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_scope_edit_requires_a_rederived_fingerprint() {
+        let (repo, _, _db) = setup().await;
+        claimed_job(&repo, "job-scope-edit", "conv_a", "turn-1").await;
+        repo.commit_update(commit(
+            "job-scope-edit",
+            "conv_a",
+            "turn-1",
+            0,
+            vec![entry(
+                "scope-entry",
+                "scope-old-fingerprint",
+                vec![source("conv_a", "turn-1")],
+            )],
+            20,
+        ))
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            repo.update_entry(UpdateMemoryEntryRow {
+                user_id: USER_A.into(),
+                id: "scope-entry".into(),
+                expected_revision: 0,
+                expected_state: "active".into(),
+                content: None,
+                pinned: None,
+                project_id: Some(Some("project-moved".into())),
+                workspace_key: None,
+                new_fingerprint: None,
+                now: 25,
+            })
+            .await,
+            Err(DbError::Conflict(_))
+        ));
+        let unchanged = repo.get_entry(USER_A, "scope-entry").await.unwrap().unwrap();
+        assert_eq!(unchanged.project_id, None);
+        assert_eq!(unchanged.fingerprint, "scope-old-fingerprint");
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_scope_edit_moves_the_canonical_lookup_under_revision_cas() {
+        let (repo, _, db) = setup().await;
+        let old_fingerprint = derive_memory_fingerprint(USER_A, None, None, "decision", "move key");
+        sqlx::query(
+            "INSERT INTO memory_entries
+                (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited,
+                 schema_version, created_at, updated_at)
+             VALUES ('move-entry', ?, 'decision', 'move key', ?, 'move content', 'active', 0, 0, 1, 1, 1)",
+        )
+        .bind(USER_A)
+        .bind(&old_fingerprint)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let moved_fingerprint = derive_memory_fingerprint(USER_A, Some("project-moved"), None, "decision", "move key");
+
+        assert!(matches!(
+            repo.update_entry(UpdateMemoryEntryRow {
+                user_id: USER_A.into(),
+                id: "move-entry".into(),
+                expected_revision: 1,
+                expected_state: "active".into(),
+                content: None,
+                pinned: None,
+                project_id: Some(Some("project-moved".into())),
+                workspace_key: None,
+                new_fingerprint: Some(moved_fingerprint.clone()),
+                now: 2,
+            })
+            .await,
+            Err(DbError::Conflict(_))
+        ));
+        let moved = repo
+            .update_entry(UpdateMemoryEntryRow {
+                user_id: USER_A.into(),
+                id: "move-entry".into(),
+                expected_revision: 0,
+                expected_state: "active".into(),
+                content: None,
+                pinned: None,
+                project_id: Some(Some("project-moved".into())),
+                workspace_key: None,
+                new_fingerprint: Some(moved_fingerprint.clone()),
+                now: 3,
+            })
+            .await
+            .unwrap();
+        assert_eq!(moved.revision, 1);
+        assert_eq!(moved.project_id.as_deref(), Some("project-moved"));
+        assert_eq!(moved.fingerprint, moved_fingerprint);
+        assert!(
+            repo.reconciliation_entries(USER_A, &[old_fingerprint], &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            repo.reconciliation_entries(USER_A, &[moved.fingerprint], &[])
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            ["move-entry"],
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_scope_edit_rejects_active_and_tombstoned_destination_identities() {
+        let (repo, _, db) = setup().await;
+        let source_fingerprint = derive_memory_fingerprint(USER_A, None, None, "decision", "source key");
+        sqlx::query(
+            "INSERT INTO memory_entries
+                (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited,
+                 schema_version, created_at, updated_at)
+             VALUES ('scope-source', ?, 'decision', 'source key', ?, 'source', 'active', 0, 0, 1, 1, 1)",
+        )
+        .bind(USER_A)
+        .bind(&source_fingerprint)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (scope, id, state, content, deleted_at) in [
+            ("active-destination", "scope-active", "active", Some("active"), None),
+            ("deleted-destination", "scope-deleted", "deleted", None, Some(2_i64)),
+        ] {
+            let fingerprint = derive_memory_fingerprint(USER_A, Some(scope), None, "decision", "source key");
+            sqlx::query(
+                "INSERT INTO memory_entries
+                    (id, user_id, project_id, kind, stable_key, fingerprint, content, state, pinned, user_edited,
+                     schema_version, deleted_at, created_at, updated_at)
+                 VALUES (?, ?, ?, 'decision', 'source key', ?, ?, ?, 0, 0, 1, ?, 2, 2)",
+            )
+            .bind(id)
+            .bind(USER_A)
+            .bind(scope)
+            .bind(&fingerprint)
+            .bind(content)
+            .bind(state)
+            .bind(deleted_at)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert!(matches!(
+                repo.update_entry(UpdateMemoryEntryRow {
+                    user_id: USER_A.into(),
+                    id: "scope-source".into(),
+                    expected_revision: 0,
+                    expected_state: "active".into(),
+                    content: None,
+                    pinned: None,
+                    project_id: Some(Some(scope.into())),
+                    workspace_key: None,
+                    new_fingerprint: Some(fingerprint),
+                    now: 3,
+                })
+                .await,
+                Err(DbError::Conflict(_))
+            ));
+        }
+        let source = repo.get_entry(USER_A, "scope-source").await.unwrap().unwrap();
+        assert_eq!(source.revision, 0);
+        assert_eq!(source.project_id, None);
+        assert_eq!(source.fingerprint, source_fingerprint);
     }
 
     #[tokio::test]
@@ -4653,10 +5092,13 @@ mod tests {
                     .update_entry(UpdateMemoryEntryRow {
                         user_id: USER_A.into(),
                         id: target_id.clone(),
+                        expected_revision: 0,
+                        expected_state: "active".into(),
                         content: edited_content.map(str::to_owned),
                         pinned,
                         project_id: None,
                         workspace_key: None,
+                        new_fingerprint: None,
                         now: 21,
                     })
                     .await
@@ -4772,10 +5214,13 @@ mod tests {
             .update_entry(UpdateMemoryEntryRow {
                 user_id: USER_A.into(),
                 id: "protected-source-target".into(),
+                expected_revision: 0,
+                expected_state: "active".into(),
                 content: None,
                 pinned: Some(true),
                 project_id: None,
                 workspace_key: None,
+                new_fingerprint: None,
                 now: 21,
             })
             .await
@@ -4886,6 +5331,76 @@ mod tests {
                 .map(str::to_owned)
                 .collect(),
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_reconciliation_lookup_bounds_conflicts_and_omits_sources() {
+        let (repo, _, db) = setup().await;
+        for (id, state, deleted_at, updated_at) in [
+            ("bounded-active", "active", None, 1_i64),
+            ("bounded-deleted-old", "deleted", Some(2_i64), 2),
+            ("bounded-deleted-new", "deleted", Some(3_i64), 3),
+        ] {
+            sqlx::query(
+                "INSERT INTO memory_entries
+                    (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited,
+                     schema_version, deleted_at, created_at, updated_at)
+                 VALUES (?, ?, 'decision', ?, 'bounded-fingerprint', ?, ?, 0, 0, 1, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(USER_A)
+            .bind(id)
+            .bind((state != "deleted").then_some(id))
+            .bind(state)
+            .bind(deleted_at)
+            .bind(updated_at)
+            .bind(updated_at)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        for index in 0..80 {
+            let id = format!("bounded-conflict-{index:03}");
+            sqlx::query(
+                "INSERT INTO memory_entries
+                    (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited,
+                     schema_version, created_at, updated_at)
+                 VALUES (?, ?, 'decision', ?, 'bounded-fingerprint', ?, 'conflict', 0, 0, 1, ?, ?)",
+            )
+            .bind(&id)
+            .bind(USER_A)
+            .bind(&id)
+            .bind(&id)
+            .bind(10 + index)
+            .bind(10 + index)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO memory_sources
+                    (memory_entry_id, conversation_id, turn_id, message_ids_json, first_observed_at, last_observed_at)
+                 VALUES (?, 'conv_a', ?, '[]', 1, 1)",
+            )
+            .bind(&id)
+            .bind(format!("source-turn-{index:03}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let rows = repo
+            .reconciliation_entries(
+                USER_A,
+                &["bounded-fingerprint".into()],
+                &["bounded-conflict-079".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["bounded-active", "bounded-deleted-new", "bounded-conflict-079"],
+        );
+        assert!(rows.iter().all(|row| row.sources.is_empty()));
     }
 
     #[tokio::test]

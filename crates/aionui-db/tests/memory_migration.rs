@@ -110,6 +110,7 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
         "input_hash",
         "lease_token",
         "invalid_output_count",
+        "reconciliation_snapshot_json",
     ] {
         assert!(job_columns.contains(column), "missing memory_jobs column {column}");
     }
@@ -208,6 +209,18 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
     .execute(pool)
     .await;
     assert!(invalid_job_state.is_err());
+
+    let invalid_reconciliation_snapshot = sqlx::query(
+        "INSERT INTO memory_jobs
+         (id, user_id, conversation_id, through_turn_id, operation_version, global_epoch, conversation_epoch,
+          turn_count, queue_digest, input_hash, expected_revision, state, attempt_count,
+          reconciliation_snapshot_json, created_at, updated_at)
+         VALUES ('bad-snapshot-job', 'system_default_user', 'conv-constraints', 'turn', 'v1', 0, 0, 0,
+                 'digest', 'hash', 0, 'pending', 0, '{}', 1, 1)",
+    )
+    .execute(pool)
+    .await;
+    assert!(invalid_reconciliation_snapshot.is_err());
 
     let object_change_arrays = sqlx::query(
         "INSERT INTO memory_change_sets

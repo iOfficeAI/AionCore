@@ -149,6 +149,7 @@ pub struct MemoryJobRow {
     pub lease_token: Option<String>,
     pub lease_expires_at: Option<TimestampMs>,
     pub invalid_output_count: i64,
+    pub reconciliation_snapshot_json: Option<String>,
     pub last_error_code: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,

@@ -48,9 +48,10 @@ pub use repository::memory::{
     CommitMemorySourceRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow,
     ExpectedMemoryEntryRow, FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, MEMORY_EVIDENCE_MAX_BYTES,
     MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow, MemoryEntryQueryRow, MemoryEvidenceMessageKind,
-    MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, SplitMemoryJobRow,
-    TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow,
-    UpdateMemoryEntryRow, UpdateMemoryLifecycleRow, UpdateMemorySettingsRow, memory_evidence_content,
+    MemoryReconciliationSnapshotRow, MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow,
+    SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow,
+    UpdateMemoryEntryRow, UpdateMemoryLifecycleRow, UpdateMemorySettingsRow, derive_memory_fingerprint,
+    memory_entry_content_hash, memory_evidence_content,
 };
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
