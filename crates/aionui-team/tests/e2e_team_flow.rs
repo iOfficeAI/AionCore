@@ -685,6 +685,7 @@ async fn setup_session_with_turn_recorder_inner(
         workspace: "/tmp/e2e-team".into(),
         agents: two_agents(),
         lead_agent_id: Some("lead-1".into()),
+        origin_conversation_id: None,
         created_at: 1000,
         updated_at: 1000,
     };
@@ -743,6 +744,7 @@ async fn setup_session_with_runtime_ports(
         workspace: "/tmp/e2e-team".into(),
         agents: two_agents(),
         lead_agent_id: Some("lead-1".into()),
+        origin_conversation_id: None,
         created_at: 1000,
         updated_at: 1000,
     };
