@@ -205,6 +205,41 @@ async fn migration_030_ddl_and_backfill_are_idempotent_when_reapplied() {
 }
 
 #[tokio::test]
+async fn migration_031_adds_idempotent_immutable_retrieval_selections() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 30).await;
+
+    let migration = include_str!("../migrations/031_memory_retrieval_selections.sql");
+    sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+    sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+
+    let columns: HashSet<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('memory_retrieval_selections')")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+    assert_eq!(
+        columns,
+        [
+            "retrieval_id",
+            "position",
+            "selection_id",
+            "selection_kind",
+            "snapshot_hash"
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+    );
+}
+
+#[tokio::test]
 async fn migration_029_creates_normalized_tables_constraints_and_required_indexes() {
     let database = aionui_db::init_database_memory().await.unwrap();
     let pool = database.pool();
@@ -218,6 +253,7 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
         "memory_jobs",
         "memory_job_turns",
         "memory_retrievals",
+        "memory_retrieval_selections",
         "memory_import_state",
         "conversation_memory_import_sequences",
         "memory_import_sequence_counter",
@@ -424,7 +460,7 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
 }
 
 #[test]
-fn migration_versions_are_unique_and_memory_owns_029_and_030() {
+fn migration_versions_are_unique_and_memory_owns_029_through_031() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let full = Migrator::new(Path::new("migrations")).await.unwrap();
@@ -435,6 +471,7 @@ fn migration_versions_are_unique_and_memory_owns_029_and_030() {
             .collect::<Vec<_>>();
         assert_eq!(versions.iter().filter(|version| **version == 29).count(), 1);
         assert_eq!(versions.iter().filter(|version| **version == 30).count(), 1);
+        assert_eq!(versions.iter().filter(|version| **version == 31).count(), 1);
         assert_eq!(versions.iter().copied().collect::<HashSet<_>>().len(), versions.len());
     });
 }
