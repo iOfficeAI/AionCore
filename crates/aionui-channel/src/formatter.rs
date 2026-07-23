@@ -2,7 +2,13 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::types::PluginType;
+use crate::types::{ParseMode, PluginType};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormattedText {
+    pub text: String,
+    pub parse_mode: Option<ParseMode>,
+}
 
 /// Convert text to the target IM platform format.
 ///
@@ -11,11 +17,27 @@ use crate::types::PluginType;
 /// - WeChat/WeCom: strip all HTML
 /// - Fallback: escape HTML special chars
 pub fn format_text_for_platform(text: &str, platform: PluginType) -> String {
+    format_outgoing_text_for_platform(text, platform).text
+}
+
+pub fn format_outgoing_text_for_platform(text: &str, platform: PluginType) -> FormattedText {
     match platform {
-        PluginType::Telegram => markdown_to_telegram_html(text),
-        PluginType::Lark | PluginType::Dingtalk => html_to_markdown(text),
-        PluginType::Weixin => strip_html(text),
-        _ => escape_html(text),
+        PluginType::Telegram => FormattedText {
+            text: markdown_to_telegram_html(text),
+            parse_mode: Some(ParseMode::HTML),
+        },
+        PluginType::Lark | PluginType::Dingtalk => FormattedText {
+            text: html_to_markdown(text),
+            parse_mode: None,
+        },
+        PluginType::Weixin => FormattedText {
+            text: strip_html(text),
+            parse_mode: None,
+        },
+        _ => FormattedText {
+            text: escape_html(text),
+            parse_mode: None,
+        },
     }
 }
 
@@ -30,7 +52,8 @@ static RE_ITALIC_UNDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"_(.+?)_"
 static RE_LINK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
 
 fn markdown_to_telegram_html(text: &str) -> String {
-    let s = escape_html(text);
+    let text = markdown_tables_to_cards(text);
+    let s = escape_html(&text);
     let s = RE_CODE_BLOCK.replace_all(&s, "<pre><code>$1</code></pre>");
     let s = RE_INLINE_CODE.replace_all(&s, "<code>$1</code>");
     let s = RE_BOLD_STAR.replace_all(&s, "<b>$1</b>");
@@ -39,6 +62,84 @@ fn markdown_to_telegram_html(text: &str) -> String {
     let s = RE_ITALIC_UNDER.replace_all(&s, "<i>$1</i>");
     let s = RE_LINK.replace_all(&s, r#"<a href="$2">$1</a>"#);
     s.into_owned()
+}
+
+fn markdown_tables_to_cards(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut output = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        if i + 1 < lines.len() && is_table_row(lines[i]) && is_separator_row(lines[i + 1]) {
+            let headers = split_table_row(lines[i]);
+            i += 2;
+
+            let mut rows = Vec::new();
+            while i < lines.len() && is_table_row(lines[i]) {
+                rows.push(split_table_row(lines[i]));
+                i += 1;
+            }
+
+            output.push(render_table_cards(&headers, &rows));
+            continue;
+        }
+
+        output.push(lines[i].to_owned());
+        i += 1;
+    }
+
+    output.join("\n")
+}
+
+fn is_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.matches('|').count() >= 2
+}
+
+fn is_separator_row(line: &str) -> bool {
+    if !is_table_row(line) {
+        return false;
+    }
+    split_table_row(line)
+        .iter()
+        .all(|cell| !cell.is_empty() && cell.chars().all(|ch| ch == '-' || ch == ':' || ch.is_whitespace()))
+}
+
+fn split_table_row(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn render_table_cards(headers: &[String], rows: &[Vec<String>]) -> String {
+    if headers.is_empty() || rows.is_empty() {
+        return String::new();
+    }
+    if headers.len() > 5 || rows.len() > 12 {
+        return format!(
+            "**表格摘要：** 共 {} 列、{} 行。Telegram 不适合展示大表格，请在 WebUI 查看完整表格。",
+            headers.len(),
+            rows.len()
+        );
+    }
+
+    rows.iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let mut card = format!("**表格记录 {}**", idx + 1);
+            for (col_idx, header) in headers.iter().enumerate() {
+                let value = row.get(col_idx).map(String::as_str).unwrap_or("");
+                if !value.trim().is_empty() {
+                    card.push_str(&format!("\n**{}:** {}", header, value));
+                }
+            }
+            card
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 // ── Lark / DingTalk ──────────────────────────────────────────────

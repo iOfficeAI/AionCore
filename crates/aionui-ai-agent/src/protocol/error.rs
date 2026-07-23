@@ -63,6 +63,7 @@ impl CloseReason {
                 Some(AgentKillReason::RuntimeCapabilityChanged) => {
                     "Agent killed: runtime capability changed".to_owned()
                 }
+                Some(AgentKillReason::BudgetExceeded) => "Agent stopped: development budget exceeded".to_owned(),
                 None => "Agent killed".to_owned(),
             },
             CloseReason::ProcessExited {

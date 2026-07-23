@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::Client;
@@ -17,8 +18,9 @@ use crate::types::{
 
 use super::api::TelegramApi;
 use super::types::{
-    AnswerCallbackQueryRequest, EditMessageTextRequest, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
-    ReplyKeyboardMarkup, ReplyMarkup, SendMessageRequest, TgCallbackQuery, TgMessage,
+    AnswerCallbackQueryRequest, BotCommand, BotCommandScope, EditMessageTextRequest, InlineKeyboardButton,
+    InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyMarkup, SendMessageRequest, TgCallbackQuery,
+    TgMessage, TgUpdate,
 };
 
 /// Long-polling timeout in seconds (Telegram recommends 20-30s).
@@ -35,6 +37,7 @@ pub struct TelegramPlugin {
     callbacks: Option<PluginCallbacks>,
     poll_handle: Option<JoinHandle<()>>,
     shutdown_tx: Option<watch::Sender<bool>>,
+    poll_runtime: Arc<PollRuntimeState>,
 }
 
 impl Default for TelegramPlugin {
@@ -47,6 +50,7 @@ impl Default for TelegramPlugin {
             callbacks: None,
             poll_handle: None,
             shutdown_tx: None,
+            poll_runtime: Arc::new(PollRuntimeState::new(PluginStatus::Created)),
         }
     }
 }
@@ -55,6 +59,205 @@ impl TelegramPlugin {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+#[derive(Debug)]
+struct PollRuntimeState {
+    inner: Mutex<PollRuntimeStateInner>,
+}
+
+#[derive(Debug)]
+struct PollRuntimeStateInner {
+    status: PluginStatus,
+    last_error: Option<String>,
+}
+
+impl PollRuntimeState {
+    fn new(status: PluginStatus) -> Self {
+        Self {
+            inner: Mutex::new(PollRuntimeStateInner {
+                status,
+                last_error: None,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn running() -> Self {
+        Self::new(PluginStatus::Running)
+    }
+
+    fn set_status(&self, status: PluginStatus) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.status = status;
+        if status != PluginStatus::Error {
+            inner.last_error = None;
+        }
+    }
+
+    fn set_error(&self, error: String) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.status = PluginStatus::Error;
+        inner.last_error = Some(error);
+    }
+
+    fn status(&self) -> PluginStatus {
+        self.inner.lock().unwrap().status
+    }
+
+    #[cfg(test)]
+    fn last_error(&self) -> Option<String> {
+        self.inner.lock().unwrap().last_error.clone()
+    }
+}
+
+fn default_bot_commands() -> Vec<BotCommand> {
+    vec![
+        BotCommand {
+            command: "status".into(),
+            description: "查看当前 Telegram 绑定和会话状态".into(),
+        },
+        BotCommand {
+            command: "model".into(),
+            description: "按钮查看或切换当前 Agent 可用模型".into(),
+        },
+        BotCommand {
+            command: "topic_info".into(),
+            description: "查看当前话题绑定的 Agent".into(),
+        },
+        BotCommand {
+            command: "new_session".into(),
+            description: "新建当前入口的会话".into(),
+        },
+        BotCommand {
+            command: "project".into(),
+            description: "查看当前项目".into(),
+        },
+        BotCommand {
+            command: "run_info".into(),
+            description: "查看当前开发运行".into(),
+        },
+        BotCommand {
+            command: "diff_summary".into(),
+            description: "查看变更和证据摘要".into(),
+        },
+        BotCommand {
+            command: "test".into(),
+            description: "执行项目配置的单元测试门禁".into(),
+        },
+        BotCommand {
+            command: "stop".into(),
+            description: "停止当前开发运行".into(),
+        },
+        BotCommand {
+            command: "retry".into(),
+            description: "重试最近失败的质量门禁".into(),
+        },
+        BotCommand {
+            command: "handoff".into(),
+            description: "获取 Web 接力入口".into(),
+        },
+        BotCommand {
+            command: "help".into(),
+            description: "查看 Telegram 使用帮助".into(),
+        },
+    ]
+}
+
+fn private_bot_commands() -> Vec<BotCommand> {
+    vec![
+        BotCommand {
+            command: "status".into(),
+            description: "查看当前 Telegram 绑定和会话状态".into(),
+        },
+        BotCommand {
+            command: "agent".into(),
+            description: "查看或切换 Telegram Agent".into(),
+        },
+        BotCommand {
+            command: "model".into(),
+            description: "按钮查看或切换当前 Agent 可用模型".into(),
+        },
+        BotCommand {
+            command: "team".into(),
+            description: "查看团队入口和当前团队会话说明".into(),
+        },
+        BotCommand {
+            command: "team_help".into(),
+            description: "查看 Team 功能说明".into(),
+        },
+        BotCommand {
+            command: "team_list".into(),
+            description: "查看团队列表入口".into(),
+        },
+        BotCommand {
+            command: "team_select".into(),
+            description: "按钮选择或绑定团队会话".into(),
+        },
+        BotCommand {
+            command: "team_new".into(),
+            description: "交互式创建真实 Team".into(),
+        },
+        BotCommand {
+            command: "personal".into(),
+            description: "切换到个人会话".into(),
+        },
+        BotCommand {
+            command: "personal_list".into(),
+            description: "按钮选择已有个人会话".into(),
+        },
+        BotCommand {
+            command: "new_session".into(),
+            description: "新建个人会话".into(),
+        },
+        BotCommand {
+            command: "project".into(),
+            description: "查看当前项目".into(),
+        },
+        BotCommand {
+            command: "run_info".into(),
+            description: "查看当前开发运行".into(),
+        },
+        BotCommand {
+            command: "diff_summary".into(),
+            description: "查看变更和证据摘要".into(),
+        },
+        BotCommand {
+            command: "test".into(),
+            description: "执行项目配置的单元测试门禁".into(),
+        },
+        BotCommand {
+            command: "stop".into(),
+            description: "停止当前开发运行".into(),
+        },
+        BotCommand {
+            command: "retry".into(),
+            description: "重试最近失败的质量门禁".into(),
+        },
+        BotCommand {
+            command: "handoff".into(),
+            description: "获取 Web 接力入口".into(),
+        },
+        BotCommand {
+            command: "help".into(),
+            description: "查看 Telegram 使用帮助".into(),
+        },
+    ]
+}
+
+fn admin_group_bot_commands() -> Vec<BotCommand> {
+    let mut commands = default_bot_commands();
+    commands.extend([
+        BotCommand {
+            command: "topic_bind".into(),
+            description: "管理员：绑定当前话题到指定 Agent".into(),
+        },
+        BotCommand {
+            command: "topic_unbind".into(),
+            description: "管理员：解除当前话题的 Agent 绑定".into(),
+        },
+    ]);
+    commands
 }
 
 #[async_trait::async_trait]
@@ -97,6 +300,20 @@ impl ChannelPlugin for TelegramPlugin {
             display_name: me.first_name.clone(),
         });
 
+        let command_scopes = [
+            (default_bot_commands(), BotCommandScope::Default),
+            (private_bot_commands(), BotCommandScope::AllPrivateChats),
+            (default_bot_commands(), BotCommandScope::AllGroupChats),
+            (admin_group_bot_commands(), BotCommandScope::AllChatAdministrators),
+        ];
+        for (commands, scope) in command_scopes {
+            let command_count = commands.len();
+            match api.set_my_commands(commands, scope).await {
+                Ok(()) => info!(?scope, command_count, "registered Telegram bot commands"),
+                Err(error) => warn!(error = %error, ?scope, "failed to register Telegram bot commands"),
+            }
+        }
+
         info!(
             bot_id = me.id,
             bot_username = ?me.username,
@@ -112,9 +329,12 @@ impl ChannelPlugin for TelegramPlugin {
     async fn start(&mut self) -> Result<(), ChannelError> {
         self.status = PluginStatus::Starting;
 
-        if self.poll_handle.is_some() {
+        if self.poll_handle.as_ref().is_some_and(|handle| !handle.is_finished()) {
             self.status = PluginStatus::Running;
             return Ok(());
+        }
+        if self.poll_handle.as_ref().is_some_and(|handle| handle.is_finished()) {
+            self.poll_handle.take();
         }
 
         let api = self
@@ -129,11 +349,13 @@ impl ChannelPlugin for TelegramPlugin {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
+        self.poll_runtime.set_status(PluginStatus::Running);
         self.poll_handle = Some(tokio::spawn(poll_loop(
             api,
             callbacks.message_tx,
             callbacks.confirm_tx,
             shutdown_rx,
+            Arc::clone(&self.poll_runtime),
         )));
 
         self.status = PluginStatus::Running;
@@ -157,6 +379,7 @@ impl ChannelPlugin for TelegramPlugin {
 
         self.api = None;
         self.callbacks = None;
+        self.poll_runtime.set_status(PluginStatus::Stopped);
         self.status = PluginStatus::Stopped;
         info!("Telegram plugin stopped");
         Ok(())
@@ -180,11 +403,13 @@ impl ChannelPlugin for TelegramPlugin {
 
         let req = SendMessageRequest {
             chat_id: chat_id_num,
+            message_thread_id: message.topic.as_ref().map(|topic| topic.message_thread_id),
             text,
             parse_mode,
             reply_to_message_id: reply_to,
             reply_markup,
             disable_notification: message.silent,
+            disable_web_page_preview: Some(true),
         };
 
         let sent = api.send_message(&req).await?;
@@ -222,6 +447,24 @@ impl ChannelPlugin for TelegramPlugin {
         api.edit_message_text(&req).await
     }
 
+    async fn send_chat_action(&self, chat_id: &str, action: &str) -> Result<(), ChannelError> {
+        self.send_chat_action_in_topic(chat_id, action, None).await
+    }
+
+    async fn send_chat_action_in_topic(
+        &self,
+        chat_id: &str,
+        action: &str,
+        message_thread_id: Option<i64>,
+    ) -> Result<(), ChannelError> {
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
+        let chat_id_num = parse_chat_id(chat_id)?;
+        api.send_chat_action(chat_id_num, action, message_thread_id).await
+    }
+
     fn active_user_count(&self) -> usize {
         // Tracked externally by ChannelManager via SessionManager
         0
@@ -236,6 +479,15 @@ impl ChannelPlugin for TelegramPlugin {
     }
 
     fn status(&self) -> PluginStatus {
+        if self.status == PluginStatus::Running {
+            let runtime_status = self.poll_runtime.status();
+            if runtime_status != PluginStatus::Running {
+                return runtime_status;
+            }
+            if self.poll_handle.as_ref().is_some_and(|handle| handle.is_finished()) {
+                return PluginStatus::Stopped;
+            }
+        }
         self.status
     }
 
@@ -256,19 +508,55 @@ async fn poll_loop(
     api: Arc<TelegramApi>,
     message_tx: mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: mpsc::Sender<(String, String)>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
+    runtime: Arc<PollRuntimeState>,
 ) {
+    poll_loop_with_get_updates(
+        |offset, timeout| {
+            let api = Arc::clone(&api);
+            async move { api.get_updates(offset, timeout).await }
+        },
+        message_tx,
+        confirm_tx,
+        shutdown_rx,
+        runtime,
+        Some(Arc::clone(&api)),
+        TELEGRAM_MAX_RECONNECT_ATTEMPTS,
+        backoff_delay,
+    )
+    .await;
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the polling seam keeps transport, channels, shutdown, callback API, and retry policy independently injectable in tests"
+)]
+async fn poll_loop_with_get_updates<GetUpdates, GetUpdatesFuture>(
+    mut get_updates: GetUpdates,
+    message_tx: mpsc::Sender<UnifiedIncomingMessage>,
+    confirm_tx: mpsc::Sender<(String, String)>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    runtime: Arc<PollRuntimeState>,
+    callback_api: Option<Arc<TelegramApi>>,
+    max_reconnect_attempts: u32,
+    backoff_delay_for_attempt: impl Fn(u32) -> Duration,
+) where
+    GetUpdates: FnMut(Option<i64>, u32) -> GetUpdatesFuture,
+    GetUpdatesFuture: Future<Output = Result<Vec<TgUpdate>, ChannelError>>,
+{
     let mut offset: Option<i64> = None;
     let mut consecutive_errors: u32 = 0;
+    let mut stopped_by_shutdown = false;
 
     loop {
         // Check shutdown signal
         if *shutdown_rx.borrow() {
             debug!("Telegram poll loop received shutdown signal");
+            stopped_by_shutdown = true;
             break;
         }
 
-        match api.get_updates(offset, POLL_TIMEOUT).await {
+        match get_updates(offset, POLL_TIMEOUT).await {
             Ok(updates) => {
                 consecutive_errors = 0;
 
@@ -277,30 +565,37 @@ async fn poll_loop(
                     offset = Some(update.update_id + 1);
 
                     if let Some(cb) = update.callback_query {
-                        handle_callback_query(&api, &cb, &message_tx, &confirm_tx).await;
+                        if let Some(api) = callback_api.as_deref() {
+                            handle_callback_query(api, &cb, &message_tx, &confirm_tx).await;
+                        }
                     } else if let Some(msg) = update.message {
-                        handle_message(&msg, &message_tx).await;
+                        handle_message(callback_api.as_deref(), &msg, &message_tx).await;
                     }
                 }
             }
             Err(e) => {
                 consecutive_errors += 1;
+                let error = e.to_string();
                 warn!(
                     error = %e,
                     consecutive_errors,
                     "Telegram poll error"
                 );
 
-                if consecutive_errors >= TELEGRAM_MAX_RECONNECT_ATTEMPTS {
+                if consecutive_errors >= max_reconnect_attempts {
+                    runtime.set_error(format!(
+                        "Telegram polling stopped after {consecutive_errors} consecutive errors: {error}"
+                    ));
                     error!("Telegram max reconnect attempts reached, stopping poll loop");
                     break;
                 }
 
-                let backoff = backoff_delay(consecutive_errors);
+                let backoff = backoff_delay_for_attempt(consecutive_errors);
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
                     _ = shutdown_rx.changed() => {
                         debug!("Telegram poll loop shutdown during backoff");
+                        stopped_by_shutdown = true;
                         break;
                     }
                 }
@@ -308,6 +603,9 @@ async fn poll_loop(
         }
     }
 
+    if stopped_by_shutdown && runtime.status() == PluginStatus::Running {
+        runtime.set_status(PluginStatus::Stopped);
+    }
     debug!("Telegram poll loop exited");
 }
 
@@ -372,6 +670,11 @@ async fn handle_callback_query(
     });
 
     let msg = UnifiedIncomingMessage {
+        topic: cb
+            .message
+            .as_ref()
+            .and_then(|message| message.message_thread_id)
+            .map(|message_thread_id| crate::types::ChannelTopicContext { message_thread_id }),
         id: cb.id.clone(),
         platform: PluginType::Telegram,
         chat_id: chat_id.to_string(),
@@ -399,7 +702,7 @@ async fn handle_callback_query(
 }
 
 /// Handle a regular text/media message from Telegram.
-async fn handle_message(msg: &TgMessage, message_tx: &mpsc::Sender<UnifiedIncomingMessage>) {
+async fn handle_message(api: Option<&TelegramApi>, msg: &TgMessage, message_tx: &mpsc::Sender<UnifiedIncomingMessage>) {
     let from = match &msg.from {
         Some(u) => u,
         None => return, // system messages without a sender
@@ -416,7 +719,23 @@ async fn handle_message(msg: &TgMessage, message_tx: &mpsc::Sender<UnifiedIncomi
 
     let reply_to = msg.reply_to_message.as_ref().map(|r| r.message_id.to_string());
 
+    let admin_status = if msg
+        .text
+        .as_deref()
+        .is_some_and(|text| text.trim_start().starts_with("/topic_"))
+    {
+        if let Some(api) = api {
+            api.get_chat_member_status(msg.chat.id, from.id).await.ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let unified = UnifiedIncomingMessage {
+        topic: msg
+            .message_thread_id
+            .map(|message_thread_id| crate::types::ChannelTopicContext { message_thread_id }),
         id: msg.message_id.to_string(),
         platform: PluginType::Telegram,
         chat_id: msg.chat.id.to_string(),
@@ -429,7 +748,7 @@ async fn handle_message(msg: &TgMessage, message_tx: &mpsc::Sender<UnifiedIncomi
         timestamp: msg.date,
         reply_to_message_id: reply_to,
         action: None,
-        raw: None,
+        raw: admin_status.map(|status| serde_json::json!({"telegram_chat_member_status": status})),
     };
 
     let _ = message_tx.send(unified).await;
@@ -550,13 +869,19 @@ fn parse_callback_data(data: &str) -> Option<ParsedCallback> {
     }
 
     let category = match parts[0] {
+        "s" => ActionCategory::System,
         "platform" => ActionCategory::Platform,
         "system" => ActionCategory::System,
         "chat" => ActionCategory::Chat,
         _ => return None,
     };
 
-    let action = parts[1].to_string();
+    let action = match parts[1] {
+        "ms" => "model.select",
+        "mc" => "model.clear",
+        other => other,
+    }
+    .to_string();
 
     let params = if parts.len() == 3 && !parts[2].is_empty() {
         let mut map = std::collections::HashMap::new();
@@ -666,13 +991,21 @@ fn action_category_prefix(action: &str) -> &'static str {
 ///
 /// This is the inverse of [`parse_callback_data`].
 fn format_callback_data(btn: &ActionButton) -> String {
-    let category = action_category_prefix(&btn.action);
+    let category = match btn.action.as_str() {
+        "model.select" | "model.clear" => "s",
+        _ => action_category_prefix(&btn.action),
+    };
+    let action = match btn.action.as_str() {
+        "model.select" => "ms",
+        "model.clear" => "mc",
+        other => other,
+    };
     match &btn.params {
         Some(params) if !params.is_empty() => {
             let encoded: Vec<String> = params.iter().map(|(k, v)| format!("{k}={v}")).collect();
-            format!("{category}:{}:{}", btn.action, encoded.join(","))
+            format!("{category}:{action}:{}", encoded.join(","))
         }
-        _ => format!("{category}:{}", btn.action),
+        _ => format!("{category}:{action}"),
     }
 }
 
@@ -685,6 +1018,41 @@ fn parse_chat_id(chat_id: &str) -> Result<i64, ChannelError> {
     chat_id
         .parse::<i64>()
         .map_err(|_| ChannelError::InvalidConfig(format!("Invalid chat_id: {chat_id}")))
+}
+
+#[cfg(test)]
+mod callback_data_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn model_select_callback_uses_compact_encoding_that_fits_telegram_limit() {
+        let button = ActionButton {
+            label: "openai-codex:gpt-5.3-codex-spark".into(),
+            action: "model.select".into(),
+            params: Some(HashMap::from([
+                ("p".into(), "hermes-1".into()),
+                ("m".into(), "openai-codex:gpt-5.3-codex-spark".into()),
+            ])),
+        };
+
+        let encoded = format_callback_data(&button);
+        assert!(
+            encoded.len() <= 64,
+            "callback_data too long for Telegram: len={} data={encoded}",
+            encoded.len()
+        );
+
+        let parsed = parse_callback_data(&encoded).expect("callback should parse");
+        assert_eq!(parsed.category, ActionCategory::System);
+        assert_eq!(parsed.action, "model.select");
+        let params = parsed.params.expect("params should parse");
+        assert_eq!(params.get("p").map(String::as_str), Some("hermes-1"));
+        assert_eq!(
+            params.get("m").map(String::as_str),
+            Some("openai-codex:gpt-5.3-codex-spark")
+        );
+    }
 }
 
 /// Truncate a message to the platform limit, appending "..." if truncated.
@@ -981,6 +1349,7 @@ mod tests {
             media_actions: None,
             reply_to_message_id: None,
             silent: None,
+            topic: None,
         };
         let markup = build_reply_markup(&msg);
         assert!(matches!(markup, Some(ReplyMarkup::InlineKeyboard(_))));
@@ -1004,6 +1373,7 @@ mod tests {
             media_actions: None,
             reply_to_message_id: None,
             silent: None,
+            topic: None,
         };
         let markup = build_reply_markup(&msg);
         assert!(matches!(markup, Some(ReplyMarkup::ReplyKeyboard(_))));
@@ -1023,6 +1393,7 @@ mod tests {
             media_actions: None,
             reply_to_message_id: None,
             silent: None,
+            topic: None,
         };
         assert!(build_reply_markup(&msg).is_none());
     }
@@ -1200,6 +1571,103 @@ mod tests {
         assert_eq!(plugin.active_user_count(), 0);
     }
 
+    #[test]
+    fn telegram_default_commands_are_safe_in_bound_group_topics() {
+        let commands = default_bot_commands();
+        let names: Vec<_> = commands.iter().map(|cmd| cmd.command.as_str()).collect();
+        assert!(names.contains(&"status"));
+        assert!(names.contains(&"topic_info"));
+        assert!(names.contains(&"model"));
+        assert!(names.contains(&"new_session"));
+        assert!(names.contains(&"help"));
+        assert!(names.contains(&"project"));
+        assert!(names.contains(&"run_info"));
+        assert!(names.contains(&"diff_summary"));
+        assert!(names.contains(&"test"));
+        assert!(names.contains(&"stop"));
+        assert!(names.contains(&"retry"));
+        assert!(names.contains(&"handoff"));
+        assert!(!names.iter().any(|name| name.starts_with("team")));
+        assert!(!names.contains(&"agent"));
+        assert!(!names.iter().any(|name| name.starts_with("personal")));
+        assert!(!names.contains(&"topic_bind"));
+        assert!(!names.contains(&"topic_unbind"));
+    }
+
+    #[test]
+    fn telegram_private_commands_keep_full_bot_workflow() {
+        let commands = private_bot_commands();
+        let names: Vec<_> = commands.iter().map(|cmd| cmd.command.as_str()).collect();
+        assert!(names.contains(&"agent"));
+        assert!(names.contains(&"team"));
+        assert!(names.contains(&"team_help"));
+        assert!(names.contains(&"team_list"));
+        assert!(names.contains(&"team_select"));
+        assert!(names.contains(&"team_new"));
+        assert!(names.contains(&"personal"));
+        assert!(names.contains(&"personal_list"));
+    }
+
+    #[test]
+    fn approval_callback_stays_within_telegram_limit() {
+        let button = ActionButton {
+            label: "Allow once".into(),
+            action: "approval.resolve".into(),
+            params: Some(HashMap::from([
+                ("id".into(), "019f7b93e1b27c42".into()),
+                ("o".into(), "7".into()),
+            ])),
+        };
+        let callback = format_callback_data(&button);
+        assert!(callback.len() <= 64, "callback too long: {callback}");
+        let parsed = parse_callback_data(&callback).unwrap();
+        assert_eq!(parsed.action, "approval.resolve");
+    }
+
+    #[test]
+    fn telegram_admin_commands_add_topic_management_without_team_workflow() {
+        let commands = admin_group_bot_commands();
+        let names: Vec<_> = commands.iter().map(|cmd| cmd.command.as_str()).collect();
+        assert!(names.contains(&"status"));
+        assert!(names.contains(&"topic_bind"));
+        assert!(names.contains(&"topic_unbind"));
+        assert!(names.contains(&"topic_info"));
+        assert!(!names.iter().any(|name| name.starts_with("team")));
+        assert!(!names.contains(&"agent"));
+    }
+
+    #[tokio::test]
+    async fn poll_loop_marks_runtime_error_after_reconnect_attempts_are_exhausted() {
+        let (message_tx, _message_rx) = mpsc::channel(1);
+        let (confirm_tx, _confirm_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let runtime = Arc::new(PollRuntimeState::running());
+
+        poll_loop_with_get_updates(
+            |_offset, _timeout| async {
+                Err::<Vec<super::super::types::TgUpdate>, ChannelError>(ChannelError::PlatformApi(
+                    "network unavailable".into(),
+                ))
+            },
+            message_tx,
+            confirm_tx,
+            shutdown_rx,
+            Arc::clone(&runtime),
+            None,
+            1,
+            |_| Duration::from_millis(0),
+        )
+        .await;
+
+        assert_eq!(runtime.status(), PluginStatus::Error);
+        assert!(
+            runtime
+                .last_error()
+                .as_deref()
+                .is_some_and(|error| error.contains("network unavailable"))
+        );
+    }
+
     // -- Test helpers -------------------------------------------------------
 
     fn make_tg_message(
@@ -1228,6 +1696,7 @@ mod tests {
         use super::super::types::TgChat;
         TgMessage {
             message_id: 1,
+            message_thread_id: None,
             from: None,
             chat: TgChat {
                 id: 1,

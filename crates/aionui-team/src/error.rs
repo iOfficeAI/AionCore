@@ -26,6 +26,9 @@ pub enum TeamError {
     #[error("Blocked task not found: {0}")]
     BlockedTaskNotFound(String),
 
+    #[error("Task dependency cycle: {0}")]
+    TaskDependencyCycle(String),
+
     #[error("Backend not allowed: {0}")]
     BackendNotAllowed(String),
 
@@ -48,6 +51,9 @@ pub enum TeamError {
 
     #[error("Workspace path is unavailable during execution: {0}")]
     WorkspacePathRuntimeUnavailable(String),
+
+    #[error("Workspace operation failed: {0}")]
+    WorkspaceOperation(String),
 
     #[error("{0}")]
     Database(#[from] aionui_db::DbError),

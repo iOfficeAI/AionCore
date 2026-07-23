@@ -463,9 +463,6 @@ impl TeamSession {
 
         let wake_target = self.scheduler.finalize_turn(&slot_id, &[]).await?;
 
-        // Clear the dedup window unconditionally once finalize has run.
-        self.scheduler.clear_finalized_turn(conversation_id);
-
         // Re-wake self if there are still unread messages in mailbox.
         // This handles the case where messages arrived while the agent was
         // working (e.g. shutdown_request). Mirrors Claude's useMailboxBridge:
@@ -2004,6 +2001,7 @@ mod tests {
             id: "t1".into(),
             name: "Test Team".into(),
             workspace: "/tmp/test-team".into(),
+            workspace_mode: aionui_api_types::TeamWorkspaceMode::Shared,
             agents: vec![
                 TeamAgent {
                     slot_id: "lead-1".into(),
@@ -2031,6 +2029,12 @@ mod tests {
                 },
             ],
             lead_agent_id: Some("lead-1".into()),
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
             created_at: 1000,
             updated_at: 1000,
         }

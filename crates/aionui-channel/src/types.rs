@@ -1,4 +1,10 @@
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelConversationTitleHint {
+    pub title: String,
+    pub source: String,
+}
 use std::collections::HashMap;
 use std::fmt;
 
@@ -271,6 +277,11 @@ pub struct BotInfo {
 // ---------------------------------------------------------------------------
 
 /// Message received from an IM platform, normalized to a common format.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelTopicContext {
+    pub message_thread_id: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UnifiedIncomingMessage {
     pub id: String,
@@ -279,6 +290,8 @@ pub struct UnifiedIncomingMessage {
     pub user: UnifiedUser,
     pub content: UnifiedMessageContent,
     pub timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<ChannelTopicContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -369,6 +382,8 @@ pub struct UnifiedOutgoingMessage {
     pub reply_to_message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub silent: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<ChannelTopicContext>,
 }
 
 /// Outgoing message type discriminant.
@@ -731,6 +746,7 @@ mod tests {
                 attachments: None,
             },
             timestamp: 1700000000,
+            topic: None,
             reply_to_message_id: None,
             action: None,
             raw: None,
@@ -795,6 +811,7 @@ mod tests {
             media_actions: None,
             reply_to_message_id: None,
             silent: None,
+            topic: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "text");
@@ -826,6 +843,7 @@ mod tests {
             media_actions: None,
             reply_to_message_id: None,
             silent: None,
+            topic: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "buttons");
@@ -984,6 +1002,7 @@ mod tests {
                 attachments: None,
             },
             timestamp: 1000,
+            topic: None,
             reply_to_message_id: None,
             action: None,
             raw: None,
@@ -1007,6 +1026,7 @@ mod tests {
             media_actions: None,
             reply_to_message_id: None,
             silent: Some(true),
+            topic: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: UnifiedOutgoingMessage = serde_json::from_str(&json).unwrap();

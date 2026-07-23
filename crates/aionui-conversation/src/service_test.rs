@@ -52,7 +52,10 @@ use tokio::sync::{Notify, broadcast};
 
 use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
-use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
+use crate::{
+    ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError, ConversationTurnAdmission,
+    ConversationTurnAdmissionRequest, ConversationTurnGuard, ConversationTurnObservation, ConversationTurnObserver,
+};
 
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
@@ -183,6 +186,29 @@ struct RecordedAvailabilityFailure {
 struct RecordingAvailabilityFeedback {
     successes: Mutex<Vec<String>>,
     failures: Mutex<Vec<RecordedAvailabilityFailure>>,
+}
+
+#[derive(Default)]
+struct RecordingTurnObserver {
+    observations: Mutex<Vec<ConversationTurnObservation>>,
+}
+
+#[async_trait::async_trait]
+impl ConversationTurnObserver for RecordingTurnObserver {
+    async fn observe(&self, observation: ConversationTurnObservation) {
+        self.observations.lock().unwrap().push(observation);
+    }
+}
+
+struct DenyingTurnGuard;
+
+#[async_trait::async_trait]
+impl ConversationTurnGuard for DenyingTurnGuard {
+    async fn authorize(&self, _request: ConversationTurnAdmissionRequest) -> Result<ConversationTurnAdmission, String> {
+        Ok(ConversationTurnAdmission::Denied {
+            reason: "development run is paused by its budget policy".into(),
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -701,6 +727,7 @@ fn stub_agent_metadata_rows() -> Vec<AgentMetadataRow> {
         last_check_at: None,
         last_success_at: None,
         last_failure_at: None,
+        dynamic_probe_result: None,
         command_override: None,
         env_override: None,
         created_at: 1,
@@ -801,6 +828,7 @@ fn claude_metadata_row() -> AgentMetadataRow {
         last_check_at: None,
         last_success_at: None,
         last_failure_at: None,
+        dynamic_probe_result: None,
         command_override: None,
         env_override: None,
         created_at: 1,
@@ -984,6 +1012,16 @@ fn make_service() -> (
     Arc<dyn IWorkerTaskManager>,
 ) {
     make_service_with_resolver(Arc::new(FixedSkillResolver { names: vec![] }))
+}
+
+#[test]
+fn turn_policy_is_ready_only_after_observer_and_guard_are_both_installed() {
+    let (service, _, _, _) = make_service();
+    assert!(!service.has_turn_policy());
+    service.with_turn_observer(Arc::new(RecordingTurnObserver::default()));
+    assert!(!service.has_turn_policy());
+    service.with_turn_guard(Arc::new(DenyingTurnGuard));
+    assert!(service.has_turn_policy());
 }
 
 fn make_service_with_resolver(
@@ -1349,6 +1387,12 @@ async fn insert_conversation_with_type(repo: &Arc<MockRepo>, user_id: &str, agen
         status: Some("finished".into()),
         source: Some("aionui".into()),
         channel_chat_id: None,
+        source_channel: None,
+        source_channel_id: None,
+        source_chat_id: None,
+        source_user_id: None,
+        source_label: None,
+        created_from: None,
         pinned: false,
         pinned_at: None,
         created_at: 1,
@@ -2771,6 +2815,70 @@ impl IAgentTask for BlockingCancelAgent {
 
 impl IMockAgent for BlockingCancelAgent {}
 
+struct CountingSendAgent {
+    conversation_id: String,
+    event_tx: broadcast::Sender<AgentStreamEvent>,
+    send_count: AtomicUsize,
+}
+
+impl CountingSendAgent {
+    fn new(conversation_id: &str) -> Self {
+        let (event_tx, _) = broadcast::channel(64);
+        Self {
+            conversation_id: conversation_id.to_owned(),
+            event_tx,
+            send_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn send_count(&self) -> usize {
+        self.send_count.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl IAgentTask for CountingSendAgent {
+    fn agent_type(&self) -> AgentType {
+        AgentType::Acp
+    }
+
+    fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+
+    fn workspace(&self) -> &str {
+        "/tmp/test"
+    }
+
+    fn status(&self) -> Option<ConversationStatus> {
+        Some(ConversationStatus::Running)
+    }
+
+    fn last_activity_at(&self) -> TimestampMs {
+        0
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
+        self.event_tx.subscribe()
+    }
+
+    async fn send_message(&self, _data: SendMessageData) -> Result<(), AgentSendError> {
+        self.send_count.fetch_add(1, Ordering::SeqCst);
+        let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData::default()));
+        Ok(())
+    }
+
+    async fn cancel(&self) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        Ok(())
+    }
+}
+
+impl IMockAgent for CountingSendAgent {}
+
 // ── Mock WorkerTaskManager ──────────────────────────────────────
 
 struct MockTaskManager {
@@ -2909,6 +3017,55 @@ impl DelayedFailingBuildTaskManager {
             delay,
             error: error.into(),
         }
+    }
+}
+
+struct DelayedReadyTaskManager {
+    delay: Duration,
+    agent: AgentInstance,
+}
+
+impl DelayedReadyTaskManager {
+    fn new(delay: Duration, agent: AgentInstance) -> Self {
+        Self { delay, agent }
+    }
+}
+
+#[async_trait::async_trait]
+impl IWorkerTaskManager for DelayedReadyTaskManager {
+    fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+        None
+    }
+
+    async fn get_or_build_task(
+        &self,
+        _conversation_id: &str,
+        _options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        tokio::time::sleep(self.delay).await;
+        Ok(self.agent.clone())
+    }
+
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    fn kill_and_wait(
+        &self,
+        _conversation_id: &str,
+        _reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(std::future::ready(()))
+    }
+
+    async fn clear(&self) {}
+
+    fn active_count(&self) -> usize {
+        0
+    }
+
+    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -3211,6 +3368,7 @@ struct ScriptedAgent {
     scripts: Mutex<VecDeque<Vec<AgentStreamEvent>>>,
     sent_contents: Mutex<Vec<String>>,
     send_error: Option<AgentSendError>,
+    usage: Option<serde_json::Value>,
 }
 
 impl ScriptedAgent {
@@ -3224,6 +3382,7 @@ impl ScriptedAgent {
             scripts: Mutex::new(VecDeque::from(scripts)),
             sent_contents: Mutex::new(vec![]),
             send_error: None,
+            usage: None,
         }
     }
 
@@ -3239,6 +3398,11 @@ impl ScriptedAgent {
 
     fn with_send_error(mut self, error: AgentSendError) -> Self {
         self.send_error = Some(error);
+        self
+    }
+
+    fn with_usage(mut self, usage: serde_json::Value) -> Self {
+        self.usage = Some(usage);
         self
     }
 
@@ -3299,7 +3463,12 @@ impl IAgentTask for ScriptedAgent {
     }
 }
 
-impl IMockAgent for ScriptedAgent {}
+#[async_trait::async_trait]
+impl IMockAgent for ScriptedAgent {
+    async fn get_usage(&self) -> Result<Option<serde_json::Value>, AgentError> {
+        Ok(self.usage.clone())
+    }
+}
 
 // ── send_message tests ──────────────────────────────────────────
 
@@ -3359,6 +3528,46 @@ async fn send_message_returns_accepted() {
     assert_eq!(response.msg_id.len(), 8, "msg_id should be an 8-char short hex ID");
     assert!(response.turn_id.starts_with("turn_"), "turn_id must use turn_ prefix");
     assert_ne!(response.msg_id, response.turn_id, "turn_id must not reuse msg_id");
+}
+
+#[tokio::test]
+async fn turn_guard_blocks_messages_agent_turns_and_runtime_recovery_before_side_effects() {
+    let (svc, _broadcaster, repo, task_mgr) = make_service();
+    svc.with_turn_guard(Arc::new(DenyingTurnGuard));
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let send_error = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        send_error,
+        ConversationError::Forbidden { ref reason } if reason.contains("budget policy")
+    ));
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+    assert_eq!(task_mgr.active_count(), 0);
+
+    let turn_error = svc
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            content: "scheduled work".into(),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+            required_runtime_mode: None,
+            persist_user_message: true,
+            user_message_hidden: false,
+            on_started: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(turn_error, ConversationError::Forbidden { .. }));
+    assert!(repo_messages_asc(&repo, &conv.id, 10).await.is_empty());
+
+    let runtime_error = svc.ensure_runtime("user_1", &conv.id, &task_mgr).await.unwrap_err();
+    assert!(matches!(runtime_error, ConversationError::Forbidden { .. }));
+    assert_eq!(task_mgr.active_count(), 0);
 }
 
 #[tokio::test]
@@ -5143,6 +5352,55 @@ async fn send_message_records_agent_availability_feedback_on_send_success() {
 }
 
 #[tokio::test]
+async fn send_message_reports_completed_agent_turn_usage() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let observer = Arc::new(RecordingTurnObserver::default());
+    svc.with_turn_observer(observer.clone());
+
+    let mut create_req = make_create_req();
+    create_req.extra = json!({
+        "backend": "codex",
+        "agent_id": "agent-budget-1",
+        "agent_source": "builtin",
+        "workspace": ensure_test_workspace_path()
+    });
+    let conv = svc.create("user_1", create_req).await.unwrap();
+    let usage = json!({
+        "size": 258400,
+        "used": 1200,
+        "cost": { "amount": 0.25, "currency": "USD" }
+    });
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(
+            &conv.id,
+            vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+        )
+        .with_usage(usage.clone()),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let response = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let observations = observer.observations.lock().unwrap();
+    assert_eq!(observations.len(), 1);
+    let observation = &observations[0];
+    assert_eq!(observation.user_id, "user_1");
+    assert_eq!(observation.conversation_id, conv.id);
+    assert_eq!(observation.turn_id, response.turn_id);
+    assert_eq!(observation.status, ConversationAgentTurnStatus::Completed);
+    assert_eq!(observation.agent_id.as_deref(), Some("agent-budget-1"));
+    assert_eq!(observation.usage.as_ref(), Some(&usage));
+    assert_eq!(observation.retry_count, 0);
+    assert!(observation.duration_ms >= 0);
+}
+
+#[tokio::test]
 async fn send_message_recovers_when_finished_task_has_no_runtime_terminal() {
     let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());
@@ -5528,6 +5786,37 @@ async fn cancel_with_mismatched_turn_id_does_not_cancel_and_returns_current_runt
     assert!(svc.runtime_state().is_claimed(&conv.id));
 }
 
+#[tokio::test(start_paused = true)]
+async fn cancel_during_agent_build_prevents_late_prompt_dispatch() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(CountingSendAgent::new(&conv.id));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(DelayedReadyTaskManager::new(
+        Duration::from_secs(5),
+        AgentInstance::Mock(agent.clone()),
+    ));
+
+    let send = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+
+    let cancel = svc.cancel("user_1", &conv.id, &send.turn_id, &task_mgr).await.unwrap();
+
+    assert_eq!(cancel.runtime.turn_id.as_deref(), Some(send.turn_id.as_str()));
+    assert!(cancel.runtime.is_processing);
+    assert!(svc.runtime_state().is_cancelling(&conv.id));
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(5) + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(agent.send_count(), 0);
+    assert!(!svc.runtime_state().is_cancelling(&conv.id));
+}
+
 #[tokio::test]
 async fn cancel_keeps_turn_claim_until_agent_terminal_event() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
@@ -5600,12 +5889,13 @@ async fn cancel_timeout_kills_acp_task_when_turn_still_claimed() {
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let agent = Arc::new(BlockingCancelAgent::new(&conv.id));
-    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
 
     let send = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
         .await
         .unwrap();
+    agent.wait_until_send_started().await;
 
     svc.cancel("user_1", &conv.id, &send.turn_id, &task_mgr_dyn)
         .await
@@ -7215,6 +7505,12 @@ async fn get_backfills_legacy_row_and_persists() {
         status: Some("finished".into()),
         source: Some("aionui".into()),
         channel_chat_id: None,
+        source_channel: None,
+        source_channel_id: None,
+        source_chat_id: None,
+        source_user_id: None,
+        source_label: None,
+        created_from: None,
         pinned: false,
         pinned_at: None,
         created_at: 0,
@@ -7263,6 +7559,12 @@ async fn list_backfills_mixed_rows() {
         status: None,
         source: None,
         channel_chat_id: None,
+        source_channel: None,
+        source_channel_id: None,
+        source_chat_id: None,
+        source_user_id: None,
+        source_label: None,
+        created_from: None,
         pinned: false,
         pinned_at: None,
         created_at: 1,
@@ -7283,6 +7585,12 @@ async fn list_backfills_mixed_rows() {
         status: None,
         source: None,
         channel_chat_id: None,
+        source_channel: None,
+        source_channel_id: None,
+        source_chat_id: None,
+        source_user_id: None,
+        source_label: None,
+        created_from: None,
         pinned: false,
         pinned_at: None,
         created_at: 2,
@@ -7400,6 +7708,12 @@ async fn seed_aionrs_conversation_with_snapshot(
         status: Some("finished".into()),
         source: Some("aionui".into()),
         channel_chat_id: None,
+        source_channel: None,
+        source_channel_id: None,
+        source_chat_id: None,
+        source_user_id: None,
+        source_label: None,
+        created_from: None,
         pinned: false,
         pinned_at: None,
         created_at: 1,

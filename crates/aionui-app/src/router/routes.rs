@@ -26,10 +26,12 @@ use aionui_channel::weixin_login_route;
 use aionui_common::ApiErrorLogContext;
 use aionui_conversation::{conversation_ops_routes, conversation_routes};
 use aionui_cron::cron_routes;
+use aionui_development::{approval_routes, development_routes};
 use aionui_extension::{extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
 use aionui_mcp::mcp_routes;
 use aionui_office::{office_proxy_routes, office_routes};
+use aionui_project::project_routes;
 use aionui_realtime::{WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
 use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
@@ -39,7 +41,7 @@ use crate::services::AppServices;
 
 use super::health::health_check;
 use super::runtime_team_tools::{RuntimeTeamToolsState, runtime_team_tools_routes};
-use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
+use super::state::{ModuleStates, RouterBuildError, build_approval_state, build_module_states, build_ws_state};
 use super::trace::with_access_log;
 
 pub struct RouterRuntime {
@@ -215,6 +217,15 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let cron_authenticated =
         cron_routes(states.cron).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    let project_authenticated =
+        project_routes(states.project).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
+    let development_authenticated =
+        development_routes(states.development).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
+    let approval_authenticated = approval_routes(build_approval_state(services))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Office routes protected by auth middleware
     let office_authenticated =
         office_routes(states.office.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -258,6 +269,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(channel_authenticated)
         .merge(team_authenticated)
         .merge(cron_authenticated)
+        .merge(project_authenticated)
+        .merge(development_authenticated)
+        .merge(approval_authenticated)
         .merge(office_authenticated)
         .merge(shell_authenticated)
         .merge(assistant_authenticated);

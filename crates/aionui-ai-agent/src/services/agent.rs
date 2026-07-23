@@ -15,7 +15,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_api_types::{AgentLogoEntry, AgentManagementRow, ProviderHealthCheckRequest, ProviderHealthCheckResponse};
+use aionui_api_types::{
+    AgentLogoEntry, AgentManagementRow, AgentMetadata, ProviderHealthCheckRequest, ProviderHealthCheckResponse,
+};
 use aionui_db::IProviderRepository;
 use aionui_realtime::EventBroadcaster;
 
@@ -40,7 +42,7 @@ impl AgentService {
         data_dir: PathBuf,
     ) -> Arc<Self> {
         let provider_health = ProviderHealthCheckService::new(provider_repo.clone(), encryption_key, data_dir.clone());
-        let availability = AgentAvailabilityService::new(registry.clone(), provider_repo);
+        let availability = AgentAvailabilityService::new(registry.clone(), provider_repo, data_dir);
         Arc::new(Self {
             registry,
             broadcaster,
@@ -66,6 +68,18 @@ impl AgentService {
 
 // Agent operations
 impl AgentService {
+    pub async fn list_agents(&self, include_disabled: bool) -> Result<Vec<AgentMetadata>, AgentError> {
+        let rows = if include_disabled {
+            self.registry.list_all_including_hidden().await
+        } else {
+            self.registry.list_all().await
+        };
+        Ok(rows
+            .into_iter()
+            .filter(|agent| agent.agent_type.supports_new_conversation())
+            .collect())
+    }
+
     pub async fn list_management_agents(&self) -> Result<Vec<AgentManagementRow>, AgentError> {
         Ok(self.availability.list_management_rows().await)
     }

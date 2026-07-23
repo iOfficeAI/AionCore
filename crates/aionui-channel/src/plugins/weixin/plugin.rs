@@ -324,6 +324,7 @@ async fn handle_message(
     };
 
     let unified = UnifiedIncomingMessage {
+        topic: None,
         id: msg.msg_id.clone().unwrap_or_default(),
         platform: PluginType::Weixin,
         chat_id: from_user_id.clone(),

@@ -44,7 +44,12 @@ impl TeammateManager {
     }
 
     pub async fn mark_idle(&self, slot_id: &str, summary: Option<&str>) -> Result<Option<String>, TeamError> {
-        self.set_status(slot_id, TeammateStatus::Idle).await?;
+        // Error is a terminal observation for the completed turn. Finalization
+        // must still notify/wake the lead, but it must not erase the crash
+        // signal by publishing a later Idle status.
+        if self.get_status(slot_id).await? != TeammateStatus::Error {
+            self.set_status(slot_id, TeammateStatus::Idle).await?;
+        }
 
         let is_lead = {
             let slots = self.slots.lock().await;

@@ -1,5 +1,5 @@
-use aionui_channel::formatter::format_text_for_platform;
-use aionui_channel::types::PluginType;
+use aionui_channel::formatter::{format_outgoing_text_for_platform, format_text_for_platform};
+use aionui_channel::types::{ParseMode, PluginType};
 
 // ── Telegram: escape HTML, then convert markdown to HTML tags ────
 
@@ -35,6 +35,23 @@ fn telegram_link() {
         result.contains(r#"<a href="https://example.com">click</a>"#),
         "got: {result}"
     );
+}
+
+#[test]
+fn telegram_simple_markdown_table_becomes_cards() {
+    let input =
+        "| Role | Model |\n|---|---|\n| Research Lead | deepseek-v4-pro |\n| Risk Validator | deepseek-v4-flash |";
+    let result = format_text_for_platform(input, PluginType::Telegram);
+    assert!(result.contains("<b>Role:</b> Research Lead"), "got: {result}");
+    assert!(result.contains("<b>Model:</b> deepseek-v4-pro"), "got: {result}");
+    assert!(!result.contains("|---|"), "got: {result}");
+}
+
+#[test]
+fn telegram_outgoing_text_uses_html_parse_mode() {
+    let result = format_outgoing_text_for_platform("**bold**", PluginType::Telegram);
+    assert_eq!(result.parse_mode, Some(ParseMode::HTML));
+    assert_eq!(result.text, "<b>bold</b>");
 }
 
 // ── Lark / DingTalk: HTML tags → markdown syntax ─────────────────

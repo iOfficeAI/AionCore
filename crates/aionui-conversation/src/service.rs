@@ -318,6 +318,8 @@ pub struct ConversationService {
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
+    turn_observer: Arc<RwLock<Option<Arc<dyn ConversationTurnObserver>>>>,
+    turn_guard: Arc<RwLock<Option<Arc<dyn ConversationTurnGuard>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
@@ -358,6 +360,46 @@ pub enum ConversationAgentTurnStatus {
 }
 
 #[derive(Debug, Clone)]
+pub struct ConversationTurnObservation {
+    pub user_id: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub status: ConversationAgentTurnStatus,
+    pub agent_id: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub team_id: Option<String>,
+    pub slot_id: Option<String>,
+    pub usage: Option<serde_json::Value>,
+    pub duration_ms: i64,
+    pub retry_count: i64,
+    pub occurred_at: i64,
+}
+
+#[async_trait::async_trait]
+pub trait ConversationTurnObserver: Send + Sync {
+    async fn observe(&self, observation: ConversationTurnObservation);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationTurnAdmissionRequest {
+    pub user_id: String,
+    pub conversation_id: String,
+    pub team_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationTurnAdmission {
+    Allowed,
+    Denied { reason: String },
+}
+
+#[async_trait::async_trait]
+pub trait ConversationTurnGuard: Send + Sync {
+    async fn authorize(&self, request: ConversationTurnAdmissionRequest) -> Result<ConversationTurnAdmission, String>;
+}
+
+#[derive(Debug, Clone)]
 pub struct ConversationAgentTurnOutcome {
     pub conversation_id: String,
     pub turn_id: String,
@@ -391,6 +433,8 @@ impl ConversationService {
             assistant_preference_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
+            turn_observer: Arc::new(RwLock::new(None)),
+            turn_guard: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
@@ -459,6 +503,26 @@ impl ConversationService {
         if let Ok(mut guard) = self.agent_availability_feedback.write() {
             *guard = Some(feedback);
         }
+    }
+
+    pub fn with_turn_observer(&self, observer: Arc<dyn ConversationTurnObserver>) {
+        if let Ok(mut guard) = self.turn_observer.write() {
+            *guard = Some(observer);
+        }
+    }
+
+    pub fn with_turn_guard(&self, turn_guard: Arc<dyn ConversationTurnGuard>) {
+        if let Ok(mut guard) = self.turn_guard.write() {
+            *guard = Some(turn_guard);
+        }
+    }
+
+    /// Whether both post-turn observation and pre-turn admission have been
+    /// installed. Schedulers use this as a startup invariant before they begin
+    /// dispatching work from persisted jobs.
+    pub fn has_turn_policy(&self) -> bool {
+        self.turn_observer.read().is_ok_and(|guard| guard.is_some())
+            && self.turn_guard.read().is_ok_and(|guard| guard.is_some())
     }
 
     /// Register a hook to be notified when a conversation is deleted.
@@ -547,6 +611,34 @@ impl ConversationService {
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    pub(crate) fn turn_observer(&self) -> Option<Arc<dyn ConversationTurnObserver>> {
+        self.turn_observer.read().ok().and_then(|guard| guard.as_ref().cloned())
+    }
+
+    async fn authorize_turn(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        team_id: Option<&str>,
+    ) -> Result<(), ConversationError> {
+        let turn_guard = self.turn_guard.read().ok().and_then(|guard| guard.as_ref().cloned());
+        let Some(turn_guard) = turn_guard else {
+            return Ok(());
+        };
+        match turn_guard
+            .authorize(ConversationTurnAdmissionRequest {
+                user_id: user_id.to_owned(),
+                conversation_id: conversation_id.to_owned(),
+                team_id: team_id.map(str::to_owned),
+            })
+            .await
+        {
+            Ok(ConversationTurnAdmission::Allowed) => Ok(()),
+            Ok(ConversationTurnAdmission::Denied { reason }) => Err(ConversationError::Forbidden { reason }),
+            Err(reason) => Err(ConversationError::Internal { reason }),
+        }
     }
 
     pub(crate) fn runtime_persistence(&self) -> RuntimePersistenceCoordinator {
@@ -695,7 +787,10 @@ impl ConversationService {
         let id = generate_short_id();
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
+        let legacy_source = enum_to_db(&source)?;
 
+        let source_metadata =
+            ConversationSourceMetadata::from_request(&req, &req.extra, &legacy_source, req.channel_chat_id.as_deref());
         let mut extra = req.extra;
 
         let assistant_id = req
@@ -1106,8 +1201,14 @@ impl ConversationService {
                 .transpose()
                 .map_err(|e| ConversationError::internal(format!("Failed to serialize model: {e}")))?,
             status: Some(enum_to_db(&ConversationStatus::Pending)?),
-            source: Some(enum_to_db(&source)?),
+            source: Some(legacy_source),
             channel_chat_id: req.channel_chat_id,
+            source_channel: source_metadata.source_channel,
+            source_channel_id: source_metadata.source_channel_id,
+            source_chat_id: source_metadata.source_chat_id,
+            source_user_id: source_metadata.source_user_id,
+            source_label: source_metadata.source_label,
+            created_from: source_metadata.created_from,
             pinned: false,
             pinned_at: None,
             created_at: now,
@@ -2608,6 +2709,7 @@ impl ConversationService {
         }
 
         reject_deprecated_runtime_row(&row)?;
+        self.authorize_turn(user_id, conversation_id, None).await?;
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
@@ -2735,6 +2837,9 @@ impl ConversationService {
             })?;
 
         reject_deprecated_runtime_row(&row)?;
+        let team_id = team_id_from_extra(&row.extra);
+        self.authorize_turn(&request.user_id, &request.conversation_id, team_id.as_deref())
+            .await?;
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
@@ -2946,17 +3051,18 @@ impl ConversationService {
             });
         }
 
+        self.runtime_state.mark_cancelling(conversation_id);
+
         let Some(agent) = task_manager.get_task(conversation_id) else {
             info!(
                 conversation_id,
-                turn_id, "No active agent to cancel; returning runtime summary"
+                turn_id, "No active agent to cancel yet; marked pending turn cancellation"
             );
             return Ok(CancelConversationResponse {
                 runtime: self.runtime_summary_for(conversation_id).await,
             });
         };
 
-        self.runtime_state.mark_cancelling(conversation_id);
         if let Err(e) = agent.cancel().await {
             self.runtime_state.clear_cancelling(conversation_id);
             warn!(conversation_id, turn_id, error = %ErrorChain(&e), "Failed to cancel agent");
@@ -3110,6 +3216,9 @@ impl ConversationService {
             })?;
 
         reject_deprecated_runtime_row(&row)?;
+        let team_id = team_id_from_extra(&row.extra);
+        self.authorize_turn(user_id, conversation_id, team_id.as_deref())
+            .await?;
 
         if let Some(agent) = task_manager.get_task(conversation_id) {
             debug!(conversation_id, phase, "Conversation runtime already active");
@@ -3946,6 +4055,89 @@ fn enum_to_db<T: serde::Serialize>(val: &T) -> Result<String, ConversationError>
         .ok_or_else(|| ConversationError::internal("Expected string enum value"))
 }
 
+#[derive(Debug, Clone, Default)]
+struct ConversationSourceMetadata {
+    source_channel: Option<String>,
+    source_channel_id: Option<String>,
+    source_chat_id: Option<String>,
+    source_user_id: Option<String>,
+    source_label: Option<String>,
+    created_from: Option<String>,
+}
+
+impl ConversationSourceMetadata {
+    fn from_request(
+        req: &CreateConversationRequest,
+        extra: &serde_json::Value,
+        legacy_source: &str,
+        channel_chat_id: Option<&str>,
+    ) -> Self {
+        let source_channel = clean_source(req.source_channel.as_deref())
+            .or_else(|| extra_string(extra, "source_channel"))
+            .or_else(|| source_channel_from_legacy(legacy_source));
+        let source_chat_id = clean_source(req.source_chat_id.as_deref())
+            .or_else(|| extra_string(extra, "source_chat_id"))
+            .or_else(|| clean_source(channel_chat_id));
+        let source_label = clean_source(req.source_label.as_deref())
+            .or_else(|| extra_string(extra, "source_label"))
+            .or_else(|| {
+                source_channel
+                    .as_deref()
+                    .map(source_label_for_channel)
+                    .map(str::to_owned)
+            });
+        let created_from = clean_source(req.created_from.as_deref())
+            .or_else(|| extra_string(extra, "created_from"))
+            .or_else(|| source_channel.clone());
+
+        Self {
+            source_channel,
+            source_channel_id: clean_source(req.source_channel_id.as_deref())
+                .or_else(|| extra_string(extra, "source_channel_id")),
+            source_chat_id,
+            source_user_id: clean_source(req.source_user_id.as_deref())
+                .or_else(|| extra_string(extra, "source_user_id")),
+            source_label,
+            created_from,
+        }
+    }
+}
+
+fn clean_source(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn extra_string(extra: &serde_json::Value, key: &str) -> Option<String> {
+    extra
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| clean_source(Some(value)))
+}
+
+fn source_channel_from_legacy(source: &str) -> Option<String> {
+    clean_source(Some(match source {
+        "aionui" => "webui",
+        other => other,
+    }))
+}
+
+fn source_label_for_channel(channel: &str) -> &'static str {
+    match channel {
+        "aionui" | "webui" => "WebUI",
+        "desktop" => "Desktop",
+        "telegram" => "Telegram",
+        "discord" => "Discord",
+        "lark" => "Lark",
+        "wecom" => "WeCom",
+        "weixin" => "Weixin",
+        "dingtalk" => "DingTalk",
+        _ => "Unknown Source",
+    }
+}
+
 /// Persist the agent's session key into `conversation.extra.sessionKey`.
 ///
 /// Called after send_message completes so the session can be resumed
@@ -4169,6 +4361,12 @@ mod tests {
             pinned: false,
             pinned_at: None,
             channel_chat_id: None,
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
             assistant: None,
             created_at: 0,
             modified_at: 0,

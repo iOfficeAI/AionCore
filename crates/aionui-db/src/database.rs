@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -29,6 +30,35 @@ static DB_MIGRATOR: Migrator = sqlx::migrate!();
 // Historical special-case for the MCP schema reconciliation fallback.
 // Keep this pinned to migration version 7 even as newer migrations land.
 const MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION: i64 = 7;
+#[derive(Clone, Copy)]
+struct LegacyRoadmapMigrationLayout {
+    start: i64,
+    end: i64,
+    shift: i64,
+}
+
+const LEGACY_ROADMAP_MIGRATION_LAYOUTS: [LegacyRoadmapMigrationLayout; 2] = [
+    LegacyRoadmapMigrationLayout {
+        start: 17,
+        end: 34,
+        shift: 11,
+    },
+    LegacyRoadmapMigrationLayout {
+        start: 26,
+        end: 43,
+        shift: 2,
+    },
+];
+const LEGACY_ROADMAP_CHECKSUM_ALIASES: &[(i64, &str)] = &[
+    (
+        20,
+        "41297AC04B19B0C1361F6CA41064766AB2DA5784115F3FA7B936A8856B372458AEA5AA30754A7FEB13A649EB9E192C52",
+    ),
+    (
+        21,
+        "DCB189DEAC028EB386E2E6B3CEFD9B04F9D80F2CB21AE437C3B020D624065FF133C940F6AC34582D89AD439DAADD6DB5",
+    ),
+];
 const RECOVERABLE_DATABASE_CORRUPTION_STAGE: &str = "database.recoverable_corruption";
 
 /// Wraps a SQLite connection pool with lifecycle management.
@@ -346,6 +376,9 @@ async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitErro
     // `_sqlx_migrations` blows up with `UNIQUE constraint failed:
     // _sqlx_migrations.version`. The outer startup lock also covers
     // schema-repair and connection PRAGMAs before migration execution.
+    reconcile_legacy_roadmap_migration_versions(pool)
+        .await
+        .map_err(|e| DatabaseInitError::new("database.migration_compatibility", e))?;
     ensure_schema_columns(pool)
         .await
         .map_err(|e| DatabaseInitError::new("database.schema_repair", e))?;
@@ -372,6 +405,130 @@ async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitErro
         .await
         .map_err(|e| DatabaseInitError::new("database.migration", DbError::Query(e)))?;
     result
+}
+
+async fn reconcile_legacy_roadmap_migration_versions(pool: &SqlitePool) -> Result<(), DbError> {
+    let migrations_table_exists: bool =
+        sqlx::query_scalar("SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'")
+            .fetch_one(pool)
+            .await
+            .map_err(DbError::Query)?;
+    if !migrations_table_exists {
+        return Ok(());
+    }
+
+    for layout in LEGACY_ROADMAP_MIGRATION_LAYOUTS {
+        if reconcile_legacy_roadmap_migration_layout(pool, layout).await? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn reconcile_legacy_roadmap_migration_layout(
+    pool: &SqlitePool,
+    layout: LegacyRoadmapMigrationLayout,
+) -> Result<bool, DbError> {
+    let rows: Vec<(i64, String, Vec<u8>, bool)> = sqlx::query_as(
+        "SELECT version, description, checksum, success FROM _sqlx_migrations \
+         WHERE version BETWEEN ? AND ? ORDER BY version",
+    )
+    .bind(layout.start)
+    .bind(layout.end)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)?;
+
+    let Some(first) = rows.first() else {
+        return Ok(false);
+    };
+    let Some(first_target) = DB_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == first.0 + layout.shift)
+    else {
+        return Ok(false);
+    };
+    if first.0 != layout.start
+        || first.1 != first_target.description.as_ref()
+        || first.2.as_slice() != first_target.checksum.as_ref()
+    {
+        return Ok(false);
+    }
+
+    let mut expected_version = layout.start;
+    for (version, description, checksum, success) in &rows {
+        if *version != expected_version {
+            return Err(DbError::Init(format!(
+                "Legacy roadmap migration history is not contiguous at version {expected_version}"
+            )));
+        }
+        let target_version = version + layout.shift;
+        let Some(target) = DB_MIGRATOR.iter().find(|migration| migration.version == target_version) else {
+            return Err(DbError::Init(format!(
+                "Legacy roadmap migration {version} has no current target version {target_version}"
+            )));
+        };
+        if !*success
+            || description != target.description.as_ref()
+            || !legacy_roadmap_checksum_matches(*version, checksum, target.checksum.as_ref())
+        {
+            return Err(DbError::Init(format!(
+                "Legacy roadmap migration {version} does not match the known immutable migration"
+            )));
+        }
+        expected_version += 1;
+    }
+
+    let last_legacy_version = expected_version - 1;
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    sqlx::query("UPDATE _sqlx_migrations SET version = version + 1000 WHERE version BETWEEN ? AND ?")
+        .bind(layout.start)
+        .bind(last_legacy_version)
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+
+    for version in layout.start..=last_legacy_version {
+        let target_version = version + layout.shift;
+        let target = DB_MIGRATOR
+            .iter()
+            .find(|migration| migration.version == target_version)
+            .expect("validated legacy roadmap migration target must exist");
+        sqlx::query("UPDATE _sqlx_migrations SET version = ?, description = ?, checksum = ? WHERE version = ?")
+            .bind(target_version)
+            .bind(&*target.description)
+            .bind(&*target.checksum)
+            .bind(version + 1000)
+            .execute(&mut *transaction)
+            .await
+            .map_err(DbError::Query)?;
+    }
+    transaction.commit().await.map_err(DbError::Query)?;
+    info!(
+        "Reconciled legacy roadmap migration versions {}-{} to {}-{}",
+        layout.start,
+        last_legacy_version,
+        layout.start + layout.shift,
+        last_legacy_version + layout.shift
+    );
+    Ok(true)
+}
+
+fn legacy_roadmap_checksum_matches(version: i64, legacy_checksum: &[u8], current_checksum: &[u8]) -> bool {
+    if legacy_checksum == current_checksum {
+        return true;
+    }
+    let Some((_, accepted_hex)) = LEGACY_ROADMAP_CHECKSUM_ALIASES
+        .iter()
+        .find(|(legacy_version, _)| *legacy_version == version)
+    else {
+        return false;
+    };
+    let mut actual_hex = String::with_capacity(legacy_checksum.len() * 2);
+    for byte in legacy_checksum {
+        write!(&mut actual_hex, "{byte:02X}").expect("writing to a String cannot fail");
+    }
+    actual_hex == *accepted_hex
 }
 
 /// Run sqlx migrations with one retry on `_sqlx_migrations` UNIQUE conflict.

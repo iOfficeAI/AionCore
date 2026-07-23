@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
-    AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
+    AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamHttpRequest,
     GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
     SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
     TeamRunStateResponse,
@@ -54,7 +54,7 @@ impl From<TeamError> for ApiError {
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
-            TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
+            TeamError::BlockedTaskNotFound(msg) | TeamError::TaskDependencyCycle(msg) => ApiError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),
             TeamError::DuplicateAgentName(msg) => ApiError::BadRequest(format!("Agent name already taken: {msg}")),
             TeamError::RuntimeNotReady { conversation_id } => ApiError::coded(
@@ -81,6 +81,7 @@ impl From<TeamError> for ApiError {
             ),
             TeamError::WorkspacePathUnavailable(path) => ApiError::WorkspacePathUnavailable(path),
             TeamError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
+            TeamError::WorkspaceOperation(message) => ApiError::BadRequest(message),
             TeamError::Database(db_err) => db_error_to_api_error(db_err),
             TeamError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
         }
@@ -123,10 +124,13 @@ pub fn team_routes(state: TeamRouterState) -> Router {
 async fn create_team(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
-    body: Result<Json<CreateTeamRequest>, JsonRejection>,
+    body: Result<Json<CreateTeamHttpRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<TeamResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let team = state.service.create_team(&user.id, req).await?;
+    let team = state
+        .service
+        .create_team_with_workspace_mode(&user.id, req.team, req.workspace_mode)
+        .await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(team))))
 }
 

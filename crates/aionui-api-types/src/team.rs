@@ -28,9 +28,8 @@ pub struct TeamAgentInput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct TeamAgentInputCompat {
-    #[serde(default)]
+    #[serde(default, alias = "assistantId", alias = "custom_agent_id", alias = "customAgentId")]
     pub assistant_id: Option<String>,
     pub name: String,
     pub role: String,
@@ -76,6 +75,47 @@ pub struct CreateTeamRequest {
     pub agents: Vec<TeamAgentInput>,
     #[serde(default)]
     pub workspace: Option<String>,
+    #[serde(default)]
+    pub source_channel: Option<String>,
+    #[serde(default)]
+    pub source_channel_id: Option<String>,
+    #[serde(default)]
+    pub source_chat_id: Option<String>,
+    #[serde(default)]
+    pub source_user_id: Option<String>,
+    #[serde(default)]
+    pub source_label: Option<String>,
+    #[serde(default)]
+    pub created_from: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamWorkspaceMode {
+    #[default]
+    Shared,
+    #[serde(alias = "isolated")]
+    IsolatedWorktree,
+}
+
+impl TeamWorkspaceMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::IsolatedWorktree => "isolated_worktree",
+        }
+    }
+}
+
+/// HTTP request contract for Team creation. `CreateTeamRequest` remains the
+/// reusable source/agent payload used by channel integrations, while the Web
+/// endpoint adds the workspace lifecycle selection.
+#[derive(Debug, Deserialize)]
+pub struct CreateTeamHttpRequest {
+    #[serde(flatten)]
+    pub team: CreateTeamRequest,
+    #[serde(default)]
+    pub workspace_mode: TeamWorkspaceMode,
 }
 
 /// Request body for `PATCH /api/teams/:id/name`.
@@ -112,7 +152,7 @@ struct AddAgentRequestCompat {
     role: Option<String>,
     #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "assistantId", alias = "custom_agent_id", alias = "customAgentId")]
     assistant_id: Option<String>,
 }
 
@@ -443,12 +483,44 @@ pub struct TeamResponse {
     pub name: String,
     #[serde(default)]
     pub workspace: String,
+    #[serde(default)]
+    pub workspace_mode: TeamWorkspaceMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_leases: Vec<AgentWorkspaceLeaseResponse>,
     #[serde(alias = "agents")]
     pub assistants: Vec<TeamAgentResponse>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "lead_agent_id")]
     pub leader_assistant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chat_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_from: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentWorkspaceLeaseResponse {
+    pub id: String,
+    pub slot_id: String,
+    pub worktree_path: String,
+    pub branch_name: String,
+    pub base_commit: String,
+    pub allowed_paths: Vec<String>,
+    pub lease_status: String,
+    pub cleanup_status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Type alias for team list responses.
@@ -585,6 +657,40 @@ mod tests {
     // -- A. Team management requests ------------------------------------------
 
     #[test]
+    fn create_team_http_request_defaults_to_shared_workspace() {
+        let req: CreateTeamHttpRequest = serde_json::from_value(json!({
+            "name": "Legacy",
+            "agents": [{
+                "name": "Lead",
+                "role": "lead",
+                "model": "default",
+                "assistant_id": "assistant-x"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(req.workspace_mode, TeamWorkspaceMode::Shared);
+    }
+
+    #[test]
+    fn create_team_http_request_canonicalizes_isolated_alias() {
+        for value in ["isolated", "isolated_worktree"] {
+            let req: CreateTeamHttpRequest = serde_json::from_value(json!({
+                "name": "Isolated",
+                "workspace_mode": value,
+                "agents": [{
+                    "name": "Lead",
+                    "role": "lead",
+                    "model": "default",
+                    "assistant_id": "assistant-x"
+                }]
+            }))
+            .unwrap();
+            assert_eq!(req.workspace_mode, TeamWorkspaceMode::IsolatedWorktree);
+            assert_eq!(req.workspace_mode.as_str(), "isolated_worktree");
+        }
+    }
+
+    #[test]
     fn deserialize_create_team_request_full() {
         let raw = json!({
             "name": "Team Alpha",
@@ -650,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_team_agent_input_rejects_legacy_custom_agent_id() {
+    fn deserialize_team_agent_input_accepts_legacy_custom_agent_id() {
         let raw = json!({
             "name": "Lead",
             "role": "lead",
@@ -658,8 +764,9 @@ mod tests {
             "model": "claude",
             "custom_agent_id": "assistant-legacy"
         });
-        let result = serde_json::from_value::<TeamAgentInput>(raw);
-        assert!(result.is_err());
+        let input = serde_json::from_value::<TeamAgentInput>(raw).unwrap();
+        assert_eq!(input.assistant_id.as_deref(), Some("assistant-legacy"));
+        assert!(input.backend.is_none());
     }
 
     #[test]
@@ -688,7 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_team_agent_input_rejects_backend_field() {
+    fn deserialize_team_agent_input_ignores_legacy_backend_field() {
         let raw = json!({
             "name": "Lead",
             "role": "lead",
@@ -696,8 +803,30 @@ mod tests {
             "model": "claude",
             "assistant_id": "assistant-x"
         });
-        let result = serde_json::from_value::<TeamAgentInput>(raw);
-        assert!(result.is_err());
+        let input = serde_json::from_value::<TeamAgentInput>(raw).unwrap();
+        assert_eq!(input.assistant_id.as_deref(), Some("assistant-x"));
+        assert!(input.backend.is_none());
+    }
+
+    #[test]
+    fn deserialize_team_agent_input_accepts_cached_webui_legacy_shape() {
+        let raw = json!({
+            "slot_id": "leader",
+            "name": "Aion CLI",
+            "role": "leader",
+            "backend": "acp",
+            "agent_type": "acp",
+            "conversation_type": "acp",
+            "status": "idle",
+            "model": "default",
+            "custom_agent_id": "bare:632f31d2"
+        });
+        let input = serde_json::from_value::<TeamAgentInput>(raw).unwrap();
+        assert_eq!(input.name, "Aion CLI");
+        assert_eq!(input.role, "leader");
+        assert_eq!(input.model, "default");
+        assert_eq!(input.assistant_id.as_deref(), Some("bare:632f31d2"));
+        assert!(input.backend.is_none());
     }
 
     #[test]
@@ -766,15 +895,16 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_add_agent_request_rejects_custom_agent_id() {
+    fn deserialize_add_agent_request_accepts_legacy_custom_agent_id() {
         let raw = json!({
             "name": "Custom",
             "role": "teammate",
             "model": "claude",
             "custom_agent_id": "custom-1"
         });
-        let result = serde_json::from_value::<AddAgentRequest>(raw);
-        assert!(result.is_err());
+        let req = serde_json::from_value::<AddAgentRequest>(raw).unwrap();
+        assert_eq!(req.assistant_id.as_deref(), Some("custom-1"));
+        assert!(req.backend.is_none());
     }
 
     #[test]
@@ -957,6 +1087,8 @@ mod tests {
             id: "team-1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team-1".into(),
+            workspace_mode: TeamWorkspaceMode::Shared,
+            workspace_leases: vec![],
             assistants: vec![TeamAgentResponse {
                 slot_id: "slot-1".into(),
                 assistant_name: "Lead".into(),
@@ -972,6 +1104,12 @@ mod tests {
                 pending_confirmations: 0,
             }],
             leader_assistant_id: Some("slot-1".into()),
+            source_channel: Some("telegram".into()),
+            source_channel_id: Some("bot-1".into()),
+            source_chat_id: Some("chat-1".into()),
+            source_user_id: Some("user-1".into()),
+            source_label: Some("Telegram".into()),
+            created_from: Some("telegram".into()),
             created_at: 1700000000000,
             updated_at: 1700001000000,
         };
@@ -980,6 +1118,8 @@ mod tests {
         assert_eq!(json["name"], "Alpha");
         assert_eq!(json["workspace"], "/workspace/team-1");
         assert_eq!(json["leader_assistant_id"], "slot-1");
+        assert_eq!(json["source_channel"], "telegram");
+        assert_eq!(json["source_label"], "Telegram");
         assert_eq!(json["created_at"], 1700000000000_i64);
         assert_eq!(json["updated_at"], 1700001000000_i64);
         assert_eq!(json["assistants"].as_array().unwrap().len(), 1);
@@ -992,13 +1132,22 @@ mod tests {
             id: "team-2".into(),
             name: "Beta".into(),
             workspace: String::new(),
+            workspace_mode: TeamWorkspaceMode::Shared,
+            workspace_leases: vec![],
             assistants: vec![],
             leader_assistant_id: None,
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
             created_at: 1700000000000,
             updated_at: 1700000000000,
         };
         let json = serde_json::to_value(&team).unwrap();
         assert!(json.get("leader_assistant_id").is_none());
+        assert!(json.get("source_channel").is_none());
         assert!(json["assistants"].as_array().unwrap().is_empty());
     }
 
@@ -1097,6 +1246,8 @@ mod tests {
             id: "team-1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team-1".into(),
+            workspace_mode: TeamWorkspaceMode::Shared,
+            workspace_leases: vec![],
             assistants: vec![
                 TeamAgentResponse {
                     slot_id: "s1".into(),
@@ -1128,6 +1279,12 @@ mod tests {
                 },
             ],
             leader_assistant_id: Some("s1".into()),
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
             created_at: 1000,
             updated_at: 2000,
         };

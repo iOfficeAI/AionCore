@@ -226,15 +226,11 @@ fn compare_active_tasks(
 
 fn compare_same_status_recency(left: &TeamTask, right: &TeamTask) -> Ordering {
     match left.status {
-        TaskStatus::InProgress => right
+        status if is_active(status) => right
             .updated_at
             .cmp(&left.updated_at)
             .then_with(|| left.created_at.cmp(&right.created_at)),
-        TaskStatus::Pending => right
-            .updated_at
-            .cmp(&left.updated_at)
-            .then_with(|| left.created_at.cmp(&right.created_at)),
-        TaskStatus::Completed | TaskStatus::Deleted => Ordering::Equal,
+        _ => Ordering::Equal,
     }
 }
 
@@ -260,14 +256,21 @@ fn active_rank(
 fn status_rank(status: TaskStatus) -> u8 {
     match status {
         TaskStatus::InProgress => 0,
-        TaskStatus::Pending => 1,
-        TaskStatus::Completed => 2,
-        TaskStatus::Deleted => 3,
+        TaskStatus::Claimed => 1,
+        TaskStatus::Ready | TaskStatus::Rework => 2,
+        TaskStatus::WaitingApproval | TaskStatus::Verifying | TaskStatus::Review => 3,
+        TaskStatus::Pending => 4,
+        TaskStatus::Failed | TaskStatus::Cancelled => 5,
+        TaskStatus::Completed => 6,
+        TaskStatus::Deleted => 7,
     }
 }
 
 fn is_active(status: TaskStatus) -> bool {
-    matches!(status, TaskStatus::Pending | TaskStatus::InProgress)
+    !matches!(
+        status,
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Deleted
+    )
 }
 
 fn is_current_or_ownerless(task: &TeamTask, current_slot_ids: &HashSet<String>) -> bool {

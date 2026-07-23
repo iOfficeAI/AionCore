@@ -6,7 +6,10 @@
 
 use std::sync::Arc;
 
-use aionui_db::models::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
+use aionui_db::models::{
+    AssistantSessionRow, AssistantUserRow, ChannelPluginRow, ChannelTopicModelOverrideRow, PairingCodeRow,
+    TelegramTopicBindingRow,
+};
 use aionui_db::{DbError, IChannelRepository, SqliteChannelRepository, UpdatePluginStatusParams, init_database_memory};
 
 async fn repo() -> (Arc<dyn IChannelRepository>, aionui_db::Database) {
@@ -52,8 +55,22 @@ fn make_session(id: &str, user_id: &str, chat_id: &str) -> AssistantSessionRow {
         conversation_id: None,
         workspace: None,
         chat_id: Some(chat_id.into()),
+        message_thread_id: None,
+        bound_agent_id: None,
+        bound_backend: None,
+        bound_provider_id: None,
+        bound_model: None,
         created_at: now,
         last_activity: now,
+    }
+}
+
+fn make_topic_session(id: &str, user_id: &str, chat_id: &str, thread_id: i64) -> AssistantSessionRow {
+    AssistantSessionRow {
+        message_thread_id: Some(thread_id),
+        bound_agent_id: Some("agent-a".into()),
+        bound_backend: Some("codex".into()),
+        ..make_session(id, user_id, chat_id)
     }
 }
 
@@ -287,4 +304,88 @@ async fn users_ordered_by_authorized_at_desc() {
     assert_eq!(users.len(), 2);
     assert_eq!(users[0].id, "u2"); // more recent first
     assert_eq!(users[1].id, "u1");
+}
+
+#[tokio::test]
+async fn telegram_topic_sessions_are_isolated_and_can_be_invalidated_together() {
+    let (repo, _db) = repo().await;
+    repo.create_user(&make_user("u1", "tg_1", "telegram")).await.unwrap();
+    repo.create_user(&make_user("u2", "tg_2", "telegram")).await.unwrap();
+
+    let topic_3 = repo
+        .get_or_create_topic_session("u1", "group", 3, &make_topic_session("s1", "u1", "group", 3))
+        .await
+        .unwrap();
+    let topic_5 = repo
+        .get_or_create_topic_session("u1", "group", 5, &make_topic_session("s2", "u1", "group", 5))
+        .await
+        .unwrap();
+    let other_user_topic_3 = repo
+        .get_or_create_topic_session("u2", "group", 3, &make_topic_session("s3", "u2", "group", 3))
+        .await
+        .unwrap();
+
+    assert_ne!(topic_3.id, topic_5.id);
+    assert_ne!(topic_3.id, other_user_topic_3.id);
+
+    repo.delete_sessions_by_topic("group", 3).await.unwrap();
+    assert!(repo.get_session(&topic_3.id).await.unwrap().is_none());
+    assert!(repo.get_session(&other_user_topic_3.id).await.unwrap().is_none());
+    assert!(repo.get_session(&topic_5.id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn telegram_topic_binding_and_model_override_roundtrip() {
+    let (repo, _db) = repo().await;
+    let now = aionui_common::now_ms();
+    repo.upsert_telegram_topic_binding(&TelegramTopicBindingRow {
+        chat_id: "group".into(),
+        message_thread_id: 3,
+        agent_id: "8e1acf31".into(),
+        bound_by_user_id: "admin".into(),
+        created_at: now,
+        updated_at: now,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        repo.get_telegram_topic_binding("group", 3)
+            .await
+            .unwrap()
+            .unwrap()
+            .agent_id,
+        "8e1acf31"
+    );
+
+    repo.upsert_topic_model_override(&ChannelTopicModelOverrideRow {
+        platform: "telegram".into(),
+        internal_user_id: "u1".into(),
+        chat_id: "group".into(),
+        message_thread_id: 3,
+        agent_id: "8e1acf31".into(),
+        provider_id: "openai-codex".into(),
+        model: "gpt-5.3-codex".into(),
+        updated_at: now,
+    })
+    .await
+    .unwrap();
+
+    let selected = repo
+        .get_topic_model_override("telegram", "u1", "group", 3)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.model, "gpt-5.3-codex");
+    assert!(
+        repo.get_topic_model_override("telegram", "u2", "group", 3)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repo.get_topic_model_override("telegram", "u1", "group", 5)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

@@ -6,4 +6,7 @@ pub mod remote;
 
 pub use agent::AgentService;
 pub use availability::AgentAvailabilityFeedbackPort;
+pub use availability::dynamic_probe::{
+    DynamicAgentProbe, DynamicProbeFailure, DynamicProbeSession, DynamicProbeSessionFactory,
+};
 pub use remote::RemoteAgentService;

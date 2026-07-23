@@ -563,8 +563,19 @@ pub(crate) mod workspace_harness {
                     r#type: request.agent_type.unwrap_or(AgentType::Acp).serde_name().to_owned(),
                     pinned: false,
                     pinned_at: None,
-                    source: None,
-                    channel_chat_id: None,
+                    source: request.source.map(|source| {
+                        serde_json::to_value(source)
+                            .ok()
+                            .and_then(|value| value.as_str().map(str::to_owned))
+                            .unwrap_or_else(|| "aionui".into())
+                    }),
+                    channel_chat_id: request.channel_chat_id,
+                    source_channel: None,
+                    source_channel_id: None,
+                    source_chat_id: None,
+                    source_user_id: None,
+                    source_label: None,
+                    created_from: None,
                     extra: serde_json::to_string(&extra).unwrap(),
                     model: request
                         .top_level_model
@@ -1078,6 +1089,12 @@ pub(crate) mod workspace_harness {
                 conversation_id: None,
             }],
             workspace: None,
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
         }
     }
 }

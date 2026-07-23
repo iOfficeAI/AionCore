@@ -13,9 +13,11 @@
 //! Both paths produce identical outcomes / error text.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use aionui_api_types::TryConnectCustomAgentResponse;
+use aionui_api_types::{AgentDynamicProbeResult, AgentProbeErrorCategory, TryConnectCustomAgentResponse};
 use aionui_common::{CommandSpec, EnvVar};
 use aionui_runtime::{NodeRuntimeProgressReporter, ResolvedCommand, ensure_runtime_command_with_reporter};
 use tokio::sync::{broadcast, mpsc};
@@ -25,8 +27,11 @@ use crate::capability::cli_process::CliAgentProcess;
 use crate::protocol::acp::AcpProtocol;
 use crate::protocol::error::AcpError;
 use crate::protocol::npx_cache_repair::CorruptNpxCacheRepair;
+use crate::services::{DynamicAgentProbe, DynamicProbeFailure, DynamicProbeSession, DynamicProbeSessionFactory};
 
-use agent_client_protocol::schema::NewSessionRequest;
+use agent_client_protocol::schema::{
+    CancelNotification, ContentBlock, NewSessionRequest, PromptRequest, ResumeSessionRequest, SessionId, TextContent,
+};
 
 /// Step 2 overall timeout. Belt-and-suspenders: `AcpProtocol::connect`
 /// already caps the initialize RPC at 30 s, but a CLI that hangs
@@ -85,6 +90,43 @@ pub async fn try_connect_custom_agent(
     outcome
 }
 
+/// Resolve and run the full dynamic preflight for a custom ACP Agent.
+pub(crate) async fn dynamic_probe_custom_agent(
+    agent_id: &str,
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+    data_dir: &Path,
+) -> AgentDynamicProbeResult {
+    let resolved = match ensure_runtime_command_with_reporter(first_token(command), None).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return failed_dynamic_probe(
+                agent_id,
+                DynamicProbeFailure::new(AgentProbeErrorCategory::RuntimeMissing, error.to_string()),
+            )
+            .await;
+        }
+    };
+    let spec = build_probe_command_spec(resolved, args, env);
+    dynamic_probe_command_spec(agent_id, spec, data_dir).await
+}
+
+async fn failed_dynamic_probe(agent_id: &str, failure: DynamicProbeFailure) -> AgentDynamicProbeResult {
+    struct FailedFactory(DynamicProbeFailure);
+
+    #[async_trait::async_trait]
+    impl DynamicProbeSessionFactory for FailedFactory {
+        async fn spawn(&self, _agent_id: &str) -> Result<Box<dyn DynamicProbeSession>, DynamicProbeFailure> {
+            Err(self.0.clone())
+        }
+    }
+
+    DynamicAgentProbe::new(Arc::new(FailedFactory(failure)))
+        .run(agent_id)
+        .await
+}
+
 fn first_token(command: &str) -> &str {
     command.split_whitespace().next().unwrap_or(command)
 }
@@ -94,6 +136,14 @@ async fn spawn_probe_process(
     args: &[String],
     env: &HashMap<String, String>,
 ) -> Result<CliAgentProcess, String> {
+    let spec = build_probe_command_spec(resolved, args, env);
+
+    CliAgentProcess::spawn_for_sdk(spec)
+        .await
+        .map_err(|e| format!("spawn failed: {e}"))
+}
+
+fn build_probe_command_spec(resolved: ResolvedCommand, args: &[String], env: &HashMap<String, String>) -> CommandSpec {
     let mut final_args: Vec<String> = resolved
         .args_prefix
         .iter()
@@ -113,16 +163,12 @@ async fn spawn_probe_process(
         value: value.to_string_lossy().into_owned(),
     }));
 
-    let spec = CommandSpec {
+    CommandSpec {
         command: resolved.program,
         args: final_args,
         env: final_env,
         cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
-    };
-
-    CliAgentProcess::spawn_for_sdk(spec)
-        .await
-        .map_err(|e| format!("spawn failed: {e}"))
+    }
 }
 
 /// RAII guard that force-kills a probe's process tree when dropped.
@@ -181,6 +227,169 @@ async fn acp_probe_command_spec_once(spec: CommandSpec) -> ProbeOutcome {
     let _guard = ProbeProcessGuard { proc: &proc };
 
     run_handshake(&proc).await
+}
+
+/// Run the full six-stage dynamic probe against a pre-built ACP command.
+/// The process and ACP session are throwaway and never enter conversation
+/// persistence, so the fixed prompt cannot appear in user history.
+pub(crate) async fn dynamic_probe_command_spec(
+    agent_id: &str,
+    spec: CommandSpec,
+    data_dir: &Path,
+) -> AgentDynamicProbeResult {
+    let factory = Arc::new(AcpDynamicProbeFactory {
+        spec,
+        data_dir: data_dir.to_path_buf(),
+    });
+    DynamicAgentProbe::new(factory).run(agent_id).await
+}
+
+struct AcpDynamicProbeFactory {
+    spec: CommandSpec,
+    data_dir: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl DynamicProbeSessionFactory for AcpDynamicProbeFactory {
+    async fn spawn(&self, _agent_id: &str) -> Result<Box<dyn DynamicProbeSession>, DynamicProbeFailure> {
+        let process = CliAgentProcess::spawn_for_sdk_in_data_dir(self.spec.clone(), &self.data_dir)
+            .await
+            .map_err(|error| DynamicProbeFailure::new(AgentProbeErrorCategory::Startup, error.to_string()))?;
+        Ok(Box::new(AcpDynamicProbeSession {
+            process,
+            protocol: None,
+            session_id: None,
+        }))
+    }
+}
+
+struct AcpDynamicProbeSession {
+    process: CliAgentProcess,
+    protocol: Option<AcpProtocol>,
+    session_id: Option<SessionId>,
+}
+
+impl Drop for AcpDynamicProbeSession {
+    fn drop(&mut self) {
+        self.process.force_kill_tree();
+    }
+}
+
+#[async_trait::async_trait]
+impl DynamicProbeSession for AcpDynamicProbeSession {
+    async fn initialize(&mut self) -> Result<(), DynamicProbeFailure> {
+        let (stdin, stdout) = self.process.take_stdio().await.ok_or_else(|| {
+            DynamicProbeFailure::new(AgentProbeErrorCategory::Startup, "stdio unavailable after Agent spawn")
+        })?;
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let (permission_tx, _permission_rx) = mpsc::channel(4);
+        let (notification_tx, _notification_rx) = mpsc::channel(4);
+        self.protocol = Some(
+            AcpProtocol::connect(stdin, stdout, event_tx, permission_tx, notification_tx)
+                .await
+                .map_err(dynamic_probe_error)?,
+        );
+        Ok(())
+    }
+
+    async fn models(&mut self) -> Result<Vec<String>, DynamicProbeFailure> {
+        let response = self
+            .protocol()?
+            .new_session(NewSessionRequest::new(std::env::temp_dir()))
+            .await
+            .map_err(dynamic_probe_error)?;
+        self.session_id = Some(response.session_id.clone());
+        Ok(response
+            .models
+            .map(|state| {
+                state
+                    .available_models
+                    .into_iter()
+                    .map(|model| model.model_id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn minimal_prompt(&mut self) -> Result<(), DynamicProbeFailure> {
+        let session_id = self.session_id()?;
+        let prompt = PromptRequest::new(
+            session_id,
+            vec![ContentBlock::Text(TextContent::new(
+                "Reply with exactly OK. Do not call tools or modify files.",
+            ))],
+        );
+        self.protocol()?
+            .prompt(prompt)
+            .await
+            .map(|_| ())
+            .map_err(dynamic_probe_error)
+    }
+
+    async fn cancel(&mut self) -> Result<(), DynamicProbeFailure> {
+        let session_id = self.session_id()?;
+        let protocol = self.protocol()?;
+        if !protocol.is_connected() {
+            return Err(DynamicProbeFailure::new(
+                AgentProbeErrorCategory::Protocol,
+                "ACP connection closed before cancellation probe",
+            ));
+        }
+        protocol.cancel(CancelNotification::new(session_id));
+        Ok(())
+    }
+
+    async fn resume(&mut self) -> Result<(), DynamicProbeFailure> {
+        let session_id = self.session_id()?;
+        self.protocol()?
+            .resume_session(ResumeSessionRequest::new(session_id, std::env::temp_dir()))
+            .await
+            .map(|_| ())
+            .map_err(|error| match error {
+                AcpError::MethodNotFound { .. } => DynamicProbeFailure::unsupported(error.to_string()),
+                other => dynamic_probe_error(other),
+            })
+    }
+}
+
+impl AcpDynamicProbeSession {
+    fn protocol(&self) -> Result<&AcpProtocol, DynamicProbeFailure> {
+        self.protocol.as_ref().ok_or_else(|| {
+            DynamicProbeFailure::new(AgentProbeErrorCategory::Protocol, "ACP protocol is not initialized")
+        })
+    }
+
+    fn session_id(&self) -> Result<SessionId, DynamicProbeFailure> {
+        self.session_id.clone().ok_or_else(|| {
+            DynamicProbeFailure::new(AgentProbeErrorCategory::Protocol, "ACP session is not initialized")
+        })
+    }
+}
+
+fn dynamic_probe_error(error: AcpError) -> DynamicProbeFailure {
+    let message = error.to_string();
+    match error {
+        AcpError::AuthRequired => DynamicProbeFailure::new(AgentProbeErrorCategory::Authentication, message),
+        AcpError::SpawnFailed { .. } | AcpError::StartupCrash { .. } => {
+            DynamicProbeFailure::new(AgentProbeErrorCategory::Startup, message)
+        }
+        AcpError::InitTimeout { .. } => DynamicProbeFailure::timed_out(message),
+        AcpError::AgentInternal { ref message, .. } | AcpError::OtherProtocolError { ref message, .. }
+            if message.to_ascii_lowercase().contains("rate limit") =>
+        {
+            DynamicProbeFailure::new(AgentProbeErrorCategory::RateLimited, message)
+        }
+        AcpError::AgentInternal { ref message, .. } | AcpError::OtherProtocolError { ref message, .. }
+            if message.to_ascii_lowercase().contains("model") =>
+        {
+            DynamicProbeFailure::new(AgentProbeErrorCategory::ModelRejected, message)
+        }
+        AcpError::MethodNotFound { .. }
+        | AcpError::ProtocolParseError { .. }
+        | AcpError::InvalidRequest { .. }
+        | AcpError::InvalidParams { .. } => DynamicProbeFailure::new(AgentProbeErrorCategory::Protocol, message),
+        _ => DynamicProbeFailure::new(AgentProbeErrorCategory::Unknown, message),
+    }
 }
 
 /// Result of the Step 2 probe (`initialize` + `session/new`).

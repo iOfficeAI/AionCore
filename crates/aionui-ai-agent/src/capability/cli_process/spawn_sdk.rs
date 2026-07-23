@@ -1,10 +1,9 @@
 use aionui_common::{CommandSpec, ErrorChain};
-use aionui_runtime::Builder as CmdBuilder;
-#[cfg(test)]
+use aionui_runtime::{Builder as CmdBuilder, ProcessLeaseSpec};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Child;
 use tokio::sync::{Mutex, watch};
 use tracing::{debug, error, info, warn};
 
@@ -23,12 +22,17 @@ impl CliAgentProcess {
     /// - stderr buffering
     /// - Process exit monitoring
     pub async fn spawn_for_sdk(config: CommandSpec) -> Result<Self, AgentError> {
-        let mut cmd = CmdBuilder::new(&config.command);
+        Self::spawn_for_sdk_in_data_dir(config, &std::env::temp_dir()).await
+    }
+
+    pub async fn spawn_for_sdk_in_data_dir(config: CommandSpec, data_dir: &Path) -> Result<Self, AgentError> {
+        let (mut cmd, environment_kind, environment_id, lease_id) = Self::sdk_runner_command(&config)?;
         let agent_env = aionui_runtime::agent_process_env().await;
-        cmd.args(&config.args)
-            .env_clear()
+        cmd.env_clear()
             .envs(agent_env)
+            .envs(Self::agent_spawn_env(data_dir))
             .envs(config.env.iter().map(|e| (&e.name, &e.value)))
+            .env("AIONUI_RUNNER_ENVIRONMENT_ID", &environment_id)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -37,32 +41,61 @@ impl CliAgentProcess {
             cmd.current_dir(prepare_command_cwd(cwd)?);
         }
         let preview = Self::sdk_spawn_preview(&config);
-        info!(command = %preview, "Spawning CLI process (SDK mode)");
-        let mut child: Child = cmd.spawn().map_err(|e| {
-            error!(command = %preview, error = %ErrorChain(&e), "Failed to spawn CLI process");
-            AgentError::internal(format!("Failed to spawn CLI process '{preview}': {e}"))
-        })?;
+        info!(
+            lease_id,
+            environment_kind, environment_id, "spawning leased ACP process"
+        );
+        let mut child = cmd
+            .spawn_leased(ProcessLeaseSpec::new(
+                &lease_id,
+                &environment_id,
+                Duration::from_secs(24 * 60 * 60),
+            ))
+            .map_err(|e| {
+                error!(lease_id, environment_kind, error = %ErrorChain(&e), "failed to spawn leased ACP process");
+                AgentError::internal(format!("Failed to spawn CLI process '{preview}': {e}"))
+            })?;
 
-        let pid = child.id().ok_or_else(|| {
-            error!(command = %preview, "Failed to obtain PID from spawned process");
-            AgentError::internal("Failed to obtain PID from spawned process")
-        })?;
-        info!(pid, command = %preview, "CLI process spawned (SDK mode)");
+        let pid = match child.id() {
+            Some(pid) => pid,
+            None => {
+                error!(lease_id, environment_kind, "failed to obtain leased ACP process id");
+                let _ = child.terminate_tree().await;
+                return Err(AgentError::internal("Failed to obtain PID from spawned process"));
+            }
+        };
+        info!(
+            pid,
+            lease_id, environment_kind, environment_id, "leased ACP process spawned"
+        );
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            error!(pid, "Failed to capture stdout from child process");
-            AgentError::internal("Failed to capture stdout from child process")
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            error!(pid, "Failed to capture stderr from child process");
-            AgentError::internal("Failed to capture stderr from child process")
-        })?;
-        let stdin = child.stdin.take().ok_or_else(|| {
-            error!(pid, "Failed to capture stdin for child process");
-            AgentError::internal("Failed to capture stdin for child process")
-        })?;
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                error!(pid, "Failed to capture stdout from child process");
+                let _ = child.terminate_tree().await;
+                return Err(AgentError::internal("Failed to capture stdout from child process"));
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                error!(pid, "Failed to capture stderr from child process");
+                let _ = child.terminate_tree().await;
+                return Err(AgentError::internal("Failed to capture stderr from child process"));
+            }
+        };
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                error!(pid, "Failed to capture stdin for child process");
+                let _ = child.terminate_tree().await;
+                return Err(AgentError::internal("Failed to capture stdin from child process"));
+            }
+        };
 
         let (exit_tx, exit_rx) = watch::channel(None);
+        let process_lease = child.lease().clone();
 
         // Background task: read stderr → ring buffer + log
         let stderr_buffer = Arc::new(Mutex::new(String::new()));
@@ -74,7 +107,7 @@ impl CliAgentProcess {
             while let Ok(Some(line)) = lines.next_line().await {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
-                    warn!(pid, stderr = trimmed, "CLI process stderr");
+                    warn!(pid, stderr_bytes = line.len(), "ACP process emitted stderr");
                 }
                 let mut buf = stderr_buf_clone.lock().await;
                 buf.push_str(&line);
@@ -85,12 +118,20 @@ impl CliAgentProcess {
             debug!(pid, "Stderr reader finished");
         });
 
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            while !process_lease.is_terminal() {
+                interval.tick().await;
+                process_lease.heartbeat();
+            }
+        });
+
         // Background task: monitor process exit
         let exit_handle = tokio::spawn(async move {
-            match child.wait().await {
-                Ok(status) => {
-                    info!(pid, ?status, "CLI process exited");
-                    let _ = exit_tx.send(Some(status));
+            match child.wait_with_timeout().await {
+                Ok(exit) => {
+                    info!(pid, lease_id, timed_out = exit.timed_out, "leased ACP process exited");
+                    let _ = exit_tx.send(exit.status);
                 }
                 Err(e) => {
                     error!(pid, error = %ErrorChain(&e), "Failed to wait on CLI process");
@@ -111,6 +152,96 @@ impl CliAgentProcess {
         })
     }
 
+    fn sdk_runner_command(config: &CommandSpec) -> Result<(CmdBuilder, String, String, String), AgentError> {
+        let environment_kind = config_env(config, "AIONUI_RUNNER_ENVIRONMENT_KIND").unwrap_or("host");
+        let environment_id = config_env(config, "AIONUI_RUNNER_ENVIRONMENT_ID")
+            .map(str::to_owned)
+            .unwrap_or_else(|| "host:local".into());
+        let lease_id = config_env(config, "AIONUI_EXECUTION_LEASE_ID")
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("agent:{}", uuid::Uuid::now_v7()));
+        let command = match environment_kind {
+            "host" => {
+                let mut command = CmdBuilder::new(&config.command);
+                command.args(&config.args);
+                command
+            }
+            "docker" => {
+                let image = config_env(config, "AIONUI_RUNNER_CONTAINER_IMAGE")
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| AgentError::bad_request("Docker Agent execution requires a container image"))?;
+                let cwd = config
+                    .cwd
+                    .as_deref()
+                    .ok_or_else(|| AgentError::bad_request("Docker Agent execution requires a workspace"))?;
+                let container_name = format!("aion-agent-{}", safe_runner_id(&lease_id));
+                let mut args = vec![
+                    "run".into(),
+                    "--rm".into(),
+                    "--init".into(),
+                    "-i".into(),
+                    "--name".into(),
+                    container_name,
+                    "--workdir".into(),
+                    "/workspace".into(),
+                    "--volume".into(),
+                    format!("{cwd}:/workspace:rw"),
+                ];
+                for entry in config.env.iter().filter(|entry| !entry.name.starts_with("AIONUI_")) {
+                    args.push("--env".into());
+                    args.push(entry.name.clone());
+                }
+                args.push(image.into());
+                args.push(config.command.to_string_lossy().into_owned());
+                args.extend(config.args.clone());
+                let mut command = CmdBuilder::new("docker");
+                command.args(args);
+                command
+            }
+            "devcontainer" => {
+                let cwd = config
+                    .cwd
+                    .as_deref()
+                    .ok_or_else(|| AgentError::bad_request("Dev Container Agent execution requires a workspace"))?;
+                let devcontainer_config = config_env(config, "AIONUI_RUNNER_DEVCONTAINER_CONFIG")
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| AgentError::bad_request("Dev Container Agent execution requires a config path"))?;
+                if config.env.iter().any(|entry| !entry.name.starts_with("AIONUI_")) {
+                    return Err(AgentError::bad_request(
+                        "Dev Container Agent credentials must be provisioned inside the selected container",
+                    ));
+                }
+                let mut args = vec![
+                    "exec".into(),
+                    "--workspace-folder".into(),
+                    cwd.into(),
+                    "--config".into(),
+                    devcontainer_config.into(),
+                    config.command.to_string_lossy().into_owned(),
+                ];
+                args.extend(config.args.clone());
+                let mut command = CmdBuilder::new("devcontainer");
+                command.args(args);
+                command
+            }
+            other => {
+                return Err(AgentError::bad_request(format!(
+                    "Unsupported Agent execution environment: {other}"
+                )));
+            }
+        };
+        Ok((command, environment_kind.into(), environment_id, lease_id))
+    }
+
+    fn agent_spawn_env(data_dir: &Path) -> Vec<(String, String)> {
+        let bun_cache = data_dir.join("bun-cache");
+        let bun_tmp = data_dir.join("bun-tmp");
+        vec![
+            ("BUN_INSTALL_CACHE_DIR".into(), bun_cache.to_string_lossy().into_owned()),
+            ("BUN_TMPDIR".into(), bun_tmp.to_string_lossy().into_owned()),
+        ]
+    }
+
     fn sdk_spawn_preview(config: &CommandSpec) -> String {
         let explicit_env_key_names: Vec<&str> = config.env.iter().map(|entry| entry.name.as_str()).collect();
         format!(
@@ -122,6 +253,28 @@ impl CliAgentProcess {
             config.cwd.as_deref().unwrap_or("<inherit>")
         )
     }
+}
+
+fn config_env<'a>(config: &'a CommandSpec, name: &str) -> Option<&'a str> {
+    config
+        .env
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.value.as_str())
+}
+
+fn safe_runner_id(value: &str) -> String {
+    let value = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    value.trim_matches('-').chars().take(48).collect()
 }
 
 #[cfg(test)]

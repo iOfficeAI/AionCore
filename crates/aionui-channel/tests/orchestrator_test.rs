@@ -25,6 +25,7 @@ fn make_text_message(user_id: &str, chat_id: &str, text: &str) -> UnifiedIncomin
             attachments: None,
         },
         timestamp: 0,
+        topic: None,
         reply_to_message_id: None,
         action: None,
         raw: None,

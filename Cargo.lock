@@ -404,10 +404,12 @@ dependencies = [
  "aionui-conversation",
  "aionui-cron",
  "aionui-db",
+ "aionui-development",
  "aionui-extension",
  "aionui-file",
  "aionui-mcp",
  "aionui-office",
+ "aionui-project",
  "aionui-realtime",
  "aionui-runtime",
  "aionui-shell",
@@ -533,6 +535,7 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.26.2",
@@ -625,6 +628,34 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "aionui-development"
+version = "0.1.50"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "aionui-runtime",
+ "async-trait",
+ "axum",
+ "ed25519-dalek",
+ "git2",
+ "hex",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -737,6 +768,31 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "which 7.0.3",
+]
+
+[[package]]
+name = "aionui-project"
+version = "0.1.50"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "aionui-runtime",
+ "async-trait",
+ "axum",
+ "git2",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "uuid",
+ "walkdir",
  "which 7.0.3",
 ]
 

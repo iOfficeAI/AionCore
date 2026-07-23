@@ -27,6 +27,13 @@ pub struct ConversationRow {
     pub source: Option<String>,
     /// Channel isolation ID (e.g. "user:xxx", "group:xxx").
     pub channel_chat_id: Option<String>,
+    /// Explicit product source channel (webui, desktop, telegram, discord, ...).
+    pub source_channel: Option<String>,
+    pub source_channel_id: Option<String>,
+    pub source_chat_id: Option<String>,
+    pub source_user_id: Option<String>,
+    pub source_label: Option<String>,
+    pub created_from: Option<String>,
     /// Whether this conversation is pinned (SQLite INTEGER 0/1).
     pub pinned: bool,
     pub pinned_at: Option<TimestampMs>,

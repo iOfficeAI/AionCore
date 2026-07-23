@@ -689,6 +689,7 @@ async fn handle_bot_message(data_str: &str, message_tx: &mpsc::Sender<UnifiedInc
     let timestamp = cb.create_at.map(|ms| ms / 1000).unwrap_or_else(chrono_now);
 
     let unified = UnifiedIncomingMessage {
+        topic: None,
         id: cb.msg_id.clone().unwrap_or_default(),
         platform: PluginType::Dingtalk,
         chat_id,
@@ -782,6 +783,7 @@ async fn handle_card_action(
     });
 
     let msg = UnifiedIncomingMessage {
+        topic: None,
         id: format!("card_{}", chrono_now()),
         platform: PluginType::Dingtalk,
         chat_id,
@@ -1097,6 +1099,7 @@ mod tests {
             media_actions: None,
             reply_to_message_id: None,
             silent: None,
+            topic: None,
         };
         let result = plugin.edit_message("chat1", "msg1", msg).await;
         assert!(result.is_err());
@@ -1121,6 +1124,7 @@ mod tests {
             media_actions: None,
             reply_to_message_id: None,
             silent: None,
+            topic: None,
         };
         let result = plugin.send_message("chat1", msg).await;
         assert!(result.is_err());

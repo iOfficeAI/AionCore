@@ -14,11 +14,13 @@ mod connection_test;
 mod conversation;
 mod cron;
 mod custom_agent;
+mod development;
 mod extension;
 mod file;
 mod lifecycle;
 mod mcp;
 mod office;
+mod project;
 mod provider;
 mod remote_agent;
 mod response;
@@ -44,7 +46,8 @@ pub use agent_build_extra::{
     SlashCommandCompletionBehavior, SlashCommandItem,
 };
 pub use agent_discovery::{
-    AgentEnvEntry, AgentHandshake, AgentLogoEntry, AgentManagementRow, AgentManagementStatus, AgentMetadata,
+    AgentDynamicProbeResult, AgentEnvEntry, AgentHandshake, AgentLogoEntry, AgentManagementRow, AgentManagementStatus,
+    AgentMetadata, AgentProbeErrorCategory, AgentProbeStatus, AgentProbeStep, AgentProbeStepResult,
     AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource, AgentSourceInfo, BehaviorPolicy,
 };
 pub use agent_error::{
@@ -94,6 +97,13 @@ pub use custom_agent::{
     AgentOverridesResponse, CustomAgentAdvancedOverrides, CustomAgentUpsertRequest, DeleteCustomAgentResponse,
     SetAgentOverridesRequest, SetEnabledRequest,
 };
+pub use development::{
+    AcceptanceCriterion, CriterionCoverage, DevelopmentConfirmationRequest, DevelopmentDeploymentRequest,
+    DevelopmentModelPriceRequest, DevelopmentRunControlRequest, DevelopmentRunControlState, DevelopmentRunTimeline,
+    DevelopmentSecretCreateRequest, DevelopmentSecretGrantRequest, DevelopmentSecretReference, DevelopmentTagRequest,
+    DevelopmentTimelineEvent, DevelopmentUsageCost, PlanRevision, RequirementVersion, RequirementsSnapshot,
+    SingleRunWorkspace,
+};
 pub use extension::{
     DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,
     GetRiskLevelRequest, HubExtensionListItem, HubExtensionListResponse, HubOperationResponse, HubUpdateInfo,
@@ -120,6 +130,14 @@ pub use office::{
     ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, GetSnapshotContentRequest, ListSnapshotsRequest, PptJsonData,
     PptSlideData, PreviewHistoryTargetDto, PreviewSnapshotInfoDto, PreviewState, PreviewStatusEvent,
     PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StartPreviewRequest, StopPreviewRequest,
+};
+pub use project::{
+    DevelopmentEvaluation, DevelopmentRetentionPolicy, DirtyWorktreeChoice, EvaluationComparison,
+    EvaluationComparisonRequest, EvaluationRecordInput, EvaluationRegression, ImportProjectBundleRequest,
+    PlatformInstanceSummary, ProjectExportBundle, ProjectExportManifest, ProjectImportReport, ProjectKnowledgeFact,
+    ProjectKnowledgeStatus, ProjectRepositoryFacts, ProjectRepositoryOnboardingInput, ProjectTaskContext,
+    ProjectTaskContextRequest, RepositorySource, RepositorySubmodule, RetentionCleanupReport, RetentionCleanupRequest,
+    RetentionPolicyInput,
 };
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest, DetectionSuggestion,
@@ -158,14 +176,15 @@ pub use system::{
     UpdateClientPreferencesRequest, UpdateSettingsRequest,
 };
 pub use team::{
-    AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, PauseTeamSlotRequest,
-    RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, TeamAgentInput,
-    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamAgentRuntimeStatusPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload,
-    TeamListResponse, TeamMcpRuntimeConfig, TeamMessageEnqueueStatus, TeamResponse, TeamRunAckResponse, TeamRunPayload,
-    TeamRunSource, TeamRunStateResponse, TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed,
-    TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
-    TeamSlotBlockedReason, TeamSlotWorkPayload, TeamSlotWorkState, TeammateMessagePayload,
+    AddAgentRequest, AgentWorkspaceLeaseResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest,
+    CreateTeamHttpRequest, CreateTeamRequest, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
+    SendAgentMessageRequest, SendTeamMessageRequest, TeamAgentInput, TeamAgentRemovedPayload, TeamAgentRenamedPayload,
+    TeamAgentResponse, TeamAgentRuntimeStatus, TeamAgentRuntimeStatusPayload, TeamAgentSpawnedPayload,
+    TeamAgentStatusPayload, TeamChildTurnPayload, TeamListResponse, TeamMcpRuntimeConfig, TeamMessageEnqueueStatus,
+    TeamResponse, TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStateResponse, TeamRunStatus,
+    TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase,
+    TeamSessionStatus, TeamSessionStatusPayload, TeamSlotBlockedReason, TeamSlotWorkPayload, TeamSlotWorkState,
+    TeamWorkspaceMode, TeammateMessagePayload,
 };
 pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use team_tools::{

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{env, path::Path, sync::Arc};
 
 use aionui_api_types::{
     ChannelAssistantSettingRequest, ChannelAssistantSettingResponse, ChannelDefaultModelSetting,
@@ -6,8 +6,9 @@ use aionui_api_types::{
 };
 use aionui_common::ProviderWithModel;
 use aionui_db::{
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IClientPreferenceRepository,
-    resolve_agent_binding_from_rows,
+    AgentMetadataRow, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    IClientPreferenceRepository, IProviderRepository, models::Provider, resolve_agent_binding_from_rows,
+    runtime_backend_for_agent,
 };
 use tracing::debug;
 
@@ -15,6 +16,7 @@ use crate::error::ChannelError;
 use crate::types::PluginType;
 
 const DEFAULT_AGENT_TYPE: &str = "aionrs";
+const AIONRS_DEFAULT_MODEL_KEY: &str = "aionrs.defaultModel";
 
 /// Per-plugin agent/model configuration read from `client_preferences`.
 ///
@@ -24,6 +26,7 @@ const DEFAULT_AGENT_TYPE: &str = "aionrs";
 pub struct ChannelSettingsService {
     pref_repo: Arc<dyn IClientPreferenceRepository>,
     agent_metadata_repo: Option<Arc<dyn IAgentMetadataRepository>>,
+    provider_repo: Option<Arc<dyn IProviderRepository>>,
     assistant_definition_repo: Option<Arc<dyn IAssistantDefinitionRepository>>,
     assistant_overlay_repo: Option<Arc<dyn IAssistantOverlayRepository>>,
 }
@@ -46,11 +49,40 @@ pub struct ResolvedModelConfig {
     pub use_model: Option<String>,
 }
 
+/// Assistant option exposed to channel command UIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelAssistantOption {
+    pub assistant_id: String,
+    pub name: String,
+    pub agent_type: String,
+    pub backend: Option<String>,
+}
+
+/// Local agent option exposed to channel command UIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelAgentOption {
+    pub agent_id: String,
+    pub name: String,
+    pub agent_type: String,
+    pub backend: Option<String>,
+    pub models: Vec<ChannelModelOption>,
+    pub last_probe_at: Option<i64>,
+}
+
+/// Model option exposed to channel command UIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelModelOption {
+    pub provider_id: String,
+    pub model: String,
+    pub label: String,
+}
+
 impl ChannelSettingsService {
     pub fn new(pref_repo: Arc<dyn IClientPreferenceRepository>) -> Self {
         Self {
             pref_repo,
             agent_metadata_repo: None,
+            provider_repo: None,
             assistant_definition_repo: None,
             assistant_overlay_repo: None,
         }
@@ -58,6 +90,11 @@ impl ChannelSettingsService {
 
     pub fn with_agent_metadata_repo(mut self, agent_metadata_repo: Arc<dyn IAgentMetadataRepository>) -> Self {
         self.agent_metadata_repo = Some(agent_metadata_repo);
+        self
+    }
+
+    pub fn with_provider_repo(mut self, provider_repo: Arc<dyn IProviderRepository>) -> Self {
+        self.provider_repo = Some(provider_repo);
         self
     }
 
@@ -139,28 +176,47 @@ impl ChannelSettingsService {
     /// Returns `None` when no model is configured (common for ACP agents).
     pub async fn get_model_config(&self, platform: PluginType) -> Result<Option<ResolvedModelConfig>, ChannelError> {
         let key = model_key(platform);
-        let prefs = self.pref_repo.get_by_keys(&[&key]).await?;
+        if let Some(config) = self.get_model_config_by_key(&key).await? {
+            return Ok(Some(config));
+        }
+
+        let agent_config = match self.get_agent_config(platform).await {
+            Ok(config) => config,
+            Err(error) => {
+                debug!(platform = %platform, error = %error, "skipping channel model fallback because agent config could not be resolved");
+                return Ok(None);
+            }
+        };
+        if agent_config.agent_type == DEFAULT_AGENT_TYPE {
+            return self.get_model_config_by_key(AIONRS_DEFAULT_MODEL_KEY).await;
+        }
+
+        Ok(None)
+    }
+
+    async fn get_model_config_by_key(&self, key: &str) -> Result<Option<ResolvedModelConfig>, ChannelError> {
+        let prefs = self.pref_repo.get_by_keys(&[key]).await?;
 
         let Some(pref) = prefs.into_iter().next() else {
             return Ok(None);
         };
 
-        let parsed: serde_json::Value = serde_json::from_str(&pref.value).unwrap_or_default();
-
-        let provider_id = parsed["id"].as_str().unwrap_or_default().to_owned();
-        let use_model = parsed["use_model"].as_str().map(|s| s.to_owned());
-
-        if provider_id.is_empty() && use_model.is_none() {
+        let Some(model) = parse_model_config_value(&pref.value) else {
             return Ok(None);
-        }
+        };
 
-        debug!(platform = %platform, provider_id = %provider_id, use_model = ?use_model, "resolved channel model config");
+        debug!(key, provider_id = %model.provider_id, use_model = ?model.use_model, "resolved channel model config");
 
-        Ok(Some(ResolvedModelConfig {
-            provider_id: provider_id.clone(),
-            model: use_model.clone().unwrap_or_default(),
-            use_model,
-        }))
+        Ok(Some(model))
+    }
+
+    async fn provider_model_options(&self) -> Result<Vec<ChannelModelOption>, ChannelError> {
+        let Some(provider_repo) = self.provider_repo.as_ref() else {
+            return Ok(vec![]);
+        };
+
+        let providers = provider_repo.list().await?;
+        Ok(provider_model_options_from_rows(&providers))
     }
 
     pub async fn get_platform_settings(
@@ -238,6 +294,91 @@ impl ChannelSettingsService {
         Ok(())
     }
 
+    pub async fn clear_model_setting(&self, platform: PluginType) -> Result<(), ChannelError> {
+        let key = model_key(platform);
+        self.pref_repo.delete_keys(&[&key]).await?;
+        Ok(())
+    }
+
+    pub async fn list_assistant_options(&self) -> Result<Vec<ChannelAssistantOption>, ChannelError> {
+        let (Some(definition_repo), Some(overlay_repo)) =
+            (&self.assistant_definition_repo, &self.assistant_overlay_repo)
+        else {
+            return Ok(vec![]);
+        };
+
+        let definitions = definition_repo.list().await?;
+        let overlays = overlay_repo.list().await?;
+        let mut options = Vec::new();
+
+        for definition in definitions
+            .into_iter()
+            .filter(|definition| definition.deleted_at.is_none())
+        {
+            let overlay = overlays
+                .iter()
+                .find(|overlay| overlay.assistant_definition_id == definition.id);
+            if overlay.is_some_and(|overlay| !overlay.enabled) {
+                continue;
+            }
+
+            let backend = self.effective_assistant_backend(&definition, &overlays).await?;
+            let agent_type = backend_to_agent_type(&backend);
+            let backend = if agent_type == "acp" { Some(backend) } else { None };
+            options.push(ChannelAssistantOption {
+                assistant_id: definition.assistant_id,
+                name: definition.name,
+                agent_type,
+                backend,
+            });
+        }
+
+        options.sort_by_key(|option| option.name.to_lowercase());
+        Ok(options)
+    }
+
+    pub async fn list_agent_options(&self) -> Result<Vec<ChannelAgentOption>, ChannelError> {
+        let Some(agent_metadata_repo) = self.agent_metadata_repo.as_ref() else {
+            return Ok(vec![]);
+        };
+
+        let rows = agent_metadata_repo.list_all().await?;
+        let provider_models = self.provider_model_options().await?;
+        let mut options = Vec::new();
+
+        for row in rows.into_iter().filter(is_channel_visible_agent_row) {
+            let runtime_backend = runtime_backend_for_agent(&row);
+            let backend = if row.agent_type == "acp" {
+                Some(runtime_backend)
+            } else {
+                None
+            };
+            options.push((
+                row.sort_order,
+                row.name.to_lowercase(),
+                ChannelAgentOption {
+                    agent_id: row.id.clone(),
+                    name: row.name.clone(),
+                    agent_type: row.agent_type.clone(),
+                    backend,
+                    models: if row.agent_type == DEFAULT_AGENT_TYPE {
+                        provider_models.clone()
+                    } else {
+                        parse_probed_agent_model_options(
+                            &row.id,
+                            row.dynamic_probe_result.as_deref(),
+                            row.config_options.as_deref(),
+                        )
+                    },
+                    last_probe_at: parse_dynamic_probe_checked_at(row.dynamic_probe_result.as_deref()),
+                },
+            ));
+        }
+
+        options.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        Ok(options.into_iter().map(|(_, _, option)| option).collect())
+    }
+
     async fn resolve_assistant_agent_config(
         &self,
         assistant_id: &str,
@@ -245,11 +386,11 @@ impl ChannelSettingsService {
         let (Some(definition_repo), Some(overlay_repo)) =
             (&self.assistant_definition_repo, &self.assistant_overlay_repo)
         else {
-            return Ok(None);
+            return self.resolve_agent_metadata_config(assistant_id).await;
         };
 
         let Some(definition) = definition_repo.get_by_assistant_id(assistant_id).await? else {
-            return Ok(None);
+            return self.resolve_agent_metadata_config(assistant_id).await;
         };
 
         let agent_id = overlay_repo
@@ -262,6 +403,25 @@ impl ChannelSettingsService {
         let backend = if agent_type == "acp" { Some(agent_backend) } else { None };
 
         Ok(Some(ResolvedAgentConfig { agent_type, backend }))
+    }
+
+    async fn resolve_agent_metadata_config(&self, agent_id: &str) -> Result<Option<ResolvedAgentConfig>, ChannelError> {
+        let Some(agent_metadata_repo) = self.agent_metadata_repo.as_ref() else {
+            return Ok(None);
+        };
+        let rows = agent_metadata_repo.list_all().await?;
+        let Some(resolved) = resolve_agent_binding_from_rows(&rows, agent_id) else {
+            return Ok(None);
+        };
+        let backend = if resolved.agent_type == "acp" {
+            Some(resolved.runtime_backend)
+        } else {
+            None
+        };
+        Ok(Some(ResolvedAgentConfig {
+            agent_type: resolved.agent_type,
+            backend,
+        }))
     }
 
     async fn resolve_assistant_identity_for_legacy_binding(
@@ -405,6 +565,179 @@ impl ChannelSettingsService {
     }
 }
 
+fn is_channel_visible_agent_row(row: &AgentMetadataRow) -> bool {
+    if !row.enabled {
+        return false;
+    }
+    if row.agent_type != DEFAULT_AGENT_TYPE && row.agent_type != "acp" {
+        return false;
+    }
+    match row.last_check_status.as_deref() {
+        Some("offline") | Some("unavailable") => false,
+        Some("online") | Some("available") => true,
+        _ => {
+            row.agent_source == "internal"
+                || row.last_success_at.is_some()
+                || row
+                    .available_models
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                || row_has_direct_local_command(row)
+        }
+    }
+}
+
+fn row_has_direct_local_command(row: &AgentMetadataRow) -> bool {
+    let command = row
+        .command
+        .as_deref()
+        .or(row.backend.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "-");
+    let Some(command) = command else {
+        return false;
+    };
+    if matches!(command, "npx" | "npm" | "pnpm" | "bun" | "yarn") {
+        return false;
+    }
+    command_exists(command)
+}
+
+fn command_exists(command: &str) -> bool {
+    let path = Path::new(command);
+    if path.components().count() > 1 {
+        return path.is_file();
+    }
+    env::var_os("PATH")
+        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(command).is_file()))
+        .unwrap_or(false)
+}
+
+fn parse_probed_agent_model_options(
+    provider_id: &str,
+    raw: Option<&str>,
+    config_options_raw: Option<&str>,
+) -> Vec<ChannelModelOption> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return vec![];
+    };
+    let Ok(probe) = serde_json::from_str::<aionui_api_types::AgentDynamicProbeResult>(raw) else {
+        return vec![];
+    };
+    if !probe.is_usable() {
+        return vec![];
+    }
+
+    let observed_models = if probe.available_models.is_empty() {
+        parse_config_option_models(config_options_raw)
+    } else {
+        probe
+            .available_models
+            .into_iter()
+            .map(|model| (model.clone(), model))
+            .collect()
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut models = Vec::new();
+    for (model, label) in observed_models {
+        let model = model.trim().to_owned();
+        if model.is_empty() || !seen.insert(model.clone()) {
+            continue;
+        }
+        models.push(ChannelModelOption {
+            provider_id: provider_id.to_owned(),
+            label: label.trim().to_owned(),
+            model,
+        });
+    }
+    models
+}
+
+fn parse_config_option_models(raw: Option<&str>) -> Vec<(String, String)> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return vec![];
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return vec![];
+    };
+    let Some(options) = value
+        .get("config_options")
+        .or_else(|| value.get("configOptions"))
+        .or_else(|| value.as_array().map(|_| &value))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return vec![];
+    };
+    let Some(model_option) = options.iter().find(|option| {
+        option
+            .get("category")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|category| category.eq_ignore_ascii_case("model"))
+            || option
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| matches!(id.to_ascii_lowercase().as_str(), "model" | "models"))
+    }) else {
+        return vec![];
+    };
+
+    fn collect_options(value: &serde_json::Value, output: &mut Vec<(String, String)>) {
+        let Some(entries) = value.as_array() else {
+            return;
+        };
+        for entry in entries {
+            if let Some(model) = entry.get("value").and_then(serde_json::Value::as_str) {
+                let label = entry
+                    .get("name")
+                    .or_else(|| entry.get("label"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(model);
+                output.push((model.to_owned(), label.to_owned()));
+            } else if let Some(children) = entry.get("options") {
+                collect_options(children, output);
+            }
+        }
+    }
+
+    let mut models = Vec::new();
+    if let Some(entries) = model_option.get("options") {
+        collect_options(entries, &mut models);
+    }
+    models
+}
+
+fn parse_dynamic_probe_checked_at(raw: Option<&str>) -> Option<i64> {
+    raw.and_then(|value| serde_json::from_str::<aionui_api_types::AgentDynamicProbeResult>(value).ok())
+        .map(|probe| probe.checked_at)
+}
+
+fn provider_model_options_from_rows(providers: &[Provider]) -> Vec<ChannelModelOption> {
+    let mut options = Vec::new();
+    for provider in providers.iter().filter(|provider| provider.enabled) {
+        let model_enabled = parse_model_enabled_map(provider.model_enabled.as_deref());
+        let Ok(models) = serde_json::from_str::<Vec<String>>(&provider.models) else {
+            continue;
+        };
+        for model in models {
+            let model = model.trim().to_owned();
+            if model.is_empty() || model_enabled.get(&model) == Some(&false) {
+                continue;
+            }
+            options.push(ChannelModelOption {
+                provider_id: provider.id.clone(),
+                model: model.clone(),
+                label: format!("{} / {}", provider.name, model),
+            });
+        }
+    }
+    options
+}
+
+fn parse_model_enabled_map(raw: Option<&str>) -> std::collections::HashMap<String, bool> {
+    raw.and_then(|value| serde_json::from_str::<std::collections::HashMap<String, bool>>(value).ok())
+        .unwrap_or_default()
+}
+
 fn agent_key(platform: PluginType) -> String {
     format!("assistant.{platform}.agent")
 }
@@ -459,6 +792,23 @@ fn parse_channel_model_setting(value: &str) -> Option<ChannelDefaultModelSetting
     let id = parsed["id"].as_str()?.to_owned();
     let use_model = parsed["use_model"].as_str()?.to_owned();
     Some(ChannelDefaultModelSetting { id, use_model })
+}
+
+fn parse_model_config_value(value: &str) -> Option<ResolvedModelConfig> {
+    let parsed: serde_json::Value = serde_json::from_str(value).unwrap_or_default();
+
+    let provider_id = parsed["id"].as_str().unwrap_or_default().to_owned();
+    let use_model = parsed["use_model"].as_str().map(|s| s.to_owned());
+
+    if provider_id.is_empty() && use_model.is_none() {
+        return None;
+    }
+
+    Some(ResolvedModelConfig {
+        provider_id: provider_id.clone(),
+        model: use_model.clone().unwrap_or_default(),
+        use_model,
+    })
 }
 
 /// Maps a backend identifier to the corresponding `AgentType` serde name.
@@ -724,6 +1074,65 @@ mod tests {
         assert_eq!(backend_to_agent_type("unknown"), "acp");
     }
 
+    #[test]
+    fn dynamic_probe_timestamp_is_exposed_to_channel_model_menu() {
+        let raw = r#"{"agent_id":"codex","checked_at":1750000000000,"steps":[],"available_models":["gpt-5"]}"#;
+        assert_eq!(parse_dynamic_probe_checked_at(Some(raw)), Some(1_750_000_000_000));
+        assert_eq!(parse_dynamic_probe_checked_at(Some("not-json")), None);
+        assert_eq!(parse_dynamic_probe_checked_at(None), None);
+    }
+
+    #[test]
+    fn channel_model_menu_uses_only_last_successful_dynamic_probe_models() {
+        let checked_at = 1_750_000_000_000;
+        let raw = serde_json::to_string(&healthy_probe_with_models(
+            "codex",
+            checked_at,
+            vec!["gpt-5.6".into(), "gpt-5.6".into(), "".into()],
+        ))
+        .unwrap();
+
+        let models = parse_probed_agent_model_options("codex", Some(&raw), None);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].provider_id, "codex");
+        assert_eq!(models[0].model, "gpt-5.6");
+        assert_eq!(models[0].label, "gpt-5.6");
+        assert!(parse_probed_agent_model_options("codex", Some("not-json"), None).is_empty());
+        assert!(parse_probed_agent_model_options("codex", None, None).is_empty());
+    }
+
+    fn healthy_probe_with_models(
+        agent_id: &str,
+        checked_at: i64,
+        available_models: Vec<String>,
+    ) -> aionui_api_types::AgentDynamicProbeResult {
+        use aionui_api_types::{AgentProbeStatus, AgentProbeStep, AgentProbeStepResult};
+
+        aionui_api_types::AgentDynamicProbeResult {
+            agent_id: agent_id.into(),
+            checked_at,
+            available_models,
+            steps: [
+                AgentProbeStep::Spawn,
+                AgentProbeStep::Initialize,
+                AgentProbeStep::Models,
+                AgentProbeStep::MinimalPrompt,
+                AgentProbeStep::Cancel,
+            ]
+            .into_iter()
+            .map(|step| AgentProbeStepResult {
+                step,
+                status: AgentProbeStatus::Passed,
+                started_at: checked_at,
+                duration_ms: 1,
+                error_category: None,
+                error_message: None,
+            })
+            .collect(),
+        }
+    }
+
     // ── get_agent_config ──────────────────────────────────────────────
 
     #[tokio::test]
@@ -893,6 +1302,48 @@ mod tests {
 
         let config = svc.get_model_config(PluginType::Telegram).await.unwrap();
         assert!(config.is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_model_setting_removes_platform_default_model() {
+        let repo = Arc::new(MockPrefRepo::with_data(vec![(
+            "assistant.telegram.defaultModel",
+            r#"{"id":"openai","use_model":"gpt-5"}"#,
+        )]));
+        let svc = ChannelSettingsService::new(repo.clone());
+
+        svc.clear_model_setting(PluginType::Telegram).await.unwrap();
+
+        let stored = repo.get_by_keys(&["assistant.telegram.defaultModel"]).await.unwrap();
+        assert!(stored.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_assistant_options_returns_enabled_assistants() {
+        let repo = Arc::new(MockPrefRepo::new());
+        let disabled = make_definition("bare-disabled", "codex");
+        let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(MockAssistantDefinitionRepo {
+            rows: vec![make_definition("bare-aionrs", "aionrs"), disabled.clone()],
+        });
+        let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(MockAssistantOverlayRepo {
+            rows: vec![AssistantOverlayRow {
+                assistant_definition_id: disabled.id,
+                enabled: false,
+                sort_order: 0,
+                agent_id_override: None,
+                last_used_at: None,
+                created_at: 0,
+                updated_at: 0,
+            }],
+        });
+        let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
+
+        let options = svc.list_assistant_options().await.unwrap();
+
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].assistant_id, "bare-aionrs");
+        assert_eq!(options[0].agent_type, "aionrs");
+        assert_eq!(options[0].backend, None);
     }
 
     #[tokio::test]

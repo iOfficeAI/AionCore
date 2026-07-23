@@ -1,7 +1,10 @@
 use aionui_common::TimestampMs;
 
 use crate::error::DbError;
-use crate::models::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
+use crate::models::{
+    AssistantSessionRow, AssistantUserRow, ChannelPluginRow, ChannelTopicModelOverrideRow, PairingCodeRow,
+    TelegramTopicBindingRow,
+};
 
 /// Data access abstraction for channel integration tables.
 ///
@@ -11,6 +14,34 @@ use crate::models::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, Pai
 /// Object-safe via `async_trait` to support `Arc<dyn IChannelRepository>`.
 #[async_trait::async_trait]
 pub trait IChannelRepository: Send + Sync {
+    async fn get_telegram_topic_binding(
+        &self,
+        _chat_id: &str,
+        _message_thread_id: i64,
+    ) -> Result<Option<TelegramTopicBindingRow>, DbError> {
+        Ok(None)
+    }
+    async fn upsert_telegram_topic_binding(&self, _row: &TelegramTopicBindingRow) -> Result<(), DbError> {
+        Err(DbError::NotFound("topic bindings unsupported".into()))
+    }
+    async fn delete_telegram_topic_binding(&self, _chat_id: &str, _message_thread_id: i64) -> Result<(), DbError> {
+        Ok(())
+    }
+    async fn get_topic_model_override(
+        &self,
+        _platform: &str,
+        _internal_user_id: &str,
+        _chat_id: &str,
+        _message_thread_id: i64,
+    ) -> Result<Option<ChannelTopicModelOverrideRow>, DbError> {
+        Ok(None)
+    }
+    async fn upsert_topic_model_override(&self, _row: &ChannelTopicModelOverrideRow) -> Result<(), DbError> {
+        Err(DbError::NotFound("topic model overrides unsupported".into()))
+    }
+    async fn delete_topic_model_overrides(&self, _chat_id: &str, _message_thread_id: i64) -> Result<(), DbError> {
+        Ok(())
+    }
     // ── Plugin CRUD ──────────────────────────────────────────────────
 
     /// Returns all registered plugins.
@@ -67,6 +98,16 @@ pub trait IChannelRepository: Send + Sync {
         chat_id: &str,
         new_row: &AssistantSessionRow,
     ) -> Result<AssistantSessionRow, DbError>;
+    async fn get_or_create_topic_session(
+        &self,
+        user_id: &str,
+        chat_id: &str,
+        message_thread_id: i64,
+        new_row: &AssistantSessionRow,
+    ) -> Result<AssistantSessionRow, DbError> {
+        let _ = message_thread_id;
+        self.get_or_create_session(user_id, chat_id, new_row).await
+    }
 
     /// Updates `last_activity` timestamp for a session.
     async fn update_session_activity(&self, id: &str, last_activity: TimestampMs) -> Result<(), DbError>;
@@ -82,6 +123,13 @@ pub trait IChannelRepository: Send + Sync {
 
     /// Deletes the session for a specific user + chat pair.
     async fn delete_session_by_user_chat(&self, user_id: &str, chat_id: &str) -> Result<(), DbError>;
+    async fn delete_topic_session(&self, user_id: &str, chat_id: &str, message_thread_id: i64) -> Result<(), DbError> {
+        let _ = message_thread_id;
+        self.delete_session_by_user_chat(user_id, chat_id).await
+    }
+    async fn delete_sessions_by_topic(&self, _chat_id: &str, _message_thread_id: i64) -> Result<(), DbError> {
+        Ok(())
+    }
 
     // ── Pairing Codes ────────────────────────────────────────────────
 

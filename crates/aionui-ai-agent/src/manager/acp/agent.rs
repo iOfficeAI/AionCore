@@ -24,7 +24,8 @@ use aionui_api_types::{
     SlashCommandCompletionBehavior, SlashCommandItem,
 };
 use aionui_common::{
-    AgentKillReason, AgentType, ConversationStatus, ErrorChain, TimestampMs, normalize_keys_to_snake_case, now_ms,
+    AgentKillReason, AgentType, ConversationStatus, EnvVar, ErrorChain, TimestampMs, normalize_keys_to_snake_case,
+    now_ms,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -182,8 +183,25 @@ async fn spawn_and_connect_acp_once(
     params: &AcpSessionParams,
     runtime: &AgentRuntime,
 ) -> Result<AcpStartupConnection, AcpStartupConnectError> {
+    let mut command_spec = params.command_spec.clone();
+    ensure_runner_env(
+        &mut command_spec.env,
+        "AIONUI_EXECUTION_LEASE_ID",
+        format!("conversation:{}", params.conversation_id),
+    );
+    ensure_runner_env(
+        &mut command_spec.env,
+        "AIONUI_EXECUTION_TURN_ID",
+        params.conversation_id.clone(),
+    );
+    ensure_runner_env(&mut command_spec.env, "AIONUI_RUNNER_ENVIRONMENT_KIND", "host".into());
+    ensure_runner_env(
+        &mut command_spec.env,
+        "AIONUI_RUNNER_ENVIRONMENT_ID",
+        "host:local".into(),
+    );
     let process = Arc::new(
-        CliAgentProcess::spawn_for_sdk(params.command_spec.clone())
+        CliAgentProcess::spawn_for_sdk_in_data_dir(command_spec, &params.data_dir)
             .await
             .map_err(AcpStartupConnectError::Agent)?,
     );
@@ -632,6 +650,15 @@ impl AcpAgentManager {
             let mut session = self.session.write().await;
             session.apply_advertised_auth_methods(auth_methods);
         }
+    }
+}
+
+fn ensure_runner_env(environment: &mut Vec<EnvVar>, name: &str, value: String) {
+    if !environment.iter().any(|entry| entry.name == name) {
+        environment.push(EnvVar {
+            name: name.into(),
+            value,
+        });
     }
 }
 

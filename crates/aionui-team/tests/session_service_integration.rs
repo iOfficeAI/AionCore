@@ -1,6 +1,9 @@
 mod common;
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -13,7 +16,7 @@ use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{
     AcpBuildExtra, AcpConfigOptionDto, AcpConfigSelectOptionDto, AddAgentRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, TeamAgentInput, WebSocketMessage,
+    GetConfigOptionsResponse, TeamAgentInput, TeamWorkspaceMode, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
@@ -24,10 +27,12 @@ use aionui_db::models::{
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IAssistantDefinitionRepository,
     IAssistantOverlayRepository, IConversationRepository, IProviderRepository, ITeamRepository, MessagePageParams,
-    MessagePageResult, MessageRowUpdate, MessageSearchRow, resolve_agent_binding_from_rows,
+    MessagePageResult, MessageRowUpdate, MessageSearchRow, SqliteAgentWorkspaceLeaseRepository,
+    resolve_agent_binding_from_rows,
 };
 use aionui_realtime::EventBroadcaster;
 
+use aionui_team::GitTeamWorkspaceManager;
 use aionui_team::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
     AgentTurnStarted, AgentTurnStatus, TeamAssistantCatalogEntry, TeamAssistantCatalogPort,
@@ -390,6 +395,12 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 pinned_at: None,
                 source: None,
                 channel_chat_id: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
                 extra: serde_json::to_string(&extra).unwrap(),
                 model: request
                     .top_level_model
@@ -1643,6 +1654,135 @@ fn setup() -> Arc<TeamSessionService> {
     setup_with_factory(success_factory()).0
 }
 
+fn git(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn init_git_repo(root: &Path) -> std::path::PathBuf {
+    let repo = root.join("project");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "aion@example.test"]);
+    git(&repo, &["config", "user.name", "Aion Test"]);
+    fs::write(repo.join("README.md"), "baseline\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-m", "baseline"]);
+    repo
+}
+
+async fn setup_with_real_workspace_manager(
+    managed_root: std::path::PathBuf,
+) -> (Arc<TeamSessionService>, Arc<MockConversationRepo>, aionui_db::Database) {
+    let team_repo = Arc::new(FullMockTeamRepo::new());
+    let conv_repo = Arc::new(MockConversationRepo::new());
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
+    let database = aionui_db::init_database_memory().await.unwrap();
+    let workspace_manager = Arc::new(GitTeamWorkspaceManager::new(
+        Arc::new(SqliteAgentWorkspaceLeaseRepository::new(database.pool().clone())),
+        managed_root,
+    ));
+    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(success_factory()));
+    let service = TeamSessionService::new_with_workspace_manager(
+        team_repo,
+        Arc::new(StubAgentMetadataRepo::empty()),
+        Arc::new(EmptyTeamAssistantCatalog),
+        Arc::new(EmptyAssistantDefinitionRepo),
+        Arc::new(EmptyAssistantOverlayRepo),
+        Arc::new(EmptyProviderRepo),
+        conversation_ports.clone(),
+        conversation_ports,
+        Arc::new(NullBroadcaster),
+        task_manager,
+        noop_turn_port(),
+        noop_cancellation_port(),
+        Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
+        workspace_manager,
+    );
+    (service, conv_repo, database)
+}
+
+#[tokio::test]
+async fn isolated_team_assigns_distinct_leases_and_cleans_removed_agent() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = init_git_repo(temp.path());
+    let (service, conversations, _database) = setup_with_real_workspace_manager(temp.path().join("managed")).await;
+
+    let created = service
+        .create_team_with_workspace_mode(
+            "user1",
+            CreateTeamRequest {
+                name: "Isolated".into(),
+                agents: two_agent_input(),
+                workspace: Some(repository.to_string_lossy().into_owned()),
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
+            },
+            TeamWorkspaceMode::IsolatedWorktree,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(created.workspace_mode, TeamWorkspaceMode::IsolatedWorktree);
+    assert_eq!(created.workspace_leases.len(), 3);
+    let first_workspace = conversations.get_extra(&created.assistants[0].conversation_id).unwrap()["workspace"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second_workspace = conversations.get_extra(&created.assistants[1].conversation_id).unwrap()["workspace"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(first_workspace, second_workspace);
+    assert_ne!(created.workspace, first_workspace);
+
+    let added = service
+        .add_agent(
+            "user1",
+            &created.id,
+            AddAgentRequest {
+                name: "Third".into(),
+                role: "teammate".into(),
+                backend: Some("acp".into()),
+                model: "claude".into(),
+                assistant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let added_workspace = conversations.get_extra(&added.conversation_id).unwrap()["workspace"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(added_workspace, first_workspace);
+    assert_ne!(added_workspace, second_workspace);
+    assert!(Path::new(&added_workspace).is_dir());
+
+    service
+        .remove_agent("user1", &created.id, &added.slot_id)
+        .await
+        .unwrap();
+    assert!(!Path::new(&added_workspace).exists());
+    let updated = service.get_team("user1", &created.id).await.unwrap();
+    let released = updated
+        .workspace_leases
+        .iter()
+        .find(|lease| lease.slot_id == added.slot_id)
+        .unwrap();
+    assert_eq!(released.lease_status, "released");
+    assert_eq!(released.cleanup_status, "removed");
+}
+
 #[tokio::test]
 async fn recovery_creates_background_intents_without_restoring_old_memory_run() {
     let (svc, team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
@@ -1653,6 +1793,12 @@ async fn recovery_creates_background_intents_without_restoring_old_memory_run() 
                 name: "Recover".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -1710,6 +1856,12 @@ async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
                 name: "Recover Teammate".into(),
                 agents: aionrs_two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -1780,6 +1932,12 @@ async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
                 name: "Self Only".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -1898,6 +2056,32 @@ fn setup_with_factory_recording_broadcaster_and_conversation_repo(factory: Agent
 }
 
 fn make_agent_metadata_row(id: &str, backend: &str, icon: &str) -> AgentMetadataRow {
+    use aionui_api_types::{AgentDynamicProbeResult, AgentProbeStatus, AgentProbeStep, AgentProbeStepResult};
+
+    let checked_at = aionui_common::now_ms();
+    let dynamic_probe_result = serde_json::to_string(&AgentDynamicProbeResult {
+        agent_id: id.to_owned(),
+        checked_at,
+        available_models: vec![backend.to_owned(), "gpt-5".into(), "claude-sonnet-4".into()],
+        steps: [
+            AgentProbeStep::Spawn,
+            AgentProbeStep::Initialize,
+            AgentProbeStep::Models,
+            AgentProbeStep::MinimalPrompt,
+            AgentProbeStep::Cancel,
+        ]
+        .into_iter()
+        .map(|step| AgentProbeStepResult {
+            step,
+            status: AgentProbeStatus::Passed,
+            started_at: checked_at,
+            duration_ms: 1,
+            error_category: None,
+            error_message: None,
+        })
+        .collect(),
+    })
+    .unwrap();
     AgentMetadataRow {
         id: id.to_owned(),
         icon: Some(icon.to_owned()),
@@ -1923,15 +2107,16 @@ fn make_agent_metadata_row(id: &str, backend: &str, icon: &str) -> AgentMetadata
         available_models: None,
         available_commands: None,
         sort_order: 0,
-        last_check_status: None,
-        last_check_kind: None,
+        last_check_status: Some("online".into()),
+        last_check_kind: Some("manual".into()),
         last_check_error_code: None,
         last_check_error_message: None,
         last_check_guidance: None,
         last_check_latency_ms: None,
-        last_check_at: None,
-        last_success_at: None,
+        last_check_at: Some(checked_at),
+        last_success_at: Some(checked_at),
         last_failure_at: None,
+        dynamic_probe_result: Some(dynamic_probe_result),
         command_override: None,
         env_override: None,
         created_at: 0,
@@ -2135,6 +2320,12 @@ async fn renew_active_lease_records_all_team_agent_conversations() {
                 name: "Lease Team".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -2167,6 +2358,12 @@ async fn renew_active_lease_allows_empty_team_without_unrelated_lease() {
             lead_agent_id: None,
             session_mode: None,
             agents_version: "1.0.1".into(),
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
             created_at: aionui_common::now_ms(),
             updated_at: aionui_common::now_ms(),
         })
@@ -2195,6 +2392,12 @@ async fn renew_active_lease_rejects_team_owned_by_other_user() {
                 name: "Lease Team".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -2238,6 +2441,12 @@ async fn tc1_create_team_with_multiple_agents() {
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -2269,6 +2478,12 @@ async fn create_team_rejects_existing_conversation_id_request_side_adoption() {
                     conversation_id: Some("solo-conv-1".into()),
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -2297,6 +2512,12 @@ async fn create_team_with_workspace_writes_same_workspace_to_team_and_initial_ag
                 name: "Shared".into(),
                 agents: two_agent_input(),
                 workspace: Some(workspace.clone()),
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -2326,6 +2547,12 @@ async fn create_team_without_workspace_uses_leader_auto_workspace_for_all_initia
                 name: "Auto Shared".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -2412,6 +2639,12 @@ async fn tc_create_team_prefers_assistant_avatar_over_backend_logo() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -2482,6 +2715,12 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -2568,6 +2807,12 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -2654,6 +2899,12 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -2712,6 +2963,12 @@ async fn team_preset_assistant_snapshot_is_frozen() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -2752,6 +3009,12 @@ async fn spawned_preset_assistant_snapshot_is_frozen() {
                 name: "Spawn Preset".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -2808,6 +3071,12 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -2901,6 +3170,12 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -2995,6 +3270,12 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3035,6 +3316,12 @@ async fn tc2_create_single_agent_team() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3071,6 +3358,12 @@ async fn create_team_uses_explicit_leader_role_when_leader_is_not_first() {
                     },
                 ],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3100,6 +3393,12 @@ async fn create_team_rejects_zero_leaders() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await;
@@ -3134,6 +3433,12 @@ async fn create_team_rejects_multiple_leaders() {
                     },
                 ],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await;
@@ -3158,6 +3463,12 @@ async fn create_team_rejects_unknown_role() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await;
@@ -3175,6 +3486,12 @@ async fn tc5_empty_agents_returns_error() {
                 name: "Empty".into(),
                 agents: vec![],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await;
@@ -3191,6 +3508,12 @@ async fn tc3_each_agent_has_conversation_id() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3220,6 +3543,12 @@ async fn tl2_list_multiple_teams() {
             name: "A".into(),
             agents: two_agent_input(),
             workspace: None,
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
         },
     )
     .await
@@ -3230,6 +3559,12 @@ async fn tl2_list_multiple_teams() {
             name: "B".into(),
             agents: two_agent_input(),
             workspace: None,
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
         },
     )
     .await
@@ -3248,6 +3583,12 @@ async fn tl3_list_teams_filters_by_owner() {
             name: "Owned".into(),
             agents: two_agent_input(),
             workspace: None,
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
         },
     )
     .await
@@ -3258,6 +3599,12 @@ async fn tl3_list_teams_filters_by_owner() {
             name: "Other".into(),
             agents: two_agent_input(),
             workspace: None,
+            source_channel: None,
+            source_channel_id: None,
+            source_chat_id: None,
+            source_user_id: None,
+            source_label: None,
+            created_from: None,
         },
     )
     .await
@@ -3286,6 +3633,12 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3321,6 +3674,12 @@ async fn tg1_get_existing_team() {
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3349,6 +3708,12 @@ async fn tg3_get_team_rejects_cross_user_access() {
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3371,6 +3736,12 @@ async fn td1_delete_existing_team() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3400,6 +3771,12 @@ async fn tr1_rename_existing_team() {
                 name: "Old".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3427,6 +3804,12 @@ async fn tr5_rename_team_rejects_cross_user_access() {
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3458,6 +3841,12 @@ async fn aa1_add_agent_to_team() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3506,6 +3895,12 @@ async fn manual_add_without_active_run_queues_background_welcome_without_creatin
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3565,6 +3960,12 @@ async fn add_agent_rejects_leader_role() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3605,6 +4006,12 @@ async fn add_agent_allows_same_assistant_id_multiple_times() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3668,6 +4075,12 @@ async fn manual_add_agent_active_session_attaches_runtime_in_background_without_
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3746,6 +4159,12 @@ async fn manual_add_agent_attach_failure_marks_slot_error_and_notifies_leader() 
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3896,6 +4315,12 @@ async fn failed_member_returns_conflict_and_removal_restores_ready() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -3997,6 +4422,12 @@ async fn remove_during_attach_cancels_work_and_rejects_late_ready() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4077,6 +4508,12 @@ async fn aa_add_agent_inherits_team_workspace() {
                     conversation_id: None,
                 }],
                 workspace: Some(workspace.clone()),
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4123,6 +4560,12 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4177,6 +4620,12 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4238,6 +4687,12 @@ async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4288,6 +4743,12 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4343,6 +4804,12 @@ async fn provisioning_writes_typed_team_binding_for_create_and_add_agent() {
                 name: "Typed".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4424,6 +4891,12 @@ async fn provisioning_resolves_acp_backend_from_agent_metadata() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4481,6 +4954,12 @@ async fn ar1_remove_agent_from_team() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4507,6 +4986,12 @@ async fn membership_persist_failure_does_not_delete_the_conversation() {
                 name: "Removal persistence failure".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4553,6 +5038,12 @@ async fn remove_tolerates_current_session_already_missing_the_slot() {
                 name: "Already absent runtime slot".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4593,6 +5084,12 @@ async fn manual_remove_agent_projects_team_system_message_without_active_team_ru
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4628,6 +5125,12 @@ async fn remove_agent_rejects_leader() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4651,6 +5154,12 @@ async fn ar4_remove_nonexistent_agent() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4670,6 +5179,12 @@ async fn an1_rename_agent() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4695,6 +5210,12 @@ async fn an3_rename_nonexistent_agent() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4718,6 +5239,12 @@ async fn es1_ensure_session_creates_session() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4788,6 +5315,12 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4846,6 +5379,12 @@ async fn leader_spawn_then_immediate_ensure_joins_the_same_attach_operation() {
                 name: "Leader spawn reconciliation".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4906,6 +5445,12 @@ async fn lead_send_agent_message_in_session_requires_active_team_run() {
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4950,6 +5495,12 @@ async fn spawn_agent_in_session_aborts_lease_when_persistence_fails() {
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -4996,6 +5547,12 @@ async fn spawn_agent_in_session_compensates_when_welcome_mailbox_write_fails() {
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5035,6 +5592,12 @@ async fn es2_ensure_session_is_idempotent() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5061,6 +5624,12 @@ async fn es4_ensure_session_rejects_cross_user_access() {
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5107,6 +5676,12 @@ async fn ensure_session_broadcasts_starting_and_ready_session_status() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5143,6 +5718,12 @@ async fn ensure_session_existing_ready_session_broadcasts_ready_terminal_status(
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5181,6 +5762,12 @@ async fn ss1_stop_session() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5200,6 +5787,12 @@ async fn ss3_stop_session_without_active_is_noop() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5218,6 +5811,12 @@ async fn ss4_stop_session_rejects_cross_user_access() {
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5249,6 +5848,12 @@ async fn sm1_send_message_with_active_session() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5270,6 +5875,12 @@ async fn sm2_send_message_rejects_cross_user_access() {
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5290,6 +5901,12 @@ async fn sa_send_message_to_agent_with_active_session() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5312,6 +5929,12 @@ async fn sa2_send_message_to_agent_rejects_cross_user_access() {
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5335,6 +5958,12 @@ async fn sa3_send_message_to_nonexistent_agent() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5361,6 +5990,12 @@ async fn dispose_all_cleans_up_sessions() {
                 name: "A".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5372,6 +6007,12 @@ async fn dispose_all_cleans_up_sessions() {
                 name: "B".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5401,6 +6042,12 @@ async fn td_delete_team_stops_session() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5427,6 +6074,12 @@ async fn d9_create_team_persists_without_warming_initial_agents() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5457,6 +6110,12 @@ async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5488,6 +6147,12 @@ async fn d9_ensure_session_rebuilds_agents_with_staggered_bounded_parallelism() 
                 name: "T".into(),
                 agents: five_agent_input_leader_not_first(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5588,6 +6253,12 @@ async fn d9_ensure_session_persists_team_mcp_stdio_config() {
                 name: "T".into(),
                 agents: aionrs_two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5606,6 +6277,12 @@ async fn d9_ensure_session_is_idempotent() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5632,6 +6309,12 @@ async fn manual_add_then_immediate_ensure_joins_attach_without_rebuilding_sessio
                 name: "Join dynamic attach".into(),
                 agents: vec![team_agent_input("Lead", "lead", "claude")],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5702,6 +6385,12 @@ async fn concurrent_ensures_launch_one_dynamic_attach() {
                 name: "Concurrent repair".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5768,6 +6457,12 @@ async fn stopped_session_rejects_late_attach_completion() {
                 name: "Stopped late attach".into(),
                 agents: vec![team_agent_input("Lead", "lead", "claude")],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5868,6 +6563,12 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -5922,6 +6623,12 @@ async fn cold_bootstrap_failure_stops_session_and_cleans_all_successful_runtimes
                 name: "T".into(),
                 agents: four_agent_input_leader_not_first(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -6011,6 +6718,12 @@ async fn ensure_session_serializes_manual_add_until_rebuild_completes() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -6071,6 +6784,12 @@ async fn ensure_session_serializes_manual_remove_until_rebuild_completes() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -6125,6 +6844,12 @@ async fn ensure_session_serializes_manual_rename_until_rebuild_completes() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -6193,6 +6918,12 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await
@@ -6260,6 +6991,12 @@ async fn d115_remove_team_kills_every_agent_process() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                source_channel: None,
+                source_channel_id: None,
+                source_chat_id: None,
+                source_user_id: None,
+                source_label: None,
+                created_from: None,
             },
         )
         .await

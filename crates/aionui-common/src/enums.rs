@@ -249,6 +249,10 @@ pub enum AgentKillReason {
     /// The requested runtime capabilities changed, so the in-memory task must
     /// be rebuilt before handling the next turn.
     RuntimeCapabilityChanged,
+    /// A development-run budget policy stopped this Agent after a completed
+    /// usage observation. The conversation remains available for an audited
+    /// operator decision or a later policy-compliant retry.
+    BudgetExceeded,
 }
 
 /// Preview content type for document preview history.

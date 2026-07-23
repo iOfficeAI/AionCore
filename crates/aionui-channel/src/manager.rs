@@ -82,7 +82,7 @@ impl ChannelManager {
         let statuses: Vec<PluginStatusResponse> = rows
             .into_iter()
             .map(|row| {
-                let live_status = self.plugins.get(&row.id).map(|p| p.status().to_string());
+                let live_status = self.plugins.get(&row.id).map(|p| p.status());
                 self.row_to_status_response(&row, live_status)
             })
             .collect();
@@ -371,6 +371,30 @@ impl ChannelManager {
         plugin.edit_message(chat_id, message_id, message).await
     }
 
+    pub async fn send_chat_action(&self, plugin_id: &str, chat_id: &str, action: &str) -> Result<(), ChannelError> {
+        let plugin = self
+            .plugins
+            .get(plugin_id)
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
+        plugin.send_chat_action(chat_id, action).await
+    }
+
+    pub async fn send_chat_action_in_topic(
+        &self,
+        plugin_id: &str,
+        chat_id: &str,
+        action: &str,
+        message_thread_id: Option<i64>,
+    ) -> Result<(), ChannelError> {
+        let plugin = self
+            .plugins
+            .get(plugin_id)
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
+        plugin
+            .send_chat_action_in_topic(chat_id, action, message_thread_id)
+            .await
+    }
+
     // ── Private helpers ──────────────────────────────────────────────
 
     /// Parses a freshly supplied plugin config, returning it only when it
@@ -505,7 +529,7 @@ impl ChannelManager {
             }
         };
 
-        let live_status = self.plugins.get(plugin_id).map(|p| p.status().to_string());
+        let live_status = self.plugins.get(plugin_id).map(|p| p.status());
         let status_response = self.row_to_status_response(&row, live_status);
 
         let payload = PluginStatusChangedPayload {
@@ -524,15 +548,21 @@ impl ChannelManager {
     }
 
     /// Converts a DB row + optional live status to a `PluginStatusResponse`.
-    fn row_to_status_response(&self, row: &ChannelPluginRow, live_status: Option<String>) -> PluginStatusResponse {
-        let is_running = self.plugins.contains_key(&row.id);
+    fn row_to_status_response(
+        &self,
+        row: &ChannelPluginRow,
+        live_status: Option<PluginStatus>,
+    ) -> PluginStatusResponse {
+        let is_running = live_status == Some(PluginStatus::Running);
         let has_token = !row.config.is_empty();
         PluginStatusResponse {
             plugin_id: row.id.clone(),
             plugin_type: row.r#type.clone(),
             name: row.name.clone(),
             enabled: row.enabled,
-            status: live_status.or_else(|| row.status.clone()),
+            status: live_status
+                .map(|status| status.to_string())
+                .or_else(|| row.status.clone()),
             last_connected: row.last_connected,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -575,6 +605,26 @@ impl crate::stream_relay::ChannelSender for ChannelManager {
         message: crate::types::UnifiedOutgoingMessage,
     ) -> Result<(), crate::error::ChannelError> {
         self.edit_message(plugin_id, chat_id, message_id, message).await
+    }
+
+    async fn send_chat_action(
+        &self,
+        plugin_id: &str,
+        chat_id: &str,
+        action: &str,
+    ) -> Result<(), crate::error::ChannelError> {
+        self.send_chat_action(plugin_id, chat_id, action).await
+    }
+
+    async fn send_chat_action_in_topic(
+        &self,
+        plugin_id: &str,
+        chat_id: &str,
+        action: &str,
+        message_thread_id: Option<i64>,
+    ) -> Result<(), crate::error::ChannelError> {
+        self.send_chat_action_in_topic(plugin_id, chat_id, action, message_thread_id)
+            .await
     }
 }
 
@@ -926,6 +976,7 @@ mod tests {
             media_actions: None,
             reply_to_message_id: None,
             silent: None,
+            topic: None,
         }
     }
 
@@ -984,6 +1035,33 @@ mod tests {
         assert_eq!(statuses.len(), 1);
         // Live status (running) should override DB status (stopped)
         assert_eq!(statuses[0].status.as_deref(), Some("running"));
+    }
+
+    #[tokio::test]
+    async fn get_status_does_not_report_error_plugin_as_connected() {
+        let (mgr, repo, _bc) = make_manager();
+        let now = now_ms();
+        repo.plugins.lock().unwrap().push(ChannelPluginRow {
+            id: "telegram".into(),
+            r#type: "telegram".into(),
+            name: "Telegram Bot".into(),
+            enabled: true,
+            config: "encrypted".into(),
+            status: Some("running".into()),
+            last_connected: Some(now),
+            created_at: now,
+            updated_at: now,
+        });
+
+        let mut plugin = MockPlugin::new(PluginType::Telegram);
+        plugin.status = PluginStatus::Error;
+        plugin.last_error = Some("poll loop stopped".into());
+        mgr.plugins.insert("telegram".into(), Box::new(plugin));
+
+        let statuses = mgr.get_plugin_status().await.unwrap();
+
+        assert_eq!(statuses[0].status.as_deref(), Some("error"));
+        assert!(!statuses[0].connected);
     }
 
     // ── enable_plugin ──────────────────────────────────────────────────

@@ -63,6 +63,20 @@ pub trait ChannelPlugin: Send + Sync {
         message: UnifiedOutgoingMessage,
     ) -> Result<(), ChannelError>;
 
+    /// Send a lightweight platform activity indicator where supported.
+    async fn send_chat_action(&self, _chat_id: &str, _action: &str) -> Result<(), ChannelError> {
+        Ok(())
+    }
+
+    async fn send_chat_action_in_topic(
+        &self,
+        chat_id: &str,
+        action: &str,
+        _message_thread_id: Option<i64>,
+    ) -> Result<(), ChannelError> {
+        self.send_chat_action(chat_id, action).await
+    }
+
     /// Number of currently active (chatting) users on this plugin.
     fn active_user_count(&self) -> usize;
 
@@ -206,6 +220,7 @@ mod tests {
             media_actions: None,
             reply_to_message_id: None,
             silent: None,
+            topic: None,
         }
     }
 

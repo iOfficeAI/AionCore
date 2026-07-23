@@ -1,14 +1,15 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use aionui_api_types::{
-    AgentManagementRow, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource,
-    TryConnectCustomAgentResponse,
+    AgentDynamicProbeResult, AgentManagementRow, AgentMetadata, AgentProbeStatus, AgentSnapshotCheckKind,
+    AgentSnapshotCheckStatus, AgentSource, TryConnectCustomAgentResponse,
 };
 use aionui_common::now_ms;
 use aionui_common::{AgentType, CommandSpec, EnvVar};
-use aionui_db::{IProviderRepository, UpdateAgentAvailabilitySnapshotParams};
+use aionui_db::{IProviderRepository, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams};
 use aionui_runtime::{
     ManagedAcpToolId, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter, resolve_command_path,
 };
@@ -17,6 +18,8 @@ use tokio::time::Duration;
 use crate::error::AgentError;
 use crate::protocol::{cli_detect, custom_agent_probe};
 use crate::registry::{AgentRegistry, guidance_for_snapshot_error_code};
+
+pub mod dynamic_probe;
 
 #[async_trait::async_trait]
 pub trait AgentAvailabilityFeedbackPort: Send + Sync {
@@ -39,13 +42,15 @@ pub struct AgentAvailabilityService {
     // Used to decide aionrs (built-in, no external CLI) availability: it is
     // usable only when at least one model provider is configured & enabled.
     provider_repo: Arc<dyn IProviderRepository>,
+    data_dir: PathBuf,
 }
 
 impl AgentAvailabilityService {
-    pub fn new(registry: Arc<AgentRegistry>, provider_repo: Arc<dyn IProviderRepository>) -> Self {
+    pub fn new(registry: Arc<AgentRegistry>, provider_repo: Arc<dyn IProviderRepository>, data_dir: PathBuf) -> Self {
         Self {
             registry,
             provider_repo,
+            data_dir,
         }
     }
 
@@ -67,14 +72,40 @@ impl AgentAvailabilityService {
                 .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")));
         }
 
-        let snapshot = run_probe(
+        let mut snapshot = run_probe(
             &self.registry,
             &self.provider_repo,
             &meta,
             AgentSnapshotCheckKind::Manual,
         )
         .await;
-        self.persist_snapshot(id, &snapshot).await?;
+        let dynamic_probe = if snapshot.status == "online" {
+            run_dynamic_probe(&meta, &self.data_dir).await
+        } else {
+            None
+        };
+        if let Some(result) = dynamic_probe.as_ref() {
+            if !result.is_usable() {
+                snapshot.status = "offline";
+                snapshot.error_code = Some("dynamic_probe_failed".to_owned());
+                snapshot.error_message = Some(dynamic_probe_failure_message(result));
+            } else {
+                let models_json = serde_json::to_string(&result.available_models)
+                    .map_err(|error| AgentError::internal(format!("encode probed models: {error}")))?;
+                self.registry
+                    .repo_handle()
+                    .apply_handshake(
+                        id,
+                        &UpdateAgentHandshakeParams {
+                            available_models: Some(Some(&models_json)),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|error| AgentError::internal(format!("repo.apply_handshake: {error}")))?;
+            }
+        }
+        self.persist_snapshot(id, &snapshot, dynamic_probe.as_ref()).await?;
         self.management_row_by_id(id)
             .await
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))
@@ -90,7 +121,7 @@ impl AgentAvailabilityService {
             latency_ms: 0,
             checked_at,
         };
-        self.persist_snapshot(agent_id, &snapshot).await
+        self.persist_snapshot(agent_id, &snapshot, None).await
     }
 
     pub async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError> {
@@ -103,14 +134,19 @@ impl AgentAvailabilityService {
             latency_ms: 0,
             checked_at,
         };
-        self.persist_snapshot(agent_id, &snapshot).await
+        self.persist_snapshot(agent_id, &snapshot, None).await
     }
 
     pub async fn management_row_by_id(&self, id: &str) -> Option<AgentManagementRow> {
         self.registry.management_row_by_id(id).await
     }
 
-    async fn persist_snapshot(&self, id: &str, snapshot: &AvailabilitySnapshot) -> Result<(), AgentError> {
+    async fn persist_snapshot(
+        &self,
+        id: &str,
+        snapshot: &AvailabilitySnapshot,
+        dynamic_probe: Option<&AgentDynamicProbeResult>,
+    ) -> Result<(), AgentError> {
         let existing = self
             .registry
             .repo_handle()
@@ -119,6 +155,8 @@ impl AgentAvailabilityService {
             .map_err(|error| AgentError::internal(format!("repo.get: {error}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
 
+        let dynamic_probe_json = probe_snapshot_to_persist(existing.dynamic_probe_result.as_deref(), dynamic_probe)
+            .map_err(|error| AgentError::internal(format!("encode dynamic probe: {error}")))?;
         let params = UpdateAgentAvailabilitySnapshotParams {
             last_check_status: Some(snapshot.status),
             last_check_kind: Some(snapshot.kind),
@@ -140,6 +178,7 @@ impl AgentAvailabilityService {
             } else {
                 existing.last_failure_at
             },
+            dynamic_probe_result: dynamic_probe_json.as_deref(),
         };
         self.registry
             .repo_handle()
@@ -149,6 +188,37 @@ impl AgentAvailabilityService {
         self.registry.reload_one(id).await?;
         Ok(())
     }
+}
+
+/// `dynamic_probe_result` is the last *successful* six-stage probe. The latest
+/// failed attempt is represented by the availability error fields, while the
+/// successful snapshot remains available for diagnostics and model menus.
+fn probe_snapshot_to_persist(
+    existing: Option<&str>,
+    candidate: Option<&AgentDynamicProbeResult>,
+) -> Result<Option<String>, serde_json::Error> {
+    match candidate.filter(|probe| probe.is_usable()) {
+        Some(probe) => serde_json::to_string(probe).map(Some),
+        None => Ok(existing.map(str::to_owned)),
+    }
+}
+
+fn dynamic_probe_failure_message(result: &AgentDynamicProbeResult) -> String {
+    result
+        .steps
+        .iter()
+        .find(|step| !matches!(step.status, AgentProbeStatus::Passed | AgentProbeStatus::Unsupported))
+        .map(|step| {
+            let message = step.error_message.as_deref().unwrap_or("no diagnostic message");
+            match step.error_category.as_ref() {
+                Some(category) => format!(
+                    "Agent dynamic preflight failed at {:?} ({category:?}): {message}",
+                    step.step
+                ),
+                None => format!("Agent dynamic preflight failed at {:?}: {message}", step.step),
+            }
+        })
+        .unwrap_or_else(|| "Agent failed the dynamic capability preflight".to_owned())
 }
 
 async fn run_probe(
@@ -295,33 +365,77 @@ async fn probe_aionrs_provider_readiness(
     }
 }
 
+async fn run_dynamic_probe(meta: &AgentMetadata, data_dir: &std::path::Path) -> Option<AgentDynamicProbeResult> {
+    if meta.agent_type != AgentType::Acp {
+        return None;
+    }
+
+    if meta.agent_source == AgentSource::Builtin
+        && let Some(backend) = meta.backend.as_deref()
+        && let Some(tool) = ManagedAcpToolId::from_backend(backend)
+    {
+        let spec = build_builtin_managed_agent_spec(meta, tool).await.ok()?;
+        return Some(custom_agent_probe::dynamic_probe_command_spec(&meta.id, spec, data_dir).await);
+    }
+
+    let command = meta.command.as_deref()?;
+    let env: HashMap<String, String> = meta
+        .env
+        .iter()
+        .map(|entry| (entry.name.clone(), entry.value.clone()))
+        .collect();
+    Some(custom_agent_probe::dynamic_probe_custom_agent(&meta.id, command, &meta.args, &env, data_dir).await)
+}
+
 async fn try_connect_builtin_managed_agent(
     meta: &AgentMetadata,
     tool: ManagedAcpToolId,
 ) -> TryConnectCustomAgentResponse {
+    let spec = match build_builtin_managed_agent_spec(meta, tool).await {
+        Ok(spec) => spec,
+        Err(error) => return error,
+    };
+
+    match tokio::time::timeout(
+        Duration::from_secs(35),
+        custom_agent_probe::acp_probe_command_spec(spec),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => TryConnectCustomAgentResponse::FailAcp {
+            error: "ACP handshake did not complete within 35s".to_owned(),
+        },
+    }
+}
+
+async fn build_builtin_managed_agent_spec(
+    meta: &AgentMetadata,
+    tool: ManagedAcpToolId,
+) -> Result<CommandSpec, TryConnectCustomAgentResponse> {
     if let Some(primary) = meta.agent_source_info.binary_name.as_deref()
         && resolve_command_path(primary).is_none()
     {
-        return TryConnectCustomAgentResponse::FailCli {
+        return Err(TryConnectCustomAgentResponse::FailCli {
             error: format!("`{primary}` not found on PATH"),
-        };
+        });
     }
 
     let node_runtime = match ensure_node_runtime_with_reporter(None).await {
         Ok(runtime) => runtime,
         Err(error) => {
-            return TryConnectCustomAgentResponse::FailCli {
+            return Err(TryConnectCustomAgentResponse::FailCli {
                 error: error.to_string(),
-            };
+            });
         }
     };
 
     let managed_tool = match ensure_managed_acp_tool_with_reporter(tool, None).await {
         Ok(tool) => tool,
         Err(error) => {
-            return TryConnectCustomAgentResponse::FailCli {
+            return Err(TryConnectCustomAgentResponse::FailCli {
                 error: error.to_string(),
-            };
+            });
         }
     };
 
@@ -339,7 +453,7 @@ async fn try_connect_builtin_managed_agent(
         value: value.to_string_lossy().into_owned(),
     }));
 
-    let spec = CommandSpec {
+    Ok(CommandSpec {
         command: resolved.program,
         args: resolved
             .args_prefix
@@ -348,19 +462,7 @@ async fn try_connect_builtin_managed_agent(
             .collect(),
         env,
         cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
-    };
-
-    match tokio::time::timeout(
-        Duration::from_secs(35),
-        custom_agent_probe::acp_probe_command_spec(spec),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(_) => TryConnectCustomAgentResponse::FailAcp {
-            error: "ACP handshake did not complete within 35s".to_owned(),
-        },
-    }
+    })
 }
 
 #[async_trait::async_trait]
@@ -378,7 +480,10 @@ impl AgentAvailabilityFeedbackPort for AgentAvailabilityService {
 mod tests {
     use std::sync::Arc;
 
-    use super::{AgentAvailabilityService, explicit_probe_args, probe_aionrs_provider_readiness, run_probe};
+    use super::{
+        AgentAvailabilityService, dynamic_probe_failure_message, explicit_probe_args, probe_aionrs_provider_readiness,
+        probe_snapshot_to_persist, run_probe,
+    };
     use crate::registry::AgentRegistry;
     use aionui_api_types::{
         AgentHandshake, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus,
@@ -408,6 +513,73 @@ mod tests {
             bedrock_config: None,
             is_full_url: false,
         }
+    }
+
+    #[test]
+    fn failed_probe_preserves_the_last_successful_probe_snapshot() {
+        use aionui_api_types::{AgentDynamicProbeResult, AgentProbeStatus, AgentProbeStep, AgentProbeStepResult};
+
+        let existing = r#"{"agent_id":"codex","checked_at":1,"steps":[],"available_models":["gpt-5"]}"#;
+        let failed = AgentDynamicProbeResult {
+            agent_id: "codex".into(),
+            checked_at: 2,
+            steps: vec![AgentProbeStepResult {
+                step: AgentProbeStep::Spawn,
+                status: AgentProbeStatus::Failed,
+                started_at: 2,
+                duration_ms: 1,
+                error_category: None,
+                error_message: None,
+            }],
+            available_models: vec![],
+        };
+
+        assert_eq!(
+            probe_snapshot_to_persist(Some(existing), Some(&failed))
+                .unwrap()
+                .as_deref(),
+            Some(existing)
+        );
+        assert_eq!(
+            probe_snapshot_to_persist(Some(existing), None).unwrap().as_deref(),
+            Some(existing)
+        );
+    }
+
+    #[test]
+    fn failed_probe_exposes_the_sanitized_failed_stage_diagnostic() {
+        use aionui_api_types::{
+            AgentDynamicProbeResult, AgentProbeErrorCategory, AgentProbeStatus, AgentProbeStep, AgentProbeStepResult,
+        };
+
+        let failed = AgentDynamicProbeResult {
+            agent_id: "codex".into(),
+            checked_at: 2,
+            steps: vec![
+                AgentProbeStepResult {
+                    step: AgentProbeStep::Spawn,
+                    status: AgentProbeStatus::Passed,
+                    started_at: 2,
+                    duration_ms: 1,
+                    error_category: None,
+                    error_message: None,
+                },
+                AgentProbeStepResult {
+                    step: AgentProbeStep::MinimalPrompt,
+                    status: AgentProbeStatus::Failed,
+                    started_at: 3,
+                    duration_ms: 5,
+                    error_category: Some(AgentProbeErrorCategory::ModelRejected),
+                    error_message: Some("Agent rejected the configured model".into()),
+                },
+            ],
+            available_models: vec![],
+        };
+
+        assert_eq!(
+            dynamic_probe_failure_message(&failed),
+            "Agent dynamic preflight failed at MinimalPrompt (ModelRejected): Agent rejected the configured model"
+        );
     }
 
     #[tokio::test]
@@ -471,7 +643,7 @@ mod tests {
         registry.hydrate().await.unwrap();
 
         let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
-        let service = AgentAvailabilityService::new(registry.clone(), provider_repo);
+        let service = AgentAvailabilityService::new(registry.clone(), provider_repo, std::env::temp_dir());
         service
             .record_session_failure(
                 "agent-session-failure",
@@ -543,7 +715,7 @@ mod tests {
         registry.hydrate().await.unwrap();
 
         let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
-        let service = AgentAvailabilityService::new(registry.clone(), provider_repo);
+        let service = AgentAvailabilityService::new(registry.clone(), provider_repo, std::env::temp_dir());
         service
             .record_session_failure(
                 "agent-session-success",

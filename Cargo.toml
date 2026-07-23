@@ -20,6 +20,8 @@ members = [
     "crates/aionui-team-prompts",
     "crates/aionui-team",
     "crates/aionui-cron",
+    "crates/aionui-project",
+    "crates/aionui-development",
     "crates/aionui-assistant",
     "crates/aionui-app",
 ]
@@ -50,6 +52,8 @@ aionui-channel = { path = "crates/aionui-channel" }
 aionui-team-prompts = { path = "crates/aionui-team-prompts" }
 aionui-team = { path = "crates/aionui-team" }
 aionui-cron = { path = "crates/aionui-cron" }
+aionui-project = { path = "crates/aionui-project" }
+aionui-development = { path = "crates/aionui-development" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
@@ -98,6 +102,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 jsonwebtoken = "9"
 bcrypt = "0.17"
 aes-gcm = "0.10"
+zeroize = "1"
 
 # UUID
 uuid = { version = "1", features = ["v7"] }

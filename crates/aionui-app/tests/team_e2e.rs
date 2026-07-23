@@ -1,5 +1,10 @@
 mod common;
 
+use std::path::Path;
+use std::process::Command;
+
+use aionui_api_types::{AgentDynamicProbeResult, AgentProbeStatus, AgentProbeStep, AgentProbeStepResult};
+use aionui_app::AppServices;
 use aionui_db::{IConversationRepository, MessagePageDirection, MessagePageParams};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -9,12 +14,84 @@ use tower::ServiceExt;
 use aionui_api_types::TeamMcpStdioConfig;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
 use common::{
-    body_json, build_app, build_app_with_mock_agents, delete_with_token, get_request, get_with_token, json_with_token,
-    setup_and_login,
+    body_json, build_app as build_base_app, build_app_with_mock_agents as build_base_app_with_mock_agents,
+    delete_with_token, get_request, get_with_token, json_with_token, setup_and_login,
 };
 
 const DEFAULT_TEAM_ASSISTANT_ID: &str = "team-e2e-assistant";
 const DEFAULT_TEAM_AGENT_ID: &str = "2d23ff1c";
+
+async fn seed_healthy_team_agent(services: &AppServices) {
+    let checked_at = aionui_common::now_ms();
+    let probe = serde_json::to_string(&AgentDynamicProbeResult {
+        agent_id: DEFAULT_TEAM_AGENT_ID.into(),
+        checked_at,
+        available_models: vec!["claude".into()],
+        steps: [
+            AgentProbeStep::Spawn,
+            AgentProbeStep::Initialize,
+            AgentProbeStep::Models,
+            AgentProbeStep::MinimalPrompt,
+            AgentProbeStep::Cancel,
+        ]
+        .into_iter()
+        .map(|step| AgentProbeStepResult {
+            step,
+            status: AgentProbeStatus::Passed,
+            started_at: checked_at,
+            duration_ms: 1,
+            error_category: None,
+            error_message: None,
+        })
+        .collect(),
+    })
+    .unwrap();
+    let result = sqlx::query(
+        "UPDATE agent_metadata SET last_check_status='online', last_check_kind='test', \
+         last_check_at=?, last_success_at=?, last_failure_at=NULL, dynamic_probe_result=?, updated_at=? \
+         WHERE id=?",
+    )
+    .bind(checked_at)
+    .bind(checked_at)
+    .bind(probe)
+    .bind(checked_at)
+    .bind(DEFAULT_TEAM_AGENT_ID)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(result.rows_affected(), 1, "team test Agent metadata must exist");
+}
+
+async fn build_app() -> (axum::Router, AppServices) {
+    let (app, services) = build_base_app().await;
+    seed_healthy_team_agent(&services).await;
+    (app, services)
+}
+
+async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
+    let (app, services) = build_base_app_with_mock_agents().await;
+    seed_healthy_team_agent(&services).await;
+    (app, services)
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let output = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn init_git_repo(root: &Path) {
+    git(root, &["init", "-b", "main"]);
+    git(root, &["config", "user.email", "aion@example.test"]);
+    git(root, &["config", "user.name", "Aion Test"]);
+    std::fs::write(root.join("README.md"), "baseline\n").unwrap();
+    git(root, &["add", "README.md"]);
+    git(root, &["commit", "-m", "baseline"]);
+}
 
 fn team_agent(name: &str, role: &str) -> serde_json::Value {
     json!({
@@ -418,6 +495,54 @@ async fn tc6c_create_team_rejects_missing_workspace_path() {
     );
 }
 
+#[tokio::test]
+async fn tc6d_isolated_worktree_request_returns_persisted_lease_status() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
+    let repository = tempfile::tempdir().unwrap();
+    init_git_repo(repository.path());
+
+    let req = json_with_token(
+        "POST",
+        "/api/teams",
+        json!({
+            "name": "Isolated",
+            "workspace": repository.path().to_string_lossy(),
+            "workspace_mode": "isolated_worktree",
+            "agents": [team_agent("Lead", "lead"), team_agent("Worker", "teammate")]
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let json = body_json(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "response: {json}");
+    let team = &json["data"];
+    assert_eq!(team["workspace_mode"], "isolated_worktree");
+    assert_eq!(team["workspace_leases"].as_array().unwrap().len(), 3);
+    assert!(
+        team["workspace_leases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|lease| lease["lease_status"] == "active")
+    );
+    assert_ne!(
+        team["workspace_leases"][1]["worktree_path"],
+        team["workspace_leases"][2]["worktree_path"]
+    );
+
+    let team_id = team["id"].as_str().unwrap();
+    let req = get_with_token(&format!("/api/teams/{team_id}"), &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["workspace_mode"], "isolated_worktree");
+    assert_eq!(json["data"]["workspace_leases"].as_array().unwrap().len(), 3);
+}
+
 // TC-7: Unauthenticated returns 401
 #[tokio::test]
 async fn tc7_unauthenticated_returns_401() {
@@ -621,7 +746,7 @@ async fn trs2_run_state_returns_active_run_payload() {
     assert!(body["data"]["active_run"]["starting_batch_count"].is_number());
     assert!(body["data"]["active_run"]["running_batch_count"].is_number());
     assert!(body["data"]["active_run"]["active_enqueue_lease_count"].is_number());
-    assert!(body["data"]["active_run"]["slot_work"].as_array().unwrap().len() >= 1);
+    assert!(!body["data"]["active_run"]["slot_work"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

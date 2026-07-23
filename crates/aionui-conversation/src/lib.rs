@@ -33,7 +33,8 @@ pub use routes::conversation_routes;
 pub use routes_aux::conversation_ops_routes;
 pub use service::{
     ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
-    ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
+    ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService, ConversationTurnAdmission,
+    ConversationTurnAdmissionRequest, ConversationTurnGuard, ConversationTurnObservation, ConversationTurnObserver,
 };
 pub use state::ConversationRouterState;
 

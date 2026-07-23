@@ -260,6 +260,7 @@ mod tests {
             last_check_at: None,
             last_success_at: None,
             last_failure_at: None,
+            dynamic_probe_result: None,
             command_override: None,
             env_override: None,
             created_at: 0,

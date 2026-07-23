@@ -67,10 +67,13 @@ async fn conversations_accepts_all_columns() {
     sqlx::query(
         "INSERT INTO conversations \
          (id, user_id, name, type, extra, model, status, source, channel_chat_id, \
+          source_channel, source_channel_id, source_chat_id, source_user_id, source_label, created_from, \
           pinned, pinned_at, created_at, updated_at) \
          VALUES ($1, $2, 'Full Chat', 'acp', '{\"backend\":\"claude\"}', \
                  '{\"providerId\":\"p1\",\"model\":\"claude-sonnet\"}', \
-                 'running', 'telegram', 'user:123', 1, 1700000000000, 1000, 2000)",
+                 'running', 'telegram', 'user:123', \
+                 'telegram', 'bot:main', 'chat:123', 'user:456', 'Telegram', 'telegram', \
+                 1, 1700000000000, 1000, 2000)",
     )
     .bind("conv_full")
     .bind(&user_id)
@@ -88,6 +91,12 @@ async fn conversations_accepts_all_columns() {
     assert_eq!(row.get::<String, _>("status"), "running");
     assert_eq!(row.get::<String, _>("source"), "telegram");
     assert_eq!(row.get::<String, _>("channel_chat_id"), "user:123");
+    assert_eq!(row.get::<String, _>("source_channel"), "telegram");
+    assert_eq!(row.get::<String, _>("source_channel_id"), "bot:main");
+    assert_eq!(row.get::<String, _>("source_chat_id"), "chat:123");
+    assert_eq!(row.get::<String, _>("source_user_id"), "user:456");
+    assert_eq!(row.get::<String, _>("source_label"), "Telegram");
+    assert_eq!(row.get::<String, _>("created_from"), "telegram");
     assert_eq!(row.get::<i32, _>("pinned"), 1);
     assert_eq!(row.get::<i64, _>("pinned_at"), 1700000000000);
 }

@@ -6,7 +6,7 @@
 
 pub(crate) mod backend_output_sink;
 pub(crate) mod backend_protocol_sink;
-pub(crate) mod cli_process;
+pub mod cli_process;
 pub(crate) mod first_message_injector;
 pub(crate) mod image_input;
 pub mod prompt_pipeline;

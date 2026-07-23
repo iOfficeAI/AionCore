@@ -1,10 +1,14 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AddAgentRequest, GetConfigOptionsResponse, TeamAgentInput, TeamToolTransport};
-use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
+use aionui_api_types::{
+    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentInput, TeamToolTransport,
+};
+use aionui_common::{AgentKillReason, AgentType, ConversationSource, ProviderWithModel, generate_id, now_ms};
 use aionui_db::models::{AgentMetadataRow, TeamRow};
-use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
+use aionui_db::{
+    IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams, resolve_agent_binding_from_rows,
+};
 use async_trait::async_trait;
 use tracing::{info, warn};
 
@@ -17,6 +21,7 @@ use crate::service::inherit_team_workspace;
 use crate::service::spawn_support::{acp_backend_metadata, parse_agent_type, session_mode_for_backend};
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::workspace::TeamWorkspaceResolver;
+use crate::{PreparedTeamWorkspaces, TeamWorkspaceManager, WorkspaceAgentSpec};
 
 #[derive(Clone)]
 pub struct TeamAgentProvisioner {
@@ -25,6 +30,7 @@ pub struct TeamAgentProvisioner {
     assistant_catalog: Arc<dyn TeamAssistantCatalogPort>,
     provider_repo: Arc<dyn IProviderRepository>,
     conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+    workspace_manager: Option<Arc<dyn TeamWorkspaceManager>>,
 }
 
 pub(crate) struct InitialProvisioningResult {
@@ -67,7 +73,228 @@ pub struct TeamConversationCreateRequest {
     pub name: String,
     pub top_level_model: Option<ProviderWithModel>,
     pub assistant_id: Option<String>,
+    pub source: Option<ConversationSource>,
+    pub channel_chat_id: Option<String>,
+    pub source_channel: Option<String>,
+    pub source_channel_id: Option<String>,
+    pub source_chat_id: Option<String>,
+    pub source_user_id: Option<String>,
+    pub source_label: Option<String>,
+    pub created_from: Option<String>,
     pub extra: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TeamSourceMetadata {
+    pub source_channel: Option<String>,
+    pub source_channel_id: Option<String>,
+    pub source_chat_id: Option<String>,
+    pub source_user_id: Option<String>,
+    pub source_label: Option<String>,
+    pub created_from: Option<String>,
+}
+
+impl TeamSourceMetadata {
+    pub fn from_create_request(req: &CreateTeamRequest) -> Self {
+        Self {
+            source_channel: clean_source(req.source_channel.as_deref()).or_else(|| Some("webui".into())),
+            source_channel_id: clean_source(req.source_channel_id.as_deref()),
+            source_chat_id: clean_source(req.source_chat_id.as_deref()),
+            source_user_id: clean_source(req.source_user_id.as_deref()),
+            source_label: clean_source(req.source_label.as_deref()).or_else(|| Some("WebUI".into())),
+            created_from: clean_source(req.created_from.as_deref()).or_else(|| Some("webui".into())),
+        }
+    }
+
+    pub fn top_level_source(&self) -> ConversationSource {
+        match self.source_channel.as_deref() {
+            Some("telegram") => ConversationSource::Telegram,
+            Some("lark") => ConversationSource::Lark,
+            Some("dingtalk") => ConversationSource::Dingtalk,
+            Some("weixin") | Some("wecom") => ConversationSource::Weixin,
+            _ => ConversationSource::Aionui,
+        }
+    }
+
+    pub fn apply_to_extra(&self, extra: &mut serde_json::Value) {
+        set_extra_string(extra, "source_channel", self.source_channel.as_deref());
+        set_extra_string(extra, "source_channel_id", self.source_channel_id.as_deref());
+        set_extra_string(extra, "source_chat_id", self.source_chat_id.as_deref());
+        set_extra_string(extra, "source_user_id", self.source_user_id.as_deref());
+        set_extra_string(extra, "source_label", self.source_label.as_deref());
+        set_extra_string(extra, "created_from", self.created_from.as_deref());
+    }
+}
+
+#[cfg(test)]
+mod source_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn team_source_metadata_applies_telegram_source_to_extra() {
+        let req = CreateTeamRequest {
+            name: "Telegram Team".into(),
+            agents: vec![],
+            workspace: None,
+            source_channel: Some("telegram".into()),
+            source_channel_id: Some("bot-1".into()),
+            source_chat_id: Some("chat-1".into()),
+            source_user_id: Some("user-1".into()),
+            source_label: Some("Telegram".into()),
+            created_from: Some("telegram".into()),
+        };
+        let metadata = TeamSourceMetadata::from_create_request(&req);
+        let mut extra = serde_json::json!({});
+
+        metadata.apply_to_extra(&mut extra);
+
+        assert_eq!(extra["source_channel"], "telegram");
+        assert_eq!(extra["source_channel_id"], "bot-1");
+        assert_eq!(extra["source_chat_id"], "chat-1");
+        assert_eq!(extra["source_user_id"], "user-1");
+        assert_eq!(extra["source_label"], "Telegram");
+        assert_eq!(extra["created_from"], "telegram");
+        assert_eq!(metadata.top_level_source(), ConversationSource::Telegram);
+    }
+
+    #[test]
+    fn formal_team_preflight_rejects_stale_dynamic_probe() {
+        let now = aionui_common::now_ms();
+        let raw = serde_json::json!({
+            "agent_id": "codex",
+            "checked_at": now - 25 * 60 * 60 * 1000,
+            "available_models": ["gpt-5"],
+            "steps": [
+                {"step":"spawn","status":"passed","started_at":now,"duration_ms":1},
+                {"step":"initialize","status":"passed","started_at":now,"duration_ms":1},
+                {"step":"models","status":"passed","started_at":now,"duration_ms":1},
+                {"step":"minimal_prompt","status":"passed","started_at":now,"duration_ms":1},
+                {"step":"cancel","status":"passed","started_at":now,"duration_ms":1},
+                {"step":"resume","status":"unsupported","started_at":now,"duration_ms":1,
+                 "error_category":"protocol","error_message":"unsupported"}
+            ]
+        })
+        .to_string();
+
+        let error = validate_dynamic_probe_result(&raw, "gpt-5", now).unwrap_err();
+        assert!(error.to_string().contains("stale"));
+    }
+
+    #[test]
+    fn formal_team_preflight_rejects_unobserved_selected_model() {
+        let now = aionui_common::now_ms();
+        let mut result = healthy_probe("codex", now);
+        result.available_models = vec!["gpt-5".into()];
+        let raw = serde_json::to_string(&result).unwrap();
+
+        let error = validate_dynamic_probe_result(&raw, "gpt-5.6", now).unwrap_err();
+        assert!(error.to_string().contains("was not observed"));
+    }
+
+    #[test]
+    fn formal_team_preflight_rejects_latest_failed_check_even_with_prior_success() {
+        let now = aionui_common::now_ms();
+        let raw = serde_json::to_string(&healthy_probe("codex", now)).unwrap();
+
+        let error = validate_agent_dynamic_preflight(Some("offline"), Some(&raw), "gpt-5", now).unwrap_err();
+
+        assert!(error.to_string().contains("latest health check failed"));
+    }
+
+    fn healthy_probe(agent_id: &str, checked_at: i64) -> aionui_api_types::AgentDynamicProbeResult {
+        use aionui_api_types::{AgentProbeStatus, AgentProbeStep, AgentProbeStepResult};
+
+        aionui_api_types::AgentDynamicProbeResult {
+            agent_id: agent_id.into(),
+            checked_at,
+            available_models: vec!["gpt-5".into()],
+            steps: [
+                AgentProbeStep::Spawn,
+                AgentProbeStep::Initialize,
+                AgentProbeStep::Models,
+                AgentProbeStep::MinimalPrompt,
+                AgentProbeStep::Cancel,
+                AgentProbeStep::Resume,
+            ]
+            .into_iter()
+            .map(|step| AgentProbeStepResult {
+                step,
+                status: if step == AgentProbeStep::Resume {
+                    AgentProbeStatus::Unsupported
+                } else {
+                    AgentProbeStatus::Passed
+                },
+                started_at: checked_at,
+                duration_ms: 1,
+                error_category: None,
+                error_message: None,
+            })
+            .collect(),
+        }
+    }
+}
+
+fn clean_source(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn set_extra_string(extra: &mut serde_json::Value, key: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        extra[key] = serde_json::Value::String(value.to_owned());
+    }
+}
+
+const DYNAMIC_PROBE_STALE_MS: i64 = 24 * 60 * 60 * 1000;
+
+fn validate_dynamic_probe_result(raw: &str, selected_model: &str, checked_at: i64) -> Result<(), TeamError> {
+    let probe: aionui_api_types::AgentDynamicProbeResult = serde_json::from_str(raw).map_err(|_| {
+        TeamError::InvalidRequest("Agent dynamic probe snapshot is invalid; run health check again".into())
+    })?;
+    if checked_at.saturating_sub(probe.checked_at) > DYNAMIC_PROBE_STALE_MS {
+        return Err(TeamError::InvalidRequest(format!(
+            "Agent '{}' dynamic probe is stale; run health check again",
+            probe.agent_id
+        )));
+    }
+    if !probe.is_usable() {
+        return Err(TeamError::InvalidRequest(format!(
+            "Agent '{}' failed dynamic capability preflight",
+            probe.agent_id
+        )));
+    }
+    let selected_model = selected_model.trim();
+    if !selected_model.is_empty()
+        && !selected_model.eq_ignore_ascii_case("default")
+        && !probe.available_models.iter().any(|model| model == selected_model)
+    {
+        return Err(TeamError::InvalidRequest(format!(
+            "Model '{selected_model}' was not observed during Agent '{}' dynamic probe",
+            probe.agent_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_agent_dynamic_preflight(
+    last_check_status: Option<&str>,
+    dynamic_probe_result: Option<&str>,
+    selected_model: &str,
+    checked_at: i64,
+) -> Result<(), TeamError> {
+    if !last_check_status.is_some_and(|status| matches!(status, "online" | "available")) {
+        return Err(TeamError::InvalidRequest(
+            "Agent latest health check failed; run health check again before creating a Team".into(),
+        ));
+    }
+    let raw = dynamic_probe_result.ok_or_else(|| {
+        TeamError::InvalidRequest(
+            "Agent has no successful dynamic probe; run health check before creating a Team".into(),
+        )
+    })?;
+    validate_dynamic_probe_result(raw, selected_model, checked_at)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +313,13 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
     async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
+
+    async fn conversation_source_metadata(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<TeamSourceMetadata>, TeamError> {
+        Ok(None)
+    }
 
     async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, TeamError>;
 
@@ -127,12 +361,44 @@ impl TeamAgentProvisioner {
             .map(str::to_owned)
     }
 
+    pub(crate) async fn validate_dynamic_preflight(&self, agents: &[TeamAgentInput]) -> Result<(), TeamError> {
+        for agent in agents {
+            let Some(assistant_id) = Self::effective_assistant_id(agent.assistant_id.as_deref()) else {
+                continue;
+            };
+            let assistant = self
+                .assistant_catalog
+                .resolve_team_selectable_assistant(&assistant_id)
+                .await?
+                .ok_or_else(|| {
+                    TeamError::InvalidRequest(format!("Assistant is not available for team mode: {assistant_id}"))
+                })?;
+            let rows = self.agent_metadata_repo.list_all().await?;
+            let resolved = resolve_agent_binding_from_rows(&rows, &assistant.backend)
+                .ok_or_else(|| TeamError::InvalidRequest(format!("Agent not found: {}", assistant.backend)))?;
+            let row = rows
+                .iter()
+                .find(|row| row.id == resolved.agent_id)
+                .ok_or_else(|| TeamError::InvalidRequest(format!("Agent not found: {}", assistant.backend)))?;
+            if row.agent_type == "acp" {
+                validate_agent_dynamic_preflight(
+                    row.last_check_status.as_deref(),
+                    row.dynamic_probe_result.as_deref(),
+                    &agent.model,
+                    now_ms(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(
         repo: Arc<dyn ITeamRepository>,
         agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
         assistant_catalog: Arc<dyn TeamAssistantCatalogPort>,
         provider_repo: Arc<dyn IProviderRepository>,
         conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+        workspace_manager: Option<Arc<dyn TeamWorkspaceManager>>,
     ) -> Self {
         Self {
             repo,
@@ -140,6 +406,7 @@ impl TeamAgentProvisioner {
             assistant_catalog,
             provider_repo,
             conversation_port,
+            workspace_manager,
         }
     }
 
@@ -153,6 +420,8 @@ impl TeamAgentProvisioner {
         team_id: &str,
         inputs: &[TeamAgentInput],
         shared_workspace: Option<&str>,
+        isolated_workspaces: Option<&PreparedTeamWorkspaces>,
+        source_metadata: &TeamSourceMetadata,
     ) -> Result<InitialProvisioningResult, TeamError> {
         if inputs.is_empty() {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
@@ -174,7 +443,10 @@ impl TeamAgentProvisioner {
         };
 
         let leader_input = &inputs[*leader_idx];
-        let leader_slot_id = generate_id();
+        let leader_lease = isolated_workspaces.and_then(|plan| plan.agent_leases.get(*leader_idx));
+        let leader_slot_id = leader_lease
+            .map(|lease| lease.slot_id.clone())
+            .unwrap_or_else(generate_id);
         let leader_role = TeammateRole::Lead;
         let leader_assistant_id = Self::effective_assistant_id(leader_input.assistant_id.as_deref());
         let leader_backend = self
@@ -190,21 +462,27 @@ impl TeamAgentProvisioner {
                 &leader_backend,
                 &leader_input.model,
                 leader_assistant_id.as_deref(),
-                shared_workspace,
+                leader_lease
+                    .map(|lease| lease.worktree_path.as_str())
+                    .or(shared_workspace),
+                source_metadata,
                 None,
             )
             .await?;
 
-        let team_workspace = match shared_workspace {
-            Some(workspace) => workspace.to_owned(),
-            None => {
-                self.resolve_initial_leader_workspace(
-                    team_id,
-                    &leader_conversation.conversation_id,
-                    leader_conversation.workspace,
-                )
-                .await?
-            }
+        let team_workspace = match isolated_workspaces {
+            Some(plan) => plan.integration.worktree_path.clone(),
+            None => match shared_workspace {
+                Some(workspace) => workspace.to_owned(),
+                None => {
+                    self.resolve_initial_leader_workspace(
+                        team_id,
+                        &leader_conversation.conversation_id,
+                        leader_conversation.workspace,
+                    )
+                    .await?
+                }
+            },
         };
 
         let mut agents = Vec::with_capacity(inputs.len());
@@ -221,12 +499,16 @@ impl TeamAgentProvisioner {
             cli_path: None,
         });
 
-        for (input, role) in inputs
+        for (index, (input, role)) in inputs
             .iter()
             .zip(roles.iter())
-            .filter(|(_, role)| **role == TeammateRole::Teammate)
+            .enumerate()
+            .filter(|(_, (_, role))| **role == TeammateRole::Teammate)
         {
-            let slot_id = generate_id();
+            let isolated_lease = isolated_workspaces.and_then(|plan| plan.agent_leases.get(index));
+            let slot_id = isolated_lease
+                .map(|lease| lease.slot_id.clone())
+                .unwrap_or_else(generate_id);
             let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
             let backend = self
                 .resolve_requested_backend(input.backend.as_deref(), assistant_id.as_deref())
@@ -241,7 +523,10 @@ impl TeamAgentProvisioner {
                     &backend,
                     &input.model,
                     assistant_id.as_deref(),
-                    Some(&team_workspace),
+                    isolated_lease
+                        .map(|lease| lease.worktree_path.as_str())
+                        .or(Some(&team_workspace)),
+                    source_metadata,
                     None,
                 )
                 .await?;
@@ -291,7 +576,10 @@ impl TeamAgentProvisioner {
                 "add_agent only supports teammate role".into(),
             ));
         }
-        let workspace = self.workspace_resolver().resolve_for_new_agent(row, team).await?;
+        let slot_id = generate_id();
+        let workspace = self
+            .resolve_workspace_for_new_agent(user_id, row, team, &slot_id, &req.name)
+            .await?;
         let assistant_id = Self::effective_assistant_id(req.assistant_id.as_deref());
         let backend = self
             .resolve_requested_backend(req.backend.as_deref(), assistant_id.as_deref())
@@ -300,7 +588,7 @@ impl TeamAgentProvisioner {
             .provision_new_agent(NewAgentProvisioning {
                 user_id: user_id.to_owned(),
                 team_id: team.id.clone(),
-                slot_id: generate_id(),
+                slot_id: slot_id.clone(),
                 name: req.name,
                 role,
                 backend,
@@ -309,7 +597,14 @@ impl TeamAgentProvisioner {
                 workspace: Some(workspace),
                 session_mode: row.session_mode.clone(),
             })
-            .await?;
+            .await;
+        let agent = match agent {
+            Ok(agent) => agent,
+            Err(error) => {
+                self.release_failed_isolated_slot(row, &slot_id).await;
+                return Err(error);
+            }
+        };
         team.agents.push(agent.clone());
         self.persist_agents(&team.id, &team.agents).await?;
         Ok(agent)
@@ -347,7 +642,10 @@ impl TeamAgentProvisioner {
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(req.team_id.clone()))?;
         let mut team = Team::from_row(&row)?;
-        let workspace = self.workspace_resolver().resolve_for_new_agent(&row, &team).await?;
+        let slot_id = req.slot_id.clone();
+        let workspace = self
+            .resolve_workspace_for_new_agent(&req.user_id, &row, &team, &slot_id, &req.name)
+            .await?;
         let agent = self
             .provision_new_agent(NewAgentProvisioning {
                 user_id: req.user_id,
@@ -361,7 +659,14 @@ impl TeamAgentProvisioner {
                 workspace: Some(workspace),
                 session_mode: row.session_mode.clone(),
             })
-            .await?;
+            .await;
+        let agent = match agent {
+            Ok(agent) => agent,
+            Err(error) => {
+                self.release_failed_isolated_slot(&row, &slot_id).await;
+                return Err(error);
+            }
+        };
         team.agents.push(agent.clone());
         self.persist_agents(&req.team_id, &team.agents).await?;
         Ok(agent)
@@ -508,6 +813,7 @@ impl TeamAgentProvisioner {
                 &input.model,
                 input.assistant_id.as_deref(),
                 input.workspace.as_deref(),
+                &TeamSourceMetadata::default(),
                 input.session_mode.as_deref(),
             )
             .await?;
@@ -537,6 +843,7 @@ impl TeamAgentProvisioner {
         model: &str,
         assistant_id: Option<&str>,
         workspace: Option<&str>,
+        source_metadata: &TeamSourceMetadata,
         session_mode: Option<&str>,
     ) -> Result<ProvisionedConversation, TeamError> {
         let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, backend).await?;
@@ -556,6 +863,7 @@ impl TeamAgentProvisioner {
             agent_type,
             acp_metadata.as_ref(),
             session_mode,
+            source_metadata,
         );
         let provider_id = if agent_type == AgentType::Aionrs {
             self.resolve_provider_for_model(model)
@@ -587,6 +895,14 @@ impl TeamAgentProvisioner {
                 name: name.to_owned(),
                 top_level_model,
                 assistant_id: assistant_id.map(str::to_owned),
+                source: Some(source_metadata.top_level_source()),
+                channel_chat_id: source_metadata.source_chat_id.clone(),
+                source_channel: source_metadata.source_channel.clone(),
+                source_channel_id: source_metadata.source_channel_id.clone(),
+                source_chat_id: source_metadata.source_chat_id.clone(),
+                source_user_id: source_metadata.source_user_id.clone(),
+                source_label: source_metadata.source_label.clone(),
+                created_from: source_metadata.created_from.clone(),
                 extra,
             })
             .await?;
@@ -658,6 +974,7 @@ impl TeamAgentProvisioner {
         agent_type: AgentType,
         acp_metadata: Option<&AgentMetadataRow>,
         session_mode: Option<&str>,
+        source_metadata: &TeamSourceMetadata,
     ) -> serde_json::Value {
         let session_mode = session_mode
             .map(str::trim)
@@ -680,6 +997,7 @@ impl TeamAgentProvisioner {
         if let Some(workspace) = workspace {
             inherit_team_workspace(&mut extra, workspace);
         }
+        source_metadata.apply_to_extra(&mut extra);
         extra
     }
 
@@ -709,6 +1027,35 @@ impl TeamAgentProvisioner {
             }
         }
         None
+    }
+
+    async fn resolve_workspace_for_new_agent(
+        &self,
+        user_id: &str,
+        row: &TeamRow,
+        team: &Team,
+        slot_id: &str,
+        name: &str,
+    ) -> Result<String, TeamError> {
+        if matches!(row.workspace_mode.as_str(), "isolated" | "isolated_worktree") {
+            let manager = self
+                .workspace_manager
+                .as_ref()
+                .ok_or_else(|| TeamError::WorkspaceOperation("isolated worktree support is unavailable".into()))?;
+            return Ok(manager
+                .allocate_agent(user_id, &row.id, &WorkspaceAgentSpec::new(slot_id, name))
+                .await?
+                .worktree_path);
+        }
+        self.workspace_resolver().resolve_for_new_agent(row, team).await
+    }
+
+    async fn release_failed_isolated_slot(&self, row: &TeamRow, slot_id: &str) {
+        if matches!(row.workspace_mode.as_str(), "isolated" | "isolated_worktree")
+            && let Some(manager) = &self.workspace_manager
+        {
+            let _ = manager.release_slot(&row.id, slot_id).await;
+        }
     }
 }
 
@@ -942,6 +1289,7 @@ mod tests {
             Arc::new(EmptyTeamAssistantCatalog),
             Arc::new(EmptyProviderRepo),
             Arc::new(RecordingProvisioningPort { events, patches }),
+            None,
         )
     }
 

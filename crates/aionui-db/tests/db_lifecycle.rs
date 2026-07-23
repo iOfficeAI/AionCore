@@ -2,6 +2,8 @@ use aionui_db::{
     DatabaseInitOptions, init_database, init_database_memory, init_database_with_options, maybe_copy_legacy_database,
 };
 use sqlx::Row;
+use sqlx::migrate::Migrator;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 // -- T1.1 Initialization --
 
@@ -489,4 +491,90 @@ fn concurrent_init_database_does_not_panic_on_unique_conflict() {
     // Lock file is created next to the DB and is harmless to leave behind.
     let lock = path.with_file_name("aionui-backend.db.migrate.lock");
     assert!(lock.exists(), "advisory lock file should be present after migrate");
+}
+
+#[tokio::test]
+async fn legacy_roadmap_migration_ranges_are_reconciled_without_losing_topic_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let current_migration_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+
+    for (case_name, legacy_start, current_start, current_end, legacy_shift) in [
+        ("original-partial", 17_i64, 28_i64, 29_i64, 11_i64),
+        ("original-full", 17_i64, 28_i64, 45_i64, 11_i64),
+        ("intermediate-full", 26_i64, 28_i64, 45_i64, 2_i64),
+    ] {
+        let case_dir = dir.path().join(case_name);
+        let migration_dir = case_dir.join("legacy-migrations");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        for entry in std::fs::read_dir(&current_migration_dir).unwrap() {
+            let entry = entry.unwrap();
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let version: i64 = file_name[..3].parse().unwrap();
+            let legacy_name = if version < legacy_start {
+                file_name
+            } else if (current_start..=current_end).contains(&version) {
+                format!("{:03}_{}", version - legacy_shift, &file_name[4..])
+            } else {
+                continue;
+            };
+            let legacy_path = migration_dir.join(legacy_name);
+            if legacy_start == 17 && matches!(version, 31 | 32) {
+                let mut legacy_contents = std::fs::read(entry.path()).unwrap();
+                legacy_contents.push(b'\n');
+                std::fs::write(legacy_path, legacy_contents).unwrap();
+            } else {
+                std::fs::copy(entry.path(), legacy_path).unwrap();
+            }
+        }
+
+        let path = case_dir.join("legacy-roadmap.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&path).create_if_missing(true))
+            .await
+            .unwrap();
+        Migrator::new(migration_dir).await.unwrap().run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO telegram_topic_bindings \
+             (chat_id, message_thread_id, agent_id, bound_by_user_id, created_at, updated_at) \
+             VALUES ('-1003977604085', 3, 'codex-agent', 'admin-user', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = init_database(&path).await.unwrap();
+        let migrations: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT version, description FROM _sqlx_migrations WHERE version IN (17, 18, 26, 27, 28, 29) ORDER BY version",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            migrations,
+            vec![
+                (17, "drop conversation assistant identity snapshot".to_string()),
+                (18, "reset builtin assistant enabled".to_string()),
+                (26, "clear bridge agent command override".to_string()),
+                (27, "provider model settings".to_string()),
+                (28, "source channel metadata".to_string()),
+                (29, "telegram topic single agent".to_string()),
+            ]
+        );
+        let migration_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(migration_count.0, 46);
+
+        let binding: (String,) = sqlx::query_as(
+            "SELECT agent_id FROM telegram_topic_bindings WHERE chat_id = '-1003977604085' AND message_thread_id = 3",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(binding.0, "codex-agent");
+        db.close().await;
+    }
 }

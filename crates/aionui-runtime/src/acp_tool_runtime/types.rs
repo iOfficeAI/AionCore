@@ -227,6 +227,14 @@ mod tests {
         assert_eq!(ManagedAcpToolId::CodexAcp.version(), "1.1.2");
         assert_eq!(ManagedAcpToolId::ClaudeAgentAcp.version(), "0.58.1");
     }
+
+    #[test]
+    fn codex_uses_the_maintained_agentclientprotocol_package() {
+        assert_eq!(
+            ManagedAcpToolId::CodexAcp.package_name(),
+            "@agentclientprotocol/codex-acp"
+        );
+    }
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

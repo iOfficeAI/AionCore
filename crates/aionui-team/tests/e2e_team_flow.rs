@@ -683,8 +683,15 @@ async fn setup_session_with_turn_recorder_inner(
         id: "e2e-team".into(),
         name: "E2E Team".into(),
         workspace: "/tmp/e2e-team".into(),
+        workspace_mode: aionui_api_types::TeamWorkspaceMode::Shared,
         agents: two_agents(),
         lead_agent_id: Some("lead-1".into()),
+        source_channel: None,
+        source_channel_id: None,
+        source_chat_id: None,
+        source_user_id: None,
+        source_label: None,
+        created_from: None,
         created_at: 1000,
         updated_at: 1000,
     };
@@ -741,8 +748,15 @@ async fn setup_session_with_runtime_ports(
         id: "e2e-team".into(),
         name: "E2E Team".into(),
         workspace: "/tmp/e2e-team".into(),
+        workspace_mode: aionui_api_types::TeamWorkspaceMode::Shared,
         agents: two_agents(),
         lead_agent_id: Some("lead-1".into()),
+        source_channel: None,
+        source_channel_id: None,
+        source_chat_id: None,
+        source_user_id: None,
+        source_label: None,
+        created_from: None,
         created_at: 1000,
         updated_at: 1000,
     };
@@ -1305,7 +1319,6 @@ async fn s5_consecutive_finish_events_after_dedup_clear() {
 /// be cleared immediately after the first success if the second finish arrives
 /// within the 5-second window.
 #[tokio::test]
-#[ignore = "Bug: on_agent_finish clears dedup window immediately, allowing double-processing within window (task #5 fix pending)"]
 async fn s5b_dedup_window_blocks_rapid_duplicate_finish() {
     let (session, _tm, repo, _sent) = setup_session().await;
 
@@ -1813,10 +1826,9 @@ async fn s9d_late_child_start_after_team_cancel_is_cancelled_without_reviving_ru
 /// Bug (task #5 related): Currently `on_agent_finish` sets status to Error,
 /// then calls `finalize_turn` → `mark_idle`, which overwrites Error with Idle.
 /// The correct behavior: Error status should be preserved (not overwritten by
-/// mark_idle). This test is #[ignore] until the Error-status-preservation fix
-/// is merged into fix/team-communication-bugs.
+/// `mark_idle`). The regression test remains active so finalization cannot
+/// silently erase a crash/error observation in future changes.
 #[tokio::test]
-#[ignore = "Bug: mark_idle overwrites Error status with Idle (fix pending in fix/team-communication-bugs)"]
 async fn s10_error_finish_sets_agent_status_to_error() {
     let (session, _tm, _repo, _sent) = setup_session().await;
 

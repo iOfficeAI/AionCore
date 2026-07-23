@@ -226,6 +226,7 @@ fn make_test_outgoing() -> UnifiedOutgoingMessage {
         media_actions: None,
         reply_to_message_id: None,
         silent: None,
+        topic: None,
     }
 }
 
