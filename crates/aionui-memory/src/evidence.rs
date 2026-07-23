@@ -373,7 +373,7 @@ mod tests {
             existing_entries: vec![active_entry("active"), superseded_entry("superseded")],
         };
 
-        let output = EvidenceBuilder::default().build(request).unwrap();
+        let output = EvidenceBuilder.build(request).unwrap();
 
         assert_eq!(output.conversation.id, "conversation-1");
         assert_eq!(output.conversation.project_id.as_deref(), Some("project-alpha"));
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn rejects_excess_evidence_limits_deterministically() {
-        let builder = EvidenceBuilder::default();
+        let builder = EvidenceBuilder;
 
         let too_many_turns = EvidenceBuildRequest {
             conversation: conversation(json!({})),
@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn retains_the_canonical_claimed_turn_order() {
-        let output = EvidenceBuilder::default()
+        let output = EvidenceBuilder
             .build(EvidenceBuildRequest {
                 conversation: conversation(json!({})),
                 messages: vec![
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn rejects_mixed_canonical_rows_and_scope_incompatible_entries() {
-        let builder = EvidenceBuilder::default();
+        let builder = EvidenceBuilder;
         let request = EvidenceBuildRequest {
             conversation: conversation(json!({ "project_id": "project-a", "workspace": "/work/a" })),
             messages: vec![MessageRow {
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn removes_user_context_sentences_but_keeps_work_local_preferences_and_http_outcomes() {
-        let output = EvidenceBuilder::default()
+        let output = EvidenceBuilder
             .build(EvidenceBuildRequest {
                 conversation: conversation(json!({})),
                 messages: vec![text_message(
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_claims_and_treats_the_summary_cursor_as_prior_state() {
-        let builder = EvidenceBuilder::default();
+        let builder = EvidenceBuilder;
         let duplicate_cursor = EvidenceBuildRequest {
             conversation: conversation(json!({})),
             messages: Vec::new(),
@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn orders_final_messages_and_rejects_non_final_or_cumulative_oversize_evidence() {
-        let builder = EvidenceBuilder::default();
+        let builder = EvidenceBuilder;
         let ordered = builder
             .build(EvidenceBuildRequest {
                 conversation: conversation(json!({})),
@@ -647,7 +647,7 @@ mod tests {
 
     #[test]
     fn rejects_aggregate_summary_or_identifier_overflow_but_ignores_inactive_entries_for_limits() {
-        let builder = EvidenceBuilder::default();
+        let builder = EvidenceBuilder;
         let summary_overflow = builder.build(EvidenceBuildRequest {
             conversation: conversation(json!({})),
             messages: Vec::new(),
