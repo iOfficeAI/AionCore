@@ -1694,7 +1694,8 @@ fn failure_transition(
         | MemoryJobFailureCode::ModelUnavailable
         | MemoryJobFailureCode::ProviderAuthFailed => ("blocked", None, true, false),
         MemoryJobFailureCode::InvalidInput => ("failed", None, true, false),
-        MemoryJobFailureCode::Canceled | MemoryJobFailureCode::QueueFull => ("pending", None, false, false),
+        MemoryJobFailureCode::Canceled => ("pending", None, false, false),
+        MemoryJobFailureCode::QueueFull => ("retry_wait", Some(now + 30_000), false, false),
         MemoryJobFailureCode::InvalidOutput if invalid_output_count >= 1 => ("failed", None, true, true),
         _ if attempt_count >= RETRY_DELAYS_MS.len() as i64 => ("failed", None, true, false),
         _ => (
@@ -1850,7 +1851,7 @@ mod tests {
         );
         assert_eq!(
             failure_transition(&MemoryJobFailureCode::QueueFull, 4, 0, now),
-            ("pending", None, false, false),
+            ("retry_wait", Some(now + 30_000), false, false),
         );
         assert_eq!(
             failure_transition(&MemoryJobFailureCode::InvalidOutput, 0, 0, now),
@@ -2243,6 +2244,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let before_queue_failure = aionui_common::now_ms();
         let queued = fixture
             .service
             .record_job_failure(
@@ -2257,7 +2259,25 @@ mod tests {
             )
             .await
             .unwrap();
+        let after_queue_failure = aionui_common::now_ms();
+        assert_eq!(queued.state, MemoryJobState::RetryWait);
         assert_eq!(queued.attempt_count, 0);
+        let next_attempt_at = queued.next_attempt_at.expect("queue-full retry deadline");
+        assert!((before_queue_failure + 30_000..=after_queue_failure + 30_000).contains(&next_attempt_at));
+        assert!(
+            fixture
+                .service
+                .claim_job(USER_ID, "worker-2", 30_000)
+                .await
+                .unwrap()
+                .is_none(),
+            "queue-full retry must remain unavailable until its durable deadline",
+        );
+        sqlx::query("UPDATE memory_jobs SET next_attempt_at = 0 WHERE id = ?")
+            .bind(&first.id)
+            .execute(fixture._db.pool())
+            .await
+            .unwrap();
         let second = fixture
             .service
             .claim_job(USER_ID, "worker-2", 30_000)
