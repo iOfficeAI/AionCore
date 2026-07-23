@@ -172,6 +172,25 @@ pub struct WorkspaceBrowseQuery {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_mode: Option<WorkspaceSearchMode>,
+}
+
+/// Search mode for workspace browse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSearchMode {
+    All,
+    Name,
+    Content,
+}
+
+/// How a workspace search result matched the query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSearchMatchKind {
+    Name,
+    Content,
 }
 
 /// A file or directory entry in the workspace browse response.
@@ -180,6 +199,10 @@ pub struct WorkspaceEntry {
     pub name: String,
     #[serde(rename = "type")]
     pub entry_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_kind: Option<WorkspaceSearchMatchKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_match_count: Option<usize>,
 }
 
 /// Request body for side question.
