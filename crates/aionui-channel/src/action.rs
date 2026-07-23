@@ -4111,6 +4111,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slash_model_uses_acp_config_options_when_probe_models_are_empty() {
+        let mut prefs = HashMap::new();
+        prefs.insert(
+            "assistant.telegram.agent".into(),
+            r#"{"assistant_id":"claude-1","name":"Claude Code"}"#.into(),
+        );
+        let mut row = make_agent_row(
+            "claude-1",
+            "Claude Code",
+            "acp",
+            Some("claude"),
+            true,
+            Some("online"),
+            Some(r#"{"available_models":[]}"#),
+            10,
+        );
+        row.config_options = Some(
+            r#"{"config_options":[{"category":"model","currentValue":"sonnet","id":"model","name":"Model","options":[{"name":"Default","value":"default"},{"name":"Sonnet","value":"sonnet"}],"type":"select"}]}"#
+                .into(),
+        );
+        let (executor, repo, _prefs) = setup_with_agent_rows(vec![row], prefs);
+        repo.add_authorized_user("tg_42", "telegram");
+
+        let msg = make_command_message("tg_42", "chat_1", "/model", PluginType::Telegram);
+        let result = executor.handle_incoming_message(&msg).await.unwrap();
+        match result {
+            MessageResult::Action(resp) => {
+                let text = resp.text.unwrap();
+                assert!(text.contains("当前 Agent: Claude Code"), "got: {text}");
+                let buttons = resp.buttons.unwrap();
+                assert_eq!(buttons[0][0].label, "Default");
+                assert_eq!(buttons[1][0].label, "Sonnet");
+                assert_eq!(buttons[1][0].action, "model.select");
+                assert_eq!(
+                    buttons[1][0].params.as_ref().unwrap().get("m").map(String::as_str),
+                    Some("sonnet")
+                );
+            }
+            _ => panic!("Expected Action result"),
+        }
+    }
+
+    #[tokio::test]
     async fn slash_model_uses_compact_callback_params_for_telegram_limit() {
         let mut prefs = HashMap::new();
         prefs.insert(

@@ -364,7 +364,11 @@ impl ChannelSettingsService {
                     models: if row.agent_type == DEFAULT_AGENT_TYPE {
                         provider_models.clone()
                     } else {
-                        parse_probed_agent_model_options(&row.id, row.dynamic_probe_result.as_deref())
+                        parse_probed_agent_model_options(
+                            &row.id,
+                            row.dynamic_probe_result.as_deref(),
+                            row.config_options.as_deref(),
+                        )
                     },
                     last_probe_at: parse_dynamic_probe_checked_at(row.dynamic_probe_result.as_deref()),
                 },
@@ -609,7 +613,11 @@ fn command_exists(command: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_probed_agent_model_options(provider_id: &str, raw: Option<&str>) -> Vec<ChannelModelOption> {
+fn parse_probed_agent_model_options(
+    provider_id: &str,
+    raw: Option<&str>,
+    config_options_raw: Option<&str>,
+) -> Vec<ChannelModelOption> {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return vec![];
     };
@@ -620,18 +628,80 @@ fn parse_probed_agent_model_options(provider_id: &str, raw: Option<&str>) -> Vec
         return vec![];
     }
 
+    let observed_models = if probe.available_models.is_empty() {
+        parse_config_option_models(config_options_raw)
+    } else {
+        probe
+            .available_models
+            .into_iter()
+            .map(|model| (model.clone(), model))
+            .collect()
+    };
     let mut seen = std::collections::HashSet::new();
     let mut models = Vec::new();
-    for model in probe.available_models {
+    for (model, label) in observed_models {
         let model = model.trim().to_owned();
         if model.is_empty() || !seen.insert(model.clone()) {
             continue;
         }
         models.push(ChannelModelOption {
             provider_id: provider_id.to_owned(),
-            label: model.clone(),
+            label: label.trim().to_owned(),
             model,
         });
+    }
+    models
+}
+
+fn parse_config_option_models(raw: Option<&str>) -> Vec<(String, String)> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return vec![];
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return vec![];
+    };
+    let Some(options) = value
+        .get("config_options")
+        .or_else(|| value.get("configOptions"))
+        .or_else(|| value.as_array().map(|_| &value))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return vec![];
+    };
+    let Some(model_option) = options.iter().find(|option| {
+        option
+            .get("category")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|category| category.eq_ignore_ascii_case("model"))
+            || option
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| matches!(id.to_ascii_lowercase().as_str(), "model" | "models"))
+    }) else {
+        return vec![];
+    };
+
+    fn collect_options(value: &serde_json::Value, output: &mut Vec<(String, String)>) {
+        let Some(entries) = value.as_array() else {
+            return;
+        };
+        for entry in entries {
+            if let Some(model) = entry.get("value").and_then(serde_json::Value::as_str) {
+                let label = entry
+                    .get("name")
+                    .or_else(|| entry.get("label"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(model);
+                output.push((model.to_owned(), label.to_owned()));
+            } else if let Some(children) = entry.get("options") {
+                collect_options(children, output);
+            }
+        }
+    }
+
+    let mut models = Vec::new();
+    if let Some(entries) = model_option.get("options") {
+        collect_options(entries, &mut models);
     }
     models
 }
@@ -1022,14 +1092,14 @@ mod tests {
         ))
         .unwrap();
 
-        let models = parse_probed_agent_model_options("codex", Some(&raw));
+        let models = parse_probed_agent_model_options("codex", Some(&raw), None);
 
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].provider_id, "codex");
         assert_eq!(models[0].model, "gpt-5.6");
         assert_eq!(models[0].label, "gpt-5.6");
-        assert!(parse_probed_agent_model_options("codex", Some("not-json")).is_empty());
-        assert!(parse_probed_agent_model_options("codex", None).is_empty());
+        assert!(parse_probed_agent_model_options("codex", Some("not-json"), None).is_empty());
+        assert!(parse_probed_agent_model_options("codex", None, None).is_empty());
     }
 
     fn healthy_probe_with_models(
