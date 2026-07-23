@@ -3270,7 +3270,12 @@ impl IMemoryRepository for SqliteMemoryRepository {
                     OR (? IS NOT NULL AND project_id = ?)
                     OR (? IS NOT NULL AND workspace_key = ?))
              ORDER BY
-               CASE WHEN project_id = ? THEN 0 WHEN workspace_key = ? THEN 1 ELSE 2 END,
+               CASE
+                 WHEN project_id = ? AND workspace_key = ? THEN 0
+                 WHEN project_id = ? THEN 1
+                 WHEN workspace_key = ? THEN 2
+                 ELSE 3
+               END,
                pinned DESC, user_edited DESC, updated_at DESC, id
              LIMIT ?",
         )
@@ -3278,6 +3283,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
         .bind(&query.project_id)
         .bind(&query.project_id)
         .bind(&query.workspace_key)
+        .bind(&query.workspace_key)
+        .bind(&query.project_id)
         .bind(&query.workspace_key)
         .bind(&query.project_id)
         .bind(&query.workspace_key)
@@ -3295,7 +3302,12 @@ impl IMemoryRepository for SqliteMemoryRepository {
                AND ((project_id IS NULL AND workspace_key IS NULL)
                     OR (? IS NOT NULL AND project_id = ?)
                     OR (? IS NOT NULL AND workspace_key = ?))
-             ORDER BY CASE WHEN project_id = ? THEN 0 WHEN workspace_key = ? THEN 1 ELSE 2 END,
+             ORDER BY CASE
+                        WHEN project_id = ? AND workspace_key = ? THEN 0
+                        WHEN project_id = ? THEN 1
+                        WHEN workspace_key = ? THEN 2
+                        ELSE 3
+                      END,
                       updated_at DESC,conversation_id
              LIMIT ?",
         )
@@ -3303,6 +3315,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
         .bind(&query.project_id)
         .bind(&query.project_id)
         .bind(&query.workspace_key)
+        .bind(&query.workspace_key)
+        .bind(&query.project_id)
         .bind(&query.workspace_key)
         .bind(&query.project_id)
         .bind(&query.workspace_key)
@@ -3366,66 +3380,6 @@ impl IMemoryRepository for SqliteMemoryRepository {
             ));
         }
         Ok(rows.into_iter().map(|row| row.with_sources(Vec::new())).collect())
-    }
-
-    async fn create_retrieval(&self, retrieval: MemoryRetrievalRow) -> Result<MemoryRetrievalRow, DbError> {
-        let selected_ids: Vec<String> = serde_json::from_str(&retrieval.selected_ids_json)
-            .map_err(|error| DbError::Conflict(format!("Invalid selected Memory IDs: {error}")))?;
-        if selected_ids.len() > 64 {
-            return Err(DbError::Conflict("Invalid Memory retrieval selection count".into()));
-        }
-        let mut connection = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
-        let result = async {
-            Self::ensure_conversation_on(&mut connection, &retrieval.user_id, &retrieval.conversation_id).await?;
-            for selection_id in &selected_ids {
-                Self::retrieval_item_on(&mut connection, &retrieval.user_id, selection_id)
-                    .await?
-                    .ok_or_else(|| DbError::NotFound(format!("Memory selection '{selection_id}' not found")))?;
-            }
-            sqlx::query("DELETE FROM memory_retrievals WHERE expires_at <= ?")
-                .bind(retrieval.created_at)
-                .execute(&mut *connection)
-                .await?;
-            sqlx::query(
-                "DELETE FROM memory_retrievals
-                 WHERE user_id = ? AND conversation_id = ? AND prompt_hash = ? AND retrieval_version = ?",
-            )
-            .bind(&retrieval.user_id)
-            .bind(&retrieval.conversation_id)
-            .bind(&retrieval.prompt_hash)
-            .bind(&retrieval.retrieval_version)
-            .execute(&mut *connection)
-            .await?;
-            sqlx::query(
-                "INSERT INTO memory_retrievals
-                (id, user_id, conversation_id, prompt_hash, selected_ids_json, estimated_tokens, budget_tokens,
-                 retrieval_version, created_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&retrieval.id)
-            .bind(&retrieval.user_id)
-            .bind(&retrieval.conversation_id)
-            .bind(&retrieval.prompt_hash)
-            .bind(&retrieval.selected_ids_json)
-            .bind(retrieval.estimated_tokens)
-            .bind(retrieval.budget_tokens)
-            .bind(&retrieval.retrieval_version)
-            .bind(retrieval.created_at)
-            .bind(retrieval.expires_at)
-            .execute(&mut *connection)
-            .await?;
-            sqlx::query("COMMIT").execute(&mut *connection).await?;
-            Ok::<_, DbError>(())
-        }
-        .await;
-        match result {
-            Ok(()) => Ok(retrieval),
-            Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-                Err(error)
-            }
-        }
     }
 
     async fn create_retrieval_snapshot(
@@ -3589,14 +3543,6 @@ impl IMemoryRepository for SqliteMemoryRepository {
             ))),
             row => Ok(row),
         }
-    }
-
-    async fn delete_expired_retrievals(&self, now: TimestampMs) -> Result<u64, DbError> {
-        Ok(sqlx::query("DELETE FROM memory_retrievals WHERE expires_at <= ?")
-            .bind(now)
-            .execute(&self.pool)
-            .await?
-            .rows_affected())
     }
 
     async fn get_import_state(&self, user_id: &str) -> Result<Option<MemoryImportStateRow>, DbError> {
@@ -6428,12 +6374,15 @@ mod tests {
         exact_workspace.content = "needle needle needle".into();
         let mut global = entry("global", "fp-global", vec![source("conv_a", "turn-1")]);
         global.content = "needle".into();
+        let mut exact_both = entry("exact-both", "fp-both", vec![source("conv_a", "turn-1")]);
+        exact_both.project_id = Some("project-1".into());
+        exact_both.workspace_key = Some("workspace-1".into());
         repo.commit_update(commit(
             "job-candidates",
             "conv_a",
             "turn-1",
             0,
-            vec![global, exact_workspace, exact_project],
+            vec![global, exact_workspace, exact_project, exact_both],
             20,
         ))
         .await
@@ -6450,50 +6399,109 @@ mod tests {
             .unwrap();
         assert_eq!(
             candidates.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-            ["exact-project", "exact-workspace"]
+            ["exact-both", "exact-project"]
         );
     }
 
     #[tokio::test]
-    async fn sqlite_memory_retrieval_create_replaces_same_key_and_lazily_cleans_expired_rows() {
+    async fn sqlite_memory_candidate_window_cannot_crowd_out_exact_project_workspace() {
         let (repo, _, db) = setup().await;
-        let retrieval = |id: &str, prompt_hash: &str, created_at: i64, expires_at: i64| MemoryRetrievalRow {
-            id: id.into(),
-            user_id: USER_A.into(),
-            conversation_id: "conv_a".into(),
-            prompt_hash: prompt_hash.into(),
-            selected_ids_json: "[]".into(),
-            estimated_tokens: 0,
-            budget_tokens: 2_000,
-            retrieval_version: "memory-retrieval-v1".into(),
-            created_at,
-            expires_at,
-        };
-        repo.create_retrieval(retrieval("first", "same", 10, 100))
+        for index in 0..200 {
+            sqlx::query(
+                "INSERT INTO memory_entries
+                    (id,user_id,project_id,workspace_key,kind,stable_key,fingerprint,content,state,pinned,user_edited,
+                     revision,schema_version,created_at,updated_at)
+                 VALUES (?,?,'project-1',?,'issue',?,?,'needle','active',1,0,1,1,?,?)",
+            )
+            .bind(format!("project-only-{index:03}"))
+            .bind(USER_A)
+            .bind(format!("other-workspace-{index:03}"))
+            .bind(format!("key-{index:03}"))
+            .bind(format!("fp-project-only-{index:03}"))
+            .bind(1_000 + index)
+            .bind(1_000 + index)
+            .execute(db.pool())
             .await
             .unwrap();
-        repo.create_retrieval(retrieval("replacement", "same", 20, 200))
-            .await
-            .unwrap();
-        assert!(repo.get_retrieval(USER_A, "first").await.unwrap().is_none());
-        assert!(repo.get_retrieval(USER_A, "replacement").await.unwrap().is_some());
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM memory_retrievals")
-                .fetch_one(db.pool())
-                .await
-                .unwrap(),
-            1,
-        );
+        }
+        sqlx::query(
+            "INSERT INTO memory_entries
+                (id,user_id,project_id,workspace_key,kind,stable_key,fingerprint,content,state,pinned,user_edited,
+                 revision,schema_version,created_at,updated_at)
+             VALUES ('exact-saturated',?,'project-1','workspace-1','issue','exact','fp-exact-saturated',
+                     'needle','active',0,0,1,1,1,1)",
+        )
+        .bind(USER_A)
+        .execute(db.pool())
+        .await
+        .unwrap();
 
-        repo.create_retrieval(retrieval("expired", "other", 30, 31))
+        let candidates = repo
+            .retrieval_candidates(MemoryCandidateQueryRow {
+                user_id: USER_A.into(),
+                project_id: Some("project-1".into()),
+                workspace_key: Some("workspace-1".into()),
+                limit: 200,
+            })
             .await
             .unwrap();
-        assert_eq!(repo.delete_expired_retrievals(31).await.unwrap(), 1);
-        assert!(repo.get_retrieval(USER_A, "expired").await.unwrap().is_none());
-        assert!(matches!(
-            repo.get_retrieval(USER_B, "replacement").await,
-            Err(DbError::NotFound(_))
-        ));
+        assert_eq!(candidates.len(), 200);
+        assert_eq!(candidates[0].id, "exact-saturated");
+        assert!(!candidates.iter().any(|entry| entry.id == "project-only-000"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_summary_window_cannot_crowd_out_exact_project_workspace() {
+        let (repo, conversations, db) = setup().await;
+        for index in 0..8 {
+            let id = format!("summary-project-only-{index}");
+            conversations.create(&conversation(&id, USER_A)).await.unwrap();
+            sqlx::query(
+                "INSERT INTO conversation_memories
+                    (user_id,conversation_id,project_id,workspace_key,summary_json,through_turn_id,revision,source,
+                     schema_version,created_at,updated_at)
+                 VALUES (?,?, 'project-1', ?, '{}','turn',1,'memory_update',1,?,?)",
+            )
+            .bind(USER_A)
+            .bind(&id)
+            .bind(format!("other-workspace-{index}"))
+            .bind(1_000 + index)
+            .bind(1_000 + index)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        conversations
+            .create(&conversation("summary-exact", USER_A))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_memories
+                (user_id,conversation_id,project_id,workspace_key,summary_json,through_turn_id,revision,source,
+                 schema_version,created_at,updated_at)
+             VALUES (?,'summary-exact','project-1','workspace-1','{}','turn',1,'memory_update',1,1,1)",
+        )
+        .bind(USER_A)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let summaries = repo
+            .retrieval_summaries(MemoryCandidateQueryRow {
+                user_id: USER_A.into(),
+                project_id: Some("project-1".into()),
+                workspace_key: Some("workspace-1".into()),
+                limit: 8,
+            })
+            .await
+            .unwrap();
+        assert_eq!(summaries.len(), 8);
+        assert_eq!(summaries[0].conversation_id, "summary-exact");
+        assert!(
+            !summaries
+                .iter()
+                .any(|summary| summary.conversation_id == "summary-project-only-0")
+        );
     }
 
     #[tokio::test]

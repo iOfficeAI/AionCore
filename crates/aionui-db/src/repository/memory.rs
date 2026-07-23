@@ -530,7 +530,6 @@ pub trait IMemoryRepository: Send + Sync {
         fingerprints: &[String],
         target_ids: &[String],
     ) -> Result<Vec<MemoryEntryRow>, DbError>;
-    async fn create_retrieval(&self, retrieval: MemoryRetrievalRow) -> Result<MemoryRetrievalRow, DbError>;
     async fn create_retrieval_snapshot(
         &self,
         input: CreateMemoryRetrievalSnapshotRow,
@@ -540,7 +539,6 @@ pub trait IMemoryRepository: Send + Sync {
         input: ConsumeMemoryRetrievalSnapshotRow,
     ) -> Result<MemoryRetrievalSnapshotRow, DbError>;
     async fn get_retrieval(&self, user_id: &str, retrieval_id: &str) -> Result<Option<MemoryRetrievalRow>, DbError>;
-    async fn delete_expired_retrievals(&self, now: TimestampMs) -> Result<u64, DbError>;
     async fn get_import_state(&self, user_id: &str) -> Result<Option<MemoryImportStateRow>, DbError>;
     async fn upsert_import_state(&self, state: MemoryImportStateRow) -> Result<MemoryImportStateRow, DbError>;
 }
