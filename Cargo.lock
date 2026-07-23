@@ -742,6 +742,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aionui-project"
+version = "0.1.50"
+dependencies = [
+ "aionui-common",
+ "aionui-db",
+ "chrono",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "aionui-realtime"
 version = "0.1.50"
 dependencies = [

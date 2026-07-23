@@ -19,6 +19,7 @@ members = [
     "crates/aionui-channel",
     "crates/aionui-team-prompts",
     "crates/aionui-team",
+    "crates/aionui-project",
     "crates/aionui-cron",
     "crates/aionui-assistant",
     "crates/aionui-app",
@@ -49,6 +50,7 @@ aionui-extension = { path = "crates/aionui-extension" }
 aionui-channel = { path = "crates/aionui-channel" }
 aionui-team-prompts = { path = "crates/aionui-team-prompts" }
 aionui-team = { path = "crates/aionui-team" }
+aionui-project = { path = "crates/aionui-project" }
 aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
@@ -101,6 +103,7 @@ aes-gcm = "0.10"
 
 # UUID
 uuid = { version = "1", features = ["v7"] }
+url = "2"
 
 # HTTP client — use rustls with native roots to align backend trust with the host system.
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls-native-roots"], default-features = false }
