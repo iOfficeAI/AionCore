@@ -238,6 +238,49 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map(str::to_owned))
     }
 
+    async fn conversation_metadata(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<aionui_team::provisioning::ConversationMetadata>, TeamError> {
+        let Some(row) = self.conversation_repo.get(conversation_id).await? else {
+            return Ok(None);
+        };
+
+        let assistant_id = self.conversation_assistant_id(conversation_id).await?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        let workspace = extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let (backend, model) = row
+            .model
+            .as_deref()
+            .and_then(|model_json| serde_json::from_str::<serde_json::Value>(model_json).ok())
+            .map(|model_value| {
+                let backend = model_value
+                    .get("provider_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let model = model_value
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                (backend, model)
+            })
+            .unwrap_or_default();
+
+        Ok(Some(aionui_team::provisioning::ConversationMetadata {
+            conversation_id: row.id,
+            user_id: row.user_id,
+            assistant_id,
+            backend,
+            model,
+            workspace,
+        }))
+    }
+
     async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, TeamError> {
         self.conversation_service
             .create_team_temp_workspace(team_id)

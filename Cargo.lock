@@ -918,7 +918,9 @@ dependencies = [
  "async-trait",
  "axum",
  "dashmap",
+ "futures",
  "futures-util",
+ "http-body-util",
  "regex",
  "reqwest",
  "serde",
@@ -927,6 +929,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
 ]
 

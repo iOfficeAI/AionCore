@@ -12,8 +12,9 @@ use aionui_ai_agent::task_manager::AgentFactory;
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{
-    AcpBuildExtra, AcpConfigOptionDto, AcpConfigSelectOptionDto, AddAgentRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, TeamAgentInput, WebSocketMessage,
+    AcpBuildExtra, AcpConfigOptionDto, AcpConfigSelectOptionDto, AddAgentRequest,
+    CreateAdHocTeamFromConversationRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentInput,
+    WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
@@ -426,6 +427,57 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         }))
     }
 
+    async fn conversation_metadata(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<aionui_team::provisioning::ConversationMetadata>, aionui_team::TeamError> {
+        let assistant_id = self.conversation_assistant_id(conversation_id).await?;
+        let extra = self.repo.get_extra(conversation_id);
+        let workspace = extra.as_ref().and_then(|value| {
+            value
+                .get("workspace")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        });
+        let backend = extra.as_ref().and_then(|value| {
+            value
+                .get("backend")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        });
+        let model = extra.as_ref().and_then(|value| {
+            value
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        });
+
+        let user_id = self
+            .repo
+            .get(conversation_id)
+            .await?
+            .map(|row| row.user_id)
+            .unwrap_or_default();
+        if user_id.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(aionui_team::provisioning::ConversationMetadata {
+            conversation_id: conversation_id.to_owned(),
+            user_id,
+            assistant_id,
+            backend,
+            model,
+            workspace,
+        }))
+    }
+
     async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, aionui_team::TeamError> {
         if self
             .fail_team_temp_create
@@ -690,6 +742,7 @@ struct FullMockTeamRepo {
     fail_workspace_update: std::sync::Mutex<bool>,
     fail_agent_update: std::sync::Mutex<bool>,
     fail_message_writes: std::sync::Mutex<bool>,
+    fail_create_team_conflict: std::sync::Mutex<Option<String>>,
 }
 
 impl FullMockTeamRepo {
@@ -700,6 +753,7 @@ impl FullMockTeamRepo {
             fail_workspace_update: std::sync::Mutex::new(false),
             fail_agent_update: std::sync::Mutex::new(false),
             fail_message_writes: std::sync::Mutex::new(false),
+            fail_create_team_conflict: std::sync::Mutex::new(None),
         }
     }
 
@@ -714,11 +768,23 @@ impl FullMockTeamRepo {
     fn fail_message_writes(&self) {
         *self.fail_message_writes.lock().unwrap() = true;
     }
+
+    fn fail_create_team_with_conflict(&self, origin_conversation_id: &str) {
+        *self.fail_create_team_conflict.lock().unwrap() = Some(origin_conversation_id.to_owned());
+    }
 }
 
 #[async_trait::async_trait]
 impl ITeamRepository for FullMockTeamRepo {
     async fn create_team(&self, row: &aionui_db::models::TeamRow) -> Result<(), DbError> {
+        if let Some(ref conflict_origin) = *self.fail_create_team_conflict.lock().unwrap() {
+            if row.origin_conversation_id.as_deref() == Some(conflict_origin.as_str()) {
+                return Err(DbError::Conflict(format!(
+                    "team with origin conversation id '{}' already exists",
+                    conflict_origin
+                )));
+            }
+        }
         self.teams.lock().unwrap().push(row.clone());
         Ok(())
     }
@@ -737,6 +803,19 @@ impl ITeamRepository for FullMockTeamRepo {
     }
     async fn get_team(&self, id: &str) -> Result<Option<aionui_db::models::TeamRow>, DbError> {
         Ok(self.teams.lock().unwrap().iter().find(|t| t.id == id).cloned())
+    }
+    async fn get_team_by_origin_conversation_id(
+        &self,
+        user_id: &str,
+        origin_conversation_id: &str,
+    ) -> Result<Option<aionui_db::models::TeamRow>, DbError> {
+        Ok(self
+            .teams
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.user_id == user_id && t.origin_conversation_id.as_deref() == Some(origin_conversation_id))
+            .cloned())
     }
     async fn update_team(&self, id: &str, params: &aionui_db::UpdateTeamParams) -> Result<(), DbError> {
         if params.workspace.is_some() && *self.fail_workspace_update.lock().unwrap() {
@@ -1323,6 +1402,80 @@ impl IProviderRepository for EmptyProviderRepo {
     }
 }
 
+struct ManyAssistantDefinitionRepo {
+    rows: Vec<AssistantDefinitionRow>,
+}
+
+impl ManyAssistantDefinitionRepo {
+    fn with_definitions(rows: Vec<AssistantDefinitionRow>) -> Self {
+        Self { rows }
+    }
+}
+
+#[async_trait::async_trait]
+impl IAssistantDefinitionRepository for ManyAssistantDefinitionRepo {
+    async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        Ok(self.rows.clone())
+    }
+
+    async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(self.rows.iter().find(|row| row.assistant_id == assistant_id).cloned())
+    }
+
+    async fn get_by_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(self.rows.iter().find(|row| row.id == definition_id).cloned())
+    }
+
+    async fn get_by_source_ref(
+        &self,
+        _source: &str,
+        _source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn upsert(&self, _params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError> {
+        Err(DbError::Init("not implemented".into()))
+    }
+
+    async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
+        Ok(false)
+    }
+}
+
+struct ManyAssistantOverlayRepo {
+    rows: Vec<AssistantOverlayRow>,
+}
+
+impl ManyAssistantOverlayRepo {
+    fn with_overlays(rows: Vec<AssistantOverlayRow>) -> Self {
+        Self { rows }
+    }
+}
+
+#[async_trait::async_trait]
+impl IAssistantOverlayRepository for ManyAssistantOverlayRepo {
+    async fn get(&self, definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
+        Ok(self
+            .rows
+            .iter()
+            .find(|row| row.assistant_definition_id == definition_id)
+            .cloned())
+    }
+
+    async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
+        Ok(self.rows.clone())
+    }
+
+    async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
+        Err(DbError::Init("not implemented".into()))
+    }
+
+    async fn delete(&self, _definition_id: &str) -> Result<bool, DbError> {
+        Ok(false)
+    }
+}
+
 struct EmptyAssistantDefinitionRepo;
 
 #[async_trait::async_trait]
@@ -1702,7 +1855,7 @@ async fn recovery_creates_background_intents_without_restoring_old_memory_run() 
 
 #[tokio::test]
 async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
-    let (svc, _team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
+    let (svc, team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
     let created = svc
         .create_team(
             "user1",
@@ -1719,14 +1872,23 @@ async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
         .await
         .expect("clear existing session");
 
-    svc.ensure_session("user1", &created.id).await.expect("ensure");
-
-    // Leader-only warmup: the teammate is dormant at first start. Delivering a
-    // message lazily wakes it, and its first turn is a cold wake built with the
-    // canonical role prompt plus the delivered content (spec 5.1).
-    svc.send_message_to_agent("user1", &created.id, &worker_slot_id, "do X", None)
+    team_repo
+        .write_message(&aionui_db::models::MailboxMessageRow {
+            id: "mailbox-worker-1".into(),
+            team_id: created.id.clone(),
+            to_agent_id: worker_slot_id.clone(),
+            from_agent_id: "user".into(),
+            msg_type: "message".into(),
+            content: "do X".into(),
+            summary: None,
+            files: None,
+            read: false,
+            created_at: aionui_common::now_ms(),
+        })
         .await
-        .expect("deliver to teammate triggers lazy wakeup");
+        .expect("seed teammate mailbox");
+
+    svc.ensure_session("user1", &created.id).await.expect("ensure");
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -2050,6 +2212,8 @@ struct WarmupConcurrencyProbe {
     active: AtomicUsize,
     max_active: AtomicUsize,
     starts: Mutex<Vec<String>>,
+    start_times: Mutex<Vec<(String, std::time::Duration)>>,
+    started_at: tokio::time::Instant,
 }
 
 impl Default for WarmupConcurrencyProbe {
@@ -2058,6 +2222,8 @@ impl Default for WarmupConcurrencyProbe {
             active: AtomicUsize::new(0),
             max_active: AtomicUsize::new(0),
             starts: Mutex::new(Vec::new()),
+            start_times: Mutex::new(Vec::new()),
+            started_at: tokio::time::Instant::now(),
         }
     }
 }
@@ -2071,7 +2237,13 @@ impl WarmupConcurrencyProbe {
             let probe = Arc::clone(&probe);
             async move {
                 let conversation_id = opts.context.conversation.conversation_id.clone();
+                let elapsed = probe.started_at.elapsed();
                 probe.starts.lock().unwrap().push(conversation_id.clone());
+                probe
+                    .start_times
+                    .lock()
+                    .unwrap()
+                    .push((conversation_id.clone(), elapsed));
                 let current = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
                 probe.max_active.fetch_max(current, Ordering::SeqCst);
                 tokio::time::sleep(delay).await;
@@ -2091,6 +2263,10 @@ impl WarmupConcurrencyProbe {
 
     fn starts(&self) -> Vec<String> {
         self.starts.lock().unwrap().clone()
+    }
+
+    fn start_times(&self) -> Vec<(String, std::time::Duration)> {
+        self.start_times.lock().unwrap().clone()
     }
 }
 
@@ -2146,6 +2322,7 @@ async fn renew_active_lease_allows_empty_team_without_unrelated_lease() {
             agents_version: "1.0.1".into(),
             created_at: aionui_common::now_ms(),
             updated_at: aionui_common::now_ms(),
+            origin_conversation_id: None,
         })
         .await
         .expect("insert empty team");
@@ -2199,6 +2376,516 @@ async fn force_team_workspace(repo: &Arc<FullMockTeamRepo>, team_id: &str, works
     )
     .await
     .expect("force workspace");
+}
+
+fn setup_ad_hoc_team_service(
+    factory: AgentFactory,
+) -> (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<CountingTaskManager>,
+    Arc<MockConversationRepo>,
+) {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::with_rows(vec![
+        AgentMetadataRow {
+            id: "assistant-lead".into(),
+            icon: None,
+            name: "Lead Assistant".into(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("acp".into()),
+            agent_type: "acp".into(),
+            agent_source: "builtin".into(),
+            agent_source_info: None,
+            enabled: true,
+            command: None,
+            args: None,
+            env: None,
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            command_override: None,
+            env_override: None,
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        },
+        AgentMetadataRow {
+            id: "assistant-target".into(),
+            icon: None,
+            name: "Target Assistant".into(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("acp".into()),
+            agent_type: "acp".into(),
+            agent_source: "builtin".into(),
+            agent_source_info: None,
+            enabled: true,
+            command: None,
+            args: None,
+            env: None,
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            command_override: None,
+            env_override: None,
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        },
+    ]));
+    let assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository> =
+        Arc::new(ManyAssistantDefinitionRepo::with_definitions(vec![
+            AssistantDefinitionRow {
+                id: "def-lead".into(),
+                assistant_id: "assistant-lead".into(),
+                source: "builtin".into(),
+                owner_type: "system".into(),
+                source_ref: None,
+                name: "Lead Assistant".into(),
+                name_i18n: String::new(),
+                description: Some("lead assistant".into()),
+                description_i18n: String::new(),
+                avatar_type: "icon".into(),
+                avatar_value: None,
+                agent_id: "assistant-lead".into(),
+                rule_resource_type: String::new(),
+                rule_resource_ref: None,
+                recommended_prompts: String::new(),
+                recommended_prompts_i18n: String::new(),
+                default_model_mode: "default".into(),
+                default_model_value: None,
+                default_permission_mode: "default".into(),
+                default_permission_value: None,
+                default_thought_level_mode: "default".into(),
+                default_thought_level_value: None,
+                default_skills_mode: "default".into(),
+                default_skill_ids: String::new(),
+                custom_skill_names: String::new(),
+                default_disabled_builtin_skill_ids: String::new(),
+                default_mcps_mode: "default".into(),
+                default_mcp_ids: String::new(),
+                created_at: aionui_common::now_ms(),
+                updated_at: aionui_common::now_ms(),
+                deleted_at: None,
+            },
+            AssistantDefinitionRow {
+                id: "def-target".into(),
+                assistant_id: "assistant-target".into(),
+                source: "builtin".into(),
+                owner_type: "system".into(),
+                source_ref: None,
+                name: "Target Assistant".into(),
+                name_i18n: String::new(),
+                description: Some("target assistant".into()),
+                description_i18n: String::new(),
+                avatar_type: "icon".into(),
+                avatar_value: None,
+                agent_id: "assistant-target".into(),
+                rule_resource_type: String::new(),
+                rule_resource_ref: None,
+                recommended_prompts: String::new(),
+                recommended_prompts_i18n: String::new(),
+                default_model_mode: "default".into(),
+                default_model_value: None,
+                default_permission_mode: "default".into(),
+                default_permission_value: None,
+                default_thought_level_mode: "default".into(),
+                default_thought_level_value: None,
+                default_skills_mode: "default".into(),
+                default_skill_ids: String::new(),
+                custom_skill_names: String::new(),
+                default_disabled_builtin_skill_ids: String::new(),
+                default_mcps_mode: "default".into(),
+                default_mcp_ids: String::new(),
+                created_at: aionui_common::now_ms(),
+                updated_at: aionui_common::now_ms(),
+                deleted_at: None,
+            },
+        ]));
+    let assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository> =
+        Arc::new(ManyAssistantOverlayRepo::with_overlays(vec![]));
+    setup_with_factory_metadata_assistants_and_conversation_repo(
+        factory,
+        agent_metadata_repo,
+        assistant_definition_repo,
+        assistant_overlay_repo,
+    )
+}
+
+fn seed_conversation(conv_repo: &Arc<MockConversationRepo>, user_id: &str, conversation_id: &str, assistant_id: &str) {
+    let now = aionui_common::now_ms();
+    let extra = if assistant_id.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::json!({ "assistant_id": assistant_id })
+    };
+    let row = ConversationRow {
+        id: conversation_id.to_owned(),
+        user_id: user_id.to_owned(),
+        name: "Source Conversation".into(),
+        r#type: aionui_common::AgentType::Acp.serde_name().to_owned(),
+        pinned: false,
+        pinned_at: None,
+        source: None,
+        channel_chat_id: None,
+        extra: serde_json::to_string(&extra).unwrap(),
+        model: None,
+        status: Some("active".into()),
+        created_at: now,
+        updated_at: now,
+    };
+    futures::executor::block_on(conv_repo.create(&row)).expect("seed conversation");
+}
+
+// ===========================================================================
+// Test: Ad-hoc team from conversation
+// ===========================================================================
+
+#[tokio::test]
+async fn ad_hoc_team_from_conversation_creates_leader_and_target() {
+    let (svc, team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-1";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+
+    let resp = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: Some("assistant-target".to_owned()),
+                name: Some("Ad-hoc Squad".to_owned()),
+                workspace_mode: Some("shared".to_owned()),
+            },
+        )
+        .await
+        .expect("create ad-hoc team from conversation");
+
+    assert!(resp.created, "first call must create a new team");
+    assert_eq!(resp.origin_conversation_id, conversation_id);
+    assert!(!resp.leader_slot_id.is_empty(), "leader slot must be set");
+    assert!(
+        resp.target_slot_id.is_some(),
+        "target slot must be set when target_assistant_id is provided"
+    );
+    assert_ne!(resp.target_slot_id, Some(resp.leader_slot_id.clone()));
+
+    let stored = team_repo
+        .get_team(&resp.team_id)
+        .await
+        .unwrap()
+        .expect("team persisted");
+    assert_eq!(stored.origin_conversation_id.as_deref(), Some(conversation_id));
+    assert_eq!(stored.name, "Ad-hoc Squad");
+}
+
+#[tokio::test]
+async fn ad_hoc_team_from_conversation_reuses_existing_association() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-2";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+
+    let first = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: None,
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .expect("create first");
+
+    let second = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: None,
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .expect("create second");
+
+    assert!(first.created);
+    assert!(!second.created, "second call must reuse existing team");
+    assert_eq!(first.team_id, second.team_id);
+    assert_eq!(first.leader_slot_id, second.leader_slot_id);
+}
+
+#[tokio::test]
+async fn ad_hoc_team_from_conversation_rejects_missing_assistant_id() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-3";
+    seed_conversation(&conv_repo, "user1", conversation_id, "");
+
+    let err = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: None,
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, TeamError::InvalidRequest(ref msg) if msg.contains("has no assistant_id")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_ad_hoc_team_by_conversation_returns_association_with_team() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-4";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+
+    let created = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: Some("assistant-target".to_owned()),
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .expect("create");
+
+    let assoc = svc
+        .get_ad_hoc_team_by_conversation("user1", conversation_id)
+        .await
+        .expect("get association");
+
+    assert_eq!(assoc.team_id, created.team_id);
+    assert_eq!(assoc.origin_conversation_id, conversation_id);
+    assert_eq!(assoc.status, aionui_api_types::AdHocTeamAssociationStatus::Active);
+    let team = assoc.team.expect("team payload present");
+    assert_eq!(team.id, created.team_id);
+    assert_eq!(team.assistants.len(), 2);
+}
+
+#[tokio::test]
+async fn get_ad_hoc_team_by_conversation_returns_none_for_unknown() {
+    let svc = setup();
+    let assoc = svc
+        .get_ad_hoc_team_by_conversation("user1", "conv-unknown")
+        .await
+        .expect("should return Ok with empty association");
+    assert_eq!(assoc.origin_conversation_id, "conv-unknown");
+    assert_eq!(assoc.status, aionui_api_types::AdHocTeamAssociationStatus::Active);
+    assert!(
+        assoc.team.is_none(),
+        "expected no team payload when no association exists"
+    );
+    assert!(
+        assoc.team_id.is_empty(),
+        "expected empty team_id placeholder when no association exists"
+    );
+}
+
+#[tokio::test]
+async fn create_ad_hoc_team_from_conversation_rejects_cross_user_conversation() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-cross-user";
+    seed_conversation(&conv_repo, "user-owner", conversation_id, "assistant-lead");
+
+    let err = svc
+        .create_ad_hoc_team_from_conversation(
+            "user-attacker",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user-attacker".to_owned(),
+                target_assistant_id: None,
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, TeamError::Forbidden(ref msg) if msg.contains("not owned")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_ad_hoc_team_from_conversation_reuses_existing_and_adds_missing_target() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-reuse-target";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+
+    let first = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: None,
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .expect("create without target");
+    assert!(first.created);
+    assert!(first.target_slot_id.is_none());
+
+    let second = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: Some("assistant-target".to_owned()),
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .expect("reuse with added target");
+    assert!(!second.created);
+    assert_eq!(second.team_id, first.team_id);
+    assert!(
+        second.target_slot_id.is_some(),
+        "target assistant should be dynamically added on reuse"
+    );
+}
+
+#[tokio::test]
+async fn create_ad_hoc_team_from_conversation_returns_conflict_on_origin_binding_race() {
+    let (svc, team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-binding-race";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+    team_repo.fail_create_team_with_conflict(conversation_id);
+
+    let err = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: Some("assistant-target".to_owned()),
+                name: Some("Race Test".to_owned()),
+                workspace_mode: Some("shared".to_owned()),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, TeamError::Database(DbError::Conflict(ref msg)) if msg.contains("origin conversation id")),
+        "expected Conflict error for duplicate origin binding, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_ad_hoc_team_from_conversation_reuses_source_conversation_as_lead() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-reuse-source";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+    let before_count = conv_repo.conversation_count();
+
+    let resp = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: Some("assistant-target".to_owned()),
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .expect("create ad-hoc team from conversation");
+
+    let assoc = svc
+        .get_ad_hoc_team_by_conversation("user1", conversation_id)
+        .await
+        .expect("get association")
+        .team
+        .expect("team payload");
+    let leader = assoc
+        .assistants
+        .iter()
+        .find(|agent| agent.slot_id == resp.leader_slot_id)
+        .expect("leader agent in response");
+
+    assert_eq!(
+        leader.conversation_id, conversation_id,
+        "lead agent must reuse the source conversation_id"
+    );
+    assert_eq!(
+        conv_repo.conversation_count(),
+        before_count + 1,
+        "promotion must create exactly one target conversation, not a new lead conversation"
+    );
+
+    // Lifecycle: removing the promoted team must preserve the origin conversation
+    // while deleting the dynamically-created teammate conversation.
+    svc.remove_team("user1", &resp.team_id).await.unwrap();
+    assert!(
+        conv_repo.get(conversation_id).await.unwrap().is_some(),
+        "origin conversation must survive team removal"
+    );
+    let target_conversation_id = assoc
+        .assistants
+        .iter()
+        .find(|agent| Some(agent.slot_id.clone()) == resp.target_slot_id)
+        .map(|agent| agent.conversation_id.clone())
+        .expect("target agent");
+    assert!(
+        conv_repo.get(&target_conversation_id).await.unwrap().is_none(),
+        "target conversation must be deleted when team is removed"
+    );
 }
 
 // ===========================================================================
@@ -3691,7 +4378,7 @@ async fn manual_add_agent_active_session_attaches_runtime_in_background_without_
 }
 
 #[tokio::test]
-async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice() {
+async fn manual_add_agent_attach_failure_marks_slot_error_and_notifies_leader() {
     use futures_util::FutureExt;
 
     let fail_next = Arc::new(AtomicBool::new(false));
@@ -3763,27 +4450,24 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
     .await
     .expect("manual add attach failure should mark the slot error");
 
-    // Teammate attach failure is inline (spec 5.4②): the per-member runtime
-    // status goes `failed` (drives the column's failure UI), but the session
-    // lifecycle must NOT fail — the leader is still ready, so the team stays
-    // usable and the full-screen warmup overlay never appears.
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            let runtime_failed = recorder
-                .events_by_name("team.agentRuntimeStatusChanged")
+            if recorder
+                .events_by_name("team.sessionStatusChanged")
                 .iter()
                 .any(|event| {
-                    event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(agent.slot_id.as_str())
+                    event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
                         && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
-                });
-            if runtime_failed {
+                        && event.data.get("phase").and_then(serde_json::Value::as_str) == Some("attaching_agents")
+                })
+            {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("teammate attach failure must surface inline as a failed runtime status");
+    .expect("dynamic attach failure must fail the team lifecycle");
 
     assert!(Arc::ptr_eq(
         &original_scheduler,
@@ -3806,10 +4490,10 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
     let lead_slot_id = created.leader_assistant_id.as_deref().expect("leader slot");
     let leader_messages = team_repo.get_history(&created.id, lead_slot_id, None).await.unwrap();
     assert!(
-        !leader_messages
+        leader_messages
             .iter()
-            .any(|message| message.content.contains("failed to start its runtime")),
-        "user-initiated add failure must NOT wake the leader; it surfaces inline to the user (spec 5.4)"
+            .any(|message| message.content.contains("failed to attach its runtime")),
+        "leader should receive a persisted attach-failure notice"
     );
 
     svc.ensure_session("user1", &created.id)
@@ -3841,143 +4525,10 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
             }),
         "single-member retry must restore team Ready"
     );
-    assert!(
-        !recorder
-            .events_by_name("team.sessionStatusChanged")
-            .iter()
-            .any(|event| {
-                event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
-                    && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
-            }),
-        "a teammate add-then-retry flow must never fail the session lifecycle; the failure was inline (spec 5.4/5.5)"
-    );
-}
-
-// The full-screen overlay (warming + failure card) is leader-scoped (spec
-// 5.4/5.5). A whole-team `ensure_session` — invoked on page mount, model
-// switches, and before sends via `warmupSession` — reconciles non-dormant
-// members. If it retries an already-failed TEAMMATE and the retry fails again,
-// the team must stay usable (leader ready): `ensure_session` returns Ok, no
-// session `failed` is broadcast, and the teammate failure stays inline. Only a
-// LEADER reconciliation failure may fail the whole team.
-#[tokio::test]
-async fn reensure_with_failed_teammate_keeps_team_usable_and_inline() {
-    use futures_util::FutureExt;
-
-    // Lead builds once (cold start); every later build fails, so the teammate's
-    // attach fails on add AND on the explicit re-ensure retry.
-    let build_count = Arc::new(AtomicUsize::new(0));
-    let factory_count = Arc::clone(&build_count);
-    let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
-        let build_index = factory_count.fetch_add(1, Ordering::SeqCst);
-        async move {
-            if build_index >= 1 {
-                return Err(AgentError::internal("teammate build keeps failing"));
-            }
-            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
-                mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
-            )))
-        }
-        .boxed()
-    });
-    let (svc, _team_repo, _task_manager, recorder) = setup_with_factory_and_recording_broadcaster(factory);
-    let created = svc
-        .create_team(
-            "user1",
-            CreateTeamRequest {
-                name: "Re-ensure with broken teammate".into(),
-                agents: vec![TeamAgentInput {
-                    name: "Lead".into(),
-                    role: "lead".into(),
-                    backend: Some("acp".into()),
-                    model: "claude".into(),
-                    assistant_id: None,
-                    conversation_id: None,
-                }],
-                workspace: None,
-            },
-        )
-        .await
-        .unwrap();
-    svc.ensure_session("user1", &created.id).await.unwrap();
-
-    let failed = svc
-        .add_agent(
-            "user1",
-            &created.id,
-            AddAgentRequest {
-                name: "Broken".into(),
-                role: "teammate".into(),
-                backend: Some("acp".into()),
-                model: "claude".into(),
-                assistant_id: None,
-            },
-        )
-        .await
-        .unwrap();
-
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let runtime_failed = recorder
-                .events_by_name("team.agentRuntimeStatusChanged")
-                .iter()
-                .any(|event| {
-                    event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(failed.slot_id.as_str())
-                        && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
-                });
-            if runtime_failed {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the added teammate must fail inline first");
-
-    recorder.clear();
-
-    // Explicit full re-ensure (e.g. switching the leader's model, page remount)
-    // retries the still-broken teammate. `join_all` inside reconciliation means
-    // the teammate's failed attach has completed by the time this returns.
-    svc.ensure_session("user1", &created.id)
-        .await
-        .expect("a teammate reconciliation failure must not fail the whole team");
-
-    let session_failed = recorder
-        .events_by_name("team.sessionStatusChanged")
-        .into_iter()
-        .find(|event| {
-            event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
-                && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
-        });
-    assert!(
-        session_failed.is_none(),
-        "a teammate reconciliation failure must not raise the full-screen failure card (session `failed`), got {session_failed:?}"
-    );
-    assert!(
-        recorder
-            .events_by_name("team.sessionStatusChanged")
-            .iter()
-            .any(|event| {
-                event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
-                    && event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready")
-            }),
-        "the team stays ready after a teammate reconciliation failure (leader ready = usable)"
-    );
-    assert!(
-        recorder
-            .events_by_name("team.agentRuntimeStatusChanged")
-            .iter()
-            .any(|event| {
-                event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(failed.slot_id.as_str())
-                    && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
-            }),
-        "the teammate failure stays inline via agentRuntimeStatusChanged"
-    );
 }
 
 #[tokio::test]
-async fn failed_member_stays_inline_and_removal_restores_ready() {
+async fn failed_member_returns_conflict_and_removal_restores_ready() {
     use futures_util::FutureExt;
 
     let build_count = Arc::new(AtomicUsize::new(0));
@@ -4032,33 +4583,37 @@ async fn failed_member_stays_inline_and_removal_restores_ready() {
         )
         .await
         .unwrap();
-    // The dynamic teammate's attach failure surfaces inline (spec 5.4②): its
-    // per-member runtime status goes `failed`. The session lifecycle stays Ready
-    // (leader still ready) — a teammate failure is never a whole-team failure.
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            let runtime_failed = recorder
-                .events_by_name("team.agentRuntimeStatusChanged")
+            if recorder
+                .events_by_name("team.sessionStatusChanged")
                 .iter()
-                .any(|event| {
-                    event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(failed.slot_id.as_str())
-                        && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
-                });
-            if runtime_failed {
+                .any(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed"))
+            {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("dynamic teammate failure must surface inline as a failed runtime status");
+    .expect("dynamic failure status");
 
-    // A whole-team re-ensure retries the still-broken teammate but must keep the
-    // team usable (leader ready): it returns Ok and the failure stays inline,
-    // rather than reporting a session-level conflict (spec 5.4/5.5).
-    svc.ensure_session("user1", &created.id)
+    let error = svc
+        .ensure_session("user1", &created.id)
         .await
-        .expect("a teammate reconciliation failure must not fail the whole team");
+        .expect_err("failed-member retry should report one deterministic failure");
+    assert!(matches!(
+        error,
+        TeamError::MemberRuntimeFailed {
+            ref team_id,
+            ref slot_id,
+            ref conversation_id,
+            ref public_reason,
+        } if team_id == &created.id
+            && slot_id == &failed.slot_id
+            && conversation_id == &failed.conversation_id
+            && public_reason == "Agent runtime failed to start"
+    ));
 
     task_manager.reset_calls();
     recorder.clear();
@@ -5557,7 +6112,7 @@ async fn d9_create_team_persists_without_warming_initial_agents() {
 }
 
 #[tokio::test]
-async fn d9_ensure_session_warms_up_only_the_lead() {
+async fn d9_ensure_session_kills_and_rebuilds_every_agent() {
     let (svc, tm) = setup_with_factory(success_factory());
     let created = svc
         .create_team(
@@ -5574,32 +6129,22 @@ async fn d9_ensure_session_warms_up_only_the_lead() {
     reset_runtime_state(&svc, &tm, &created.id).await;
     svc.ensure_session("user1", &created.id).await.unwrap();
 
-    // Leader-only warmup (spec 5.1): only the lead is killed+rebuilt at first
-    // start; the teammate stays dormant and is never built.
-    let lead = created.assistants.iter().find(|a| a.role == "lead").unwrap();
-    let worker = created.assistants.iter().find(|a| a.role == "teammate").unwrap();
+    // Two agents → kill called 2x and get_or_build_task called 2x, each with
+    // the corresponding conversation_id. Order is agents-iteration order.
     let calls = tm.snapshot();
-    assert_eq!(
-        calls.build,
-        vec![lead.conversation_id.clone()],
-        "only the lead should be built"
-    );
-    assert_eq!(calls.kill.len(), 1, "only the lead should be killed+rebuilt");
-    assert_eq!(calls.kill[0].0, lead.conversation_id);
-    assert_eq!(calls.kill[0].1, Some(AgentKillReason::TeamMcpRebuild));
-    assert!(
-        !calls.build.contains(&worker.conversation_id),
-        "dormant teammate must not be built at first start"
-    );
+    assert_eq!(calls.kill.len(), 2, "expected 2 kill calls");
+    assert_eq!(calls.build.len(), 2, "expected 2 build calls");
+    for (i, agent) in created.assistants.iter().enumerate() {
+        assert_eq!(calls.kill[i].0, agent.conversation_id);
+        assert_eq!(calls.kill[i].1, Some(AgentKillReason::TeamMcpRebuild));
+        assert_eq!(calls.build[i], agent.conversation_id);
+    }
 }
 
-#[tokio::test]
-async fn d9_ensure_session_warms_up_only_the_lead_without_teammate_stagger() {
-    // The batch rebuild machine (bounded concurrency + staggered starts) was
-    // removed in favor of leader-only warmup on a single attach path (spec 5.1).
-    // First start must warm exactly the lead — no teammate warmup, no stagger.
+#[tokio::test(start_paused = true)]
+async fn d9_ensure_session_rebuilds_agents_with_staggered_bounded_parallelism() {
     let probe = Arc::new(WarmupConcurrencyProbe::default());
-    let (svc, _tm) = setup_with_factory(probe.factory(std::time::Duration::from_millis(10)));
+    let (svc, _tm) = setup_with_factory(probe.factory(std::time::Duration::from_secs(20)));
     let created = svc
         .create_team(
             "user1",
@@ -5611,25 +6156,56 @@ async fn d9_ensure_session_warms_up_only_the_lead_without_teammate_stagger() {
         )
         .await
         .unwrap();
-    let lead = created
-        .assistants
-        .iter()
-        .find(|assistant| assistant.role == "lead")
-        .unwrap();
+    let mut expected_starts = Vec::new();
+    expected_starts.extend(
+        created
+            .assistants
+            .iter()
+            .filter(|assistant| assistant.role == "lead")
+            .map(|assistant| assistant.conversation_id.clone()),
+    );
+    expected_starts.extend(
+        created
+            .assistants
+            .iter()
+            .filter(|assistant| assistant.role != "lead")
+            .map(|assistant| assistant.conversation_id.clone()),
+    );
 
-    svc.ensure_session("user1", &created.id).await.unwrap();
+    let svc_for_task = Arc::clone(&svc);
+    let team_id = created.id.clone();
+    let handle = tokio::spawn(async move { svc_for_task.ensure_session("user1", &team_id).await });
+
+    tokio::time::advance(std::time::Duration::from_secs(120)).await;
+    handle.await.unwrap().unwrap();
 
     let starts = probe.starts();
     assert_eq!(
-        starts,
-        vec![lead.conversation_id.clone()],
-        "leader-only warmup must start exactly the lead"
+        starts, expected_starts,
+        "team rebuild warmup must start leader first and preserve teammate order"
+    );
+    assert!(
+        probe.max_active() > 1,
+        "team rebuild warmup should overlap staggered agents when warmup takes longer than the launch interval"
     );
     assert_eq!(
         probe.max_active(),
-        1,
-        "leader-only warmup runs a single attach, never overlapping teammates"
+        3,
+        "team rebuild warmup should cap concurrent agents at 3"
     );
+    let start_times = probe.start_times();
+    assert_eq!(start_times.len(), expected_starts.len());
+    for pair in start_times.windows(2).take(2) {
+        let delta = pair[1].1.saturating_sub(pair[0].1);
+        assert!(
+            delta >= std::time::Duration::from_secs(3),
+            "agent starts should be staggered by at least 3s; observed {delta:?}"
+        );
+        assert!(
+            delta < std::time::Duration::from_secs(5),
+            "agent starts should use the configured 3s stagger, not the old 5s interval; observed {delta:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -5703,16 +6279,10 @@ async fn d9_ensure_session_is_idempotent() {
     svc.ensure_session("user1", &created.id).await.unwrap();
     svc.ensure_session("user1", &created.id).await.unwrap();
 
-    // Leader-only warmup: first ensure kills+builds only the lead; the second
-    // ensure reconciles (lead already Ready, teammate dormant/skipped) and adds
-    // no kill/build calls.
+    // Second call short-circuits — no additional kill/build calls.
     let calls = tm.snapshot();
-    assert_eq!(
-        calls.kill.len(),
-        1,
-        "leader-only: only the lead is (re)built, and only once"
-    );
-    assert_eq!(calls.build.len(), 1, "second ensure_session must not re-build");
+    assert_eq!(calls.kill.len(), 2, "second ensure_session must not re-kill");
+    assert_eq!(calls.build.len(), 2, "second ensure_session must not re-build");
 }
 
 #[tokio::test]
@@ -5808,11 +6378,9 @@ async fn concurrent_ensures_launch_one_dynamic_attach() {
         .iter()
         .find(|agent| agent.role == "teammate")
         .unwrap();
-    // Leader-only warmup leaves the worker dormant, so reconciliation would skip
-    // it (spec 5.1). Repair is exercised against the always-warm lead: drop its
-    // task so concurrent ensures reconcile it, and assert lease dedup launches
-    // exactly one attach.
-    task_manager.remove_task_without_recording(&lead.conversation_id).await;
+    task_manager
+        .remove_task_without_recording(&worker.conversation_id)
+        .await;
     task_manager.reset_calls();
     gate.enable();
 
@@ -5831,15 +6399,15 @@ async fn concurrent_ensures_launch_one_dynamic_attach() {
     gate.wait_for_starts(1).await;
     tokio::task::yield_now().await;
     assert!(handles.iter().all(|handle| !handle.is_finished()));
-    assert_eq!(gate.starts(), vec![lead.conversation_id.clone()]);
-    assert_eq!(task_manager.snapshot().build, vec![lead.conversation_id.clone()]);
+    assert_eq!(gate.starts(), vec![worker.conversation_id.clone()]);
+    assert_eq!(task_manager.snapshot().build, vec![worker.conversation_id.clone()]);
     assert!(
         task_manager
             .snapshot()
             .kill
             .iter()
-            .all(|(conversation_id, _)| conversation_id != &worker.conversation_id),
-        "dormant members must not be woken or killed during a one-slot repair"
+            .all(|(conversation_id, _)| conversation_id != &lead.conversation_id),
+        "healthy members must not be killed during a one-slot repair"
     );
     assert!(Arc::ptr_eq(
         &original_scheduler,
@@ -5850,7 +6418,7 @@ async fn concurrent_ensures_launch_one_dynamic_attach() {
     for handle in handles {
         handle.await.unwrap().unwrap();
     }
-    assert_eq!(gate.starts(), vec![lead.conversation_id.clone()]);
+    assert_eq!(gate.starts(), vec![worker.conversation_id.clone()]);
 }
 
 #[tokio::test]
@@ -5887,34 +6455,47 @@ async fn stopped_session_rejects_late_attach_completion() {
         .await
         .unwrap();
     gate.wait_for_starts(1).await;
-    let lead_conversation_id = created.assistants[0].conversation_id.clone();
     svc.stop_session("user1", &created.id).await.unwrap();
-
-    // Leader-only warmup: the replacement session cold-starts the lead only
-    // (its build is not gated), so it completes without touching the
-    // dynamically-added worker, which stays dormant in the new session.
-    svc.ensure_session("user1", &created.id)
-        .await
-        .expect("replacement leader-only ensure completes");
-
-    // The worker attach in the old session issued exactly one kill (before its
-    // gated build). Record it so we can assert the fenced late completion adds
-    // no further kill.
-    let worker_kills_before_release = task_manager
-        .snapshot()
-        .kill
-        .iter()
-        .filter(|(conversation_id, _)| conversation_id == &added.conversation_id)
-        .count();
-
-    // Release the old (stopped) session's still-in-flight worker attach and let
-    // it run to completion. The generation fence must reject it: it must never
-    // publish Ready, and its stale cleanup must be skipped because a different
-    // session is now published (so it cannot kill the new session's runtime).
+    let svc_for_replacement = Arc::clone(&svc);
+    let replacement_team_id = created.id.clone();
+    let replacement =
+        tokio::spawn(async move { svc_for_replacement.ensure_session("user1", &replacement_team_id).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let replacement_kill_started = task_manager
+                .snapshot()
+                .kill
+                .iter()
+                .filter(|(conversation_id, _)| conversation_id == &added.conversation_id)
+                .count();
+            if replacement_kill_started >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replacement bootstrap must begin replacing the same member before old attach release");
+    assert!(!replacement.is_finished());
     gate.release(1);
-    for _ in 0..200 {
-        tokio::task::yield_now().await;
-    }
+    replacement.await.unwrap().unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let cleanup_kills = task_manager
+                .snapshot()
+                .kill
+                .iter()
+                .filter(|(conversation_id, _)| conversation_id == &added.conversation_id)
+                .count();
+            if cleanup_kills >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late completion must clean up its partial task");
 
     let added_events = recorder
         .events_by_name("team.agentRuntimeStatusChanged")
@@ -5926,22 +6507,12 @@ async fn stopped_session_rejects_late_attach_completion() {
             .iter()
             .filter(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready"))
             .count(),
-        0,
-        "a fenced late attach must not publish Ready; leader-only keeps the worker dormant in the new session"
-    );
-    let worker_kills_after_release = task_manager
-        .snapshot()
-        .kill
-        .iter()
-        .filter(|(conversation_id, _)| conversation_id == &added.conversation_id)
-        .count();
-    assert_eq!(
-        worker_kills_after_release, worker_kills_before_release,
-        "the fenced late completion must not kill the worker again once a different session is published"
+        1,
+        "only the replacement session may publish Ready for the member"
     );
     assert!(
-        task_manager.get_task(&lead_conversation_id).is_some(),
-        "stale worker cleanup must not kill the replacement session's live lead runtime"
+        task_manager.get_task(&added.conversation_id).is_some(),
+        "stale cleanup must not kill the replacement session runtime"
     );
     assert!(svc.get_session_scheduler(&created.id).is_some());
 }
@@ -5968,39 +6539,27 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
 
     reset_runtime_state(&svc, &tm, &created.id).await;
     let result = svc.ensure_session("user1", &created.id).await;
-    assert!(
-        result.is_err(),
-        "ensure_session should propagate the leader build error"
-    );
+    assert!(result.is_err(), "ensure_session should propagate build error");
 
-    // Leader-only warmup: only the lead attach is attempted; its failure fails
-    // the whole session and no teammate is ever built or killed.
-    let lead = created.assistants.iter().find(|a| a.role == "lead").unwrap();
-    let worker = created.assistants.iter().find(|a| a.role == "teammate").unwrap();
+    // Serial rebuild stops at the first failing agent, and no session is
+    // inserted after the failure.
     let calls = tm.snapshot();
     assert_eq!(
-        calls.build,
-        vec![lead.conversation_id.clone()],
-        "only the lead build is attempted"
+        calls.kill.len(),
+        3,
+        "failed bootstrap cleans the full two-member snapshot"
     );
-    assert!(
-        !calls.build.contains(&worker.conversation_id)
-            && calls
-                .kill
-                .iter()
-                .all(|(conversation_id, _)| conversation_id != &worker.conversation_id),
-        "the dormant teammate is never built or killed on a leader bootstrap failure"
-    );
+    assert_eq!(calls.build.len(), 1);
 
     let send_result = svc.send_message("user1", &created.id, "Hello", None).await;
     assert!(
         send_result.is_err(),
-        "session must not be registered after leader build failure"
+        "session must not be registered after build failure"
     );
 }
 
 #[tokio::test]
-async fn cold_bootstrap_failure_stops_session_when_leader_attach_fails() {
+async fn cold_bootstrap_failure_stops_session_and_cleans_all_successful_runtimes() {
     use futures_util::FutureExt;
 
     let fail_conversation_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -6031,48 +6590,53 @@ async fn cold_bootstrap_failure_stops_session_when_leader_attach_fails() {
         )
         .await
         .unwrap();
-    // Leader-only warmup: only the lead is attached at cold start, so only a
-    // lead failure can fail the session (teammate failures are isolated and
-    // deferred to lazy wakeup, spec 5.1). Fail the lead's build.
-    let lead = created
+    let failed_agent = created
         .assistants
         .iter()
-        .find(|assistant| assistant.role == "lead")
-        .expect("lead");
-    *fail_conversation_id.lock().unwrap() = Some(lead.conversation_id.clone());
+        .find(|assistant| assistant.name == "Worker 3")
+        .expect("failed agent")
+        .conversation_id
+        .clone();
+    *fail_conversation_id.lock().unwrap() = Some(failed_agent);
 
     let result = svc.ensure_session("user1", &created.id).await;
-    assert!(
-        result.is_err(),
-        "ensure_session should propagate the leader build error"
-    );
+    assert!(result.is_err(), "ensure_session should propagate build error");
     let error = result.unwrap_err().to_string();
     assert!(
-        error.contains(&lead.slot_id),
-        "leader attach failure should surface as a member-runtime failure for the lead slot: {error}"
+        error.contains("Worker 3")
+            && error.contains("backend=acp")
+            && error.contains("model=worker-3")
+            && error.contains("role=teammate"),
+        "rebuild error should identify the failing agent by name, backend, model, and role: {error}"
     );
 
     let calls = tm.snapshot();
     assert_eq!(
-        calls.build,
-        vec![lead.conversation_id.clone()],
-        "only the lead is built at cold start"
+        calls.build.len(),
+        4,
+        "serial rebuild should stop only after the failing attempted agent"
     );
-    for teammate in created.assistants.iter().filter(|a| a.role != "lead") {
+    assert_eq!(
+        calls.kill.len(),
+        11,
+        "cleanup is idempotent after partial-success cleanup"
+    );
+    for agent in &created.assistants {
         assert!(
-            !calls.build.contains(&teammate.conversation_id)
-                && calls
-                    .kill
-                    .iter()
-                    .all(|(conversation_id, _)| conversation_id != &teammate.conversation_id),
-            "dormant teammate {} must never be built or killed on leader bootstrap failure",
-            teammate.conversation_id
+            calls
+                .kill
+                .iter()
+                .filter(|(conversation_id, _)| conversation_id == &agent.conversation_id)
+                .count()
+                >= 2,
+            "bootstrap failure must issue final cleanup for {}",
+            agent.conversation_id
         );
     }
     assert_eq!(tm.active_count(), 0);
     assert!(
         svc.get_session_scheduler(&created.id).is_none(),
-        "session must not be registered after leader bootstrap failure"
+        "session must not be registered after partial rebuild failure"
     );
 
     let team_session_failed = recorder
@@ -6085,7 +6649,7 @@ async fn cold_bootstrap_failure_stops_session_when_leader_attach_fails() {
         });
     assert!(
         team_session_failed.is_some(),
-        "leader bootstrap failure must emit a team-level failed/attaching_agents terminal event"
+        "partial rebuild failure must emit a team-level failed/attaching_agents terminal event"
     );
 }
 
@@ -6125,7 +6689,7 @@ async fn ensure_session_serializes_manual_add_until_rebuild_completes() {
 
     let svc_for_add = Arc::clone(&svc);
     let add_team_id = created.id.clone();
-    let add_handle = tokio::spawn(async move {
+    let mut add_handle = tokio::spawn(async move {
         svc_for_add
             .add_agent(
                 "user1",
@@ -6141,10 +6705,11 @@ async fn ensure_session_serializes_manual_add_until_rebuild_completes() {
             .await
     });
 
-    // Leader-only warmup publishes the session before the (blocking) lead attach
-    // and releases the membership guard, so a manual add now runs concurrently
-    // with leader warmup instead of being serialized behind it. The invariant
-    // that must still hold is a consistent final roster.
+    tokio::select! {
+        result = &mut add_handle => panic!("add_agent completed while ensure_session was rebuilding: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+    }
+
     release_build.notify_waiters();
     ensure_handle.await.unwrap().unwrap();
     add_handle.await.unwrap().unwrap();
@@ -6186,14 +6751,17 @@ async fn ensure_session_serializes_manual_remove_until_rebuild_completes() {
     let svc_for_remove = Arc::clone(&svc);
     let remove_team_id = created.id.clone();
     let remove_slot = worker_slot.clone();
-    let remove_handle = tokio::spawn(async move {
+    let mut remove_handle = tokio::spawn(async move {
         svc_for_remove
             .remove_agent("user1", &remove_team_id, &remove_slot)
             .await
     });
 
-    // Leader-only warmup runs the manual remove concurrently with leader warmup
-    // (see the add variant); assert the final roster is consistent.
+    tokio::select! {
+        result = &mut remove_handle => panic!("remove_agent completed while ensure_session was rebuilding: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+    }
+
     release_build.notify_waiters();
     ensure_handle.await.unwrap().unwrap();
     remove_handle.await.unwrap().unwrap();
@@ -6237,14 +6805,17 @@ async fn ensure_session_serializes_manual_rename_until_rebuild_completes() {
     let svc_for_rename = Arc::clone(&svc);
     let rename_team_id = created.id.clone();
     let rename_slot = worker_slot.clone();
-    let rename_handle = tokio::spawn(async move {
+    let mut rename_handle = tokio::spawn(async move {
         svc_for_rename
             .rename_agent("user1", &rename_team_id, &rename_slot, "Senior Worker")
             .await
     });
 
-    // Leader-only warmup runs the manual rename concurrently with leader warmup
-    // (see the add variant); assert the rename is reflected in the final roster.
+    tokio::select! {
+        result = &mut rename_handle => panic!("rename_agent completed while ensure_session was rebuilding: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+    }
+
     release_build.notify_waiters();
     ensure_handle.await.unwrap().unwrap();
     rename_handle.await.unwrap().unwrap();
@@ -6359,14 +6930,9 @@ async fn d115_remove_team_kills_every_agent_process() {
         .unwrap();
 
     reset_runtime_state(&svc, &tm, &created.id).await;
-    // Leader-only warmup: only the lead is live after ensure_session; the
-    // teammate stays dormant (spec 5.1).
+    // Bring two agents online — after ensure_session, active_count == 2.
     svc.ensure_session("user1", &created.id).await.unwrap();
-    assert_eq!(
-        tm.active_count(),
-        1,
-        "leader-only warmup registers only the lead runtime"
-    );
+    assert_eq!(tm.active_count(), 2, "ensure_session must register 2 live agents");
 
     let before_kill = tm.snapshot().kill.len();
 
@@ -6393,426 +6959,468 @@ async fn d115_remove_team_kills_every_agent_process() {
 }
 
 // ===========================================================================
-// Task A7: per-member attach route/service — directed retry/wakeup of a single
-// member runtime (dormant or failed). auth + CSRF are enforced by the shared
-// team router middleware layer (same as add_agent/remove_agent/send_message);
-// the service-level behavior is asserted here.
+// Test: Ad-hoc team HTTP routes
+// ===========================================================================
+
+fn ad_hoc_router_for_user(svc: Arc<TeamSessionService>, user_id: &str) -> axum::Router {
+    use aionui_auth::CurrentUser;
+    use aionui_team::{TeamRouterState, team_routes};
+
+    let state = TeamRouterState {
+        service: svc,
+        active_leases: Arc::new(aionui_ai_agent::ActiveLeaseRegistry::new()),
+    };
+    team_routes(state).layer(axum::Extension(CurrentUser {
+        id: user_id.into(),
+        username: user_id.into(),
+    }))
+}
+
+async fn send_route_request(
+    router: &mut axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let request_body = body.map(|value| Body::from(serde_json::to_vec(&value).unwrap()));
+    let request = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(request_body.unwrap_or_else(|| Body::from(Vec::new())))
+        .unwrap();
+    router.clone().oneshot(request).await.unwrap()
+}
+
+async fn route_response_json(response: axum::response::Response) -> serde_json::Value {
+    use http_body_util::BodyExt;
+
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn route_create_ad_hoc_team_from_conversation_returns_201_with_payload() {
+    let (svc, _team_repo, _tm, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    seed_conversation(&conv_repo, "user1", "conv-route-create", "assistant-lead");
+    let mut router = ad_hoc_router_for_user(svc, "user1");
+
+    let response = send_route_request(
+        &mut router,
+        "POST",
+        "/api/teams/from-conversation",
+        Some(serde_json::json!({
+            "conversation_id": "conv-route-create",
+            "user_id": "user1",
+            "target_assistant_id": "assistant-target",
+            "name": "HTTP Ad-hoc",
+            "workspace_mode": "shared"
+        })),
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let json = route_response_json(response).await;
+    assert!(json["success"].as_bool().unwrap());
+    let data = json["data"].as_object().unwrap();
+    assert_eq!(data["origin_conversation_id"], "conv-route-create");
+    assert!(data["created"].as_bool().unwrap());
+    assert!(!data["leader_slot_id"].as_str().unwrap().is_empty());
+    assert!(data["target_slot_id"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn route_get_ad_hoc_team_by_conversation_returns_association() {
+    let (svc, _team_repo, _tm, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    seed_conversation(&conv_repo, "user1", "conv-route-get", "assistant-lead");
+    let mut router = ad_hoc_router_for_user(svc.clone(), "user1");
+
+    send_route_request(
+        &mut router,
+        "POST",
+        "/api/teams/from-conversation",
+        Some(serde_json::json!({
+            "conversation_id": "conv-route-get",
+            "user_id": "user1",
+            "target_assistant_id": "assistant-target"
+        })),
+    )
+    .await;
+
+    let response = send_route_request(
+        &mut router,
+        "GET",
+        "/api/teams/by-conversation?conversation_id=conv-route-get",
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let json = route_response_json(response).await;
+    assert!(json["success"].as_bool().unwrap());
+    let data = json["data"].as_object().unwrap();
+    assert_eq!(data["origin_conversation_id"], "conv-route-get");
+    assert!(data["team"].is_object());
+}
+
+#[tokio::test]
+async fn route_get_ad_hoc_team_by_conversation_returns_empty_for_unassociated() {
+    let svc = setup();
+    let mut router = ad_hoc_router_for_user(svc, "user1");
+
+    let response = send_route_request(
+        &mut router,
+        "GET",
+        "/api/teams/by-conversation?conversation_id=conv-route-unassociated",
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let json = route_response_json(response).await;
+    assert!(json["success"].as_bool().unwrap());
+    let data = json["data"].as_object().unwrap();
+    assert!(data.get("team").is_none());
+    assert_eq!(data.get("team_id").unwrap().as_str().unwrap(), "");
+}
+
+#[tokio::test]
+async fn route_create_ad_hoc_team_from_conversation_rejects_cross_user() {
+    let (svc, _team_repo, _tm, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    seed_conversation(&conv_repo, "user1", "conv-route-cross", "assistant-lead");
+    let mut router = ad_hoc_router_for_user(svc, "user-attacker");
+
+    let response = send_route_request(
+        &mut router,
+        "POST",
+        "/api/teams/from-conversation",
+        Some(serde_json::json!({
+            "conversation_id": "conv-route-cross",
+            "user_id": "user-attacker"
+        })),
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    let json = route_response_json(response).await;
+    assert!(!json["success"].as_bool().unwrap());
+}
+
+// ── team_id marker in conversation extra ─────────────────────────────
+
+#[tokio::test]
+async fn teammate_conversation_extra_has_team_id_marker_for_sidebar_filtering() {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "FilterMarker".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let got = svc.get_team("user1", &created.id).await.unwrap();
+    let leader = got.assistants.iter().find(|a| a.role == "lead").unwrap();
+    let teammate = got.assistants.iter().find(|a| a.role == "teammate").unwrap();
+
+    let leader_extra = conv_repo.get_extra(&leader.conversation_id).unwrap();
+    let teammate_extra = conv_repo.get_extra(&teammate.conversation_id).unwrap();
+
+    // Leader must have teamId (session binding) but NOT team_id (sidebar visible)
+    assert_eq!(
+        leader_extra.get("teamId").and_then(serde_json::Value::as_str),
+        Some(created.id.as_str()),
+        "leader must carry teamId for session binding"
+    );
+    assert!(
+        leader_extra.get("team_id").is_none(),
+        "leader must NOT carry team_id so it stays visible in sidebar"
+    );
+
+    // Teammate must have BOTH teamId and team_id (hidden from sidebar)
+    assert_eq!(
+        teammate_extra.get("teamId").and_then(serde_json::Value::as_str),
+        Some(created.id.as_str()),
+        "teammate must carry teamId for session binding"
+    );
+    assert_eq!(
+        teammate_extra.get("team_id").and_then(serde_json::Value::as_str),
+        Some(created.id.as_str()),
+        "teammate must carry team_id so sidebar can filter it out"
+    );
+}
+
+#[tokio::test]
+async fn route_create_ad_hoc_team_from_conversation_rejects_unknown_conversation() {
+    let svc = setup();
+    let mut router = ad_hoc_router_for_user(svc, "user1");
+
+    let response = send_route_request(
+        &mut router,
+        "POST",
+        "/api/teams/from-conversation",
+        Some(serde_json::json!({
+            "conversation_id": "conv-route-unknown",
+            "user_id": "user1"
+        })),
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    let json = route_response_json(response).await;
+    assert!(!json["success"].as_bool().unwrap());
+}
+
+// ===========================================================================
+// Helper: ad-hoc team service setup that exposes RecordingBroadcaster
+// ===========================================================================
+
+fn setup_ad_hoc_team_service_with_broadcaster(
+    factory: AgentFactory,
+) -> (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<CountingTaskManager>,
+    Arc<MockConversationRepo>,
+    Arc<RecordingBroadcaster>,
+) {
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::with_rows(vec![
+        AgentMetadataRow {
+            id: "assistant-lead".into(),
+            icon: None,
+            name: "Lead Assistant".into(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("acp".into()),
+            agent_type: "acp".into(),
+            agent_source: "builtin".into(),
+            agent_source_info: None,
+            enabled: true,
+            command: None,
+            args: None,
+            env: None,
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            command_override: None,
+            env_override: None,
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        },
+        AgentMetadataRow {
+            id: "assistant-target".into(),
+            icon: None,
+            name: "Target Assistant".into(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("acp".into()),
+            agent_type: "acp".into(),
+            agent_source: "builtin".into(),
+            agent_source_info: None,
+            enabled: true,
+            command: None,
+            args: None,
+            env: None,
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 0,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            command_override: None,
+            env_override: None,
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        },
+    ]));
+    let assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository> =
+        Arc::new(ManyAssistantDefinitionRepo::with_definitions(vec![
+            AssistantDefinitionRow {
+                id: "def-lead".into(),
+                assistant_id: "assistant-lead".into(),
+                source: "builtin".into(),
+                owner_type: "system".into(),
+                source_ref: None,
+                name: "Lead Assistant".into(),
+                name_i18n: String::new(),
+                description: Some("lead assistant".into()),
+                description_i18n: String::new(),
+                avatar_type: "icon".into(),
+                avatar_value: None,
+                agent_id: "assistant-lead".into(),
+                rule_resource_type: String::new(),
+                rule_resource_ref: None,
+                recommended_prompts: String::new(),
+                recommended_prompts_i18n: String::new(),
+                default_model_mode: "default".into(),
+                default_model_value: None,
+                default_permission_mode: "default".into(),
+                default_permission_value: None,
+                default_thought_level_mode: "default".into(),
+                default_thought_level_value: None,
+                default_skills_mode: "default".into(),
+                default_skill_ids: String::new(),
+                custom_skill_names: String::new(),
+                default_disabled_builtin_skill_ids: String::new(),
+                default_mcps_mode: "default".into(),
+                default_mcp_ids: String::new(),
+                created_at: aionui_common::now_ms(),
+                updated_at: aionui_common::now_ms(),
+                deleted_at: None,
+            },
+            AssistantDefinitionRow {
+                id: "def-target".into(),
+                assistant_id: "assistant-target".into(),
+                source: "builtin".into(),
+                owner_type: "system".into(),
+                source_ref: None,
+                name: "Target Assistant".into(),
+                name_i18n: String::new(),
+                description: Some("target assistant".into()),
+                description_i18n: String::new(),
+                avatar_type: "icon".into(),
+                avatar_value: None,
+                agent_id: "assistant-target".into(),
+                rule_resource_type: String::new(),
+                rule_resource_ref: None,
+                recommended_prompts: String::new(),
+                recommended_prompts_i18n: String::new(),
+                default_model_mode: "default".into(),
+                default_model_value: None,
+                default_permission_mode: "default".into(),
+                default_permission_value: None,
+                default_thought_level_mode: "default".into(),
+                default_thought_level_value: None,
+                default_skills_mode: "default".into(),
+                default_skill_ids: String::new(),
+                custom_skill_names: String::new(),
+                default_disabled_builtin_skill_ids: String::new(),
+                default_mcps_mode: "default".into(),
+                default_mcp_ids: String::new(),
+                created_at: aionui_common::now_ms(),
+                updated_at: aionui_common::now_ms(),
+                deleted_at: None,
+            },
+        ]));
+    let assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository> =
+        Arc::new(ManyAssistantOverlayRepo::with_overlays(vec![]));
+    let team_repo = Arc::new(FullMockTeamRepo::new());
+    let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
+    let conv_repo = Arc::new(MockConversationRepo::new());
+    let broadcaster = Arc::new(RecordingBroadcaster::new());
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
+    let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+    let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+    let task_manager = Arc::new(CountingTaskManager::new(factory));
+    let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
+    let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
+    let assistant_catalog: Arc<dyn TeamAssistantCatalogPort> = Arc::new(TestTeamAssistantCatalog {
+        agent_metadata_repo: agent_metadata_repo.clone(),
+        assistant_definition_repo: assistant_definition_repo.clone(),
+        assistant_overlay_repo: assistant_overlay_repo.clone(),
+    });
+    let svc = TeamSessionService::new(
+        team_repo_dyn,
+        agent_metadata_repo,
+        assistant_catalog,
+        assistant_definition_repo,
+        assistant_overlay_repo,
+        provider_repo,
+        conversation_port,
+        projection_store,
+        broadcaster_dyn,
+        task_manager_dyn,
+        noop_turn_port(),
+        noop_cancellation_port(),
+        backend_binary_path,
+    );
+    (svc, team_repo, task_manager, conv_repo, broadcaster)
+}
+
+// ===========================================================================
+// Test: ad-hoc team creation broadcasts team.created + team.listChanged events
 // ===========================================================================
 
 #[tokio::test]
-async fn attach_agent_runtime_wakes_dormant_teammate() {
-    let (svc, _team_repo, _task_manager, recorder) = setup_with_factory_and_recording_broadcaster(success_factory());
-    let created = svc
-        .create_team(
+async fn ad_hoc_team_from_conversation_broadcasts_team_created_event() {
+    let (svc, _team_repo, _task_manager, conv_repo, broadcaster) =
+        setup_ad_hoc_team_service_with_broadcaster(success_factory());
+    let conversation_id = "conv-adhoc-broadcast";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+
+    let resp = svc
+        .create_ad_hoc_team_from_conversation(
             "user1",
-            CreateTeamRequest {
-                name: "Directed attach".into(),
-                agents: two_agent_input(),
-                workspace: None,
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: Some("assistant-target".to_owned()),
+                name: Some("Broadcast Test Team".to_owned()),
+                workspace_mode: Some("shared".to_owned()),
             },
         )
         .await
-        .unwrap();
-    let worker = created
-        .assistants
-        .iter()
-        .find(|assistant| assistant.role == "teammate")
-        .expect("teammate")
-        .clone();
-    svc.ensure_session("user1", &created.id).await.unwrap();
+        .expect("create ad-hoc team from conversation");
 
-    // The teammate is dormant after leader-only warmup; a directed attach wakes it.
-    svc.attach_agent_runtime("user1", &created.id, &worker.slot_id)
-        .await
-        .expect("directed attach should succeed");
+    assert!(resp.created);
 
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let ready = recorder
-                .events_by_name("team.agentRuntimeStatusChanged")
-                .iter()
-                .any(|event| {
-                    event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(worker.slot_id.as_str())
-                        && event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready")
-                });
-            if ready {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("directed attach must bring the dormant teammate to ready");
-}
+    let created_events = broadcaster.events_by_name("team.created");
+    assert_eq!(
+        created_events.len(),
+        1,
+        "team.created must be broadcast exactly once after ad-hoc team creation"
+    );
+    assert_eq!(
+        created_events[0].data["team_id"], resp.team_id,
+        "team.created payload must contain the created team_id"
+    );
 
-#[tokio::test]
-async fn attach_agent_runtime_rejects_cross_user() {
-    let (svc, _tm) = setup_with_factory(success_factory());
-    let created = svc
-        .create_team(
-            "user1",
-            CreateTeamRequest {
-                name: "Directed attach isolation".into(),
-                agents: two_agent_input(),
-                workspace: None,
-            },
-        )
-        .await
-        .unwrap();
-    let worker = created
-        .assistants
-        .iter()
-        .find(|assistant| assistant.role == "teammate")
-        .expect("teammate")
-        .clone();
-    svc.ensure_session("user1", &created.id).await.unwrap();
-
-    let error = svc
-        .attach_agent_runtime("intruder", &created.id, &worker.slot_id)
-        .await
-        .expect_err("cross-user directed attach must be rejected");
+    let list_changed_events = broadcaster.events_by_name("team.listChanged");
     assert!(
-        matches!(error, TeamError::Forbidden(_)),
-        "expected Forbidden, got {error:?}"
+        list_changed_events.len() >= 1,
+        "team.listChanged must be broadcast after ad-hoc team creation"
     );
-}
-
-#[tokio::test]
-async fn attach_agent_runtime_rejects_unknown_slot() {
-    let (svc, _tm) = setup_with_factory(success_factory());
-    let created = svc
-        .create_team(
-            "user1",
-            CreateTeamRequest {
-                name: "Directed attach unknown slot".into(),
-                agents: two_agent_input(),
-                workspace: None,
-            },
-        )
-        .await
-        .unwrap();
-    svc.ensure_session("user1", &created.id).await.unwrap();
-
-    let error = svc
-        .attach_agent_runtime("user1", &created.id, "slot-does-not-exist")
-        .await
-        .expect_err("attaching an unknown slot must be rejected");
-    assert!(
-        matches!(error, TeamError::AgentNotFound(_)),
-        "expected AgentNotFound, got {error:?}"
-    );
-}
-
-// The full-screen warmup overlay is driven by session-level status and must
-// reflect the leader only (spec 5.4/5.5): once the team is Ready (leader ready),
-// waking a dormant teammate is an inline, per-column event and must NOT flip the
-// session back to `starting` — otherwise the overlay resurfaces on every lazy
-// wakeup / add-member.
-#[tokio::test]
-async fn waking_dormant_teammate_does_not_resurface_session_starting() {
-    let (svc, _team_repo, _task_manager, recorder) = setup_with_factory_and_recording_broadcaster(success_factory());
-    let created = svc
-        .create_team(
-            "user1",
-            CreateTeamRequest {
-                name: "Lazy wakeup overlay".into(),
-                agents: two_agent_input(),
-                workspace: None,
-            },
-        )
-        .await
-        .unwrap();
-    let worker = created
-        .assistants
-        .iter()
-        .find(|assistant| assistant.role == "teammate")
-        .expect("teammate")
-        .clone();
-    svc.ensure_session("user1", &created.id).await.unwrap();
-
-    // The team is Ready with the teammate dormant. Drop the bootstrap events so
-    // only the wakeup's session-status broadcasts remain.
-    recorder.clear();
-
-    svc.attach_agent_runtime("user1", &created.id, &worker.slot_id)
-        .await
-        .expect("directed attach should succeed");
-
-    // Wait until the teammate attach has fully completed (ready broadcast).
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let ready = recorder
-                .events_by_name("team.agentRuntimeStatusChanged")
-                .iter()
-                .any(|event| {
-                    event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(worker.slot_id.as_str())
-                        && event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready")
-                });
-            if ready {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("teammate attach must complete");
-
-    let starting = recorder
-        .events_by_name("team.sessionStatusChanged")
-        .into_iter()
-        .find(|event| {
-            event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
-                && event.data.get("status").and_then(serde_json::Value::as_str) == Some("starting")
-        });
-    assert!(
-        starting.is_none(),
-        "waking a dormant teammate must not resurface the warmup overlay (session `starting`); \
-         teammate lifecycle is inline via agentRuntimeStatusChanged, got {starting:?}"
-    );
-}
-
-// A teammate's lazy-attach FAILURE is inline (spec 5.4②): the per-member
-// runtime status goes `failed` and the send box gates that column, but the
-// session-level status must stay Ready (leader still ready = team usable). A
-// teammate failure must never raise the full-screen failure card.
-#[tokio::test]
-async fn failed_teammate_wakeup_does_not_flip_session_to_failed() {
-    use futures_util::FutureExt;
-
-    let fail_next = Arc::new(AtomicBool::new(false));
-    let factory_fail_next = Arc::clone(&fail_next);
-    let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
-        let should_fail = factory_fail_next.swap(false, Ordering::SeqCst);
-        async move {
-            if should_fail {
-                return Err(AgentError::internal("simulated teammate lazy attach failure"));
-            }
-            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
-                mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
-            )))
-        }
-        .boxed()
-    });
-    let (svc, _team_repo, _task_manager, recorder) = setup_with_factory_and_recording_broadcaster(factory);
-    let created = svc
-        .create_team(
-            "user1",
-            CreateTeamRequest {
-                name: "Teammate failure stays inline".into(),
-                agents: two_agent_input(),
-                workspace: None,
-            },
-        )
-        .await
-        .unwrap();
-    let worker = created
-        .assistants
-        .iter()
-        .find(|assistant| assistant.role == "teammate")
-        .expect("teammate")
-        .clone();
-    svc.ensure_session("user1", &created.id).await.unwrap();
-
-    // Leader is Ready; drop bootstrap events. Now arm a failure and wake the
-    // dormant teammate — the failure must stay inline.
-    recorder.clear();
-    fail_next.store(true, Ordering::SeqCst);
-    svc.send_message_to_agent("user1", &created.id, &worker.slot_id, "please do X", None)
-        .await
-        .expect("human delivery acks immediately even though the lazy attach will fail");
-
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let failed = recorder
-                .events_by_name("team.agentRuntimeStatusChanged")
-                .iter()
-                .any(|event| {
-                    event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(worker.slot_id.as_str())
-                        && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
-                });
-            if failed {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("failed lazy attach must broadcast a failed runtime status for the teammate");
-
-    let session_failed = recorder
-        .events_by_name("team.sessionStatusChanged")
-        .into_iter()
-        .find(|event| {
-            event.data.get("team_id").and_then(serde_json::Value::as_str) == Some(created.id.as_str())
-                && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
-        });
-    assert!(
-        session_failed.is_none(),
-        "a teammate lazy-attach failure must stay inline and never flip session status to `failed` \
-         (leader still ready = team usable, spec 5.4②), got {session_failed:?}"
-    );
-}
-
-#[tokio::test]
-async fn lazy_attach_failure_preserves_unread_and_skips_leader_on_human_delivery() {
-    use futures_util::FutureExt;
-
-    // Fail exactly the next build after it is armed; the lead attaches cleanly
-    // during cold start, then the teammate's lazy attach fails.
-    let fail_next = Arc::new(AtomicBool::new(false));
-    let factory_fail_next = Arc::clone(&fail_next);
-    let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
-        let should_fail = factory_fail_next.swap(false, Ordering::SeqCst);
-        async move {
-            if should_fail {
-                return Err(AgentError::internal("simulated teammate lazy attach failure"));
-            }
-            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
-                mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
-            )))
-        }
-        .boxed()
-    });
-    let (svc, team_repo, _task_manager, recorder) = setup_with_factory_and_recording_broadcaster(factory);
-    let created = svc
-        .create_team(
-            "user1",
-            CreateTeamRequest {
-                name: "Lazy failure preserves unread".into(),
-                agents: two_agent_input(),
-                workspace: None,
-            },
-        )
-        .await
-        .unwrap();
-    let lead = created.assistants.iter().find(|a| a.role == "lead").unwrap().clone();
-    let worker = created
-        .assistants
-        .iter()
-        .find(|a| a.role == "teammate")
-        .unwrap()
-        .clone();
-    svc.ensure_session("user1", &created.id).await.unwrap();
-
-    // Arm the failure and deliver to the dormant teammate (human-direct).
-    fail_next.store(true, Ordering::SeqCst);
-    svc.send_message_to_agent("user1", &created.id, &worker.slot_id, "please do X", None)
-        .await
-        .expect("human delivery acks immediately even though the lazy attach will fail");
-
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let failed = recorder
-                .events_by_name("team.agentRuntimeStatusChanged")
-                .iter()
-                .any(|event| {
-                    event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(worker.slot_id.as_str())
-                        && event.data.get("status").and_then(serde_json::Value::as_str) == Some("failed")
-                });
-            if failed {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("failed lazy attach must broadcast a failed runtime status for the teammate");
-
-    // Preserve-unread (spec 5.4b): the delivered message must remain unread so a
-    // retry re-drains it via reconcile_mailbox.
-    let worker_unread = team_repo.peek_unread(&created.id, &worker.slot_id).await.unwrap();
-    assert!(
-        worker_unread.iter().any(|message| message.content == "please do X"),
-        "a failed lazy attach must not mark the pending delivery read"
-    );
-
-    // Human-direct failure must NOT wake the leader (spec 5.4c): the failure is
-    // surfaced inline to the user instead.
-    let lead_unread = team_repo.peek_unread(&created.id, &lead.slot_id).await.unwrap();
-    assert!(
-        !lead_unread
-            .iter()
-            .any(|message| message.from_agent_id == worker.slot_id),
-        "a human-direct lazy attach failure must not notify the leader"
-    );
-}
-
-#[tokio::test]
-async fn agent_triggered_attach_failure_notifies_leader() {
-    use futures_util::FutureExt;
-
-    // Positive counterpart to the human-direct/manual-add "must NOT notify"
-    // tests: an agent-triggered attach failure (here a leader-initiated spawn,
-    // which flows through the single attach path with
-    // notify_leader_on_failure=true) MUST wake the leader so it can re-delegate
-    // the work it just handed out (spec 5.4c).
-    //
-    // The lead attaches cleanly during cold start; only the spawned teammate's
-    // attach is armed to fail.
-    let fail_next = Arc::new(AtomicBool::new(false));
-    let factory_fail_next = Arc::clone(&fail_next);
-    let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
-        let should_fail = factory_fail_next.swap(false, Ordering::SeqCst);
-        async move {
-            if should_fail {
-                return Err(AgentError::internal("simulated spawned teammate attach failure"));
-            }
-            Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
-                mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
-            )))
-        }
-        .boxed()
-    });
-    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_assistants_and_conversation_repo(
-        factory,
-        seeded_agent_metadata_repo(),
-        Arc::new(SingleAssistantDefinitionRepo {
-            row: word_creator_definition(),
-        }),
-        Arc::new(EmptyAssistantOverlayRepo),
-    );
-    let created = svc
-        .create_team(
-            "user1",
-            CreateTeamRequest {
-                name: "Agent-triggered failure notifies leader".into(),
-                agents: two_agent_input(),
-                workspace: None,
-            },
-        )
-        .await
-        .unwrap();
-    let lead_slot_id = created.leader_assistant_id.clone().expect("leader slot");
-    svc.ensure_session("user1", &created.id).await.unwrap();
-
-    // Arm the failure, then have the leader spawn a teammate whose attach fails.
-    fail_next.store(true, Ordering::SeqCst);
-    let spawned = svc
-        .spawn_agent_in_session(
-            &created.id,
-            &lead_slot_id,
-            SpawnAgentRequest {
-                name: "Writer".into(),
-                assistant_id: Some("word-creator".into()),
-            },
-        )
-        .await
-        .expect("spawn returns before the background attach completes");
-
-    // Agent/leader-triggered failure MUST notify the leader: its mailbox gets a
-    // "failed to start its runtime" message from the failed slot so it can
-    // re-delegate.
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let leader_messages = team_repo.get_history(&created.id, &lead_slot_id, None).await.unwrap();
-            if leader_messages.iter().any(|message| {
-                message.from_agent_id == spawned.slot_id && message.content.contains("failed to start its runtime")
-            }) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("an agent-triggered attach failure must notify the leader (notify_leader_on_failure=true)");
 }

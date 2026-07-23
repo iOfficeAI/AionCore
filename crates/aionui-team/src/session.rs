@@ -2108,6 +2108,7 @@ mod tests {
                 },
             ],
             lead_agent_id: Some("lead-1".into()),
+            origin_conversation_id: None,
             created_at: 1000,
             updated_at: 1000,
         }

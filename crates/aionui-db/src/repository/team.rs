@@ -9,6 +9,7 @@ pub struct UpdateTeamParams {
     pub agents: Option<String>,
     pub lead_agent_id: Option<String>,
     pub session_mode: Option<String>,
+    pub origin_conversation_id: Option<String>,
 }
 
 /// Parameters for updating a task record.
@@ -41,6 +42,13 @@ pub trait ITeamRepository: Send + Sync {
 
     /// Returns a single team by id, or `None` if not found.
     async fn get_team(&self, team_id: &str) -> Result<Option<TeamRow>, DbError>;
+
+    /// Returns a single team by origin conversation id, or `None` if not found.
+    async fn get_team_by_origin_conversation_id(
+        &self,
+        user_id: &str,
+        origin_conversation_id: &str,
+    ) -> Result<Option<TeamRow>, DbError>;
 
     /// Updates a team by id with the provided fields.
     /// Returns `DbError::NotFound` if absent.

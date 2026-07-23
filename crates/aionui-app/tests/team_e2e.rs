@@ -9,8 +9,8 @@ use tower::ServiceExt;
 use aionui_api_types::TeamMcpStdioConfig;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
 use common::{
-    body_json, build_app, build_app_with_mock_agents, delete_with_token, get_request, get_with_token, json_with_token,
-    setup_and_login,
+    body_json, build_app, build_app_with_mock_agents, delete_with_token, extract_csrf_token, get_request,
+    get_with_token, json_with_token, setup_and_login,
 };
 
 const DEFAULT_TEAM_ASSISTANT_ID: &str = "team-e2e-assistant";
@@ -1478,4 +1478,213 @@ async fn full_team_lifecycle() {
     let resp = app.oneshot(req).await.unwrap();
     let json = body_json(resp).await;
     assert!(json["data"].as_array().unwrap().is_empty());
+}
+
+async fn seed_conversation_with_assistant(
+    services: &aionui_app::AppServices,
+    username: &str,
+    conversation_id: &str,
+    assistant_id: &str,
+) {
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
+        .bind(username)
+        .fetch_one(services.database.pool())
+        .await
+        .expect("lookup user id");
+    let now = aionui_common::now_ms();
+    let extra = serde_json::json!({ "assistant_id": assistant_id }).to_string();
+    let agent_type = aionui_common::AgentType::Acp.serde_name();
+    sqlx::query(
+        "INSERT INTO conversations \
+         (id, user_id, name, type, extra, model, status, pinned, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, 'running', 0, ?, ?)",
+    )
+    .bind(conversation_id)
+    .bind(user_id)
+    .bind("Source Conversation")
+    .bind(agent_type)
+    .bind(extra)
+    .bind(None::<String>)
+    .bind(now)
+    .bind(now)
+    .execute(services.database.pool())
+    .await
+    .expect("seed conversation");
+}
+
+async fn ensure_target_team_assistant(
+    app: &mut axum::Router,
+    services: &aionui_app::AppServices,
+    token: &str,
+    csrf: &str,
+) {
+    ensure_default_team_agent_installed(services).await;
+    let req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "team-e2e-target-assistant",
+            "name": "Team E2E Target Assistant",
+            "agent_id": DEFAULT_TEAM_AGENT_ID
+        }),
+        token,
+        csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::CREATED || resp.status() == StatusCode::CONFLICT,
+        "expected target assistant seed to be created or already exist, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn adc1_create_ad_hoc_team_from_conversation() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
+    ensure_target_team_assistant(&mut app, &services, &token, &csrf).await;
+    seed_conversation_with_assistant(&services, "admin", "conv-adhoc-source", DEFAULT_TEAM_ASSISTANT_ID).await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/teams/from-conversation",
+        json!({
+            "conversation_id": "conv-adhoc-source",
+            "user_id": "admin",
+            "target_assistant_id": "team-e2e-target-assistant",
+            "name": "Ad-hoc HTTP Team",
+            "workspace_mode": "shared"
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = body_json(resp).await;
+    assert!(json["success"].as_bool().unwrap());
+    let data = json["data"].as_object().unwrap();
+    assert_eq!(data["origin_conversation_id"], "conv-adhoc-source");
+    assert!(data["created"].as_bool().unwrap());
+    assert!(!data["leader_slot_id"].as_str().unwrap().is_empty());
+    assert!(!data["target_slot_id"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn adg1_get_ad_hoc_team_by_conversation() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
+    ensure_target_team_assistant(&mut app, &services, &token, &csrf).await;
+    seed_conversation_with_assistant(&services, "admin", "conv-adhoc-get", DEFAULT_TEAM_ASSISTANT_ID).await;
+
+    let create_req = json_with_token(
+        "POST",
+        "/api/teams/from-conversation",
+        json!({
+            "conversation_id": "conv-adhoc-get",
+            "user_id": "admin",
+            "target_assistant_id": "team-e2e-target-assistant"
+        }),
+        &token,
+        &csrf,
+    );
+    let create_resp = app.clone().oneshot(create_req).await.unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    let req = get_with_token("/api/teams/by-conversation?conversation_id=conv-adhoc-get", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(json["success"].as_bool().unwrap());
+    let data = json["data"].as_object().unwrap();
+    assert_eq!(data["origin_conversation_id"], "conv-adhoc-get");
+    assert!(data["team"].is_object());
+    assert!(!data["team_id"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn adg2_get_ad_hoc_team_by_conversation_empty() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = get_with_token("/api/teams/by-conversation?conversation_id=conv-adhoc-none", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(json["success"].as_bool().unwrap());
+    let data = json["data"].as_object().unwrap();
+    assert!(data.get("team").is_none());
+    assert_eq!(data["team_id"].as_str().unwrap(), "");
+    assert_eq!(data["origin_conversation_id"], "conv-adhoc-none");
+}
+
+#[tokio::test]
+async fn adu1_unauthenticated_ad_hoc_endpoints_return_401() {
+    let (app, _services) = build_app().await;
+
+    let resp = app.clone().oneshot(get_request("/api/auth/status")).await.unwrap();
+    let csrf = extract_csrf_token(&resp).expect("CSRF cookie should be set");
+
+    let create_req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/teams/from-conversation")
+        .header("content-type", "application/json")
+        .header("x-csrf-token", &csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(axum::body::Body::from(r#"{"conversation_id":"x","user_id":"x"}"#))
+        .unwrap();
+    let resp = app.clone().oneshot(create_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let get_req = get_request("/api/teams/by-conversation?conversation_id=x");
+    let resp = app.oneshot(get_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn adx1_ad_hoc_endpoints_reject_cross_user_access() {
+    let (mut app, services) = build_app().await;
+    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (other_token, other_csrf) = setup_and_login(&mut app, &services, "alice", "StrongP@ss2").await;
+    ensure_default_team_assistant(&mut app, &services, &owner_token, &owner_csrf).await;
+    ensure_target_team_assistant(&mut app, &services, &owner_token, &owner_csrf).await;
+    seed_conversation_with_assistant(&services, "admin", "conv-adhoc-cross", DEFAULT_TEAM_ASSISTANT_ID).await;
+
+    let create_req = json_with_token(
+        "POST",
+        "/api/teams/from-conversation",
+        json!({
+            "conversation_id": "conv-adhoc-cross",
+            "user_id": "admin",
+            "target_assistant_id": "team-e2e-target-assistant"
+        }),
+        &owner_token,
+        &owner_csrf,
+    );
+    let create_resp = app.clone().oneshot(create_req).await.unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    let req = get_with_token(
+        "/api/teams/by-conversation?conversation_id=conv-adhoc-cross",
+        &other_token,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(json["data"].as_object().unwrap().get("team").is_none());
+
+    let req = json_with_token(
+        "POST",
+        "/api/teams/from-conversation",
+        json!({
+            "conversation_id": "conv-adhoc-cross",
+            "user_id": "alice",
+            "target_assistant_id": "team-e2e-target-assistant"
+        }),
+        &other_token,
+        &other_csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

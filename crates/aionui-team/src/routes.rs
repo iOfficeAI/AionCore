@@ -10,7 +10,8 @@ use axum::routing::{get, post};
 
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
-    AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
+    AdHocTeamAssociationResponse, AdHocTeamFromConversationResponse, AddAgentRequest, ApiResponse,
+    CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateAdHocTeamFromConversationRequest, CreateTeamRequest,
     GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
     SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
     TeamRunStateResponse,
@@ -90,6 +91,11 @@ impl From<TeamError> for ApiError {
 pub fn team_routes(state: TeamRouterState) -> Router {
     Router::new()
         .route("/api/teams", post(create_team).get(list_teams))
+        .route(
+            "/api/teams/from-conversation",
+            post(create_ad_hoc_team_from_conversation),
+        )
+        .route("/api/teams/by-conversation", get(get_ad_hoc_team_by_conversation))
         .route("/api/teams/{id}", get(get_team).delete(remove_team))
         .route("/api/teams/{id}/run-state", get(get_run_state))
         .route("/api/teams/{id}/name", axum::routing::patch(rename_team))
@@ -146,6 +152,36 @@ async fn get_team(
 ) -> Result<Json<ApiResponse<TeamResponse>>, ApiError> {
     let team = state.service.get_team(&user.id, &id).await?;
     Ok(Json(ApiResponse::ok(team)))
+}
+
+async fn create_ad_hoc_team_from_conversation(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<CreateAdHocTeamFromConversationRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<AdHocTeamFromConversationResponse>>), ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let resp = state
+        .service
+        .create_ad_hoc_team_from_conversation(&user.id, req)
+        .await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(resp))))
+}
+
+async fn get_ad_hoc_team_by_conversation(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    axum::extract::Query(query): axum::extract::Query<ByConversationQuery>,
+) -> Result<Json<ApiResponse<AdHocTeamAssociationResponse>>, ApiError> {
+    let resp = state
+        .service
+        .get_ad_hoc_team_by_conversation(&user.id, &query.conversation_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(resp)))
+}
+
+#[derive(serde::Deserialize)]
+struct ByConversationQuery {
+    conversation_id: String,
 }
 
 async fn get_run_state(

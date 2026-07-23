@@ -39,6 +39,13 @@ impl ITeamRepository for MockTeamRepo {
     async fn get_team(&self, _id: &str) -> Result<Option<TeamRow>, DbError> {
         Ok(None)
     }
+    async fn get_team_by_origin_conversation_id(
+        &self,
+        _user_id: &str,
+        _origin_conversation_id: &str,
+    ) -> Result<Option<TeamRow>, DbError> {
+        Ok(None)
+    }
     async fn update_team(&self, _id: &str, _p: &UpdateTeamParams) -> Result<(), DbError> {
         Ok(())
     }
@@ -422,6 +429,20 @@ pub(crate) mod workspace_harness {
             Ok(self.teams.lock().unwrap().iter().find(|t| t.id == id).cloned())
         }
 
+        async fn get_team_by_origin_conversation_id(
+            &self,
+            user_id: &str,
+            origin_conversation_id: &str,
+        ) -> Result<Option<TeamRow>, DbError> {
+            Ok(self
+                .teams
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.user_id == user_id && t.origin_conversation_id.as_deref() == Some(origin_conversation_id))
+                .cloned())
+        }
+
         async fn update_team(&self, id: &str, params: &UpdateTeamParams) -> Result<(), DbError> {
             let mut teams = self.teams.lock().unwrap();
             let team = teams
@@ -442,6 +463,9 @@ pub(crate) mod workspace_harness {
             }
             if let Some(ref session_mode) = params.session_mode {
                 team.session_mode = Some(session_mode.clone());
+            }
+            if let Some(ref origin_conversation_id) = params.origin_conversation_id {
+                team.origin_conversation_id = Some(origin_conversation_id.clone());
             }
             team.updated_at = now_ms();
             Ok(())
@@ -598,6 +622,60 @@ pub(crate) mod workspace_harness {
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(str::to_owned)
+            }))
+        }
+
+        async fn conversation_metadata(
+            &self,
+            conversation_id: &str,
+        ) -> Result<Option<crate::provisioning::ConversationMetadata>, TeamError> {
+            let assistant_id = self.conversation_assistant_id(conversation_id).await?;
+            let extra = self.repo.get_extra(conversation_id);
+            let workspace = extra.as_ref().and_then(|value| {
+                value
+                    .get("workspace")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            });
+            let backend = extra.as_ref().and_then(|value| {
+                value
+                    .get("backend")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            });
+            let model = extra.as_ref().and_then(|value| {
+                value
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            });
+
+            let user_id = self
+                .repo
+                .conversations
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|c| c.id == conversation_id)
+                .map(|c| c.user_id.clone())
+                .unwrap_or_default();
+            if user_id.is_empty() {
+                return Ok(None);
+            }
+
+            Ok(Some(crate::provisioning::ConversationMetadata {
+                conversation_id: conversation_id.to_owned(),
+                user_id,
+                assistant_id,
+                backend,
+                model,
+                workspace,
             }))
         }
 

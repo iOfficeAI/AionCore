@@ -92,6 +92,16 @@ fn mcp_capability_object(agent_capabilities: Option<&serde_json::Value>) -> Opti
     caps.get("mcp_capabilities")
         .or_else(|| caps.get("mcpCapabilities"))
         .or_else(|| caps.get("mcp"))
+        .or_else(|| {
+            caps.get("agent_capabilities")
+                .or_else(|| caps.get("agentCapabilities"))
+                .and_then(|nested| {
+                    nested
+                        .get("mcp_capabilities")
+                        .or_else(|| nested.get("mcpCapabilities"))
+                        .or_else(|| nested.get("mcp"))
+                })
+        })
 }
 
 fn bool_field(value: &serde_json::Value, key: &str) -> bool {
@@ -124,6 +134,9 @@ mod tests {
         assert!(has_mcp_capability(Some(&json!({
             "mcp": { "http": false, "sse": true }
         }))));
+        assert!(has_mcp_capability(Some(&json!({
+            "agentCapabilities": { "mcpCapabilities": { "http": true, "sse": true } }
+        }))));
     }
 
     #[test]
@@ -153,6 +166,12 @@ mod tests {
         ));
         assert!(!supports_team_mcp("acp", None));
         assert!(!supports_team_mcp("claude", Some(&json!({ "mcp_capabilities": {} }))));
+        assert!(supports_team_mcp(
+            "grok",
+            Some(&json!({
+                "agentCapabilities": { "mcpCapabilities": { "http": true, "sse": true } }
+            }))
+        ));
     }
 
     #[test]

@@ -17,14 +17,18 @@ impl SqliteTeamRepository {
     }
 }
 
+fn is_unique_violation(err: &dyn sqlx::error::DatabaseError) -> bool {
+    err.code().is_some_and(|c| c == "2067" || c == "1555")
+}
+
 #[async_trait::async_trait]
 impl ITeamRepository for SqliteTeamRepository {
     // ── Team CRUD ────────────────────────────────────────────────────
 
     async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, origin_conversation_id, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.user_id)
@@ -35,10 +39,17 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(&row.lead_agent_id)
         .bind(&row.session_mode)
         .bind(&row.agents_version)
+        .bind(&row.origin_conversation_id)
         .bind(row.created_at)
         .bind(row.updated_at)
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => {
+                DbError::Conflict(format!("team with id '{}' or origin conversation id {:?} already exists", row.id, row.origin_conversation_id))
+            }
+            _ => DbError::Query(e),
+        })?;
         Ok(())
     }
 
@@ -65,6 +76,19 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(row)
     }
 
+    async fn get_team_by_origin_conversation_id(
+        &self,
+        user_id: &str,
+        origin_conversation_id: &str,
+    ) -> Result<Option<TeamRow>, DbError> {
+        let row = sqlx::query_as::<_, TeamRow>("SELECT * FROM teams WHERE user_id = ? AND origin_conversation_id = ?")
+            .bind(user_id)
+            .bind(origin_conversation_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
+    }
+
     async fn update_team(&self, team_id: &str, params: &UpdateTeamParams) -> Result<(), DbError> {
         let mut set_clauses = Vec::new();
         if params.name.is_some() {
@@ -81,6 +105,9 @@ impl ITeamRepository for SqliteTeamRepository {
         }
         if params.session_mode.is_some() {
             set_clauses.push("session_mode = ?");
+        }
+        if params.origin_conversation_id.is_some() {
+            set_clauses.push("origin_conversation_id = ?");
         }
 
         if set_clauses.is_empty() {
@@ -106,10 +133,19 @@ impl ITeamRepository for SqliteTeamRepository {
         if let Some(ref session_mode) = params.session_mode {
             query = query.bind(session_mode);
         }
+        if let Some(ref origin_conversation_id) = params.origin_conversation_id {
+            query = query.bind(origin_conversation_id);
+        }
         query = query.bind(now_ms());
         query = query.bind(team_id);
 
-        let result = query.execute(&self.pool).await?;
+        let result = query.execute(&self.pool).await.map_err(|e| match &e {
+            sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => DbError::Conflict(format!(
+                "team with id '{}' or origin conversation id {:?} already exists",
+                team_id, params.origin_conversation_id
+            )),
+            _ => DbError::Query(e),
+        })?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("team {team_id}")));
         }
