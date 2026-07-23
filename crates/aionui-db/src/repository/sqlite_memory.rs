@@ -2841,7 +2841,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
              LEFT JOIN memory_sources sources ON sources.memory_entry_id = entries.id
              WHERE entries.user_id = ?
                AND (? IS NULL OR entries.kind = ?)
-               AND (? IS NULL OR entries.state = ?)
+               AND ((? IS NULL AND entries.state <> 'deleted') OR entries.state = ?)
                AND (? IS NULL OR entries.project_id = ?)
                AND (? IS NULL OR entries.workspace_key = ?)
                AND (? IS NULL OR sources.conversation_id = ?)
@@ -2882,7 +2882,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
              LEFT JOIN memory_sources sources ON sources.memory_entry_id = entries.id
              WHERE entries.user_id = ?
                AND (? IS NULL OR entries.kind = ?)
-               AND (? IS NULL OR entries.state = ?)
+               AND ((? IS NULL AND entries.state <> 'deleted') OR entries.state = ?)
                AND (? IS NULL OR entries.project_id = ?)
                AND (? IS NULL OR entries.workspace_key = ?)
                AND (? IS NULL OR sources.conversation_id = ?)
@@ -3190,14 +3190,13 @@ impl IMemoryRepository for SqliteMemoryRepository {
                             "INSERT INTO memory_entries
                              (id,user_id,project_id,workspace_key,kind,stable_key,fingerprint,content,state,pinned,
                               user_edited,revision,schema_version,deleted_at,created_at,updated_at)
-                             VALUES (?,?,?,?,?,?,?,NULL,'deleted',0,0,0,?,?,?,?)",
+                             VALUES (?,?,?,?,?,'',?,NULL,'deleted',0,0,0,?,?,?,?)",
                         )
                         .bind(tombstone_id)
                         .bind(&input.user_id)
                         .bind(&identity.project_id)
                         .bind(&identity.workspace_key)
                         .bind(&identity.kind)
-                        .bind(&identity.stable_key)
                         .bind(&identity.fingerprint)
                         .bind(identity.schema_version)
                         .bind(input.now)
@@ -3243,7 +3242,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
             .execute(&mut *transaction)
             .await?;
         sqlx::query(
-            "UPDATE memory_entries SET content = NULL, state = 'deleted', pinned = 0, user_edited = 0,
+            "UPDATE memory_entries SET stable_key = '', content = NULL, state = 'deleted', pinned = 0, user_edited = 0,
              supersedes_id = NULL, conflict_group_id = NULL, revision = revision + 1, deleted_at = ?, updated_at = ?
              WHERE id = ? AND user_id = ?",
         )
@@ -3348,7 +3347,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
             for (entry_id, pinned, user_edited) in exclusive_entries {
                 if pinned || user_edited {
                     sqlx::query(
-                        "UPDATE memory_entries SET content = NULL, state = 'deleted', pinned = 0, user_edited = 0,
+                        "UPDATE memory_entries SET stable_key = '', content = NULL, state = 'deleted',
+                         pinned = 0, user_edited = 0,
                          supersedes_id = NULL, conflict_group_id = NULL, revision = revision + 1,
                          deleted_at = ?, updated_at = ? WHERE id = ? AND user_id = ?",
                     )
@@ -3961,7 +3961,7 @@ mod tests {
         ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
         CommitMemoryUpdateResult, CommitMemoryUpdateRow, ConsumeMemoryRetrievalSnapshotRow,
         CreateMemoryRetrievalSnapshotRow, EnqueueMemoryTurnRow, ExpectedMemoryEntryRow,
-        FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, MemoryCandidateQueryRow,
+        FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, MemoryCandidateQueryRow, MemoryEntryQueryRow,
         MemoryReconciliationSnapshotRow, MemoryRetrievalItemRow, MemoryTurnSnapshotExpectationRow,
         ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, ResolveMemoryConflictActionRow, ResolveMemoryConflictRow,
         SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow,
@@ -5810,6 +5810,7 @@ mod tests {
         for entry_id in ["protected-exclusive-pinned", "protected-exclusive-edited"] {
             let tombstone = repo.get_entry(USER_A, entry_id).await.unwrap().unwrap();
             assert_eq!(tombstone.state, "deleted");
+            assert_eq!(tombstone.stable_key, "");
             assert_eq!(tombstone.content, None);
             assert!(tombstone.sources.is_empty());
             assert!(!tombstone.pinned && !tombstone.user_edited);
@@ -5894,8 +5895,10 @@ mod tests {
         repo.delete_entry(USER_A, "entry-delete", 25).await.unwrap();
         let tombstone = repo.get_entry(USER_A, "entry-delete").await.unwrap().unwrap();
         assert_eq!(tombstone.state, "deleted");
+        assert_eq!(tombstone.stable_key, "");
         assert_eq!(tombstone.content, None);
         assert!(tombstone.sources.is_empty());
+        assert!(!tombstone.pinned && !tombstone.user_edited);
         assert!(matches!(
             repo.update_entry(UpdateMemoryEntryRow {
                 user_id: USER_A.into(),
@@ -5968,15 +5971,23 @@ mod tests {
                 .iter()
                 .all(|entry| entry.state == "active" && entry.user_edited)
         );
-        let tombstoned_fingerprints: Vec<String> = sqlx::query_scalar(
-            "SELECT fingerprint FROM memory_entries WHERE user_id = ? AND state = 'deleted'
+        let tombstones: Vec<(String, String, bool, bool, Option<String>, i64)> = sqlx::query_as(
+            "SELECT entries.fingerprint,entries.stable_key,entries.pinned,entries.user_edited,entries.content,
+                    (SELECT COUNT(*) FROM memory_sources sources WHERE sources.memory_entry_id = entries.id)
+             FROM memory_entries entries WHERE user_id = ? AND state = 'deleted'
              AND fingerprint IN ('fp-separate-a','fp-separate-b') ORDER BY fingerprint",
         )
         .bind(USER_A)
         .fetch_all(&repo.pool)
         .await
         .unwrap();
-        assert_eq!(tombstoned_fingerprints, ["fp-separate-a", "fp-separate-b"]);
+        assert_eq!(
+            tombstones,
+            [
+                ("fp-separate-a".into(), String::new(), false, false, None, 0),
+                ("fp-separate-b".into(), String::new(), false, false, None, 0),
+            ]
+        );
 
         claimed_job(&repo, "job-replay-separate", "conv_a", "turn-replay-separate").await;
         let replay = repo
@@ -6007,6 +6018,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_memory_entry_queries_exclude_deleted_by_default_but_page_explicit_deleted_state() {
+        let (repo, _, db) = setup().await;
+        for (id, state, stable_key, content, deleted_at, updated_at) in [
+            ("query-active", "active", "active-key", Some("active"), None, 1_i64),
+            ("query-deleted-new", "deleted", "", None, Some(3_i64), 3),
+            ("query-deleted-old", "deleted", "", None, Some(2_i64), 2),
+        ] {
+            sqlx::query(
+                "INSERT INTO memory_entries
+                    (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,
+                     schema_version,deleted_at,created_at,updated_at)
+                 VALUES (?,?,'decision',?,?,?, ?,0,0,1,?,1,?)",
+            )
+            .bind(id)
+            .bind(USER_A)
+            .bind(stable_key)
+            .bind(format!("fingerprint-{id}"))
+            .bind(content)
+            .bind(state)
+            .bind(deleted_at)
+            .bind(updated_at)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let default_rows = repo
+            .query_entries(
+                USER_A,
+                MemoryEntryQueryRow {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            default_rows.into_iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            ["query-active"]
+        );
+        assert_eq!(
+            repo.count_entries(USER_A, MemoryEntryQueryRow::default())
+                .await
+                .unwrap(),
+            1
+        );
+
+        let deleted_query = MemoryEntryQueryRow {
+            state: Some("deleted".into()),
+            limit: 1,
+            ..Default::default()
+        };
+        let first_page = repo.query_entries(USER_A, deleted_query.clone()).await.unwrap();
+        assert_eq!(
+            first_page.into_iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            ["query-deleted-new"]
+        );
+        assert_eq!(repo.count_entries(USER_A, deleted_query.clone()).await.unwrap(), 2);
+        let second_page = repo
+            .query_entries(
+                USER_A,
+                MemoryEntryQueryRow {
+                    offset: 1,
+                    ..deleted_query
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second_page.into_iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            ["query-deleted-old"]
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_memory_update_entry_rejects_zero_row_cas_after_tombstone() {
         let (repo, _, _db) = setup().await;
         claimed_job(&repo, "job-update-race", "conv_a", "turn-1").await;
@@ -6030,7 +6116,8 @@ mod tests {
              WHEN OLD.id = 'entry-update-race' AND OLD.state = 'active' AND NEW.state <> 'deleted'
              BEGIN
                  DELETE FROM memory_sources WHERE memory_entry_id = OLD.id;
-                 UPDATE memory_entries SET content = NULL, state = 'deleted', pinned = 0, user_edited = 0,
+                 UPDATE memory_entries SET stable_key = '', content = NULL, state = 'deleted',
+                     pinned = 0, user_edited = 0,
                      supersedes_id = NULL, conflict_group_id = NULL, deleted_at = 25, updated_at = 25
                      WHERE id = OLD.id;
                  SELECT RAISE(IGNORE);
@@ -6181,20 +6268,28 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        for (scope, id, state, content, deleted_at) in [
-            ("active-destination", "scope-active", "active", Some("active"), None),
-            ("deleted-destination", "scope-deleted", "deleted", None, Some(2_i64)),
+        for (scope, id, state, stable_key, content, deleted_at) in [
+            (
+                "active-destination",
+                "scope-active",
+                "active",
+                "source key",
+                Some("active"),
+                None,
+            ),
+            ("deleted-destination", "scope-deleted", "deleted", "", None, Some(2_i64)),
         ] {
             let fingerprint = derive_memory_fingerprint(USER_A, Some(scope), None, "decision", "source key");
             sqlx::query(
                 "INSERT INTO memory_entries
                     (id, user_id, project_id, kind, stable_key, fingerprint, content, state, pinned, user_edited,
                      schema_version, deleted_at, created_at, updated_at)
-                 VALUES (?, ?, ?, 'decision', 'source key', ?, ?, ?, 0, 0, 1, ?, 2, 2)",
+                 VALUES (?, ?, ?, 'decision', ?, ?, ?, ?, 0, 0, 1, ?, 2, 2)",
             )
             .bind(id)
             .bind(USER_A)
             .bind(scope)
+            .bind(stable_key)
             .bind(&fingerprint)
             .bind(content)
             .bind(state)
@@ -6630,7 +6725,7 @@ mod tests {
             "INSERT INTO memory_entries
                 (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited,
                  schema_version, deleted_at, created_at, updated_at)
-             VALUES ('lookup-tombstone', ?, 'decision', 'deleted key', 'lookup-deleted-fingerprint', NULL,
+             VALUES ('lookup-tombstone', ?, 'decision', '', 'lookup-deleted-fingerprint', NULL,
                      'deleted', 0, 0, 1, 70, 70, 70)",
         )
         .bind(USER_A)
@@ -6662,10 +6757,10 @@ mod tests {
     #[tokio::test]
     async fn sqlite_memory_reconciliation_lookup_bounds_conflicts_and_omits_sources() {
         let (repo, _, db) = setup().await;
-        for (id, state, deleted_at, updated_at) in [
-            ("bounded-active", "active", None, 1_i64),
-            ("bounded-deleted-old", "deleted", Some(2_i64), 2),
-            ("bounded-deleted-new", "deleted", Some(3_i64), 3),
+        for (id, state, stable_key, deleted_at, updated_at) in [
+            ("bounded-active", "active", "bounded-active", None, 1_i64),
+            ("bounded-deleted-old", "deleted", "", Some(2_i64), 2),
+            ("bounded-deleted-new", "deleted", "", Some(3_i64), 3),
         ] {
             sqlx::query(
                 "INSERT INTO memory_entries
@@ -6675,7 +6770,7 @@ mod tests {
             )
             .bind(id)
             .bind(USER_A)
-            .bind(id)
+            .bind(stable_key)
             .bind((state != "deleted").then_some(id))
             .bind(state)
             .bind(deleted_at)

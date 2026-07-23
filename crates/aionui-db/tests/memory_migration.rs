@@ -343,6 +343,62 @@ async fn migration_031_adds_idempotent_immutable_retrieval_selections() {
 }
 
 #[tokio::test]
+async fn migration_032_scrubs_legacy_tombstones_and_is_idempotent() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 31).await;
+    sqlx::query(
+        "INSERT INTO users (id,username,email,password_hash,created_at,updated_at)
+         VALUES ('tombstone-user','tombstone-user','tombstone@example.com','',1,1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (id,user_id,name,type,extra,status,created_at,updated_at)
+         VALUES ('tombstone-conversation','tombstone-user','Tombstone','acp','{}','finished',1,1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_entries
+            (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,
+             schema_version,deleted_at,created_at,updated_at)
+         VALUES ('legacy-tombstone','tombstone-user','decision','legacy secret','legacy-fingerprint',
+                 NULL,'deleted',1,1,1,2,1,2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_sources
+            (memory_entry_id,conversation_id,turn_id,message_ids_json,first_observed_at,last_observed_at)
+         VALUES ('legacy-tombstone','tombstone-conversation','turn','[]',1,2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let migration = include_str!("../migrations/032_memory_tombstone_invariant.sql");
+    sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+    sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+
+    let scrubbed: (String, bool, bool, Option<String>, i64) = sqlx::query_as(
+        "SELECT stable_key,pinned,user_edited,content,
+                (SELECT COUNT(*) FROM memory_sources WHERE memory_entry_id = memory_entries.id)
+         FROM memory_entries WHERE id = 'legacy-tombstone'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(scrubbed, (String::new(), false, false, None, 0));
+}
+
+#[tokio::test]
 async fn migration_029_creates_normalized_tables_constraints_and_required_indexes() {
     let database = aionui_db::init_database_memory().await.unwrap();
     let pool = database.pool();
@@ -465,17 +521,18 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
     .execute(pool)
     .await;
     assert!(duplicate_active.is_err());
-    for (id, state, content, deleted_at) in [
-        ("conflict-identity", "conflict", Some("conflict"), None),
-        ("deleted-identity", "deleted", None, Some(2_i64)),
+    for (id, state, stable_key, content, deleted_at) in [
+        ("conflict-identity", "conflict", "key", Some("conflict"), None),
+        ("deleted-identity", "deleted", "", None, Some(2_i64)),
     ] {
         sqlx::query(
             "INSERT INTO memory_entries
              (id, user_id, kind, stable_key, fingerprint, content, state, pinned, user_edited,
               schema_version, deleted_at, created_at, updated_at)
-             VALUES (?, 'system_default_user', 'decision', 'key', 'shared-fp', ?, ?, 0, 0, 1, ?, 1, 1)",
+             VALUES (?, 'system_default_user', 'decision', ?, 'shared-fp', ?, ?, 0, 0, 1, ?, 1, 1)",
         )
         .bind(id)
+        .bind(stable_key)
         .bind(content)
         .bind(state)
         .bind(deleted_at)
@@ -483,6 +540,28 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
         .await
         .unwrap();
     }
+
+    for statement in [
+        "INSERT INTO memory_entries
+         (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,schema_version,deleted_at,created_at,updated_at)
+         VALUES ('bad-deleted-key','system_default_user','decision','secret','fp-bad-key',NULL,'deleted',0,0,1,2,1,2)",
+        "INSERT INTO memory_entries
+         (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,schema_version,deleted_at,created_at,updated_at)
+         VALUES ('bad-deleted-pinned','system_default_user','decision','','fp-bad-pinned',NULL,'deleted',1,0,1,2,1,2)",
+        "INSERT INTO memory_entries
+         (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,schema_version,deleted_at,created_at,updated_at)
+         VALUES ('bad-deleted-edited','system_default_user','decision','','fp-bad-edited',NULL,'deleted',0,1,1,2,1,2)",
+    ] {
+        assert!(sqlx::query(statement).execute(pool).await.is_err(), "{statement}");
+    }
+    let deleted_source = sqlx::query(
+        "INSERT INTO memory_sources
+            (memory_entry_id,conversation_id,turn_id,message_ids_json,first_observed_at,last_observed_at)
+         VALUES ('deleted-identity','conv-constraints','turn','[]',1,2)",
+    )
+    .execute(pool)
+    .await;
+    assert!(deleted_source.is_err());
 
     let invalid_job_state = sqlx::query(
         "INSERT INTO memory_jobs
@@ -563,7 +642,7 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
 }
 
 #[test]
-fn migration_versions_are_unique_and_memory_owns_029_through_031() {
+fn migration_versions_are_unique_and_memory_owns_029_through_032() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let full = Migrator::new(Path::new("migrations")).await.unwrap();
@@ -575,6 +654,7 @@ fn migration_versions_are_unique_and_memory_owns_029_through_031() {
         assert_eq!(versions.iter().filter(|version| **version == 29).count(), 1);
         assert_eq!(versions.iter().filter(|version| **version == 30).count(), 1);
         assert_eq!(versions.iter().filter(|version| **version == 31).count(), 1);
+        assert_eq!(versions.iter().filter(|version| **version == 32).count(), 1);
         assert_eq!(versions.iter().copied().collect::<HashSet<_>>().len(), versions.len());
     });
 }
