@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
@@ -16,7 +16,7 @@ use crate::memory_port::{
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::{RuntimeCompletionOutcome, RuntimeCompletionPublisher};
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
-use crate::runtime_state::ConversationRuntimeStateService;
+use crate::runtime_state::{ConversationRuntimeStateService, TurnClaim};
 use aionui_api_types::{
     ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
     ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
@@ -322,6 +322,7 @@ pub struct ConversationService {
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
     memory_port: Arc<RwLock<Arc<dyn ConversationMemoryPort>>>,
+    completion_gates: Arc<std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
@@ -396,6 +397,7 @@ impl ConversationService {
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             memory_port: Arc::new(RwLock::new(Arc::new(NoopConversationMemoryPort))),
+            completion_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
@@ -615,11 +617,26 @@ impl ConversationService {
     }
 
     pub async fn complete_turn(&self, conversation_id: &str, turn_id: &str) {
-        self.complete_turn_with_memory(conversation_id, turn_id, ConversationTurnStatus::Completed, true)
+        let gate = self.completion_gate(conversation_id);
+        let _guard = gate.lock().await;
+        self.complete_turn_with_memory_unsequenced(conversation_id, turn_id, ConversationTurnStatus::Completed, true)
             .await;
     }
 
-    async fn complete_turn_with_memory(
+    fn completion_gate(&self, conversation_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self
+            .completion_gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(gate) = gates.get(conversation_id).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(conversation_id.to_owned(), Arc::downgrade(&gate));
+        gate
+    }
+
+    async fn complete_turn_with_memory_unsequenced(
         &self,
         conversation_id: &str,
         turn_id: &str,
@@ -655,14 +672,20 @@ impl ConversationService {
         }
     }
 
-    pub(crate) async fn complete_released_turn(
+    pub(crate) async fn finish_claimed_turn(
         &self,
         conversation_id: &str,
         turn_id: &str,
-        was_deleting: bool,
+        turn_claim: &mut TurnClaim,
         status: ConversationTurnStatus,
         memory_eligible: bool,
     ) {
+        // Acquire before releasing the runtime claim. A following turn may start
+        // as soon as the claim is released, but cannot publish completion or
+        // enqueue Memory capture ahead of this turn.
+        let gate = self.completion_gate(conversation_id);
+        let _guard = gate.lock().await;
+        let was_deleting = turn_claim.release_for_turn(turn_id);
         if was_deleting {
             debug!(
                 conversation_id,
@@ -671,7 +694,7 @@ impl ConversationService {
             return;
         }
 
-        self.complete_turn_with_memory(conversation_id, turn_id, status, memory_eligible)
+        self.complete_turn_with_memory_unsequenced(conversation_id, turn_id, status, memory_eligible)
             .await;
     }
 }
@@ -2695,11 +2718,10 @@ impl ConversationService {
             .allows(conversation_id, RuntimeWriteKind::UserMessage)
         {
             let mut turn_claim = turn_claim;
-            let was_deleting = turn_claim.release();
-            self.complete_released_turn(
+            self.finish_claimed_turn(
                 conversation_id,
                 &turn_id,
-                was_deleting,
+                &mut turn_claim,
                 ConversationTurnStatus::Failed,
                 false,
             )
@@ -2745,11 +2767,10 @@ impl ConversationService {
                 )
                 .await;
                 let mut turn_claim = turn_claim;
-                let was_deleting = turn_claim.release();
-                self.complete_released_turn(
+                self.finish_claimed_turn(
                     conversation_id,
                     &turn_id,
-                    was_deleting,
+                    &mut turn_claim,
                     ConversationTurnStatus::Failed,
                     memory_eligible,
                 )
@@ -2839,11 +2860,10 @@ impl ConversationService {
                     "Failed to insert agent turn user message"
                 );
                 let mut turn_claim = turn_claim;
-                let was_deleting = turn_claim.release();
-                self.complete_released_turn(
+                self.finish_claimed_turn(
                     &request.conversation_id,
                     &turn_id,
-                    was_deleting,
+                    &mut turn_claim,
                     ConversationTurnStatus::Failed,
                     false,
                 )
@@ -2873,11 +2893,10 @@ impl ConversationService {
                 )
                 .await;
                 let mut turn_claim = turn_claim;
-                let was_deleting = turn_claim.release();
-                self.complete_released_turn(
+                self.finish_claimed_turn(
                     &request.conversation_id,
                     &turn_id,
-                    was_deleting,
+                    &mut turn_claim,
                     ConversationTurnStatus::Failed,
                     false,
                 )

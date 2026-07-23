@@ -232,12 +232,13 @@ impl StreamPersistenceAdapter {
         final_text: &str,
         hidden: bool,
         rewrite_segments: bool,
-    ) -> Vec<FinalTextOverride> {
+    ) -> (Vec<FinalTextOverride>, bool) {
         if !self.allows_write(RuntimeWriteKind::TerminalFinalize) {
-            return Vec::new();
+            return (Vec::new(), false);
         }
 
         let mut overrides = Vec::new();
+        let mut persisted_visible_output = !hidden && !text_segments.is_empty();
         if let Some(primary_segment) = text_segments.first() {
             if rewrite_segments {
                 let content = json!({ "content": final_text }).to_string();
@@ -297,10 +298,12 @@ impl StreamPersistenceAdapter {
             };
             if let Err(e) = self.repo.insert_message(&row).await {
                 log_persist_error(&e, "Failed to create final fallback message");
+            } else {
+                persisted_visible_output = true;
             }
         }
 
-        overrides
+        (overrides, persisted_visible_output)
     }
 
     #[tracing::instrument(skip_all)]

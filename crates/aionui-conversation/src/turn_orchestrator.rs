@@ -396,6 +396,7 @@ impl ConversationTurnOrchestrator {
         let mut replay_started_at = None;
         let mut final_error_message;
         let mut auth_failure = false;
+        let mut persisted_assistant_output = false;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
@@ -428,6 +429,7 @@ impl ConversationTurnOrchestrator {
             // Track the final attempt's auth signal so the post-loop availability
             // write-back can reflect "needs sign-in" (last iteration wins).
             auth_failure = terminal_is_auth_failure(&attempt_result.outcome);
+            persisted_assistant_output |= attempt_result.summary.persisted_assistant_output;
 
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
             if !attempt_result.outcome.terminal.is_error() {
@@ -543,14 +545,14 @@ impl ConversationTurnOrchestrator {
             record_agent_session_success(&self.service, availability_agent_id(&input.build_options).as_deref()).await;
         }
 
-        let was_deleting = turn_claim.release_for_turn(&turn_id);
         let status = if final_failed {
             ConversationTurnStatus::Failed
         } else {
             ConversationTurnStatus::Completed
         };
+        let memory_eligible = input.memory_eligible && (final_failed || persisted_assistant_output);
         self.service
-            .complete_released_turn(&conv_id, &turn_id, was_deleting, status, input.memory_eligible)
+            .finish_claimed_turn(&conv_id, &turn_id, &mut turn_claim, status, memory_eligible)
             .await;
 
         ConversationTurnResult {

@@ -454,10 +454,8 @@ impl StreamRelay {
                             } else {
                                 self.finalize(&full_text_buffer, &text_segments, &event, terminal).await
                             };
+                            attempt.persisted_assistant_output |= outcome.attempt.persisted_assistant_output;
                             outcome.attempt = attempt.clone();
-                            if !full_text_buffer.is_empty() {
-                                outcome.attempt.persisted_assistant_output = true;
-                            }
                             if self.complete_turn && !deleting {
                                 self.adapter
                                     .complete_conversation(&self.broadcaster, &self.turn_id, None)
@@ -555,10 +553,8 @@ impl StreamRelay {
                         )
                         .await
                     };
+                    attempt.persisted_assistant_output |= outcome.attempt.persisted_assistant_output;
                     outcome.attempt = attempt.clone();
-                    if !full_text_buffer.is_empty() {
-                        outcome.attempt.persisted_assistant_output = true;
-                    }
                     if self.complete_turn && !deleting {
                         self.adapter
                             .complete_conversation(&self.broadcaster, &self.turn_id, None)
@@ -687,10 +683,11 @@ impl StreamRelay {
             let hidden = final_text.is_empty();
 
             let rewrite_segments = processed.message != text || hidden;
-            let overrides = self
+            let (overrides, persisted_visible_output) = self
                 .adapter
                 .persist_final_text(text_segments, status, &final_text, hidden, rewrite_segments)
                 .await;
+            outcome.attempt.persisted_assistant_output = persisted_visible_output;
             for override_event in overrides {
                 self.send_final_text_override(&override_event.msg_id, &override_event.text, override_event.hidden);
             }

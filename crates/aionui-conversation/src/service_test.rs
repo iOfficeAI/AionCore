@@ -246,6 +246,34 @@ struct MockRepo {
     messages: Mutex<Vec<MessageRow>>,
     artifacts: Mutex<Vec<ConversationArtifactRow>>,
     assistant_snapshots: Mutex<Vec<ConversationAssistantSnapshotRow>>,
+    fail_assistant_evidence_writes: AtomicBool,
+}
+
+#[derive(Default)]
+struct BlockingCompletionMemoryPort {
+    completions: Mutex<Vec<CompletedTurnMemoryInput>>,
+    first_started: Notify,
+    release_first: Notify,
+}
+
+#[async_trait::async_trait]
+impl ConversationMemoryPort for BlockingCompletionMemoryPort {
+    async fn on_turn_completed(&self, input: CompletedTurnMemoryInput) -> Result<(), MemoryPortError> {
+        let is_first = {
+            let mut completions = self.completions.lock().unwrap();
+            completions.push(input);
+            completions.len() == 1
+        };
+        if is_first {
+            self.first_started.notify_one();
+            self.release_first.notified().await;
+        }
+        Ok(())
+    }
+
+    async fn build_recall_block(&self, _input: RecallMemoryInput) -> Result<Option<String>, MemoryPortError> {
+        Ok(None)
+    }
 }
 
 struct CompletionOrderMemoryPort {
@@ -306,6 +334,7 @@ impl MockRepo {
             messages: Mutex::new(vec![]),
             artifacts: Mutex::new(vec![]),
             assistant_snapshots: Mutex::new(vec![]),
+            fail_assistant_evidence_writes: AtomicBool::new(false),
         }
     }
 }
@@ -563,6 +592,14 @@ impl IConversationRepository for MockRepo {
     }
 
     async fn insert_message(&self, message: &MessageRow) -> Result<(), aionui_db::DbError> {
+        if self.fail_assistant_evidence_writes.load(Ordering::SeqCst)
+            && message.position.as_deref() == Some("left")
+            && matches!(message.r#type.as_str(), "text" | "artifact" | "tool_result_summary")
+        {
+            return Err(aionui_db::DbError::Init(
+                "forced assistant evidence write failure".into(),
+            ));
+        }
         let mut messages = self.messages.lock().unwrap();
         messages.push(message.clone());
         Ok(())
@@ -3453,7 +3490,12 @@ async fn memory_recall_uses_canonical_ids_and_changes_only_agent_bound_content()
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let agent = Arc::new(ScriptedAgent::new(
         &conv.id,
-        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData {
+                content: "assistant outcome".into(),
+            }),
+            AgentStreamEvent::Finish(FinishEventData::default()),
+        ]],
     ));
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
     let block = "<historical_memory trust=\"untrusted\" policy_version=\"v1\">\n- [decision; sources=source] historical\n</historical_memory>";
@@ -3512,7 +3554,12 @@ async fn memory_port_failure_preserves_turn_completion_and_original_prompt() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let agent = Arc::new(ScriptedAgent::new(
         &conv.id,
-        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData {
+                content: "assistant outcome".into(),
+            }),
+            AgentStreamEvent::Finish(FinishEventData::default()),
+        ]],
     ));
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
     let memory = Arc::new(RecordingMemoryPort::with_recall_result(Err(
@@ -3591,6 +3638,175 @@ async fn memory_completion_runs_after_durable_user_and_assistant_turn_and_event(
     .expect("Memory completion observer should run");
 
     assert_eq!(memory.observations.lock().unwrap().as_slice(), &[(true, true, true)]);
+}
+
+#[tokio::test]
+async fn memory_completion_is_serialized_with_turn_completion_per_conversation() {
+    let (svc, broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let memory = Arc::new(BlockingCompletionMemoryPort::default());
+    svc.with_memory_port(memory.clone());
+    broadcaster.take_events();
+    let mut first_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-first").unwrap();
+    let first_service = svc.clone();
+    let first_conversation_id = conv.id.clone();
+    let first_completion = tokio::spawn(async move {
+        first_service
+            .finish_claimed_turn(
+                &first_conversation_id,
+                "turn-first",
+                &mut first_claim,
+                crate::turn_orchestrator::ConversationTurnStatus::Completed,
+                true,
+            )
+            .await;
+    });
+    tokio::time::timeout(Duration::from_secs(2), memory.first_started.notified())
+        .await
+        .expect("first Memory callback should start");
+
+    let mut second_claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn-second")
+        .expect("next turn should claim after the first releases");
+    let second_service = svc.clone();
+    let second_conversation_id = conv.id.clone();
+    let second_completion = tokio::spawn(async move {
+        second_service
+            .finish_claimed_turn(
+                &second_conversation_id,
+                "turn-second",
+                &mut second_claim,
+                crate::turn_orchestrator::ConversationTurnStatus::Completed,
+                true,
+            )
+            .await;
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        svc.runtime_state().is_claimed(&conv.id),
+        "second claim must remain active while first completion is blocked",
+    );
+
+    assert_eq!(
+        memory
+            .completions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|input| input.turn_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn-first"],
+    );
+    assert_eq!(
+        broadcaster
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.name == "turn.completed")
+            .map(|event| event.data["turn_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["turn-first"],
+    );
+
+    memory.release_first.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if memory.completions.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("second Memory callback should follow the first");
+    first_completion.await.unwrap();
+    second_completion.await.unwrap();
+
+    assert_eq!(
+        memory
+            .completions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|input| input.turn_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn-first", "turn-second"],
+    );
+    assert_eq!(
+        broadcaster
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.name == "turn.completed")
+            .map(|event| event.data["turn_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["turn-first", "turn-second"],
+    );
+}
+
+#[tokio::test]
+async fn failed_assistant_evidence_persistence_skips_completed_memory_capture_but_keeps_event() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData {
+                content: "assistant outcome".into(),
+            }),
+            AgentStreamEvent::Finish(FinishEventData::default()),
+        ]],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+    repo.fail_assistant_evidence_writes.store(true, Ordering::SeqCst);
+    let memory = Arc::new(RecordingMemoryPort::default());
+    svc.with_memory_port(memory.clone());
+    broadcaster.take_events();
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    let response = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if broadcaster
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.name == "turn.completed" && event.data["turn_id"] == response.turn_id)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("turn completion event should remain deliverable");
+
+    assert!(memory.completions.lock().unwrap().is_empty());
+    assert!(
+        broadcaster
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.name == "turn.completed" && event.data["turn_id"] == response.turn_id),
+    );
+    assert!(repo.messages.lock().unwrap().iter().any(|message| {
+        message.turn_id.as_deref() == Some(response.turn_id.as_str()) && message.position.as_deref() == Some("right")
+    }));
+    assert!(!repo.messages.lock().unwrap().iter().any(|message| {
+        message.turn_id.as_deref() == Some(response.turn_id.as_str())
+            && message.position.as_deref() == Some("left")
+            && matches!(message.r#type.as_str(), "text" | "artifact" | "tool_result_summary")
+    }));
 }
 
 #[tokio::test]
