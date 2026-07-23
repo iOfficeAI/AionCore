@@ -18,21 +18,17 @@ pub(crate) fn settings_response(row: MemorySettingsRow) -> Result<MemorySettings
 }
 
 pub(crate) fn entry_response(row: MemoryEntryRow) -> Result<MemoryEntryResponse, MemoryError> {
-    let content = row.content.ok_or(MemoryError::NotFound)?;
-    Ok(MemoryEntryResponse {
-        id: row.id,
-        user_id: row.user_id,
-        project_id: row.project_id,
-        workspace_key: row.workspace_key,
-        kind: entry_kind(&row.kind)?,
-        stable_key: row.stable_key,
-        fingerprint: row.fingerprint,
-        content,
-        state: entry_state(&row.state)?,
-        pinned: row.pinned,
-        user_edited: row.user_edited,
-        sources: row
-            .sources
+    let state = entry_state(&row.state)?;
+    let is_deleted = matches!(state, MemoryEntryState::Deleted);
+    let content = if is_deleted {
+        None
+    } else {
+        Some(row.content.ok_or(MemoryError::NotFound)?)
+    };
+    let sources = if is_deleted {
+        Vec::new()
+    } else {
+        row.sources
             .into_iter()
             .map(|source| {
                 Ok(MemoryEntrySourceResponse {
@@ -44,10 +40,25 @@ pub(crate) fn entry_response(row: MemoryEntryRow) -> Result<MemoryEntryResponse,
                     last_observed_at: source.last_observed_at,
                 })
             })
-            .collect::<Result<_, MemoryError>>()?,
+            .collect::<Result<_, MemoryError>>()?
+    };
+    Ok(MemoryEntryResponse {
+        id: row.id,
+        user_id: row.user_id,
+        project_id: row.project_id,
+        workspace_key: row.workspace_key,
+        kind: entry_kind(&row.kind)?,
+        stable_key: (!is_deleted).then_some(row.stable_key),
+        fingerprint: row.fingerprint,
+        content,
+        state,
+        pinned: row.pinned,
+        user_edited: row.user_edited,
+        sources,
         supersedes_id: row.supersedes_id,
         conflict_group_id: row.conflict_group_id,
         schema_version: row.schema_version.try_into().map_err(|_| MemoryError::Internal)?,
+        deleted_at: row.deleted_at,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -125,15 +136,13 @@ mod tests {
     use aionui_db::models::MemoryEntryRow;
 
     use super::entry_response;
-    use crate::MemoryError;
-
     #[test]
-    fn content_free_tombstones_never_cross_the_public_library_contract() {
+    fn content_free_tombstones_cross_the_public_contract_without_scrubbed_fields() {
         let result = entry_response(MemoryEntryRow {
             id: "tombstone-1".into(),
             user_id: "user-1".into(),
-            project_id: None,
-            workspace_key: None,
+            project_id: Some("project-1".into()),
+            workspace_key: Some("workspace-1".into()),
             kind: "decision".into(),
             stable_key: "decision".into(),
             fingerprint: "fingerprint".into(),
@@ -151,6 +160,24 @@ mod tests {
             sources: Vec::new(),
         });
 
-        assert_eq!(result.unwrap_err(), MemoryError::NotFound);
+        let response = result.unwrap();
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({
+                "id": "tombstone-1",
+                "user_id": "user-1",
+                "project_id": "project-1",
+                "workspace_key": "workspace-1",
+                "kind": "decision",
+                "fingerprint": "fingerprint",
+                "state": "deleted",
+                "pinned": false,
+                "user_edited": false,
+                "schema_version": 1,
+                "deleted_at": 10,
+                "created_at": 1,
+                "updated_at": 10,
+            }),
+        );
     }
 }

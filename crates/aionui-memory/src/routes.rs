@@ -1269,6 +1269,25 @@ mod tests {
         assert_eq!(tombstone.state, "deleted");
         assert_eq!(tombstone.content, None);
         assert!(tombstone.sources.is_empty());
+        let mut deleted_entries = Request::get("/api/memory/entries?state=deleted")
+            .body(Body::empty())
+            .unwrap();
+        deleted_entries.extensions_mut().insert(current_user());
+        let deleted_response = router.clone().oneshot(deleted_entries).await.unwrap();
+        assert_eq!(deleted_response.status(), StatusCode::OK);
+        let deleted_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(deleted_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let deleted_item = &deleted_json["data"]["items"][0];
+        assert_eq!(deleted_item["id"], "entry-edit");
+        assert_eq!(deleted_item["state"], "deleted");
+        assert_eq!(deleted_item["deleted_at"].is_number(), true);
+        for scrubbed in ["stable_key", "content", "sources"] {
+            assert!(deleted_item.get(scrubbed).is_none(), "{scrubbed} crossed the API");
+        }
 
         let mut cross_user_forget = Request::delete("/api/memory/conversations/conversation-public")
             .body(Body::empty())
@@ -1302,6 +1321,25 @@ mod tests {
         assert_eq!(protected.content, None);
         assert!(protected.sources.is_empty());
         assert!(!protected.pinned && !protected.user_edited);
+        let mut protected_tombstones = Request::get("/api/memory/entries?state=deleted")
+            .body(Body::empty())
+            .unwrap();
+        protected_tombstones.extensions_mut().insert(current_user());
+        let protected_response = router.clone().oneshot(protected_tombstones).await.unwrap();
+        assert_eq!(protected_response.status(), StatusCode::OK);
+        let protected_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(protected_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            protected_json["data"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["id"] == "forget-protected" && entry["state"] == "deleted"),
+        );
         assert!(
             memory
                 .effective_policy("system_default_user", "conversation-public")

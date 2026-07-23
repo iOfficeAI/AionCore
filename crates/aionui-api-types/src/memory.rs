@@ -86,7 +86,7 @@ pub enum MemoryEntryState {
     Deleted,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct MemoryEntryResponse {
     pub id: String,
     pub user_id: String,
@@ -95,20 +95,84 @@ pub struct MemoryEntryResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_key: Option<String>,
     pub kind: MemoryEntryKind,
-    pub stable_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_key: Option<String>,
     pub fingerprint: String,
-    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
     pub state: MemoryEntryState,
     pub pinned: bool,
     pub user_edited: bool,
+    #[serde(default)]
     pub sources: Vec<MemoryEntrySourceResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict_group_id: Option<String>,
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<TimestampMs>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+}
+
+impl Serialize for MemoryEntryResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            id: &'a str,
+            user_id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            project_id: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            workspace_key: Option<&'a str>,
+            kind: &'a MemoryEntryKind,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stable_key: Option<&'a str>,
+            fingerprint: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            content: Option<&'a str>,
+            state: &'a MemoryEntryState,
+            pinned: bool,
+            user_edited: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sources: Option<&'a [MemoryEntrySourceResponse]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            supersedes_id: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            conflict_group_id: Option<&'a str>,
+            schema_version: u32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            deleted_at: Option<TimestampMs>,
+            created_at: TimestampMs,
+            updated_at: TimestampMs,
+        }
+
+        Wire {
+            id: &self.id,
+            user_id: &self.user_id,
+            project_id: self.project_id.as_deref(),
+            workspace_key: self.workspace_key.as_deref(),
+            kind: &self.kind,
+            stable_key: self.stable_key.as_deref(),
+            fingerprint: &self.fingerprint,
+            content: self.content.as_deref(),
+            state: &self.state,
+            pinned: self.pinned,
+            user_edited: self.user_edited,
+            sources: (!matches!(self.state, MemoryEntryState::Deleted)).then_some(self.sources.as_slice()),
+            supersedes_id: self.supersedes_id.as_deref(),
+            conflict_group_id: self.conflict_group_id.as_deref(),
+            schema_version: self.schema_version,
+            deleted_at: self.deleted_at,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+        .serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -546,10 +610,37 @@ mod tests {
         });
 
         assert!(serde_json::from_value::<MemoryEntryResponse>(valid.clone()).is_ok());
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<MemoryEntryResponse>(valid.clone()).unwrap()).unwrap(),
+            valid,
+        );
 
         let mut unsupported_kind = valid;
         unsupported_kind["kind"] = json!("unsupported");
         assert!(serde_json::from_value::<MemoryEntryResponse>(unsupported_kind).is_err());
+    }
+
+    #[test]
+    fn deleted_entry_response_omits_scrubbed_fields_and_retains_tombstone_identity() {
+        let tombstone = json!({
+            "id": "mem_deleted",
+            "user_id": "user_1",
+            "project_id": "project_1",
+            "workspace_key": "workspace_1",
+            "kind": "decision",
+            "fingerprint": "fp_deleted",
+            "state": "deleted",
+            "pinned": false,
+            "user_edited": false,
+            "schema_version": 1,
+            "deleted_at": 42,
+            "created_at": 1,
+            "updated_at": 42,
+        });
+
+        let response: MemoryEntryResponse = serde_json::from_value(tombstone.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(response).unwrap(), tombstone);
     }
 
     #[test]

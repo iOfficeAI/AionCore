@@ -158,7 +158,7 @@ async fn legacy_send_payload_without_memory_fields_remains_accepted() {
 }
 
 #[tokio::test]
-async fn deleting_conversation_removes_exclusive_memory_and_preserves_shared_memory() {
+async fn deleting_conversation_handles_exclusive_protected_and_shared_memory() {
     // The mock-agent builder reconstructs ConversationService through
     // `with_worker_task_manager`, covering lifecycle-hook reinjection.
     let (mut app, services) = build_app_with_mock_agents().await;
@@ -173,8 +173,10 @@ async fn deleting_conversation_removes_exclusive_memory_and_preserves_shared_mem
              schema_version,created_at,updated_at)
          VALUES
             ('exclusive-entry',?,'decision','exclusive','exclusive-fp','exclusive content','active',0,0,1,1,1),
+            ('protected-exclusive-entry',?,'decision','protected','protected-fp','protected content','active',1,0,1,1,1),
             ('shared-entry',?,'decision','shared','shared-fp','shared content','active',0,0,1,1,1)",
     )
+    .bind(user_id)
     .bind(user_id)
     .bind(user_id)
     .execute(services.database.pool())
@@ -185,9 +187,11 @@ async fn deleting_conversation_removes_exclusive_memory_and_preserves_shared_mem
             (memory_entry_id,conversation_id,turn_id,message_ids_json,first_observed_at,last_observed_at)
          VALUES
             ('exclusive-entry',?,'turn-exclusive','[]',1,1),
+            ('protected-exclusive-entry',?,'turn-protected','[]',1,1),
             ('shared-entry',?,'turn-deleted','[]',1,1),
             ('shared-entry',?,'turn-retained','[]',1,1)",
     )
+    .bind(&deleted_id)
     .bind(&deleted_id)
     .bind(&deleted_id)
     .bind(&retained_id)
@@ -196,6 +200,7 @@ async fn deleting_conversation_removes_exclusive_memory_and_preserves_shared_mem
     .unwrap();
 
     let response = app
+        .clone()
         .oneshot(delete_with_token(
             &format!("/api/conversations/{deleted_id}"),
             &token,
@@ -223,6 +228,24 @@ async fn deleting_conversation_removes_exclusive_memory_and_preserves_shared_mem
     assert!(!exclusive_exists);
     assert_eq!(shared_state, "active");
     assert_eq!(shared_sources, vec![retained_id]);
+
+    let deleted = app
+        .oneshot(get_with_token("/api/memory/entries?state=deleted", &token))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let deleted_json = body_json(deleted).await;
+    let protected = deleted_json["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "protected-exclusive-entry")
+        .unwrap();
+    assert_eq!(protected["state"], "deleted");
+    assert!(protected["deleted_at"].is_number());
+    for scrubbed in ["stable_key", "content", "sources"] {
+        assert!(protected.get(scrubbed).is_none(), "{scrubbed} crossed the API");
+    }
 }
 
 #[tokio::test]

@@ -475,13 +475,6 @@ impl MemoryService {
         validate_entry_query(&query)?;
         let offset = parse_cursor(query.cursor.as_deref())?;
         let limit = query.limit.unwrap_or(50).clamp(1, 100) as usize;
-        if matches!(query.state.as_ref(), Some(aionui_api_types::MemoryEntryState::Deleted)) {
-            return Ok(PaginatedResult {
-                items: Vec::new(),
-                total: 0,
-                has_more: false,
-            });
-        }
         let offset_u32 = offset.try_into().map_err(|_| MemoryError::InvalidInput)?;
         let db_query = MemoryEntryQueryRow {
             search: normalized_filter(query.search)?,
