@@ -247,6 +247,8 @@ impl MemoryService {
                     user_id: user_id.into(),
                     project_id: target.project_id.clone(),
                     workspace_key: target.workspace_key.clone(),
+                    current_conversation_id: Some(conversation_id.into()),
+                    reset_at: policy.reset_at,
                     limit: MAX_RETRIEVAL_CANDIDATES,
                 })
                 .await
@@ -282,6 +284,8 @@ impl MemoryService {
                     user_id: user_id.into(),
                     project_id: target.project_id.clone(),
                     workspace_key: target.workspace_key.clone(),
+                    current_conversation_id: Some(conversation_id.into()),
+                    reset_at: policy.reset_at,
                     limit: MAX_SUMMARY_CANDIDATES,
                 })
                 .await
@@ -1167,6 +1171,8 @@ impl MemoryService {
                 user_id: user_id.into(),
                 project_id: unscoped.conversation.project_id,
                 workspace_key: unscoped.conversation.workspace_key,
+                current_conversation_id: None,
+                reset_at: None,
                 limit: MAX_EXISTING_ENTRIES as u32,
             })
             .await
@@ -3795,6 +3801,7 @@ mod tests {
         assert!(block.contains("trust=\"untrusted\""));
         assert!(block.contains("Rust ranking decision"));
         assert!(!block.contains("weather report"));
+        assert_eq!(crate::ranking::estimate_tokens(&block), second.estimated_tokens);
         assert_eq!(
             fixture
                 .service

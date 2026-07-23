@@ -3,6 +3,9 @@ use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::prompt_block::PromptBlockBuilder;
+use crate::retrieval::RETRIEVAL_POLICY_VERSION;
+
 pub(crate) const MAX_SELECTED_ENTRIES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,21 +59,24 @@ pub(crate) fn select_entries(
         )
     });
 
-    let mut estimated_tokens = 0_u32;
     let mut entries = Vec::new();
+    let mut estimated_tokens = 0_u32;
     for scored in scored {
         if entries.len() >= MAX_SELECTED_ENTRIES {
             break;
         }
-        let Some(content) = scored.entry.content.as_deref() else {
+        let mut candidate_entries = entries.clone();
+        candidate_entries.push(scored.entry);
+        let Some(block) =
+            PromptBlockBuilder::build_canonical(RETRIEVAL_POLICY_VERSION, &candidate_entries, context.budget_tokens)
+        else {
             continue;
         };
-        let tokens = estimate_tokens(content);
-        if tokens == 0 || estimated_tokens.saturating_add(tokens) > context.budget_tokens {
+        if block.entry_ids.len() != candidate_entries.len() {
             continue;
         }
-        estimated_tokens += tokens;
-        entries.push(scored.entry);
+        entries = candidate_entries;
+        estimated_tokens = block.estimated_tokens;
     }
     RankedSelection {
         entries,
@@ -109,10 +115,11 @@ fn score_entry(
         return None;
     }
 
+    let exact_scope = entry.project_id == context.project_id && entry.workspace_key == context.workspace_key;
     let project_match = context.project_id.is_some() && entry.project_id == context.project_id;
     let workspace_match = context.workspace_key.is_some() && entry.workspace_key == context.workspace_key;
     let global = entry.project_id.is_none() && entry.workspace_key.is_none();
-    let scope_rank = if project_match && workspace_match {
+    let scope_rank = if exact_scope {
         0
     } else if project_match || workspace_match {
         1
@@ -186,6 +193,7 @@ mod tests {
     use aionui_db::models::{MemoryEntryRow, MemorySourceRow};
 
     use super::{MAX_SELECTED_ENTRIES, RankingContext, estimate_tokens, retrieval_budget, select_entries};
+    use crate::prompt_block::PromptBlockBuilder;
 
     fn source(entry: &str, conversation: &str) -> MemorySourceRow {
         MemorySourceRow {
@@ -260,6 +268,41 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["exact", "relevant"],
         );
+    }
+
+    #[test]
+    fn exact_optional_scope_tuple_precedes_a_sibling_dimension() {
+        for (project_id, workspace_key, exact_project, exact_workspace, sibling_project, sibling_workspace) in [
+            (
+                Some("project-1"),
+                None,
+                Some("project-1"),
+                None,
+                Some("project-1"),
+                Some("sibling-workspace"),
+            ),
+            (
+                None,
+                Some("workspace-1"),
+                None,
+                Some("workspace-1"),
+                Some("sibling-project"),
+                Some("workspace-1"),
+            ),
+        ] {
+            let mut exact = entry("z-exact", "needle");
+            exact.project_id = exact_project.map(str::to_owned);
+            exact.workspace_key = exact_workspace.map(str::to_owned);
+            let mut sibling = entry("a-sibling", "needle");
+            sibling.project_id = sibling_project.map(str::to_owned);
+            sibling.workspace_key = sibling_workspace.map(str::to_owned);
+            let mut ranking_context = context(2_000);
+            ranking_context.project_id = project_id.map(str::to_owned);
+            ranking_context.workspace_key = workspace_key.map(str::to_owned);
+
+            let selected = select_entries("needle", vec![sibling, exact], &ranking_context);
+            assert_eq!(selected.entries[0].id, "z-exact");
+        }
     }
 
     #[test]
@@ -344,11 +387,43 @@ mod tests {
     fn selection_never_partially_truncates_an_entry() {
         let first = entry("first", "needle compact");
         let second = entry("second", &format!("needle {}", "x".repeat(300)));
-        let budget = estimate_tokens(first.content.as_deref().unwrap());
+        let budget = estimate_tokens(
+            &PromptBlockBuilder::build("memory-retrieval-v1", std::slice::from_ref(&first), 2_000).unwrap(),
+        );
         let selected = select_entries("needle", vec![second, first], &context(budget));
         assert_eq!(selected.entries.len(), 1);
         assert_eq!(selected.entries[0].id, "first");
         assert!(selected.estimated_tokens <= budget);
+    }
+
+    #[test]
+    fn selection_budgets_the_canonical_envelope_and_continues_after_an_oversized_entry() {
+        let compact = entry("compact", "needle");
+        let compact_block = PromptBlockBuilder::build("memory-retrieval-v1", std::slice::from_ref(&compact), 2_000)
+            .expect("compact block");
+        let budget = estimate_tokens(&compact_block);
+        let oversized_content = (1..budget as usize * 3)
+            .map(|length| format!("needle {}", "x".repeat(length)))
+            .find(|content| {
+                let candidate = entry("oversized", content);
+                estimate_tokens(content) <= budget
+                    && PromptBlockBuilder::build("memory-retrieval-v1", &[candidate], budget).is_none()
+            })
+            .expect("content that fits alone but not in its canonical line");
+        let mut oversized = entry("oversized", &oversized_content);
+        oversized.pinned = true;
+
+        let selected = select_entries("needle", vec![oversized, compact], &context(budget));
+        assert_eq!(
+            selected
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["compact"]
+        );
+        let final_block = PromptBlockBuilder::build("memory-retrieval-v1", &selected.entries, budget).unwrap();
+        assert_eq!(selected.estimated_tokens, estimate_tokens(&final_block));
     }
 
     #[test]

@@ -400,6 +400,8 @@ pub struct MemoryCandidateQueryRow {
     pub user_id: String,
     pub project_id: Option<String>,
     pub workspace_key: Option<String>,
+    pub current_conversation_id: Option<String>,
+    pub reset_at: Option<TimestampMs>,
     pub limit: u32,
 }
 
