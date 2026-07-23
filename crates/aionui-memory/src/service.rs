@@ -1,5 +1,6 @@
 //! Memory domain business operations.
 
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -9,12 +10,12 @@ use aionui_api_types::{
     AppOperationsModelHealth, CompleteMemoryJobRequest, ConversationMemoryPolicy, ListMemoryChangeSetsQuery,
     ListMemoryEntriesQuery, MemoryAppOperationsReadiness, MemoryChangeSetListResponse, MemoryEntryListResponse,
     MemoryEntryResponse, MemoryJobFailureCode, MemoryJobHealthSummary, MemoryJobResponse, MemoryJobState,
-    MemorySettings, MemorySourceMessageRole, MemoryStatus, MemorySummary, MemoryUpdateInput,
+    MemoryRetrievalPreview, MemorySettings, MemorySourceMessageRole, MemoryStatus, MemorySummary, MemoryUpdateInput,
     NormalizedMemoryJobFailure, ResolveMemoryEntryConflictRequest, ResolveMemoryEntryConflictResponse,
     UpdateConversationMemoryPolicyRequest, UpdateMemoryEntryRequest, UpdateMemorySettingsRequest,
 };
 use aionui_common::{PaginatedResult, generate_prefixed_id, now_ms};
-use aionui_db::models::{MemoryEntryRow, MemoryJobRow};
+use aionui_db::models::{MemoryEntryRow, MemoryJobRow, MemoryRetrievalRow};
 use aionui_db::{
     ClaimMemoryJobRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow,
     FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, IConversationRepository, IMemoryRepository,
@@ -30,7 +31,13 @@ use crate::{
     AppOperationsReadinessPort, EvidenceBuildRequest, MemoryError, MemoryTurnOutcome,
     evidence::EvidenceBuilder,
     jobs::{ClaimedMemoryJob, job_response},
+    prompt_block::PromptBlockBuilder,
+    ranking::{RankingContext, retrieval_budget, select_entries},
     reconciliation::Reconciler,
+    retrieval::{
+        MAX_RETRIEVAL_CANDIDATES, MAX_SELECTED_ENTRIES, RETRIEVAL_POLICY_VERSION, RETRIEVAL_TTL_MS, RetrievalTarget,
+        preview_from_rows, prompt_hash,
+    },
     sanitizer::{
         MAX_EVIDENCE_BYTES, MAX_EVIDENCE_MESSAGES, MAX_EVIDENCE_TURNS, MAX_EXISTING_ENTRIES, OPERATION_VERSION,
     },
@@ -176,6 +183,213 @@ impl MemoryService {
             last_successful_update_at,
             jobs,
         })
+    }
+
+    /// Creates a short-lived immutable retrieval preview from canonical Memory rows.
+    pub async fn create_retrieval(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        prompt: &str,
+    ) -> Result<MemoryRetrievalPreview, MemoryError> {
+        validate_retrieval_input(conversation_id, prompt)?;
+        let dependencies = self.job_dependencies()?;
+        let conversation = dependencies
+            .conversations
+            .get(conversation_id)
+            .await
+            .map_err(map_db_error)?
+            .filter(|conversation| conversation.user_id == user_id)
+            .ok_or(MemoryError::NotFound)?;
+        let policy = dependencies
+            .memory
+            .effective_policy(user_id, conversation_id)
+            .await
+            .map_err(map_db_error)?;
+        let mut target = RetrievalTarget::from_conversation(&conversation);
+        if let Some(memory) = dependencies
+            .memory
+            .get_conversation_memory(user_id, conversation_id)
+            .await
+            .map_err(map_db_error)?
+        {
+            target.project_id = memory.project_id.or(target.project_id);
+            target.workspace_key = memory.workspace_key.or(target.workspace_key);
+        }
+        let budget_tokens = retrieval_budget(target.context_capacity);
+        let now = now_ms();
+        let ranked = if policy.enabled && policy.recall_enabled {
+            let candidates = dependencies
+                .memory
+                .retrieval_candidates(MemoryCandidateQueryRow {
+                    user_id: user_id.into(),
+                    project_id: target.project_id.clone(),
+                    workspace_key: target.workspace_key.clone(),
+                    limit: MAX_RETRIEVAL_CANDIDATES,
+                })
+                .await
+                .map_err(map_db_error)?;
+            select_entries(
+                prompt,
+                candidates,
+                &RankingContext {
+                    project_id: target.project_id,
+                    workspace_key: target.workspace_key,
+                    current_conversation_id: conversation_id.into(),
+                    reset_at: policy.reset_at,
+                    now,
+                    budget_tokens,
+                },
+            )
+        } else {
+            crate::ranking::RankedSelection {
+                entries: Vec::new(),
+                estimated_tokens: 0,
+            }
+        };
+        let built = PromptBlockBuilder::build_canonical(RETRIEVAL_POLICY_VERSION, &ranked.entries, budget_tokens);
+        let selected_ids = built.as_ref().map(|block| block.entry_ids.clone()).unwrap_or_default();
+        let selected = ranked
+            .entries
+            .into_iter()
+            .filter(|entry| selected_ids.iter().any(|id| id == &entry.id))
+            .collect::<Vec<_>>();
+        let estimated_tokens = built.as_ref().map_or(0, |block| block.estimated_tokens);
+        let row = MemoryRetrievalRow {
+            id: generate_prefixed_id("memory-retrieval"),
+            user_id: user_id.into(),
+            conversation_id: conversation_id.into(),
+            prompt_hash: prompt_hash(prompt),
+            selected_ids_json: serde_json::to_string(&selected_ids).map_err(|_| MemoryError::Internal)?,
+            estimated_tokens: estimated_tokens.into(),
+            budget_tokens: budget_tokens.into(),
+            retrieval_version: RETRIEVAL_POLICY_VERSION.into(),
+            created_at: now,
+            expires_at: now + RETRIEVAL_TTL_MS,
+        };
+        let row = dependencies.memory.create_retrieval(row).await.map_err(map_db_error)?;
+        debug!(
+            user_id,
+            conversation_id,
+            retrieval_id = row.id,
+            selected_count = selected.len(),
+            policy_version = RETRIEVAL_POLICY_VERSION,
+            "Memory retrieval preview created"
+        );
+        preview_from_rows(&row, &selected)
+    }
+
+    /// Revalidates an immutable preview and returns the canonical untrusted block.
+    pub async fn build_recall_block(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        prompt: &str,
+        retrieval_id: &str,
+        excluded_memory_ids: &[String],
+    ) -> Result<Option<String>, MemoryError> {
+        validate_retrieval_input(conversation_id, prompt)?;
+        if retrieval_id.is_empty()
+            || retrieval_id.len() > 200
+            || excluded_memory_ids.len() > MAX_SELECTED_ENTRIES
+            || excluded_memory_ids.iter().any(|id| id.is_empty() || id.len() > 200)
+        {
+            return Err(MemoryError::InvalidInput);
+        }
+        let dependencies = self.job_dependencies()?;
+        let now = now_ms();
+        dependencies
+            .memory
+            .delete_expired_retrievals(now)
+            .await
+            .map_err(map_db_error)?;
+        let retrieval = dependencies
+            .memory
+            .get_retrieval(user_id, retrieval_id)
+            .await
+            .map_err(map_db_error)?
+            .ok_or(MemoryError::NotFound)?;
+        if retrieval.conversation_id != conversation_id
+            || retrieval.expires_at <= now
+            || retrieval.prompt_hash != prompt_hash(prompt)
+            || retrieval.retrieval_version != RETRIEVAL_POLICY_VERSION
+        {
+            return Err(MemoryError::Conflict);
+        }
+        let conversation = dependencies
+            .conversations
+            .get(conversation_id)
+            .await
+            .map_err(map_db_error)?
+            .filter(|conversation| conversation.user_id == user_id)
+            .ok_or(MemoryError::NotFound)?;
+        let policy = dependencies
+            .memory
+            .effective_policy(user_id, conversation_id)
+            .await
+            .map_err(map_db_error)?;
+        if !policy.enabled || !policy.recall_enabled {
+            return Ok(None);
+        }
+        let selected_ids: Vec<String> =
+            serde_json::from_str(&retrieval.selected_ids_json).map_err(|_| MemoryError::Internal)?;
+        if selected_ids.len() > MAX_SELECTED_ENTRIES {
+            return Err(MemoryError::Internal);
+        }
+        let excluded = excluded_memory_ids.iter().collect::<BTreeSet<_>>();
+        let mut entries = Vec::new();
+        for id in &selected_ids {
+            if excluded.contains(id) {
+                continue;
+            }
+            let Some(entry) = dependencies.memory.get_entry(user_id, id).await.map_err(map_db_error)? else {
+                continue;
+            };
+            entries.push(entry);
+        }
+        let mut target = RetrievalTarget::from_conversation(&conversation);
+        if let Some(memory) = dependencies
+            .memory
+            .get_conversation_memory(user_id, conversation_id)
+            .await
+            .map_err(map_db_error)?
+        {
+            target.project_id = memory.project_id.or(target.project_id);
+            target.workspace_key = memory.workspace_key.or(target.workspace_key);
+        }
+        let budget_tokens: u32 = retrieval.budget_tokens.try_into().map_err(|_| MemoryError::Internal)?;
+        let eligible = select_entries(
+            prompt,
+            entries.clone(),
+            &RankingContext {
+                project_id: target.project_id,
+                workspace_key: target.workspace_key,
+                current_conversation_id: conversation_id.into(),
+                reset_at: policy.reset_at,
+                now,
+                budget_tokens,
+            },
+        );
+        let eligible_by_id = eligible
+            .entries
+            .into_iter()
+            .map(|entry| (entry.id.clone(), entry))
+            .collect::<HashMap<_, _>>();
+        let canonical = selected_ids
+            .iter()
+            .filter_map(|id| eligible_by_id.get(id).cloned())
+            .collect::<Vec<_>>();
+        let block = PromptBlockBuilder::build(RETRIEVAL_POLICY_VERSION, &canonical, budget_tokens);
+        debug!(
+            user_id,
+            conversation_id,
+            retrieval_id,
+            selected_count = canonical.len(),
+            excluded_count = excluded_memory_ids.len(),
+            policy_version = RETRIEVAL_POLICY_VERSION,
+            "Memory retrieval preview consumed"
+        );
+        Ok(block)
     }
 
     pub async fn list_entries(
@@ -1351,6 +1565,17 @@ fn validate_content(value: String) -> Result<String, MemoryError> {
         return Err(MemoryError::InvalidInput);
     }
     Ok(value.to_owned())
+}
+
+fn validate_retrieval_input(conversation_id: &str, prompt: &str) -> Result<(), MemoryError> {
+    if conversation_id.trim().is_empty()
+        || conversation_id.len() > 200
+        || prompt.trim().is_empty()
+        || prompt.len() > 32 * 1024
+    {
+        return Err(MemoryError::InvalidInput);
+    }
+    Ok(())
 }
 
 fn parse_cursor(value: Option<&str>) -> Result<usize, MemoryError> {
@@ -3335,6 +3560,225 @@ mod tests {
             readiness,
             _db: db,
         }
+    }
+
+    async fn insert_retrieval_entry(
+        fixture: &Fixture,
+        id: &str,
+        content: &str,
+        state: &str,
+        source_conversation_id: &str,
+        updated_at: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO memory_entries
+                (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,revision,
+                 schema_version,created_at,updated_at)
+             VALUES (?,?,'decision',?,?,?, ?,0,0,1,1,?,?)",
+        )
+        .bind(id)
+        .bind(USER_ID)
+        .bind(id)
+        .bind(format!("fp-{id}"))
+        .bind(content)
+        .bind(state)
+        .bind(updated_at)
+        .bind(updated_at)
+        .execute(fixture._db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_sources
+                (memory_entry_id,conversation_id,turn_id,message_ids_json,first_observed_at,last_observed_at)
+             VALUES (?,?,?,'[]',?,?)",
+        )
+        .bind(id)
+        .bind(source_conversation_id)
+        .bind(format!("turn-{id}"))
+        .bind(updated_at)
+        .bind(updated_at)
+        .execute(fixture._db.pool())
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retrieval_preview_is_bounded_replaced_and_canonically_revalidated() {
+        let fixture = fixture(true).await;
+        fixture
+            .conversations
+            .create(&conversation_with_id("source-conversation"))
+            .await
+            .unwrap();
+        let observed_at = aionui_common::now_ms();
+        insert_retrieval_entry(
+            &fixture,
+            "relevant",
+            "Rust ranking decision",
+            "active",
+            "source-conversation",
+            observed_at,
+        )
+        .await;
+        insert_retrieval_entry(
+            &fixture,
+            "irrelevant",
+            "weather report",
+            "active",
+            "source-conversation",
+            observed_at,
+        )
+        .await;
+        insert_retrieval_entry(
+            &fixture,
+            "current-only",
+            "Rust ranking current",
+            "active",
+            "conversation-1",
+            observed_at,
+        )
+        .await;
+        insert_retrieval_entry(
+            &fixture,
+            "conflict",
+            "Rust ranking conflict",
+            "conflict",
+            "source-conversation",
+            observed_at,
+        )
+        .await;
+
+        let first = fixture
+            .service
+            .create_retrieval(USER_ID, "conversation-1", "rust ranking")
+            .await
+            .unwrap();
+        assert_eq!(
+            first.entries.iter().map(|entry| entry.id.as_str()).collect::<Vec<_>>(),
+            ["relevant"]
+        );
+        assert!(first.estimated_tokens <= 2_000);
+
+        let second = fixture
+            .service
+            .create_retrieval(USER_ID, "conversation-1", "rust ranking")
+            .await
+            .unwrap();
+        assert_ne!(first.retrieval_id, second.retrieval_id);
+        let preview_count: i64 = sqlx::query_scalar("SELECT count(*) FROM memory_retrievals")
+            .fetch_one(fixture._db.pool())
+            .await
+            .unwrap();
+        assert_eq!(preview_count, 1, "repeated typing must replace the unconsumed preview");
+        assert!(
+            fixture
+                .memory
+                .get_retrieval(USER_ID, &first.retrieval_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(
+            fixture
+                .service
+                .build_recall_block(
+                    USER_ID,
+                    "conversation-1",
+                    "rust ranking",
+                    &second.retrieval_id,
+                    &["relevant".into()],
+                )
+                .await
+                .unwrap(),
+            None,
+        );
+        let block = fixture
+            .service
+            .build_recall_block(USER_ID, "conversation-1", "rust ranking", &second.retrieval_id, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(block.contains("trust=\"untrusted\""));
+        assert!(block.contains("Rust ranking decision"));
+        assert!(!block.contains("weather report"));
+        assert_eq!(
+            fixture
+                .service
+                .build_recall_block(USER_ID, "conversation-1", "changed", &second.retrieval_id, &[])
+                .await,
+            Err(MemoryError::Conflict),
+        );
+
+        sqlx::query("UPDATE memory_entries SET state = 'superseded' WHERE id = 'relevant'")
+            .execute(fixture._db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .service
+                .build_recall_block(USER_ID, "conversation-1", "rust ranking", &second.retrieval_id, &[])
+                .await
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieval_enforces_owner_conversation_expiry_and_recall_policy() {
+        let fixture = fixture(true).await;
+        let preview = fixture
+            .service
+            .create_retrieval(USER_ID, "conversation-1", "anything")
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .service
+                .build_recall_block("another-user", "conversation-1", "anything", &preview.retrieval_id, &[])
+                .await,
+            Err(MemoryError::NotFound),
+        );
+        assert_eq!(
+            fixture
+                .service
+                .build_recall_block(USER_ID, "other-conversation", "anything", &preview.retrieval_id, &[])
+                .await,
+            Err(MemoryError::Conflict),
+        );
+
+        fixture
+            .service
+            .update_conversation_policy(
+                USER_ID,
+                "conversation-1",
+                aionui_api_types::UpdateConversationMemoryPolicyRequest {
+                    capture_enabled: None,
+                    recall_enabled: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .service
+                .build_recall_block(USER_ID, "conversation-1", "anything", &preview.retrieval_id, &[])
+                .await
+                .unwrap(),
+            None,
+        );
+        sqlx::query("UPDATE memory_retrievals SET expires_at = 0 WHERE id = ?")
+            .bind(&preview.retrieval_id)
+            .execute(fixture._db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .service
+                .build_recall_block(USER_ID, "conversation-1", "anything", &preview.retrieval_id, &[])
+                .await,
+            Err(MemoryError::NotFound),
+        );
     }
 
     fn completion_with_mutations(

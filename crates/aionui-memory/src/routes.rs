@@ -9,12 +9,13 @@ use axum::routing::{delete, get, post};
 
 use aionui_api_types::{
     ApiResponse, ClaimMemoryJobRequest, ClaimMemoryJobResponse, CompleteMemoryJobRequest, ConversationMemoryPolicy,
-    DeleteMemoryEntryResponse, ListMemoryChangeSetsQuery, ListMemoryEntriesQuery, MemoryChangeSetListResponse,
-    MemoryEntryListResponse, MemoryEntryResponse, MemoryEntryState, MemoryJobEvidenceResponse, MemorySettings,
-    MemoryStatus, RecordMemoryJobFailureRequest, RecordMemoryJobFailureResponse, ReleaseMemoryJobLeaseRequest,
-    ReleaseMemoryJobLeaseResponse, RenewMemoryJobLeaseRequest, RenewMemoryJobLeaseResponse,
-    ResolveMemoryEntryConflictRequest, ResolveMemoryEntryConflictResponse, RetryMemoryJobResponse,
-    UpdateConversationMemoryPolicyRequest, UpdateMemoryEntryRequest, UpdateMemorySettingsRequest,
+    CreateMemoryRetrievalRequest, DeleteMemoryEntryResponse, ListMemoryChangeSetsQuery, ListMemoryEntriesQuery,
+    MemoryChangeSetListResponse, MemoryEntryListResponse, MemoryEntryResponse, MemoryEntryState,
+    MemoryJobEvidenceResponse, MemoryRetrievalPreview, MemorySettings, MemoryStatus, RecordMemoryJobFailureRequest,
+    RecordMemoryJobFailureResponse, ReleaseMemoryJobLeaseRequest, ReleaseMemoryJobLeaseResponse,
+    RenewMemoryJobLeaseRequest, RenewMemoryJobLeaseResponse, ResolveMemoryEntryConflictRequest,
+    ResolveMemoryEntryConflictResponse, RetryMemoryJobResponse, UpdateConversationMemoryPolicyRequest,
+    UpdateMemoryEntryRequest, UpdateMemorySettingsRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -36,6 +37,7 @@ pub fn memory_routes(state: MemoryRouterState) -> Router {
         )
         .route("/api/memory/entries/{id}/resolve-conflict", post(resolve_conflict))
         .route("/api/memory/change-sets", get(list_change_sets))
+        .route("/api/memory/retrievals", post(create_retrieval))
         .route(
             "/api/conversations/{id}/memory-policy",
             get(get_conversation_policy).put(update_conversation_policy),
@@ -50,6 +52,20 @@ pub fn memory_routes(state: MemoryRouterState) -> Router {
         .route("/api/memory/internal/jobs/{id}/complete", post(complete))
         .route("/api/memory/internal/jobs/{id}/fail", post(fail))
         .with_state(state)
+}
+
+async fn create_retrieval(
+    State(state): State<MemoryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<CreateMemoryRetrievalRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<MemoryRetrievalPreview>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .create_retrieval(&user.id, &request.conversation_id, &request.prompt)
+            .await?,
+    )))
 }
 
 async fn get_settings(
@@ -408,6 +424,97 @@ mod tests {
                 StatusCode::BAD_REQUEST,
             );
         }
+    }
+
+    #[tokio::test]
+    async fn retrieval_route_uses_authenticated_owner_and_rejects_invalid_input() {
+        let db = init_database_memory().await.unwrap();
+        let conversations = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+        conversations
+            .create(&ConversationRow {
+                id: "conversation-retrieval".into(),
+                user_id: "system_default_user".into(),
+                name: "Conversation".into(),
+                r#type: "gemini".into(),
+                extra: "{}".into(),
+                model: None,
+                status: Some("finished".into()),
+                source: Some("aionui".into()),
+                channel_chat_id: None,
+                pinned: false,
+                pinned_at: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        let memory = Arc::new(SqliteMemoryRepository::new(db.pool().clone()));
+        memory
+            .update_settings(UpdateMemorySettingsRow {
+                user_id: "system_default_user".into(),
+                enabled: Some(true),
+                default_capture: None,
+                default_recall: Some(true),
+                consent_version: Some(1),
+                now: 1,
+            })
+            .await
+            .unwrap();
+        let router = memory_routes(MemoryRouterState {
+            service: Arc::new(MemoryService::with_job_dependencies(
+                memory,
+                conversations,
+                Arc::new(UsableReadiness),
+            )),
+        });
+        let request = |user_id: &str, body: &'static str| {
+            let mut request = Request::post("/api/memory/retrievals")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            request.extensions_mut().insert(CurrentUser {
+                id: user_id.into(),
+                username: "user".into(),
+            });
+            request
+        };
+        let response = router
+            .clone()
+            .oneshot(request(
+                "system_default_user",
+                r#"{"conversation_id":"conversation-retrieval","prompt":"current work"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["conversation_id"], "conversation-retrieval");
+        assert_eq!(json["data"]["entries"], serde_json::json!([]));
+
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(request(
+                    "system_default_user",
+                    r#"{"conversation_id":"conversation-retrieval","prompt":" "}"#,
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            router
+                .oneshot(request(
+                    "another-user",
+                    r#"{"conversation_id":"conversation-retrieval","prompt":"current work"}"#,
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND,
+        );
     }
 
     #[tokio::test]

@@ -3191,10 +3191,9 @@ impl IMemoryRepository for SqliteMemoryRepository {
         let rows = sqlx::query_as::<_, MemoryEntryDbRow>(
             "SELECT * FROM memory_entries
              WHERE user_id = ? AND state = 'active'
-               AND ((? IS NULL AND project_id IS NULL)
-                    OR (? IS NOT NULL AND (project_id IS NULL OR project_id = ?)))
-               AND ((? IS NULL AND workspace_key IS NULL)
-                    OR (? IS NOT NULL AND (workspace_key IS NULL OR workspace_key = ?)))
+               AND ((project_id IS NULL AND workspace_key IS NULL)
+                    OR (? IS NOT NULL AND project_id = ?)
+                    OR (? IS NOT NULL AND workspace_key = ?))
              ORDER BY
                CASE WHEN project_id = ? THEN 0 WHEN workspace_key = ? THEN 1 ELSE 2 END,
                pinned DESC, user_edited DESC, updated_at DESC, id
@@ -3203,8 +3202,6 @@ impl IMemoryRepository for SqliteMemoryRepository {
         .bind(&query.user_id)
         .bind(&query.project_id)
         .bind(&query.project_id)
-        .bind(&query.project_id)
-        .bind(&query.workspace_key)
         .bind(&query.workspace_key)
         .bind(&query.workspace_key)
         .bind(&query.project_id)
@@ -3282,25 +3279,52 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 .await?
                 .ok_or_else(|| DbError::NotFound(format!("Memory entry '{entry_id}' not found")))?;
         }
-        sqlx::query(
-            "INSERT INTO memory_retrievals
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let result = async {
+            sqlx::query("DELETE FROM memory_retrievals WHERE expires_at <= ?")
+                .bind(retrieval.created_at)
+                .execute(&mut *connection)
+                .await?;
+            sqlx::query(
+                "DELETE FROM memory_retrievals
+                 WHERE user_id = ? AND conversation_id = ? AND prompt_hash = ? AND retrieval_version = ?",
+            )
+            .bind(&retrieval.user_id)
+            .bind(&retrieval.conversation_id)
+            .bind(&retrieval.prompt_hash)
+            .bind(&retrieval.retrieval_version)
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query(
+                "INSERT INTO memory_retrievals
                 (id, user_id, conversation_id, prompt_hash, selected_ids_json, estimated_tokens, budget_tokens,
                  retrieval_version, created_at, expires_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&retrieval.id)
-        .bind(&retrieval.user_id)
-        .bind(&retrieval.conversation_id)
-        .bind(&retrieval.prompt_hash)
-        .bind(&retrieval.selected_ids_json)
-        .bind(retrieval.estimated_tokens)
-        .bind(retrieval.budget_tokens)
-        .bind(&retrieval.retrieval_version)
-        .bind(retrieval.created_at)
-        .bind(retrieval.expires_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(retrieval)
+            )
+            .bind(&retrieval.id)
+            .bind(&retrieval.user_id)
+            .bind(&retrieval.conversation_id)
+            .bind(&retrieval.prompt_hash)
+            .bind(&retrieval.selected_ids_json)
+            .bind(retrieval.estimated_tokens)
+            .bind(retrieval.budget_tokens)
+            .bind(&retrieval.retrieval_version)
+            .bind(retrieval.created_at)
+            .bind(retrieval.expires_at)
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query("COMMIT").execute(&mut *connection).await?;
+            Ok::<_, DbError>(())
+        }
+        .await;
+        match result {
+            Ok(()) => Ok(retrieval),
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
     }
 
     async fn get_retrieval(&self, user_id: &str, retrieval_id: &str) -> Result<Option<MemoryRetrievalRow>, DbError> {
@@ -3314,6 +3338,14 @@ impl IMemoryRepository for SqliteMemoryRepository {
             ))),
             row => Ok(row),
         }
+    }
+
+    async fn delete_expired_retrievals(&self, now: TimestampMs) -> Result<u64, DbError> {
+        Ok(sqlx::query("DELETE FROM memory_retrievals WHERE expires_at <= ?")
+            .bind(now)
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
     }
 
     async fn get_import_state(&self, user_id: &str) -> Result<Option<MemoryImportStateRow>, DbError> {
@@ -3351,7 +3383,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
 #[cfg(test)]
 mod tests {
     use super::SqliteMemoryRepository;
-    use crate::models::{ConversationRow, MemoryImportStateRow, MessageRow};
+    use crate::models::{ConversationRow, MemoryImportStateRow, MemoryRetrievalRow, MessageRow};
     use crate::repository::memory::{
         ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
         CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, ExpectedMemoryEntryRow,
@@ -6167,6 +6199,48 @@ mod tests {
             candidates.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
             ["exact-project", "exact-workspace"]
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_retrieval_create_replaces_same_key_and_lazily_cleans_expired_rows() {
+        let (repo, _, db) = setup().await;
+        let retrieval = |id: &str, prompt_hash: &str, created_at: i64, expires_at: i64| MemoryRetrievalRow {
+            id: id.into(),
+            user_id: USER_A.into(),
+            conversation_id: "conv_a".into(),
+            prompt_hash: prompt_hash.into(),
+            selected_ids_json: "[]".into(),
+            estimated_tokens: 0,
+            budget_tokens: 2_000,
+            retrieval_version: "memory-retrieval-v1".into(),
+            created_at,
+            expires_at,
+        };
+        repo.create_retrieval(retrieval("first", "same", 10, 100))
+            .await
+            .unwrap();
+        repo.create_retrieval(retrieval("replacement", "same", 20, 200))
+            .await
+            .unwrap();
+        assert!(repo.get_retrieval(USER_A, "first").await.unwrap().is_none());
+        assert!(repo.get_retrieval(USER_A, "replacement").await.unwrap().is_some());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM memory_retrievals")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1,
+        );
+
+        repo.create_retrieval(retrieval("expired", "other", 30, 31))
+            .await
+            .unwrap();
+        assert_eq!(repo.delete_expired_retrievals(31).await.unwrap(), 1);
+        assert!(repo.get_retrieval(USER_A, "expired").await.unwrap().is_none());
+        assert!(matches!(
+            repo.get_retrieval(USER_B, "replacement").await,
+            Err(DbError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

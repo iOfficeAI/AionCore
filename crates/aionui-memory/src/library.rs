@@ -88,7 +88,7 @@ pub(crate) fn state_name(state: &MemoryEntryState) -> &'static str {
     }
 }
 
-fn entry_kind(value: &str) -> Result<MemoryEntryKind, MemoryError> {
+pub(crate) fn entry_kind(value: &str) -> Result<MemoryEntryKind, MemoryError> {
     match value {
         "decision" => Ok(MemoryEntryKind::Decision),
         "outcome" => Ok(MemoryEntryKind::Outcome),
