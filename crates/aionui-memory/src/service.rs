@@ -1749,8 +1749,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use aionui_api_types::{
-        CompleteMemoryJobRequest, MemoryCandidateMutation, MemoryEntryKind, MemoryJobFailureCode, MemoryJobState,
-        MemorySummary, MemoryTaskResultProvenance, MemoryUpdateOutput, NormalizedMemoryJobFailure,
+        CompleteMemoryJobRequest, ListMemoryEntriesQuery, MemoryCandidateMutation, MemoryEntryKind, MemoryEntryState,
+        MemoryJobFailureCode, MemoryJobState, MemorySummary, MemoryTaskResultProvenance, MemoryUpdateOutput,
+        NormalizedMemoryJobFailure,
     };
     use aionui_db::models::{ConversationRow, MessageRow};
     use aionui_db::{
@@ -2906,14 +2907,7 @@ mod tests {
                 .await
                 .unwrap();
             if state == "deleted" {
-                sqlx::query(
-                    "UPDATE memory_entries SET state = 'deleted', content = NULL, deleted_at = 35,
-                     revision = revision + 1 WHERE id = ?",
-                )
-                .bind(&target.id)
-                .execute(fixture._db.pool())
-                .await
-                .unwrap();
+                fixture.memory.delete_entry(USER_ID, &target.id, 35).await.unwrap();
             } else {
                 sqlx::query("UPDATE memory_entries SET state = ?, revision = revision + 1 WHERE id = ?")
                     .bind(state)
@@ -3086,11 +3080,21 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = fixture.memory.list_entries(USER_ID).await.unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, deleted_id);
-        assert_eq!(entries[0].state, "deleted");
-        assert_eq!(entries[0].content, None);
+        let entries = fixture
+            .service
+            .list_entries(
+                USER_ID,
+                ListMemoryEntriesQuery {
+                    state: Some(MemoryEntryState::Deleted),
+                    ..ListMemoryEntriesQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(entries.items.len(), 1);
+        assert_eq!(entries.items[0].id, deleted_id);
+        assert_eq!(entries.items[0].state, MemoryEntryState::Deleted);
+        assert_eq!(entries.items[0].content, None);
     }
 
     #[tokio::test]

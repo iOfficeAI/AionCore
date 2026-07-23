@@ -1284,7 +1284,7 @@ mod tests {
         let deleted_item = &deleted_json["data"]["items"][0];
         assert_eq!(deleted_item["id"], "entry-edit");
         assert_eq!(deleted_item["state"], "deleted");
-        assert_eq!(deleted_item["deleted_at"].is_number(), true);
+        assert!(deleted_item["deleted_at"].is_number());
         for scrubbed in ["stable_key", "content", "sources"] {
             assert!(deleted_item.get(scrubbed).is_none(), "{scrubbed} crossed the API");
         }
