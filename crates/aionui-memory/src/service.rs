@@ -3826,9 +3826,8 @@ mod tests {
             fixture
                 .service
                 .build_recall_block(USER_ID, "conversation-1", "rust ranking", &second.retrieval_id, &[])
-                .await
-                .unwrap(),
-            None,
+                .await,
+            Err(MemoryError::Conflict),
         );
     }
 
@@ -4078,9 +4077,8 @@ mod tests {
             fixture
                 .service
                 .build_recall_block(USER_ID, "conversation-1", "needle", &replacement.retrieval_id, &[])
-                .await
-                .unwrap(),
-            None,
+                .await,
+            Err(MemoryError::Conflict),
         );
 
         let after_delete = fixture

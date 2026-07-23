@@ -5,6 +5,8 @@ use std::path::Path;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::SqlitePoolOptions;
 
+use aionui_db::{ConsumeMemoryRetrievalSnapshotRow, DbError, IMemoryRepository, SqliteMemoryRepository};
+
 async fn run_migrations_through(pool: &sqlx::SqlitePool, max_version: i64) {
     let full = Migrator::new(Path::new("migrations")).await.unwrap();
     let migrations = full
@@ -212,6 +214,38 @@ async fn migration_031_adds_idempotent_immutable_retrieval_selections() {
         .await
         .unwrap();
     run_migrations_through(&pool, 30).await;
+    sqlx::query(
+        "INSERT INTO users (id,username,email,password_hash,created_at,updated_at)
+         VALUES ('preview-user','preview-user','preview@example.com','',1,1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (id,user_id,name,type,extra,status,created_at,updated_at)
+         VALUES ('preview-conversation','preview-user','Preview','acp','{}','finished',1,1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_settings
+            (user_id,enabled,default_capture,default_recall,consent_version,consented_at,updated_at)
+         VALUES ('preview-user',1,1,1,1,1,1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_retrievals
+            (id,user_id,conversation_id,prompt_hash,selected_ids_json,estimated_tokens,budget_tokens,
+             retrieval_version,created_at,expires_at)
+         VALUES ('legacy-preview','preview-user','preview-conversation','prompt','[\"legacy-entry\"]',1,100,
+                 'memory-retrieval-v1',1,1000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let migration = include_str!("../migrations/031_memory_retrieval_selections.sql");
     sqlx::raw_sql(migration).execute(&pool).await.unwrap();
@@ -237,6 +271,75 @@ async fn migration_031_adds_idempotent_immutable_retrieval_selections() {
         .map(str::to_owned)
         .collect(),
     );
+
+    let indexes: HashSet<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'index' AND tbl_name = 'memory_retrieval_selections'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
+    assert!(indexes.contains("idx_memory_retrieval_selections_selection"));
+    let foreign_key: (String, String, String) = sqlx::query_as(
+        "SELECT \"table\",\"from\",on_delete
+         FROM pragma_foreign_key_list('memory_retrieval_selections')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        foreign_key,
+        ("memory_retrievals".into(), "retrieval_id".into(), "CASCADE".into()),
+    );
+
+    let repository = SqliteMemoryRepository::new(pool.clone());
+    assert!(matches!(
+        repository
+            .consume_retrieval_snapshot(ConsumeMemoryRetrievalSnapshotRow {
+                user_id: "preview-user".into(),
+                conversation_id: "preview-conversation".into(),
+                retrieval_id: "legacy-preview".into(),
+                prompt_hash: "prompt".into(),
+                retrieval_version: "memory-retrieval-v1".into(),
+                expected_budget_tokens: 100,
+                now: 2,
+            })
+            .await,
+        Err(DbError::Conflict(_))
+    ));
+
+    let valid_hash = "a".repeat(64);
+    sqlx::query(
+        "INSERT INTO memory_retrieval_selections
+            (retrieval_id,position,selection_id,selection_kind,snapshot_hash)
+         VALUES ('legacy-preview',0,'legacy-entry','entry',?)",
+    )
+    .bind(&valid_hash)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for statement in [
+        "INSERT INTO memory_retrieval_selections VALUES ('legacy-preview',-1,'negative','entry','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')",
+        "INSERT INTO memory_retrieval_selections VALUES ('legacy-preview',1,'bad-kind','other','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')",
+        "INSERT INTO memory_retrieval_selections VALUES ('legacy-preview',1,'bad-hash','entry','short')",
+        "INSERT INTO memory_retrieval_selections VALUES ('legacy-preview',0,'duplicate-position','entry','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')",
+        "INSERT INTO memory_retrieval_selections VALUES ('legacy-preview',1,'legacy-entry','entry','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')",
+    ] {
+        assert!(sqlx::query(statement).execute(&pool).await.is_err(), "{statement}");
+    }
+
+    sqlx::query("DELETE FROM memory_retrievals WHERE id = 'legacy-preview'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM memory_retrieval_selections WHERE retrieval_id = 'legacy-preview'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, 0);
 }
 
 #[tokio::test]
