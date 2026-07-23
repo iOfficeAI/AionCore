@@ -44,10 +44,17 @@ pub struct DevelopmentHandoffSigner {
 
 impl DevelopmentHandoffSigner {
     pub fn new(secret: [u8; 32], base_path: impl Into<String>) -> Self {
-        Self {
-            secret,
-            base_path: base_path.into(),
-        }
+        let base_path = base_path.into();
+        let base_path = if base_path.starts_with('/') {
+            std::env::var("AIONUI_PUBLIC_URL")
+                .ok()
+                .map(|public_url| public_url.trim().trim_end_matches('/').to_owned())
+                .filter(|public_url| public_url.starts_with("http://") || public_url.starts_with("https://"))
+                .map_or(base_path.clone(), |public_url| format!("{public_url}{base_path}"))
+        } else {
+            base_path
+        };
+        Self { secret, base_path }
     }
 
     pub fn sign(&self, project_id: &str, run_id: &str, expires_at: i64) -> String {

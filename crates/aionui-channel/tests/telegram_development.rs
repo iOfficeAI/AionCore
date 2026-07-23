@@ -22,3 +22,21 @@ fn handoff_links_reject_unreasonably_long_lifetimes() {
     let signature = link.split("signature=").nth(1).unwrap();
     assert!(!signer.verify("project", "run", expires_at, signature, 0));
 }
+
+#[test]
+fn relative_handoff_links_use_the_configured_public_web_url() {
+    let previous = std::env::var_os("AIONUI_PUBLIC_URL");
+    unsafe {
+        std::env::set_var("AIONUI_PUBLIC_URL", "http://127.0.0.1:25809/");
+    }
+
+    let signer = DevelopmentHandoffSigner::new([5; 32], "/#/projects");
+    let link = signer.sign("project", "run", 10_000);
+
+    match previous {
+        Some(value) => unsafe { std::env::set_var("AIONUI_PUBLIC_URL", value) },
+        None => unsafe { std::env::remove_var("AIONUI_PUBLIC_URL") },
+    }
+
+    assert!(link.starts_with("http://127.0.0.1:25809/#/projects?"), "got: {link}");
+}

@@ -42,12 +42,12 @@ use aionui_db::{
     SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteTeamRepository,
 };
 use aionui_development::{
-    ApprovalOption, ApprovalRequestInput, ApprovalResolver, ApprovalRouterState, ApprovalService, ApprovalSource,
-    DeliveryService, DeploymentService, DevelopmentOperationsService, DevelopmentRouterState, DevelopmentRunner,
-    DevelopmentService, DevelopmentUsageIngestor, DevelopmentWorkspacePort, GhCliDeliveryProvider, PortabilityService,
-    PrepareDevelopmentWorkspace, PreparedDevelopmentWorkspace, PricingService, ResolveApprovalContext,
-    ResourceLeaseCoordinator, RetentionService, SecretService, SystemDevelopmentResourceController,
-    UnconfiguredDeploymentProvider,
+    ApprovalError, ApprovalOption, ApprovalRequestInput, ApprovalResolver, ApprovalRouterState, ApprovalService,
+    ApprovalSource, DeliveryService, DeploymentService, DevelopmentOperationsService, DevelopmentRouterState,
+    DevelopmentRunner, DevelopmentService, DevelopmentUsageIngestor, DevelopmentWorkspacePort, GhCliDeliveryProvider,
+    PortabilityService, PrepareDevelopmentWorkspace, PreparedDevelopmentWorkspace, PricingService,
+    ResolveApprovalContext, ResourceLeaseCoordinator, RetentionService, SecretService,
+    SystemDevelopmentResourceController, UnconfiguredDeploymentProvider,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -238,7 +238,8 @@ impl ChannelApprovalPort for ChannelApprovalAdapter {
         approval_id: &str,
         option_index: usize,
     ) -> Result<String, ChannelError> {
-        self.service
+        let resolution = self
+            .service
             .resolve(
                 approval_id,
                 option_index,
@@ -251,9 +252,23 @@ impl ChannelApprovalPort for ChannelApprovalAdapter {
                     is_admin: context.is_admin,
                 },
             )
-            .await
-            .map(|row| row.status)
-            .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))
+            .await;
+        match resolution {
+            Ok(row) => Ok(row.status),
+            Err(error @ ApprovalError::Conflict(_)) => {
+                let row = self
+                    .service
+                    .get(&self.owner_user_id, approval_id)
+                    .await
+                    .map_err(|get_error| ChannelError::MessageSendFailed(get_error.to_string()))?;
+                if matches!(row.status.as_str(), "approved" | "rejected") {
+                    Ok(row.status)
+                } else {
+                    Err(ChannelError::MessageSendFailed(error.to_string()))
+                }
+            }
+            Err(error) => Err(ChannelError::MessageSendFailed(error.to_string())),
+        }
     }
 }
 
@@ -2371,7 +2386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_approval_adapter_links_bound_project_and_active_run() {
+    async fn channel_approval_adapter_links_run_and_reuses_final_status_for_duplicate_resolution() {
         struct NoopApprovalResolver;
 
         #[async_trait::async_trait]
@@ -2490,6 +2505,25 @@ mod tests {
         let row = approval_repo.get(&approval_id).await.unwrap().unwrap();
         assert_eq!(row.project_id.as_deref(), Some("project-approval"));
         assert_eq!(row.run_id.as_deref(), Some("run-approval"));
+
+        let resolution_context = ChannelApprovalResolutionContext {
+            source_user_id: "telegram-user".into(),
+            platform: PluginType::Telegram,
+            chat_id: "chat".into(),
+            message_thread_id: Some(3),
+            is_admin: false,
+        };
+        assert_eq!(
+            adapter
+                .resolve(resolution_context.clone(), &approval_id, 0)
+                .await
+                .unwrap(),
+            "approved"
+        );
+        assert_eq!(
+            adapter.resolve(resolution_context, &approval_id, 0).await.unwrap(),
+            "approved"
+        );
     }
 
     #[test]

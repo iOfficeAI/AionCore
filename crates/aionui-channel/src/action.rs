@@ -453,18 +453,28 @@ impl ActionExecutor {
                         option_index,
                     )
                     .await?;
+                let rejected = status == "rejected";
+                let toast = if rejected { "审批已拒绝" } else { "审批已同意" };
+                let edit_message_id = action.context.message_id.clone();
                 Ok(ActionResponse {
-                    text: None,
+                    text: Some(format!(
+                        "{}\n审批 ID：{approval_id}",
+                        if rejected {
+                            "❌ 审批已拒绝"
+                        } else {
+                            "✅ 审批已同意"
+                        }
+                    )),
                     parse_mode: None,
                     buttons: None,
                     keyboard: None,
-                    behavior: ActionBehavior::Answer,
-                    toast: Some(if status == "rejected" {
-                        "审批已拒绝".into()
+                    behavior: if edit_message_id.is_some() {
+                        ActionBehavior::Edit
                     } else {
-                        "审批已处理".into()
-                    }),
-                    edit_message_id: None,
+                        ActionBehavior::Send
+                    },
+                    toast: Some(toast.into()),
+                    edit_message_id,
                 })
             }
             "session.new" => {
@@ -4548,10 +4558,21 @@ mod tests {
             ])),
         );
         msg.topic = Some(crate::types::ChannelTopicContext { message_thread_id: 5 });
+        msg.action.as_mut().unwrap().context.message_id = Some("telegram-message-77".into());
 
         let result = executor.handle_incoming_message(&msg).await.unwrap();
         match result {
-            MessageResult::Action(response) => assert_eq!(response.toast.as_deref(), Some("审批已处理")),
+            MessageResult::Action(response) => {
+                assert_eq!(response.behavior, ActionBehavior::Edit);
+                assert_eq!(response.edit_message_id.as_deref(), Some("telegram-message-77"));
+                assert_eq!(response.buttons, None);
+                assert_eq!(response.toast.as_deref(), Some("审批已同意"));
+                let text = response
+                    .text
+                    .expect("approval callback must visibly update the Telegram card");
+                assert!(text.contains("审批已同意"), "got: {text}");
+                assert!(text.contains("approval1234567"), "got: {text}");
+            }
             _ => panic!("Expected Action result"),
         }
         let calls = approvals.resolutions.lock().unwrap();
