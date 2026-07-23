@@ -152,6 +152,10 @@ impl<'de> Deserialize<'de> for MemoryEntryResponse {
                 wire.stable_key = None;
                 wire.content = None;
                 wire.sources.clear();
+                wire.pinned = false;
+                wire.user_edited = false;
+                wire.supersedes_id = None;
+                wire.conflict_group_id = None;
             }
             _ => {
                 if wire.stable_key.is_none() || wire.content.is_none() {
@@ -224,25 +228,35 @@ impl Serialize for MemoryEntryResponse {
             updated_at: TimestampMs,
         }
 
-        let (stable_key, content, sources, deleted_at) = match &self.state {
-            MemoryEntryState::Deleted => {
-                let deleted_at = self
-                    .deleted_at
-                    .ok_or_else(|| serde::ser::Error::custom("deleted Memory entry requires deleted_at"))?;
-                (None, None, None, Some(deleted_at))
-            }
-            _ => {
-                let stable_key = self
-                    .stable_key
-                    .as_deref()
-                    .ok_or_else(|| serde::ser::Error::custom("non-deleted Memory entry requires stable_key"))?;
-                let content = self
-                    .content
-                    .as_deref()
-                    .ok_or_else(|| serde::ser::Error::custom("non-deleted Memory entry requires content"))?;
-                (Some(stable_key), Some(content), Some(self.sources.as_slice()), None)
-            }
-        };
+        let (stable_key, content, sources, pinned, user_edited, supersedes_id, conflict_group_id, deleted_at) =
+            match &self.state {
+                MemoryEntryState::Deleted => {
+                    let deleted_at = self
+                        .deleted_at
+                        .ok_or_else(|| serde::ser::Error::custom("deleted Memory entry requires deleted_at"))?;
+                    (None, None, None, false, false, None, None, Some(deleted_at))
+                }
+                _ => {
+                    let stable_key = self
+                        .stable_key
+                        .as_deref()
+                        .ok_or_else(|| serde::ser::Error::custom("non-deleted Memory entry requires stable_key"))?;
+                    let content = self
+                        .content
+                        .as_deref()
+                        .ok_or_else(|| serde::ser::Error::custom("non-deleted Memory entry requires content"))?;
+                    (
+                        Some(stable_key),
+                        Some(content),
+                        Some(self.sources.as_slice()),
+                        self.pinned,
+                        self.user_edited,
+                        self.supersedes_id.as_deref(),
+                        self.conflict_group_id.as_deref(),
+                        None,
+                    )
+                }
+            };
 
         Wire {
             id: &self.id,
@@ -254,11 +268,11 @@ impl Serialize for MemoryEntryResponse {
             fingerprint: &self.fingerprint,
             content,
             state: &self.state,
-            pinned: self.pinned,
-            user_edited: self.user_edited,
+            pinned,
+            user_edited,
             sources,
-            supersedes_id: self.supersedes_id.as_deref(),
-            conflict_group_id: self.conflict_group_id.as_deref(),
+            supersedes_id,
+            conflict_group_id,
             schema_version: self.schema_version,
             deleted_at,
             created_at: self.created_at,
@@ -746,8 +760,8 @@ mod tests {
             "fingerprint": "fp_deleted",
             "content": "secret content",
             "state": "deleted",
-            "pinned": false,
-            "user_edited": false,
+            "pinned": true,
+            "user_edited": true,
             "sources": [{
                 "memory_entry_id": "mem_deleted",
                 "conversation_id": "conv_1",
@@ -756,6 +770,8 @@ mod tests {
                 "first_observed_at": 1,
                 "last_observed_at": 2
             }],
+            "supersedes_id": "mem_previous",
+            "conflict_group_id": "conflict_secret",
             "schema_version": 1,
             "deleted_at": 42,
             "created_at": 1,
