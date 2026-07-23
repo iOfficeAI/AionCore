@@ -89,7 +89,7 @@ impl BackendConnection for CodexConnection {
             .spawner
             .spawn(cmd, &[], "aionui-session")
             .await
-            .map_err(|e| BackendError::Transport(format!("codex spawn failed: {e}")))?;
+            .map_err(|e| BackendError::from_spawn("codex spawn failed", e))?;
         let io: Box<dyn AgentIo> = Box::new(crate::adapter::ManagedProcessIo::new(proc));
         // F-4 wake recipe: a Dormant→dispatch wake re-spawns `codex app-server` and
         // replays the resume handshake against the bound threadId. Capture the
@@ -1081,7 +1081,7 @@ impl CodexSessionBackend {
         let proc = spawner
             .spawn(cmd, &[], "aionui-session")
             .await
-            .map_err(|e| BackendError::Transport(format!("codex resume-spawn failed: {e}")))?;
+            .map_err(|e| BackendError::from_spawn("codex resume-spawn failed", e))?;
         let io: Arc<dyn AgentIo> = Arc::from(Box::new(crate::adapter::ManagedProcessIo::new(proc)) as Box<dyn AgentIo>);
         let (stdin, stdout) = match io.take_stdio().await {
             Some((stdin, stdout)) => (Some(stdin), Some(stdout)),
@@ -5925,6 +5925,45 @@ mod tests {
             [("AIONUI_CONVERSATION_ID", "conv-1")],
             "spawn_env forwarded into CommandSpec.env"
         );
+    }
+
+    /// #410 parity wiring: a spawner failing with the classified
+    /// `ProcessError::WorkspaceUnavailable` surfaces from `open_session` as
+    /// `BackendError::WorkspaceUnavailable` (path intact), NOT a blanket
+    /// `Transport` — the app layer maps it to the dedicated
+    /// workspace-unavailable API error (Sentry ELECTRON-3PP follow-up).
+    #[tokio::test]
+    async fn open_session_classifies_workspace_unavailable_spawn_failure() {
+        struct WorkspaceGoneSpawner;
+        #[async_trait::async_trait]
+        impl aionui_process::Spawner for WorkspaceGoneSpawner {
+            async fn spawn(
+                &self,
+                _spec: aionui_common::CommandSpec,
+                _extra_env: &[(String, String)],
+                _opaque_owner_tag: &str,
+            ) -> Result<std::sync::Arc<aionui_process::ManagedProcess>, aionui_process::ProcessError> {
+                Err(aionui_process::ProcessError::workspace_unavailable("/gone/workspace"))
+            }
+        }
+
+        let conn = CodexConnection::new(std::sync::Arc::new(WorkspaceGoneSpawner));
+        let res = conn
+            .open_session(
+                SessionSpec::Fresh {
+                    session_id: "logical-1".into(),
+                },
+                SessionConfig {
+                    cwd: Some("/gone/workspace".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        // `expect_err` needs `T: Debug` and `Arc<dyn SessionBackend>` has none.
+        let Err(err) = res else {
+            panic!("open_session must fail when the spawner reports workspace-unavailable");
+        };
+        assert_eq!(err, BackendError::WorkspaceUnavailable("/gone/workspace".into()));
     }
 
     // ===== B-CODEX-MODEL-LIST: discovery (model/list + permissionProfile/list) =====

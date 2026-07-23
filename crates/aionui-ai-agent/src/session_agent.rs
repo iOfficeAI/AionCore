@@ -1178,9 +1178,15 @@ pub async fn build_session_instance(
         init,
         // Packaged app: resolve the bundled claude/codex binary and forward its
         // absolute path so the backend spawns OUR CLI, not the user's PATH one.
-        // `None` in dev / non-bundled runs → backend falls back to the bare name
-        // (PATH). Detection (cli_probe) stays PATH-only and is unaffected.
-        cli_program: aionui_runtime::resolve_bundled_cli(backend_label),
+        // Bundled-missing / dev falls back to a PATH lookup via
+        // `resolve_command_path` (NOT the bare name): on Windows, npm installs
+        // ship `claude.cmd`/`codex.cmd` shims which `CreateProcess` does not
+        // find from a bare name (#299 parity; Rust std runs `.cmd` via
+        // `cmd.exe` since the BatBadBut fix). `None` (nothing on PATH either)
+        // keeps the bare name so the spawn error stays diagnosable. Detection
+        // (cli_probe) stays PATH-only and is unaffected.
+        cli_program: aionui_runtime::resolve_bundled_cli(backend_label)
+            .or_else(|| aionui_runtime::resolve_command_path(backend_label)),
         ..Default::default()
     };
 
@@ -1282,7 +1288,17 @@ pub async fn build_session_instance(
     let backend = connection
         .open_session(spec, session_config)
         .await
-        .map_err(|e| AgentError::bad_gateway(format!("open {backend_label} session: {e}")))?;
+        .map_err(|e| match e {
+            // #410 parity: a missing/non-directory workspace keeps its dedicated
+            // error class end-to-end (ProcessError::WorkspaceUnavailable →
+            // BackendError::WorkspaceUnavailable → here), so the frontend gets
+            // WORKSPACE_PATH_RUNTIME_UNAVAILABLE exactly like the legacy spawn
+            // path — not an opaque 502.
+            aionui_session::BackendError::WorkspaceUnavailable(path) => {
+                AgentError::workspace_path_runtime_unavailable(path)
+            }
+            e => AgentError::bad_gateway(format!("open {backend_label} session: {e}")),
+        })?;
 
     // Re-apply the persisted effort now that the session is open. The backend validates
     // it against the current model's advertised catalog (permissive until the catalog

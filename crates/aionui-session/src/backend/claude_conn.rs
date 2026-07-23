@@ -308,7 +308,7 @@ impl BackendConnection for ClaudeConnection {
                 config.cli_program.as_deref(),
             )
             .await
-            .map_err(|e| BackendError::Transport(format!("claude spawn failed: {e}")))?;
+            .map_err(|e| BackendError::from_spawn("claude spawn failed", e))?;
 
         // F-4 wake recipe: re-spawn on wake by RESUMING the SAME claude session id
         // we spawned with (`--session-id <claude_session_id>` on Fresh → `--resume
@@ -684,7 +684,7 @@ impl ClaudeSessionBackend {
                 self.wake.cli_program.as_deref(),
             )
             .await
-            .map_err(|e| BackendError::Transport(format!("claude resume-spawn failed: {e}")))?;
+            .map_err(|e| BackendError::from_spawn("claude resume-spawn failed", e))?;
         let io: Arc<dyn AgentIo> = Arc::from(io);
         let (stdin, stdout) = match io.take_stdio().await {
             Some((stdin, stdout)) => (Some(stdin), Some(stdout)),

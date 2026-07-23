@@ -448,20 +448,13 @@ pub(crate) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, ProcessError> {
         return Err(ProcessError::bad_request("workspace directory is empty"));
     }
     let path = PathBuf::from(cwd);
+    // Missing / not-a-directory / not-accessible all classify as
+    // `WorkspaceUnavailable` carrying just the path — the legacy
+    // `workspace_path_runtime_unavailable` contract (#410), which the app
+    // layer maps to the dedicated workspace-unavailable API error.
     match std::fs::metadata(&path) {
         Ok(m) if m.is_dir() => Ok(path),
-        Ok(_) => Err(ProcessError::bad_request(format!(
-            "workspace path is not a directory: {}",
-            path.display()
-        ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ProcessError::bad_request(format!(
-            "workspace directory does not exist: {}",
-            path.display()
-        ))),
-        Err(e) => Err(ProcessError::bad_request(format!(
-            "workspace directory not accessible: {}: {e}",
-            path.display()
-        ))),
+        Ok(_) | Err(_) => Err(ProcessError::workspace_unavailable(path.display().to_string())),
     }
 }
 
@@ -676,26 +669,29 @@ mod tests {
         }
     }
 
+    /// Missing / non-directory cwds classify as `WorkspaceUnavailable` with the
+    /// PATH as payload — the legacy `workspace_path_runtime_unavailable`
+    /// contract (#410) the app layer maps to the dedicated API error.
     #[test]
-    fn prepare_command_cwd_rejects_missing_dir() {
+    fn prepare_command_cwd_rejects_missing_dir_as_workspace_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         let err = prepare_command_cwd(&missing.to_string_lossy()).unwrap_err();
         assert!(
-            matches!(err, ProcessError::BadRequest(ref m) if m.contains("does not exist")),
-            "expected BadRequest(does not exist), got {err:?}"
+            matches!(err, ProcessError::WorkspaceUnavailable(ref p) if p == &missing.display().to_string()),
+            "expected WorkspaceUnavailable(path), got {err:?}"
         );
     }
 
     #[test]
-    fn prepare_command_cwd_rejects_file_as_cwd() {
+    fn prepare_command_cwd_rejects_file_as_workspace_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("plain-file");
         std::fs::write(&file, b"x").unwrap();
         let err = prepare_command_cwd(&file.to_string_lossy()).unwrap_err();
         assert!(
-            matches!(err, ProcessError::BadRequest(ref m) if m.contains("not a directory")),
-            "expected BadRequest(not a directory), got {err:?}"
+            matches!(err, ProcessError::WorkspaceUnavailable(ref p) if p == &file.display().to_string()),
+            "expected WorkspaceUnavailable(path), got {err:?}"
         );
     }
 }

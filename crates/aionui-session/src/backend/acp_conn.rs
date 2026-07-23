@@ -92,7 +92,7 @@ impl BackendConnection for AcpConnection {
             .spawner
             .spawn(cmd, &[], "aionui-session")
             .await
-            .map_err(|e| BackendError::Transport(format!("acp spawn failed: {e}")))?;
+            .map_err(|e| BackendError::from_spawn("acp spawn failed", e))?;
         let io: Box<dyn AgentIo> = Box::new(crate::adapter::ManagedProcessIo::new(proc));
         // F-4 wake recipe: a Dormant→dispatch wake re-spawns the ACP CLI and
         // replays the resume handshake (`session/load` against the bound sid).
@@ -816,7 +816,7 @@ impl AcpSessionBackend {
         let proc = spawner
             .spawn(cmd, &[], "aionui-session")
             .await
-            .map_err(|e| BackendError::Transport(format!("acp resume-spawn failed: {e}")))?;
+            .map_err(|e| BackendError::from_spawn("acp resume-spawn failed", e))?;
         let io: Arc<dyn AgentIo> = Arc::from(Box::new(crate::adapter::ManagedProcessIo::new(proc)) as Box<dyn AgentIo>);
         let (stdin, stdout) = match io.take_stdio().await {
             Some((stdin, stdout)) => (Some(stdin), Some(stdout)),
