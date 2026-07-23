@@ -3694,7 +3694,12 @@ impl IMemoryRepository for SqliteMemoryRepository {
                         (user_id,conversation_id,project_id,workspace_key,summary_json,through_turn_id,revision,
                          source,schema_version,prompt_version,writer_provider_id,writer_model_id,created_at,updated_at)
                      SELECT ?,c.id,?,?,?,?,1,'legacy_context_snapshot',1,NULL,NULL,NULL,?,?
-                     FROM conversations c WHERE c.id = ? AND c.user_id = ?
+                     FROM conversations c
+                     LEFT JOIN conversation_memory_policies policy
+                       ON policy.user_id = c.user_id AND policy.conversation_id = c.id
+                     WHERE c.id = ? AND c.user_id = ? AND c.updated_at = ? AND c.extra = ?
+                       AND COALESCE(policy.lifecycle_epoch,0) = ?
+                       AND policy.reset_at IS NULL
                      ON CONFLICT(user_id,conversation_id) DO NOTHING",
                 )
                 .bind(&input.user_id)
@@ -3706,6 +3711,9 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 .bind(summary.updated_at)
                 .bind(&summary.conversation_id)
                 .bind(&input.user_id)
+                .bind(summary.expected_updated_at)
+                .bind(&summary.expected_extra)
+                .bind(summary.expected_conversation_epoch)
                 .execute(&mut *connection)
                 .await?;
             }

@@ -92,6 +92,9 @@ pub struct UpdateConversationMemoryPolicyRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyMemorySummaryRow {
     pub conversation_id: String,
+    pub expected_updated_at: TimestampMs,
+    pub expected_extra: String,
+    pub expected_conversation_epoch: i64,
     pub project_id: Option<String>,
     pub workspace_key: Option<String>,
     pub summary_json: String,

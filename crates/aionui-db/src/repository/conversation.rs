@@ -42,20 +42,56 @@ pub trait IConversationRepository: Send + Sync {
     async fn list_for_memory_import(
         &self,
         user_id: &str,
-        cursor: Option<&LegacyConversationCursor>,
+        after: Option<&LegacyConversationCursor>,
+        boundary: &LegacyConversationImportBoundary,
         limit: u32,
     ) -> Result<Vec<ConversationRow>, DbError> {
-        Ok(self
+        let rows = self
             .list_paginated(
                 user_id,
                 &ConversationFilters {
-                    cursor: cursor.map(|value| value.id.clone()),
-                    limit,
+                    limit: limit.saturating_mul(2).max(1),
                     ..ConversationFilters::default()
                 },
             )
             .await?
-            .items)
+            .items;
+        let mut rows = rows
+            .into_iter()
+            .filter(|row| {
+                (row.updated_at, row.id.as_str()) <= (boundary.upper.updated_at, boundary.upper.id.as_str())
+                    && after
+                        .is_none_or(|after| (row.updated_at, row.id.as_str()) > (after.updated_at, after.id.as_str()))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| (left.updated_at, &left.id).cmp(&(right.updated_at, &right.id)));
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    /// Returns the fixed upper watermark for a new legacy Memory import.
+    async fn memory_import_upper_bound(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<LegacyConversationImportBoundary>, DbError> {
+        Ok(self
+            .list_paginated(
+                user_id,
+                &ConversationFilters {
+                    limit: 1,
+                    ..ConversationFilters::default()
+                },
+            )
+            .await?
+            .items
+            .first()
+            .map(|row| LegacyConversationImportBoundary {
+                upper: LegacyConversationCursor {
+                    updated_at: row.updated_at,
+                    id: row.id.clone(),
+                },
+                max_rowid: i64::MAX,
+            }))
     }
 
     // ── Extended queries ────────────────────────────────────────────
@@ -233,6 +269,13 @@ pub struct MessagePageCursor {
 pub struct LegacyConversationCursor {
     pub updated_at: TimestampMs,
     pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyConversationImportBoundary {
+    pub upper: LegacyConversationCursor,
+    pub max_rowid: i64,
 }
 
 impl From<&MessageRow> for MessagePageCursor {

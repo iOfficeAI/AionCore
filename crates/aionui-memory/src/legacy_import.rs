@@ -3,13 +3,31 @@ use std::sync::Arc;
 use aionui_api_types::MemorySummary;
 use aionui_db::{
     IConversationRepository, IMemoryRepository, ImportLegacyMemoryPageRow, LegacyConversationCursor,
-    LegacyMemorySummaryRow,
+    LegacyConversationImportBoundary, LegacyMemorySummaryRow,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::{MemoryError, retrieval::RetrievalTarget, validation::sanitize_summary};
 
 const LEGACY_IMPORT_PAGE_SIZE: u32 = 32;
+const LEGACY_IMPORT_CURSOR_VERSION: u8 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyImportCursor {
+    version: u8,
+    boundary: LegacyConversationImportBoundary,
+    after: Option<LegacyConversationCursor>,
+}
+
+impl LegacyImportCursor {
+    fn parse(value: &str) -> Option<Self> {
+        serde_json::from_str::<Self>(value)
+            .ok()
+            .filter(|cursor| cursor.version == LEGACY_IMPORT_CURSOR_VERSION)
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,28 +93,94 @@ pub(crate) async fn ensure_legacy_import(
         return Ok(());
     }
     let expected_cursor = state.as_ref().and_then(|state| state.cursor.clone());
-    let cursor = expected_cursor
-        .as_deref()
-        .map(serde_json::from_str::<LegacyConversationCursor>)
-        .transpose()
-        .map_err(|_| MemoryError::Internal)?;
+    let cursor = match expected_cursor.as_deref() {
+        Some(value) => match LegacyImportCursor::parse(value) {
+            Some(cursor) => cursor,
+            None => {
+                warn!(
+                    user_id,
+                    status = "invalid_cursor",
+                    "Legacy Memory import cursor quarantined"
+                );
+                memory
+                    .import_legacy_memory_page(ImportLegacyMemoryPageRow {
+                        user_id: user_id.into(),
+                        expected_cursor: expected_cursor.clone(),
+                        next_cursor: expected_cursor,
+                        completed: true,
+                        summaries: Vec::new(),
+                        now: aionui_common::now_ms(),
+                    })
+                    .await
+                    .map_err(crate::service::map_db_error)?;
+                return Ok(());
+            }
+        },
+        None => {
+            let Some(upper) = conversations
+                .memory_import_upper_bound(user_id)
+                .await
+                .map_err(crate::service::map_db_error)?
+            else {
+                memory
+                    .import_legacy_memory_page(ImportLegacyMemoryPageRow {
+                        user_id: user_id.into(),
+                        expected_cursor,
+                        next_cursor: None,
+                        completed: true,
+                        summaries: Vec::new(),
+                        now: aionui_common::now_ms(),
+                    })
+                    .await
+                    .map_err(crate::service::map_db_error)?;
+                return Ok(());
+            };
+            LegacyImportCursor {
+                version: LEGACY_IMPORT_CURSOR_VERSION,
+                boundary: upper,
+                after: None,
+            }
+        }
+    };
     let rows = conversations
-        .list_for_memory_import(user_id, cursor.as_ref(), LEGACY_IMPORT_PAGE_SIZE)
+        .list_for_memory_import(
+            user_id,
+            cursor.after.as_ref(),
+            &cursor.boundary,
+            LEGACY_IMPORT_PAGE_SIZE,
+        )
         .await
         .map_err(crate::service::map_db_error)?;
     let completed = rows.len() < LEGACY_IMPORT_PAGE_SIZE as usize;
-    let next_cursor = rows.last().map(|row| LegacyConversationCursor {
-        updated_at: row.updated_at,
-        id: row.id.clone(),
-    });
+    let next_cursor = LegacyImportCursor {
+        version: LEGACY_IMPORT_CURSOR_VERSION,
+        boundary: cursor.boundary,
+        after: rows
+            .last()
+            .map(|row| LegacyConversationCursor {
+                updated_at: row.updated_at,
+                id: row.id.clone(),
+            })
+            .or(cursor.after),
+    };
     let mut summaries = Vec::new();
     for row in &rows {
         let Some(imported) = legacy_summary(&row.extra) else {
             continue;
         };
+        let policy = memory
+            .effective_policy(user_id, &row.id)
+            .await
+            .map_err(crate::service::map_db_error)?;
+        if policy.reset_at.is_some() {
+            continue;
+        }
         let target = RetrievalTarget::from_conversation(row);
         summaries.push(LegacyMemorySummaryRow {
             conversation_id: row.id.clone(),
+            expected_updated_at: row.updated_at,
+            expected_extra: row.extra.clone(),
+            expected_conversation_epoch: policy.conversation_epoch,
             project_id: target.project_id,
             workspace_key: target.workspace_key,
             summary_json: serde_json::to_string(&imported.summary).map_err(|_| MemoryError::Internal)?,
@@ -111,11 +195,7 @@ pub(crate) async fn ensure_legacy_import(
         .import_legacy_memory_page(ImportLegacyMemoryPageRow {
             user_id: user_id.into(),
             expected_cursor,
-            next_cursor: next_cursor
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|_| MemoryError::Internal)?,
+            next_cursor: Some(serde_json::to_string(&next_cursor).map_err(|_| MemoryError::Internal)?),
             completed,
             summaries,
             now: aionui_common::now_ms(),
@@ -131,8 +211,8 @@ mod tests {
 
     use aionui_db::models::ConversationRow;
     use aionui_db::{
-        IConversationRepository, IMemoryRepository, SqliteConversationRepository, SqliteMemoryRepository,
-        init_database_memory,
+        IConversationRepository, IMemoryRepository, ImportLegacyMemoryPageRow, LegacyMemorySummaryRow,
+        SqliteConversationRepository, SqliteMemoryRepository, UpdateMemorySettingsRow, init_database_memory,
     };
 
     use super::legacy_summary;
@@ -265,6 +345,11 @@ mod tests {
         let first_state = memory.get_import_state(USER_ID).await.unwrap().unwrap();
         assert!(!first_state.completed);
         assert!(first_state.cursor.is_some());
+        let durable_cursor: serde_json::Value = serde_json::from_str(first_state.cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(durable_cursor["version"], 1);
+        assert!(durable_cursor["boundary"]["upper"]["updated_at"].is_number());
+        assert!(durable_cursor["boundary"]["max_rowid"].is_number());
+        assert!(durable_cursor["after"]["updated_at"].is_number());
         let first_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_memories WHERE user_id = ?")
             .bind(USER_ID)
             .fetch_one(db.pool())
@@ -386,6 +471,393 @@ mod tests {
                 .unwrap()
                 .is_some_and(|state| state.completed),
         );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_memories")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0,
+        );
+    }
+
+    #[tokio::test]
+    async fn import_uses_a_stable_ascending_snapshot_and_excludes_later_mutations() {
+        let db = init_database_memory().await.unwrap();
+        let conversations: Arc<dyn IConversationRepository> =
+            Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+        let memory: Arc<dyn IMemoryRepository> = Arc::new(SqliteMemoryRepository::new(db.pool().clone()));
+        for index in 1..=34 {
+            conversations
+                .create(&ConversationRow {
+                    id: format!("stable-{index:02}"),
+                    user_id: USER_ID.into(),
+                    name: "Stable".into(),
+                    r#type: "acp".into(),
+                    extra: extra("Stable import", &format!("turn-{index}")),
+                    model: None,
+                    status: Some("finished".into()),
+                    source: Some("aionui".into()),
+                    channel_chat_id: None,
+                    pinned: false,
+                    pinned_at: None,
+                    created_at: index,
+                    updated_at: 10,
+                })
+                .await
+                .unwrap();
+        }
+
+        super::ensure_legacy_import(&memory, &conversations, USER_ID)
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM conversation_memories WHERE conversation_id = 'stable-01')",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        );
+        assert!(
+            !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM conversation_memories WHERE conversation_id = 'stable-34')",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        );
+
+        // Both an original unscanned row mutated after the boundary and a new row
+        // are intentionally outside the fixed import snapshot.
+        sqlx::query("UPDATE conversations SET updated_at = 1_000, extra = ? WHERE id = 'stable-34'")
+            .bind(extra("Mutated after boundary", "turn-mutated"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        conversations
+            .create(&ConversationRow {
+                id: "stable-33a".into(),
+                user_id: USER_ID.into(),
+                name: "New".into(),
+                r#type: "acp".into(),
+                extra: extra("New after boundary", "turn-new"),
+                model: None,
+                status: Some("finished".into()),
+                source: Some("aionui".into()),
+                channel_chat_id: None,
+                pinned: false,
+                pinned_at: None,
+                created_at: 1_001,
+                updated_at: 10,
+            })
+            .await
+            .unwrap();
+        super::ensure_legacy_import(&memory, &conversations, USER_ID)
+            .await
+            .unwrap();
+        assert!(memory.get_import_state(USER_ID).await.unwrap().unwrap().completed);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_memories")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            33,
+        );
+        assert!(
+            !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM conversation_memories WHERE conversation_id IN ('stable-34','stable-33a'))",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_trigger_imports_only_after_durable_turn_eligibility() {
+        let db = init_database_memory().await.unwrap();
+        let conversations = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+        let memory = Arc::new(SqliteMemoryRepository::new(db.pool().clone()));
+        conversations
+            .create(&ConversationRow {
+                id: "ineligible-completion".into(),
+                user_id: USER_ID.into(),
+                name: "Ineligible".into(),
+                r#type: "acp".into(),
+                extra: extra("Must not import", "turn-1"),
+                model: None,
+                status: Some("finished".into()),
+                source: Some("aionui".into()),
+                channel_chat_id: None,
+                pinned: false,
+                pinned_at: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        let service = MemoryService::with_job_dependencies(memory.clone(), conversations.clone(), Arc::new(Ready));
+
+        assert!(
+            !service
+                .admit_turn_completed(
+                    USER_ID,
+                    "ineligible-completion",
+                    "missing-turn",
+                    crate::MemoryTurnOutcome::Completed,
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(memory.get_import_state(USER_ID).await.unwrap().is_none());
+        memory
+            .update_settings(UpdateMemorySettingsRow {
+                user_id: USER_ID.into(),
+                enabled: Some(true),
+                default_capture: Some(true),
+                default_recall: None,
+                consent_version: None,
+                now: 2,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !service
+                .admit_turn_completed(
+                    USER_ID,
+                    "ineligible-completion",
+                    "missing-turn",
+                    crate::MemoryTurnOutcome::Completed
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(memory.get_import_state(USER_ID).await.unwrap().is_none());
+        memory
+            .update_settings(UpdateMemorySettingsRow {
+                user_id: USER_ID.into(),
+                enabled: None,
+                default_capture: Some(false),
+                default_recall: None,
+                consent_version: Some(crate::jobs::MEMORY_DISCLOSURE_VERSION),
+                now: 3,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !service
+                .admit_turn_completed(
+                    USER_ID,
+                    "ineligible-completion",
+                    "missing-turn",
+                    crate::MemoryTurnOutcome::Completed,
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(memory.get_import_state(USER_ID).await.unwrap().is_none());
+        memory
+            .update_settings(UpdateMemorySettingsRow {
+                user_id: USER_ID.into(),
+                enabled: None,
+                default_capture: Some(true),
+                default_recall: None,
+                consent_version: None,
+                now: 4,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !service
+                .admit_turn_completed(
+                    USER_ID,
+                    "ineligible-completion",
+                    "missing-turn",
+                    crate::MemoryTurnOutcome::Completed,
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(memory.get_import_state(USER_ID).await.unwrap().is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_memories")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0,
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_durable_cursor_is_terminally_quarantined_without_reindexing() {
+        let db = init_database_memory().await.unwrap();
+        let conversations: Arc<dyn IConversationRepository> =
+            Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+        let memory: Arc<dyn IMemoryRepository> = Arc::new(SqliteMemoryRepository::new(db.pool().clone()));
+        conversations
+            .create(&ConversationRow {
+                id: "cursor-row".into(),
+                user_id: USER_ID.into(),
+                name: "Cursor".into(),
+                r#type: "acp".into(),
+                extra: extra("Do not reindex", "turn-1"),
+                model: None,
+                status: Some("finished".into()),
+                source: Some("aionui".into()),
+                channel_chat_id: None,
+                pinned: false,
+                pinned_at: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        memory
+            .upsert_import_state(aionui_db::models::MemoryImportStateRow {
+                user_id: USER_ID.into(),
+                cursor: Some("{not-versioned-json".into()),
+                completed: false,
+                started_at: Some(1),
+                completed_at: None,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+
+        super::ensure_legacy_import(&memory, &conversations, USER_ID)
+            .await
+            .unwrap();
+        let state = memory.get_import_state(USER_ID).await.unwrap().unwrap();
+        assert!(state.completed);
+        assert_eq!(state.cursor.as_deref(), Some("{not-versioned-json"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_memories")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0,
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_forget_fences_an_unscanned_summary() {
+        let db = init_database_memory().await.unwrap();
+        let conversations: Arc<dyn IConversationRepository> =
+            Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+        let memory: Arc<dyn IMemoryRepository> = Arc::new(SqliteMemoryRepository::new(db.pool().clone()));
+        for index in 1..=33 {
+            conversations
+                .create(&ConversationRow {
+                    id: format!("forget-{index:02}"),
+                    user_id: USER_ID.into(),
+                    name: "Forget".into(),
+                    r#type: "acp".into(),
+                    extra: extra("Forget fence", &format!("turn-{index}")),
+                    model: None,
+                    status: Some("finished".into()),
+                    source: Some("aionui".into()),
+                    channel_chat_id: None,
+                    pinned: false,
+                    pinned_at: None,
+                    created_at: index,
+                    updated_at: index,
+                })
+                .await
+                .unwrap();
+        }
+        super::ensure_legacy_import(&memory, &conversations, USER_ID)
+            .await
+            .unwrap();
+        memory
+            .delete_conversation_memory(USER_ID, "forget-33", 100)
+            .await
+            .unwrap();
+        super::ensure_legacy_import(&memory, &conversations, USER_ID)
+            .await
+            .unwrap();
+        assert!(
+            !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM conversation_memories WHERE conversation_id = 'forget-33')",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_memories")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            32,
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_page_commit_rejects_scanned_mutation_and_forget_races() {
+        let db = init_database_memory().await.unwrap();
+        let conversations: Arc<dyn IConversationRepository> =
+            Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+        let memory: Arc<dyn IMemoryRepository> = Arc::new(SqliteMemoryRepository::new(db.pool().clone()));
+        let scanned_extra = extra("Scanned", "turn-1");
+        let forgotten_extra = extra("Scanned before forget", "turn-forgotten");
+        for (id, value) in [
+            ("stale-mutation", scanned_extra.clone()),
+            ("stale-forget", forgotten_extra.clone()),
+        ] {
+            conversations
+                .create(&ConversationRow {
+                    id: id.into(),
+                    user_id: USER_ID.into(),
+                    name: "Stale".into(),
+                    r#type: "acp".into(),
+                    extra: value,
+                    model: None,
+                    status: Some("finished".into()),
+                    source: Some("aionui".into()),
+                    channel_chat_id: None,
+                    pinned: false,
+                    pinned_at: None,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .await
+                .unwrap();
+        }
+        memory
+            .delete_conversation_memory(USER_ID, "stale-forget", 2)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET updated_at = 2,extra = ? WHERE id = 'stale-mutation'")
+            .bind(extra("Changed", "turn-2"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let summary_row = |conversation_id: &str, value: String, through_turn_id: &str| LegacyMemorySummaryRow {
+            conversation_id: conversation_id.into(),
+            expected_updated_at: 1,
+            expected_extra: value.clone(),
+            expected_conversation_epoch: 0,
+            project_id: None,
+            workspace_key: None,
+            summary_json: serde_json::to_string(&legacy_summary(&value).unwrap().summary).unwrap(),
+            through_turn_id: through_turn_id.into(),
+            created_at: 1,
+            updated_at: 1,
+        };
+        memory
+            .import_legacy_memory_page(ImportLegacyMemoryPageRow {
+                user_id: USER_ID.into(),
+                expected_cursor: None,
+                next_cursor: Some(r#"{"version":1}"#.into()),
+                completed: false,
+                summaries: vec![
+                    summary_row("stale-mutation", scanned_extra, "turn-1"),
+                    summary_row("stale-forget", forgotten_extra, "turn-forgotten"),
+                ],
+                now: 3,
+            })
+            .await
+            .unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_memories")
                 .fetch_one(db.pool())

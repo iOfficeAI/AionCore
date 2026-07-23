@@ -330,22 +330,30 @@ impl IConversationRepository for SqliteConversationRepository {
     async fn list_for_memory_import(
         &self,
         user_id: &str,
-        cursor: Option<&crate::repository::conversation::LegacyConversationCursor>,
+        after: Option<&crate::repository::conversation::LegacyConversationCursor>,
+        boundary: &crate::repository::conversation::LegacyConversationImportBoundary,
         limit: u32,
     ) -> Result<Vec<ConversationRow>, DbError> {
         let limit = limit.max(1);
-        let rows = match cursor {
-            Some(cursor) => {
+        let rows = match after {
+            Some(after) => {
                 sqlx::query_as::<_, ConversationRow>(
                     "SELECT * FROM conversations
-                     WHERE user_id = ? AND (updated_at < ? OR (updated_at = ? AND id < ?))
-                     ORDER BY updated_at DESC, id DESC
+                     WHERE user_id = ?
+                       AND rowid <= ?
+                       AND (updated_at < ? OR (updated_at = ? AND id <= ?))
+                       AND (updated_at > ? OR (updated_at = ? AND id > ?))
+                     ORDER BY updated_at ASC, id ASC
                      LIMIT ?",
                 )
                 .bind(user_id)
-                .bind(cursor.updated_at)
-                .bind(cursor.updated_at)
-                .bind(&cursor.id)
+                .bind(boundary.max_rowid)
+                .bind(boundary.upper.updated_at)
+                .bind(boundary.upper.updated_at)
+                .bind(&boundary.upper.id)
+                .bind(after.updated_at)
+                .bind(after.updated_at)
+                .bind(&after.id)
                 .bind(limit)
                 .fetch_all(&self.pool)
                 .await?
@@ -353,17 +361,47 @@ impl IConversationRepository for SqliteConversationRepository {
             None => {
                 sqlx::query_as::<_, ConversationRow>(
                     "SELECT * FROM conversations
-                     WHERE user_id = ?
-                     ORDER BY updated_at DESC, id DESC
+                     WHERE user_id = ? AND rowid <= ?
+                       AND (updated_at < ? OR (updated_at = ? AND id <= ?))
+                     ORDER BY updated_at ASC, id ASC
                      LIMIT ?",
                 )
                 .bind(user_id)
+                .bind(boundary.max_rowid)
+                .bind(boundary.upper.updated_at)
+                .bind(boundary.upper.updated_at)
+                .bind(&boundary.upper.id)
                 .bind(limit)
                 .fetch_all(&self.pool)
                 .await?
             }
         };
         Ok(rows)
+    }
+
+    async fn memory_import_upper_bound(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<crate::repository::conversation::LegacyConversationImportBoundary>, DbError> {
+        let row: Option<(i64, String, i64)> = sqlx::query_as(
+            "WITH import_boundary AS (
+                SELECT MAX(rowid) AS max_rowid FROM conversations WHERE user_id = ?
+             )
+             SELECT conversations.updated_at,conversations.id,import_boundary.max_rowid
+             FROM conversations CROSS JOIN import_boundary
+             WHERE conversations.user_id = ? AND conversations.rowid <= import_boundary.max_rowid
+             ORDER BY conversations.updated_at DESC,conversations.id DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(updated_at, id, max_rowid)| crate::repository::conversation::LegacyConversationImportBoundary {
+                upper: crate::repository::conversation::LegacyConversationCursor { updated_at, id },
+                max_rowid,
+            },
+        ))
     }
 
     // ── Extended queries ────────────────────────────────────────────

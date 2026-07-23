@@ -735,7 +735,6 @@ impl MemoryService {
         if outcome != MemoryTurnOutcome::Completed {
             return Ok(false);
         }
-        crate::legacy_import::ensure_legacy_import(&jobs.memory, &jobs.conversations, user_id).await?;
         let policy = jobs
             .memory
             .effective_policy(user_id, conversation_id)
@@ -756,7 +755,12 @@ impl MemoryService {
             })
             .await
             .map_err(map_db_error)?;
-        Ok(enqueued.is_some())
+        if enqueued.is_some() {
+            crate::legacy_import::ensure_legacy_import(&jobs.memory, &jobs.conversations, user_id).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     async fn bound_claimed_job(
