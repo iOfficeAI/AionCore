@@ -1643,6 +1643,22 @@ pub(crate) async fn attach_member_runtime(
             .cleanup_stale_member_runtime_task(&session, &agent.conversation_id)
             .await;
         let failure = sanitize_member_runtime_failure(&error);
+        // Log the RAW error before it is sanitized away: the broadcast/public
+        // reason is intentionally generic ("Agent runtime failed to start"),
+        // and without this line production logs carry no trace of the actual
+        // cause (Sentry ELECTRON-3PP was only diagnosable by timing forensics).
+        // TeamError texts here are runtime/spawn diagnostics (never prompts,
+        // tool payloads, or secrets), so info-level visibility is safe.
+        warn!(
+            team_id = session.team_id(),
+            slot_id = agent.slot_id,
+            conversation_id = agent.conversation_id,
+            operation_id,
+            generation,
+            error_classification = failure.classification,
+            error = %error,
+            "team member runtime attach failed"
+        );
         if session.member_runtimes.commit_failed(&lease, failure.clone()) {
             service.broadcast_agent_runtime_status(
                 session.team_id(),
