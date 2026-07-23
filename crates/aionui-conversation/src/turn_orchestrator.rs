@@ -550,12 +550,7 @@ impl ConversationTurnOrchestrator {
         } else {
             ConversationTurnStatus::Completed
         };
-        let memory_eligible = memory_capture_eligible(
-            input.memory_eligible,
-            status,
-            persisted_assistant_output,
-            runtime_state.lifecycle_for(&conv_id),
-        );
+        let memory_eligible = memory_capture_eligible(input.memory_eligible, status, persisted_assistant_output);
         self.service
             .finish_claimed_turn(&conv_id, &turn_id, &mut turn_claim, status, memory_eligible)
             .await;
@@ -567,14 +562,8 @@ impl ConversationTurnOrchestrator {
     }
 }
 
-fn memory_capture_eligible(
-    requested: bool,
-    status: ConversationTurnStatus,
-    persisted_assistant_output: bool,
-    lifecycle: RuntimeLifecycleState,
-) -> bool {
+fn memory_capture_eligible(requested: bool, status: ConversationTurnStatus, persisted_assistant_output: bool) -> bool {
     requested
-        && lifecycle == RuntimeLifecycleState::Active
         && match status {
             ConversationTurnStatus::Completed => persisted_assistant_output,
             ConversationTurnStatus::Failed => true,
@@ -742,43 +731,9 @@ mod tests {
     }
 
     #[test]
-    fn memory_capture_eligibility_classifies_status_and_runtime_lifecycle() {
-        assert!(memory_capture_eligible(
-            true,
-            ConversationTurnStatus::Completed,
-            true,
-            RuntimeLifecycleState::Active,
-        ));
-        assert!(!memory_capture_eligible(
-            true,
-            ConversationTurnStatus::Completed,
-            false,
-            RuntimeLifecycleState::Active,
-        ));
-        assert!(memory_capture_eligible(
-            true,
-            ConversationTurnStatus::Failed,
-            false,
-            RuntimeLifecycleState::Active,
-        ));
-
-        for lifecycle in [
-            RuntimeLifecycleState::Cancelling,
-            RuntimeLifecycleState::Deleting,
-            RuntimeLifecycleState::ShuttingDown,
-        ] {
-            assert!(!memory_capture_eligible(
-                true,
-                ConversationTurnStatus::Completed,
-                true,
-                lifecycle,
-            ));
-            assert!(!memory_capture_eligible(
-                true,
-                ConversationTurnStatus::Failed,
-                true,
-                lifecycle,
-            ));
-        }
+    fn memory_capture_eligibility_classifies_turn_status() {
+        assert!(memory_capture_eligible(true, ConversationTurnStatus::Completed, true,));
+        assert!(!memory_capture_eligible(true, ConversationTurnStatus::Completed, false,));
+        assert!(memory_capture_eligible(true, ConversationTurnStatus::Failed, false,));
     }
 }

@@ -3847,6 +3847,157 @@ async fn memory_callback_timeout_allows_the_next_ordered_completion() {
 }
 
 #[tokio::test]
+async fn aborted_completion_waiter_does_not_retain_the_gate_registry_entry() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let memory = Arc::new(BlockingCompletionMemoryPort::default());
+    svc.with_memory_port(memory.clone());
+
+    let mut first_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-first").unwrap();
+    let first_service = svc.clone();
+    let first_conversation_id = conv.id.clone();
+    let first_completion = tokio::spawn(async move {
+        first_service
+            .finish_claimed_turn(
+                &first_conversation_id,
+                "turn-first",
+                &mut first_claim,
+                crate::turn_orchestrator::ConversationTurnStatus::Completed,
+                true,
+            )
+            .await;
+    });
+    memory.first_started.notified().await;
+
+    let mut second_claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn-second")
+        .expect("next turn should claim after the first releases");
+    let second_service = svc.clone();
+    let second_conversation_id = conv.id.clone();
+    let second_completion = tokio::spawn(async move {
+        second_service
+            .finish_claimed_turn(
+                &second_conversation_id,
+                "turn-second",
+                &mut second_claim,
+                crate::turn_orchestrator::ConversationTurnStatus::Completed,
+                true,
+            )
+            .await;
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(svc.completion_gate_count(), 1);
+
+    second_completion.abort();
+    assert!(second_completion.await.unwrap_err().is_cancelled());
+    memory.release_first.notify_one();
+    first_completion.await.unwrap();
+
+    assert_eq!(svc.completion_gate_count(), 0);
+}
+
+#[tokio::test]
+async fn cancelled_current_completion_does_not_retain_the_gate_registry_entry() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let memory = Arc::new(BlockingCompletionMemoryPort::default());
+    svc.with_memory_port(memory.clone());
+
+    let mut claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-first").unwrap();
+    let completion_service = svc.clone();
+    let conversation_id = conv.id.clone();
+    let completion = tokio::spawn(async move {
+        completion_service
+            .finish_claimed_turn(
+                &conversation_id,
+                "turn-first",
+                &mut claim,
+                crate::turn_orchestrator::ConversationTurnStatus::Completed,
+                true,
+            )
+            .await;
+    });
+    memory.first_started.notified().await;
+    assert_eq!(svc.completion_gate_count(), 1);
+
+    completion.abort();
+    assert!(completion.await.unwrap_err().is_cancelled());
+
+    assert_eq!(svc.completion_gate_count(), 0);
+}
+
+#[tokio::test]
+async fn lifecycle_change_while_waiting_for_completion_gate_blocks_memory_capture() {
+    let (svc, broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let memory = Arc::new(BlockingCompletionMemoryPort::default());
+    svc.with_memory_port(memory.clone());
+    broadcaster.take_events();
+
+    let mut first_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-first").unwrap();
+    let first_service = svc.clone();
+    let first_conversation_id = conv.id.clone();
+    let first_completion = tokio::spawn(async move {
+        first_service
+            .finish_claimed_turn(
+                &first_conversation_id,
+                "turn-first",
+                &mut first_claim,
+                crate::turn_orchestrator::ConversationTurnStatus::Completed,
+                true,
+            )
+            .await;
+    });
+    memory.first_started.notified().await;
+
+    let mut second_claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn-second")
+        .expect("next turn should claim after the first releases");
+    let second_service = svc.clone();
+    let second_conversation_id = conv.id.clone();
+    let second_completion = tokio::spawn(async move {
+        second_service
+            .finish_claimed_turn(
+                &second_conversation_id,
+                "turn-second",
+                &mut second_claim,
+                crate::turn_orchestrator::ConversationTurnStatus::Completed,
+                true,
+            )
+            .await;
+    });
+    tokio::task::yield_now().await;
+    svc.runtime_state().mark_cancelling(&conv.id);
+    memory.release_first.notify_one();
+    first_completion.await.unwrap();
+    second_completion.await.unwrap();
+
+    assert_eq!(
+        memory
+            .completions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|input| input.turn_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn-first"],
+    );
+    assert_eq!(
+        broadcaster
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.name == "turn.completed")
+            .map(|event| event.data["turn_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["turn-first", "turn-second"],
+    );
+}
+
+#[tokio::test]
 async fn failed_assistant_evidence_persistence_skips_completed_memory_capture_but_keeps_event() {
     let (svc, broadcaster, repo, _default_task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());

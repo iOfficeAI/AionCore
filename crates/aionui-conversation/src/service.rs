@@ -335,6 +335,29 @@ pub struct ConversationService {
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
 }
 
+type CompletionGateRegistry = Arc<std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>;
+
+struct CompletionGateLease {
+    registry: CompletionGateRegistry,
+    conversation_id: String,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for CompletionGateLease {
+    fn drop(&mut self) {
+        let mut gates = self.registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let same_gate = gates
+            .get(&self.conversation_id)
+            .is_some_and(|stored| stored.ptr_eq(&Arc::downgrade(&self.gate)));
+        // Drop is synchronous and runs for normal return, cancellation, and
+        // unwind. Existing waiters each own another strong Arc, so the mapped
+        // identity remains until the final lease disappears.
+        if same_gate && Arc::strong_count(&self.gate) == 1 {
+            gates.remove(&self.conversation_id);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ConversationAgentTurnRequest {
     pub user_id: String,
@@ -618,46 +641,27 @@ impl ConversationService {
     }
 
     pub async fn complete_turn(&self, conversation_id: &str, turn_id: &str) {
-        let gate = self.completion_gate(conversation_id);
-        {
-            let _guard = gate.lock().await;
-            self.complete_turn_with_memory_unsequenced(
-                conversation_id,
-                turn_id,
-                ConversationTurnStatus::Completed,
-                true,
-            )
+        let lease = self.completion_gate(conversation_id);
+        let _guard = lease.gate.lock().await;
+        self.complete_turn_with_memory_unsequenced(conversation_id, turn_id, ConversationTurnStatus::Completed, true)
             .await;
-        }
-        self.cleanup_completion_gate(conversation_id, &gate);
     }
 
-    fn completion_gate(&self, conversation_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    fn completion_gate(&self, conversation_id: &str) -> CompletionGateLease {
         let mut gates = self
             .completion_gates
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(gate) = gates.get(conversation_id).and_then(Weak::upgrade) {
-            return gate;
-        }
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        gates.insert(conversation_id.to_owned(), Arc::downgrade(&gate));
-        gate
-    }
-
-    fn cleanup_completion_gate(&self, conversation_id: &str, gate: &Arc<tokio::sync::Mutex<()>>) {
-        let mut gates = self
-            .completion_gates
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let same_gate = gates
-            .get(conversation_id)
-            .is_some_and(|stored| stored.ptr_eq(&Arc::downgrade(gate)));
-        // Holding the map lock prevents a new caller from upgrading the weak
-        // entry between this count and removal. Existing/upcoming waiters own a
-        // strong Arc and therefore preserve the shared gate identity.
-        if same_gate && Arc::strong_count(gate) == 1 {
-            gates.remove(conversation_id);
+        gates.retain(|_, stored| stored.strong_count() > 0);
+        let gate = gates.get(conversation_id).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let gate = Arc::new(tokio::sync::Mutex::new(()));
+            gates.insert(conversation_id.to_owned(), Arc::downgrade(&gate));
+            gate
+        });
+        CompletionGateLease {
+            registry: Arc::clone(&self.completion_gates),
+            conversation_id: conversation_id.to_owned(),
+            gate,
         }
     }
 
@@ -720,26 +724,29 @@ impl ConversationService {
         turn_id: &str,
         turn_claim: &mut TurnClaim,
         status: ConversationTurnStatus,
-        memory_eligible: bool,
+        mut memory_eligible: bool,
     ) {
         // Acquire before releasing the runtime claim. A following turn may start
         // as soon as the claim is released, but cannot publish completion or
         // enqueue Memory capture ahead of this turn.
-        let gate = self.completion_gate(conversation_id);
-        {
-            let _guard = gate.lock().await;
-            let was_deleting = turn_claim.release_for_turn(turn_id);
-            if was_deleting {
-                debug!(
-                    conversation_id,
-                    turn_id, "Skipping turn completion because conversation was deleting at claim release"
-                );
-            } else {
-                self.complete_turn_with_memory_unsequenced(conversation_id, turn_id, status, memory_eligible)
-                    .await;
-            }
+        let lease = self.completion_gate(conversation_id);
+        let _guard = lease.gate.lock().await;
+        let release = turn_claim.release_for_turn_with_lifecycle(turn_id);
+        if !release.released {
+            return;
         }
-        self.cleanup_completion_gate(conversation_id, &gate);
+        if release.was_deleting {
+            debug!(
+                conversation_id,
+                turn_id, "Skipping turn completion because conversation was deleting at claim release"
+            );
+            return;
+        }
+        if release.was_cancelling || release.was_shutting_down {
+            memory_eligible = false;
+        }
+        self.complete_turn_with_memory_unsequenced(conversation_id, turn_id, status, memory_eligible)
+            .await;
     }
 }
 
