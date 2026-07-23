@@ -6,13 +6,9 @@ use aionui_api_types::{
     AgentManagementRow, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource,
     TryConnectCustomAgentResponse,
 };
+use aionui_common::AgentType;
 use aionui_common::now_ms;
-use aionui_common::{AgentType, CommandSpec, EnvVar};
 use aionui_db::{IProviderRepository, UpdateAgentAvailabilitySnapshotParams};
-use aionui_runtime::{
-    ManagedAcpToolId, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter, resolve_command_path,
-};
-use tokio::time::Duration;
 
 use crate::error::AgentError;
 use crate::protocol::{cli_detect, custom_agent_probe};
@@ -161,27 +157,24 @@ async fn run_probe(
     let start = Instant::now();
 
     let (status, error_code, error_message) = if meta.agent_source == AgentSource::Builtin
-        && let Some(backend) = meta.backend.as_deref()
-        && let Some(tool) = ManagedAcpToolId::from_backend(backend)
+        && matches!(meta.backend.as_deref(), Some("claude") | Some("codex"))
     {
-        match try_connect_builtin_managed_agent(meta, tool).await {
-            TryConnectCustomAgentResponse::Success => (AgentSnapshotCheckStatus::Online, None, None),
-            TryConnectCustomAgentResponse::FailCli { error } => (
+        // Builtin claude/codex are direct CLIs: availability is a PATH-only probe
+        // of the primary command (proxy for "installed + authenticated"), NOT an
+        // ACP handshake. Mirrors registry::probe_resolved_command / cli_probe.
+        match crate::cli_probe::command_name(meta) {
+            Some(primary) if aionui_runtime::resolve_command_path(primary).is_some() => {
+                (AgentSnapshotCheckStatus::Online, None, None)
+            }
+            Some(primary) => (
                 AgentSnapshotCheckStatus::Offline,
                 Some("command_not_found".to_owned()),
-                Some(error),
+                Some(format!("`{primary}` not found on PATH")),
             ),
-            TryConnectCustomAgentResponse::FailAcp { error } => (
+            None => (
                 AgentSnapshotCheckStatus::Offline,
-                Some("acp_init_failed".to_owned()),
-                Some(error),
-            ),
-            // Reachable but not authorized: still offline (unusable), but a
-            // dedicated code lets the UI guide the user to log in.
-            TryConnectCustomAgentResponse::FailAuth { error } => (
-                AgentSnapshotCheckStatus::Offline,
-                Some("auth_required".to_owned()),
-                Some(error),
+                Some("command_not_found".to_owned()),
+                Some("no CLI command configured".to_owned()),
             ),
         }
     } else if let Some(command) = meta.command.as_deref() {
@@ -292,74 +285,6 @@ async fn probe_aionrs_provider_readiness(
             Some("no_provider".to_owned()),
             Some(format!("Failed to read model providers: {e}")),
         ),
-    }
-}
-
-async fn try_connect_builtin_managed_agent(
-    meta: &AgentMetadata,
-    tool: ManagedAcpToolId,
-) -> TryConnectCustomAgentResponse {
-    if let Some(primary) = meta.agent_source_info.binary_name.as_deref()
-        && resolve_command_path(primary).is_none()
-    {
-        return TryConnectCustomAgentResponse::FailCli {
-            error: format!("`{primary}` not found on PATH"),
-        };
-    }
-
-    let node_runtime = match ensure_node_runtime_with_reporter(None).await {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            return TryConnectCustomAgentResponse::FailCli {
-                error: error.to_string(),
-            };
-        }
-    };
-
-    let managed_tool = match ensure_managed_acp_tool_with_reporter(tool, None).await {
-        Ok(tool) => tool,
-        Err(error) => {
-            return TryConnectCustomAgentResponse::FailCli {
-                error: error.to_string(),
-            };
-        }
-    };
-
-    let resolved = managed_tool.command(&node_runtime);
-    let mut env: Vec<EnvVar> = meta
-        .env
-        .iter()
-        .map(|entry| EnvVar {
-            name: entry.name.clone(),
-            value: entry.value.clone(),
-        })
-        .collect();
-    env.extend(resolved.env.iter().map(|(name, value)| EnvVar {
-        name: name.to_string_lossy().into_owned(),
-        value: value.to_string_lossy().into_owned(),
-    }));
-
-    let spec = CommandSpec {
-        command: resolved.program,
-        args: resolved
-            .args_prefix
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect(),
-        env,
-        cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
-    };
-
-    match tokio::time::timeout(
-        Duration::from_secs(35),
-        custom_agent_probe::acp_probe_command_spec(spec),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(_) => TryConnectCustomAgentResponse::FailAcp {
-            error: "ACP handshake did not complete within 35s".to_owned(),
-        },
     }
 }
 

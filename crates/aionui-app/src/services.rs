@@ -166,6 +166,19 @@ impl AppServices {
         let runtime_helper_bin = backend_binary_path.to_string_lossy().into_owned();
         let runtime_base_url = config.local_base_url();
 
+        // Session-model port: the subprocess spawner the clean-slate claude/codex
+        // SessionBackend uses. Registry-backed (feature 001) so spawned processes are
+        // reap-gateable; a fresh per-run epoch (no cross-run reap authority is required
+        // for the port's spawn path). claude/codex always run through the direct-CLI
+        // SessionAgentTask now — the spawner is unconditionally wired.
+        let process_registry = Arc::new(aionui_process::FileRegistryStore::new(&data_dir));
+        let machine_id = aionui_process::local_machine_id(&data_dir);
+        let session_spawner: Arc<dyn aionui_process::Spawner> = Arc::new(aionui_process::RealSpawner::new(
+            process_registry,
+            uuid::Uuid::now_v7(),
+            machine_id,
+        ));
+
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
             provider_repo,
@@ -177,6 +190,7 @@ impl AppServices {
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
+            session_spawner,
         });
 
         // Agent factory is now wired. Future extension/custom agents

@@ -42,6 +42,14 @@ impl AcpSessionSyncService {
         })
     }
 
+    /// The underlying `acp_session` repository. Exposed so the session-model port's
+    /// `SessionAgentTask` can persist the resume anchor + observed config directly
+    /// from its own event pump (it bypasses the ACP manager's `attach` domain-event
+    /// consumer, so it writes the same rows through the same repo).
+    pub fn repo(&self) -> Arc<dyn IAcpSessionRepository> {
+        self.repo.clone()
+    }
+
     /// Read the persisted per-session state for `conversation_id`.
     pub async fn load_persisted(&self, conversation_id: &str) -> Option<aionui_db::PersistedSessionState> {
         match self.repo.load_runtime_state(conversation_id).await {

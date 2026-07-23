@@ -72,12 +72,6 @@ async fn probe_resolved_command_keeps_bridge_but_version_probe_targets_primary_c
 
 #[test]
 fn probe_resolved_command_requires_primary_binary_for_builtin_managed_claude() {
-    if !probe_node_runtime_supported().is_supported()
-        || !probe_managed_acp_tool_supported(ManagedAcpToolId::ClaudeAgentAcp).is_supported()
-    {
-        return;
-    }
-
     let meta = AgentMetadata {
         id: "agent-claude".into(),
         icon: None,
@@ -127,12 +121,6 @@ fn probe_resolved_command_requires_primary_binary_for_builtin_managed_claude() {
 
 #[test]
 fn probe_resolved_command_requires_primary_binary_for_builtin_managed_codex() {
-    if !probe_node_runtime_supported().is_supported()
-        || !probe_managed_acp_tool_supported(ManagedAcpToolId::CodexAcp).is_supported()
-    {
-        return;
-    }
-
     let meta = AgentMetadata {
         id: "agent-codex".into(),
         icon: None,

@@ -397,6 +397,9 @@ impl StreamPersistenceAdapter {
             ToolCallStatus::Running => "work",
             ToolCallStatus::Completed => "finish",
             ToolCallStatus::Error => "error",
+            // A cancelled call is terminal: the row must leave "work" so the
+            // frontend spinner (hasRunningToolMessages) stops after interrupt.
+            ToolCallStatus::Canceled => "finish",
         };
         let content = serde_json::to_string(data).unwrap_or_default();
 
@@ -472,9 +475,12 @@ impl StreamPersistenceAdapter {
         if !self.allows_write(RuntimeWriteKind::ToolGroupPersist) {
             return;
         }
-        let all_done = entries
-            .iter()
-            .all(|e| matches!(e.status, ToolCallStatus::Completed | ToolCallStatus::Error));
+        let all_done = entries.iter().all(|e| {
+            matches!(
+                e.status,
+                ToolCallStatus::Completed | ToolCallStatus::Error | ToolCallStatus::Canceled
+            )
+        });
         let status = if all_done { "finish" } else { "work" };
         let content = serde_json::to_string(entries).unwrap_or_default();
 

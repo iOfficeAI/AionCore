@@ -240,13 +240,7 @@ pub(crate) async fn run_server(
         let prepare_started = Instant::now();
         info!("startup: managed runtime background preparation started");
         let result = async {
-            runtime_prepare_service.ensure_node_runtime(scope.clone()).await?;
-            runtime_prepare_service
-                .ensure_managed_acp_tool(scope.clone(), "codex-acp")
-                .await?;
-            runtime_prepare_service
-                .ensure_managed_acp_tool(scope, "claude-agent-acp")
-                .await?;
+            runtime_prepare_service.ensure_node_runtime(scope).await?;
             Ok::<(), aionui_system::SystemError>(())
         }
         .await;
@@ -293,6 +287,7 @@ pub(crate) async fn run_server(
     );
     let conversation_runtime_state = services.conversation_runtime_state.clone();
     let worker_task_manager = services.worker_task_manager.clone();
+    let client_pref_service = router_runtime.client_pref_service.clone();
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -320,6 +315,14 @@ pub(crate) async fn run_server(
                         Err(_) => warn!(active_task_count, "worker task manager shutdown timed out"),
                     }
                 }
+            }
+            if let Err(error) = client_pref_service.release_keep_awake_for_shutdown().await {
+                warn!(
+                    code = "BOOTSTRAP_DEGRADED_KEEP_AWAKE_RELEASE",
+                    stage = "shutdown.keep_awake.release",
+                    error = %error,
+                    "keep-awake shutdown release failed"
+                );
             }
             let _ = shutdown_tx.send(true);
         })

@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","cwd":"/tmp","session_id":"00000000-0000-0000-0000-000000000001","tools":["Read"],"mcp_servers":[],"model":"claude-opus-4-5","permissionMode":"bypassPermissions","apiKeySource":"none","claude_code_version":"2.1.0"}
+{"type":"assistant","message":{"id":"msg_par_1","model":"claude-opus-4-5","role":"assistant","content":[{"type":"tool_use","id":"toolu_par_A","name":"Read","input":{"file_path":"/tmp/a.txt"}},{"type":"tool_use","id":"toolu_par_B","name":"Read","input":{"file_path":"/tmp/b.txt"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":15,"output_tokens":12}}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_par_B","content":"contents of B","is_error":false}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_par_A","content":"contents of A","is_error":false}]}}
+{"type":"assistant","message":{"id":"msg_par_2","model":"claude-opus-4-5","role":"assistant","content":[{"type":"text","text":"Read both files."}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":20,"output_tokens":5}}}
+{"type":"result","subtype":"success","is_error":false,"result":"Read both files.","stop_reason":"end_turn","session_id":"00000000-0000-0000-0000-000000000001","total_cost_usd":0.0}

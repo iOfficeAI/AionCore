@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","cwd":"/tmp","session_id":"00000000-0000-0000-0000-000000000001","tools":["Read"],"mcp_servers":[],"model":"claude-opus-4-5","permissionMode":"bypassPermissions","apiKeySource":"none","claude_code_version":"2.1.0"}
+{"type":"assistant","message":{"id":"msg_a_001","model":"claude-opus-4-5","role":"assistant","content":[{"type":"tool_use","id":"toolu_read_att","name":"Read","input":{"file_path":"/tmp/attached.txt"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":8}}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read_att","content":"ATTACHMENT_MARKER_42","is_error":false}]}}
+{"type":"assistant","message":{"id":"msg_a_002","model":"claude-opus-4-5","role":"assistant","content":[{"type":"text","text":"The file contains ATTACHMENT_MARKER_42."}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":20,"output_tokens":6}}}
+{"type":"result","subtype":"success","is_error":false,"result":"The file contains ATTACHMENT_MARKER_42.","stop_reason":"end_turn","session_id":"00000000-0000-0000-0000-000000000001","total_cost_usd":0.0}

@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.51](https://github.com/iOfficeAI/AionCore/compare/v0.1.50...v0.1.51) (2026-07-23)
+
+
+### Features
+
+* **project:** add project-bind foundation (db + aionui-project) ([#672](https://github.com/iOfficeAI/AionCore/issues/672)) ([70eae04](https://github.com/iOfficeAI/AionCore/commit/70eae0465259c4a4ca1db44a1a456b0040d1d24f))
+* **session-port:** route claude/codex through the direct-CLI SessionAgentTask ([#609](https://github.com/iOfficeAI/AionCore/issues/609)) ([14efff8](https://github.com/iOfficeAI/AionCore/commit/14efff85f192e0d1a588584fea3a870347661de7))
+* **team:** leader-only warmup with lazy teammate wakeup and per-member attach ([#670](https://github.com/iOfficeAI/AionCore/issues/670)) ([f542da8](https://github.com/iOfficeAI/AionCore/commit/f542da83bf7387dc8525df561eda9f43f2c5ac34))
+
+
+### Bug Fixes
+
+* **acp:** harden grok startup environment and npx recovery ([#662](https://github.com/iOfficeAI/AionCore/issues/662)) ([10cdd57](https://github.com/iOfficeAI/AionCore/commit/10cdd579849e6430c360cc88b25896ff8c146490))
+* **ci:** restore main migration immutability guard ([7603d44](https://github.com/iOfficeAI/AionCore/commit/7603d44227f65f3d15e8b447c00c18bddd212314))
+* **cron:** use host timezone for conversation cron ([#652](https://github.com/iOfficeAI/AionCore/issues/652)) ([19b36f8](https://github.com/iOfficeAI/AionCore/commit/19b36f8ee3e67b5ffe58a0ca333696a880c22c9b))
+* **skills:** repair butler cron and doc drift (2026-07-22 audit) ([#664](https://github.com/iOfficeAI/AionCore/issues/664)) ([273ac47](https://github.com/iOfficeAI/AionCore/commit/273ac476bc892edb7bb63429e423e0b4928bcad0))
+* **system:** release keep-awake on shutdown ([#666](https://github.com/iOfficeAI/AionCore/issues/666)) ([6e0b3a7](https://github.com/iOfficeAI/AionCore/commit/6e0b3a73a6bc8fca6f7c5378760d352bfe6e667c))
+
 ## [0.1.50](https://github.com/iOfficeAI/AionCore/compare/v0.1.49...v0.1.50) (2026-07-21)
 
 

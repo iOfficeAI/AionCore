@@ -7,11 +7,11 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 
 use aionui_api_types::{
-    ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest, EnsureManagedAcpToolRequest,
-    EnsureManagedAcpToolResponse, EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, FeedbackDiagnosticsQuery,
-    FeedbackDiagnosticsResponse, FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse,
-    ProtocolDetectionResponse, ProviderResponse, SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest,
-    UpdateCheckResult, UpdateClientPreferencesRequest, UpdateProviderRequest, UpdateSettingsRequest,
+    ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest, EnsureNodeRuntimeRequest,
+    EnsureNodeRuntimeResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse, FetchModelsAnonymousRequest,
+    FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse, SystemInfoResponse,
+    SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
+    UpdateProviderRequest, UpdateSettingsRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -72,7 +72,6 @@ impl From<SystemError> for ApiError {
 /// - `GET  /api/system/info`                 — system directory & platform info
 /// - `POST /api/system/check-update`         — check GitHub for new versions
 /// - `POST /api/system/ensure-node-runtime`  — prepare managed Node runtime
-/// - `POST /api/system/ensure-managed-acp-tool` — prepare managed ACP tool artifact
 /// - `GET  /api/system/diagnostics/feedback-report` — collect sanitized feedback diagnostics
 pub fn system_routes(state: SystemRouterState) -> Router {
     Router::new()
@@ -92,7 +91,6 @@ pub fn system_routes(state: SystemRouterState) -> Router {
         .route("/api/system/info", get(get_system_info))
         .route("/api/system/check-update", post(check_update))
         .route("/api/system/ensure-node-runtime", post(ensure_node_runtime))
-        .route("/api/system/ensure-managed-acp-tool", post(ensure_managed_acp_tool))
         .route("/api/system/diagnostics/feedback-report", get(get_feedback_diagnostics))
         .with_state(state)
 }
@@ -288,17 +286,5 @@ async fn ensure_node_runtime(
 ) -> Result<Json<ApiResponse<EnsureNodeRuntimeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state.runtime_prepare_service.ensure_node_runtime(req.scope).await?;
-    Ok(Json(ApiResponse::ok(result)))
-}
-
-async fn ensure_managed_acp_tool(
-    State(state): State<SystemRouterState>,
-    body: Result<Json<EnsureManagedAcpToolRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<EnsureManagedAcpToolResponse>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let result = state
-        .runtime_prepare_service
-        .ensure_managed_acp_tool(req.scope, &req.tool_id)
-        .await?;
     Ok(Json(ApiResponse::ok(result)))
 }

@@ -951,6 +951,10 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
         *self.session_id.lock().unwrap() = Some(session_id.to_owned());
         Ok(true)
     }
+    async fn clear_session_id(&self, _conversation_id: &str) -> Result<bool, DbError> {
+        *self.session_id.lock().unwrap() = None;
+        Ok(true)
+    }
     async fn delete(&self, _conversation_id: &str) -> Result<bool, DbError> {
         Ok(false)
     }

@@ -53,6 +53,17 @@ pub enum AgentStreamEvent {
     System(serde_json::Value),
     RequestTrace(serde_json::Value),
     SessionAssigned(SessionAssignedEventData),
+    /// Intra-turn soft boundary between two independent assistant outputs.
+    ///
+    /// Unlike `Finish`, this does NOT terminate the turn or the relay: it only
+    /// tells the relay to close the current text/thinking segment so the next
+    /// batch of text starts a fresh message bubble. Emitted by the direct-CLI
+    /// session pump when it suppresses a non-blocking Workflow's intermediate
+    /// launch `result` (claude produces one launch output while subagents run
+    /// and a separate completion output afterwards — two independent outputs
+    /// under one turn). The relay consumes it internally and never forwards it
+    /// to the WebSocket, so no frontend renderer is required.
+    SegmentBreak,
 }
 
 /// Data for the `Start` event.

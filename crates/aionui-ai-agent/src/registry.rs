@@ -23,10 +23,7 @@ use aionui_api_types::{
 };
 use aionui_common::AgentType;
 use aionui_db::{AgentMetadataRow, IAgentMetadataRepository, UpdateAgentHandshakeParams};
-use aionui_runtime::{
-    ManagedAcpToolId, RuntimeCommandProbe, probe_managed_acp_tool_supported, probe_node_runtime_supported,
-    probe_runtime_command, resolve_command_path,
-};
+use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::{RwLock, mpsc};
@@ -721,16 +718,7 @@ fn apply_cached_availability(meta: &mut AgentMetadata) -> Option<UnavailableReas
 }
 
 fn is_builtin_managed_agent(meta: &AgentMetadata) -> bool {
-    meta.agent_source == AgentSource::Builtin
-        && meta
-            .backend
-            .as_deref()
-            .and_then(ManagedAcpToolId::from_backend)
-            .is_some()
-}
-
-fn is_builtin_codex(meta: &AgentMetadata) -> bool {
-    meta.agent_source == AgentSource::Builtin && meta.backend.as_deref() == Some("codex")
+    meta.agent_source == AgentSource::Builtin && matches!(meta.backend.as_deref(), Some("claude") | Some("codex"))
 }
 
 fn has_availability_snapshot(meta: &AgentMetadata) -> bool {
@@ -1234,39 +1222,15 @@ fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableRe
         return Err(UnavailableReason::Disabled);
     }
 
-    if is_builtin_codex(meta) {
-        let primary = crate::cli_probe::command_name(meta).unwrap_or("codex");
+    // Builtin claude/codex run as direct CLIs now: availability is a PATH-only
+    // probe of the primary command (packaged app ships the binary, but PATH
+    // presence is our proxy for "user installed + authenticated" — see
+    // managed_cli / cli_probe). No node/ACP-tool preparation is involved.
+    if is_builtin_managed_agent(meta) {
+        let primary = crate::cli_probe::command_name(meta).ok_or(UnavailableReason::NoCommand)?;
         return probe_command_candidate(primary).ok_or_else(|| UnavailableReason::PrimaryMissing {
             binary: primary.to_owned(),
         });
-    }
-
-    if meta.agent_source == AgentSource::Builtin
-        && let Some(backend) = meta.backend.as_deref()
-        && let Some(tool) = ManagedAcpToolId::from_backend(backend)
-    {
-        let node_support = probe_node_runtime_supported();
-        if !node_support.is_supported() {
-            return Err(UnavailableReason::ManagedRuntimeUnavailable {
-                resource: "node".to_owned(),
-                detail: node_support.detail,
-            });
-        }
-        let tool_support = probe_managed_acp_tool_supported(tool);
-        if !tool_support.is_supported() {
-            return Err(UnavailableReason::ManagedRuntimeUnavailable {
-                resource: tool.slug().to_owned(),
-                detail: tool_support.detail,
-            });
-        }
-        if let Some(primary) = meta.agent_source_info.binary_name.as_deref()
-            && probe_command_candidate(primary).is_none()
-        {
-            return Err(UnavailableReason::PrimaryMissing {
-                binary: primary.to_owned(),
-            });
-        }
-        return Ok(PathBuf::from(tool.slug()));
     }
 
     let Some(cmd) = meta.command.as_deref().filter(|s| !s.is_empty()) else {

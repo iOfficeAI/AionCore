@@ -14,13 +14,10 @@ use aionui_common::CommandSpec;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
-use aionui_runtime::{
-    ManagedAcpToolId, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter, ensure_runtime_command,
-    ensure_runtime_command_with_reporter, resolve_command_path,
-};
+use aionui_runtime::{ensure_runtime_command, ensure_runtime_command_with_reporter};
 use tracing::{info, warn};
 
-use crate::runtime_status::{conversation_acp_tool_runtime_reporter, conversation_runtime_reporter};
+use crate::runtime_status::conversation_runtime_reporter;
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -48,6 +45,60 @@ pub(super) async fn build(
     // vendor label (builtin path), we preserve it as-is.
     if config.agent_id.is_some() || config.backend.is_none() {
         config.backend.clone_from(&meta.backend);
+    }
+
+    // Session-model port: claude/codex ALWAYS run through the clean-slate direct-CLI
+    // SessionBackend (SessionAgentTask), NOT the ACP manager. Every other ACP vendor
+    // keeps the AcpAgentManager path below. There is no fallback: a claude/codex
+    // build that yields no instance is a hard error, not a silent drop to ACP. The
+    // build inputs mirror clean-slate `build_runtime` 1:1 (resume anchor, mode/model
+    // precedence, MCP + preset + skills init surface, cc-switch env, codex sandbox/approval).
+    if let Some(backend_label) = config.backend.as_deref()
+        && matches!(backend_label, "claude" | "codex")
+    {
+        let instance = crate::session_agent::build_session_instance(
+            backend_label,
+            crate::session_agent::SessionBuildInputs {
+                conversation_id: ctx.conversation_id.clone(),
+                workspace: ctx.workspace.clone(),
+                config: &config,
+                metadata: &meta,
+                session_snapshot: build_context.session_snapshot.as_ref(),
+                backend_session_id: build_context.session_id.clone(),
+                mcp_server_repo: deps.mcp_server_repo.as_ref(),
+                // The AIONUI_* conversation runtime context the legacy path
+                // injects via apply_acp_launch_policy — forwarded into
+                // SessionConfig.spawn_env so direct-CLI spawns get it too.
+                runtime_env: &ctx.runtime_env,
+                broadcaster: deps.broadcaster.clone(),
+                // G5: keyed by the resolved catalog row so the discovered
+                // modes/models/commands refresh the `/api/agents` picker (the
+                // AcpAgentManager path does this via CatalogForwarder; the session
+                // path polls capabilities() directly since its stream carries no
+                // catalog events).
+                catalog_writeback: Some((meta.id.clone(), deps.agent_registry.catalog_sender())),
+                // Persist the resume anchor + observed mode/model from the session
+                // pump (the ACP path does this via acp_agent_service.attach, which
+                // this early-return bypasses).
+                acp_session_repo: Some(deps.acp_agent_service.repo()),
+                // DEV (`--dump-prompts`): resolve the dump dir once (mirrors the
+                // aionrs factory's `prompt_dump_dir`). `None` when off.
+                prompt_dump_dir: crate::dev_prompt_dump::dump_dir_for_data_dir(&deps.data_dir, deps.dump_prompts),
+            },
+            deps.session_spawner.clone(),
+        )
+        .await?
+        .ok_or_else(|| {
+            AgentError::internal(format!(
+                "session backend for '{backend_label}' unexpectedly returned no instance"
+            ))
+        })?;
+        tracing::info!(
+            conversation_id = %ctx.conversation_id,
+            backend = %backend_label,
+            "session-port: routing conversation through the direct-CLI SessionAgentTask (not AcpAgentManager)"
+        );
+        return Ok(instance);
     }
 
     let mut command_spec =
@@ -173,13 +224,6 @@ async fn resolve_agent_command_spec(
     conversation_id: &str,
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
 ) -> Result<CommandSpec, AgentError> {
-    if meta.agent_source == aionui_api_types::AgentSource::Builtin
-        && let Some(backend) = meta.backend.as_deref()
-        && let Some(tool) = ManagedAcpToolId::from_backend(backend)
-    {
-        return resolve_builtin_managed_acp_command_spec(meta, workspace, conversation_id, broadcaster, tool).await;
-    }
-
     let command = meta
         .command
         .as_deref()
@@ -205,61 +249,6 @@ async fn resolve_agent_command_spec(
         meta.args.clone()
     };
     args.extend(launch_args);
-
-    let mut env: Vec<aionui_common::EnvVar> = meta
-        .env
-        .iter()
-        .map(|entry| aionui_common::EnvVar {
-            name: entry.name.clone(),
-            value: entry.value.clone(),
-        })
-        .collect();
-    env.extend(resolved.env.iter().map(|(name, value)| aionui_common::EnvVar {
-        name: name.to_string_lossy().into_owned(),
-        value: value.to_string_lossy().into_owned(),
-    }));
-
-    Ok(CommandSpec {
-        command: resolved.program,
-        args,
-        env,
-        cwd: Some(workspace.to_owned()),
-    })
-}
-
-async fn resolve_builtin_managed_acp_command_spec(
-    meta: &aionui_api_types::AgentMetadata,
-    workspace: &str,
-    conversation_id: &str,
-    broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
-    tool: ManagedAcpToolId,
-) -> Result<CommandSpec, AgentError> {
-    if let Some(primary) = meta.agent_source_info.binary_name.as_deref()
-        && resolve_command_path(primary).is_none()
-    {
-        return Err(AgentError::bad_request(format!(
-            "Agent '{}' requires `{primary}` to be installed and available on PATH",
-            meta.name
-        )));
-    }
-
-    let node_reporter = conversation_runtime_reporter(broadcaster.clone(), conversation_id.to_owned());
-    let node_runtime = ensure_node_runtime_with_reporter(Some(node_reporter.as_ref()))
-        .await
-        .map_err(|error| AgentError::bad_request(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
-
-    let tool_reporter = conversation_acp_tool_runtime_reporter(broadcaster, conversation_id.to_owned(), tool);
-    let managed_tool = ensure_managed_acp_tool_with_reporter(tool, Some(tool_reporter.as_ref()))
-        .await
-        .map_err(|error| AgentError::bad_request(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
-
-    let resolved = managed_tool.command(&node_runtime);
-
-    let args: Vec<String> = resolved
-        .args_prefix
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
 
     let mut env: Vec<aionui_common::EnvVar> = meta
         .env

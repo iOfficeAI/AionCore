@@ -295,6 +295,15 @@ impl StreamRelay {
                     }
 
                     match &event {
+                        AgentStreamEvent::SegmentBreak => {
+                            // Intra-turn soft boundary (see AgentStreamEvent::SegmentBreak):
+                            // close the current text/thinking segment so the next batch of
+                            // text starts a fresh bubble, but do NOT terminate the relay and
+                            // do NOT forward this event to the WebSocket.
+                            self.complete_active_thinking(&mut active_thinking).await;
+                            self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+                                .await;
+                        }
                         AgentStreamEvent::Thinking(data) => {
                             if data.status.as_deref() == Some("done") {
                                 self.complete_active_thinking(&mut active_thinking).await;
@@ -596,6 +605,7 @@ impl StreamRelay {
             AgentStreamEvent::System(_) => "System",
             AgentStreamEvent::RequestTrace(_) => "RequestTrace",
             AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
+            AgentStreamEvent::SegmentBreak => "SegmentBreak",
         }
     }
 
@@ -1061,6 +1071,72 @@ mod tests {
                 text_event_msg_ids.push(evt.data["msg_id"].as_str().unwrap_or_default().to_owned());
             }
         }
+        assert_eq!(text_event_msg_ids.len(), 2);
+        assert_eq!(text_event_msg_ids[0], "asst-1");
+        assert_ne!(text_event_msg_ids[0], text_event_msg_ids[1]);
+    }
+
+    // A SegmentBreak (emitted by the direct-CLI pump when it suppresses a
+    // non-blocking Workflow's launch result) must split text into two bubbles
+    // just like a tool call does — but WITHOUT terminating the relay and
+    // WITHOUT being forwarded to the WebSocket as its own frame.
+    #[tokio::test]
+    async fn segment_break_splits_text_without_forwarding_or_terminating() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+
+        let mut ws_rx = bus.subscribe();
+        let rx = tx.subscribe();
+
+        // launch reply -> SegmentBreak -> completion reply -> Finish
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "launching workflow".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::SegmentBreak).unwrap();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "workflow done".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        // Two persisted text segments under two different msg_ids.
+        let inserts = repo.take_inserts();
+        let text_msgs: Vec<_> = inserts.iter().filter(|msg| msg.r#type == "text").collect();
+        assert_eq!(text_msgs.len(), 2, "SegmentBreak should split text into two segments");
+        assert_eq!(text_msgs[0].id, "asst-1");
+        assert_ne!(text_msgs[0].id, text_msgs[1].id);
+
+        // The two text frames reach the WS under two msg_ids, and no
+        // `segment_break` frame is ever forwarded.
+        let mut text_event_msg_ids = Vec::new();
+        let mut saw_segment_break_frame = false;
+        while let Ok(evt) = ws_rx.try_recv() {
+            if evt.name == "message.stream" {
+                if evt.data["type"] == "text" || evt.data["type"] == "content" {
+                    text_event_msg_ids.push(evt.data["msg_id"].as_str().unwrap_or_default().to_owned());
+                }
+                if evt.data["type"] == "segment_break" {
+                    saw_segment_break_frame = true;
+                }
+            }
+        }
+        assert!(
+            !saw_segment_break_frame,
+            "SegmentBreak must never be forwarded to the WS"
+        );
         assert_eq!(text_event_msg_ids.len(), 2);
         assert_eq!(text_event_msg_ids[0], "asst-1");
         assert_ne!(text_event_msg_ids[0], text_event_msg_ids[1]);

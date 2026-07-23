@@ -52,10 +52,6 @@ pub fn node_runtime_root() -> Option<PathBuf> {
     runtime_root().map(|root| root.join("node"))
 }
 
-pub fn managed_acp_tool_root() -> Option<PathBuf> {
-    runtime_root().map(|root| root.join("managed-tools").join("acp"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,26 +80,6 @@ mod tests {
         assert_eq!(
             tail,
             vec!["node".to_string(), "runtime".to_string(), "aionui".to_string()]
-        );
-    }
-
-    #[test]
-    fn managed_acp_tool_root_appends_expected_directory() {
-        let dir = managed_acp_tool_root().expect("cache available");
-        let tail: Vec<_> = dir
-            .components()
-            .rev()
-            .take(4)
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            tail,
-            vec![
-                "acp".to_string(),
-                "managed-tools".to_string(),
-                "runtime".to_string(),
-                "aionui".to_string()
-            ]
         );
     }
 }
