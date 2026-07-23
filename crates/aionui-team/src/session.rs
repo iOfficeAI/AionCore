@@ -511,6 +511,53 @@ impl TeamSession {
             .await
     }
 
+    /// Lazily bring up a teammate runtime on delivery. When the slot has no
+    /// running event loop, synchronously reserve its attach lease — this flips
+    /// the registry snapshot to `Attaching` immediately so both the enqueue ack
+    /// (`publish_runtime_constraint` → `Starting{op>0}` → `BlockedRuntimeStarting`)
+    /// and `refresh_member_runtime_status` observe `pending`, closing the race
+    /// window in spec 5.2 — then spawns the attach in the background.
+    ///
+    /// No-op when the loop already runs (the post-commit `notify` wakes it) or
+    /// when an attach is already in flight (lease dedup keeps concurrent
+    /// deliveries to a single attach).
+    async fn ensure_member_runtime_lazy(&self, slot_id: &str, notify_leader_on_failure: bool) -> Result<(), TeamError> {
+        if self.event_loops.has(slot_id) {
+            return Ok(());
+        }
+        // A live service + published session are required to actually run the
+        // background attach. Resolve them BEFORE reserving so we never leave a
+        // dangling `Attaching` lease (e.g. unit tests without a service, or a
+        // shutting-down service) that would corrupt the runtime snapshot.
+        let Some(service) = self.service.upgrade() else {
+            return Ok(());
+        };
+        let Some(captured) = service.capture_published_session(self) else {
+            return Ok(());
+        };
+        let reservation = self.member_runtimes.reserve_attach(slot_id, false);
+        if matches!(reservation, ReserveAttach::Start(_)) {
+            let agent = self.scheduler.get_agent(slot_id).await?;
+            service.broadcast_agent_runtime_status(&self.team.id, &agent, TeamAgentRuntimeStatus::Pending, None);
+            info!(
+                team_id = %self.team.id,
+                slot_id,
+                trigger = if notify_leader_on_failure { "agent" } else { "human" },
+                "team member lazy runtime wakeup triggered"
+            );
+            spawn_attach_agent_process_bg(
+                service,
+                captured,
+                self.user_id.clone(),
+                agent,
+                self.task_manager.clone(),
+                reservation,
+                notify_leader_on_failure,
+            );
+        }
+        Ok(())
+    }
+
     async fn enqueue_user_message(
         &self,
         slot_id: &str,
@@ -518,6 +565,9 @@ impl TeamSession {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        // Human-direct delivery: lazily wake a dormant teammate. Failures stay
+        // inline for the user, so do NOT notify the leader.
+        self.ensure_member_runtime_lazy(slot_id, false).await?;
         self.publish_runtime_constraint(slot_id).await?;
         let agent = self.scheduler.get_agent(slot_id).await?;
         let source = if self.team_run_manager.current_active_run_id().is_some() {
@@ -618,6 +668,9 @@ impl TeamSession {
     ) -> Result<AgentMessageQueueResult, TeamError> {
         let to_agent = self.scheduler.get_agent(to_slot_id).await?;
         let from_agent = self.scheduler.get_agent(from_slot_id).await?;
+        // Agent-triggered delivery: lazily wake a dormant teammate. On failure
+        // notify the leader so it can re-delegate the work.
+        self.ensure_member_runtime_lazy(to_slot_id, true).await?;
         self.publish_runtime_constraint(to_slot_id).await?;
         let lease = self.work_coordinator.acquire_enqueue(EnqueueRequest {
             slot_id: to_slot_id.to_owned(),
@@ -816,6 +869,13 @@ impl TeamSession {
 
         let mut recovered_slots = Vec::new();
         for agent in self.scheduler.list_agents().await {
+            // First-start recovery only drains the lead slot. Teammates are
+            // dormant at first start (leader-only warmup); their unread mailbox
+            // rows are recovered when each is lazily woken and its event loop's
+            // reconcile_mailbox back-scans them (spec 5.1).
+            if agent.role != TeammateRole::Lead {
+                continue;
+            }
             let unread = self
                 .mailbox
                 .peek_unread(&self.team.id, &agent.slot_id)
@@ -1076,7 +1136,7 @@ impl TeamSession {
         let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await else {
             return Err(TeamError::AgentNotFound("lead".into()));
         };
-        let content = format!("Spawned teammate {failed_slot_id} failed to attach its runtime. Error: {error}");
+        let content = format!("Teammate {failed_slot_id} failed to start its runtime. Error: {error}");
         self.mailbox
             .write(
                 &self.team.id,
@@ -1440,6 +1500,9 @@ impl TeamSession {
             new_agent.clone(),
             self.task_manager.clone(),
             reservation,
+            // Leader-initiated delegation spawn: notify the leader on failure so
+            // it can re-delegate the work it just handed out.
+            true,
         );
 
         Ok(new_agent)
@@ -1487,6 +1550,7 @@ pub(crate) fn spawn_attach_agent_process_bg(
     agent: TeamAgent,
     task_manager: Arc<dyn IWorkerTaskManager>,
     reservation: ReserveAttach,
+    notify_leader_on_failure: bool,
 ) {
     tokio::spawn(async move {
         let outcome = match reservation {
@@ -1498,6 +1562,7 @@ pub(crate) fn spawn_attach_agent_process_bg(
                     agent.clone(),
                     task_manager,
                     lease,
+                    notify_leader_on_failure,
                 )
                 .await
             }
@@ -1538,6 +1603,7 @@ pub(crate) async fn attach_member_runtime(
     agent: TeamAgent,
     task_manager: Arc<dyn IWorkerTaskManager>,
     lease: AttachLease,
+    notify_leader_on_failure: bool,
 ) -> AttachOutcome {
     let started_at = Instant::now();
     let operation_id = lease.operation_id();
@@ -1545,7 +1611,14 @@ pub(crate) async fn attach_member_runtime(
     session
         .work_coordinator
         .set_runtime_constraint(&agent.slot_id, RuntimeConstraint::Starting { operation_id });
-    service.publish_member_runtime_starting_if_current(&session);
+    // Session-level `Starting` drives the full-screen warmup overlay, which is
+    // leader-scoped (spec 5.4/5.5): it only reflects leader bootstrap/failure.
+    // A teammate attach is surfaced inline via its own
+    // `agentRuntimeStatusChanged=pending` (broadcast by the caller), so it must
+    // NOT resurface the overlay on lazy wakeup / add-member / directed retry.
+    if agent.role == TeammateRole::Lead {
+        service.publish_member_runtime_starting_if_current(&session);
+    }
     info!(
         team_id = session.team_id(),
         slot_id = agent.slot_id,
@@ -1581,20 +1654,24 @@ pub(crate) async fn attach_member_runtime(
                 .scheduler
                 .set_status(&agent.slot_id, TeammateStatus::Error)
                 .await;
-            let update = session.work_coordinator.set_runtime_constraint(
+            // Preserve unread: a failed attach must NOT mark the pending mailbox
+            // rows read. Keeping `read=0` lets a later retry re-drain them via
+            // reconcile_mailbox instead of silently dropping the delivery that
+            // triggered the (lazy) wakeup (spec 5.4b). We still run
+            // `set_runtime_constraint(Failed)` so registry/coordinator/run state
+            // converges; we just ignore its `terminal_message_ids`.
+            let _update = session.work_coordinator.set_runtime_constraint(
                 &agent.slot_id,
                 RuntimeConstraint::Failed {
                     operation_id,
                     classification: failure.classification,
                 },
             );
-            if !update.terminal_message_ids.is_empty() {
-                let _ = session.mailbox.mark_read_batch(&update.terminal_message_ids).await;
-            }
             service.refresh_member_runtime_status(&session).await;
-            if let Err(notify_error) = session
-                .notify_leader_spawn_attach_failed(&agent.slot_id, &failure.public_reason)
-                .await
+            if notify_leader_on_failure
+                && let Err(notify_error) = session
+                    .notify_leader_spawn_attach_failed(&agent.slot_id, &failure.public_reason)
+                    .await
             {
                 warn!(
                     team_id = session.team_id(),

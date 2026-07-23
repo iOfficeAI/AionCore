@@ -155,6 +155,11 @@ impl MemberRuntimeRegistry {
         &self.session_generation
     }
 
+    /// Test-only helper: seed a slot straight to `Ready` without running an
+    /// attach. Production code reaches `Ready` exclusively through the single
+    /// attach path (`reserve_attach` → `commit_ready`); leader-only warmup left
+    /// teammates dormant (`Absent`), so this is no longer used outside tests.
+    #[cfg(test)]
     pub(crate) fn seed_ready(&self, agent_id: impl Into<String>) -> bool {
         let agent_id = agent_id.into();
         let mut entries = self.lock_entries();

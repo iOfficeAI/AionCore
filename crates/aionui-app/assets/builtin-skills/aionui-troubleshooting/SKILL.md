@@ -65,7 +65,9 @@ Use the overview to decide where to drill in:
 
 - `providers.unhealthy` means inspect provider health.
 - `mcp.enabled_but_no_tools` means inspect MCP startup/tool registration.
-- `cron.failing` means inspect scheduled task state.
+- `cron.failing` means inspect scheduled task state. If `cron.failing` is empty
+  but cron issues are suspected, fall back to `diagnose cron summary` and check
+  `all[].state.last_status` directly.
 - `running_conversations` means inspect the conversation runtime repeatedly.
 
 ## Commands By Symptom
@@ -127,8 +129,10 @@ the named command is insufficient.
 "$AIONUI_HELPER_BIN" diagnose cron summary
 ```
 
-Check `enabled`, `last_status`, `last_error`, `next_run_at`, `last_run_at`,
-`run_count`, and `retry_count` when present.
+Top-level fields: `enabled`, `name`, `id`.
+Run-state fields are nested under `state`: `state.last_status`, `state.last_error`,
+`state.run_count`, `state.retry_count`, `state.next_run_at_ms`, `state.last_run_at_ms`
+(timestamps are millisecond epoch integers, not human dates).
 
 ### MCP Server Has No Tools
 

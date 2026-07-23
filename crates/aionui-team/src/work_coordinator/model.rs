@@ -237,4 +237,8 @@ pub(crate) trait RunCausalityPort: Send + Sync {
     fn bind_enqueue(&self, request: &EnqueueRequest) -> RunBinding;
     fn abort_binding(&self, binding: &RunBinding);
     fn apply_work_summary(&self, summary: RunWorkSummary);
+    /// Broadcast a single slot's current work snapshot, independent of any team
+    /// run. Emitted on every slot work-state transition so the frontend clears
+    /// per-slot state even for run-less work (see `TeamSlotWorkChangedPayload`).
+    fn publish_slot_work(&self, snapshot: SlotWorkSnapshot);
 }

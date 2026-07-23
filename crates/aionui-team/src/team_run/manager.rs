@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use aionui_api_types::{
-    TeamRunPayload, TeamRunSource, TeamRunStatus, TeamRunTargetRole, TeamSlotBlockedReason, TeamSlotWorkPayload,
-    TeamSlotWorkState,
+    TeamRunPayload, TeamRunSource, TeamRunStatus, TeamRunTargetRole, TeamSlotBlockedReason, TeamSlotWorkChangedPayload,
+    TeamSlotWorkPayload, TeamSlotWorkState,
 };
 use aionui_common::{TimestampMs, generate_id, now_ms};
 use tracing::info;
@@ -293,5 +293,12 @@ impl RunCausalityPort for TeamRunManager {
 
     fn apply_work_summary(&self, summary: RunWorkSummary) {
         TeamRunManager::apply_work_summary(self, summary);
+    }
+
+    fn publish_slot_work(&self, snapshot: SlotWorkSnapshot) {
+        self.emitter.broadcast_slot_work(TeamSlotWorkChangedPayload {
+            team_id: self.team_id.clone(),
+            slot_work: Self::slot_payload(&snapshot),
+        });
     }
 }

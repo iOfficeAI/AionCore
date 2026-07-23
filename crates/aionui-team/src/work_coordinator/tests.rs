@@ -8,6 +8,7 @@ use crate::{TeamError, work_source::WorkSource};
 #[derive(Default)]
 struct RecordingRunCausality {
     summaries: Mutex<Vec<RunWorkSummary>>,
+    slot_work: Mutex<Vec<SlotWorkSnapshot>>,
 }
 
 impl RunCausalityPort for RecordingRunCausality {
@@ -24,6 +25,10 @@ impl RunCausalityPort for RecordingRunCausality {
 
     fn apply_work_summary(&self, summary: RunWorkSummary) {
         self.summaries.lock().unwrap().push(summary);
+    }
+
+    fn publish_slot_work(&self, snapshot: SlotWorkSnapshot) {
+        self.slot_work.lock().unwrap().push(snapshot);
     }
 }
 
@@ -45,6 +50,49 @@ fn enqueue(coordinator: &SlotWorkCoordinator, source: WorkSource, message_id: &s
         })
         .unwrap();
     coordinator.commit_enqueue(&lease, Some(message_id.into())).unwrap();
+}
+
+fn coordinator_with_recorder() -> (SlotWorkCoordinator, Arc<RecordingRunCausality>) {
+    let recorder = Arc::new(RecordingRunCausality::default());
+    let coordinator = SlotWorkCoordinator::new("team-1".into(), "generation-1".into(), recorder.clone());
+    (coordinator, recorder)
+}
+
+// Regression: run-less work (Background binding → no team_run_id, e.g. a leader
+// self-wake draining its mailbox for a membership-change notice) produces NO run
+// summaries, so the ONLY way the frontend learns the slot moved Running→Idle is a
+// per-slot `team.slotWorkChanged`. Every batch-lifecycle transition must publish
+// the slot's current snapshot regardless of run association, or the send-box
+// spinner stays stuck until a full reconcile.
+#[test]
+fn run_less_batch_lifecycle_publishes_per_slot_work_snapshots() {
+    let (coordinator, recorder) = coordinator_with_recorder();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::McpSendMessage, "bg-1");
+
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("run-less batch must be claimable");
+    };
+    coordinator.mark_started(&batch, "turn-1");
+    assert_eq!(coordinator.complete_batch(&batch), CommitResult::Committed);
+
+    let snaps = recorder.slot_work.lock().unwrap();
+    assert!(
+        snaps
+            .iter()
+            .any(|snap| snap.slot_id == "lead-1" && snap.state == SlotPhase::Running),
+        "run-less start must publish a Running per-slot snapshot"
+    );
+    let last = snaps
+        .iter()
+        .rev()
+        .find(|snap| snap.slot_id == "lead-1")
+        .expect("run-less slot transitions must publish per-slot work snapshots");
+    assert_eq!(
+        last.state,
+        SlotPhase::Idle,
+        "the final published snapshot must be Idle so the frontend clears the spinner"
+    );
 }
 
 #[test]

@@ -146,8 +146,9 @@ JSON
 
 For `name`, `description`, `avatar`, or recommended prompt changes, report that
 the change is saved and may require refreshing or reopening the UI to see. For
-`agent_id`, `defaults`, `enabled_skills`, `default_mcp_ids`, or other runtime
-defaults, report that the saved change applies to new conversations only.
+`agent_id`, `defaults`, `enabled_skills`, or other runtime defaults (MCP
+defaults are set via `defaults.mcps`, not `default_mcp_ids`), report that the
+saved change applies to new conversations only.
 
 Enable, disable, or reorder an assistant:
 
@@ -477,7 +478,7 @@ JSON
 JSON
 ```
 
-Create, update, delete, or test a custom agent:
+Create, update, delete, or try-connect a custom agent:
 
 ```bash
 "$AIONUI_HELPER_BIN" config agents custom create <<'JSON'
@@ -493,6 +494,16 @@ JSON
 {
   "agent_id": "custom_agent_123",
   "name": "Custom Agent",
+  "command": "/absolute/path/to/agent-cli"
+}
+JSON
+```
+
+Test whether a custom agent binary is reachable (does not persist anything):
+
+```bash
+"$AIONUI_HELPER_BIN" config agents custom try-connect <<'JSON'
+{
   "command": "/absolute/path/to/agent-cli"
 }
 JSON
@@ -572,12 +583,15 @@ Use `"conversation_id": "current"` to attach the job to the current conversation
 
 Update, run, or manage a cron job skill:
 
+Note: `cron jobs` uses the tagged `schedule` object (same shape as create). This
+is different from `cron current`, where `schedule` is a flat cron string.
+
 ```bash
 "$AIONUI_HELPER_BIN" config cron jobs update <<'JSON'
 {
   "job_id": "cron_123",
   "name": "Weekly Report",
-  "schedule": "0 10 * * MON"
+  "schedule": { "kind": "cron", "expr": "0 10 * * MON" }
 }
 JSON
 ```
