@@ -340,14 +340,18 @@ impl IConversationRepository for SqliteConversationRepository {
                 sqlx::query_as::<_, ConversationRow>(
                     "SELECT * FROM conversations
                      WHERE user_id = ?
-                       AND rowid <= ?
+                       AND id IN (
+                           SELECT conversation_id FROM conversation_memory_import_sequences
+                           WHERE user_id = ? AND sequence <= ?
+                       )
                        AND (updated_at < ? OR (updated_at = ? AND id <= ?))
                        AND (updated_at > ? OR (updated_at = ? AND id > ?))
                      ORDER BY updated_at ASC, id ASC
                      LIMIT ?",
                 )
                 .bind(user_id)
-                .bind(boundary.max_rowid)
+                .bind(user_id)
+                .bind(boundary.max_sequence)
                 .bind(boundary.upper.updated_at)
                 .bind(boundary.upper.updated_at)
                 .bind(&boundary.upper.id)
@@ -361,13 +365,17 @@ impl IConversationRepository for SqliteConversationRepository {
             None => {
                 sqlx::query_as::<_, ConversationRow>(
                     "SELECT * FROM conversations
-                     WHERE user_id = ? AND rowid <= ?
+                     WHERE user_id = ? AND id IN (
+                         SELECT conversation_id FROM conversation_memory_import_sequences
+                         WHERE user_id = ? AND sequence <= ?
+                     )
                        AND (updated_at < ? OR (updated_at = ? AND id <= ?))
                      ORDER BY updated_at ASC, id ASC
                      LIMIT ?",
                 )
                 .bind(user_id)
-                .bind(boundary.max_rowid)
+                .bind(user_id)
+                .bind(boundary.max_sequence)
                 .bind(boundary.upper.updated_at)
                 .bind(boundary.upper.updated_at)
                 .bind(&boundary.upper.id)
@@ -385,23 +393,28 @@ impl IConversationRepository for SqliteConversationRepository {
     ) -> Result<Option<crate::repository::conversation::LegacyConversationImportBoundary>, DbError> {
         let row: Option<(i64, String, i64)> = sqlx::query_as(
             "WITH import_boundary AS (
-                SELECT MAX(rowid) AS max_rowid FROM conversations WHERE user_id = ?
+                SELECT MAX(sequence) AS max_sequence
+                FROM conversation_memory_import_sequences
+                WHERE user_id = ?
              )
-             SELECT conversations.updated_at,conversations.id,import_boundary.max_rowid
-             FROM conversations CROSS JOIN import_boundary
-             WHERE conversations.user_id = ? AND conversations.rowid <= import_boundary.max_rowid
+             SELECT conversations.updated_at,conversations.id,import_boundary.max_sequence
+             FROM conversations
+             JOIN conversation_memory_import_sequences membership
+               ON membership.conversation_id = conversations.id AND membership.user_id = conversations.user_id
+             CROSS JOIN import_boundary
+             WHERE conversations.user_id = ? AND membership.sequence <= import_boundary.max_sequence
              ORDER BY conversations.updated_at DESC,conversations.id DESC LIMIT 1",
         )
         .bind(user_id)
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(
-            |(updated_at, id, max_rowid)| crate::repository::conversation::LegacyConversationImportBoundary {
+        Ok(row.map(|(updated_at, id, max_sequence)| {
+            crate::repository::conversation::LegacyConversationImportBoundary {
                 upper: crate::repository::conversation::LegacyConversationCursor { updated_at, id },
-                max_rowid,
-            },
-        ))
+                max_sequence,
+            }
+        }))
     }
 
     // ── Extended queries ────────────────────────────────────────────

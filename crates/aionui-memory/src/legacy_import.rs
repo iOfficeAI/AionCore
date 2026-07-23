@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::{MemoryError, retrieval::RetrievalTarget, validation::sanitize_summary};
 
 const LEGACY_IMPORT_PAGE_SIZE: u32 = 32;
-const LEGACY_IMPORT_CURSOR_VERSION: u8 = 1;
+const LEGACY_IMPORT_CURSOR_VERSION: u8 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -107,6 +107,7 @@ pub(crate) async fn ensure_legacy_import(
                         user_id: user_id.into(),
                         expected_cursor: expected_cursor.clone(),
                         next_cursor: expected_cursor,
+                        max_conversation_sequence: None,
                         completed: true,
                         summaries: Vec::new(),
                         now: aionui_common::now_ms(),
@@ -127,6 +128,7 @@ pub(crate) async fn ensure_legacy_import(
                         user_id: user_id.into(),
                         expected_cursor,
                         next_cursor: None,
+                        max_conversation_sequence: None,
                         completed: true,
                         summaries: Vec::new(),
                         now: aionui_common::now_ms(),
@@ -152,6 +154,7 @@ pub(crate) async fn ensure_legacy_import(
         .await
         .map_err(crate::service::map_db_error)?;
     let completed = rows.len() < LEGACY_IMPORT_PAGE_SIZE as usize;
+    let max_conversation_sequence = cursor.boundary.max_sequence;
     let next_cursor = LegacyImportCursor {
         version: LEGACY_IMPORT_CURSOR_VERSION,
         boundary: cursor.boundary,
@@ -196,6 +199,7 @@ pub(crate) async fn ensure_legacy_import(
             user_id: user_id.into(),
             expected_cursor,
             next_cursor: Some(serde_json::to_string(&next_cursor).map_err(|_| MemoryError::Internal)?),
+            max_conversation_sequence: Some(max_conversation_sequence),
             completed,
             summaries,
             now: aionui_common::now_ms(),
@@ -346,9 +350,9 @@ mod tests {
         assert!(!first_state.completed);
         assert!(first_state.cursor.is_some());
         let durable_cursor: serde_json::Value = serde_json::from_str(first_state.cursor.as_deref().unwrap()).unwrap();
-        assert_eq!(durable_cursor["version"], 1);
+        assert_eq!(durable_cursor["version"], 2);
         assert!(durable_cursor["boundary"]["upper"]["updated_at"].is_number());
-        assert!(durable_cursor["boundary"]["max_rowid"].is_number());
+        assert!(durable_cursor["boundary"]["max_sequence"].is_number());
         assert!(durable_cursor["after"]["updated_at"].is_number());
         let first_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_memories WHERE user_id = ?")
             .bind(USER_ID)
@@ -527,13 +531,9 @@ mod tests {
             .unwrap(),
         );
 
-        // Both an original unscanned row mutated after the boundary and a new row
-        // are intentionally outside the fixed import snapshot.
-        sqlx::query("UPDATE conversations SET updated_at = 1_000, extra = ? WHERE id = 'stable-34'")
-            .bind(extra("Mutated after boundary", "turn-mutated"))
-            .execute(db.pool())
-            .await
-            .unwrap();
+        // Deleting the maximum member must not let SQLite rowid reuse admit a
+        // replacement whose tied tuple falls between the cursor and upper bound.
+        conversations.delete("stable-34").await.unwrap();
         conversations
             .create(&ConversationRow {
                 id: "stable-33a".into(),
@@ -547,7 +547,7 @@ mod tests {
                 channel_chat_id: None,
                 pinned: false,
                 pinned_at: None,
-                created_at: 1_001,
+                created_at: 10,
                 updated_at: 10,
             })
             .await
@@ -565,7 +565,7 @@ mod tests {
         );
         assert!(
             !sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM conversation_memories WHERE conversation_id IN ('stable-34','stable-33a'))",
+                "SELECT EXISTS(SELECT 1 FROM conversation_memories WHERE conversation_id = 'stable-33a')",
             )
             .fetch_one(db.pool())
             .await
@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_durable_cursor_is_terminally_quarantined_without_reindexing() {
+    async fn obsolete_v1_cursor_is_terminally_quarantined_without_reindexing() {
         let db = init_database_memory().await.unwrap();
         let conversations: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(db.pool().clone()));
@@ -712,10 +712,12 @@ mod tests {
             })
             .await
             .unwrap();
+        let obsolete_cursor =
+            r#"{"version":1,"boundary":{"upper":{"updated_at":1,"id":"cursor-row"},"max_rowid":1},"after":null}"#;
         memory
             .upsert_import_state(aionui_db::models::MemoryImportStateRow {
                 user_id: USER_ID.into(),
-                cursor: Some("{not-versioned-json".into()),
+                cursor: Some(obsolete_cursor.into()),
                 completed: false,
                 started_at: Some(1),
                 completed_at: None,
@@ -729,7 +731,7 @@ mod tests {
             .unwrap();
         let state = memory.get_import_state(USER_ID).await.unwrap().unwrap();
         assert!(state.completed);
-        assert_eq!(state.cursor.as_deref(), Some("{not-versioned-json"));
+        assert_eq!(state.cursor.as_deref(), Some(obsolete_cursor));
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_memories")
                 .fetch_one(db.pool())
@@ -849,6 +851,7 @@ mod tests {
                 user_id: USER_ID.into(),
                 expected_cursor: None,
                 next_cursor: Some(r#"{"version":1}"#.into()),
+                max_conversation_sequence: Some(i64::MAX),
                 completed: false,
                 summaries: vec![
                     summary_row("stale-mutation", scanned_extra, "turn-1"),

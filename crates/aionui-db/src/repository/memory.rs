@@ -108,6 +108,7 @@ pub struct ImportLegacyMemoryPageRow {
     pub user_id: String,
     pub expected_cursor: Option<String>,
     pub next_cursor: Option<String>,
+    pub max_conversation_sequence: Option<i64>,
     pub completed: bool,
     pub summaries: Vec<LegacyMemorySummaryRow>,
     pub now: TimestampMs,

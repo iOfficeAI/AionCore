@@ -90,7 +90,7 @@ pub trait IConversationRepository: Send + Sync {
                     updated_at: row.updated_at,
                     id: row.id.clone(),
                 },
-                max_rowid: i64::MAX,
+                max_sequence: i64::MAX,
             }))
     }
 
@@ -275,7 +275,7 @@ pub struct LegacyConversationCursor {
 #[serde(deny_unknown_fields)]
 pub struct LegacyConversationImportBoundary {
     pub upper: LegacyConversationCursor,
-    pub max_rowid: i64,
+    pub max_sequence: i64,
 }
 
 impl From<&MessageRow> for MessagePageCursor {

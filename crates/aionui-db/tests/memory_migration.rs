@@ -71,6 +71,65 @@ async fn migration_029_upgrades_028_and_preserves_legacy_messages_with_null_turn
 }
 
 #[tokio::test]
+async fn migration_030_assigns_non_reusable_sequences_to_existing_and_new_conversations() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 29).await;
+    sqlx::query(
+        "INSERT INTO users (id,username,email,password_hash,created_at,updated_at)
+         VALUES ('sequence-user','sequence-user','sequence@example.com','',1,1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for id in ["sequence-a", "sequence-b"] {
+        sqlx::query(
+            "INSERT INTO conversations (id,user_id,name,type,extra,status,created_at,updated_at)
+             VALUES (?,'sequence-user','Sequence','acp','{}','finished',1,1)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    run_migrations_through(&pool, 30).await;
+    let existing: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT conversation_id,sequence FROM conversation_memory_import_sequences
+         WHERE user_id = 'sequence-user' ORDER BY sequence",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(existing.len(), 2);
+    assert!(existing[0].1 < existing[1].1);
+    let deleted_max = existing[1].1;
+
+    sqlx::query("DELETE FROM conversations WHERE id = 'sequence-b'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (id,user_id,name,type,extra,status,created_at,updated_at)
+         VALUES ('sequence-replacement','sequence-user','Replacement','acp','{}','finished',1,1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let replacement: i64 = sqlx::query_scalar(
+        "SELECT sequence FROM conversation_memory_import_sequences
+         WHERE conversation_id = 'sequence-replacement'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(replacement > deleted_max);
+}
+
+#[tokio::test]
 async fn migration_029_creates_normalized_tables_constraints_and_required_indexes() {
     let database = aionui_db::init_database_memory().await.unwrap();
     let pool = database.pool();
@@ -85,6 +144,8 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
         "memory_job_turns",
         "memory_retrievals",
         "memory_import_state",
+        "conversation_memory_import_sequences",
+        "memory_import_sequence_counter",
     ];
     let tables: HashSet<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
         .fetch_all(pool)
@@ -142,9 +203,20 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
         "idx_memory_jobs_one_next",
         "idx_memory_job_turns_job_position",
         "idx_memory_retrievals_expiry",
+        "idx_conversation_memory_import_sequences_user",
     ] {
         assert!(indexes.contains(index), "missing index {index}");
     }
+    let trigger_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'trigger' AND name = 'conversations_assign_memory_import_sequence'
+        )",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(trigger_exists);
 
     sqlx::query(
         "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at)
@@ -277,7 +349,7 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
 }
 
 #[test]
-fn migration_versions_are_unique_and_memory_owns_029() {
+fn migration_versions_are_unique_and_memory_owns_029_and_030() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let full = Migrator::new(Path::new("migrations")).await.unwrap();
@@ -287,6 +359,7 @@ fn migration_versions_are_unique_and_memory_owns_029() {
             .map(|migration| migration.version)
             .collect::<Vec<_>>();
         assert_eq!(versions.iter().filter(|version| **version == 29).count(), 1);
+        assert_eq!(versions.iter().filter(|version| **version == 30).count(), 1);
         assert_eq!(versions.iter().copied().collect::<HashSet<_>>().len(), versions.len());
     });
 }
