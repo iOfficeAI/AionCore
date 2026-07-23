@@ -698,7 +698,7 @@ impl MemoryService {
         outcome: MemoryTurnOutcome,
     ) {
         match self
-            .enqueue_canonical_turn(user_id, conversation_id, turn_id, outcome)
+            .admit_turn_completed(user_id, conversation_id, turn_id, outcome)
             .await
         {
             Ok(true) => debug!(
@@ -721,7 +721,12 @@ impl MemoryService {
         }
     }
 
-    async fn enqueue_canonical_turn(
+    /// Admits an eligible completed turn to the local durable Memory queue.
+    ///
+    /// This boundary performs no extraction or model work. Composition adapters
+    /// use it to acknowledge the conversation callback only after the durable
+    /// admission attempt has completed.
+    pub async fn admit_turn_completed(
         &self,
         user_id: &str,
         conversation_id: &str,

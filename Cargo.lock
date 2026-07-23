@@ -407,6 +407,7 @@ dependencies = [
  "aionui-extension",
  "aionui-file",
  "aionui-mcp",
+ "aionui-memory",
  "aionui-office",
  "aionui-realtime",
  "aionui-runtime",

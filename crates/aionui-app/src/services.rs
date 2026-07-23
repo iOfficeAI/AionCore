@@ -19,6 +19,11 @@ use aionui_db::{
     SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
+use aionui_system::SettingsService;
+
+use crate::router::memory_adapters::{
+    ConversationMemoryAdapter, SettingsReadinessAdapter, TrustedRetrievalContextAdapter,
+};
 
 pub struct AppServices {
     pub database: Database,
@@ -33,6 +38,8 @@ pub struct AppServices {
     pub runtime_token_service: Arc<RuntimeTokenService>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    pub memory_service: Arc<aionui_memory::MemoryService>,
+    pub settings_service: SettingsService,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -86,6 +93,8 @@ impl AppServices {
             runtime_base_url: self.runtime_base_url.clone(),
             runtime_token_service: self.runtime_token_service.clone(),
         });
+        self.conversation_service
+            .with_memory_port(Arc::new(ConversationMemoryAdapter::new(self.memory_service.clone())));
         self
     }
 
@@ -122,7 +131,8 @@ impl AppServices {
 
         let encryption_key = derive_encryption_key(&secret);
 
-        let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
+        let provider_repo: Arc<dyn aionui_db::IProviderRepository> =
+            Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
         // User-configured MCP servers — injected into ACP `session/new`
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
@@ -143,6 +153,21 @@ impl AppServices {
 
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
+        let settings_service = SettingsService::new(Arc::new(aionui_db::SqliteSettingsRepository::new(
+            database.pool().clone(),
+        )))
+        .with_provider_repo(provider_repo.clone());
+        let memory_service = Arc::new(
+            aionui_memory::MemoryService::with_job_dependencies(
+                Arc::new(aionui_db::SqliteMemoryRepository::new(database.pool().clone())),
+                conversation_repo.clone(),
+                Arc::new(SettingsReadinessAdapter::new(settings_service.clone())),
+            )
+            .with_retrieval_context(Arc::new(TrustedRetrievalContextAdapter::new(
+                conversation_repo.clone(),
+                provider_repo.clone(),
+            ))),
+        );
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
 
         // Skill paths need app resource dir (for builtin rules) + data dir
@@ -205,6 +230,7 @@ impl AppServices {
             runtime_base_url: runtime_base_url.clone(),
             runtime_token_service: runtime_token_service.clone(),
         });
+        conversation_service.with_memory_port(Arc::new(ConversationMemoryAdapter::new(memory_service.clone())));
 
         Ok(Self {
             database,
@@ -219,6 +245,8 @@ impl AppServices {
             runtime_token_service,
             conversation_runtime_state,
             conversation_service,
+            memory_service,
+            settings_service,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
