@@ -1429,6 +1429,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
             );
             if let Some(pending) = failed.or(pending) {
                 let remains_failed = pending.state == "failed";
+                let preserves_queue_full_retry =
+                    pending.state == "retry_wait" && pending.last_error_code.as_deref() == Some("queue_full");
                 let digest = Self::append_queue_digest(
                     Self::parse_queue_digest(&pending.queue_digest)?, &input.through_turn_id, &snapshot.hash,
                 );
@@ -1450,7 +1452,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 sqlx::query(
                     "UPDATE memory_jobs SET from_turn_id = ?,through_turn_id = ?, operation_version = ?, global_epoch = ?,
                      conversation_epoch = ?, turn_count = ?, queue_digest = ?, input_hash = ?, expected_revision = ?,
-                     state = ?, next_attempt_at = NULL, last_error_code = ?, updated_at = ?
+                     state = ?, next_attempt_at = ?, last_error_code = ?, updated_at = ?
                      WHERE id = ? AND user_id = ?",
                 )
                 .bind(&base_from_turn_id)
@@ -1459,8 +1461,19 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 .bind(settings.4).bind(conversation_epoch).bind(turn_count).bind(Self::queue_digest(digest))
                 .bind(input_hash)
                 .bind(base_revision)
-                .bind(if remains_failed { "failed" } else { "pending" })
-                .bind(if remains_failed { pending.last_error_code.as_deref() } else { None })
+                .bind(if remains_failed {
+                    "failed"
+                } else if preserves_queue_full_retry {
+                    "retry_wait"
+                } else {
+                    "pending"
+                })
+                .bind((remains_failed || preserves_queue_full_retry).then_some(pending.next_attempt_at).flatten())
+                .bind(if remains_failed || preserves_queue_full_retry {
+                    pending.last_error_code.as_deref()
+                } else {
+                    None
+                })
                 .bind(input.now)
                 .bind(&pending.id)
                 .bind(&input.user_id)
@@ -2103,7 +2116,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
     async fn block_jobs(&self, user_id: &str, now: TimestampMs) -> Result<u64, DbError> {
         let result = sqlx::query(
             "UPDATE memory_jobs SET state = 'blocked', next_attempt_at = NULL, updated_at = ?
-             WHERE user_id = ? AND state IN ('pending','retry_wait')",
+             WHERE user_id = ? AND state = 'pending'",
         )
         .bind(now)
         .bind(user_id)
@@ -4495,6 +4508,53 @@ mod tests {
         assert_eq!(pending.through_turn_id, "turn-4");
         assert_eq!(repo.count_jobs(USER_A, "conv_a", "running").await.unwrap(), 1);
         assert_eq!(repo.count_jobs(USER_A, "conv_a", "pending").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_queue_full_coalescing_preserves_retry_deadline_across_reconstruction() {
+        let (repo, _, _db) = setup().await;
+        let first = enqueue_turn(&repo, "queue-full", "conv_a", "turn-1", 10).await.unwrap();
+        let running = repo.claim_next_job(claim(USER_A, "worker", 20)).await.unwrap().unwrap();
+        let retry = repo
+            .transition_running_job(TransitionMemoryJobRow {
+                user_id: USER_A.into(),
+                job_id: running.id.clone(),
+                worker_id: "worker".into(),
+                lease_token: running.lease_token.unwrap(),
+                state: "retry_wait".into(),
+                next_attempt_at: Some(100),
+                error_code: Some("queue_full".into()),
+                increment_attempt: false,
+                increment_invalid_output: false,
+                now: 29,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let original_hash = retry.input_hash;
+
+        let coalesced = enqueue_turn(&repo, "ignored", "conv_a", "turn-2", 40).await.unwrap();
+        assert_eq!(coalesced.id, first.id);
+        assert_eq!(coalesced.state, "retry_wait");
+        assert_eq!(coalesced.next_attempt_at, Some(100));
+        assert_eq!(coalesced.last_error_code.as_deref(), Some("queue_full"));
+        assert_eq!(coalesced.turn_count, 2);
+        assert_ne!(coalesced.input_hash, original_hash);
+
+        let restarted = SqliteMemoryRepository::new(repo.pool.clone());
+        assert!(
+            restarted
+                .claim_next_job(claim(USER_A, "before-deadline", 99))
+                .await
+                .unwrap()
+                .is_none(),
+        );
+        let claimed = restarted
+            .claim_next_job(claim(USER_A, "at-deadline", 100))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, first.id);
     }
 
     #[tokio::test]

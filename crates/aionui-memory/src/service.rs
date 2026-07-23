@@ -2304,6 +2304,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_full_retry_wait_survives_a_readiness_flap() {
+        let fixture = fixture(true).await;
+        fixture.persist_turn("turn-1", 10).await;
+        fixture
+            .service
+            .on_turn_completed(USER_ID, "conversation-1", "turn-1", MemoryTurnOutcome::Completed)
+            .await;
+        let first = fixture
+            .service
+            .claim_job(USER_ID, "worker-1", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let queued = fixture
+            .service
+            .record_job_failure(
+                USER_ID,
+                &first.id,
+                "worker-1",
+                &first.lease_token,
+                NormalizedMemoryJobFailure {
+                    code: MemoryJobFailureCode::QueueFull,
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+        let deadline = queued.next_attempt_at.expect("queue-full retry deadline");
+
+        fixture.readiness.set(false);
+        assert!(
+            fixture
+                .service
+                .claim_job(USER_ID, "worker-2", 30_000)
+                .await
+                .unwrap()
+                .is_none(),
+        );
+        let while_unavailable = fixture.memory.get_job(USER_ID, &first.id).await.unwrap().unwrap();
+        assert_eq!(while_unavailable.state, "retry_wait");
+        assert_eq!(while_unavailable.next_attempt_at, Some(deadline));
+        assert_eq!(while_unavailable.last_error_code.as_deref(), Some("queue_full"));
+
+        fixture.readiness.set(true);
+        assert!(
+            fixture
+                .service
+                .claim_job(USER_ID, "worker-2", 30_000)
+                .await
+                .unwrap()
+                .is_none(),
+        );
+        let after_flap = fixture.memory.get_job(USER_ID, &first.id).await.unwrap().unwrap();
+        assert_eq!(after_flap.state, "retry_wait");
+        assert_eq!(after_flap.next_attempt_at, Some(deadline));
+        assert_eq!(after_flap.last_error_code.as_deref(), Some("queue_full"));
+
+        sqlx::query("UPDATE memory_jobs SET next_attempt_at = 0 WHERE id = ?")
+            .bind(&first.id)
+            .execute(fixture._db.pool())
+            .await
+            .unwrap();
+        let claimed = fixture
+            .service
+            .claim_job(USER_ID, "worker-2", 30_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, first.id);
+    }
+
+    #[tokio::test]
     async fn running_work_has_one_next_pending_range_and_lease_operations_are_owner_fenced() {
         let fixture = fixture(true).await;
         fixture.persist_turn("turn-1", 10).await;
