@@ -550,7 +550,12 @@ impl ConversationTurnOrchestrator {
         } else {
             ConversationTurnStatus::Completed
         };
-        let memory_eligible = input.memory_eligible && (final_failed || persisted_assistant_output);
+        let memory_eligible = memory_capture_eligible(
+            input.memory_eligible,
+            status,
+            persisted_assistant_output,
+            runtime_state.lifecycle_for(&conv_id),
+        );
         self.service
             .finish_claimed_turn(&conv_id, &turn_id, &mut turn_claim, status, memory_eligible)
             .await;
@@ -560,6 +565,20 @@ impl ConversationTurnOrchestrator {
             error_message: if final_failed { final_error_message } else { None },
         }
     }
+}
+
+fn memory_capture_eligible(
+    requested: bool,
+    status: ConversationTurnStatus,
+    persisted_assistant_output: bool,
+    lifecycle: RuntimeLifecycleState,
+) -> bool {
+    requested
+        && lifecycle == RuntimeLifecycleState::Active
+        && match status {
+            ConversationTurnStatus::Completed => persisted_assistant_output,
+            ConversationTurnStatus::Failed => true,
+        }
 }
 
 fn availability_agent_id(options: &BuildTaskOptions) -> Option<String> {
@@ -720,5 +739,46 @@ mod tests {
         assert!(!terminal_is_auth_failure(&error_outcome(
             AgentErrorCode::UserLlmProviderBillingRequired
         )));
+    }
+
+    #[test]
+    fn memory_capture_eligibility_classifies_status_and_runtime_lifecycle() {
+        assert!(memory_capture_eligible(
+            true,
+            ConversationTurnStatus::Completed,
+            true,
+            RuntimeLifecycleState::Active,
+        ));
+        assert!(!memory_capture_eligible(
+            true,
+            ConversationTurnStatus::Completed,
+            false,
+            RuntimeLifecycleState::Active,
+        ));
+        assert!(memory_capture_eligible(
+            true,
+            ConversationTurnStatus::Failed,
+            false,
+            RuntimeLifecycleState::Active,
+        ));
+
+        for lifecycle in [
+            RuntimeLifecycleState::Cancelling,
+            RuntimeLifecycleState::Deleting,
+            RuntimeLifecycleState::ShuttingDown,
+        ] {
+            assert!(!memory_capture_eligible(
+                true,
+                ConversationTurnStatus::Completed,
+                true,
+                lifecycle,
+            ));
+            assert!(!memory_capture_eligible(
+                true,
+                ConversationTurnStatus::Failed,
+                true,
+                lifecycle,
+            ));
+        }
     }
 }

@@ -61,6 +61,7 @@ use std::sync::RwLock;
 
 pub(crate) const MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN: usize = 4;
 const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const MEMORY_COMPLETION_CALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
@@ -618,9 +619,17 @@ impl ConversationService {
 
     pub async fn complete_turn(&self, conversation_id: &str, turn_id: &str) {
         let gate = self.completion_gate(conversation_id);
-        let _guard = gate.lock().await;
-        self.complete_turn_with_memory_unsequenced(conversation_id, turn_id, ConversationTurnStatus::Completed, true)
+        {
+            let _guard = gate.lock().await;
+            self.complete_turn_with_memory_unsequenced(
+                conversation_id,
+                turn_id,
+                ConversationTurnStatus::Completed,
+                true,
+            )
             .await;
+        }
+        self.cleanup_completion_gate(conversation_id, &gate);
     }
 
     fn completion_gate(&self, conversation_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -634,6 +643,30 @@ impl ConversationService {
         let gate = Arc::new(tokio::sync::Mutex::new(()));
         gates.insert(conversation_id.to_owned(), Arc::downgrade(&gate));
         gate
+    }
+
+    fn cleanup_completion_gate(&self, conversation_id: &str, gate: &Arc<tokio::sync::Mutex<()>>) {
+        let mut gates = self
+            .completion_gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let same_gate = gates
+            .get(conversation_id)
+            .is_some_and(|stored| stored.ptr_eq(&Arc::downgrade(gate)));
+        // Holding the map lock prevents a new caller from upgrading the weak
+        // entry between this count and removal. Existing/upcoming waiters own a
+        // strong Arc and therefore preserve the shared gate identity.
+        if same_gate && Arc::strong_count(gate) == 1 {
+            gates.remove(conversation_id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completion_gate_count(&self) -> usize {
+        self.completion_gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     async fn complete_turn_with_memory_unsequenced(
@@ -658,17 +691,26 @@ impl ConversationService {
             ConversationTurnStatus::Completed => MemoryTurnOutcome::Completed,
             ConversationTurnStatus::Failed => MemoryTurnOutcome::Failed,
         };
-        if let Err(error) = self
-            .memory_port()
-            .on_turn_completed(CompletedTurnMemoryInput {
-                user_id,
-                conversation_id: conversation_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-                outcome,
-            })
-            .await
-        {
-            warn!(conversation_id, turn_id, error = %error, "Memory completion callback failed");
+        let memory_port = self.memory_port();
+        let callback = memory_port.on_turn_completed(CompletedTurnMemoryInput {
+            user_id,
+            conversation_id: conversation_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            outcome,
+        });
+        match tokio::time::timeout(MEMORY_COMPLETION_CALLBACK_TIMEOUT, callback).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(conversation_id, turn_id, error = %error, "Memory completion callback failed");
+            }
+            Err(_) => {
+                warn!(
+                    conversation_id,
+                    turn_id,
+                    timeout_ms = MEMORY_COMPLETION_CALLBACK_TIMEOUT.as_millis() as u64,
+                    "Memory completion callback timed out"
+                );
+            }
         }
     }
 
@@ -684,18 +726,20 @@ impl ConversationService {
         // as soon as the claim is released, but cannot publish completion or
         // enqueue Memory capture ahead of this turn.
         let gate = self.completion_gate(conversation_id);
-        let _guard = gate.lock().await;
-        let was_deleting = turn_claim.release_for_turn(turn_id);
-        if was_deleting {
-            debug!(
-                conversation_id,
-                turn_id, "Skipping turn completion because conversation was deleting at claim release"
-            );
-            return;
+        {
+            let _guard = gate.lock().await;
+            let was_deleting = turn_claim.release_for_turn(turn_id);
+            if was_deleting {
+                debug!(
+                    conversation_id,
+                    turn_id, "Skipping turn completion because conversation was deleting at claim release"
+                );
+            } else {
+                self.complete_turn_with_memory_unsequenced(conversation_id, turn_id, status, memory_eligible)
+                    .await;
+            }
         }
-
-        self.complete_turn_with_memory_unsequenced(conversation_id, turn_id, status, memory_eligible)
-            .await;
+        self.cleanup_completion_gate(conversation_id, &gate);
     }
 }
 

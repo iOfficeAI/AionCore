@@ -2814,6 +2814,7 @@ struct BlockingCancelAgent {
     finish_notify: Notify,
     cancel_count: AtomicUsize,
     cancel_error: bool,
+    visible_output_before_finish: bool,
 }
 
 impl BlockingCancelAgent {
@@ -2831,12 +2832,19 @@ impl BlockingCancelAgent {
             finish_notify: Notify::new(),
             cancel_count: AtomicUsize::new(0),
             cancel_error: false,
+            visible_output_before_finish: false,
         }
     }
 
     fn new_with_cancel_error(conversation_id: &str) -> Self {
         let mut agent = Self::new(conversation_id);
         agent.cancel_error = true;
+        agent
+    }
+
+    fn new_with_visible_output(conversation_id: &str) -> Self {
+        let mut agent = Self::new(conversation_id);
+        agent.visible_output_before_finish = true;
         agent
     }
 
@@ -2877,6 +2885,11 @@ impl IAgentTask for BlockingCancelAgent {
 
     async fn send_message(&self, _data: SendMessageData) -> Result<(), AgentSendError> {
         self.send_started.notify_waiters();
+        if self.visible_output_before_finish {
+            let _ = self.event_tx.send(AgentStreamEvent::Text(TextEventData {
+                content: "partial assistant outcome".into(),
+            }));
+        }
         self.finish_notify.notified().await;
         let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData::default()));
         Ok(())
@@ -3664,6 +3677,7 @@ async fn memory_completion_is_serialized_with_turn_completion_per_conversation()
     tokio::time::timeout(Duration::from_secs(2), memory.first_started.notified())
         .await
         .expect("first Memory callback should start");
+    assert_eq!(svc.completion_gate_count(), 1);
 
     let mut second_claim = svc
         .runtime_state()
@@ -3723,6 +3737,7 @@ async fn memory_completion_is_serialized_with_turn_completion_per_conversation()
     .expect("second Memory callback should follow the first");
     first_completion.await.unwrap();
     second_completion.await.unwrap();
+    assert_eq!(svc.completion_gate_count(), 0);
 
     assert_eq!(
         memory
@@ -3745,6 +3760,90 @@ async fn memory_completion_is_serialized_with_turn_completion_per_conversation()
             .collect::<Vec<_>>(),
         vec!["turn-first", "turn-second"],
     );
+}
+
+#[tokio::test]
+async fn completion_gate_entries_are_pruned_across_many_conversations() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+
+    for index in 0..64 {
+        let conv = svc.create("user_1", make_create_req()).await.unwrap();
+        svc.complete_turn(&conv.id, &format!("turn-{index}")).await;
+        assert_eq!(svc.completion_gate_count(), 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn memory_callback_timeout_allows_the_next_ordered_completion() {
+    let (svc, broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let memory = Arc::new(BlockingCompletionMemoryPort::default());
+    svc.with_memory_port(memory.clone());
+    broadcaster.take_events();
+
+    let mut first_claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-first").unwrap();
+    let first_service = svc.clone();
+    let first_conversation_id = conv.id.clone();
+    let first_completion = tokio::spawn(async move {
+        first_service
+            .finish_claimed_turn(
+                &first_conversation_id,
+                "turn-first",
+                &mut first_claim,
+                crate::turn_orchestrator::ConversationTurnStatus::Completed,
+                true,
+            )
+            .await;
+    });
+    memory.first_started.notified().await;
+
+    let mut second_claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn-second")
+        .expect("next turn should claim after the first releases");
+    let second_service = svc.clone();
+    let second_conversation_id = conv.id.clone();
+    let second_completion = tokio::spawn(async move {
+        second_service
+            .finish_claimed_turn(
+                &second_conversation_id,
+                "turn-second",
+                &mut second_claim,
+                crate::turn_orchestrator::ConversationTurnStatus::Completed,
+                true,
+            )
+            .await;
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(memory.completions.lock().unwrap().len(), 1);
+
+    tokio::time::advance(crate::service::MEMORY_COMPLETION_CALLBACK_TIMEOUT).await;
+    tokio::task::yield_now().await;
+    first_completion.await.unwrap();
+    second_completion.await.unwrap();
+
+    assert_eq!(
+        memory
+            .completions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|input| input.turn_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn-first", "turn-second"],
+    );
+    assert_eq!(
+        broadcaster
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.name == "turn.completed")
+            .map(|event| event.data["turn_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["turn-first", "turn-second"],
+    );
+    assert_eq!(svc.completion_gate_count(), 0);
 }
 
 #[tokio::test]
@@ -6186,6 +6285,53 @@ async fn cancel_keeps_turn_claim_until_agent_terminal_event() {
 
     agent.release_finish();
     wait_for_turn_released(&svc, &conv.id).await;
+}
+
+#[tokio::test]
+async fn cancelled_turn_with_persisted_partial_output_is_not_memory_capture_eligible() {
+    let (svc, broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let memory = Arc::new(RecordingMemoryPort::default());
+    svc.with_memory_port(memory.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(BlockingCancelAgent::new_with_visible_output(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    broadcaster.take_events();
+
+    let send = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    agent.wait_until_send_started().await;
+    svc.cancel("user_1", &conv.id, &send.turn_id, &task_mgr_dyn)
+        .await
+        .unwrap();
+    agent.release_finish();
+    wait_for_turn_released(&svc, &conv.id).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if broadcaster
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.name == "turn.completed" && event.data["turn_id"] == send.turn_id)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled turn should still publish completion");
+
+    assert!(memory.completions.lock().unwrap().is_empty());
+    assert!(repo.messages.lock().unwrap().iter().any(|message| {
+        message.turn_id.as_deref() == Some(send.turn_id.as_str())
+            && message.position.as_deref() == Some("left")
+            && message.r#type == "text"
+    }));
 }
 
 #[tokio::test]
