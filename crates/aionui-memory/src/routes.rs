@@ -1026,10 +1026,13 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        sqlx::query("UPDATE memory_entries SET pinned = 1 WHERE id = 'forget-protected'")
-            .execute(db.pool())
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE memory_entries SET pinned = 1, project_id = 'project-1'
+             WHERE id = 'forget-protected'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
         for entry_id in ["forget-exclusive", "forget-protected"] {
             sqlx::query(
                 "INSERT INTO memory_sources
@@ -1340,6 +1343,65 @@ mod tests {
                 .iter()
                 .any(|entry| entry["id"] == "forget-protected" && entry["state"] == "deleted"),
         );
+        let active_total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_entries
+             WHERE user_id = 'system_default_user' AND state <> 'deleted'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let mut default_entries = Request::get("/api/memory/entries").body(Body::empty()).unwrap();
+        default_entries.extensions_mut().insert(current_user());
+        let default_response = router.clone().oneshot(default_entries).await.unwrap();
+        assert_eq!(default_response.status(), StatusCode::OK);
+        let default_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(default_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(default_json["data"]["total"], active_total);
+        assert!(
+            default_json["data"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["state"] != "deleted"),
+        );
+
+        let mut deleted_page_one = Request::get("/api/memory/entries?state=deleted&project_id=project-1&limit=1")
+            .body(Body::empty())
+            .unwrap();
+        deleted_page_one.extensions_mut().insert(current_user());
+        let page_one_response = router.clone().oneshot(deleted_page_one).await.unwrap();
+        assert_eq!(page_one_response.status(), StatusCode::OK);
+        let page_one: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(page_one_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page_one["data"]["total"], 2);
+        assert_eq!(page_one["data"]["items"].as_array().unwrap().len(), 1);
+        assert!(page_one["data"]["has_more"].as_bool().unwrap());
+
+        let mut deleted_page_two =
+            Request::get("/api/memory/entries?state=deleted&project_id=project-1&limit=1&cursor=1")
+                .body(Body::empty())
+                .unwrap();
+        deleted_page_two.extensions_mut().insert(current_user());
+        let page_two_response = router.clone().oneshot(deleted_page_two).await.unwrap();
+        assert_eq!(page_two_response.status(), StatusCode::OK);
+        let page_two: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(page_two_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page_two["data"]["total"], 2);
+        assert_eq!(page_two["data"]["items"].as_array().unwrap().len(), 1);
+        assert!(!page_two["data"]["has_more"].as_bool().unwrap());
+        assert_ne!(page_one["data"]["items"][0]["id"], page_two["data"]["items"][0]["id"]);
         assert!(
             memory
                 .effective_policy("system_default_user", "conversation-public")

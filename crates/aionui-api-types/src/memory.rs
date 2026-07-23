@@ -86,34 +86,107 @@ pub enum MemoryEntryState {
     Deleted,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryEntryResponse {
     pub id: String,
     pub user_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_key: Option<String>,
     pub kind: MemoryEntryKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable_key: Option<String>,
     pub fingerprint: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     pub state: MemoryEntryState,
     pub pinned: bool,
     pub user_edited: bool,
-    #[serde(default)]
     pub sources: Vec<MemoryEntrySourceResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict_group_id: Option<String>,
     pub schema_version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<TimestampMs>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+}
+
+#[derive(Deserialize)]
+struct MemoryEntryResponseWire {
+    id: String,
+    user_id: String,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    workspace_key: Option<String>,
+    kind: MemoryEntryKind,
+    #[serde(default)]
+    stable_key: Option<String>,
+    fingerprint: String,
+    #[serde(default)]
+    content: Option<String>,
+    state: MemoryEntryState,
+    pinned: bool,
+    user_edited: bool,
+    #[serde(default)]
+    sources: Vec<MemoryEntrySourceResponse>,
+    #[serde(default)]
+    supersedes_id: Option<String>,
+    #[serde(default)]
+    conflict_group_id: Option<String>,
+    schema_version: u32,
+    #[serde(default)]
+    deleted_at: Option<TimestampMs>,
+    created_at: TimestampMs,
+    updated_at: TimestampMs,
+}
+
+impl<'de> Deserialize<'de> for MemoryEntryResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut wire = MemoryEntryResponseWire::deserialize(deserializer)?;
+        match &wire.state {
+            MemoryEntryState::Deleted => {
+                if wire.deleted_at.is_none() {
+                    return Err(serde::de::Error::custom("deleted Memory entry requires deleted_at"));
+                }
+                wire.stable_key = None;
+                wire.content = None;
+                wire.sources.clear();
+            }
+            _ => {
+                if wire.stable_key.is_none() || wire.content.is_none() {
+                    return Err(serde::de::Error::custom(
+                        "non-deleted Memory entry requires stable_key and content",
+                    ));
+                }
+                if wire.deleted_at.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "non-deleted Memory entry cannot include deleted_at",
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            id: wire.id,
+            user_id: wire.user_id,
+            project_id: wire.project_id,
+            workspace_key: wire.workspace_key,
+            kind: wire.kind,
+            stable_key: wire.stable_key,
+            fingerprint: wire.fingerprint,
+            content: wire.content,
+            state: wire.state,
+            pinned: wire.pinned,
+            user_edited: wire.user_edited,
+            sources: wire.sources,
+            supersedes_id: wire.supersedes_id,
+            conflict_group_id: wire.conflict_group_id,
+            schema_version: wire.schema_version,
+            deleted_at: wire.deleted_at,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+        })
+    }
 }
 
 impl Serialize for MemoryEntryResponse {
@@ -151,23 +224,43 @@ impl Serialize for MemoryEntryResponse {
             updated_at: TimestampMs,
         }
 
+        let (stable_key, content, sources, deleted_at) = match &self.state {
+            MemoryEntryState::Deleted => {
+                let deleted_at = self
+                    .deleted_at
+                    .ok_or_else(|| serde::ser::Error::custom("deleted Memory entry requires deleted_at"))?;
+                (None, None, None, Some(deleted_at))
+            }
+            _ => {
+                let stable_key = self
+                    .stable_key
+                    .as_deref()
+                    .ok_or_else(|| serde::ser::Error::custom("non-deleted Memory entry requires stable_key"))?;
+                let content = self
+                    .content
+                    .as_deref()
+                    .ok_or_else(|| serde::ser::Error::custom("non-deleted Memory entry requires content"))?;
+                (Some(stable_key), Some(content), Some(self.sources.as_slice()), None)
+            }
+        };
+
         Wire {
             id: &self.id,
             user_id: &self.user_id,
             project_id: self.project_id.as_deref(),
             workspace_key: self.workspace_key.as_deref(),
             kind: &self.kind,
-            stable_key: self.stable_key.as_deref(),
+            stable_key,
             fingerprint: &self.fingerprint,
-            content: self.content.as_deref(),
+            content,
             state: &self.state,
             pinned: self.pinned,
             user_edited: self.user_edited,
-            sources: (!matches!(self.state, MemoryEntryState::Deleted)).then_some(self.sources.as_slice()),
+            sources,
             supersedes_id: self.supersedes_id.as_deref(),
             conflict_group_id: self.conflict_group_id.as_deref(),
             schema_version: self.schema_version,
-            deleted_at: self.deleted_at,
+            deleted_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -641,6 +734,99 @@ mod tests {
         let response: MemoryEntryResponse = serde_json::from_value(tombstone.clone()).unwrap();
 
         assert_eq!(serde_json::to_value(response).unwrap(), tombstone);
+    }
+
+    #[test]
+    fn deleted_entry_response_normalizes_hostile_content_and_requires_deletion_time() {
+        let dirty = json!({
+            "id": "mem_deleted",
+            "user_id": "user_1",
+            "kind": "decision",
+            "stable_key": "secret identity",
+            "fingerprint": "fp_deleted",
+            "content": "secret content",
+            "state": "deleted",
+            "pinned": false,
+            "user_edited": false,
+            "sources": [{
+                "memory_entry_id": "mem_deleted",
+                "conversation_id": "conv_1",
+                "turn_id": "turn_1",
+                "message_ids": ["msg_1"],
+                "first_observed_at": 1,
+                "last_observed_at": 2
+            }],
+            "schema_version": 1,
+            "deleted_at": 42,
+            "created_at": 1,
+            "updated_at": 42,
+        });
+
+        let response: MemoryEntryResponse = serde_json::from_value(dirty).unwrap();
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "id": "mem_deleted",
+                "user_id": "user_1",
+                "kind": "decision",
+                "fingerprint": "fp_deleted",
+                "state": "deleted",
+                "pinned": false,
+                "user_edited": false,
+                "schema_version": 1,
+                "deleted_at": 42,
+                "created_at": 1,
+                "updated_at": 42,
+            }),
+        );
+
+        let missing_deleted_at = json!({
+            "id": "mem_deleted",
+            "user_id": "user_1",
+            "kind": "decision",
+            "fingerprint": "fp_deleted",
+            "state": "deleted",
+            "pinned": false,
+            "user_edited": false,
+            "schema_version": 1,
+            "created_at": 1,
+            "updated_at": 42,
+        });
+        assert!(serde_json::from_value::<MemoryEntryResponse>(missing_deleted_at).is_err());
+    }
+
+    #[test]
+    fn active_entry_response_requires_content_identity_and_never_emits_deleted_at() {
+        let valid = json!({
+            "id": "mem_1",
+            "user_id": "user_1",
+            "kind": "decision",
+            "stable_key": "decision:one",
+            "fingerprint": "fp_1",
+            "content": "Use the established plan.",
+            "state": "active",
+            "pinned": false,
+            "user_edited": false,
+            "sources": [],
+            "schema_version": 1,
+            "created_at": 1,
+            "updated_at": 1,
+        });
+
+        for missing in ["stable_key", "content"] {
+            let mut malformed = valid.clone();
+            malformed.as_object_mut().unwrap().remove(missing);
+            assert!(
+                serde_json::from_value::<MemoryEntryResponse>(malformed).is_err(),
+                "active response accepted missing {missing}",
+            );
+        }
+
+        let mut dirty_active: MemoryEntryResponse = serde_json::from_value(valid.clone()).unwrap();
+        dirty_active.deleted_at = Some(99);
+        assert_eq!(serde_json::to_value(&dirty_active).unwrap(), valid);
+        dirty_active.content = None;
+        assert!(serde_json::to_value(dirty_active).is_err());
     }
 
     #[test]
