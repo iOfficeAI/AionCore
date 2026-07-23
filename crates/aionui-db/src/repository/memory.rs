@@ -90,6 +90,27 @@ pub struct UpdateConversationMemoryPolicyRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyMemorySummaryRow {
+    pub conversation_id: String,
+    pub project_id: Option<String>,
+    pub workspace_key: Option<String>,
+    pub summary_json: String,
+    pub through_turn_id: String,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportLegacyMemoryPageRow {
+    pub user_id: String,
+    pub expected_cursor: Option<String>,
+    pub next_cursor: Option<String>,
+    pub completed: bool,
+    pub summaries: Vec<LegacyMemorySummaryRow>,
+    pub now: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnqueueMemoryTurnRow {
     pub id: String,
     pub user_id: String,
@@ -543,6 +564,10 @@ pub trait IMemoryRepository: Send + Sync {
     async fn get_retrieval(&self, user_id: &str, retrieval_id: &str) -> Result<Option<MemoryRetrievalRow>, DbError>;
     async fn get_import_state(&self, user_id: &str) -> Result<Option<MemoryImportStateRow>, DbError>;
     async fn upsert_import_state(&self, state: MemoryImportStateRow) -> Result<MemoryImportStateRow, DbError>;
+    async fn import_legacy_memory_page(
+        &self,
+        input: ImportLegacyMemoryPageRow,
+    ) -> Result<MemoryImportStateRow, DbError>;
 }
 
 #[cfg(test)]

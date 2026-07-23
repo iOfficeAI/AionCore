@@ -37,8 +37,8 @@ pub use models::{
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, MessagePageCursor, MessagePageDirection, MessagePageParams,
-    MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    ConversationFilters, ConversationRowUpdate, LegacyConversationCursor, MessagePageCursor, MessagePageDirection,
+    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
 };
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
@@ -48,13 +48,14 @@ pub use repository::memory::{
     BoundedMemoryTurnMessagesRow, ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition,
     CommitMemorySourceRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, ConsumeMemoryRetrievalSnapshotRow,
     CreateMemoryRetrievalSnapshotRow, EnqueueMemoryTurnRow, ExpectedMemoryEntryRow, FinalizeMemoryJobSnapshotResult,
-    FinalizeMemoryJobSnapshotRow, MEMORY_EVIDENCE_MAX_BYTES, MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow,
-    MemoryChangeSetQueryRow, MemoryEntryQueryRow, MemoryEvidenceMessageKind, MemoryReconciliationSnapshotRow,
-    MemoryRetrievalItemRow, MemoryRetrievalSnapshotRow, MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow,
-    RenewMemoryLeaseRow, ResolveMemoryConflictActionRow, ResolveMemoryConflictRow, SplitMemoryJobRow,
-    TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow,
-    UpdateMemoryEntryRow, UpdateMemoryLifecycleRow, UpdateMemorySettingsRow, derive_memory_fingerprint,
-    memory_entry_content_hash, memory_evidence_content, memory_summary_conversation_id, memory_summary_selection_id,
+    FinalizeMemoryJobSnapshotRow, ImportLegacyMemoryPageRow, LegacyMemorySummaryRow, MEMORY_EVIDENCE_MAX_BYTES,
+    MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow, MemoryChangeSetQueryRow, MemoryEntryQueryRow,
+    MemoryEvidenceMessageKind, MemoryReconciliationSnapshotRow, MemoryRetrievalItemRow, MemoryRetrievalSnapshotRow,
+    MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, ResolveMemoryConflictActionRow,
+    ResolveMemoryConflictRow, SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow,
+    UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow, UpdateMemoryLifecycleRow, UpdateMemorySettingsRow,
+    derive_memory_fingerprint, memory_entry_content_hash, memory_evidence_content, memory_summary_conversation_id,
+    memory_summary_selection_id,
 };
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};

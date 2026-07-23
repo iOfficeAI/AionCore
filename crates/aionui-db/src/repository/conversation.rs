@@ -38,6 +38,26 @@ pub trait IConversationRepository: Send + Sync {
         filters: &ConversationFilters,
     ) -> Result<PaginatedResult<ConversationRow>, DbError>;
 
+    /// Lists one stable, owner-scoped page for the one-time legacy Memory import.
+    async fn list_for_memory_import(
+        &self,
+        user_id: &str,
+        cursor: Option<&LegacyConversationCursor>,
+        limit: u32,
+    ) -> Result<Vec<ConversationRow>, DbError> {
+        Ok(self
+            .list_paginated(
+                user_id,
+                &ConversationFilters {
+                    cursor: cursor.map(|value| value.id.clone()),
+                    limit,
+                    ..ConversationFilters::default()
+                },
+            )
+            .await?
+            .items)
+    }
+
     // ── Extended queries ────────────────────────────────────────────
 
     /// Finds a conversation by source, channel chat ID, and agent type.
@@ -205,6 +225,13 @@ pub trait IConversationRepository: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessagePageCursor {
     pub created_at: TimestampMs,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyConversationCursor {
+    pub updated_at: TimestampMs,
     pub id: String,
 }
 

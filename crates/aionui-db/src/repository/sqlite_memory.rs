@@ -20,13 +20,13 @@ use crate::repository::memory::{
     BoundedMemoryTurnMessagesRow, ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition,
     CommitMemorySourceRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, ConsumeMemoryRetrievalSnapshotRow,
     CreateMemoryRetrievalSnapshotRow, EnqueueMemoryTurnRow, FinalizeMemoryJobSnapshotResult,
-    FinalizeMemoryJobSnapshotRow, IMemoryRepository, MEMORY_EVIDENCE_MAX_BYTES, MEMORY_EVIDENCE_MAX_MESSAGES,
-    MemoryCandidateQueryRow, MemoryChangeSetQueryRow, MemoryEntryQueryRow, MemoryReconciliationSnapshotRow,
-    MemoryRetrievalItemRow, MemoryRetrievalSnapshotRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow,
-    ResolveMemoryConflictActionRow, ResolveMemoryConflictRow, SplitMemoryJobRow, TransitionMemoryJobRow,
-    UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow,
-    UpdateMemoryLifecycleRow, UpdateMemorySettingsRow, derive_memory_fingerprint, memory_entry_content_hash,
-    memory_evidence_content, memory_summary_conversation_id, memory_summary_selection_id,
+    FinalizeMemoryJobSnapshotRow, IMemoryRepository, ImportLegacyMemoryPageRow, MEMORY_EVIDENCE_MAX_BYTES,
+    MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow, MemoryChangeSetQueryRow, MemoryEntryQueryRow,
+    MemoryReconciliationSnapshotRow, MemoryRetrievalItemRow, MemoryRetrievalSnapshotRow, ReleaseMemoryLeaseRow,
+    RenewMemoryLeaseRow, ResolveMemoryConflictActionRow, ResolveMemoryConflictRow, SplitMemoryJobRow,
+    TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow,
+    UpdateMemoryEntryRow, UpdateMemoryLifecycleRow, UpdateMemorySettingsRow, derive_memory_fingerprint,
+    memory_entry_content_hash, memory_evidence_content, memory_summary_conversation_id, memory_summary_selection_id,
 };
 
 const MAX_MEMORY_CANDIDATES: u32 = 200;
@@ -3665,6 +3665,88 @@ impl IMemoryRepository for SqliteMemoryRepository {
         self.get_import_state(&state.user_id)
             .await?
             .ok_or_else(|| DbError::NotFound("Memory import state was not persisted".into()))
+    }
+
+    async fn import_legacy_memory_page(
+        &self,
+        input: ImportLegacyMemoryPageRow,
+    ) -> Result<MemoryImportStateRow, DbError> {
+        self.ensure_user(&input.user_id).await?;
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let result = async {
+            let current: Option<MemoryImportStateRow> =
+                sqlx::query_as("SELECT * FROM memory_import_state WHERE user_id = ?")
+                    .bind(&input.user_id)
+                    .fetch_optional(&mut *connection)
+                    .await?;
+            if let Some(ref current) = current {
+                if current.completed || current.cursor != input.expected_cursor {
+                    return Ok(current.clone());
+                }
+            } else if input.expected_cursor.is_some() {
+                return Err(DbError::Conflict("Memory import cursor changed".into()));
+            }
+
+            for summary in &input.summaries {
+                sqlx::query(
+                    "INSERT INTO conversation_memories
+                        (user_id,conversation_id,project_id,workspace_key,summary_json,through_turn_id,revision,
+                         source,schema_version,prompt_version,writer_provider_id,writer_model_id,created_at,updated_at)
+                     SELECT ?,c.id,?,?,?,?,1,'legacy_context_snapshot',1,NULL,NULL,NULL,?,?
+                     FROM conversations c WHERE c.id = ? AND c.user_id = ?
+                     ON CONFLICT(user_id,conversation_id) DO NOTHING",
+                )
+                .bind(&input.user_id)
+                .bind(&summary.project_id)
+                .bind(&summary.workspace_key)
+                .bind(&summary.summary_json)
+                .bind(&summary.through_turn_id)
+                .bind(summary.created_at)
+                .bind(summary.updated_at)
+                .bind(&summary.conversation_id)
+                .bind(&input.user_id)
+                .execute(&mut *connection)
+                .await?;
+            }
+
+            let started_at = current.and_then(|state| state.started_at).unwrap_or(input.now);
+            let completed_at = input.completed.then_some(input.now);
+            sqlx::query(
+                "INSERT INTO memory_import_state
+                    (user_id,cursor,completed,started_at,completed_at,updated_at)
+                 VALUES (?,?,?,?,?,?)
+                 ON CONFLICT(user_id) DO UPDATE SET
+                    cursor=excluded.cursor,completed=excluded.completed,started_at=excluded.started_at,
+                    completed_at=excluded.completed_at,updated_at=excluded.updated_at
+                 WHERE memory_import_state.completed = 0 AND memory_import_state.cursor IS ?",
+            )
+            .bind(&input.user_id)
+            .bind(&input.next_cursor)
+            .bind(input.completed)
+            .bind(started_at)
+            .bind(completed_at)
+            .bind(input.now)
+            .bind(&input.expected_cursor)
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query_as("SELECT * FROM memory_import_state WHERE user_id = ?")
+                .bind(&input.user_id)
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(DbError::from)
+        }
+        .await;
+        match result {
+            Ok(state) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(state)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
     }
 }
 

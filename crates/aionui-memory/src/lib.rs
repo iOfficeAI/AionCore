@@ -4,6 +4,7 @@ pub mod app_operations_port;
 pub mod error;
 mod evidence;
 pub mod jobs;
+mod legacy_import;
 mod library;
 mod prompt_block;
 mod ranking;

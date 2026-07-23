@@ -117,12 +117,9 @@ impl MemoryService {
     }
 
     pub async fn get_settings(&self, user_id: &str) -> Result<MemorySettings, MemoryError> {
-        let row = self
-            .job_dependencies()?
-            .memory
-            .get_settings(user_id)
-            .await
-            .map_err(map_db_error)?;
+        let dependencies = self.job_dependencies()?;
+        crate::legacy_import::ensure_legacy_import(&dependencies.memory, &dependencies.conversations, user_id).await?;
+        let row = dependencies.memory.get_settings(user_id).await.map_err(map_db_error)?;
         crate::library::settings_response(row)
     }
 
@@ -145,8 +142,9 @@ impl MemoryService {
         if consent_version.is_some_and(|version| version != crate::jobs::MEMORY_DISCLOSURE_VERSION) {
             return Err(MemoryError::InvalidInput);
         }
-        let row = self
-            .job_dependencies()?
+        let dependencies = self.job_dependencies()?;
+        crate::legacy_import::ensure_legacy_import(&dependencies.memory, &dependencies.conversations, user_id).await?;
+        let row = dependencies
             .memory
             .update_settings(UpdateMemorySettingsRow {
                 user_id: user_id.into(),
@@ -737,6 +735,7 @@ impl MemoryService {
         if outcome != MemoryTurnOutcome::Completed {
             return Ok(false);
         }
+        crate::legacy_import::ensure_legacy_import(&jobs.memory, &jobs.conversations, user_id).await?;
         let policy = jobs
             .memory
             .effective_policy(user_id, conversation_id)
@@ -1725,7 +1724,7 @@ fn failure_code(code: &MemoryJobFailureCode) -> &'static str {
     }
 }
 
-fn map_db_error(error: aionui_db::DbError) -> MemoryError {
+pub(crate) fn map_db_error(error: aionui_db::DbError) -> MemoryError {
     match error {
         aionui_db::DbError::NotFound(_) => MemoryError::NotFound,
         aionui_db::DbError::Conflict(_) => MemoryError::Conflict,

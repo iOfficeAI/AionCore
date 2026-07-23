@@ -327,6 +327,45 @@ impl IConversationRepository for SqliteConversationRepository {
         })
     }
 
+    async fn list_for_memory_import(
+        &self,
+        user_id: &str,
+        cursor: Option<&crate::repository::conversation::LegacyConversationCursor>,
+        limit: u32,
+    ) -> Result<Vec<ConversationRow>, DbError> {
+        let limit = limit.max(1);
+        let rows = match cursor {
+            Some(cursor) => {
+                sqlx::query_as::<_, ConversationRow>(
+                    "SELECT * FROM conversations
+                     WHERE user_id = ? AND (updated_at < ? OR (updated_at = ? AND id < ?))
+                     ORDER BY updated_at DESC, id DESC
+                     LIMIT ?",
+                )
+                .bind(user_id)
+                .bind(cursor.updated_at)
+                .bind(cursor.updated_at)
+                .bind(&cursor.id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as::<_, ConversationRow>(
+                    "SELECT * FROM conversations
+                     WHERE user_id = ?
+                     ORDER BY updated_at DESC, id DESC
+                     LIMIT ?",
+                )
+                .bind(user_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows)
+    }
+
     // ── Extended queries ────────────────────────────────────────────
 
     async fn find_by_source_and_chat(
