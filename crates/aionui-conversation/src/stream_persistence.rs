@@ -95,6 +95,11 @@ impl StreamPersistenceAdapter {
         self
     }
 
+    pub fn with_turn_id(mut self, turn_id: Option<String>) -> Self {
+        self.turn_id = turn_id;
+        self
+    }
+
     #[tracing::instrument(skip_all, fields(conversation_id = %self.conversation_id))]
     pub async fn complete_conversation(
         &self,

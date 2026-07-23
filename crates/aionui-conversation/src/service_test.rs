@@ -52,7 +52,10 @@ use tokio::sync::{Notify, broadcast};
 
 use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
-use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
+use crate::{
+    CompletedTurnMemoryInput, ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError,
+    ConversationMemoryPort, MemoryPortError, MemoryTurnOutcome, RecallMemoryInput,
+};
 
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
@@ -202,6 +205,40 @@ impl AgentAvailabilityFeedbackPort for RecordingAvailabilityFeedback {
     }
 }
 
+#[derive(Default)]
+struct RecordingMemoryPort {
+    completions: Mutex<Vec<CompletedTurnMemoryInput>>,
+    recalls: Mutex<Vec<RecallMemoryInput>>,
+    recall_result: Mutex<Option<Result<Option<String>, MemoryPortError>>>,
+    fail_completion: AtomicBool,
+}
+
+impl RecordingMemoryPort {
+    fn with_recall_result(result: Result<Option<String>, MemoryPortError>) -> Self {
+        Self {
+            recall_result: Mutex::new(Some(result)),
+            ..Self::default()
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ConversationMemoryPort for RecordingMemoryPort {
+    async fn on_turn_completed(&self, input: CompletedTurnMemoryInput) -> Result<(), MemoryPortError> {
+        self.completions.lock().unwrap().push(input);
+        if self.fail_completion.load(Ordering::SeqCst) {
+            Err(MemoryPortError::Unavailable)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn build_recall_block(&self, input: RecallMemoryInput) -> Result<Option<String>, MemoryPortError> {
+        self.recalls.lock().unwrap().push(input);
+        self.recall_result.lock().unwrap().take().unwrap_or(Ok(None))
+    }
+}
+
 // ── Mock Repository ────────────────────────────────────────────────
 
 struct MockRepo {
@@ -209,6 +246,57 @@ struct MockRepo {
     messages: Mutex<Vec<MessageRow>>,
     artifacts: Mutex<Vec<ConversationArtifactRow>>,
     assistant_snapshots: Mutex<Vec<ConversationAssistantSnapshotRow>>,
+}
+
+struct CompletionOrderMemoryPort {
+    repo: Arc<MockRepo>,
+    broadcaster: Arc<MockBroadcaster>,
+    observations: Mutex<Vec<(bool, bool, bool)>>,
+}
+
+#[async_trait::async_trait]
+impl ConversationMemoryPort for CompletionOrderMemoryPort {
+    async fn on_turn_completed(&self, input: CompletedTurnMemoryInput) -> Result<(), MemoryPortError> {
+        let status_finished = self
+            .repo
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| row.id == input.conversation_id)
+            .and_then(|row| row.status.as_deref())
+            == Some("finished");
+        let messages = self.repo.messages.lock().unwrap();
+        let user_persisted = messages.iter().any(|message| {
+            message.turn_id.as_deref() == Some(input.turn_id.as_str())
+                && message.position.as_deref() == Some("right")
+                && message.status.as_deref() == Some("finish")
+        });
+        let assistant_persisted = messages.iter().any(|message| {
+            message.turn_id.as_deref() == Some(input.turn_id.as_str())
+                && message.position.as_deref() == Some("left")
+                && message.status.as_deref() == Some("finish")
+                && message.r#type == "text"
+        });
+        drop(messages);
+        let event_published = self
+            .broadcaster
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.name == "turn.completed" && event.data["turn_id"] == input.turn_id);
+        self.observations.lock().unwrap().push((
+            status_finished && event_published,
+            user_persisted,
+            assistant_persisted,
+        ));
+        Ok(())
+    }
+
+    async fn build_recall_block(&self, _input: RecallMemoryInput) -> Result<Option<String>, MemoryPortError> {
+        Ok(None)
+    }
 }
 
 impl MockRepo {
@@ -3345,6 +3433,302 @@ async fn wait_for_turn_released(svc: &ConversationService, conversation_id: &str
     .expect("turn should release runtime claim");
 }
 
+async fn wait_for_memory_completions(port: &RecordingMemoryPort, count: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if port.completions.lock().unwrap().len() >= count {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Memory completion callback should run");
+}
+
+#[tokio::test]
+async fn memory_recall_uses_canonical_ids_and_changes_only_agent_bound_content() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let block = "<historical_memory trust=\"untrusted\" policy_version=\"v1\">\n- [decision; sources=source] historical\n</historical_memory>";
+    let memory = Arc::new(RecordingMemoryPort::with_recall_result(Ok(Some(block.into()))));
+    svc.with_memory_port(memory.clone());
+    broadcaster.take_events();
+
+    let request = SendMessageRequest {
+        content: "current prompt".into(),
+        files: vec![],
+        inject_skills: vec![],
+        hidden: false,
+        memory_retrieval_id: Some("retrieval-1".into()),
+        excluded_memory_ids: vec!["entry-2".into()],
+    };
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let response = svc
+        .send_message("user_1", &conv.id, request, &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+    wait_for_memory_completions(&memory, 1).await;
+
+    assert_eq!(
+        memory.recalls.lock().unwrap().as_slice(),
+        &[RecallMemoryInput {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            prompt: "current prompt".into(),
+            retrieval_id: "retrieval-1".into(),
+            excluded_memory_ids: vec!["entry-2".into()],
+        }],
+    );
+    assert_eq!(agent.sent_contents(), vec![format!("{block}\n\ncurrent prompt")]);
+    let persisted = repo
+        .messages
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|message| message.id == response.msg_id)
+        .cloned()
+        .unwrap();
+    assert_eq!(persisted.content, r#"{"content":"current prompt"}"#);
+    let user_event = broadcaster
+        .take_events()
+        .into_iter()
+        .find(|event| event.name == "message.userCreated")
+        .unwrap();
+    assert_eq!(user_event.data["content"], "current prompt");
+}
+
+#[tokio::test]
+async fn memory_port_failure_preserves_turn_completion_and_original_prompt() {
+    let (svc, broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let memory = Arc::new(RecordingMemoryPort::with_recall_result(Err(
+        MemoryPortError::Unavailable,
+    )));
+    memory.fail_completion.store(true, Ordering::SeqCst);
+    svc.with_memory_port(memory.clone());
+    broadcaster.take_events();
+
+    let mut request = make_send_req();
+    request.memory_retrieval_id = Some("retrieval-1".into());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let response = svc
+        .send_message("user_1", &conv.id, request, &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+    wait_for_memory_completions(&memory, 1).await;
+
+    assert_eq!(agent.sent_contents(), vec!["Hello"]);
+    assert_eq!(
+        memory.completions.lock().unwrap().as_slice(),
+        &[CompletedTurnMemoryInput {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            turn_id: response.turn_id.clone(),
+            outcome: MemoryTurnOutcome::Completed,
+        }],
+    );
+    assert!(
+        broadcaster
+            .take_events()
+            .iter()
+            .any(|event| event.name == "turn.completed" && event.data["turn_id"] == response.turn_id),
+    );
+}
+
+#[tokio::test]
+async fn memory_completion_runs_after_durable_user_and_assistant_turn_and_event() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData {
+                content: "assistant outcome".into(),
+            }),
+            AgentStreamEvent::Finish(FinishEventData::default()),
+        ]],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+    let memory = Arc::new(CompletionOrderMemoryPort {
+        repo: repo.clone(),
+        broadcaster: broadcaster.clone(),
+        observations: Mutex::new(Vec::new()),
+    });
+    svc.with_memory_port(memory.clone());
+    broadcaster.take_events();
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !memory.observations.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Memory completion observer should run");
+
+    assert_eq!(memory.observations.lock().unwrap().as_slice(), &[(true, true, true)]);
+}
+
+#[tokio::test]
+async fn memory_completion_marks_build_failures_failed_after_the_failure_tip() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(FailingBuildTaskManager::new("build failed"));
+    let memory = Arc::new(RecordingMemoryPort::default());
+    svc.with_memory_port(memory.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    broadcaster.take_events();
+
+    let response = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+    wait_for_memory_completions(&memory, 1).await;
+
+    assert_eq!(
+        memory.completions.lock().unwrap().as_slice(),
+        &[CompletedTurnMemoryInput {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            turn_id: response.turn_id.clone(),
+            outcome: MemoryTurnOutcome::Failed,
+        }],
+    );
+    let messages = repo.messages.lock().unwrap();
+    assert!(
+        messages.iter().any(|message| {
+            message.turn_id.as_deref() == Some(response.turn_id.as_str()) && message.r#type == "tips"
+        })
+    );
+}
+
+#[tokio::test]
+async fn internal_agent_turn_neither_recalls_nor_captures_memory_and_leaves_persisted_turn_ids_empty() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let repo = Arc::new(MockRepo::new());
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr_dyn,
+        repo.clone(),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    let memory = Arc::new(RecordingMemoryPort::with_recall_result(Ok(Some(
+        "<historical_memory trust=\"untrusted\">ignored</historical_memory>".into(),
+    ))));
+    service.with_memory_port(memory.clone());
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData {
+                content: "internal outcome".into(),
+            }),
+            AgentStreamEvent::Finish(FinishEventData::default()),
+        ]],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+
+    let outcome = service
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            content: "internal control prompt".into(),
+            files: vec![],
+            inject_skills: vec![],
+            required_runtime_mode: None,
+            persist_user_message: true,
+            user_message_hidden: true,
+            on_started: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
+    assert_eq!(agent.sent_contents(), vec!["internal control prompt"]);
+    assert!(memory.recalls.lock().unwrap().is_empty());
+    assert!(memory.completions.lock().unwrap().is_empty());
+    assert!(
+        repo.messages
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|message| message.turn_id.is_none()),
+    );
+}
+
+#[tokio::test]
+async fn invalid_memory_block_falls_back_to_original_agent_prompt() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let memory = Arc::new(RecordingMemoryPort::with_recall_result(Ok(Some(
+        "renderer-supplied memory".into(),
+    ))));
+    svc.with_memory_port(memory);
+    let mut request = make_send_req();
+    request.memory_retrieval_id = Some("retrieval-1".into());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.send_message("user_1", &conv.id, request, &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(agent.sent_contents(), vec!["Hello"]);
+}
+
+#[tokio::test]
+async fn duplicate_completion_delivery_preserves_the_same_idempotency_key() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let memory = Arc::new(RecordingMemoryPort::default());
+    svc.with_memory_port(memory.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    svc.complete_turn(&conv.id, "turn-duplicate").await;
+    svc.complete_turn(&conv.id, "turn-duplicate").await;
+
+    assert_eq!(memory.completions.lock().unwrap().len(), 2);
+    assert!(memory.completions.lock().unwrap().iter().all(|input| {
+        input.user_id == "user_1"
+            && input.conversation_id == conv.id
+            && input.turn_id == "turn-duplicate"
+            && input.outcome == MemoryTurnOutcome::Completed
+    }));
+}
+
 #[tokio::test]
 async fn send_message_returns_accepted() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
@@ -4522,7 +4906,7 @@ async fn run_agent_turn_returns_error_message_when_agent_build_fails() {
         broadcaster,
         Arc::new(FixedSkillResolver { names: vec![] }),
         task_mgr,
-        repo,
+        repo.clone(),
         Arc::new(StubAgentMetadataRepo),
         Arc::new(StubAcpSessionRepo::default()),
     );
@@ -4547,6 +4931,14 @@ async fn run_agent_turn_returns_error_message_when_agent_build_fails() {
     assert_eq!(
         outcome.error_message.as_deref(),
         Some("ACP init failed: config file is invalid")
+    );
+    assert!(
+        repo.messages
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|message| message.turn_id.is_none()),
+        "internal build-failure rows must not become Memory-eligible evidence",
     );
 }
 

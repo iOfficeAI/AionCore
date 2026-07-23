@@ -151,6 +151,11 @@ impl StreamRelay {
         self
     }
 
+    pub fn with_persisted_turn_id(mut self, turn_id: Option<String>) -> Self {
+        self.adapter = self.adapter.with_turn_id(turn_id);
+        self
+    }
+
     pub fn with_skill_resolver(mut self, skill_resolver: Arc<dyn SkillResolver>) -> Self {
         self.skill_resolver = Some(skill_resolver);
         self

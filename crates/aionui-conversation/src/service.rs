@@ -10,8 +10,11 @@ use aionui_ai_agent::{
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
 };
 
+use crate::memory_port::{
+    CompletedTurnMemoryInput, ConversationMemoryPort, MemoryTurnOutcome, NoopConversationMemoryPort,
+};
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
-use crate::runtime_completion::RuntimeCompletionPublisher;
+use crate::runtime_completion::{RuntimeCompletionOutcome, RuntimeCompletionPublisher};
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::{
@@ -318,6 +321,7 @@ pub struct ConversationService {
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
+    memory_port: Arc<RwLock<Arc<dyn ConversationMemoryPort>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
@@ -391,6 +395,7 @@ impl ConversationService {
             assistant_preference_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
+            memory_port: Arc::new(RwLock::new(Arc::new(NoopConversationMemoryPort))),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
@@ -458,6 +463,12 @@ impl ConversationService {
     pub fn with_agent_availability_feedback(&self, feedback: Arc<dyn AgentAvailabilityFeedbackPort>) {
         if let Ok(mut guard) = self.agent_availability_feedback.write() {
             *guard = Some(feedback);
+        }
+    }
+
+    pub fn with_memory_port(&self, port: Arc<dyn ConversationMemoryPort>) {
+        if let Ok(mut guard) = self.memory_port.write() {
+            *guard = port;
         }
     }
 
@@ -549,6 +560,13 @@ impl ConversationService {
             .and_then(|guard| guard.as_ref().cloned())
     }
 
+    pub(crate) fn memory_port(&self) -> Arc<dyn ConversationMemoryPort> {
+        self.memory_port
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|_| Arc::new(NoopConversationMemoryPort))
+    }
+
     pub(crate) fn runtime_persistence(&self) -> RuntimePersistenceCoordinator {
         RuntimePersistenceCoordinator::new(self.runtime_state())
     }
@@ -597,13 +615,54 @@ impl ConversationService {
     }
 
     pub async fn complete_turn(&self, conversation_id: &str, turn_id: &str) {
-        let runtime = self.runtime_summary_for(conversation_id).await;
-        self.completion_publisher()
-            .publish(conversation_id, turn_id, Some(runtime))
+        self.complete_turn_with_memory(conversation_id, turn_id, ConversationTurnStatus::Completed, true)
             .await;
     }
 
-    pub(crate) async fn complete_released_turn(&self, conversation_id: &str, turn_id: &str, was_deleting: bool) {
+    async fn complete_turn_with_memory(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        status: ConversationTurnStatus,
+        memory_eligible: bool,
+    ) {
+        let runtime = self.runtime_summary_for(conversation_id).await;
+        let outcome = self
+            .completion_publisher()
+            .publish(conversation_id, turn_id, Some(runtime))
+            .await;
+        let RuntimeCompletionOutcome::Committed { user_id } = outcome else {
+            return;
+        };
+        if !memory_eligible {
+            return;
+        }
+        let outcome = match status {
+            ConversationTurnStatus::Completed => MemoryTurnOutcome::Completed,
+            ConversationTurnStatus::Failed => MemoryTurnOutcome::Failed,
+        };
+        if let Err(error) = self
+            .memory_port()
+            .on_turn_completed(CompletedTurnMemoryInput {
+                user_id,
+                conversation_id: conversation_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                outcome,
+            })
+            .await
+        {
+            warn!(conversation_id, turn_id, error = %error, "Memory completion callback failed");
+        }
+    }
+
+    pub(crate) async fn complete_released_turn(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        was_deleting: bool,
+        status: ConversationTurnStatus,
+        memory_eligible: bool,
+    ) {
         if was_deleting {
             debug!(
                 conversation_id,
@@ -612,7 +671,8 @@ impl ConversationService {
             return;
         }
 
-        self.complete_turn(conversation_id, turn_id).await;
+        self.complete_turn_with_memory(conversation_id, turn_id, status, memory_eligible)
+            .await;
     }
 }
 
@@ -2611,6 +2671,7 @@ impl ConversationService {
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
+        let memory_eligible = !req.hidden;
 
         // Store user message. `msg_id` is server-generated so the WebSocket
         // stream, DB row, and client-side message index all agree on the same
@@ -2635,8 +2696,14 @@ impl ConversationService {
         {
             let mut turn_claim = turn_claim;
             let was_deleting = turn_claim.release();
-            self.complete_released_turn(conversation_id, &turn_id, was_deleting)
-                .await;
+            self.complete_released_turn(
+                conversation_id,
+                &turn_id,
+                was_deleting,
+                ConversationTurnStatus::Failed,
+                false,
+            )
+            .await;
             return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
         }
         if let Err(e) = self.conversation_repo.insert_message(&user_msg).await {
@@ -2679,8 +2746,14 @@ impl ConversationService {
                 .await;
                 let mut turn_claim = turn_claim;
                 let was_deleting = turn_claim.release();
-                self.complete_released_turn(conversation_id, &turn_id, was_deleting)
-                    .await;
+                self.complete_released_turn(
+                    conversation_id,
+                    &turn_id,
+                    was_deleting,
+                    ConversationTurnStatus::Failed,
+                    memory_eligible,
+                )
+                .await;
                 return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
             }
         };
@@ -2698,6 +2771,8 @@ impl ConversationService {
             stored_workspace,
             turn_id: turn_id.clone(),
             turn_claim,
+            memory_eligible,
+            persisted_turn_id: Some(turn_id.clone()),
         });
 
         info!(
@@ -2744,7 +2819,7 @@ impl ConversationService {
             let user_msg = aionui_db::models::MessageRow {
                 id: user_msg_id.clone(),
                 conversation_id: request.conversation_id.clone(),
-                turn_id: Some(turn_id.clone()),
+                turn_id: None,
                 msg_id: Some(user_msg_id),
                 r#type: "text".into(),
                 content: serde_json::json!({ "content": request.content }).to_string(),
@@ -2765,8 +2840,14 @@ impl ConversationService {
                 );
                 let mut turn_claim = turn_claim;
                 let was_deleting = turn_claim.release();
-                self.complete_released_turn(&request.conversation_id, &turn_id, was_deleting)
-                    .await;
+                self.complete_released_turn(
+                    &request.conversation_id,
+                    &turn_id,
+                    was_deleting,
+                    ConversationTurnStatus::Failed,
+                    false,
+                )
+                .await;
                 return Err(e.into());
             }
         }
@@ -2783,17 +2864,24 @@ impl ConversationService {
             Err(err) => {
                 let top_level_code = err.error_code();
                 let send_error = AgentSendError::from_agent_error(err.to_agent_error());
-                self.persist_and_broadcast_send_failure_tip(
+                self.persist_and_broadcast_send_failure_tip_with_turn_id(
                     &request.conversation_id,
                     &turn_id,
+                    None,
                     &send_error,
                     Some(top_level_code),
                 )
                 .await;
                 let mut turn_claim = turn_claim;
                 let was_deleting = turn_claim.release();
-                self.complete_released_turn(&request.conversation_id, &turn_id, was_deleting)
-                    .await;
+                self.complete_released_turn(
+                    &request.conversation_id,
+                    &turn_id,
+                    was_deleting,
+                    ConversationTurnStatus::Failed,
+                    false,
+                )
+                .await;
                 return Ok(ConversationAgentTurnOutcome {
                     conversation_id: request.conversation_id.clone(),
                     turn_id,
@@ -2825,6 +2913,8 @@ impl ConversationService {
                 stored_workspace,
                 turn_id: turn_id.clone(),
                 turn_claim,
+                memory_eligible: false,
+                persisted_turn_id: None,
             })
             .await;
 
@@ -2865,8 +2955,26 @@ impl ConversationService {
         err: &AgentSendError,
         top_level_code: Option<&'static str>,
     ) {
+        self.persist_and_broadcast_send_failure_tip_with_turn_id(
+            conversation_id,
+            turn_id,
+            Some(turn_id),
+            err,
+            top_level_code,
+        )
+        .await;
+    }
+
+    pub(crate) async fn persist_and_broadcast_send_failure_tip_with_turn_id(
+        &self,
+        conversation_id: &str,
+        runtime_turn_id: &str,
+        persisted_turn_id: Option<&str>,
+        err: &AgentSendError,
+        top_level_code: Option<&'static str>,
+    ) {
         let Some(row) = self
-            .persist_send_failure_tip(conversation_id, turn_id, err, top_level_code)
+            .persist_send_failure_tip_with_turn_id(conversation_id, persisted_turn_id, err, top_level_code)
             .await
         else {
             return;
@@ -2880,7 +2988,7 @@ impl ConversationService {
             serde_json::json!({
                 "conversation_id": row.conversation_id,
                 "msg_id": msg_id,
-                "turn_id": turn_id,
+                "turn_id": runtime_turn_id,
                 "type": row.r#type,
                 "data": content_value,
                 "position": row.position,
