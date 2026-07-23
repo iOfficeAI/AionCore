@@ -2268,6 +2268,11 @@ impl ConversationService {
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
+        self.memory_port()
+            .on_conversation_reset(user_id, id)
+            .await
+            .map_err(|_| ConversationError::internal("Failed to reset conversation Memory"))?;
+
         // Delete all messages
         self.conversation_repo.delete_messages_by_conversation(id).await?;
         self.conversation_repo.delete_artifacts_by_conversation(id).await?;

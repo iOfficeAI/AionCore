@@ -97,6 +97,13 @@ impl ConversationMemoryPort for ConversationMemoryAdapter {
             .map_err(map_memory_port_error)
     }
 
+    async fn on_conversation_reset(&self, user_id: &str, conversation_id: &str) -> Result<(), MemoryPortError> {
+        self.service
+            .forget_conversation(user_id, conversation_id)
+            .await
+            .map_err(map_memory_port_error)
+    }
+
     async fn build_recall_block(&self, input: RecallMemoryInput) -> Result<Option<String>, MemoryPortError> {
         self.service
             .build_recall_block(

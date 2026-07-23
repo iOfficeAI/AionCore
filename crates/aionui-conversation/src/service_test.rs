@@ -249,6 +249,51 @@ struct MockRepo {
     fail_assistant_evidence_writes: AtomicBool,
 }
 
+struct ResetObservingMemoryPort {
+    repo: Arc<MockRepo>,
+    observations: Mutex<Vec<(String, String, bool, bool)>>,
+    fail_reset: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl ConversationMemoryPort for ResetObservingMemoryPort {
+    async fn on_turn_completed(&self, _input: CompletedTurnMemoryInput) -> Result<(), MemoryPortError> {
+        Ok(())
+    }
+
+    async fn build_recall_block(&self, _input: RecallMemoryInput) -> Result<Option<String>, MemoryPortError> {
+        Ok(None)
+    }
+
+    async fn on_conversation_reset(&self, user_id: &str, conversation_id: &str) -> Result<(), MemoryPortError> {
+        let messages_exist = self
+            .repo
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message.conversation_id == conversation_id);
+        let artifacts_exist = self
+            .repo
+            .artifacts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|artifact| artifact.conversation_id == conversation_id);
+        self.observations.lock().unwrap().push((
+            user_id.to_owned(),
+            conversation_id.to_owned(),
+            messages_exist,
+            artifacts_exist,
+        ));
+        if self.fail_reset.load(Ordering::SeqCst) {
+            Err(MemoryPortError::Unavailable)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Default)]
 struct BlockingCompletionMemoryPort {
     completions: Mutex<Vec<CompletedTurnMemoryInput>>,
@@ -2489,6 +2534,102 @@ async fn reset_clears_conversation_artifacts() {
 
     let artifacts = repo.list_artifacts(&conv.id).await.unwrap();
     assert!(artifacts.is_empty());
+}
+
+#[tokio::test]
+async fn reset_notifies_memory_before_destroying_canonical_evidence() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.insert_message(&MessageRow {
+        id: "reset-message".into(),
+        conversation_id: conv.id.clone(),
+        turn_id: Some("reset-turn".into()),
+        msg_id: Some("reset-message".into()),
+        r#type: "text".into(),
+        content: r#"{"content":"canonical evidence"}"#.into(),
+        position: Some("right".into()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at: 1000,
+    })
+    .await
+    .unwrap();
+    repo.upsert_artifact(&ConversationArtifactRow {
+        id: "reset-artifact".into(),
+        conversation_id: conv.id.clone(),
+        cron_job_id: None,
+        kind: "skill_suggest".into(),
+        status: "pending".into(),
+        payload: "{}".into(),
+        created_at: 1000,
+        updated_at: 1000,
+    })
+    .await
+    .unwrap();
+    let memory = Arc::new(ResetObservingMemoryPort {
+        repo: repo.clone(),
+        observations: Mutex::new(Vec::new()),
+        fail_reset: AtomicBool::new(false),
+    });
+    svc.with_memory_port(memory.clone());
+
+    svc.reset("user_1", &conv.id).await.unwrap();
+
+    assert_eq!(
+        memory.observations.lock().unwrap().as_slice(),
+        &[("user_1".into(), conv.id.clone(), true, true)],
+    );
+    assert!(repo.messages.lock().unwrap().is_empty());
+    assert!(repo.artifacts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reset_preserves_canonical_evidence_when_memory_reset_fails() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.update(
+        &conv.id,
+        &ConversationRowUpdate {
+            status: Some("finished".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    repo.insert_message(&MessageRow {
+        id: "reset-failure-message".into(),
+        conversation_id: conv.id.clone(),
+        turn_id: Some("reset-failure-turn".into()),
+        msg_id: Some("reset-failure-message".into()),
+        r#type: "text".into(),
+        content: r#"{"content":"must survive"}"#.into(),
+        position: Some("right".into()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at: 1000,
+    })
+    .await
+    .unwrap();
+    let memory = Arc::new(ResetObservingMemoryPort {
+        repo: repo.clone(),
+        observations: Mutex::new(Vec::new()),
+        fail_reset: AtomicBool::new(true),
+    });
+    svc.with_memory_port(memory);
+
+    let error = svc.reset("user_1", &conv.id).await.unwrap_err();
+
+    assert!(matches!(error, ConversationError::Internal { .. }));
+    assert_eq!(repo.messages.lock().unwrap().len(), 1);
+    assert_eq!(
+        repo.rows
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| row.id == conv.id)
+            .and_then(|row| row.status.as_deref()),
+        Some("finished"),
+    );
 }
 
 #[tokio::test]

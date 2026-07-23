@@ -226,6 +226,154 @@ async fn deleting_conversation_removes_exclusive_memory_and_preserves_shared_mem
 }
 
 #[tokio::test]
+async fn resetting_conversation_clears_memory_before_evidence_and_fences_stale_workers() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conversation_id = create_conversation(&mut app, &token, &csrf, "Reset source").await;
+    let user_id = "system_default_user";
+    let now = aionui_common::now_ms();
+
+    aionui_db::IConversationRepository::insert_message(
+        &aionui_db::SqliteConversationRepository::new(services.database.pool().clone()),
+        &aionui_db::models::MessageRow {
+            id: "reset-memory-message".into(),
+            conversation_id: conversation_id.clone(),
+            turn_id: Some("reset-memory-turn".into()),
+            msg_id: Some("reset-memory-message".into()),
+            r#type: "text".into(),
+            content: r#"{"content":"canonical evidence"}"#.into(),
+            position: Some("right".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversation_memories
+            (user_id,conversation_id,summary_json,through_turn_id,revision,source,
+             schema_version,created_at,updated_at)
+         VALUES (?,?,'{\"goal\":\"reset me\"}','reset-memory-turn',0,'memory_update',1,?,?)",
+    )
+    .bind(user_id)
+    .bind(&conversation_id)
+    .bind(now)
+    .bind(now)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_entries
+            (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,
+             schema_version,created_at,updated_at)
+         VALUES
+            ('reset-memory-entry',?,'decision','reset-entry','reset-entry-fp',
+             'derived content','active',0,0,1,?,?)",
+    )
+    .bind(user_id)
+    .bind(now)
+    .bind(now)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_sources
+            (memory_entry_id,conversation_id,turn_id,message_ids_json,first_observed_at,last_observed_at)
+         VALUES ('reset-memory-entry',?,'reset-memory-turn','[\"reset-memory-message\"]',?,?)",
+    )
+    .bind(&conversation_id)
+    .bind(now)
+    .bind(now)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_jobs
+            (id,user_id,conversation_id,through_turn_id,operation_version,global_epoch,
+             conversation_epoch,turn_count,queue_digest,input_hash,expected_revision,state,
+             attempt_count,lease_owner,lease_token,lease_expires_at,invalid_output_count,
+             created_at,updated_at)
+         VALUES
+            ('reset-memory-job',?,?,'reset-memory-turn','v1',0,0,1,
+             '00000000000000000000000000000001','reset-input',0,'running',0,
+             'stale-worker','stale-reset-lease',?,0,?,?)",
+    )
+    .bind(user_id)
+    .bind(&conversation_id)
+    .bind(now + 60_000)
+    .bind(now)
+    .bind(now)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/conversations/{conversation_id}/reset"),
+            json!({}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = ?")
+        .bind(&conversation_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let summaries: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_memories WHERE user_id = ? AND conversation_id = ?")
+            .bind(user_id)
+            .bind(&conversation_id)
+            .fetch_one(services.database.pool())
+            .await
+            .unwrap();
+    let entries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_entries WHERE id = 'reset-memory-entry'")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let sources: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_sources WHERE conversation_id = ?")
+        .bind(&conversation_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let job: (String, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT state,lease_owner,lease_token FROM memory_jobs WHERE id = 'reset-memory-job'")
+            .fetch_one(services.database.pool())
+            .await
+            .unwrap();
+    let policy: (Option<i64>, i64) = sqlx::query_as(
+        "SELECT reset_at,lifecycle_epoch FROM conversation_memory_policies
+         WHERE user_id = ? AND conversation_id = ?",
+    )
+    .bind(user_id)
+    .bind(&conversation_id)
+    .fetch_one(services.database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(messages, 0);
+    assert_eq!(summaries, 0);
+    assert_eq!(entries, 0);
+    assert_eq!(sources, 0);
+    assert_eq!(job, ("canceled".into(), None, None));
+    assert!(policy.0.is_some());
+    assert_eq!(policy.1, 1);
+    assert_eq!(
+        services
+            .memory_service
+            .renew_job_lease(user_id, "reset-memory-job", "stale-worker", "stale-reset-lease", 30_000,)
+            .await,
+        Err(aionui_memory::MemoryError::LeaseLost),
+    );
+}
+
+#[tokio::test]
 async fn app_startup_recovers_expired_running_job_into_its_successor_once() {
     use aionui_db::IConversationRepository;
 

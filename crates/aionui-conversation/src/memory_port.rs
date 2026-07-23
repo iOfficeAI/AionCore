@@ -42,6 +42,13 @@ pub trait ConversationMemoryPort: Send + Sync {
     /// Implementations must treat duplicate `(conversation_id, turn_id)` delivery idempotently.
     async fn on_turn_completed(&self, input: CompletedTurnMemoryInput) -> Result<(), MemoryPortError>;
 
+    /// Resets all Memory derived from a conversation before canonical messages
+    /// and artifacts are destroyed. The default keeps helper-owned conversation
+    /// services isolated from the application Memory lifecycle.
+    async fn on_conversation_reset(&self, _user_id: &str, _conversation_id: &str) -> Result<(), MemoryPortError> {
+        Ok(())
+    }
+
     /// Returns only a canonical, code-owned historical block. Callers validate the
     /// envelope and degrade to the unchanged user prompt on any invalid response.
     async fn build_recall_block(&self, input: RecallMemoryInput) -> Result<Option<String>, MemoryPortError>;
