@@ -4,15 +4,26 @@ use sha2::{Digest, Sha256};
 
 use crate::DbError;
 use crate::models::{
-    ConversationMemoryPolicyRow, ConversationMemoryRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow, MemoryEntryRow,
-    MemoryImportStateRow, MemoryJobHealthRow, MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow, MemorySettingsRow,
-    MessageRow,
+    ConversationMemoryPolicyRow, ConversationMemoryRow, ConversationRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow,
+    MemoryEntryRow, MemoryImportStateRow, MemoryJobHealthRow, MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow,
+    MemorySettingsRow, MessageRow,
 };
 
 /// Maximum accepted messages in one bounded Memory evidence batch.
 pub const MEMORY_EVIDENCE_MAX_MESSAGES: usize = 128;
 /// Maximum accepted UTF-8 content bytes in one bounded Memory evidence batch.
 pub const MEMORY_EVIDENCE_MAX_BYTES: usize = 64 * 1024;
+pub const MEMORY_SUMMARY_SELECTION_PREFIX: &str = "memory-summary:";
+
+pub fn memory_summary_selection_id(conversation_id: &str) -> String {
+    format!("{MEMORY_SUMMARY_SELECTION_PREFIX}{conversation_id}")
+}
+
+pub fn memory_summary_conversation_id(selection_id: &str) -> Option<&str> {
+    selection_id
+        .strip_prefix(MEMORY_SUMMARY_SELECTION_PREFIX)
+        .filter(|value| !value.is_empty())
+}
 
 /// Canonical message families that may contribute text to Memory evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,6 +403,39 @@ pub struct MemoryCandidateQueryRow {
     pub limit: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryRetrievalItemRow {
+    Entry(MemoryEntryRow),
+    ConversationSummary(ConversationMemoryRow),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateMemoryRetrievalSnapshotRow {
+    pub retrieval: MemoryRetrievalRow,
+    pub expected_policy: EffectiveMemoryPolicyRow,
+    pub expected_conversation_updated_at: TimestampMs,
+    pub items: Vec<MemoryRetrievalItemRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumeMemoryRetrievalSnapshotRow {
+    pub user_id: String,
+    pub conversation_id: String,
+    pub retrieval_id: String,
+    pub prompt_hash: String,
+    pub retrieval_version: String,
+    pub expected_budget_tokens: i64,
+    pub now: TimestampMs,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryRetrievalSnapshotRow {
+    pub retrieval: MemoryRetrievalRow,
+    pub policy: EffectiveMemoryPolicyRow,
+    pub conversation: ConversationRow,
+    pub items: Vec<MemoryRetrievalItemRow>,
+}
+
 #[async_trait::async_trait]
 pub trait IMemoryRepository: Send + Sync {
     async fn get_settings(&self, user_id: &str) -> Result<MemorySettingsRow, DbError>;
@@ -479,6 +523,7 @@ pub trait IMemoryRepository: Send + Sync {
     ) -> Result<(), DbError>;
     async fn clear_memory(&self, user_id: &str, now: TimestampMs) -> Result<(), DbError>;
     async fn retrieval_candidates(&self, query: MemoryCandidateQueryRow) -> Result<Vec<MemoryEntryRow>, DbError>;
+    async fn retrieval_summaries(&self, query: MemoryCandidateQueryRow) -> Result<Vec<ConversationMemoryRow>, DbError>;
     async fn reconciliation_entries(
         &self,
         user_id: &str,
@@ -486,6 +531,14 @@ pub trait IMemoryRepository: Send + Sync {
         target_ids: &[String],
     ) -> Result<Vec<MemoryEntryRow>, DbError>;
     async fn create_retrieval(&self, retrieval: MemoryRetrievalRow) -> Result<MemoryRetrievalRow, DbError>;
+    async fn create_retrieval_snapshot(
+        &self,
+        input: CreateMemoryRetrievalSnapshotRow,
+    ) -> Result<MemoryRetrievalRow, DbError>;
+    async fn consume_retrieval_snapshot(
+        &self,
+        input: ConsumeMemoryRetrievalSnapshotRow,
+    ) -> Result<MemoryRetrievalSnapshotRow, DbError>;
     async fn get_retrieval(&self, user_id: &str, retrieval_id: &str) -> Result<Option<MemoryRetrievalRow>, DbError>;
     async fn delete_expired_retrievals(&self, now: TimestampMs) -> Result<u64, DbError>;
     async fn get_import_state(&self, user_id: &str) -> Result<Option<MemoryImportStateRow>, DbError>;

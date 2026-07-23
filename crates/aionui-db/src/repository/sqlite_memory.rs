@@ -18,13 +18,15 @@ use crate::models::{
 };
 use crate::repository::memory::{
     BoundedMemoryTurnMessagesRow, ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition,
-    CommitMemorySourceRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow,
-    FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, IMemoryRepository, MEMORY_EVIDENCE_MAX_BYTES,
-    MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow, MemoryChangeSetQueryRow, MemoryEntryQueryRow,
-    MemoryReconciliationSnapshotRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, ResolveMemoryConflictActionRow,
-    ResolveMemoryConflictRow, SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow,
-    UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow, UpdateMemoryLifecycleRow, UpdateMemorySettingsRow,
-    derive_memory_fingerprint, memory_entry_content_hash, memory_evidence_content,
+    CommitMemorySourceRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, ConsumeMemoryRetrievalSnapshotRow,
+    CreateMemoryRetrievalSnapshotRow, EnqueueMemoryTurnRow, FinalizeMemoryJobSnapshotResult,
+    FinalizeMemoryJobSnapshotRow, IMemoryRepository, MEMORY_EVIDENCE_MAX_BYTES, MEMORY_EVIDENCE_MAX_MESSAGES,
+    MemoryCandidateQueryRow, MemoryChangeSetQueryRow, MemoryEntryQueryRow, MemoryReconciliationSnapshotRow,
+    MemoryRetrievalItemRow, MemoryRetrievalSnapshotRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow,
+    ResolveMemoryConflictActionRow, ResolveMemoryConflictRow, SplitMemoryJobRow, TransitionMemoryJobRow,
+    UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow,
+    UpdateMemoryLifecycleRow, UpdateMemorySettingsRow, derive_memory_fingerprint, memory_entry_content_hash,
+    memory_evidence_content, memory_summary_conversation_id, memory_summary_selection_id,
 };
 
 const MAX_MEMORY_CANDIDATES: u32 = 200;
@@ -84,6 +86,8 @@ struct QueueTransition<'a> {
     increment_invalid_output: bool,
     now: TimestampMs,
 }
+
+type MemoryPolicyTuple = (Option<bool>, Option<bool>, Option<i64>, i64);
 
 #[derive(Clone, Debug)]
 pub struct SqliteMemoryRepository {
@@ -814,6 +818,77 @@ impl SqliteMemoryRepository {
         Ok(())
     }
 
+    async fn effective_policy_on(
+        connection: &mut SqliteConnection,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<EffectiveMemoryPolicyRow, DbError> {
+        Self::ensure_conversation_on(connection, user_id, conversation_id).await?;
+        sqlx::query("INSERT INTO memory_settings (user_id,updated_at) VALUES (?,0) ON CONFLICT(user_id) DO NOTHING")
+            .bind(user_id)
+            .execute(&mut *connection)
+            .await?;
+        let settings: MemorySettingsRow = sqlx::query_as("SELECT * FROM memory_settings WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(&mut *connection)
+            .await?;
+        let policy: Option<MemoryPolicyTuple> = sqlx::query_as(
+            "SELECT capture_enabled,recall_enabled,reset_at,lifecycle_epoch
+             FROM conversation_memory_policies WHERE user_id = ? AND conversation_id = ?",
+        )
+        .bind(user_id)
+        .bind(conversation_id)
+        .fetch_optional(&mut *connection)
+        .await?;
+        let (capture_override, recall_override, conversation_reset, conversation_epoch) =
+            policy.unwrap_or((None, None, None, 0));
+        Ok(EffectiveMemoryPolicyRow {
+            user_id: user_id.into(),
+            conversation_id: conversation_id.into(),
+            enabled: settings.enabled,
+            capture_enabled: capture_override.unwrap_or(settings.default_capture),
+            recall_enabled: recall_override.unwrap_or(settings.default_recall),
+            capture_override,
+            recall_override,
+            consent_version: settings.consent_version,
+            consented_at: settings.consented_at,
+            reset_at: match (settings.reset_at, conversation_reset) {
+                (Some(global), Some(conversation)) => Some(global.max(conversation)),
+                (global, conversation) => global.or(conversation),
+            },
+            global_epoch: settings.lifecycle_epoch,
+            conversation_epoch,
+        })
+    }
+
+    async fn retrieval_item_on(
+        connection: &mut SqliteConnection,
+        user_id: &str,
+        selection_id: &str,
+    ) -> Result<Option<MemoryRetrievalItemRow>, DbError> {
+        if let Some(conversation_id) = memory_summary_conversation_id(selection_id) {
+            return Ok(sqlx::query_as::<_, ConversationMemoryRow>(
+                "SELECT * FROM conversation_memories WHERE user_id = ? AND conversation_id = ?",
+            )
+            .bind(user_id)
+            .bind(conversation_id)
+            .fetch_optional(&mut *connection)
+            .await?
+            .map(MemoryRetrievalItemRow::ConversationSummary));
+        }
+        let row = sqlx::query_as::<_, MemoryEntryDbRow>("SELECT * FROM memory_entries WHERE id = ? AND user_id = ?")
+            .bind(selection_id)
+            .bind(user_id)
+            .fetch_optional(&mut *connection)
+            .await?;
+        match row {
+            Some(row) => Ok(Some(MemoryRetrievalItemRow::Entry(
+                Self::entry_with_sources_on(connection, row).await?,
+            ))),
+            None => Ok(None),
+        }
+    }
+
     #[cfg(test)]
     async fn count_jobs(&self, user_id: &str, conversation_id: &str, state: &str) -> Result<i64, DbError> {
         Ok(sqlx::query_scalar(
@@ -919,7 +994,7 @@ impl IMemoryRepository for SqliteMemoryRepository {
     ) -> Result<EffectiveMemoryPolicyRow, DbError> {
         self.ensure_conversation(user_id, conversation_id).await?;
         let settings = self.get_settings(user_id).await?;
-        let policy: Option<(Option<bool>, Option<bool>, Option<i64>, i64)> = sqlx::query_as(
+        let policy: Option<MemoryPolicyTuple> = sqlx::query_as(
             "SELECT capture_enabled, recall_enabled, reset_at, lifecycle_epoch
              FROM conversation_memory_policies WHERE user_id = ? AND conversation_id = ?",
         )
@@ -3212,6 +3287,30 @@ impl IMemoryRepository for SqliteMemoryRepository {
         self.entry_rows_with_sources(rows).await
     }
 
+    async fn retrieval_summaries(&self, query: MemoryCandidateQueryRow) -> Result<Vec<ConversationMemoryRow>, DbError> {
+        self.ensure_user(&query.user_id).await?;
+        Ok(sqlx::query_as(
+            "SELECT * FROM conversation_memories
+             WHERE user_id = ?
+               AND ((project_id IS NULL AND workspace_key IS NULL)
+                    OR (? IS NOT NULL AND project_id = ?)
+                    OR (? IS NOT NULL AND workspace_key = ?))
+             ORDER BY CASE WHEN project_id = ? THEN 0 WHEN workspace_key = ? THEN 1 ELSE 2 END,
+                      updated_at DESC,conversation_id
+             LIMIT ?",
+        )
+        .bind(&query.user_id)
+        .bind(&query.project_id)
+        .bind(&query.project_id)
+        .bind(&query.workspace_key)
+        .bind(&query.workspace_key)
+        .bind(&query.project_id)
+        .bind(&query.workspace_key)
+        .bind(query.limit.clamp(1, 16))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn reconciliation_entries(
         &self,
         user_id: &str,
@@ -3270,18 +3369,20 @@ impl IMemoryRepository for SqliteMemoryRepository {
     }
 
     async fn create_retrieval(&self, retrieval: MemoryRetrievalRow) -> Result<MemoryRetrievalRow, DbError> {
-        self.ensure_conversation(&retrieval.user_id, &retrieval.conversation_id)
-            .await?;
         let selected_ids: Vec<String> = serde_json::from_str(&retrieval.selected_ids_json)
             .map_err(|error| DbError::Conflict(format!("Invalid selected Memory IDs: {error}")))?;
-        for entry_id in selected_ids {
-            self.get_entry(&retrieval.user_id, &entry_id)
-                .await?
-                .ok_or_else(|| DbError::NotFound(format!("Memory entry '{entry_id}' not found")))?;
+        if selected_ids.len() > 64 {
+            return Err(DbError::Conflict("Invalid Memory retrieval selection count".into()));
         }
         let mut connection = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
         let result = async {
+            Self::ensure_conversation_on(&mut connection, &retrieval.user_id, &retrieval.conversation_id).await?;
+            for selection_id in &selected_ids {
+                Self::retrieval_item_on(&mut connection, &retrieval.user_id, selection_id)
+                    .await?
+                    .ok_or_else(|| DbError::NotFound(format!("Memory selection '{selection_id}' not found")))?;
+            }
             sqlx::query("DELETE FROM memory_retrievals WHERE expires_at <= ?")
                 .bind(retrieval.created_at)
                 .execute(&mut *connection)
@@ -3320,6 +3421,156 @@ impl IMemoryRepository for SqliteMemoryRepository {
         .await;
         match result {
             Ok(()) => Ok(retrieval),
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn create_retrieval_snapshot(
+        &self,
+        input: CreateMemoryRetrievalSnapshotRow,
+    ) -> Result<MemoryRetrievalRow, DbError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let result = async {
+            let conversation_updated_at: i64 =
+                sqlx::query_scalar("SELECT updated_at FROM conversations WHERE id = ? AND user_id = ?")
+                    .bind(&input.retrieval.conversation_id)
+                    .bind(&input.retrieval.user_id)
+                    .fetch_optional(&mut *connection)
+                    .await?
+                    .ok_or_else(|| DbError::NotFound("Memory retrieval conversation not found".into()))?;
+            let policy = Self::effective_policy_on(
+                &mut connection,
+                &input.retrieval.user_id,
+                &input.retrieval.conversation_id,
+            )
+            .await?;
+            if conversation_updated_at != input.expected_conversation_updated_at || policy != input.expected_policy {
+                return Err(DbError::Conflict("Memory retrieval snapshot changed".into()));
+            }
+            let selected_ids: Vec<String> = serde_json::from_str(&input.retrieval.selected_ids_json)
+                .map_err(|_| DbError::Conflict("Invalid Memory retrieval selections".into()))?;
+            if selected_ids.len() != input.items.len() || selected_ids.len() > 64 {
+                return Err(DbError::Conflict("Invalid Memory retrieval selection count".into()));
+            }
+            for (selection_id, expected) in selected_ids.iter().zip(&input.items) {
+                let expected_id = match expected {
+                    MemoryRetrievalItemRow::Entry(entry) => entry.id.clone(),
+                    MemoryRetrievalItemRow::ConversationSummary(summary) => {
+                        memory_summary_selection_id(&summary.conversation_id)
+                    }
+                };
+                if selection_id != &expected_id
+                    || Self::retrieval_item_on(&mut connection, &input.retrieval.user_id, selection_id).await?
+                        != Some(expected.clone())
+                {
+                    return Err(DbError::Conflict("Memory retrieval candidate changed".into()));
+                }
+            }
+            sqlx::query("DELETE FROM memory_retrievals WHERE expires_at <= ?")
+                .bind(input.retrieval.created_at)
+                .execute(&mut *connection)
+                .await?;
+            sqlx::query(
+                "DELETE FROM memory_retrievals
+                 WHERE user_id = ? AND conversation_id = ? AND prompt_hash = ? AND retrieval_version = ?",
+            )
+            .bind(&input.retrieval.user_id)
+            .bind(&input.retrieval.conversation_id)
+            .bind(&input.retrieval.prompt_hash)
+            .bind(&input.retrieval.retrieval_version)
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query(
+                "INSERT INTO memory_retrievals
+                    (id,user_id,conversation_id,prompt_hash,selected_ids_json,estimated_tokens,budget_tokens,
+                     retrieval_version,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            )
+            .bind(&input.retrieval.id)
+            .bind(&input.retrieval.user_id)
+            .bind(&input.retrieval.conversation_id)
+            .bind(&input.retrieval.prompt_hash)
+            .bind(&input.retrieval.selected_ids_json)
+            .bind(input.retrieval.estimated_tokens)
+            .bind(input.retrieval.budget_tokens)
+            .bind(&input.retrieval.retrieval_version)
+            .bind(input.retrieval.created_at)
+            .bind(input.retrieval.expires_at)
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query("COMMIT").execute(&mut *connection).await?;
+            Ok::<_, DbError>(input.retrieval)
+        }
+        .await;
+        match result {
+            Ok(row) => Ok(row),
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn consume_retrieval_snapshot(
+        &self,
+        input: ConsumeMemoryRetrievalSnapshotRow,
+    ) -> Result<MemoryRetrievalSnapshotRow, DbError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let result = async {
+            sqlx::query("DELETE FROM memory_retrievals WHERE expires_at <= ?")
+                .bind(input.now)
+                .execute(&mut *connection)
+                .await?;
+            let retrieval: MemoryRetrievalRow =
+                sqlx::query_as("SELECT * FROM memory_retrievals WHERE id = ? AND user_id = ?")
+                    .bind(&input.retrieval_id)
+                    .bind(&input.user_id)
+                    .fetch_optional(&mut *connection)
+                    .await?
+                    .ok_or_else(|| DbError::NotFound("Memory retrieval not found".into()))?;
+            if retrieval.conversation_id != input.conversation_id
+                || retrieval.prompt_hash != input.prompt_hash
+                || retrieval.retrieval_version != input.retrieval_version
+                || retrieval.budget_tokens != input.expected_budget_tokens
+                || retrieval.expires_at <= input.now
+            {
+                return Err(DbError::Conflict("Memory retrieval no longer matches".into()));
+            }
+            let policy = Self::effective_policy_on(&mut connection, &input.user_id, &input.conversation_id).await?;
+            if !policy.enabled || !policy.recall_enabled {
+                return Err(DbError::Conflict("Memory recall policy changed".into()));
+            }
+            let selected_ids: Vec<String> = serde_json::from_str(&retrieval.selected_ids_json)
+                .map_err(|_| DbError::Conflict("Invalid Memory retrieval selections".into()))?;
+            if selected_ids.len() > 64 {
+                return Err(DbError::Conflict("Invalid Memory retrieval selection count".into()));
+            }
+            let mut items = Vec::with_capacity(selected_ids.len());
+            for selection_id in selected_ids {
+                if let Some(item) = Self::retrieval_item_on(&mut connection, &input.user_id, &selection_id).await? {
+                    items.push(item);
+                }
+            }
+            let conversation = sqlx::query_as("SELECT * FROM conversations WHERE id = ? AND user_id = ?")
+                .bind(&input.conversation_id)
+                .bind(&input.user_id)
+                .fetch_one(&mut *connection)
+                .await?;
+            sqlx::query("COMMIT").execute(&mut *connection).await?;
+            Ok::<_, DbError>(MemoryRetrievalSnapshotRow {
+                retrieval,
+                policy,
+                conversation,
+                items,
+            })
+        }
+        .await;
+        match result {
+            Ok(snapshot) => Ok(snapshot),
             Err(error) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
                 Err(error)
@@ -3386,12 +3637,14 @@ mod tests {
     use crate::models::{ConversationRow, MemoryImportStateRow, MemoryRetrievalRow, MessageRow};
     use crate::repository::memory::{
         ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition, CommitMemorySourceRow,
-        CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow, ExpectedMemoryEntryRow,
+        CommitMemoryUpdateResult, CommitMemoryUpdateRow, ConsumeMemoryRetrievalSnapshotRow,
+        CreateMemoryRetrievalSnapshotRow, EnqueueMemoryTurnRow, ExpectedMemoryEntryRow,
         FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, MemoryCandidateQueryRow,
-        MemoryReconciliationSnapshotRow, MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow, RenewMemoryLeaseRow,
-        ResolveMemoryConflictActionRow, ResolveMemoryConflictRow, SplitMemoryJobRow, TransitionMemoryJobRow,
-        UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow,
-        UpdateMemorySettingsRow, derive_memory_fingerprint, memory_entry_content_hash,
+        MemoryReconciliationSnapshotRow, MemoryRetrievalItemRow, MemoryTurnSnapshotExpectationRow,
+        ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, ResolveMemoryConflictActionRow, ResolveMemoryConflictRow,
+        SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow,
+        UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow, UpdateMemorySettingsRow, derive_memory_fingerprint,
+        memory_entry_content_hash,
     };
     use crate::repository::{IConversationRepository, IMemoryRepository, SqliteConversationRepository};
     use crate::{DbError, init_database_memory};
@@ -6240,6 +6493,85 @@ mod tests {
         assert!(matches!(
             repo.get_retrieval(USER_B, "replacement").await,
             Err(DbError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_retrieval_snapshot_fences_candidate_policy_and_replacement_races() {
+        let (repo, conversations, db) = setup().await;
+        claimed_job(&repo, "job-retrieval-snapshot", "conv_a", "turn-1").await;
+        repo.commit_update(commit(
+            "job-retrieval-snapshot",
+            "conv_a",
+            "turn-1",
+            0,
+            vec![entry("snapshot-entry", "fp-snapshot", vec![source("conv_a", "turn-1")])],
+            20,
+        ))
+        .await
+        .unwrap();
+        let expected = repo.get_entry(USER_A, "snapshot-entry").await.unwrap().unwrap();
+        let policy = repo.effective_policy(USER_A, "conv_a2").await.unwrap();
+        let conversation_updated_at = conversations.get("conv_a2").await.unwrap().unwrap().updated_at;
+        let retrieval = MemoryRetrievalRow {
+            id: "snapshot-retrieval".into(),
+            user_id: USER_A.into(),
+            conversation_id: "conv_a2".into(),
+            prompt_hash: "prompt".into(),
+            selected_ids_json: r#"["snapshot-entry"]"#.into(),
+            estimated_tokens: 10,
+            budget_tokens: 2_000,
+            retrieval_version: "memory-retrieval-v1".into(),
+            created_at: 30,
+            expires_at: 630_000,
+        };
+        sqlx::query(
+            "UPDATE memory_entries SET content = 'changed',revision = revision + 1 WHERE id = 'snapshot-entry'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(matches!(
+            repo.create_retrieval_snapshot(CreateMemoryRetrievalSnapshotRow {
+                retrieval: retrieval.clone(),
+                expected_policy: policy.clone(),
+                expected_conversation_updated_at: conversation_updated_at,
+                items: vec![MemoryRetrievalItemRow::Entry(expected)],
+            })
+            .await,
+            Err(DbError::Conflict(_))
+        ));
+
+        let current = repo.get_entry(USER_A, "snapshot-entry").await.unwrap().unwrap();
+        repo.create_retrieval_snapshot(CreateMemoryRetrievalSnapshotRow {
+            retrieval: retrieval.clone(),
+            expected_policy: policy,
+            expected_conversation_updated_at: conversation_updated_at,
+            items: vec![MemoryRetrievalItemRow::Entry(current)],
+        })
+        .await
+        .unwrap();
+        repo.update_conversation_policy(UpdateConversationMemoryPolicyRow {
+            user_id: USER_A.into(),
+            conversation_id: "conv_a2".into(),
+            capture_enabled: None,
+            recall_enabled: Some(false),
+            now: 40,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            repo.consume_retrieval_snapshot(ConsumeMemoryRetrievalSnapshotRow {
+                user_id: USER_A.into(),
+                conversation_id: "conv_a2".into(),
+                retrieval_id: retrieval.id,
+                prompt_hash: "prompt".into(),
+                retrieval_version: "memory-retrieval-v1".into(),
+                expected_budget_tokens: 2_000,
+                now: 50,
+            })
+            .await,
+            Err(DbError::Conflict(_))
         ));
     }
 

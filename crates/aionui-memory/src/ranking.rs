@@ -3,6 +3,8 @@ use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use unicode_normalization::UnicodeNormalization;
 
+pub(crate) const MAX_SELECTED_ENTRIES: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RankingContext {
     pub project_id: Option<String>,
@@ -57,6 +59,9 @@ pub(crate) fn select_entries(
     let mut estimated_tokens = 0_u32;
     let mut entries = Vec::new();
     for scored in scored {
+        if entries.len() >= MAX_SELECTED_ENTRIES {
+            break;
+        }
         let Some(content) = scored.entry.content.as_deref() else {
             continue;
         };
@@ -180,7 +185,7 @@ fn kind_weight(kind: &str) -> i64 {
 mod tests {
     use aionui_db::models::{MemoryEntryRow, MemorySourceRow};
 
-    use super::{RankingContext, estimate_tokens, retrieval_budget, select_entries};
+    use super::{MAX_SELECTED_ENTRIES, RankingContext, estimate_tokens, retrieval_budget, select_entries};
 
     fn source(entry: &str, conversation: &str) -> MemorySourceRow {
         MemorySourceRow {
@@ -344,5 +349,14 @@ mod tests {
         assert_eq!(selected.entries.len(), 1);
         assert_eq!(selected.entries[0].id, "first");
         assert!(selected.estimated_tokens <= budget);
+    }
+
+    #[test]
+    fn selection_is_capped_at_the_shared_consume_limit() {
+        let candidates = (0..200)
+            .map(|index| entry(&format!("entry-{index:03}"), "needle"))
+            .collect();
+        let selected = select_entries("needle", candidates, &context(2_000));
+        assert_eq!(selected.entries.len(), MAX_SELECTED_ENTRIES);
     }
 }

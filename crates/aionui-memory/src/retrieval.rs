@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
-use aionui_api_types::{MemoryRetrievalEntrySummary, MemoryRetrievalPreview};
-use aionui_db::models::{ConversationRow, MemoryEntryRow, MemoryRetrievalRow};
+use aionui_api_types::{MemoryRetrievalEntrySummary, MemoryRetrievalPreview, MemorySummary};
+use aionui_db::memory_summary_selection_id;
+use aionui_db::models::{ConversationMemoryRow, ConversationRow, MemoryEntryRow, MemoryRetrievalRow, MemorySourceRow};
 use sha2::{Digest, Sha256};
 
 use crate::{MemoryError, library};
@@ -9,13 +10,67 @@ use crate::{MemoryError, library};
 pub(crate) const RETRIEVAL_POLICY_VERSION: &str = "memory-retrieval-v1";
 pub(crate) const RETRIEVAL_TTL_MS: i64 = 10 * 60 * 1_000;
 pub(crate) const MAX_RETRIEVAL_CANDIDATES: u32 = 200;
-pub(crate) const MAX_SELECTED_ENTRIES: usize = 64;
+pub(crate) const MAX_SUMMARY_CANDIDATES: u32 = 8;
+pub(crate) const MAX_SELECTED_SUMMARIES: usize = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RetrievalTarget {
     pub project_id: Option<String>,
     pub workspace_key: Option<String>,
-    pub context_capacity: Option<u32>,
+}
+
+pub(crate) fn summary_entry(row: &ConversationMemoryRow) -> Result<MemoryEntryRow, MemoryError> {
+    let summary: MemorySummary = serde_json::from_str(&row.summary_json).map_err(|_| MemoryError::Internal)?;
+    let mut parts = vec![format!("Goal: {}", summary.goal.trim())];
+    for (label, values) in [
+        ("Current state", summary.current_state),
+        ("Decisions", summary.decisions),
+        ("Artifacts", summary.artifacts),
+        ("Issues", summary.issues),
+        ("Next steps", summary.next_steps),
+        ("Work constraints", summary.work_constraints),
+    ] {
+        if !values.is_empty() {
+            parts.push(format!("{label}: {}", values.join("; ")));
+        }
+    }
+    let content = parts.join(" | ");
+    if content.trim().is_empty() || content.len() > 8_000 {
+        return Err(MemoryError::Internal);
+    }
+    let id = memory_summary_selection_id(&row.conversation_id);
+    Ok(MemoryEntryRow {
+        id: id.clone(),
+        user_id: row.user_id.clone(),
+        project_id: row.project_id.clone(),
+        workspace_key: row.workspace_key.clone(),
+        // A living summary is mapped to the existing Outcome kind because it
+        // describes the source conversation's achieved/current state. It is
+        // never written to memory_entries; its canonical source remains
+        // conversation_memories.
+        kind: "outcome".into(),
+        stable_key: format!("conversation-summary:{}", row.conversation_id),
+        fingerprint: id,
+        content: Some(content),
+        state: "active".into(),
+        pinned: false,
+        user_edited: false,
+        revision: row.revision,
+        supersedes_id: None,
+        conflict_group_id: None,
+        schema_version: row.schema_version,
+        deleted_at: None,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        sources: vec![MemorySourceRow {
+            memory_entry_id: memory_summary_selection_id(&row.conversation_id),
+            conversation_id: row.conversation_id.clone(),
+            turn_id: row.through_turn_id.clone(),
+            message_ids_json: "[]".into(),
+            first_observed_at: row.created_at,
+            last_observed_at: row.updated_at,
+        }],
+    })
 }
 
 impl RetrievalTarget {
@@ -24,9 +79,6 @@ impl RetrievalTarget {
         Self {
             project_id: string_field(&extra, &["project_id", "projectId"]),
             workspace_key: string_field(&extra, &["workspace_key", "workspaceKey", "workspace"]),
-            // Capacity must come from trusted runtime metadata. Conversation JSON is not
-            // authoritative for model limits, so an absent adapter uses the safe fallback.
-            context_capacity: None,
         }
     }
 }
@@ -111,7 +163,6 @@ mod tests {
             RetrievalTarget {
                 project_id: Some("project-1".into()),
                 workspace_key: Some("/work".into()),
-                context_capacity: None,
             }
         );
     }

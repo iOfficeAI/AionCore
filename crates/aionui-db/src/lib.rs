@@ -46,14 +46,15 @@ pub use repository::cron::{
 pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::memory::{
     BoundedMemoryTurnMessagesRow, ClaimMemoryJobRow, CommitMemoryEntryRow, CommitMemoryEntryTransition,
-    CommitMemorySourceRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, EnqueueMemoryTurnRow,
-    ExpectedMemoryEntryRow, FinalizeMemoryJobSnapshotResult, FinalizeMemoryJobSnapshotRow, MEMORY_EVIDENCE_MAX_BYTES,
-    MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow, MemoryChangeSetQueryRow, MemoryEntryQueryRow,
-    MemoryEvidenceMessageKind, MemoryReconciliationSnapshotRow, MemoryTurnSnapshotExpectationRow,
-    ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, ResolveMemoryConflictActionRow, ResolveMemoryConflictRow,
-    SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow,
+    CommitMemorySourceRow, CommitMemoryUpdateResult, CommitMemoryUpdateRow, ConsumeMemoryRetrievalSnapshotRow,
+    CreateMemoryRetrievalSnapshotRow, EnqueueMemoryTurnRow, ExpectedMemoryEntryRow, FinalizeMemoryJobSnapshotResult,
+    FinalizeMemoryJobSnapshotRow, MEMORY_EVIDENCE_MAX_BYTES, MEMORY_EVIDENCE_MAX_MESSAGES, MemoryCandidateQueryRow,
+    MemoryChangeSetQueryRow, MemoryEntryQueryRow, MemoryEvidenceMessageKind, MemoryReconciliationSnapshotRow,
+    MemoryRetrievalItemRow, MemoryRetrievalSnapshotRow, MemoryTurnSnapshotExpectationRow, ReleaseMemoryLeaseRow,
+    RenewMemoryLeaseRow, ResolveMemoryConflictActionRow, ResolveMemoryConflictRow, SplitMemoryJobRow,
+    TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow, UpdateConversationMemoryPolicyRow,
     UpdateMemoryEntryRow, UpdateMemoryLifecycleRow, UpdateMemorySettingsRow, derive_memory_fingerprint,
-    memory_entry_content_hash, memory_evidence_content,
+    memory_entry_content_hash, memory_evidence_content, memory_summary_conversation_id, memory_summary_selection_id,
 };
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
