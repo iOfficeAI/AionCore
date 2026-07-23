@@ -8,7 +8,7 @@ use aionui_db::{
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::{MemoryError, retrieval::RetrievalTarget, validation::sanitize_summary};
+use crate::{MemoryError, retrieval::ConversationScope, validation::sanitize_summary};
 
 const LEGACY_IMPORT_PAGE_SIZE: u32 = 32;
 const LEGACY_IMPORT_CURSOR_VERSION: u8 = 2;
@@ -178,7 +178,15 @@ pub(crate) async fn ensure_legacy_import(
         if policy.reset_at.is_some() {
             continue;
         }
-        let target = RetrievalTarget::from_conversation(row);
+        let Ok(target) = ConversationScope::from_conversation(row) else {
+            warn!(
+                user_id,
+                conversation_id = row.id,
+                status = "invalid_scope",
+                "Legacy Memory snapshot skipped"
+            );
+            continue;
+        };
         summaries.push(LegacyMemorySummaryRow {
             conversation_id: row.id.clone(),
             expected_updated_at: row.updated_at,
@@ -235,8 +243,8 @@ mod tests {
 
     fn extra(goal: &str, turn_id: &str) -> String {
         serde_json::json!({
-            "workspace": "/work/memory",
-            "project_id": "memory-project",
+            "workspace": r" \work\.\draft\..\memory\ ",
+            "projectId": " memory-project ",
             "context_handoff": {
                 "snapshot": {
                     "goal": goal,

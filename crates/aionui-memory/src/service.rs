@@ -36,8 +36,8 @@ use crate::{
     ranking::{MAX_SELECTED_ENTRIES, RankingContext, retrieval_budget, select_entries},
     reconciliation::Reconciler,
     retrieval::{
-        MAX_RETRIEVAL_CANDIDATES, MAX_SELECTED_SUMMARIES, MAX_SUMMARY_CANDIDATES, RETRIEVAL_POLICY_VERSION,
-        RETRIEVAL_TTL_MS, RetrievalTarget, preview_from_rows, prompt_hash, summary_entry,
+        ConversationScope, MAX_RETRIEVAL_CANDIDATES, MAX_SELECTED_SUMMARIES, MAX_SUMMARY_CANDIDATES,
+        RETRIEVAL_POLICY_VERSION, RETRIEVAL_TTL_MS, preview_from_rows, prompt_hash, summary_entry,
     },
     retrieval_context_port::UnknownRetrievalContext,
     sanitizer::{
@@ -229,7 +229,7 @@ impl MemoryService {
             .effective_policy(user_id, conversation_id)
             .await
             .map_err(map_db_error)?;
-        let target = RetrievalTarget::from_conversation(&conversation);
+        let target = ConversationScope::from_conversation(&conversation)?;
         let capacity = self
             .retrieval_context
             .context_capacity(user_id, conversation_id)
@@ -431,7 +431,7 @@ impl MemoryService {
             })
             .filter(|entry| !excluded.contains(&entry.id))
             .collect::<Vec<_>>();
-        let target = RetrievalTarget::from_conversation(&snapshot.conversation);
+        let target = ConversationScope::from_conversation(&snapshot.conversation)?;
         let budget_tokens: u32 = retrieval.budget_tokens.try_into().map_err(|_| MemoryError::Internal)?;
         let eligible = select_entries(
             prompt,
@@ -3829,6 +3829,89 @@ mod tests {
                 .await
                 .unwrap(),
             None,
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieval_includes_entries_in_canonicalized_conversation_scope() {
+        let fixture = fixture(true).await;
+        fixture
+            .conversations
+            .create(&conversation_with_id("source-conversation"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET extra = ? WHERE id = 'conversation-1'")
+            .bind(
+                serde_json::json!({
+                    "projectId": " project-alpha ",
+                    "workspace": r" C:\work\.\draft\..\alpha\ ",
+                })
+                .to_string(),
+            )
+            .execute(fixture._db.pool())
+            .await
+            .unwrap();
+        insert_retrieval_entry(
+            &fixture,
+            "scoped-entry",
+            "canonical scope needle",
+            "active",
+            "source-conversation",
+            aionui_common::now_ms(),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE memory_entries
+             SET project_id = NULL, workspace_key = 'C:/work/alpha'
+             WHERE id = 'scoped-entry'",
+        )
+        .execute(fixture._db.pool())
+        .await
+        .unwrap();
+
+        let preview = fixture
+            .service
+            .create_retrieval(USER_ID, "conversation-1", "canonical scope needle")
+            .await
+            .unwrap();
+        assert_eq!(
+            preview
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["scoped-entry"]
+        );
+        let block = fixture
+            .service
+            .build_recall_block(
+                USER_ID,
+                "conversation-1",
+                "canonical scope needle",
+                &preview.retrieval_id,
+                &[],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(block.contains("canonical scope needle"));
+    }
+
+    #[tokio::test]
+    async fn retrieval_rejects_invalid_canonical_project_instead_of_using_alias() {
+        let fixture = fixture(true).await;
+        sqlx::query("UPDATE conversations SET extra = ? WHERE id = 'conversation-1'")
+            .bind(r#"{"project_id":42,"projectId":"project-alpha"}"#)
+            .execute(fixture._db.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fixture
+                .service
+                .create_retrieval(USER_ID, "conversation-1", "anything")
+                .await,
+            Err(MemoryError::InvalidInput),
         );
     }
 

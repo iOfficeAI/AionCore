@@ -2,22 +2,20 @@ use std::collections::BTreeSet;
 
 use aionui_api_types::{MemoryRetrievalEntrySummary, MemoryRetrievalPreview, MemorySummary};
 use aionui_db::memory_summary_selection_id;
-use aionui_db::models::{ConversationMemoryRow, ConversationRow, MemoryEntryRow, MemoryRetrievalRow, MemorySourceRow};
+use aionui_db::models::{ConversationMemoryRow, MemoryEntryRow, MemoryRetrievalRow, MemorySourceRow};
 use sha2::{Digest, Sha256};
 
 use crate::{MemoryError, library};
+
+mod scope;
+
+pub(crate) use scope::ConversationScope;
 
 pub(crate) const RETRIEVAL_POLICY_VERSION: &str = "memory-retrieval-v1";
 pub(crate) const RETRIEVAL_TTL_MS: i64 = 10 * 60 * 1_000;
 pub(crate) const MAX_RETRIEVAL_CANDIDATES: u32 = 200;
 pub(crate) const MAX_SUMMARY_CANDIDATES: u32 = 8;
 pub(crate) const MAX_SELECTED_SUMMARIES: usize = 2;
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct RetrievalTarget {
-    pub project_id: Option<String>,
-    pub workspace_key: Option<String>,
-}
 
 pub(crate) fn summary_entry(row: &ConversationMemoryRow) -> Result<MemoryEntryRow, MemoryError> {
     let summary: MemorySummary = serde_json::from_str(&row.summary_json).map_err(|_| MemoryError::Internal)?;
@@ -73,16 +71,6 @@ pub(crate) fn summary_entry(row: &ConversationMemoryRow) -> Result<MemoryEntryRo
     })
 }
 
-impl RetrievalTarget {
-    pub(crate) fn from_conversation(row: &ConversationRow) -> Self {
-        let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_default();
-        Self {
-            project_id: string_field(&extra, &["project_id", "projectId"]),
-            workspace_key: string_field(&extra, &["workspace_key", "workspaceKey", "workspace"]),
-        }
-    }
-}
-
 pub(crate) fn prompt_hash(prompt: &str) -> String {
     format!("{:x}", Sha256::digest(prompt.as_bytes()))
 }
@@ -124,22 +112,11 @@ pub(crate) fn preview_from_rows(
     })
 }
 
-fn string_field(value: &serde_json::Value, names: &[&str]) -> Option<String> {
-    names.iter().find_map(|name| {
-        value
-            .get(name)
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && value.len() <= 2_000)
-            .map(str::to_owned)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use aionui_db::models::ConversationRow;
 
-    use super::{RETRIEVAL_TTL_MS, RetrievalTarget, prompt_hash};
+    use super::{ConversationScope, RETRIEVAL_TTL_MS, prompt_hash};
 
     #[test]
     fn target_uses_canonical_scope_but_never_untrusted_capacity_fields() {
@@ -148,7 +125,7 @@ mod tests {
             user_id: "user-1".into(),
             name: "Conversation".into(),
             r#type: "gemini".into(),
-            extra: r#"{"projectId":" project-1 ","workspace":"/work","contextCapacity":999999}"#.into(),
+            extra: r#"{"projectId":" project-1 ","workspace":" C:\\work\\.\\draft\\..\\memory\\ ","contextCapacity":999999}"#.into(),
             model: None,
             status: None,
             source: None,
@@ -159,10 +136,10 @@ mod tests {
             updated_at: 1,
         };
         assert_eq!(
-            RetrievalTarget::from_conversation(&row),
-            RetrievalTarget {
+            ConversationScope::from_conversation(&row).unwrap(),
+            ConversationScope {
                 project_id: Some("project-1".into()),
-                workspace_key: Some("/work".into()),
+                workspace_key: Some("C:/work/memory".into()),
             }
         );
     }

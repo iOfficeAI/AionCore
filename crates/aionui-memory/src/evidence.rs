@@ -1,20 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::{
+    MemoryError,
+    retrieval::ConversationScope,
+    sanitizer::{
+        MAX_EXISTING_ENTRIES, MAX_STRING_LENGTH, MAX_SUMMARY_BYTES, MAX_SUMMARY_ITEMS, sanitize_text,
+        strip_user_context_sentences,
+    },
+};
 use aionui_api_types::{
     ExistingMemoryEntryInput, MemoryEntryKind, MemorySourceMessageInput, MemorySourceMessageRole,
     MemorySourceTurnInput, MemorySummary, MemoryUpdateConversationInput, MemoryUpdateInput,
 };
 use aionui_db::memory_evidence_content;
 use aionui_db::models::{ConversationRow, MemoryEntryRow, MessageRow};
-use serde_json::Value;
-
-use crate::{
-    MemoryError,
-    sanitizer::{
-        MAX_EXISTING_ENTRIES, MAX_STRING_LENGTH, MAX_SUMMARY_BYTES, MAX_SUMMARY_ITEMS, sanitize_text,
-        strip_user_context_sentences,
-    },
-};
 
 pub use crate::sanitizer::{MAX_EVIDENCE_BYTES, MAX_EVIDENCE_MESSAGES, MAX_EVIDENCE_TURNS};
 
@@ -62,12 +61,6 @@ impl EvidenceBuilder {
     }
 }
 
-#[derive(Default)]
-struct ConversationScope {
-    project_id: Option<String>,
-    workspace_key: Option<String>,
-}
-
 fn selected_turn_ids(claimed_turn_ids: &[String]) -> Result<Vec<String>, MemoryError> {
     if claimed_turn_ids.iter().any(|turn_id| !valid_identifier(turn_id))
         || claimed_turn_ids.iter().collect::<BTreeSet<_>>().len() != claimed_turn_ids.len()
@@ -82,53 +75,7 @@ fn selected_turn_ids(claimed_turn_ids: &[String]) -> Result<Vec<String>, MemoryE
 }
 
 fn scope_from_conversation(conversation: &ConversationRow) -> Result<ConversationScope, MemoryError> {
-    let extra: Value = serde_json::from_str(&conversation.extra).map_err(|_| MemoryError::InvalidInput)?;
-    let object = extra.as_object().ok_or(MemoryError::InvalidInput)?;
-
-    let project_id = optional_metadata_string(object.get("project_id"))?;
-    let workspace_key = optional_metadata_string(object.get("workspace"))?
-        .map(normalize_workspace_key)
-        .transpose()?;
-
-    Ok(ConversationScope {
-        project_id,
-        workspace_key,
-    })
-}
-
-fn optional_metadata_string(value: Option<&Value>) -> Result<Option<String>, MemoryError> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) if valid_string(value) => Ok(Some(value.trim().to_owned())),
-        Some(_) => Err(MemoryError::InvalidInput),
-    }
-}
-
-fn normalize_workspace_key(workspace: String) -> Result<String, MemoryError> {
-    let mut components = Vec::new();
-    let absolute = workspace.starts_with('/') || workspace.starts_with('\\');
-    let normalized_separators = workspace.replace('\\', "/");
-    for component in normalized_separators.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                if components.pop().is_none() {
-                    return Err(MemoryError::InvalidInput);
-                }
-            }
-            component => components.push(component),
-        }
-    }
-    if components.is_empty() {
-        return Err(MemoryError::InvalidInput);
-    }
-    let normalized = components.join("/");
-    let normalized = if absolute { format!("/{normalized}") } else { normalized };
-    if valid_string(&normalized) {
-        Ok(normalized)
-    } else {
-        Err(MemoryError::InvalidInput)
-    }
+    ConversationScope::from_conversation(conversation)
 }
 
 fn source_turns_from_rows(
@@ -404,6 +351,59 @@ mod tests {
         }
         assert!(evidence.contains("[REDACTED]"));
         assert!(evidence.contains("Created /work/alpha/report.md"));
+    }
+
+    #[test]
+    fn canonicalizes_aliased_project_and_windows_workspace_scope() {
+        let output = EvidenceBuilder
+            .build(EvidenceBuildRequest {
+                conversation: conversation(json!({
+                    "projectId": " project-alpha ",
+                    "workspace": r" C:\work\.\draft\..\alpha\ ",
+                })),
+                messages: Vec::new(),
+                previous_summary: None,
+                summary_cursor: None,
+                claimed_turn_ids: Vec::new(),
+                existing_entries: Vec::new(),
+            })
+            .unwrap();
+
+        assert_eq!(output.conversation.project_id.as_deref(), Some("project-alpha"));
+        assert_eq!(output.conversation.workspace_key.as_deref(), Some("C:/work/alpha"));
+    }
+
+    #[test]
+    fn invalid_canonical_project_never_falls_back_to_alias() {
+        let result = EvidenceBuilder.build(EvidenceBuildRequest {
+            conversation: conversation(json!({
+                "project_id": 42,
+                "projectId": "project-alpha",
+            })),
+            messages: Vec::new(),
+            previous_summary: None,
+            summary_cursor: None,
+            claimed_turn_ids: Vec::new(),
+            existing_entries: Vec::new(),
+        });
+
+        assert_eq!(result.unwrap_err(), crate::MemoryError::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_workspace_parent_traversal_above_windows_drive_root() {
+        let result = EvidenceBuilder.build(EvidenceBuildRequest {
+            conversation: conversation(json!({
+                "workspace": r"C:\..\secret",
+            })),
+            messages: Vec::new(),
+            previous_summary: None,
+            summary_cursor: None,
+            claimed_turn_ids: Vec::new(),
+            existing_entries: Vec::new(),
+        });
+
+        assert_eq!(result.unwrap_err(), crate::MemoryError::InvalidInput);
     }
 
     #[test]
