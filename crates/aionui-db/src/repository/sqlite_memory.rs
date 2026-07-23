@@ -920,11 +920,17 @@ impl SqliteMemoryRepository {
         reset_at: Option<TimestampMs>,
     ) -> Result<Option<MemoryRetrievalItemRow>, DbError> {
         if let Some(conversation_id) = memory_summary_conversation_id(selection_id) {
+            if conversation_id == current_conversation_id {
+                return Ok(None);
+            }
             return Ok(sqlx::query_as::<_, ConversationMemoryRow>(
-                "SELECT * FROM conversation_memories WHERE user_id = ? AND conversation_id = ?",
+                "SELECT * FROM conversation_memories
+                 WHERE user_id = ? AND conversation_id = ? AND (? IS NULL OR updated_at >= ?)",
             )
             .bind(user_id)
             .bind(conversation_id)
+            .bind(reset_at)
+            .bind(reset_at)
             .fetch_optional(&mut *connection)
             .await?
             .map(MemoryRetrievalItemRow::ConversationSummary));
@@ -3322,6 +3328,12 @@ impl IMemoryRepository for SqliteMemoryRepository {
                AND ((project_id IS NULL AND workspace_key IS NULL)
                     OR (? IS NOT NULL AND project_id = ?)
                     OR (? IS NOT NULL AND workspace_key = ?))
+               AND EXISTS (
+                    SELECT 1 FROM memory_sources retrieval_source
+                    WHERE retrieval_source.memory_entry_id = memory_entries.id
+                      AND (? IS NULL OR retrieval_source.last_observed_at >= ?)
+                      AND (? IS NULL OR retrieval_source.conversation_id <> ?)
+               )
              ORDER BY
                CASE
                  WHEN project_id IS ? AND workspace_key IS ? THEN 0
@@ -3337,6 +3349,10 @@ impl IMemoryRepository for SqliteMemoryRepository {
         .bind(&query.project_id)
         .bind(&query.workspace_key)
         .bind(&query.workspace_key)
+        .bind(query.reset_at)
+        .bind(query.reset_at)
+        .bind(&query.current_conversation_id)
+        .bind(&query.current_conversation_id)
         .bind(&query.project_id)
         .bind(&query.workspace_key)
         .bind(&query.project_id)
@@ -3356,6 +3372,8 @@ impl IMemoryRepository for SqliteMemoryRepository {
                AND ((project_id IS NULL AND workspace_key IS NULL)
                     OR (? IS NOT NULL AND project_id = ?)
                     OR (? IS NOT NULL AND workspace_key = ?))
+               AND (? IS NULL OR updated_at >= ?)
+               AND (? IS NULL OR conversation_id <> ?)
              ORDER BY CASE
                         WHEN project_id IS ? AND workspace_key IS ? THEN 0
                         WHEN project_id = ? THEN 1
@@ -3370,6 +3388,10 @@ impl IMemoryRepository for SqliteMemoryRepository {
         .bind(&query.project_id)
         .bind(&query.workspace_key)
         .bind(&query.workspace_key)
+        .bind(query.reset_at)
+        .bind(query.reset_at)
+        .bind(&query.current_conversation_id)
+        .bind(&query.current_conversation_id)
         .bind(&query.project_id)
         .bind(&query.workspace_key)
         .bind(&query.project_id)
@@ -3659,7 +3681,7 @@ mod tests {
         ReleaseMemoryLeaseRow, RenewMemoryLeaseRow, ResolveMemoryConflictActionRow, ResolveMemoryConflictRow,
         SplitMemoryJobRow, TransitionMemoryJobRow, UpdateConversationMemoryLifecycleRow,
         UpdateConversationMemoryPolicyRow, UpdateMemoryEntryRow, UpdateMemorySettingsRow, derive_memory_fingerprint,
-        memory_entry_content_hash,
+        memory_entry_content_hash, memory_summary_selection_id,
     };
     use crate::repository::{IConversationRepository, IMemoryRepository, SqliteConversationRepository};
     use crate::{DbError, init_database_memory};
@@ -6506,6 +6528,15 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_sources
+                (memory_entry_id,conversation_id,turn_id,message_ids_json,first_observed_at,last_observed_at)
+             SELECT id,'conv_a','turn-' || id,'[]',updated_at,updated_at FROM memory_entries WHERE user_id = ?",
+        )
+        .bind(USER_A)
+        .execute(db.pool())
+        .await
+        .unwrap();
 
         let candidates = repo
             .retrieval_candidates(MemoryCandidateQueryRow {
@@ -6521,6 +6552,82 @@ mod tests {
         assert_eq!(candidates.len(), 200);
         assert_eq!(candidates[0].id, "exact-saturated");
         assert!(!candidates.iter().any(|entry| entry.id == "project-only-000"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_candidate_window_filters_current_only_and_pre_reset_sources_before_limit() {
+        let (repo, _, db) = setup().await;
+        for index in 0..200 {
+            sqlx::query(
+                "INSERT INTO memory_entries
+                    (id,user_id,project_id,workspace_key,kind,stable_key,fingerprint,content,state,pinned,user_edited,
+                     revision,schema_version,created_at,updated_at)
+                 VALUES (?,?,'project-1','workspace-1','issue',?,?,'needle','active',1,0,1,1,?,?)",
+            )
+            .bind(format!("ineligible-{index:03}"))
+            .bind(USER_A)
+            .bind(format!("ineligible-key-{index:03}"))
+            .bind(format!("ineligible-fingerprint-{index:03}"))
+            .bind(3_000 + index)
+            .bind(3_000 + index)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let (conversation_id, observed_at) = if index < 100 {
+                ("conv_a", 2_000 + index)
+            } else {
+                ("conv_a2", 100 + index)
+            };
+            sqlx::query(
+                "INSERT INTO memory_sources
+                    (memory_entry_id,conversation_id,turn_id,message_ids_json,first_observed_at,last_observed_at)
+                 VALUES (?,?,?,'[]',?,?)",
+            )
+            .bind(format!("ineligible-{index:03}"))
+            .bind(conversation_id)
+            .bind(format!("ineligible-turn-{index:03}"))
+            .bind(observed_at)
+            .bind(observed_at)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO memory_entries
+                (id,user_id,project_id,workspace_key,kind,stable_key,fingerprint,content,state,pinned,user_edited,
+                 revision,schema_version,created_at,updated_at)
+             VALUES ('eligible-beyond-window',?,'project-1','workspace-1','issue','eligible-key',
+                     'eligible-fingerprint','needle','active',0,0,1,1,1,1)",
+        )
+        .bind(USER_A)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_sources
+                (memory_entry_id,conversation_id,turn_id,message_ids_json,first_observed_at,last_observed_at)
+             VALUES ('eligible-beyond-window','conv_a2','eligible-turn','[]',2000,2000)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let candidates = repo
+            .retrieval_candidates(MemoryCandidateQueryRow {
+                user_id: USER_A.into(),
+                project_id: Some("project-1".into()),
+                workspace_key: Some("workspace-1".into()),
+                current_conversation_id: Some("conv_a".into()),
+                reset_at: Some(1_000),
+                limit: 200,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            candidates.iter().map(|entry| entry.id.as_str()).collect::<Vec<_>>(),
+            ["eligible-beyond-window"],
+        );
+        assert_eq!(candidates[0].sources[0].conversation_id, "conv_a2");
     }
 
     #[tokio::test]
@@ -6580,6 +6687,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_memory_summary_window_filters_ineligible_rows_before_limit_and_snapshot_lookup() {
+        let (repo, conversations, db) = setup().await;
+        sqlx::query(
+            "INSERT INTO conversation_memory_policies
+                (user_id,conversation_id,reset_at,lifecycle_epoch,updated_at) VALUES (?,'conv_a',1000,1,1000)",
+        )
+        .bind(USER_A)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_memories
+                (user_id,conversation_id,project_id,workspace_key,summary_json,through_turn_id,revision,source,
+                 schema_version,created_at,updated_at)
+             VALUES (?,'conv_a','project-1','workspace-1','{}','turn',1,'memory_update',1,1500,2000)",
+        )
+        .bind(USER_A)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for index in 0..8 {
+            let id = format!("stale-summary-{index}");
+            conversations.create(&conversation(&id, USER_A)).await.unwrap();
+            sqlx::query(
+                "INSERT INTO conversation_memories
+                    (user_id,conversation_id,project_id,workspace_key,summary_json,through_turn_id,revision,source,
+                     schema_version,created_at,updated_at)
+                 VALUES (?,?,'project-1','workspace-1','{}','turn',1,'memory_update',1,100,500)",
+            )
+            .bind(USER_A)
+            .bind(&id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        conversations
+            .create(&conversation("eligible-summary", USER_A))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_memories
+                (user_id,conversation_id,summary_json,through_turn_id,revision,source,schema_version,created_at,updated_at)
+             VALUES (?,'eligible-summary','{}','turn',1,'memory_update',1,1500,2000)",
+        )
+        .bind(USER_A)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let query = MemoryCandidateQueryRow {
+            user_id: USER_A.into(),
+            project_id: Some("project-1".into()),
+            workspace_key: Some("workspace-1".into()),
+            current_conversation_id: Some("conv_a".into()),
+            reset_at: Some(1_000),
+            limit: 8,
+        };
+        let summaries = repo.retrieval_summaries(query).await.unwrap();
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.conversation_id.as_str())
+                .collect::<Vec<_>>(),
+            ["eligible-summary"],
+        );
+
+        let policy = repo.effective_policy(USER_A, "conv_a").await.unwrap();
+        let conversation_updated_at = conversations.get("conv_a").await.unwrap().unwrap().updated_at;
+        let stale = sqlx::query_as("SELECT * FROM conversation_memories WHERE conversation_id = 'stale-summary-0'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let retrieval = |id: &str, selected_id: String| MemoryRetrievalRow {
+            id: id.into(),
+            user_id: USER_A.into(),
+            conversation_id: "conv_a".into(),
+            prompt_hash: "prompt".into(),
+            selected_ids_json: serde_json::to_string(&[selected_id]).unwrap(),
+            estimated_tokens: 10,
+            budget_tokens: 2_000,
+            retrieval_version: "memory-retrieval-v1".into(),
+            created_at: 2_001,
+            expires_at: 602_001,
+        };
+        assert!(matches!(
+            repo.create_retrieval_snapshot(CreateMemoryRetrievalSnapshotRow {
+                retrieval: retrieval(
+                    "stale-summary-retrieval",
+                    memory_summary_selection_id("stale-summary-0")
+                ),
+                expected_policy: policy.clone(),
+                expected_conversation_updated_at: conversation_updated_at,
+                items: vec![MemoryRetrievalItemRow::ConversationSummary(stale)],
+            })
+            .await,
+            Err(DbError::Conflict(_))
+        ));
+        let current = sqlx::query_as("SELECT * FROM conversation_memories WHERE conversation_id = 'conv_a'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.create_retrieval_snapshot(CreateMemoryRetrievalSnapshotRow {
+                retrieval: retrieval("current-summary-retrieval", memory_summary_selection_id("conv_a")),
+                expected_policy: policy.clone(),
+                expected_conversation_updated_at: conversation_updated_at,
+                items: vec![MemoryRetrievalItemRow::ConversationSummary(current)],
+            })
+            .await,
+            Err(DbError::Conflict(_))
+        ));
+
+        let eligible = summaries[0].clone();
+        let eligible_id = memory_summary_selection_id(&eligible.conversation_id);
+        let row = retrieval("eligible-summary-retrieval", eligible_id.clone());
+        repo.create_retrieval_snapshot(CreateMemoryRetrievalSnapshotRow {
+            retrieval: row.clone(),
+            expected_policy: policy,
+            expected_conversation_updated_at: conversation_updated_at,
+            items: vec![MemoryRetrievalItemRow::ConversationSummary(eligible.clone())],
+        })
+        .await
+        .unwrap();
+        let snapshot = repo
+            .consume_retrieval_snapshot(ConsumeMemoryRetrievalSnapshotRow {
+                user_id: USER_A.into(),
+                conversation_id: "conv_a".into(),
+                retrieval_id: row.id,
+                prompt_hash: row.prompt_hash,
+                retrieval_version: row.retrieval_version,
+                expected_budget_tokens: row.budget_tokens,
+                now: 2_002,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.items,
+            vec![MemoryRetrievalItemRow::ConversationSummary(eligible)]
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_memory_candidate_window_preserves_null_safe_one_dimension_exact_matches() {
         let (repo, _, db) = setup().await;
         for (prefix, project_id, workspace_key) in [
@@ -6616,6 +6865,15 @@ mod tests {
                      'active',0,0,1,1,1,1)",
         )
         .bind(USER_A)
+        .bind(USER_A)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_sources
+                (memory_entry_id,conversation_id,turn_id,message_ids_json,first_observed_at,last_observed_at)
+             SELECT id,'conv_a','turn-' || id,'[]',updated_at,updated_at FROM memory_entries WHERE user_id = ?",
+        )
         .bind(USER_A)
         .execute(db.pool())
         .await
