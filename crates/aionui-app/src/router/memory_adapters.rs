@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use aionui_api_types::AppOperationsModelHealth;
-use aionui_common::ProviderWithModel;
+use aionui_common::{OnConversationDelete, ProviderWithModel};
 use aionui_conversation::{
     CompletedTurnMemoryInput, ConversationMemoryPort, MemoryPortError,
     MemoryTurnOutcome as ConversationMemoryTurnOutcome, RecallMemoryInput,
@@ -42,6 +42,44 @@ pub(crate) struct ConversationMemoryAdapter {
 impl ConversationMemoryAdapter {
     pub(crate) fn new(service: Arc<MemoryService>) -> Self {
         Self { service }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct MemoryConversationDeleteAdapter {
+    service: Arc<MemoryService>,
+    conversations: Arc<dyn IConversationRepository>,
+}
+
+impl MemoryConversationDeleteAdapter {
+    pub(crate) fn new(service: Arc<MemoryService>, conversations: Arc<dyn IConversationRepository>) -> Self {
+        Self { service, conversations }
+    }
+}
+
+#[async_trait::async_trait]
+impl OnConversationDelete for MemoryConversationDeleteAdapter {
+    async fn on_conversation_deleted(&self, conversation_id: &str) {
+        let owner = match self.conversations.get(conversation_id).await {
+            Ok(Some(conversation)) => conversation.user_id,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    conversation_id,
+                    error = %error,
+                    "Memory conversation-delete owner lookup failed"
+                );
+                return;
+            }
+        };
+        if let Err(error) = self.service.forget_conversation(&owner, conversation_id).await {
+            tracing::warn!(
+                user_id = owner,
+                conversation_id,
+                error = %error,
+                "Memory conversation-delete cleanup failed"
+            );
+        }
     }
 }
 

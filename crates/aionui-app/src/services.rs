@@ -22,7 +22,8 @@ use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 use aionui_system::SettingsService;
 
 use crate::router::memory_adapters::{
-    ConversationMemoryAdapter, SettingsReadinessAdapter, TrustedRetrievalContextAdapter,
+    ConversationMemoryAdapter, MemoryConversationDeleteAdapter, SettingsReadinessAdapter,
+    TrustedRetrievalContextAdapter,
 };
 
 pub struct AppServices {
@@ -40,6 +41,7 @@ pub struct AppServices {
     pub conversation_service: ConversationService,
     pub memory_service: Arc<aionui_memory::MemoryService>,
     pub settings_service: SettingsService,
+    memory_delete_hook: Arc<dyn OnConversationDelete>,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -89,6 +91,7 @@ impl AppServices {
             conversation_runtime_state: self.conversation_runtime_state.clone(),
             conversation_repo: self.conversation_repo.clone(),
             task_manager_delete_hook: self.task_manager_delete_hook.clone(),
+            memory_delete_hook: self.memory_delete_hook.clone(),
             runtime_helper_bin: self.runtime_helper_bin.clone(),
             runtime_base_url: self.runtime_base_url.clone(),
             runtime_token_service: self.runtime_token_service.clone(),
@@ -168,6 +171,14 @@ impl AppServices {
                 provider_repo.clone(),
             ))),
         );
+        memory_service
+            .recover_expired_jobs()
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to recover expired Memory jobs: {error}"))?;
+        let memory_delete_hook: Arc<dyn OnConversationDelete> = Arc::new(MemoryConversationDeleteAdapter::new(
+            memory_service.clone(),
+            conversation_repo.clone(),
+        ));
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
 
         // Skill paths need app resource dir (for builtin rules) + data dir
@@ -226,6 +237,7 @@ impl AppServices {
             conversation_runtime_state: conversation_runtime_state.clone(),
             conversation_repo: conversation_repo.clone(),
             task_manager_delete_hook: Some(task_manager_delete_hook.clone()),
+            memory_delete_hook: memory_delete_hook.clone(),
             runtime_helper_bin: runtime_helper_bin.clone(),
             runtime_base_url: runtime_base_url.clone(),
             runtime_token_service: runtime_token_service.clone(),
@@ -247,6 +259,7 @@ impl AppServices {
             conversation_service,
             memory_service,
             settings_service,
+            memory_delete_hook,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
@@ -275,6 +288,7 @@ struct ConversationServiceDeps<'a> {
     conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     conversation_repo: Arc<dyn IConversationRepository>,
     task_manager_delete_hook: Option<Arc<dyn OnConversationDelete>>,
+    memory_delete_hook: Arc<dyn OnConversationDelete>,
     runtime_helper_bin: String,
     runtime_base_url: String,
     runtime_token_service: Arc<RuntimeTokenService>,
@@ -310,6 +324,7 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     if let Some(hook) = deps.task_manager_delete_hook {
         service.with_delete_hook(hook);
     }
+    service.with_delete_hook(deps.memory_delete_hook);
     service
 }
 
