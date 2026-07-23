@@ -1298,7 +1298,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(protected.pinned && protected.sources.is_empty());
+        assert_eq!(protected.state, "deleted");
+        assert_eq!(protected.content, None);
+        assert!(protected.sources.is_empty());
+        assert!(!protected.pinned && !protected.user_edited);
         assert!(
             memory
                 .effective_policy("system_default_user", "conversation-public")

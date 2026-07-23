@@ -3178,11 +3178,11 @@ impl IMemoryRepository for SqliteMemoryRepository {
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
         let result = async {
             Self::ensure_conversation_on(&mut connection, user_id, conversation_id).await?;
-            let exclusive_ids: Vec<String> = sqlx::query_scalar(
-                "SELECT entries.id FROM memory_entries entries
+            let exclusive_entries: Vec<(String, bool, bool)> = sqlx::query_as(
+                "SELECT DISTINCT entries.id, entries.pinned, entries.user_edited FROM memory_entries entries
                  JOIN memory_sources source ON source.memory_entry_id = entries.id
                  WHERE entries.user_id = ? AND source.conversation_id = ?
-                   AND entries.pinned = 0 AND entries.user_edited = 0 AND entries.state <> 'deleted'
+                   AND entries.state <> 'deleted'
                    AND NOT EXISTS (
                         SELECT 1 FROM memory_sources other_source
                         WHERE other_source.memory_entry_id = entries.id
@@ -3198,12 +3198,26 @@ impl IMemoryRepository for SqliteMemoryRepository {
                 .bind(conversation_id)
                 .execute(&mut *connection)
                 .await?;
-            for entry_id in exclusive_ids {
-                sqlx::query("DELETE FROM memory_entries WHERE id = ? AND user_id = ?")
+            for (entry_id, pinned, user_edited) in exclusive_entries {
+                if pinned || user_edited {
+                    sqlx::query(
+                        "UPDATE memory_entries SET content = NULL, state = 'deleted', pinned = 0, user_edited = 0,
+                         supersedes_id = NULL, conflict_group_id = NULL, revision = revision + 1,
+                         deleted_at = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+                    )
+                    .bind(now)
+                    .bind(now)
                     .bind(entry_id)
                     .bind(user_id)
                     .execute(&mut *connection)
                     .await?;
+                } else {
+                    sqlx::query("DELETE FROM memory_entries WHERE id = ? AND user_id = ?")
+                        .bind(entry_id)
+                        .bind(user_id)
+                        .execute(&mut *connection)
+                        .await?;
+                }
             }
             sqlx::query("DELETE FROM conversation_memories WHERE user_id = ? AND conversation_id = ?")
                 .bind(user_id)
@@ -5500,7 +5514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_memory_source_deletion_removes_exclusive_automatic_entries_only() {
+    async fn sqlite_memory_conversation_forget_removes_exclusive_content_and_preserves_shared_provenance() {
         let (repo, _, _db) = setup().await;
         claimed_job(&repo, "job-source", "conv_a", "turn-1").await;
         sqlx::query(
@@ -5529,9 +5543,33 @@ mod tests {
                     "fp-shared",
                     vec![source("conv_a", "turn-1"), source("conv_a2", "shared-turn")],
                 ),
+                entry(
+                    "protected-exclusive-pinned",
+                    "fp-protected-exclusive-pinned",
+                    vec![source("conv_a", "turn-1")],
+                ),
+                entry(
+                    "protected-exclusive-edited",
+                    "fp-protected-exclusive-edited",
+                    vec![source("conv_a", "turn-1")],
+                ),
+                entry(
+                    "protected-shared",
+                    "fp-protected-shared",
+                    vec![source("conv_a", "turn-1"), source("conv_a2", "shared-turn")],
+                ),
             ],
             20,
         ))
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE memory_entries
+             SET pinned = CASE WHEN id IN ('protected-exclusive-pinned', 'protected-shared') THEN 1 ELSE pinned END,
+                 user_edited = CASE WHEN id = 'protected-exclusive-edited' THEN 1 ELSE user_edited END
+             WHERE id IN ('protected-exclusive-pinned', 'protected-exclusive-edited', 'protected-shared')",
+        )
+        .execute(&repo.pool)
         .await
         .unwrap();
 
@@ -5546,6 +5584,21 @@ mod tests {
         let shared = repo.get_entry(USER_A, "shared").await.unwrap().unwrap();
         assert_eq!(shared.sources.len(), 1);
         assert_eq!(shared.sources[0].conversation_id, "conv_a2");
+        for entry_id in ["protected-exclusive-pinned", "protected-exclusive-edited"] {
+            let tombstone = repo.get_entry(USER_A, entry_id).await.unwrap().unwrap();
+            assert_eq!(tombstone.state, "deleted");
+            assert_eq!(tombstone.content, None);
+            assert!(tombstone.sources.is_empty());
+            assert!(!tombstone.pinned && !tombstone.user_edited);
+        }
+        let protected_shared = repo.get_entry(USER_A, "protected-shared").await.unwrap().unwrap();
+        assert_eq!(
+            protected_shared.content.as_deref(),
+            Some("content for protected-shared")
+        );
+        assert!(protected_shared.pinned);
+        assert_eq!(protected_shared.sources.len(), 1);
+        assert_eq!(protected_shared.sources[0].conversation_id, "conv_a2");
     }
 
     #[tokio::test]
