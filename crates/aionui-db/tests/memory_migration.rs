@@ -130,6 +130,61 @@ async fn migration_030_assigns_non_reusable_sequences_to_existing_and_new_conver
 }
 
 #[tokio::test]
+async fn migration_030_ddl_and_backfill_are_idempotent_when_reapplied() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 29).await;
+    sqlx::query(
+        "INSERT INTO users (id,username,email,password_hash,created_at,updated_at)
+         VALUES ('idempotent-user','idempotent-user','idempotent@example.com','',1,1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for id in ["idempotent-a", "idempotent-b"] {
+        sqlx::query(
+            "INSERT INTO conversations (id,user_id,name,type,extra,status,created_at,updated_at)
+             VALUES (?,'idempotent-user','Idempotent','acp','{}','finished',1,1)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let migration = include_str!("../migrations/030_memory_import_sequence.sql");
+    sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+    sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT conversation_id,sequence FROM conversation_memory_import_sequences
+         WHERE user_id = 'idempotent-user' ORDER BY sequence",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_ne!(rows[0].1, rows[1].1);
+    let previous_max = rows[1].1;
+    sqlx::query(
+        "INSERT INTO conversations (id,user_id,name,type,extra,status,created_at,updated_at)
+         VALUES ('idempotent-new','idempotent-user','New','acp','{}','finished',1,1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let new_sequence: i64 = sqlx::query_scalar(
+        "SELECT sequence FROM conversation_memory_import_sequences WHERE conversation_id = 'idempotent-new'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(new_sequence > previous_max);
+}
+
+#[tokio::test]
 async fn migration_029_creates_normalized_tables_constraints_and_required_indexes() {
     let database = aionui_db::init_database_memory().await.unwrap();
     let pool = database.pool();
