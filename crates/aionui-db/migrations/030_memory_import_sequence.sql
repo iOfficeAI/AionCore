@@ -42,9 +42,9 @@ WHERE memory_import_sequence_counter.singleton = 1
 ORDER BY conversations.rowid;
 
 UPDATE memory_import_sequence_counter
-SET next_sequence = COALESCE(
-    (SELECT MAX(sequence) + 1 FROM conversation_memory_import_sequences),
-    1
+SET next_sequence = MAX(
+    next_sequence,
+    COALESCE((SELECT MAX(sequence) + 1 FROM conversation_memory_import_sequences), 1)
 )
 WHERE singleton = 1;
 

@@ -167,7 +167,26 @@ async fn migration_030_ddl_and_backfill_are_idempotent_when_reapplied() {
     .unwrap();
     assert_eq!(rows.len(), 2);
     assert_ne!(rows[0].1, rows[1].1);
-    let previous_max = rows[1].1;
+    let deleted_high_watermark = rows[1].1;
+    let counter_before_delete: i64 =
+        sqlx::query_scalar("SELECT next_sequence FROM memory_import_sequence_counter WHERE singleton = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("DELETE FROM conversations WHERE id = ?")
+        .bind(&rows[1].0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+    let counter_after_reapply: i64 =
+        sqlx::query_scalar("SELECT next_sequence FROM memory_import_sequence_counter WHERE singleton = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(counter_after_reapply, counter_before_delete);
+    assert!(counter_after_reapply > deleted_high_watermark);
+
     sqlx::query(
         "INSERT INTO conversations (id,user_id,name,type,extra,status,created_at,updated_at)
          VALUES ('idempotent-new','idempotent-user','New','acp','{}','finished',1,1)",
@@ -181,7 +200,8 @@ async fn migration_030_ddl_and_backfill_are_idempotent_when_reapplied() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(new_sequence > previous_max);
+    assert_eq!(new_sequence, counter_after_reapply);
+    assert!(new_sequence > deleted_high_watermark);
 }
 
 #[tokio::test]
