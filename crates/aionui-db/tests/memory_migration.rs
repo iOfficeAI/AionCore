@@ -367,9 +367,19 @@ async fn migration_032_scrubs_legacy_tombstones_and_is_idempotent() {
     sqlx::query(
         "INSERT INTO memory_entries
             (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,
-             schema_version,deleted_at,created_at,updated_at)
+             schema_version,created_at,updated_at)
+         VALUES ('legacy-parent','tombstone-user','decision','parent','parent-fingerprint',
+                 'parent','active',0,0,1,1,1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_entries
+            (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,
+             supersedes_id,conflict_group_id,schema_version,deleted_at,created_at,updated_at)
          VALUES ('legacy-tombstone','tombstone-user','decision','legacy secret','legacy-fingerprint',
-                 NULL,'deleted',1,1,1,2,1,2)",
+                 NULL,'deleted',1,1,'legacy-parent','legacy-conflict',1,2,1,2)",
     )
     .execute(&pool)
     .await
@@ -387,15 +397,15 @@ async fn migration_032_scrubs_legacy_tombstones_and_is_idempotent() {
     sqlx::raw_sql(migration).execute(&pool).await.unwrap();
     sqlx::raw_sql(migration).execute(&pool).await.unwrap();
 
-    let scrubbed: (String, bool, bool, Option<String>, i64) = sqlx::query_as(
-        "SELECT stable_key,pinned,user_edited,content,
+    let scrubbed: (String, bool, bool, Option<String>, Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT stable_key,pinned,user_edited,content,supersedes_id,conflict_group_id,
                 (SELECT COUNT(*) FROM memory_sources WHERE memory_entry_id = memory_entries.id)
          FROM memory_entries WHERE id = 'legacy-tombstone'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(scrubbed, (String::new(), false, false, None, 0));
+    assert_eq!(scrubbed, (String::new(), false, false, None, None, None, 0));
 }
 
 #[tokio::test]
@@ -551,6 +561,12 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
         "INSERT INTO memory_entries
          (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,schema_version,deleted_at,created_at,updated_at)
          VALUES ('bad-deleted-edited','system_default_user','decision','','fp-bad-edited',NULL,'deleted',0,1,1,2,1,2)",
+        "INSERT INTO memory_entries
+         (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,supersedes_id,schema_version,deleted_at,created_at,updated_at)
+         VALUES ('bad-deleted-supersedes','system_default_user','decision','','fp-bad-supersedes',NULL,'deleted',0,0,'active-identity',1,2,1,2)",
+        "INSERT INTO memory_entries
+         (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,conflict_group_id,schema_version,deleted_at,created_at,updated_at)
+         VALUES ('bad-deleted-conflict','system_default_user','decision','','fp-bad-conflict',NULL,'deleted',0,0,'group',1,2,1,2)",
     ] {
         assert!(sqlx::query(statement).execute(pool).await.is_err(), "{statement}");
     }
@@ -562,6 +578,56 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
     .execute(pool)
     .await;
     assert!(deleted_source.is_err());
+
+    sqlx::query(
+        "INSERT INTO memory_entries
+         (id,user_id,kind,stable_key,fingerprint,content,state,pinned,user_edited,schema_version,created_at,updated_at)
+         VALUES ('transition-target','system_default_user','decision','transition-key','transition-fp',
+                 'transition-content','active',0,0,1,1,1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let malformed_transition = sqlx::query(
+        "UPDATE memory_entries
+         SET content = NULL,state = 'deleted',deleted_at = 2
+         WHERE id = 'transition-target'",
+    )
+    .execute(pool)
+    .await;
+    assert!(malformed_transition.is_err());
+
+    sqlx::query(
+        "INSERT INTO memory_sources
+            (memory_entry_id,conversation_id,turn_id,message_ids_json,first_observed_at,last_observed_at)
+         VALUES ('active-identity','conv-constraints','active-turn','[]',1,2)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let sourced_transition = sqlx::query(
+        "UPDATE memory_entries
+         SET stable_key = '',content = NULL,state = 'deleted',pinned = 0,user_edited = 0,
+             supersedes_id = NULL,conflict_group_id = NULL,deleted_at = 2
+         WHERE id = 'active-identity'",
+    )
+    .execute(pool)
+    .await;
+    assert!(sourced_transition.is_err());
+
+    let invalid_deleted_update =
+        sqlx::query("UPDATE memory_entries SET conflict_group_id = 'leak' WHERE id = 'deleted-identity'")
+            .execute(pool)
+            .await;
+    assert!(invalid_deleted_update.is_err());
+
+    let source_move = sqlx::query(
+        "UPDATE memory_sources SET memory_entry_id = 'deleted-identity'
+         WHERE memory_entry_id = 'active-identity' AND conversation_id = 'conv-constraints'",
+    )
+    .execute(pool)
+    .await;
+    assert!(source_move.is_err());
 
     let invalid_job_state = sqlx::query(
         "INSERT INTO memory_jobs

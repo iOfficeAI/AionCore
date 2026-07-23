@@ -7,9 +7,17 @@ WHERE memory_entry_id IN (
 UPDATE memory_entries
 SET stable_key = '',
     pinned = 0,
-    user_edited = 0
+    user_edited = 0,
+    supersedes_id = NULL,
+    conflict_group_id = NULL
 WHERE state = 'deleted'
-  AND (stable_key <> '' OR pinned <> 0 OR user_edited <> 0);
+  AND (
+    stable_key <> ''
+    OR pinned <> 0
+    OR user_edited <> 0
+    OR supersedes_id IS NOT NULL
+    OR conflict_group_id IS NOT NULL
+  );
 
 CREATE TRIGGER IF NOT EXISTS memory_entries_deleted_invariant_insert
 BEFORE INSERT ON memory_entries
@@ -19,6 +27,8 @@ WHEN NEW.state = 'deleted'
     OR NEW.content IS NOT NULL
     OR NEW.pinned <> 0
     OR NEW.user_edited <> 0
+    OR NEW.supersedes_id IS NOT NULL
+    OR NEW.conflict_group_id IS NOT NULL
     OR NEW.deleted_at IS NULL
  )
 BEGIN
@@ -33,6 +43,8 @@ WHEN NEW.state = 'deleted'
     OR NEW.content IS NOT NULL
     OR NEW.pinned <> 0
     OR NEW.user_edited <> 0
+    OR NEW.supersedes_id IS NOT NULL
+    OR NEW.conflict_group_id IS NOT NULL
     OR NEW.deleted_at IS NULL
     OR EXISTS (
         SELECT 1 FROM memory_sources WHERE memory_entry_id = OLD.id
