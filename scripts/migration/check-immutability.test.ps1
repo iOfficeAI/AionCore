@@ -98,7 +98,6 @@ function New-CaseRepo {
         Set-Content -LiteralPath "crates/aionui-db/migrations/manual_fixture.sql" -Value "-- auxiliary sql"
         Invoke-Native git add crates/aionui-db/migrations
         Invoke-Native git commit -q -m "seed migrations"
-        Invoke-Native git tag v1.0.0
         Invoke-Native git checkout -q -b feature
     } finally {
         Pop-Location
@@ -110,40 +109,30 @@ function New-CaseRepo {
 try {
     $modifiedRepo = New-CaseRepo "modified"
     Add-Content -LiteralPath (Join-Path $modifiedRepo "crates/aionui-db/migrations/001_initial_schema.sql") -Value "-- modified"
-    Invoke-InRepo $modifiedRepo 1 "Released migration files must not be modified or deleted" @{}
+    Invoke-InRepo $modifiedRepo 1 "Existing migration files from main must not be modified or deleted" @{ AIONCORE_MIGRATION_BASE_REF = "main" }
 
     $deletedRepo = New-CaseRepo "deleted"
     Remove-Item -LiteralPath (Join-Path $deletedRepo "crates/aionui-db/migrations/002_data_fix.sql")
-    Invoke-InRepo $deletedRepo 1 "Released migration files must not be modified or deleted" @{}
+    Invoke-InRepo $deletedRepo 1 "Existing migration files from main must not be modified or deleted" @{ AIONCORE_MIGRATION_BASE_REF = "main" }
 
     $auxiliaryRepo = New-CaseRepo "auxiliary"
     Add-Content -LiteralPath (Join-Path $auxiliaryRepo "crates/aionui-db/migrations/manual_fixture.sql") -Value "-- modified auxiliary sql"
-    Invoke-InRepo $auxiliaryRepo 1 "Released migration files must not be modified or deleted" @{}
+    Invoke-InRepo $auxiliaryRepo 1 "Existing migration files from main must not be modified or deleted" @{ AIONCORE_MIGRATION_BASE_REF = "main" }
 
     $addedRepo = New-CaseRepo "added"
     Set-Content -LiteralPath (Join-Path $addedRepo "crates/aionui-db/migrations/003_new_change.sql") -Value "-- 003 new migration"
-    Invoke-InRepo $addedRepo 0 "Migration immutability check passed" @{}
-
-    $unshippedRepo = New-CaseRepo "unshipped"
-    Set-Content -LiteralPath (Join-Path $unshippedRepo "crates/aionui-db/migrations/003_unshipped_change.sql") -Value "-- 003 unshipped migration"
-    Push-Location $unshippedRepo
-    try {
-        Invoke-Native git add crates/aionui-db/migrations/003_unshipped_change.sql
-        Invoke-Native git commit -q -m "add unshipped migration"
-        Invoke-Native git tag v1.1.0-rc.1
-        Invoke-Native git mv crates/aionui-db/migrations/003_unshipped_change.sql crates/aionui-db/migrations/004_unshipped_change.sql
-    } finally {
-        Pop-Location
-    }
-    Invoke-InRepo $unshippedRepo 0 "Migration immutability check passed" @{}
+    Invoke-InRepo $addedRepo 0 "Migration immutability check passed" @{ AIONCORE_MIGRATION_BASE_REF = "main" }
 
     $duplicateRepo = New-CaseRepo "duplicate"
     Set-Content -LiteralPath (Join-Path $duplicateRepo "crates/aionui-db/migrations/002_duplicate_change.sql") -Value "-- duplicate 002 migration"
-    Invoke-InRepo $duplicateRepo 1 "Duplicate database migration versions are not allowed" @{}
+    Invoke-InRepo $duplicateRepo 1 "Duplicate database migration versions are not allowed" @{ AIONCORE_MIGRATION_BASE_REF = "main" }
 
     $overrideRepo = New-CaseRepo "override"
     Add-Content -LiteralPath (Join-Path $overrideRepo "crates/aionui-db/migrations/001_initial_schema.sql") -Value "-- modified with explicit override"
-    Invoke-InRepo $overrideRepo 0 "skipping migration immutability check" @{ AIONCORE_ALLOW_MAIN_MIGRATION_EDIT = "1" }
+    Invoke-InRepo $overrideRepo 0 "skipping migration immutability check" @{
+        AIONCORE_MIGRATION_BASE_REF = "main"
+        AIONCORE_ALLOW_MAIN_MIGRATION_EDIT = "1"
+    }
 
     Write-Output "Migration immutability script tests passed"
 } finally {

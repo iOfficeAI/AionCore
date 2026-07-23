@@ -47,7 +47,6 @@ init_case_repo() {
         printf '%s\n' '-- auxiliary sql' > crates/aionui-db/migrations/manual_fixture.sql
         git add crates/aionui-db/migrations
         git commit -q -m "seed migrations"
-        git tag v1.0.0
         git checkout -q -b feature
     )
 
@@ -56,45 +55,32 @@ init_case_repo() {
 
 modified_repo="$(init_case_repo modified)"
 printf '%s\n' '-- modified' >> "$modified_repo/crates/aionui-db/migrations/001_initial_schema.sql"
-run_in_repo "$modified_repo" 1 "Released migration files must not be modified or deleted" \
-    bash "$script"
+run_in_repo "$modified_repo" 1 "Existing migration files from main must not be modified or deleted" \
+    env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
 
 deleted_repo="$(init_case_repo deleted)"
 rm "$deleted_repo/crates/aionui-db/migrations/002_data_fix.sql"
-run_in_repo "$deleted_repo" 1 "Released migration files must not be modified or deleted" \
-    bash "$script"
+run_in_repo "$deleted_repo" 1 "Existing migration files from main must not be modified or deleted" \
+    env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
 
 auxiliary_repo="$(init_case_repo auxiliary)"
 printf '%s\n' '-- modified auxiliary sql' >> "$auxiliary_repo/crates/aionui-db/migrations/manual_fixture.sql"
-run_in_repo "$auxiliary_repo" 1 "Released migration files must not be modified or deleted" \
-    bash "$script"
+run_in_repo "$auxiliary_repo" 1 "Existing migration files from main must not be modified or deleted" \
+    env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
 
 added_repo="$(init_case_repo added)"
 printf '%s\n' '-- 003 new migration' > "$added_repo/crates/aionui-db/migrations/003_new_change.sql"
 run_in_repo "$added_repo" 0 "Migration immutability check passed" \
-    bash "$script"
-
-unshipped_repo="$(init_case_repo unshipped)"
-printf '%s\n' '-- 003 unshipped migration' > "$unshipped_repo/crates/aionui-db/migrations/003_unshipped_change.sql"
-(
-    cd "$unshipped_repo"
-    git add crates/aionui-db/migrations/003_unshipped_change.sql
-    git commit -q -m "add unshipped migration"
-    git tag v1.1.0-rc.1
-    git mv crates/aionui-db/migrations/003_unshipped_change.sql \
-        crates/aionui-db/migrations/004_unshipped_change.sql
-)
-run_in_repo "$unshipped_repo" 0 "Migration immutability check passed" \
-    bash "$script"
+    env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
 
 duplicate_repo="$(init_case_repo duplicate)"
 printf '%s\n' '-- duplicate 002 migration' > "$duplicate_repo/crates/aionui-db/migrations/002_duplicate_change.sql"
 run_in_repo "$duplicate_repo" 1 "Duplicate database migration versions are not allowed" \
-    bash "$script"
+    env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
 
 override_repo="$(init_case_repo override)"
 printf '%s\n' '-- modified with explicit override' >> "$override_repo/crates/aionui-db/migrations/001_initial_schema.sql"
 run_in_repo "$override_repo" 0 "skipping migration immutability check" \
-    env AIONCORE_ALLOW_MAIN_MIGRATION_EDIT=1 bash "$script"
+    env AIONCORE_MIGRATION_BASE_REF=main AIONCORE_ALLOW_MAIN_MIGRATION_EDIT=1 bash "$script"
 
 echo "Migration immutability script tests passed"
