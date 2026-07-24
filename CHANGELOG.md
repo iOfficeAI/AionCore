@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.52](https://github.com/iOfficeAI/AionCore/compare/v0.1.51...v0.1.52) (2026-07-24)
+
+
+### Features
+
+* **project:** wire project-bind side branch into owner creation ([#676](https://github.com/iOfficeAI/AionCore/issues/676)) ([300c833](https://github.com/iOfficeAI/AionCore/commit/300c8339af25807913eec921b0221cf51e1db145))
+
+
+### Bug Fixes
+
+* **agent:** unify CLI probe pipeline with classified failures and adaptive slow-probe recheck ([#678](https://github.com/iOfficeAI/AionCore/issues/678)) ([67945d2](https://github.com/iOfficeAI/AionCore/commit/67945d2708c8829d99f6ab4aa92cd73bc51b2bcc))
+* **channel:** quiet WeChat poll log noise with state-transition logging and exponential backoff ([#683](https://github.com/iOfficeAI/AionCore/issues/683)) ([ea4da55](https://github.com/iOfficeAI/AionCore/commit/ea4da55a51138d76f0f539db65c165dd634a5517))
+* **process:** allow whitespace in workspace cwd segments ([#410](https://github.com/iOfficeAI/AionCore/issues/410) parity) ([#674](https://github.com/iOfficeAI/AionCore/issues/674)) ([c344b02](https://github.com/iOfficeAI/AionCore/commit/c344b028edf291b30d17d0a823bdab5ca74efe1f))
+* **session:** restore codex slash commands + recover dead resume anchors on the direct-CLI path ([#679](https://github.com/iOfficeAI/AionCore/issues/679)) ([7b60611](https://github.com/iOfficeAI/AionCore/commit/7b606113c36051d533f4463849060c4be8310552))
+* **team:** converge system/lifecycle wakes into a team run ([#680](https://github.com/iOfficeAI/AionCore/issues/680)) ([38facd7](https://github.com/iOfficeAI/AionCore/commit/38facd70868fe25135b01fd6e276dc816abddc05))
+
 ## [0.1.51](https://github.com/iOfficeAI/AionCore/compare/v0.1.50...v0.1.51) (2026-07-23)
 
 
