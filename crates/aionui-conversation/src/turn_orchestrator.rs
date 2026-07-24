@@ -222,7 +222,7 @@ impl ConversationTurnOrchestrator {
                 .map(str::trim)
                 .filter(|mode| !mode.is_empty())
             {
-                match apply_required_runtime_mode(&agent, mode).await {
+                match apply_required_runtime_mode(&agent, backend.as_deref(), mode).await {
                     Ok(()) => {
                         info!(
                             conversation_id = %input.conv_id,
@@ -564,8 +564,90 @@ fn terminal_is_auth_failure(outcome: &RelayOutcome) -> bool {
     )
 }
 
-async fn apply_required_runtime_mode(agent: &AgentInstance, mode: &str) -> Result<(), AgentError> {
-    agent.set_config_option("mode", mode).await?;
+/// codex's canonical full-access mode id (migration 021 / `full_auto_mode_id`,
+/// `aionui_common::enums`). What cron's forced full-auto — and a resumed full-access
+/// session — persist as `required_runtime_mode`.
+const CODEX_CANONICAL_FULL_ACCESS_MODE: &str = "agent-full-access";
+/// The LEGACY bare token codex's LIVE catalog actually advertises for the full-access
+/// tier (`:danger-full-access`→`full-access`, codex_conn `fill_discovery` /
+/// `profile_id_to_legacy_value`).
+const CODEX_LEGACY_FULL_ACCESS_MODE: &str = "full-access";
+
+/// ELECTRON-3Q0: align codex's persisted canonical full-access id to whatever the
+/// LIVE catalog exposes, mirroring what AcpAgentManager reconcile already does via
+/// `normalize_requested_mode_for_available_values`. codex persists the canonical
+/// `agent-full-access` (cron forces it for scheduled tasks) but codex's live catalog
+/// advertises the legacy bare token `full-access`, so the unnormalized apply hit
+/// `set_config_option`'s REJECT ("mode 'agent-full-access' is not one of the available
+/// modes") and failed every cron turn before the send.
+///
+/// Narrow by design (only the required-mode auto-apply path calls this): downgrade
+/// ONLY the canonical full-access id, ONLY when the live catalog lacks it but does
+/// carry the legacy token. Every other case returns the value unchanged — a live
+/// catalog that carries the canonical id keeps it, and a catalog with NO full-access
+/// tier at all leaves the value so `set_config_option` still REJECTs (never silently
+/// pick a weaker mode). Non-codex backends and non-full-access modes pass straight
+/// through. An empty catalog is left untouched too (set_config_option is permissive
+/// on an empty/not-yet-discovered catalog).
+fn normalize_required_mode_for_catalog(backend: Option<&str>, mode: &str, available_ids: &[String]) -> String {
+    if backend != Some("codex") || mode != CODEX_CANONICAL_FULL_ACCESS_MODE {
+        return mode.to_owned();
+    }
+    let has_canonical = available_ids.iter().any(|id| id == CODEX_CANONICAL_FULL_ACCESS_MODE);
+    let has_legacy = available_ids.iter().any(|id| id == CODEX_LEGACY_FULL_ACCESS_MODE);
+    if !has_canonical && has_legacy {
+        return CODEX_LEGACY_FULL_ACCESS_MODE.to_owned();
+    }
+    mode.to_owned()
+}
+
+/// Read the live mode-catalog ids for normalization. Only consulted when a codex
+/// canonical full-access id is being applied (see `resolve_required_runtime_mode`);
+/// a catalog read failure returns None so the caller falls back to the requested mode
+/// unnormalized (= pre-fix behavior).
+async fn live_mode_catalog_ids(agent: &AgentInstance) -> Option<Vec<String>> {
+    match agent.get_config_options().await {
+        Ok(resp) => Some(
+            resp.config_options
+                .into_iter()
+                .find(|opt| opt.id == "mode")
+                .map(|opt| opt.options.into_iter().map(|o| o.value).collect())
+                .unwrap_or_default(),
+        ),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "apply mode: live catalog read failed — applying the requested mode unnormalized"
+            );
+            None
+        }
+    }
+}
+
+/// Resolve the mode to actually apply. For codex's canonical full-access id, align it
+/// to the live catalog (ELECTRON-3Q0); every other backend/mode is returned verbatim
+/// without touching the catalog.
+async fn resolve_required_runtime_mode(agent: &AgentInstance, backend: Option<&str>, mode: &str) -> String {
+    if backend != Some("codex") || mode != CODEX_CANONICAL_FULL_ACCESS_MODE {
+        return mode.to_owned();
+    }
+    let Some(available_ids) = live_mode_catalog_ids(agent).await else {
+        return mode.to_owned();
+    };
+    let effective = normalize_required_mode_for_catalog(backend, mode, &available_ids);
+    if effective != mode {
+        info!(
+            requested = mode,
+            effective = %effective,
+            "apply mode: aligned codex canonical full-access to the live catalog (ELECTRON-3Q0)"
+        );
+    }
+    effective
+}
+
+async fn apply_required_runtime_mode(agent: &AgentInstance, backend: Option<&str>, mode: &str) -> Result<(), AgentError> {
+    let effective = resolve_required_runtime_mode(agent, backend, mode).await;
+    agent.set_config_option("mode", &effective).await?;
     Ok(())
 }
 
@@ -651,6 +733,73 @@ mod tests {
             },
             attempt: TurnAttemptSummary::default(),
         }
+    }
+
+    // ELECTRON-3Q0: cron forces codex's canonical full-access id (`agent-full-access`,
+    // `full_auto_mode_id`) but codex's LIVE catalog advertises the legacy bare token
+    // (`full-access`). The direct-CLI turn-time apply must align the two, mirroring
+    // AcpAgentManager reconcile — otherwise `set_config_option` REJECTs
+    // ("mode 'agent-full-access' is not one of the available modes") and every cron
+    // turn fails before the send.
+    #[test]
+    fn codex_canonical_full_access_downgrades_to_legacy_when_catalog_lacks_canonical() {
+        let ids = vec!["auto".to_string(), "full-access".to_string(), "read-only".to_string()];
+        assert_eq!(
+            normalize_required_mode_for_catalog(Some("codex"), "agent-full-access", &ids),
+            "full-access",
+            "canonical id absent but legacy present → downgrade so set_config_option accepts"
+        );
+    }
+
+    #[test]
+    fn codex_canonical_full_access_kept_when_catalog_has_it() {
+        let ids = vec!["auto".to_string(), "agent-full-access".to_string()];
+        assert_eq!(
+            normalize_required_mode_for_catalog(Some("codex"), "agent-full-access", &ids),
+            "agent-full-access",
+            "a live catalog that carries the canonical id keeps it verbatim"
+        );
+    }
+
+    #[test]
+    fn codex_full_access_left_for_local_reject_when_no_full_access_tier() {
+        // No full-access tier at all → leave the value so set_config_option still
+        // REJECTs; never silently pick a weaker mode.
+        let ids = vec!["auto".to_string(), "read-only".to_string()];
+        assert_eq!(
+            normalize_required_mode_for_catalog(Some("codex"), "agent-full-access", &ids),
+            "agent-full-access"
+        );
+    }
+
+    #[test]
+    fn non_full_access_required_mode_passes_through() {
+        let ids = vec!["auto".to_string(), "full-access".to_string()];
+        assert_eq!(
+            normalize_required_mode_for_catalog(Some("codex"), "auto", &ids),
+            "auto",
+            "only the canonical full-access id is normalized; other required modes pass through"
+        );
+    }
+
+    #[test]
+    fn non_codex_backend_never_normalized() {
+        let ids = vec!["full-access".to_string()];
+        assert_eq!(
+            normalize_required_mode_for_catalog(Some("claude"), "agent-full-access", &ids),
+            "agent-full-access",
+            "the codex canonical/legacy mapping must not touch other backends"
+        );
+    }
+
+    #[test]
+    fn empty_catalog_leaves_mode_unchanged() {
+        // An empty / not-yet-discovered catalog is permissive at set_config_option,
+        // so leave the requested value untouched here.
+        assert_eq!(
+            normalize_required_mode_for_catalog(Some("codex"), "agent-full-access", &[]),
+            "agent-full-access"
+        );
     }
 
     #[test]
