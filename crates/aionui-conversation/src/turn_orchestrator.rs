@@ -645,7 +645,11 @@ async fn resolve_required_runtime_mode(agent: &AgentInstance, backend: Option<&s
     effective
 }
 
-async fn apply_required_runtime_mode(agent: &AgentInstance, backend: Option<&str>, mode: &str) -> Result<(), AgentError> {
+async fn apply_required_runtime_mode(
+    agent: &AgentInstance,
+    backend: Option<&str>,
+    mode: &str,
+) -> Result<(), AgentError> {
     let effective = resolve_required_runtime_mode(agent, backend, mode).await;
     agent.set_config_option("mode", &effective).await?;
     Ok(())
