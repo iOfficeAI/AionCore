@@ -789,4 +789,48 @@ mod tests {
                 .is_some_and(|message| message.contains("wrapper broken"))
         );
     }
+
+    /// A previously-offline agent (stale probe verdict persisted) is restored
+    /// to online by a successful manual check — the self-rescue path (#675).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manual_check_restores_previously_offline_agent() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        let temp = tempfile::tempdir().unwrap();
+        let command = write_executable(temp.path(), "claude", "#!/bin/sh\nprintf 'claude 1.0.0\\n'\n");
+        let source_info = serde_json::json!({ "binary_name": command }).to_string();
+        repo.upsert(&upsert_builtin_claude_params("agent-restored-claude", &source_info))
+            .await
+            .unwrap();
+        repo.update_availability_snapshot(
+            "agent-restored-claude",
+            &aionui_db::UpdateAgentAvailabilitySnapshotParams {
+                last_check_status: Some("offline"),
+                last_check_kind: Some("startup"),
+                last_check_error_code: Some("version_probe_timeout"),
+                last_check_error_message: Some("version_probe_timeout@5000ms"),
+                last_check_guidance: None,
+                last_check_latency_ms: Some(5_000),
+                last_check_at: Some(1),
+                last_success_at: None,
+                last_failure_at: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        let registry = AgentRegistry::new(repo);
+        registry.hydrate().await.unwrap();
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let service = AgentAvailabilityService::new(registry, provider_repo);
+
+        let before = service.management_row_by_id("agent-restored-claude").await.unwrap();
+        assert_eq!(before.status, AgentManagementStatus::Offline);
+
+        let row = service.run_manual_health_check("agent-restored-claude").await.unwrap();
+        assert_eq!(row.status, AgentManagementStatus::Online);
+        assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Manual));
+        assert!(row.last_check_error_code.is_none());
+    }
 }
