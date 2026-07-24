@@ -558,9 +558,51 @@ pub fn codex_capabilities() -> Capabilities {
         // can_queue off steer here would be the MX-QUEUE-3 dead button.) Flips true
         // only when B5 wires Steer routing.
         accepts_proactive_input: false,
-        // #101: codex has no slash-command wire today — stays empty.
-        slash_commands: Vec::new(),
+        // #101: codex's app-server has no slash-command discovery wire (112 methods
+        // audited, none lists commands — samples/codex-cli/0.137.0/schema-full/
+        // ClientRequest.json). The legacy codex-acp bridge instead advertised a
+        // STATIC 6-command table and translated each to a native op at prompt time
+        // (zed-industries/codex-acp v0.14.0 thread.rs:2894 builtin_commands /
+        // :3252 handle_prompt). We replicate that table here; dispatch(Send)
+        // performs the same slash→native-op translation.
+        slash_commands: builtin_slash_commands(),
     }
+}
+
+/// The codex-acp bridge's static slash-command table, verbatim
+/// (zed-industries/codex-acp v0.14.0 src/thread.rs:2894-2924 `builtin_commands`;
+/// captured live: samples/codex-acp/0.14.0/freshmode.jsonl). codex itself has no
+/// command-discovery wire, so this is the authoritative catalog for the direct-CLI
+/// path — each entry is translated to its native app-server op in dispatch(Send)
+/// (`route_slash_command`).
+fn builtin_slash_commands() -> Vec<crate::capability::SlashCommandInfo> {
+    use crate::capability::SlashCommandInfo;
+    vec![
+        SlashCommandInfo {
+            name: "review".into(),
+            description: Some("Review my current changes and find issues".into()),
+        },
+        SlashCommandInfo {
+            name: "review-branch".into(),
+            description: Some("Review the code changes against a specific branch".into()),
+        },
+        SlashCommandInfo {
+            name: "review-commit".into(),
+            description: Some("Review the code changes introduced by a commit".into()),
+        },
+        SlashCommandInfo {
+            name: "init".into(),
+            description: Some("create an AGENTS.md file with instructions for Codex".into()),
+        },
+        SlashCommandInfo {
+            name: "compact".into(),
+            description: Some("summarize conversation to prevent hitting the context limit".into()),
+        },
+        SlashCommandInfo {
+            name: "logout".into(),
+            description: Some("logout of Codex".into()),
+        },
+    ]
 }
 
 /// Per-session codex handle. `&self`-concurrent (stdin write behind a Mutex).
@@ -1385,7 +1427,11 @@ async fn reader_task(
                                             SessionEvent::CatalogUpdated {
                                                 models,
                                                 modes,
-                                                slash_commands: Vec::new(),
+                                                // The static bridge-parity command table (codex has
+                                                // no discovery wire) — carried on the catalog event
+                                                // so the agent_metadata writeback + the frontend
+                                                // AvailableCommands push see it (ELECTRON-3PX).
+                                                slash_commands: builtin_slash_commands(),
                                             },
                                         );
                                     }
@@ -2327,7 +2373,25 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
 
     match item_type {
         "agentMessage" => {
-            // the final text already streamed via deltas; the bracket is the signal.
+            // A STREAMED agentMessage starts with `text:""` and arrives via
+            // item/agentMessage/delta — for it the bracket is the whole signal.
+            // But a PRE-FILLED agentMessage exists: the `review/start` verdict
+            // (item id `review_rollout_assistant`) carries its full `text` on
+            // item/started and NO deltas ever follow (live-verified:
+            // samples/codex-cli/0.144.1/review_start_uncommitted.jsonl). Emit the
+            // STARTED edge's initial text as a MessageDelta so a delta-less
+            // message is not silently dropped; started.text + subsequent deltas
+            // compose the same final text under both shapes. Only the started
+            // edge — the completed frame repeats the same text (double-emit).
+            if !completed
+                && let Some(text) = item.get("text").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                out.push(SessionEvent::MessageDelta {
+                    item_id: id.clone(),
+                    text: text.to_string(),
+                });
+            }
         }
         "commandExecution" | "mcpToolCall" | "dynamicToolCall" | "fileChange" | "webSearch" | "imageGeneration" => {
             if completed {
@@ -2866,6 +2930,47 @@ impl SessionBackend for CodexSessionBackend {
                         command: crate::capability::block_kind_name(bad),
                     });
                 }
+                // Bridge-parity slash routing (ELECTRON-3PX): the 6 advertised
+                // commands (builtin_slash_commands) translate to native ops the way
+                // the codex-acp bridge did in-process (v0.14.0 thread.rs:3252
+                // handle_prompt) — codex does NOT interpret slash text itself.
+                let route = route_slash_command(&content);
+
+                // /logout → account/logout. No turn lifecycle follows (bridge:
+                // auth.logout() then auth_required), so it is handled before the
+                // flight-check and returns NoTurn: no turn_gen bump, no
+                // turn_in_flight. The response still drains the pending queue via
+                // pending_sends → PromptAccepted; a Notice tells the user what
+                // happened (there is no other visible output).
+                if matches!(route, Some(SlashRoute::Logout)) {
+                    self.suspend
+                        .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
+                        .await?;
+                    let id = self.next_rpc_id();
+                    if let Some(cmid) = metadata.client_msg_id {
+                        self.pending_sends.lock().await.insert(id, cmid);
+                    }
+                    // params is `null` per schema (AccountLogoutParams: {"type":"null"},
+                    // samples/codex-cli/0.137.0/schema-full/ClientRequest.json).
+                    let frame = json!({
+                        "jsonrpc": "2.0", "id": id, "method": "account/logout", "params": Value::Null
+                    });
+                    self.write_frame(frame).await?;
+                    emit(
+                        &self.event_tx,
+                        &self.session_id,
+                        self.turn_gen.load(Ordering::SeqCst),
+                        SessionEvent::Notice {
+                            level: crate::event::NoticeLevel::Warning,
+                            message: "Logged out of Codex. New turns will require re-authentication.".into(),
+                        },
+                    );
+                    return Ok(CommandReceipt {
+                        accepted: true,
+                        admission: Admission::NoTurn,
+                        turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                    });
+                }
                 // 009 R1c: a flight-period Send (a turn is already active) must NOT
                 // open a second turn_gen. codex's app-server merges an overlapping
                 // input into the live turn under a SINGLE turnId (verified:
@@ -2873,6 +2978,8 @@ impl SessionBackend for CodexSessionBackend {
                 // + fetch_add would phantom-split one wire turn across two turn_gen
                 // buckets downstream (GROUP BY turn_gen). Mirror the Cancel arm's
                 // active_turn_id probe: accept as NoTurn, no frame, no fetch_add.
+                // (Slash commands during a live turn fold in as plain text — same
+                // merge semantics as any other flight-period input.)
                 if self.active_turn_id.lock().await.is_some() {
                     return Ok(CommandReceipt {
                         accepted: true,
@@ -2900,14 +3007,36 @@ impl SessionBackend for CodexSessionBackend {
                 // (that response is the "accepted" receipt; the conversation drains
                 // its pending queue on it). Only when the caller supplied a
                 // client_msg_id (otherwise there's nothing to correlate/drain).
+                // review/start's response is the same turn object and
+                // thread/compact/start's is `{}` — both drain identically (verified
+                // live: samples/codex-cli/0.144.1/review_start_uncommitted.jsonl +
+                // thread_compact.jsonl).
                 if let Some(cmid) = metadata.client_msg_id {
                     self.pending_sends.lock().await.insert(id, cmid);
                 }
+                // All three turn-flavored routes run a REAL wire turn on the thread
+                // (turn/started → items → turn/completed; verified live 0.144.1, files
+                // above), so the existing reader/FSM lifecycle applies unchanged.
+                let (method, params) = match route {
+                    None => ("turn/start", json!({ "threadId": tid, "input": build_input(&content) })),
+                    // /init → the bridge's canned AGENTS.md prompt as a normal turn
+                    // (bridge: Op::UserInput{INIT_COMMAND_PROMPT}).
+                    Some(SlashRoute::Init) => (
+                        "turn/start",
+                        json!({ "threadId": tid, "input": [{ "type": "text", "text": CODEX_INIT_PROMPT }] }),
+                    ),
+                    // /compact → thread/compact/start{threadId} (bridge: Op::Compact).
+                    Some(SlashRoute::Compact) => ("thread/compact/start", json!({ "threadId": tid })),
+                    // /review* → review/start{threadId, target} (bridge: Op::Review;
+                    // delivery omitted = inline on this thread, the bridge's behavior).
+                    Some(SlashRoute::Review(target)) => ("review/start", json!({ "threadId": tid, "target": target })),
+                    Some(SlashRoute::Logout) => unreachable!("handled above"),
+                };
                 let frame = json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "method": "turn/start",
-                    "params": { "threadId": tid, "input": build_input(&content) }
+                    "method": method,
+                    "params": params
                 });
                 self.write_frame(frame).await?;
                 let cur_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
@@ -3354,6 +3483,73 @@ impl SessionBackend for CodexSessionBackend {
 /// (`resource:true` → `Mention`). Audio/at_mention are not advertised in
 /// codex_capabilities, so dispatch (§C6, `BlockSet::allows`) rejects them before
 /// reaching here — the `_ => None` arm is a defensive belt-and-suspenders.
+/// The canned `/init` prompt, verbatim from the codex-acp bridge
+/// (zed-industries/codex-acp v0.14.0 src/prompt_for_init_command.md, wired at
+/// thread.rs:3255-3264 as `Op::UserInput{INIT_COMMAND_PROMPT}`).
+const CODEX_INIT_PROMPT: &str = include_str!("./codex_init_prompt.md");
+
+/// Where a Send's slash command routes (bridge parity, ELECTRON-3PX). codex has
+/// no slash-command wire of its own — the codex-acp bridge intercepted the 6
+/// advertised names in `handle_prompt` (v0.14.0 thread.rs:3252-3320) and mapped
+/// each to a native op; we replicate that mapping onto app-server JSON-RPC.
+#[derive(Debug, PartialEq)]
+enum SlashRoute {
+    /// `/init` → the canned AGENTS.md prompt as a normal `turn/start`.
+    Init,
+    /// `/compact` → `thread/compact/start{threadId}`.
+    Compact,
+    /// `/review [instructions]` / `/review-branch <b>` / `/review-commit <sha>`
+    /// → `review/start{threadId, target}`; payload = the wire `ReviewTarget`
+    /// (schema: samples/codex-cli/0.137.0/schema-full/ClientRequest.json).
+    Review(Value),
+    /// `/logout` → `account/logout` (no turn follows).
+    Logout,
+}
+
+/// Parse a leading slash command from the first Text block. Faithful port of the
+/// bridge's `extract_slash_command` (thread.rs:4195): the text must START with
+/// `/`, the name runs to the first whitespace, `rest` is the trimmed remainder.
+/// An unknown name (or `/review-branch`//`/review-commit` with no argument, per
+/// the bridge's `if !rest.is_empty()` guards) returns `None` → the text goes to
+/// codex verbatim as a plain turn, exactly like the bridge's `_ =>` arm.
+fn route_slash_command(content: &[ContentBlock]) -> Option<SlashRoute> {
+    let Some(ContentBlock::Text(text)) = content.first() else {
+        return None;
+    };
+    let stripped = text.strip_prefix('/')?;
+    let name_end = stripped
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(idx, _)| idx)
+        .unwrap_or(stripped.len());
+    let name = &stripped[..name_end];
+    if name.is_empty() {
+        return None;
+    }
+    let rest = stripped[name_end..].trim_start();
+    match name {
+        "compact" => Some(SlashRoute::Compact),
+        "init" => Some(SlashRoute::Init),
+        "review" => {
+            let instructions = rest.trim();
+            let target = if instructions.is_empty() {
+                json!({ "type": "uncommittedChanges" })
+            } else {
+                json!({ "type": "custom", "instructions": instructions })
+            };
+            Some(SlashRoute::Review(target))
+        }
+        "review-branch" if !rest.is_empty() => Some(SlashRoute::Review(
+            json!({ "type": "baseBranch", "branch": rest.trim() }),
+        )),
+        "review-commit" if !rest.is_empty() => {
+            Some(SlashRoute::Review(json!({ "type": "commit", "sha": rest.trim() })))
+        }
+        "logout" => Some(SlashRoute::Logout),
+        _ => None,
+    }
+}
+
 fn build_input(content: &[ContentBlock]) -> Vec<Value> {
     content
         .iter()
@@ -4100,6 +4296,49 @@ mod tests {
 
     // ===== notification → SessionEvent mapping (transport-agnostic fold) =====
 
+    #[test]
+    fn prefilled_agent_message_emits_text_streamed_one_does_not() {
+        // The review/start verdict is a PRE-FILLED agentMessage: full `text` on
+        // item/started, no deltas ever (live: samples/codex-cli/0.144.1/
+        // review_start_uncommitted.jsonl, id `review_rollout_assistant`). Its text
+        // must surface as a MessageDelta or the review verdict is silently lost.
+        let prefilled: Value = serde_json::from_str(
+            r#"{"item":{"type":"agentMessage","id":"review_rollout_assistant","text":"The change reverses the operator."},"threadId":"th1","turnId":"t1"}"#,
+        )
+        .unwrap();
+        let events = map_item(&prefilled, false);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SessionEvent::MessageDelta { text, .. } if text == "The change reverses the operator."
+            )),
+            "pre-filled agentMessage text must not be dropped, got: {events:?}"
+        );
+
+        // A STREAMED agentMessage starts empty (text carried by later deltas) —
+        // no MessageDelta from the started edge (double-emit guard).
+        let streamed: Value = serde_json::from_str(
+            r#"{"item":{"type":"agentMessage","id":"m1","text":""},"threadId":"th1","turnId":"t1"}"#,
+        )
+        .unwrap();
+        let events = map_item(&streamed, false);
+        assert!(
+            !events.iter().any(|e| matches!(e, SessionEvent::MessageDelta { .. })),
+            "empty started text must not emit, got: {events:?}"
+        );
+
+        // The COMPLETED frame repeats the same text — must not re-emit it.
+        let completed: Value = serde_json::from_str(
+            r#"{"item":{"type":"agentMessage","id":"review_rollout_assistant","text":"The change reverses the operator."},"threadId":"th1","turnId":"t1"}"#,
+        )
+        .unwrap();
+        let events = map_item(&completed, true);
+        assert!(
+            !events.iter().any(|e| matches!(e, SessionEvent::MessageDelta { .. })),
+            "completed frame must not double-emit, got: {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn full_codex_turn_maps_to_canonical_events() {
         // A realistic codex turn: thread/started → turn/started → item deltas →
@@ -4711,6 +4950,217 @@ mod tests {
         assert!(
             !written.contains("sendUserTurn"),
             "must NOT use the fictional sendUserTurn method"
+        );
+    }
+
+    /// Bridge-parity slash routing (ELECTRON-3PX): the parser is a faithful port
+    /// of codex-acp v0.14.0 `extract_slash_command` + `handle_prompt` match arms
+    /// (thread.rs:4195 / :3252) — including the "unknown or arg-less
+    /// review-branch/commit falls through as plain text" behavior.
+    #[test]
+    fn route_slash_command_maps_bridge_table() {
+        let text = |s: &str| vec![ContentBlock::Text(s.into())];
+        assert_eq!(route_slash_command(&text("/compact")), Some(SlashRoute::Compact));
+        assert_eq!(route_slash_command(&text("/init")), Some(SlashRoute::Init));
+        assert_eq!(route_slash_command(&text("/logout")), Some(SlashRoute::Logout));
+        assert_eq!(
+            route_slash_command(&text("/review")),
+            Some(SlashRoute::Review(json!({ "type": "uncommittedChanges" })))
+        );
+        assert_eq!(
+            route_slash_command(&text("/review focus on error handling")),
+            Some(SlashRoute::Review(
+                json!({ "type": "custom", "instructions": "focus on error handling" })
+            ))
+        );
+        assert_eq!(
+            route_slash_command(&text("/review-branch main")),
+            Some(SlashRoute::Review(json!({ "type": "baseBranch", "branch": "main" })))
+        );
+        assert_eq!(
+            route_slash_command(&text("/review-commit abc123")),
+            Some(SlashRoute::Review(json!({ "type": "commit", "sha": "abc123" })))
+        );
+        // Arg-less branch/commit reviews fall through as plain text (bridge guards).
+        assert_eq!(route_slash_command(&text("/review-branch")), None);
+        assert_eq!(route_slash_command(&text("/review-commit")), None);
+        // Unknown command / plain text / bare slash / non-text first block → None.
+        assert_eq!(route_slash_command(&text("/frobnicate now")), None);
+        assert_eq!(route_slash_command(&text("hello")), None);
+        assert_eq!(route_slash_command(&text("/")), None);
+        assert_eq!(route_slash_command(&[]), None);
+    }
+
+    /// #101/ELECTRON-3PX: codex advertises the bridge's static 6-command table
+    /// (codex-acp v0.14.0 thread.rs:2894 builtin_commands) so the in-session `/`
+    /// menu is no longer empty on the direct-CLI path.
+    #[test]
+    fn capabilities_advertise_bridge_slash_commands() {
+        let names: Vec<String> = codex_capabilities()
+            .slash_commands
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["review", "review-branch", "review-commit", "init", "compact", "logout"]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_slash_review_writes_review_start() {
+        // `/review` → review/start{threadId, target:{uncommittedChanges}} and runs
+        // as a REAL turn (Started + turn_gen bump) — the wire lifecycle is a normal
+        // turn/started→turn/completed (verified live:
+        // samples/codex-cli/0.144.1/review_start_uncommitted.jsonl).
+        let fake = fake_with_binding("th-77", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/review".into())],
+                metadata: super::super::types::CommandMeta::default(),
+            })
+            .await
+            .expect("accepted");
+        assert_eq!(receipt.admission, Admission::Started);
+        assert_eq!(receipt.turn_gen, 1);
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"review/start""#),
+            "wrote review/start, got: {written}"
+        );
+        assert!(
+            written.contains(r#""type":"uncommittedChanges""#),
+            "bare /review targets uncommitted changes, got: {written}"
+        );
+        assert!(
+            written.contains(r#""threadId":"th-77""#),
+            "carries the bound threadId, got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_slash_compact_writes_thread_compact_start() {
+        // `/compact` → thread/compact/start{threadId}; also a real wire turn
+        // (verified live: samples/codex-cli/0.144.1/thread_compact.jsonl).
+        let fake = fake_with_binding("th-77", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/compact".into())],
+                metadata: super::super::types::CommandMeta::default(),
+            })
+            .await
+            .expect("accepted");
+        assert_eq!(receipt.admission, Admission::Started);
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"thread/compact/start""#),
+            "wrote thread/compact/start, got: {written}"
+        );
+        assert!(
+            !written.contains(r#""input""#),
+            "compact carries no input payload, got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_slash_init_sends_canned_prompt_as_turn() {
+        // `/init` → a normal turn/start whose input is the bridge's canned
+        // AGENTS.md prompt (codex-acp v0.14.0 thread.rs:3255), NOT the literal
+        // "/init" text (codex would treat that as a prompt about a slash).
+        let fake = fake_with_binding("th-77", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/init".into())],
+                metadata: super::super::types::CommandMeta::default(),
+            })
+            .await
+            .expect("accepted");
+        assert_eq!(receipt.admission, Admission::Started);
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"turn/start""#),
+            "init rides a normal turn, got: {written}"
+        );
+        assert!(
+            written.contains("AGENTS.md"),
+            "carries the canned init prompt, got: {written}"
+        );
+        assert!(
+            !written.contains("/init"),
+            "the literal slash text must not reach codex, got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_slash_logout_writes_account_logout_noturn() {
+        use futures_util::StreamExt as _;
+        // `/logout` → account/logout{params:null}; NO turn lifecycle follows
+        // (bridge: auth.logout() then auth_required) → NoTurn, no turn_gen bump,
+        // and a user-visible Notice (there is no other output for this command).
+        let fake = fake_with_binding("th-77", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut events = backend.events();
+        let receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/logout".into())],
+                metadata: super::super::types::CommandMeta::default(),
+            })
+            .await
+            .expect("accepted");
+        assert_eq!(receipt.admission, Admission::NoTurn);
+        assert_eq!(receipt.turn_gen, 0, "no turn_gen bump for logout");
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"account/logout""#),
+            "wrote account/logout, got: {written}"
+        );
+        let notice = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::Notice { message, .. } = env.event {
+                    return Some(message);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        assert!(
+            notice.is_some_and(|m| m.contains("Logged out")),
+            "logout emits a user-visible Notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_unknown_slash_passes_through_as_plain_text() {
+        // Unknown slash names fall through verbatim (bridge `_ =>` arm) — never a
+        // rejection, never a silent drop.
+        let fake = fake_with_binding("th-77", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/frobnicate the widgets".into())],
+                metadata: super::super::types::CommandMeta::default(),
+            })
+            .await
+            .expect("accepted");
+        assert_eq!(receipt.admission, Admission::Started);
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"turn/start""#),
+            "unknown slash rides a normal turn, got: {written}"
+        );
+        assert!(
+            written.contains("/frobnicate the widgets"),
+            "text reaches codex verbatim, got: {written}"
         );
     }
 
