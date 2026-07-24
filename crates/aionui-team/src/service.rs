@@ -3,8 +3,8 @@ mod response_builder;
 pub(crate) mod spawn_support;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::{Arc, Weak};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock, Weak};
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::{
@@ -19,6 +19,7 @@ use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
     ITeamRepository, UpdateTeamParams,
 };
+use aionui_project::{ProjectService, canonical};
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
@@ -108,6 +109,9 @@ pub struct TeamSessionService {
     /// Per-team mutex serializing `ensure_session` so concurrent callers cannot
     /// race and start two sessions for the same team.
     ensure_session_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Project-bind side branch (optional). `None` → team binding is a no-op,
+    /// so team create/read behaves exactly as before.
+    project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
     /// Back-pointer used by [`TeamSession::spawn_agent`] to reach DB-facing
     /// orchestration without threading the service through every session method.
     /// Stored as `Weak` so the session map does not create a strong cycle with
@@ -186,6 +190,7 @@ impl TeamSessionService {
             sessions: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
+            project_service: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
         })
     }
@@ -198,6 +203,60 @@ impl TeamSessionService {
             self.provider_repo.clone(),
             self.conversation_port.clone(),
         )
+    }
+
+    /// Inject the project-bind service (project-bind side branch). When unset,
+    /// binding/backfill are no-ops.
+    pub fn with_project_service(&self, project_service: Arc<ProjectService>) {
+        if let Ok(mut guard) = self.project_service.write() {
+            *guard = Some(project_service);
+        }
+    }
+
+    /// Resolve a team workspace into `(project_id, folder_id)`. Best-effort:
+    /// missing service / empty workspace / bad URI / resolve error → `(None, None)`,
+    /// logged at `warn`. Never affects team create/read.
+    async fn resolve_binding_best_effort(&self, workspace: &str) -> (Option<String>, Option<String>) {
+        let project_service = self.project_service.read().ok().and_then(|guard| guard.clone());
+        let Some(project_service) = project_service else {
+            return (None, None);
+        };
+        if workspace.trim().is_empty() {
+            return (None, None);
+        }
+        let uri = match canonical::to_file_uri(Path::new(workspace)) {
+            Ok(uri) => uri,
+            Err(err) => {
+                warn!(error = err.code(), "team project bind skipped: bad workspace uri");
+                return (None, None);
+            }
+        };
+        match project_service.resolve_existing(uri).await {
+            Ok(out) => (Some(out.project.project_id), Some(out.folder.folder_id)),
+            Err(err) => {
+                warn!(error = err.code(), "team project bind skipped");
+                (None, None)
+            }
+        }
+    }
+
+    /// Lazily backfill `teams.project_id`/`folder_id` on read. Best-effort;
+    /// no-op when already bound, workspace empty, or service unset.
+    async fn backfill_team_binding_best_effort(&self, row: &TeamRow) {
+        if row.project_id.is_some() || row.workspace.trim().is_empty() {
+            return;
+        }
+        let (Some(project_id), Some(folder_id)) = self.resolve_binding_best_effort(&row.workspace).await else {
+            return;
+        };
+        let params = UpdateTeamParams {
+            project_id: Some(project_id),
+            folder_id: Some(folder_id),
+            ..Default::default()
+        };
+        if let Err(err) = self.repo.update_team(&row.id, &params).await {
+            warn!(team_id = %row.id, error = %err, "team project bind: backfill update failed");
+        }
     }
 
     async fn load_owned_team(&self, user_id: &str, team_id: &str) -> Result<Team, TeamError> {
@@ -311,6 +370,9 @@ impl TeamSessionService {
         let team_workspace = provisioned.team_workspace;
         let agents_json = serde_json::to_string(&agents)?;
 
+        // Project-bind side branch (best-effort; never affects team creation).
+        let (project_id, folder_id) = self.resolve_binding_best_effort(&team_workspace).await;
+
         let row = TeamRow {
             id: team_id.clone(),
             user_id: user_id.to_owned(),
@@ -323,6 +385,8 @@ impl TeamSessionService {
             agents_version: "1.0.1".into(),
             created_at: now,
             updated_at: now,
+            project_id,
+            folder_id,
         };
         self.repo.create_team(&row).await?;
 
@@ -372,7 +436,20 @@ impl TeamSessionService {
     }
 
     pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {
-        let team = self.load_owned_team(user_id, team_id).await?;
+        let row = self
+            .repo
+            .get_team(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+        if row.user_id != user_id {
+            return Err(TeamError::Forbidden(format!(
+                "team {team_id} is not owned by current user"
+            )));
+        }
+        // Project-bind side branch: lazily backfill binding only when a single
+        // team is opened (never during list_teams / lease renew).
+        self.backfill_team_binding_best_effort(&row).await;
+        let team = Team::from_row(&row)?;
         self.build_team_response(&team).await
     }
 
@@ -2837,6 +2914,8 @@ mod tests {
                 pinned_at: None,
                 created_at: now_ms(),
                 updated_at: now_ms(),
+                project_id: None,
+                folder_id: None,
             })
             .await
             .unwrap();
@@ -2859,6 +2938,8 @@ mod tests {
                 pinned_at: None,
                 created_at: now_ms(),
                 updated_at: now_ms(),
+                project_id: None,
+                folder_id: None,
             })
             .await
             .unwrap();

@@ -32,6 +32,10 @@ pub struct ConversationRow {
     pub pinned_at: Option<TimestampMs>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    /// Project binding (project-bind side branch); NULL until bound/backfilled.
+    pub project_id: Option<String>,
+    /// Workspace folder binding; NULL until bound/backfilled.
+    pub folder_id: Option<String>,
 }
 
 /// Row mapping for the `conversation_assistant_snapshots` table.

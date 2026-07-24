@@ -283,6 +283,12 @@ impl IConversationRepository for MockRepo {
         if let Some(updated_at) = updates.updated_at {
             row.updated_at = updated_at;
         }
+        if let Some(project_id) = &updates.project_id {
+            row.project_id = Some(project_id.clone());
+        }
+        if let Some(folder_id) = &updates.folder_id {
+            row.folder_id = Some(folder_id.clone());
+        }
         Ok(())
     }
 
@@ -1357,6 +1363,8 @@ async fn insert_conversation_with_type(repo: &Arc<MockRepo>, user_id: &str, agen
         pinned_at: None,
         created_at: 1,
         updated_at: 1,
+        project_id: None,
+        folder_id: None,
     };
     repo.create(&row).await.unwrap();
     row
@@ -1388,6 +1396,85 @@ async fn create_returns_conversation_with_defaults() {
     assert_eq!(events[0].data["action"], "created");
     assert_eq!(events[0].data["conversation_id"], resp.id);
     assert_eq!(events[0].data["source"], "aionui");
+}
+
+// ── Project-bind side branch tests ─────────────────────────────────
+
+async fn make_injected_project_service(temp_root: &std::path::Path) -> std::sync::Arc<aionui_project::ProjectService> {
+    // A real store on an in-memory DB; temp_root mirrors the app wiring
+    // (`work_dir/conversations`) so classification matches production. The
+    // Database handle is leaked so the shared in-memory pool outlives the test.
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let store: std::sync::Arc<dyn aionui_db::IProjectStore> =
+        std::sync::Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
+    std::mem::forget(db);
+    std::sync::Arc::new(aionui_project::ProjectService::new(
+        store,
+        temp_root.join("conversations"),
+    ))
+}
+
+#[tokio::test]
+async fn create_side_branch_backfills_project_binding_when_injected() {
+    let work_root = tempfile::tempdir().unwrap();
+    let (svc, _bc, repo, _task_mgr) = make_service_with_workspace_root(work_root.path().to_path_buf());
+    svc.with_project_service(make_injected_project_service(work_root.path()).await);
+
+    // Custom workspace outside temp_root → classified standard.
+    let ws = tempfile::tempdir().unwrap();
+    let mut req = make_create_req();
+    req.extra = json!({ "workspace": ws.path().to_string_lossy(), "backend": "claude" });
+
+    let resp = svc.create("user_1", req).await.unwrap();
+
+    let row = repo.get(&resp.id).await.unwrap().unwrap();
+    assert!(
+        row.project_id.is_some(),
+        "create side branch should backfill project_id"
+    );
+    assert!(row.folder_id.is_some(), "create side branch should backfill folder_id");
+    // The transitional workspace string must be untouched by the side branch.
+    assert_eq!(resp.extra["workspace"], ws.path().to_string_lossy().as_ref());
+}
+
+#[tokio::test]
+async fn create_without_project_service_leaves_binding_null() {
+    // Best-effort contract: no ProjectService injected → binding stays NULL and
+    // create still succeeds (the side branch is a pure no-op).
+    let (svc, _bc, repo, _task_mgr) = make_service();
+    let resp = svc.create("user_1", make_create_req()).await.unwrap();
+    let row = repo.get(&resp.id).await.unwrap().unwrap();
+    assert!(row.project_id.is_none());
+    assert!(row.folder_id.is_none());
+}
+
+#[tokio::test]
+async fn list_does_not_backfill_but_get_does() {
+    let work_root = tempfile::tempdir().unwrap();
+    let (svc, _bc, repo, _task_mgr) = make_service_with_workspace_root(work_root.path().to_path_buf());
+
+    // Create WITHOUT the project service so the row starts unbound.
+    let ws = tempfile::tempdir().unwrap();
+    let mut req = make_create_req();
+    req.extra = json!({ "workspace": ws.path().to_string_lossy(), "backend": "claude" });
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert!(repo.get(&resp.id).await.unwrap().unwrap().project_id.is_none());
+
+    svc.with_project_service(make_injected_project_service(work_root.path()).await);
+
+    // Narrowed contract: list is a pure read — it must NOT backfill, so the
+    // conversation list stays fast and side-effect free.
+    let _ = svc.list("user_1", ListConversationsQuery::default()).await.unwrap();
+    assert!(
+        repo.get(&resp.id).await.unwrap().unwrap().project_id.is_none(),
+        "list must not backfill"
+    );
+
+    // Opening the single conversation via get → lazy backfill.
+    let _ = svc.get("user_1", &resp.id).await.unwrap();
+    let row = repo.get(&resp.id).await.unwrap().unwrap();
+    assert!(row.project_id.is_some(), "get should lazily backfill project_id");
+    assert!(row.folder_id.is_some());
 }
 
 #[tokio::test]
@@ -7223,6 +7310,8 @@ async fn get_backfills_legacy_row_and_persists() {
         pinned_at: None,
         created_at: 0,
         updated_at: 0,
+        project_id: None,
+        folder_id: None,
     };
     repo.create(&legacy_row).await.unwrap();
 
@@ -7271,6 +7360,8 @@ async fn list_backfills_mixed_rows() {
         pinned_at: None,
         created_at: 1,
         updated_at: 1,
+        project_id: None,
+        folder_id: None,
     };
     // Row 2: already migrated.
     let modern = ConversationRow {
@@ -7291,6 +7382,8 @@ async fn list_backfills_mixed_rows() {
         pinned_at: None,
         created_at: 2,
         updated_at: 2,
+        project_id: None,
+        folder_id: None,
     };
     repo.create(&legacy).await.unwrap();
     repo.create(&modern).await.unwrap();
@@ -7408,6 +7501,8 @@ async fn seed_aionrs_conversation_with_snapshot(
         pinned_at: None,
         created_at: 1,
         updated_at: 1,
+        project_id: None,
+        folder_id: None,
     };
     repo.create(&row).await.unwrap();
     repo.upsert_assistant_snapshot(&UpsertConversationAssistantSnapshotParams {

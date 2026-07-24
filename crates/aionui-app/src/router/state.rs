@@ -674,6 +674,7 @@ pub fn build_team_state(
         backend_binary_path,
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
+    service.with_project_service(Arc::new(services.project_service.clone()));
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),
@@ -717,6 +718,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     conv_service.with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(
         services.database.pool().clone(),
     )));
+    conv_service.with_project_service(Arc::new(services.project_service.clone()));
 
     let executor = Arc::new(aionui_cron::executor::JobExecutor::new(
         services.worker_task_manager.clone(),
@@ -960,10 +962,8 @@ mod tests {
 
         Arc::new(WorkerTaskManagerImpl::new(factory))
     }
-
-    fn capturing_worker_task_manager(
-        captured_env: Arc<Mutex<Vec<Vec<(String, String)>>>>,
-    ) -> Arc<dyn IWorkerTaskManager> {
+    type CapturedEnv = Vec<Vec<(String, String)>>;
+    fn capturing_worker_task_manager(captured_env: Arc<Mutex<CapturedEnv>>) -> Arc<dyn IWorkerTaskManager> {
         let factory = Arc::new(move |opts: BuildTaskOptions| {
             let captured_env = captured_env.clone();
             Box::pin(async move {
@@ -980,7 +980,7 @@ mod tests {
         Arc::new(WorkerTaskManagerImpl::new(factory))
     }
 
-    async fn wait_for_captured_env(captured_env: &Arc<Mutex<Vec<Vec<(String, String)>>>>) -> Vec<(String, String)> {
+    async fn wait_for_captured_env(captured_env: &Arc<Mutex<CapturedEnv>>) -> Vec<(String, String)> {
         for _ in 0..50 {
             if let Some(env) = captured_env.lock().unwrap().first().cloned() {
                 return env;

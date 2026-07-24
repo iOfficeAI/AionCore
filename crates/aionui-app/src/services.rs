@@ -13,11 +13,12 @@ use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    IProjectStore, ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
-    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProviderRepository, SqliteSkillRepository,
-    SqliteUserRepository,
+    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository,
+    SqliteSkillRepository, SqliteUserRepository,
 };
+use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 
 pub struct AppServices {
@@ -33,6 +34,9 @@ pub struct AppServices {
     pub runtime_token_service: Arc<RuntimeTokenService>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    /// Project-bind service (project-bind side branch). Shared by conversation
+    /// and team wiring to bind/backfill project/folder rows. Cheap to clone.
+    pub project_service: ProjectService,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -85,6 +89,7 @@ impl AppServices {
             runtime_helper_bin: self.runtime_helper_bin.clone(),
             runtime_base_url: self.runtime_base_url.clone(),
             runtime_token_service: self.runtime_token_service.clone(),
+            project_service: self.project_service.clone(),
         });
         self
     }
@@ -144,6 +149,13 @@ impl AppServices {
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
+
+        // Project-bind service (side branch). temp_root mirrors the existing
+        // conversation temp-workspace root (`work_dir/conversations`) so
+        // `resolve_existing` classifies auto workspaces as temp and
+        // user-picked directories as standard.
+        let project_store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(database.pool().clone()));
+        let project_service = ProjectService::new(project_store, work_dir.join("conversations"));
 
         // Skill paths need app resource dir (for builtin rules) + data dir
         // (for user skills + materialized views). AcpSkillManager uses these
@@ -218,6 +230,7 @@ impl AppServices {
             runtime_helper_bin: runtime_helper_bin.clone(),
             runtime_base_url: runtime_base_url.clone(),
             runtime_token_service: runtime_token_service.clone(),
+            project_service: project_service.clone(),
         });
 
         Ok(Self {
@@ -233,6 +246,7 @@ impl AppServices {
             runtime_token_service,
             conversation_runtime_state,
             conversation_service,
+            project_service,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
@@ -264,6 +278,7 @@ struct ConversationServiceDeps<'a> {
     runtime_helper_bin: String,
     runtime_base_url: String,
     runtime_token_service: Arc<RuntimeTokenService>,
+    project_service: ProjectService,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -296,6 +311,7 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     if let Some(hook) = deps.task_manager_delete_hook {
         service.with_delete_hook(hook);
     }
+    service.with_project_service(Arc::new(deps.project_service));
     service
 }
 

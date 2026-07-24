@@ -38,6 +38,7 @@ use aionui_db::{
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
+use aionui_project::{ProjectService, canonical};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
 use chrono::Datelike;
@@ -318,6 +319,9 @@ pub struct ConversationService {
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
+    /// Project-bind side branch (optional). `None` → binding is a no-op, so
+    /// conversation create/read behaves exactly as before.
+    project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
@@ -391,6 +395,7 @@ impl ConversationService {
             assistant_preference_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
+            project_service: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
@@ -428,6 +433,50 @@ impl ConversationService {
     pub fn with_mcp_server_repo(&self, repo: Arc<dyn IMcpServerRepository>) {
         if let Ok(mut guard) = self.mcp_server_repo.write() {
             *guard = Some(repo);
+        }
+    }
+
+    /// Inject the project-bind service (project-bind side branch). When unset,
+    /// [`Self::bind_project_best_effort`] is a no-op.
+    pub fn with_project_service(&self, project_service: Arc<ProjectService>) {
+        if let Ok(mut guard) = self.project_service.write() {
+            *guard = Some(project_service);
+        }
+    }
+
+    /// Project-bind side branch: resolve the owner's workspace into a
+    /// project/folder and backfill `conversations.project_id`/`folder_id`.
+    ///
+    /// Best-effort by contract: a missing service, a bad URI, a resolve
+    /// failure, or an update failure are all logged at `warn` and swallowed.
+    /// This must NEVER affect conversation creation or reads.
+    async fn bind_project_best_effort(&self, conversation_id: &str, workspace_path: &str) {
+        let project_service = self.project_service.read().ok().and_then(|guard| guard.clone());
+        let Some(project_service) = project_service else {
+            return;
+        };
+        let uri = match canonical::to_file_uri(Path::new(workspace_path)) {
+            Ok(uri) => uri,
+            Err(err) => {
+                warn!(conversation_id = %conversation_id, error = err.code(), "project bind skipped: bad workspace uri");
+                return;
+            }
+        };
+        match project_service.resolve_existing(uri).await {
+            Ok(out) => {
+                let update = ConversationRowUpdate {
+                    project_id: Some(out.project.project_id),
+                    folder_id: Some(out.folder.folder_id),
+                    updated_at: Some(now_ms()),
+                    ..Default::default()
+                };
+                if let Err(err) = self.conversation_repo.update(conversation_id, &update).await {
+                    warn!(conversation_id = %conversation_id, error = %ErrorChain(&err), "project bind: backfill update failed");
+                }
+            }
+            Err(err) => {
+                warn!(conversation_id = %conversation_id, error = err.code(), "project bind skipped");
+            }
         }
     }
 
@@ -1112,9 +1161,21 @@ impl ConversationService {
             pinned_at: None,
             created_at: now,
             updated_at: now,
+            project_id: None,
+            folder_id: None,
         };
 
         self.conversation_repo.create(&row).await?;
+
+        // Project-bind side branch (best-effort; never affects creation).
+        // Uses the workspace the existing flow already decided + created.
+        if let Some(workspace) = extra
+            .get("workspace")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            self.bind_project_best_effort(&id, workspace).await;
+        }
 
         if let Some(snapshot) = assistant_snapshot.as_ref() {
             let resolved_skill_ids = serde_json::to_string(&snapshot.resolved_defaults.skill_ids).map_err(|e| {
@@ -1745,6 +1806,15 @@ impl ConversationService {
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra)
             .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
         self.backfill_extra_inplace(&row.id, &mut extra).await;
+        // Project-bind side branch: lazily backfill owner binding on read.
+        if row.project_id.is_none()
+            && let Some(workspace) = extra
+                .get("workspace")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        {
+            self.bind_project_best_effort(&row.id, workspace).await;
+        }
         let mut response = row_to_response_with_extra(row, extra, &self.workspace_root)?;
         self.attach_assistant_identity(&mut response).await?;
         response.runtime = Some(self.runtime_summary_for(id).await);
@@ -1921,6 +1991,8 @@ impl ConversationService {
             extra: merged_extra,
             status: None,
             updated_at: Some(now),
+            project_id: None,
+            folder_id: None,
         };
 
         self.conversation_repo.update(id, &updates).await?;

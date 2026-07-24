@@ -1,4 +1,4 @@
-use aionui_common::{generate_id, now_ms};
+use aionui_common::{generate_prefixed_id, now_ms};
 use sqlx::{Row, SqlitePool};
 
 use crate::error::DbError;
@@ -25,7 +25,7 @@ const ENTRY_COLS: &str = "pe_id, project_id, folder_id, role, display_name, orde
 impl IProjectStore for SqliteProjectStore {
     async fn upsert_folder(&self, canonical: &str, raw_uri: &str) -> Result<FolderRow, DbError> {
         let now = now_ms();
-        let folder_id = generate_id();
+        let folder_id = generate_prefixed_id("folder");
         // INSERT OR IGNORE: a canonical collision leaves the existing row
         // untouched (immutable folder rows, no updated_at bump).
         sqlx::query(
@@ -135,8 +135,8 @@ impl IProjectStore for SqliteProjectStore {
         kind: ProjectKind,
     ) -> Result<(ProjectRow, ProjectExplorerRow), DbError> {
         let now = now_ms();
-        let project_id = generate_id();
-        let pe_id = generate_id();
+        let project_id = generate_prefixed_id("project");
+        let pe_id = generate_prefixed_id("pe");
 
         let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO projects (project_id, name, kind, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
@@ -203,7 +203,7 @@ impl IProjectStore for SqliteProjectStore {
         order_index: i64,
     ) -> Result<ProjectExplorerRow, DbError> {
         let now = now_ms();
-        let pe_id = generate_id();
+        let pe_id = generate_prefixed_id("pe");
         sqlx::query(
             "INSERT INTO project_explorer \
                  (pe_id, project_id, folder_id, role, display_name, order_index, created_at, updated_at) \

@@ -18,6 +18,10 @@ pub struct TeamRow {
     pub agents_version: String,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    /// Project binding (project-bind side branch); NULL until bound/backfilled.
+    pub project_id: Option<String>,
+    /// Workspace folder binding; NULL until bound/backfilled.
+    pub folder_id: Option<String>,
 }
 
 /// Row mapping for the `mailbox` table.
@@ -82,6 +86,8 @@ mod tests {
             agents_version: "1.0.1".into(),
             created_at: 0,
             updated_at: 0,
+            project_id: None,
+            folder_id: None,
         };
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&row.agents).expect("agents should be valid JSON");
         assert!(parsed.is_empty());

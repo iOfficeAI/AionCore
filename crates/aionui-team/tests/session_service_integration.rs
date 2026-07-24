@@ -397,6 +397,8 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 status: Some("pending".into()),
                 created_at: now,
                 updated_at: now,
+                project_id: None,
+                folder_id: None,
             })
             .await?;
         Ok(TeamConversationCreateResult {
@@ -477,6 +479,8 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                     extra: Some(serde_json::to_string(&extra).unwrap()),
                     status: None,
                     updated_at: Some(aionui_common::now_ms()),
+                    project_id: None,
+                    folder_id: None,
                 },
             )
             .await?;
@@ -2146,6 +2150,8 @@ async fn renew_active_lease_allows_empty_team_without_unrelated_lease() {
             agents_version: "1.0.1".into(),
             created_at: aionui_common::now_ms(),
             updated_at: aionui_common::now_ms(),
+            project_id: None,
+            folder_id: None,
         })
         .await
         .expect("insert empty team");
@@ -2288,6 +2294,51 @@ async fn create_team_with_workspace_writes_same_workspace_to_team_and_initial_ag
             Some(workspace.as_str())
         );
     }
+}
+
+#[tokio::test]
+async fn create_team_side_branch_backfills_project_binding_when_injected() {
+    // Project-bind side branch: with a ProjectService injected, create_team
+    // resolves the team workspace and backfills teams.project_id/folder_id.
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, team_repo, _tm, _conv_repo) =
+        setup_with_factory_metadata_team_repo_and_conversation_repo(success_factory(), agent_metadata_repo);
+
+    // Real store on an in-memory DB; leaked so the shared pool outlives the test.
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let store: Arc<dyn aionui_db::IProjectStore> = Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
+    std::mem::forget(db);
+    svc.with_project_service(Arc::new(aionui_project::ProjectService::new(
+        store,
+        std::env::temp_dir().join("aionui-team-bind-test-conversations"),
+    )));
+
+    let workspace_dir = std::env::temp_dir().join(format!("aionui-team-bind-{}", aionui_common::generate_id()));
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Bound".into(),
+                agents: two_agent_input(),
+                workspace: Some(workspace_dir.to_string_lossy().into_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let row = team_repo.get_team(&created.id).await.unwrap().unwrap();
+    assert!(
+        row.project_id.is_some(),
+        "team create side branch should backfill project_id"
+    );
+    assert!(
+        row.folder_id.is_some(),
+        "team create side branch should backfill folder_id"
+    );
+    // Transitional workspace column must be untouched by the side branch.
+    assert_eq!(row.workspace, workspace_dir.to_string_lossy());
 }
 
 #[tokio::test]

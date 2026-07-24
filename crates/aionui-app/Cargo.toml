@@ -34,6 +34,7 @@ aionui-channel.workspace = true
 aionui-team.workspace = true
 aionui-team-prompts.workspace = true
 aionui-cron.workspace = true
+aionui-project.workspace = true
 aionui-assistant.workspace = true
 aionui-runtime.workspace = true
 aionui-process.workspace = true
