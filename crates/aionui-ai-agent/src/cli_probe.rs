@@ -55,7 +55,9 @@ impl ProbeFailure {
                 format!("version_probe_failed ({duration_ms}ms): {detail}")
             }
             Self::VersionTimeout { budget_ms } => {
-                format!("version_probe_timeout@{budget_ms}ms: `--version` timed out (slow load, not proof of corruption)")
+                format!(
+                    "version_probe_timeout@{budget_ms}ms: `--version` timed out (slow load, not proof of corruption)"
+                )
             }
         }
     }
@@ -74,14 +76,7 @@ pub(crate) fn command_name(meta: &AgentMetadata) -> Option<&str> {
         .or(meta.command.as_deref())
 }
 
-pub(crate) async fn validate(meta: &AgentMetadata) -> Result<ProbeSuccess, ProbeFailure> {
-    validate_with_budget(meta, CLI_VERSION_TIMEOUT).await
-}
-
-pub(crate) async fn validate_with_budget(
-    meta: &AgentMetadata,
-    budget: Duration,
-) -> Result<ProbeSuccess, ProbeFailure> {
+pub(crate) async fn validate_with_budget(meta: &AgentMetadata, budget: Duration) -> Result<ProbeSuccess, ProbeFailure> {
     let command = command_name(meta).ok_or(ProbeFailure::NoCommand)?;
     let path = resolve_command_path(command).ok_or_else(|| ProbeFailure::CommandNotFound {
         command: command.to_owned(),
@@ -89,8 +84,11 @@ pub(crate) async fn validate_with_budget(
     if meta.agent_source == aionui_api_types::AgentSource::Builtin
         && meta.agent_source_info.bridge_binary.as_deref() == Some("npx")
         && let Some(backend) = meta.backend.as_deref()
-        && aionui_runtime::should_skip_registry_npx_version_probe(backend)
-            .map_err(|error| ProbeFailure::SkipLookup { detail: error.to_string() })?
+        && aionui_runtime::should_skip_registry_npx_version_probe(backend).map_err(|error| {
+            ProbeFailure::SkipLookup {
+                detail: error.to_string(),
+            }
+        })?
     {
         return Ok(ProbeSuccess {
             duration_ms: 0,
@@ -109,10 +107,7 @@ async fn resolve_and_validate_command(command: &str) -> Result<PathBuf, ProbeFai
     Ok(path)
 }
 
-async fn validate_version_with_timeout(
-    path: &std::path::Path,
-    budget: Duration,
-) -> Result<ProbeSuccess, ProbeFailure> {
+async fn validate_version_with_timeout(path: &std::path::Path, budget: Duration) -> Result<ProbeSuccess, ProbeFailure> {
     let mut command = Builder::clean_cli(path);
     command.arg("--version");
 
@@ -180,9 +175,15 @@ mod tests {
     #[tokio::test]
     async fn version_probe_success_reports_duration() {
         let (_dir, path) = executable_script("agent-cli", "#!/bin/sh\nprintf 'agent-cli 1.2.3\\n'\n");
-        let ok = validate_version_with_timeout(&path, Duration::from_secs(5)).await.unwrap();
+        let ok = validate_version_with_timeout(&path, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert!(ok.version_checked);
-        assert!(ok.duration_ms < 5_000, "duration should be measured, got {}", ok.duration_ms);
+        assert!(
+            ok.duration_ms < 5_000,
+            "duration should be measured, got {}",
+            ok.duration_ms
+        );
     }
 
     #[tokio::test]
@@ -201,7 +202,11 @@ mod tests {
             }
             other => panic!("expected VersionFailed, got {other:?}"),
         }
-        assert!(failure.detail().contains("native binary missing"), "{}", failure.detail());
+        assert!(
+            failure.detail().contains("native binary missing"),
+            "{}",
+            failure.detail()
+        );
     }
 
     #[tokio::test]

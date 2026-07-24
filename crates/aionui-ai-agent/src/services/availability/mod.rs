@@ -11,7 +11,7 @@ use aionui_common::now_ms;
 use aionui_db::{IProviderRepository, UpdateAgentAvailabilitySnapshotParams};
 
 use crate::error::AgentError;
-use crate::protocol::{cli_detect, custom_agent_probe};
+use crate::protocol::custom_agent_probe;
 use crate::registry::{AgentRegistry, guidance_for_snapshot_error_code};
 
 #[async_trait::async_trait]
@@ -56,13 +56,10 @@ impl AgentAvailabilityService {
             .await
             .and_then(|row| row.ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found"))))?;
 
-        if !meta.available {
-            return self
-                .management_row_by_id(id)
-                .await
-                .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")));
-        }
-
+        // #675: never short-circuit on a stale availability verdict — the
+        // manual check is the user's self-rescue path. `run_probe` handles a
+        // missing binary itself (persisted command_not_found snapshot), and a
+        // success restores the agent.
         let snapshot = run_probe(
             &self.registry,
             &self.provider_repo,
@@ -148,7 +145,7 @@ impl AgentAvailabilityService {
 }
 
 async fn run_probe(
-    registry: &Arc<AgentRegistry>,
+    _registry: &Arc<AgentRegistry>,
     provider_repo: &Arc<dyn IProviderRepository>,
     meta: &AgentMetadata,
     kind: AgentSnapshotCheckKind,
@@ -159,22 +156,16 @@ async fn run_probe(
     let (status, error_code, error_message) = if meta.agent_source == AgentSource::Builtin
         && matches!(meta.backend.as_deref(), Some("claude") | Some("codex"))
     {
-        // Builtin claude/codex are direct CLIs: availability is a PATH-only probe
-        // of the primary command (proxy for "installed + authenticated"), NOT an
-        // ACP handshake. Mirrors registry::probe_resolved_command / cli_probe.
-        match crate::cli_probe::command_name(meta) {
-            Some(primary) if aionui_runtime::resolve_command_path(primary).is_some() => {
-                (AgentSnapshotCheckStatus::Online, None, None)
-            }
-            Some(primary) => (
+        // Builtin claude/codex are direct CLIs that do not speak ACP, so
+        // their deep check is PATH + `--version` (integrity), never a
+        // session/new-style handshake (#675). Uses the wide recheck budget:
+        // the user is explicitly waiting and large Node CLIs load slowly.
+        match crate::cli_probe::validate_with_budget(meta, crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT).await {
+            Ok(_) => (AgentSnapshotCheckStatus::Online, None, None),
+            Err(failure) => (
                 AgentSnapshotCheckStatus::Offline,
-                Some("command_not_found".to_owned()),
-                Some(format!("`{primary}` not found on PATH")),
-            ),
-            None => (
-                AgentSnapshotCheckStatus::Offline,
-                Some("command_not_found".to_owned()),
-                Some("no CLI command configured".to_owned()),
+                Some(failure.error_code().to_owned()),
+                Some(failure.detail()),
             ),
         }
     } else if let Some(command) = meta.command.as_deref() {
@@ -210,16 +201,16 @@ async fn run_probe(
                 ),
             },
         }
-    } else if let Some(backend) = meta.backend.as_deref() {
-        let result = cli_detect::health_check(registry, backend).await;
-        if result.available {
-            (AgentSnapshotCheckStatus::Online, None, None)
-        } else {
-            (
+    } else if meta.backend.is_some() {
+        // Commandless builtin fallback: same PATH + `--version` treatment as
+        // the direct CLIs — no PATH-only side door (#675).
+        match crate::cli_probe::validate_with_budget(meta, crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT).await {
+            Ok(_) => (AgentSnapshotCheckStatus::Online, None, None),
+            Err(failure) => (
                 AgentSnapshotCheckStatus::Offline,
-                Some("health_check_failed".to_owned()),
-                result.error,
-            )
+                Some(failure.error_code().to_owned()),
+                Some(failure.detail()),
+            ),
         }
     } else if meta.agent_type == AgentType::Aionrs {
         // aionrs is the built-in Rust agent: there is no external CLI to probe,
@@ -567,5 +558,235 @@ mod tests {
         pi.agent_source_info.bridge_binary = Some("npx".into());
         pi.args = vec!["-y".into(), "pi-acp".into()];
         assert_eq!(explicit_probe_args(&pi).unwrap(), ["-y", "pi-acp@0.0.31"]);
+    }
+
+    // ---- #675: manual health check runs --version for direct CLIs and is
+    // never short-circuited by a stale availability verdict ----
+
+    #[cfg(unix)]
+    fn write_executable(dir: &std::path::Path, name: &str, contents: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    #[cfg(unix)]
+    fn upsert_builtin_claude_params<'a>(id: &'a str, source_info: &'a str) -> UpsertAgentMetadataParams<'a> {
+        UpsertAgentMetadataParams {
+            id,
+            icon: None,
+            name: "Claude Code",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("claude"),
+            agent_type: "acp",
+            agent_source: "builtin",
+            agent_source_info: Some(source_info),
+            enabled: true,
+            command: None,
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 100,
+        }
+    }
+
+    /// Manual health check on a direct-CLI builtin (claude/codex) must run
+    /// `--version` — a corrupted install on PATH is offline with the
+    /// classified code, not online-by-PATH (#675).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manual_check_flags_corrupted_direct_cli_offline() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        let temp = tempfile::tempdir().unwrap();
+        let command = write_executable(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nprintf 'native binary missing\\n' >&2\nexit 1\n",
+        );
+        let source_info = serde_json::json!({ "binary_name": command }).to_string();
+        repo.upsert(&upsert_builtin_claude_params("agent-corrupted-claude", &source_info))
+            .await
+            .unwrap();
+
+        let registry = AgentRegistry::new(repo);
+        registry.hydrate().await.unwrap();
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let service = AgentAvailabilityService::new(registry, provider_repo);
+
+        let row = service.run_manual_health_check("agent-corrupted-claude").await.unwrap();
+
+        assert_eq!(row.status, AgentManagementStatus::Offline);
+        assert_eq!(row.last_check_status, Some(AgentSnapshotCheckStatus::Offline));
+        assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Manual));
+        assert_eq!(row.last_check_error_code.as_deref(), Some("version_probe_failed"));
+        assert!(
+            row.last_check_error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("native binary missing"))
+        );
+    }
+
+    /// Manual health check on a healthy direct-CLI builtin stays online and
+    /// records the measured `--version` cost (#675).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manual_check_confirms_healthy_direct_cli_online() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        let temp = tempfile::tempdir().unwrap();
+        let command = write_executable(temp.path(), "claude", "#!/bin/sh\nprintf 'claude 1.0.0\\n'\n");
+        let source_info = serde_json::json!({ "binary_name": command }).to_string();
+        repo.upsert(&upsert_builtin_claude_params("agent-healthy-claude", &source_info))
+            .await
+            .unwrap();
+
+        let registry = AgentRegistry::new(repo);
+        registry.hydrate().await.unwrap();
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let service = AgentAvailabilityService::new(registry, provider_repo);
+
+        let row = service.run_manual_health_check("agent-healthy-claude").await.unwrap();
+
+        assert_eq!(row.status, AgentManagementStatus::Online);
+        assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Manual));
+        assert!(row.last_check_error_code.is_none());
+    }
+
+    /// Manual health check must reach its real probe even when the binary is
+    /// missing entirely: the outcome is a persisted command_not_found manual
+    /// snapshot, not a silent early return (#675).
+    #[tokio::test]
+    async fn manual_check_persists_command_not_found_instead_of_short_circuit() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        let source_info = r#"{"binary_name":"definitely-missing-claude-cli"}"#;
+        repo.upsert(&{
+            let mut params = UpsertAgentMetadataParams {
+                id: "agent-missing-claude",
+                icon: None,
+                name: "Claude Code",
+                name_i18n: None,
+                description: None,
+                description_i18n: None,
+                backend: Some("claude"),
+                agent_type: "acp",
+                agent_source: "builtin",
+                agent_source_info: Some(source_info),
+                enabled: true,
+                command: None,
+                args: Some("[]"),
+                env: Some("[]"),
+                native_skills_dirs: None,
+                behavior_policy: None,
+                yolo_id: None,
+                agent_capabilities: None,
+                auth_methods: None,
+                config_options: None,
+                available_modes: None,
+                available_models: None,
+                available_commands: None,
+                sort_order: 100,
+            };
+            params.sort_order = 100;
+            params
+        })
+        .await
+        .unwrap();
+
+        let registry = AgentRegistry::new(repo.clone());
+        registry.hydrate().await.unwrap();
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let service = AgentAvailabilityService::new(registry, provider_repo);
+
+        let row = service.run_manual_health_check("agent-missing-claude").await.unwrap();
+
+        assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Manual));
+        assert_eq!(row.last_check_error_code.as_deref(), Some("command_not_found"));
+        let persisted = repo.get("agent-missing-claude").await.unwrap().unwrap();
+        assert_eq!(persisted.last_check_error_code.as_deref(), Some("command_not_found"));
+    }
+
+    /// A builtin without an explicit spawn command (the non-claude/codex
+    /// fallback branch) gets the same PATH + `--version` treatment with
+    /// classified errors — no PATH-only side door (#675).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commandless_builtin_fallback_probe_runs_version_check() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        let temp = tempfile::tempdir().unwrap();
+        let command = write_executable(
+            temp.path(),
+            "hermes",
+            "#!/bin/sh\nprintf 'wrapper broken\\n' >&2\nexit 1\n",
+        );
+        let registry = AgentRegistry::new(repo);
+        registry.hydrate().await.unwrap();
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+
+        let meta = AgentMetadata {
+            id: "agent-fallback-builtin".into(),
+            icon: None,
+            name: "Fallback Builtin".into(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("hermes".into()),
+            agent_type: AgentType::Acp,
+            agent_source: AgentSource::Builtin,
+            agent_source_info: AgentSourceInfo {
+                binary_name: Some(command.clone()),
+                ..Default::default()
+            },
+            enabled: true,
+            available: true,
+            command: None,
+            resolved_command: Some(std::path::PathBuf::from(&command)),
+            args: vec![],
+            env: vec![],
+            native_skills_dirs: None,
+            behavior_policy: BehaviorPolicy::default(),
+            yolo_id: None,
+            sort_order: 0,
+            team_capable: false,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_error_details: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            handshake: AgentHandshake::default(),
+            has_command_override: false,
+            env_override_key_count: 0,
+        };
+
+        let snapshot = run_probe(&registry, &provider_repo, &meta, AgentSnapshotCheckKind::Manual).await;
+        assert_eq!(snapshot.status, "offline");
+        assert_eq!(snapshot.error_code.as_deref(), Some("version_probe_failed"));
+        assert!(
+            snapshot
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("wrapper broken"))
+        );
     }
 }

@@ -136,6 +136,9 @@ impl AppServices {
             .hydrate()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to hydrate agent registry: {e}"))?;
+        // Settle any slow version probes off the readiness path (#675):
+        // hydrate never waits beyond the inline budget per agent.
+        agent_registry.spawn_slow_probe_recheck();
 
         let acp_session_repo: Arc<dyn IAcpSessionRepository> =
             Arc::new(SqliteAcpSessionRepository::new(database.pool().clone()));

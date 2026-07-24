@@ -21,7 +21,7 @@ use aionui_api_types::{
     AgentEnvEntry, AgentHandshake, AgentManagementRow, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind,
     AgentSnapshotCheckStatus, AgentSource, AgentSourceInfo, BehaviorPolicy,
 };
-use aionui_common::AgentType;
+use aionui_common::{AgentType, now_ms};
 use aionui_db::{AgentMetadataRow, IAgentMetadataRepository, UpdateAgentHandshakeParams};
 use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
 use futures_util::StreamExt;
@@ -39,6 +39,40 @@ use crate::manager::acp::config_option_catalog::{
 /// before producers start to back off.
 const CATALOG_SYNC_CHANNEL_CAPACITY: usize = 256;
 const CLI_PROBE_CONCURRENCY: usize = 8;
+
+/// Budgets for the CLI version probe (#675). A probe that exceeds
+/// `inline_budget` is NOT condemned — it is queued for a background recheck
+/// under `recheck_budget`. An agent whose persisted startup snapshot shows a
+/// probe slower than `slow_threshold_ms` skips the inline probe entirely so
+/// backend readiness never pays for known-slow CLIs.
+#[derive(Debug, Clone, Copy)]
+pub struct ProbePolicy {
+    pub inline_budget: std::time::Duration,
+    pub recheck_budget: std::time::Duration,
+    pub slow_threshold_ms: i64,
+}
+
+impl Default for ProbePolicy {
+    fn default() -> Self {
+        Self {
+            inline_budget: crate::cli_probe::CLI_VERSION_TIMEOUT,
+            recheck_budget: crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT,
+            slow_threshold_ms: 2_000,
+        }
+    }
+}
+
+/// What the inline version probe decided for one row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineProbeOutcome {
+    /// Probe not applicable (non-builtin, unavailable, or no command).
+    NotProbed,
+    /// Version probe ran (or was explicitly skipped) and the row is settled.
+    Settled,
+    /// Probe timed out or was skipped for slow history — needs the
+    /// background recheck to settle.
+    PendingRecheck,
+}
 
 /// One unit of work submitted to the catalog sync consumer task.
 #[derive(Debug)]
@@ -63,16 +97,27 @@ pub struct AgentRegistry {
     /// Draining happens in a single background task owned by this
     /// registry, so DB writes for the same (id, field) serialize.
     catalog_tx: mpsc::Sender<CatalogSyncMessage>,
+    probe_policy: ProbePolicy,
+    /// Agent ids whose inline version probe timed out (or was skipped for
+    /// slow history) during the last hydrate/refresh. Settled by
+    /// [`Self::run_slow_probe_recheck`].
+    pending_recheck: RwLock<Vec<String>>,
 }
 
 impl AgentRegistry {
     pub fn new(repo: Arc<dyn IAgentMetadataRepository>) -> Arc<Self> {
+        Self::new_with_probe_policy(repo, ProbePolicy::default())
+    }
+
+    pub fn new_with_probe_policy(repo: Arc<dyn IAgentMetadataRepository>, probe_policy: ProbePolicy) -> Arc<Self> {
         let (tx, rx) = mpsc::channel::<CatalogSyncMessage>(CATALOG_SYNC_CHANNEL_CAPACITY);
         let this = Arc::new(Self {
             repo,
             by_id: RwLock::new(HashMap::new()),
             unavailable_reasons: RwLock::new(HashMap::new()),
             catalog_tx: tx,
+            probe_policy,
+            pending_recheck: RwLock::new(Vec::new()),
         });
 
         this.clone().spawn_catalog_consumer(rx);
@@ -204,23 +249,97 @@ impl AgentRegistry {
             .into_iter()
             .filter_map(|row| decode_row(row, AvailabilityProjection::Probe))
             .collect();
-        let validated = validate_cli_candidates(candidates).await;
+        let validated = validate_cli_candidates(candidates, self.probe_policy).await;
 
         let mut map = HashMap::with_capacity(validated.len());
         let mut reasons = HashMap::new();
-        for (meta, reason) in validated {
+        let mut pending = Vec::new();
+        for (meta, reason, outcome) in validated {
             if let Some(reason) = reason {
                 reasons.insert(meta.id.clone(), reason);
             }
+            if outcome == InlineProbeOutcome::PendingRecheck {
+                pending.push(meta.id.clone());
+            }
             map.insert(meta.id.clone(), meta);
         }
+        pending.sort();
         // Snapshot the summary off the local map before transferring it
         // into the lock — `log_availability_summary` borrows the values
         // and we don't want that borrow to outlive the move.
         log_availability_summary(map.values(), "AgentRegistry hydrated");
         *self.by_id.write().await = map;
         *self.unavailable_reasons.write().await = reasons;
+        *self.pending_recheck.write().await = pending;
         Ok(())
+    }
+
+    /// Agent ids waiting for the background version-probe recheck.
+    pub async fn pending_slow_probe_rechecks(&self) -> Vec<String> {
+        self.pending_recheck.read().await.clone()
+    }
+
+    /// Settle every pending slow-probe agent with the wider recheck budget,
+    /// sequentially — recheck targets are large CLIs whose cold loads would
+    /// thrash disk I/O if run in parallel. Persists the outcome as a
+    /// startup-kind snapshot so the next hydrate can skip the inline probe.
+    pub async fn run_slow_probe_recheck(&self) {
+        let pending: Vec<String> = std::mem::take(&mut *self.pending_recheck.write().await);
+        for id in pending {
+            let Some(meta) = self.by_id.read().await.get(&id).cloned() else {
+                continue;
+            };
+            let checked_at = now_ms();
+            let started = std::time::Instant::now();
+            let outcome = crate::cli_probe::validate_with_budget(&meta, self.probe_policy.recheck_budget).await;
+            let latency_ms = started.elapsed().as_millis() as i64;
+            let (status, error_code, error_message) = match &outcome {
+                Ok(_) => ("online", None, None),
+                Err(failure) => ("offline", Some(failure.error_code()), Some(failure.detail())),
+            };
+            info!(id = %id, status, latency_ms, error_code = error_code.unwrap_or("-"), "slow-probe recheck settled");
+            let params = aionui_db::UpdateAgentAvailabilitySnapshotParams {
+                last_check_status: Some(status),
+                last_check_kind: Some("startup"),
+                last_check_error_code: error_code,
+                last_check_error_message: error_message.as_deref(),
+                last_check_guidance: None,
+                last_check_latency_ms: Some(latency_ms),
+                last_check_at: Some(checked_at),
+                last_success_at: outcome.is_ok().then_some(checked_at),
+                last_failure_at: outcome.is_err().then_some(checked_at),
+            };
+            if let Err(error) = self.repo.update_availability_snapshot(&id, &params).await {
+                warn!(id = %id, %error, "slow-probe recheck: persisting snapshot failed");
+            }
+            let mut guard = self.by_id.write().await;
+            if let Some(meta) = guard.get_mut(&id) {
+                meta.last_check_status = Some(if outcome.is_ok() {
+                    AgentSnapshotCheckStatus::Online
+                } else {
+                    AgentSnapshotCheckStatus::Offline
+                });
+                meta.last_check_kind = Some(AgentSnapshotCheckKind::Startup);
+                meta.last_check_error_code = error_code.map(str::to_owned);
+                meta.last_check_error_message = error_message;
+                meta.last_check_latency_ms = Some(latency_ms);
+                meta.last_check_at = Some(checked_at);
+                if outcome.is_ok() {
+                    meta.last_success_at = Some(checked_at);
+                } else {
+                    meta.last_failure_at = Some(checked_at);
+                }
+            }
+        }
+    }
+
+    /// Fire-and-forget wrapper for startup: settle pending slow probes off
+    /// the readiness path.
+    pub fn spawn_slow_probe_recheck(self: &Arc<Self>) {
+        let registry = self.clone();
+        tokio::spawn(async move {
+            registry.run_slow_probe_recheck().await;
+        });
     }
 
     /// Re-probe every row's command without refetching from the DB.
@@ -237,17 +356,23 @@ impl AgentRegistry {
                 (meta, reason)
             })
             .collect();
-        let validated = validate_cli_candidates(candidates).await;
+        let validated = validate_cli_candidates(candidates, self.probe_policy).await;
 
         let mut results = Vec::with_capacity(validated.len());
         let mut reasons = HashMap::new();
-        for (meta, reason) in validated {
+        let mut pending = Vec::new();
+        for (meta, reason, outcome) in validated {
             log_probe_result(&meta, &reason);
             results.push((meta.id.clone(), meta.available, meta.resolved_command.clone()));
+            if outcome == InlineProbeOutcome::PendingRecheck {
+                pending.push(meta.id.clone());
+            }
             if let Some(reason) = reason {
                 reasons.insert(meta.id.clone(), reason);
             }
         }
+        pending.sort();
+        *self.pending_recheck.write().await = pending;
         let mut guard = self.by_id.write().await;
         for (id, available, resolved_command) in results {
             if let Some(meta) = guard.get_mut(&id) {
@@ -277,7 +402,10 @@ impl AgentRegistry {
             self.unavailable_reasons.write().await.remove(id);
             return Ok(None);
         };
-        let (meta, reason) = validate_cli_availability(meta, reason).await;
+        // #675: reload is a cache refresh, not a probe — the version verdict
+        // lives in the persisted snapshot columns. Re-running `--version` here
+        // made every reload pay the probe cost and stomped fresher
+        // manual/session snapshots with a startup-kind verdict.
         log_probe_result(&meta, &reason);
         self.update_cached_unavailable_reason(&meta.id, reason).await;
         self.by_id.write().await.insert(meta.id.clone(), meta.clone());
@@ -658,20 +786,56 @@ fn apply_probe_availability(meta: &mut AgentMetadata) -> Option<UnavailableReaso
     if meta.available { None } else { reason }
 }
 
+/// Whether the persisted startup snapshot proves this agent's version probe
+/// is too slow for the inline budget. "Slow" is a property of package ×
+/// machine, so it is learned from measured history — never a static list.
+/// Only startup-kind snapshots count: manual/session snapshots measure
+/// handshakes, not `--version`.
+fn has_slow_probe_history(meta: &AgentMetadata, policy: &ProbePolicy) -> bool {
+    if meta.last_check_error_code.as_deref() == Some("version_probe_timeout") {
+        return true;
+    }
+    meta.last_check_kind == Some(AgentSnapshotCheckKind::Startup)
+        && meta
+            .last_check_latency_ms
+            .is_some_and(|ms| ms > policy.slow_threshold_ms)
+}
+
 async fn validate_cli_availability(
     mut meta: AgentMetadata,
     reason: Option<UnavailableReason>,
-) -> (AgentMetadata, Option<UnavailableReason>) {
+    policy: ProbePolicy,
+) -> (AgentMetadata, Option<UnavailableReason>, InlineProbeOutcome) {
     if !meta.available || meta.agent_source != AgentSource::Builtin {
-        return (meta, reason);
+        return (meta, reason, InlineProbeOutcome::NotProbed);
     }
 
     let Some(binary) = crate::cli_probe::command_name(&meta).map(str::to_owned) else {
-        return (meta, reason);
+        return (meta, reason, InlineProbeOutcome::NotProbed);
     };
 
-    match crate::cli_probe::validate(&meta).await {
-        Ok(_) => (meta, None),
+    if has_slow_probe_history(&meta, &policy) {
+        return (meta, None, InlineProbeOutcome::PendingRecheck);
+    }
+
+    match crate::cli_probe::validate_with_budget(&meta, policy.inline_budget).await {
+        Ok(_) => (meta, None, InlineProbeOutcome::Settled),
+        Err(failure @ crate::cli_probe::ProbeFailure::VersionTimeout { .. }) => {
+            // Slow load is not proof of corruption: keep the row installed,
+            // let the persisted snapshot (if any) keep its word, and settle
+            // via the background recheck.
+            debug!(id = %meta.id, binary, detail = %failure.detail(), "inline version probe timed out; queued for recheck");
+            (meta, None, InlineProbeOutcome::PendingRecheck)
+        }
+        Err(failure @ crate::cli_probe::ProbeFailure::VersionFailed { .. }) => {
+            // The binary IS on PATH — a failing `--version` proves a
+            // corrupted install, not a missing one: installed + Offline.
+            meta.last_check_status = Some(AgentSnapshotCheckStatus::Offline);
+            meta.last_check_kind = Some(AgentSnapshotCheckKind::Startup);
+            meta.last_check_error_code = Some(failure.error_code().to_owned());
+            meta.last_check_error_message = Some(failure.detail());
+            (meta, None, InlineProbeOutcome::Settled)
+        }
         Err(failure) => {
             meta.available = false;
             meta.resolved_command = None;
@@ -681,6 +845,7 @@ async fn validate_cli_availability(
                     binary,
                     detail: failure.detail(),
                 }),
+                InlineProbeOutcome::Settled,
             )
         }
     }
@@ -688,9 +853,10 @@ async fn validate_cli_availability(
 
 async fn validate_cli_candidates(
     candidates: Vec<(AgentMetadata, Option<UnavailableReason>)>,
-) -> Vec<(AgentMetadata, Option<UnavailableReason>)> {
+    policy: ProbePolicy,
+) -> Vec<(AgentMetadata, Option<UnavailableReason>, InlineProbeOutcome)> {
     futures_util::stream::iter(candidates)
-        .map(|(meta, reason)| validate_cli_availability(meta, reason))
+        .map(|(meta, reason)| validate_cli_availability(meta, reason, policy))
         .buffer_unordered(CLI_PROBE_CONCURRENCY)
         .collect()
         .await
