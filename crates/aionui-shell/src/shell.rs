@@ -52,6 +52,7 @@ impl ShellService {
         match tool {
             ToolType::Terminal | ToolType::Explorer => true,
             ToolType::Vscode => self.detect_vscode(),
+            ToolType::Zed => self.detect_zed(),
         }
     }
 
@@ -61,6 +62,7 @@ impl ShellService {
             ToolType::Vscode => self.open_folder_vscode(&path).await,
             ToolType::Terminal => self.open_folder_terminal(&path).await,
             ToolType::Explorer => self.open_folder_explorer(&path).await,
+            ToolType::Zed => self.open_folder_zed(&path).await,
         }
     }
 
@@ -80,6 +82,41 @@ impl ShellService {
             return Err(ShellError::ToolNotInstalled("vscode".to_owned()));
         }
         self.opener.run_command("code", &[&path.to_string_lossy()]).await
+    }
+
+    /// Resolve an invokable Zed CLI binary.
+    ///
+    /// Prefers `zed` on PATH (after "Zed → Install CLI"). Falls back to the
+    /// macOS app CLI path so detection works when the symlink is missing.
+    /// Avoids spawning bare Windows `.cmd` shims (see AionUi#2210).
+    fn zed_cli_program(&self) -> Option<String> {
+        if self.opener.is_tool_available("zed") {
+            return Some("zed".to_owned());
+        }
+        if cfg!(target_os = "macos") {
+            let app_cli = "/Applications/Zed.app/Contents/MacOS/cli";
+            if Path::new(app_cli).exists() {
+                return Some(app_cli.to_owned());
+            }
+        }
+        if cfg!(target_os = "windows") {
+            // Prefer a real .exe on PATH only — never spawn .cmd without shell.
+            if self.opener.is_tool_available("zed.exe") {
+                return Some("zed.exe".to_owned());
+            }
+        }
+        None
+    }
+
+    fn detect_zed(&self) -> bool {
+        self.zed_cli_program().is_some()
+    }
+
+    async fn open_folder_zed(&self, path: &Path) -> Result<(), ShellError> {
+        let Some(program) = self.zed_cli_program() else {
+            return Err(ShellError::ToolNotInstalled("zed".to_owned()));
+        };
+        self.opener.run_command(&program, &[&path.to_string_lossy()]).await
     }
 
     async fn open_folder_terminal(&self, path: &Path) -> Result<(), ShellError> {
@@ -345,6 +382,22 @@ mod tests {
     async fn check_tool_explorer_always_true() {
         let svc = ShellService::new(Arc::new(NoopSystemOpener));
         assert!(svc.check_tool_installed(ToolType::Explorer).await);
+    }
+
+    #[tokio::test]
+    async fn check_tool_zed_returns_bool_with_noop() {
+        // NoopSystemOpener reports every tool available → zed appears installed.
+        let svc = ShellService::new(Arc::new(NoopSystemOpener));
+        assert!(svc.check_tool_installed(ToolType::Zed).await);
+    }
+
+    #[tokio::test]
+    async fn open_folder_zed_succeeds_with_noop_when_dir_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = ShellService::new(Arc::new(NoopSystemOpener));
+        svc.open_folder_with(dir.path().to_str().unwrap(), ToolType::Zed)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

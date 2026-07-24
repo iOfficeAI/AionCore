@@ -83,6 +83,14 @@ async fn sh10_check_tool_vscode_returns_bool() {
 }
 
 // ---------------------------------------------------------------------------
+// SH-11: check_tool_installed — zed (environment-dependent)
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn sh11_check_tool_zed_returns_bool() {
+    let _installed = service().check_tool_installed(ToolType::Zed).await;
+}
+
+// ---------------------------------------------------------------------------
 // SH-12: open_folder_with — directory does not exist
 // ---------------------------------------------------------------------------
 #[tokio::test]

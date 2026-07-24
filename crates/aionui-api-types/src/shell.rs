@@ -10,6 +10,7 @@ pub enum ToolType {
     Vscode,
     Terminal,
     Explorer,
+    Zed,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -147,6 +148,7 @@ mod tests {
         assert_eq!(serde_json::to_value(ToolType::Vscode).unwrap(), "vscode");
         assert_eq!(serde_json::to_value(ToolType::Terminal).unwrap(), "terminal");
         assert_eq!(serde_json::to_value(ToolType::Explorer).unwrap(), "explorer");
+        assert_eq!(serde_json::to_value(ToolType::Zed).unwrap(), "zed");
     }
 
     #[test]
@@ -157,6 +159,8 @@ mod tests {
         assert_eq!(t, ToolType::Terminal);
         let e: ToolType = serde_json::from_str(r#""explorer""#).unwrap();
         assert_eq!(e, ToolType::Explorer);
+        let z: ToolType = serde_json::from_str(r#""zed""#).unwrap();
+        assert_eq!(z, ToolType::Zed);
     }
 
     #[test]
@@ -199,6 +203,13 @@ mod tests {
         let raw = json!({ "tool": "vscode" });
         let req: CheckToolInstalledRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.tool, ToolType::Vscode);
+    }
+
+    #[test]
+    fn check_tool_installed_request_parses_zed() {
+        let raw = json!({ "tool": "zed" });
+        let req: CheckToolInstalledRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.tool, ToolType::Zed);
     }
 
     #[test]
