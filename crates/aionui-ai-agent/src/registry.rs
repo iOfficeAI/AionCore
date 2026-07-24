@@ -1263,6 +1263,12 @@ pub(crate) fn guidance_for_snapshot_error_code(error_code: &str) -> &'static str
             "Fix the provider credentials or network issue that caused the last session failure, then start a new conversation."
         }
         "no_provider" => "Add and enable a model provider in Settings, then run Test Connection again.",
+        "version_probe_failed" => {
+            "The CLI is on PATH but `--version` failed — the install is likely corrupted. Reinstall the CLI, then run Test Connection again."
+        }
+        "version_probe_timeout" => {
+            "The CLI loads too slowly for the probe budget. This usually means a very large package on slow disk or antivirus interference — the agent may still work; run Test Connection to verify with a longer budget."
+        }
         _ => "",
     }
 }
