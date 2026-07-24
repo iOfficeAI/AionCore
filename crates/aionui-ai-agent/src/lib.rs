@@ -25,6 +25,7 @@ pub(crate) mod runtime_status;
 pub mod runtime_token;
 pub(crate) mod services;
 pub mod session_agent;
+pub(crate) mod session_catalog;
 pub mod session_context;
 pub mod shared_kernel;
 pub mod task_manager;
