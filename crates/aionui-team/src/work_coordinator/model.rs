@@ -80,9 +80,25 @@ pub(crate) struct WorkIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CausalBinding {
     UserVisible,
-    InheritRunningBatch { caller_slot_id: String },
+    InheritRunningBatch {
+        caller_slot_id: String,
+    },
+    // `ActiveRunOrBackground` and `Background` no longer have production
+    // callers now that all system/lifecycle wakes go through `SystemInitiated`
+    // (which never leaves a turn run-less). They are intentionally retained as
+    // documented binding semantics and remain exercised by regression tests, so
+    // silence the lib-only dead-code lint rather than dropping the variants.
+    #[allow(dead_code)]
     ActiveRunOrBackground,
+    #[allow(dead_code)]
     Background,
+    /// System/lifecycle wake that must still run inside a team run. Resolution
+    /// order: inherit the caller's running batch run (when `inherit_from` is
+    /// set and that caller has one) → attach to the team's active run → open a
+    /// new `SystemLifecycle` run. Never leaves the turn run-less.
+    SystemInitiated {
+        inherit_from: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +251,10 @@ pub(crate) struct RunBinding {
 
 pub(crate) trait RunCausalityPort: Send + Sync {
     fn bind_enqueue(&self, request: &EnqueueRequest) -> RunBinding;
+    /// Bind a system/lifecycle enqueue: attach to the team's active run when one
+    /// exists, otherwise open a new `SystemLifecycle` run. Never sets
+    /// `user_intervention` (the key difference from a user enqueue).
+    fn bind_system_enqueue(&self, request: &EnqueueRequest) -> RunBinding;
     fn abort_binding(&self, binding: &RunBinding);
     fn apply_work_summary(&self, summary: RunWorkSummary);
     /// Broadcast a single slot's current work snapshot, independent of any team

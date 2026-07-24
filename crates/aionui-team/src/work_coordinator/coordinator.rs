@@ -132,6 +132,23 @@ impl SlotWorkCoordinator {
             CausalBinding::UserVisible | CausalBinding::ActiveRunOrBackground => {
                 self.run_causality.bind_enqueue(&request)
             }
+            CausalBinding::SystemInitiated { inherit_from } => {
+                let inherited = inherit_from.as_ref().and_then(|caller_slot_id| {
+                    state
+                        .slots
+                        .get(caller_slot_id)
+                        .and_then(|caller| caller.active.as_ref())
+                        .and_then(|active| active.batch.team_run_ids.first().cloned())
+                });
+                match inherited {
+                    Some(team_run_id) => RunBinding {
+                        team_run_id: Some(team_run_id),
+                        created_new_run: false,
+                        user_intervention: false,
+                    },
+                    None => self.run_causality.bind_system_enqueue(&request),
+                }
+            }
         };
         let lease = EnqueueLease {
             lease_id: generate_id(),

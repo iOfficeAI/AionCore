@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aionui_api_types::{TeamRunStatus, TeamRunTargetRole};
+use aionui_api_types::{TeamRunSource, TeamRunStatus, TeamRunTargetRole};
 
 use crate::events::TeamEventEmitter;
 use crate::team_run::TeamRunManager;
@@ -287,4 +287,192 @@ fn manual_or_leader_add_during_run_inherits_run_causality() {
 
     assert_eq!(manual.team_run_id.as_deref(), Some(run_id.as_str()));
     assert_eq!(leader_spawn.team_run_id.as_deref(), Some(run_id.as_str()));
+}
+
+fn acquire_system(
+    coordinator: &SlotWorkCoordinator,
+    slot_id: &str,
+    role: TeamRunTargetRole,
+    source: WorkSource,
+    inherit_from: Option<String>,
+) -> crate::work_coordinator::EnqueueLease {
+    coordinator
+        .acquire_enqueue(EnqueueRequest {
+            slot_id: slot_id.into(),
+            role,
+            source,
+            binding: CausalBinding::SystemInitiated { inherit_from },
+        })
+        .unwrap()
+}
+
+#[test]
+fn system_initiated_without_active_run_opens_system_lifecycle_run() {
+    let (coordinator, manager) = coordinator_and_manager();
+    let lease = acquire_system(
+        &coordinator,
+        "lead-1",
+        TeamRunTargetRole::Lead,
+        WorkSource::SpawnWelcome,
+        None,
+    );
+    assert!(lease.team_run_id.is_some(), "a system wake must open a run when idle");
+    coordinator.commit_enqueue(&lease, Some("m1".into())).unwrap();
+    let ReconcileDecision::Claim(_batch) = coordinator.next("lead-1") else {
+        panic!("system intent must be claimable");
+    };
+
+    assert!(manager.current_active_run_id().is_some());
+    let payload = manager.current_payload(&coordinator.snapshot()).unwrap();
+    assert_eq!(payload.source, TeamRunSource::SystemLifecycle);
+    assert!(
+        !payload.has_user_intervention,
+        "a system run must not be flagged as user-intervened"
+    );
+}
+
+#[test]
+fn system_initiated_attaches_to_existing_user_run() {
+    let (coordinator, manager) = coordinator_and_manager();
+    let user = acquire(&coordinator, CausalBinding::UserVisible);
+    let run_id = user.team_run_id.clone().unwrap();
+    coordinator.commit_enqueue(&user, Some("m-user".into())).unwrap();
+    assert_eq!(manager.current_active_run_id().as_deref(), Some(run_id.as_str()));
+
+    let system = acquire_system(
+        &coordinator,
+        "lead-1",
+        TeamRunTargetRole::Lead,
+        WorkSource::TeamMembershipChanged,
+        None,
+    );
+    assert_eq!(
+        system.team_run_id.as_deref(),
+        Some(run_id.as_str()),
+        "a system wake must attach to the active user run"
+    );
+    coordinator.commit_enqueue(&system, Some("m-system".into())).unwrap();
+
+    assert_eq!(
+        manager.current_active_run_id().as_deref(),
+        Some(run_id.as_str()),
+        "attaching must not open a second run"
+    );
+    let payload = manager.current_payload(&coordinator.snapshot()).unwrap();
+    assert_eq!(
+        payload.source,
+        TeamRunSource::UserMessage,
+        "attaching keeps the original user run"
+    );
+    assert!(
+        !payload.has_user_intervention,
+        "a system attach must not flag user intervention"
+    );
+}
+
+#[test]
+fn system_initiated_inherits_callers_running_run() {
+    let (coordinator, manager) = coordinator_and_manager();
+    coordinator.set_runtime_constraint("worker-1", RuntimeConstraint::Ready);
+    let user = acquire(&coordinator, CausalBinding::UserVisible);
+    let run_id = user.team_run_id.clone().unwrap();
+    coordinator.commit_enqueue(&user, Some("m-user".into())).unwrap();
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("caller batch must be claimable");
+    };
+    coordinator.mark_started(&batch, "turn-lead");
+
+    let inherited = acquire_system(
+        &coordinator,
+        "worker-1",
+        TeamRunTargetRole::Teammate,
+        WorkSource::SpawnWelcome,
+        Some("lead-1".into()),
+    );
+    assert_eq!(
+        inherited.team_run_id.as_deref(),
+        Some(run_id.as_str()),
+        "a system wake must inherit the caller's running run"
+    );
+    assert_eq!(
+        manager.current_active_run_id().as_deref(),
+        Some(run_id.as_str()),
+        "inheriting must not open a second run"
+    );
+    coordinator.abort_enqueue(&inherited, "test_complete");
+}
+
+#[test]
+fn system_initiated_inherit_miss_falls_back_to_new_system_run() {
+    let (coordinator, manager) = coordinator_and_manager();
+    // Caller slot has no active batch and the team has no active run, so the
+    // inherit lookup misses and we open a fresh system run.
+    let lease = acquire_system(
+        &coordinator,
+        "lead-1",
+        TeamRunTargetRole::Lead,
+        WorkSource::SpawnWelcome,
+        Some("worker-unknown".into()),
+    );
+    assert!(lease.team_run_id.is_some());
+    coordinator.commit_enqueue(&lease, Some("m1".into())).unwrap();
+
+    let payload = manager.current_payload(&coordinator.snapshot()).unwrap();
+    assert_eq!(payload.source, TeamRunSource::SystemLifecycle);
+    assert!(!payload.has_user_intervention);
+}
+
+#[test]
+fn system_run_completes_after_single_batch_no_dangling() {
+    let (coordinator, manager) = coordinator_and_manager();
+    let lease = acquire_system(
+        &coordinator,
+        "lead-1",
+        TeamRunTargetRole::Lead,
+        WorkSource::SpawnWelcome,
+        None,
+    );
+    coordinator.commit_enqueue(&lease, Some("m1".into())).unwrap();
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("system intent must be claimable");
+    };
+    coordinator.complete_batch(&batch);
+
+    let payload = manager.current_payload(&coordinator.snapshot()).unwrap();
+    assert_eq!(payload.status, TeamRunStatus::Completed);
+    assert_eq!(
+        manager.current_active_run_id(),
+        None,
+        "an idle-settle system run must not dangle after its only batch completes"
+    );
+}
+
+#[test]
+fn recovery_drain_multiple_messages_reuse_single_system_run() {
+    let (coordinator, manager) = coordinator_and_manager();
+    let first = acquire_system(
+        &coordinator,
+        "lead-1",
+        TeamRunTargetRole::Lead,
+        WorkSource::RecoveryDrain,
+        None,
+    );
+    let run_id = first.team_run_id.clone().expect("the first drain opens a system run");
+    coordinator.commit_enqueue(&first, Some("m1".into())).unwrap();
+
+    let second = acquire_system(
+        &coordinator,
+        "lead-1",
+        TeamRunTargetRole::Lead,
+        WorkSource::RecoveryDrain,
+        None,
+    );
+    coordinator.commit_enqueue(&second, Some("m2".into())).unwrap();
+
+    assert_eq!(
+        second.team_run_id.as_deref(),
+        Some(run_id.as_str()),
+        "subsequent drains must attach to the single system run, not open new ones"
+    );
+    assert_eq!(manager.current_active_run_id().as_deref(), Some(run_id.as_str()));
 }

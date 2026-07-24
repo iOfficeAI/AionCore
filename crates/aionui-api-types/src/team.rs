@@ -288,6 +288,11 @@ pub enum TeamRunStatus {
 #[serde(rename_all = "snake_case")]
 pub enum TeamRunSource {
     UserMessage,
+    /// A team run opened by a system/lifecycle wake (member add/remove,
+    /// recovery drain, idle settle, spawn welcome) rather than a user message,
+    /// so every agent turn runs inside exactly one run and run-scoped tools are
+    /// always permitted. Distinguished from `UserMessage` for observability.
+    SystemLifecycle,
 }
 
 #[derive(Debug, Deserialize)]

@@ -98,6 +98,51 @@ impl TeamRunManager {
         }
     }
 
+    /// Bind a system/lifecycle enqueue. Mirrors `bind_user_enqueue` but never
+    /// marks the run as user-intervened: attach to the active run if one exists,
+    /// otherwise open a new `SystemLifecycle` run. Like `bind_user_enqueue`, this
+    /// only creates the record and logs `team run accepted`; the
+    /// `TEAM_RUN_ACCEPTED` event is emitted by `apply_work_summary` via the
+    /// `accepted_emitted` flag, so we must not broadcast here.
+    pub(crate) fn bind_system_enqueue(&self, target_slot_id: &str, target_role: TeamRunTargetRole) -> RunBinding {
+        let mut state = self.lock_state();
+        if let Some(run) = state.as_ref().filter(|run| run.is_active()) {
+            return RunBinding {
+                team_run_id: Some(run.team_run_id.clone()),
+                created_new_run: false,
+                user_intervention: false,
+            };
+        }
+
+        let run = TeamRunRecord {
+            team_run_id: generate_id(),
+            source: TeamRunSource::SystemLifecycle,
+            has_user_intervention: false,
+            target_slot_id: target_slot_id.to_owned(),
+            target_role,
+            status: TeamRunStatus::Accepted,
+            started_at_ms: None,
+            completed_at_ms: None,
+            cancel_reason: None,
+            summary: None,
+            accepted_emitted: false,
+        };
+        let run_id = run.team_run_id.clone();
+        *state = Some(run);
+        drop(state);
+        info!(
+            team_id = %self.team_id,
+            team_run_id = %run_id,
+            target_slot_id,
+            "team run accepted"
+        );
+        RunBinding {
+            team_run_id: Some(run_id),
+            created_new_run: true,
+            user_intervention: false,
+        }
+    }
+
     pub fn current_active_run_id(&self) -> Option<String> {
         self.lock_state()
             .as_ref()
@@ -278,7 +323,12 @@ impl RunCausalityPort for TeamRunManager {
                 created_new_run: false,
                 user_intervention: false,
             },
+            CausalBinding::SystemInitiated { .. } => self.bind_system_enqueue(&request.slot_id, request.role.clone()),
         }
+    }
+
+    fn bind_system_enqueue(&self, request: &EnqueueRequest) -> RunBinding {
+        self.bind_system_enqueue(&request.slot_id, request.role.clone())
     }
 
     fn abort_binding(&self, binding: &RunBinding) {

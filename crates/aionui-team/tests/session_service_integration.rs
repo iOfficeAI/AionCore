@@ -13,7 +13,7 @@ use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{
     AcpBuildExtra, AcpConfigOptionDto, AcpConfigSelectOptionDto, AddAgentRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, TeamAgentInput, WebSocketMessage,
+    GetConfigOptionsResponse, TeamAgentInput, TeamRunSource, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
@@ -1644,7 +1644,7 @@ fn setup() -> Arc<TeamSessionService> {
 }
 
 #[tokio::test]
-async fn recovery_creates_background_intents_without_restoring_old_memory_run() {
+async fn recovery_creates_system_run_intents_without_restoring_old_memory_run() {
     let (svc, team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
     let created = svc
         .create_team(
@@ -1694,9 +1694,12 @@ async fn recovery_creates_background_intents_without_restoring_old_memory_run() 
     let requests = turn_port.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].slot_id, lead_slot_id);
-    assert_eq!(
-        requests[0].team_run_id, None,
-        "recovery work must not synthesize a user-visible TeamRun"
+    // Recovery drain now runs the recovered turn inside a freshly opened
+    // SystemLifecycle run (not run-less background, and not a restored
+    // pre-restart run), so the recovered turn carries a run id.
+    assert!(
+        requests[0].team_run_id.is_some(),
+        "recovery work must run inside a system run, not run-less background"
     );
 }
 
@@ -3464,7 +3467,7 @@ async fn aa1_add_agent_to_team() {
 }
 
 #[tokio::test]
-async fn manual_add_without_active_run_queues_background_welcome_without_creating_run() {
+async fn manual_add_without_active_run_opens_system_lifecycle_run() {
     let (svc, _, conv_repo) = setup_with_factory_and_metadata_and_conversation_repo(
         success_factory(),
         Arc::new(StubAgentMetadataRepo::empty()),
@@ -3528,7 +3531,12 @@ async fn manual_add_without_active_run_queues_background_welcome_without_creatin
     assert!(added_content["content"].as_str().unwrap().contains("manually added"));
 
     let run_state = svc.get_run_state("user1", &created.id).await.unwrap();
-    assert!(run_state.active_run.is_none());
+    // Manual add during an idle team now opens a SystemLifecycle run so the
+    // welcome and membership-change turns run inside a run (invariant: no
+    // run-less turn), rather than falling to run-less background as before.
+    let active_run = run_state.active_run.expect("manual add must open a system run");
+    assert_eq!(active_run.source, TeamRunSource::SystemLifecycle);
+    assert!(!active_run.has_user_intervention);
     assert!(run_state.slot_work.iter().any(|slot| slot.slot_id == added.slot_id));
 }
 
