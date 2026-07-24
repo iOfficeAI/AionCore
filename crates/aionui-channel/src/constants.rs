@@ -88,6 +88,9 @@ pub const WEIXIN_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Longer backoff delay after max consecutive failures.
 pub const WEIXIN_BACKOFF_DELAY: Duration = Duration::from_secs(30);
 
+/// Maximum backoff delay between WeChat poll retries (10 minutes).
+pub const WEIXIN_MAX_BACKOFF: Duration = Duration::from_secs(600);
+
 /// Long-polling timeout for WeChat getupdates (matches iLink API).
 pub const WEIXIN_POLL_TIMEOUT: Duration = Duration::from_secs(35);
 
@@ -169,5 +172,6 @@ mod tests {
         assert_eq!(WEIXIN_BACKOFF_DELAY, Duration::from_secs(30));
         assert_eq!(WEIXIN_POLL_TIMEOUT, Duration::from_secs(35));
         assert_eq!(WEIXIN_API_TIMEOUT, Duration::from_secs(15));
+        assert_eq!(WEIXIN_MAX_BACKOFF, Duration::from_secs(600));
     }
 }

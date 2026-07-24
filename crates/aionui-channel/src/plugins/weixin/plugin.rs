@@ -7,7 +7,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::constants::{WEIXIN_BACKOFF_DELAY, WEIXIN_MAX_RETRIES, WEIXIN_POLL_TIMEOUT, WEIXIN_RETRY_DELAY};
+use crate::constants::{
+    WEIXIN_BACKOFF_DELAY, WEIXIN_MAX_BACKOFF, WEIXIN_MAX_RETRIES, WEIXIN_POLL_TIMEOUT, WEIXIN_RETRY_DELAY,
+};
 use crate::error::ChannelError;
 use crate::plugin::{ChannelPlugin, PluginCallbacks};
 use crate::types::{
@@ -289,6 +291,42 @@ async fn poll_loop(
     debug!("WeChat poll loop exited");
 }
 
+/// Exponential backoff delay for WeChat poll failures: `2^n` seconds,
+/// capped at `WEIXIN_MAX_BACKOFF` (10 minutes). `saturating_pow` guards
+/// against overflow on long failure streaks.
+#[allow(dead_code)] // wired into poll_loop in Task 2
+fn backoff_delay(consecutive_failures: u32) -> Duration {
+    let secs = 2u64
+        .saturating_pow(consecutive_failures)
+        .min(WEIXIN_MAX_BACKOFF.as_secs());
+    Duration::from_secs(secs)
+}
+
+/// What to log for a single WeChat poll outcome, decided from the failure
+/// streak *before* this outcome is applied. Keeps the log-level policy in
+/// one pure, testable place; the loop performs the actual logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollLogAction {
+    /// Success while healthy — log nothing.
+    Silent,
+    /// First failure after a healthy streak (0 -> 1) — log once at warn.
+    StartedFailing,
+    /// Repeated failure while already failing — log at debug only.
+    StillFailing,
+    /// First success after one or more failures — log once at info.
+    Recovered,
+}
+
+#[allow(dead_code)] // wired into poll_loop in Task 2
+fn poll_log_action(prev_failures: u32, succeeded: bool) -> PollLogAction {
+    match (succeeded, prev_failures) {
+        (true, 0) => PollLogAction::Silent,
+        (true, _) => PollLogAction::Recovered,
+        (false, 0) => PollLogAction::StartedFailing,
+        (false, _) => PollLogAction::StillFailing,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Message handling
 // ---------------------------------------------------------------------------
@@ -410,6 +448,50 @@ mod tests {
     use super::*;
     use crate::types::PluginCredentials;
     use std::collections::HashMap;
+
+    // -- backoff_delay ---------------------------------------------------------
+
+    #[test]
+    fn backoff_delay_exponential_curve() {
+        assert_eq!(backoff_delay(1), Duration::from_secs(2));
+        assert_eq!(backoff_delay(2), Duration::from_secs(4));
+        assert_eq!(backoff_delay(3), Duration::from_secs(8));
+        assert_eq!(backoff_delay(4), Duration::from_secs(16));
+        assert_eq!(backoff_delay(5), Duration::from_secs(32));
+        assert_eq!(backoff_delay(9), Duration::from_secs(512));
+    }
+
+    #[test]
+    fn backoff_delay_caps_at_ten_minutes() {
+        assert_eq!(backoff_delay(10), Duration::from_secs(600));
+        assert_eq!(backoff_delay(20), Duration::from_secs(600));
+        // Must not overflow on large counts.
+        assert_eq!(backoff_delay(u32::MAX), Duration::from_secs(600));
+    }
+
+    // -- poll_log_action -------------------------------------------------------
+
+    #[test]
+    fn log_action_silent_when_healthy_success() {
+        assert_eq!(poll_log_action(0, true), PollLogAction::Silent);
+    }
+
+    #[test]
+    fn log_action_started_failing_on_first_failure() {
+        assert_eq!(poll_log_action(0, false), PollLogAction::StartedFailing);
+    }
+
+    #[test]
+    fn log_action_still_failing_on_repeat_failure() {
+        assert_eq!(poll_log_action(1, false), PollLogAction::StillFailing);
+        assert_eq!(poll_log_action(9, false), PollLogAction::StillFailing);
+    }
+
+    #[test]
+    fn log_action_recovered_after_failures() {
+        assert_eq!(poll_log_action(1, true), PollLogAction::Recovered);
+        assert_eq!(poll_log_action(5, true), PollLogAction::Recovered);
+    }
 
     // -- extract_content -------------------------------------------------------
 
