@@ -34,6 +34,9 @@ struct TeamAgentInputCompat {
     pub assistant_id: Option<String>,
     pub name: String,
     pub role: String,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
     pub model: String,
     #[serde(default)]
     pub conversation_id: Option<String>,
@@ -51,15 +54,13 @@ impl<'de> Deserialize<'de> for TeamAgentInput {
         D: Deserializer<'de>,
     {
         let raw = TeamAgentInputCompat::deserialize(deserializer)?;
-        let assistant_id =
-            normalize_assistant_id(raw.assistant_id).ok_or_else(|| serde::de::Error::missing_field("assistant_id"))?;
 
         Ok(Self {
             name: raw.name,
             role: raw.role,
-            backend: None,
+            backend: raw.backend,
             model: raw.model,
-            assistant_id: Some(assistant_id),
+            assistant_id: normalize_assistant_id(raw.assistant_id),
             conversation_id: raw.conversation_id,
         })
     }
