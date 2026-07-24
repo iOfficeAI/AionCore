@@ -1572,6 +1572,12 @@ async fn reader_task(
                                                 // so the agent_metadata writeback + the frontend
                                                 // AvailableCommands push see it (ELECTRON-3PX).
                                                 slash_commands: builtin_slash_commands(),
+                                                // Filled by the follow-up transport
+                                                // commit; None keeps this commit
+                                                // standalone.
+                                                current_model: None,
+                                                current_mode: None,
+                                                current_effort: None,
                                             },
                                         );
                                     }

@@ -1837,6 +1837,10 @@ fn spawn_event_pump(
                 models,
                 modes,
                 slash_commands,
+                // The additive current_model/current_mode/current_effort fields are
+                // consumed by the follow-up commit (highlight precedence); tolerated
+                // here so this commit builds standalone.
+                ..
             } = &env.event
             {
                 let mut config_options: Vec<aionui_api_types::AcpConfigOptionDto> = Vec::new();
@@ -4361,6 +4365,9 @@ mod pump_tests {
                 description: None,
             }],
             slash_commands: Vec::new(),
+            current_model: None,
+            current_mode: None,
+            current_effort: None,
         })];
         let frames = drain_script(script).await;
         let config = frames
@@ -4424,6 +4431,9 @@ mod pump_tests {
                     description: None,
                 },
             ],
+            current_model: None,
+            current_mode: None,
+            current_effort: None,
         })];
         let frames = drain_script(script).await;
         let commands = frames
@@ -4456,6 +4466,9 @@ mod pump_tests {
             }],
             modes: Vec::new(),
             slash_commands: Vec::new(),
+            current_model: None,
+            current_mode: None,
+            current_effort: None,
         })];
         let frames = drain_script(script).await;
         assert!(

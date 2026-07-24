@@ -318,6 +318,23 @@ pub enum SessionEvent {
         /// own mode semantics (claude permission-mode, etc.).
         modes: Vec<crate::capability::ModeInfo>,
         slash_commands: Vec<crate::capability::SlashCommandInfo>,
+        /// The backend's CURRENT selections at emit time, so the (backend-Arc-free)
+        /// event pump can highlight the active model/mode/effort in the pushed
+        /// config-options frame without calling `capabilities()`. Before these fields
+        /// existed the push could only read the task-runtime's optimistic overrides —
+        /// `None` until the user interactively switched — so a catalog push always
+        /// carried `current_value: null` and the picker showed no active selection
+        /// (the #609 direct-path regression against the #574 defaults). `None` = the
+        /// backend does not know that axis's current (the pump's override-wins
+        /// precedence then falls through to nothing, exactly as before).
+        /// `#[serde(default)]` keeps OLD persisted frames (no current fields)
+        /// deserializable — the additive-variant guarantee this enum maintains.
+        #[serde(default)]
+        current_model: Option<String>,
+        #[serde(default)]
+        current_mode: Option<String>,
+        #[serde(default)]
+        current_effort: Option<String>,
     },
 
     /// ⭐ Subagent lifecycle normalization (Addendum 8 / §9.12-9.14 / U22). THE
@@ -815,6 +832,11 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             SubagentUpdate { .. } => PersistTier::DisplayAndState, // roster→display; resumable→Tier2.last_subagents
             Rewound { .. } => PersistTier::State,                  // turn-truncation anchor
             AdapterSpecific { tag, .. } if is_raw_timing(tag) => PersistTier::Ephemeral,
+            // Internal reconcile signal for the task-level pump (clear the optimistic
+            // effort highlight after a backend reject) — not a user-facing history
+            // entry; the user-visible half of the same reject is the Notice that
+            // rides alongside it (Display).
+            AdapterSpecific { tag, .. } if tag == "config_option_rejected" => PersistTier::Ephemeral,
             AdapterSpecific { .. } => PersistTier::Display,
             // Orchestration-lowered already handled above; this arm is unreachable
             // for them but keeps the match total over the enum.
@@ -1600,6 +1622,23 @@ mod additive_tests {
                 );
             }
             other => panic!("expected Detached, got {other:?}"),
+        }
+        // An OLD CatalogUpdated frame (pre-currents: no current_model/current_mode/
+        // current_effort) must still deserialize → all three default to None.
+        let old_cat = r#"{"CatalogUpdated":{"models":[],"modes":[],"slash_commands":[]}}"#;
+        let ev: SessionEvent = serde_json::from_str(old_cat).expect("old CatalogUpdated deserializes");
+        match ev {
+            SessionEvent::CatalogUpdated {
+                current_model,
+                current_mode,
+                current_effort,
+                ..
+            } => {
+                assert!(current_model.is_none(), "missing current_model → None");
+                assert!(current_mode.is_none(), "missing current_mode → None");
+                assert!(current_effort.is_none(), "missing current_effort → None");
+            }
+            other => panic!("expected CatalogUpdated, got {other:?}"),
         }
         // LC-8a: a Plan frame round-trips entries (status enum + optional priority).
         let plan = r#"{"Plan":{"entries":[{"content":"a","status":"InProgress","priority":"High"},{"content":"b","status":"Pending"}],"explanation":"why"}}"#;

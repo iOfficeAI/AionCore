@@ -1776,6 +1776,12 @@ fn sniff_control_initialize(
             models: parsed_models,
             modes: crate::adapter::claude_permission_modes(),
             slash_commands: parsed_commands,
+            // The additive current_model/current_mode/current_effort fields are
+            // filled by the follow-up transport commit; None here keeps this
+            // commit standalone.
+            current_model: None,
+            current_mode: None,
+            current_effort: None,
         },
     });
 }
@@ -4731,6 +4737,7 @@ mod tests {
                     models,
                     modes,
                     slash_commands,
+                    ..
                 } = env.event
             {
                 catalog = Some((models, modes, slash_commands));
