@@ -891,6 +891,11 @@ impl TeamSessionService {
             |_| {},
         );
 
+        let carried_run_id = self
+            .sessions
+            .get(team_id)
+            .and_then(|entry| entry.session.team_run_manager().current_active_run_id());
+
         let session = match TeamSession::start_with_prompt_dump(
             team,
             self.repo.clone(),
@@ -965,6 +970,14 @@ impl TeamSessionService {
             slow_monitor_handle,
         };
         self.sessions.insert(team_id.to_owned(), entry);
+        // If the previous session had an active team run, carry it forward so
+        // team tools (e.g. team_send_message) don't fail with "no active team
+        // run for run-scoped wake" after a session restart.
+        if let Some(ref run_id) = carried_run_id {
+            if let Err(e) = session.team_run_manager().resume_run(run_id.clone()) {
+                tracing::warn!(team_id, error = %e, "failed to resume team run after session restart");
+            }
+        }
         drop(membership_guard);
         drop(ensure_guard);
 
