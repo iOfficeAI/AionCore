@@ -7,9 +7,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::constants::{
-    WEIXIN_BACKOFF_DELAY, WEIXIN_MAX_BACKOFF, WEIXIN_MAX_RETRIES, WEIXIN_POLL_TIMEOUT, WEIXIN_RETRY_DELAY,
-};
+use crate::constants::{WEIXIN_MAX_BACKOFF, WEIXIN_POLL_TIMEOUT};
 use crate::error::ChannelError;
 use crate::plugin::{ChannelPlugin, PluginCallbacks};
 use crate::types::{
@@ -218,70 +216,61 @@ async fn poll_loop(
             break;
         }
 
-        match api.get_updates(&buf).await {
+        // Reduce each round to success or a failure reason. On success we also
+        // advance the buffer and dispatch messages; on API error / transport
+        // error we only record the reason.
+        let outcome: Result<(), String> = match api.get_updates(&buf).await {
             Ok(resp) => {
                 let is_api_error = resp.ret.unwrap_or(0) != 0 || resp.errcode.unwrap_or(0) != 0;
-
                 if is_api_error {
-                    consecutive_failures += 1;
-                    warn!(
-                        ret = resp.ret,
-                        errcode = resp.errcode,
-                        consecutive_failures,
-                        "WeChat getupdates API error"
-                    );
-
-                    if consecutive_failures >= WEIXIN_MAX_RETRIES {
-                        consecutive_failures = 0;
-                        tokio::select! {
-                            _ = tokio::time::sleep(WEIXIN_BACKOFF_DELAY) => {}
-                            _ = shutdown_rx.changed() => {
-                                debug!("WeChat poll loop shutdown during backoff");
-                                break;
-                            }
-                        }
-                    } else {
-                        tokio::select! {
-                            _ = tokio::time::sleep(WEIXIN_RETRY_DELAY) => {}
-                            _ = shutdown_rx.changed() => {
-                                debug!("WeChat poll loop shutdown during retry");
-                                break;
-                            }
-                        }
+                    Err(format!(
+                        "getupdates API error ret={:?} errcode={:?}",
+                        resp.ret, resp.errcode
+                    ))
+                } else {
+                    if let Some(new_buf) = resp.get_updates_buf {
+                        buf = new_buf;
                     }
-                    continue;
-                }
-
-                consecutive_failures = 0;
-
-                if let Some(new_buf) = resp.get_updates_buf {
-                    buf = new_buf;
-                }
-
-                for msg in resp.msgs.unwrap_or_default() {
-                    handle_message(&msg, &message_tx, &context_tokens).await;
+                    for msg in resp.msgs.unwrap_or_default() {
+                        handle_message(&msg, &message_tx, &context_tokens).await;
+                    }
+                    Ok(())
                 }
             }
-            Err(e) => {
-                consecutive_failures += 1;
-                warn!(error = %e, consecutive_failures, "WeChat poll error");
+            Err(e) => Err(e.to_string()),
+        };
 
-                if consecutive_failures >= WEIXIN_MAX_RETRIES {
-                    consecutive_failures = 0;
-                    tokio::select! {
-                        _ = tokio::time::sleep(WEIXIN_BACKOFF_DELAY) => {}
-                        _ = shutdown_rx.changed() => {
-                            debug!("WeChat poll loop shutdown during backoff");
-                            break;
-                        }
+        match outcome {
+            Ok(()) => {
+                if poll_log_action(consecutive_failures, true) == PollLogAction::Recovered {
+                    info!(consecutive_failures, "WeChat poll recovered");
+                }
+                consecutive_failures = 0;
+            }
+            Err(reason) => {
+                let action = poll_log_action(consecutive_failures, false);
+                consecutive_failures += 1;
+                let delay = backoff_delay(consecutive_failures);
+                match action {
+                    PollLogAction::StartedFailing => {
+                        warn!(error = %reason, "WeChat poll started failing");
                     }
-                } else {
-                    tokio::select! {
-                        _ = tokio::time::sleep(WEIXIN_RETRY_DELAY) => {}
-                        _ = shutdown_rx.changed() => {
-                            debug!("WeChat poll loop shutdown during retry");
-                            break;
-                        }
+                    PollLogAction::StillFailing => {
+                        debug!(
+                            error = %reason,
+                            consecutive_failures,
+                            next_backoff_secs = delay.as_secs(),
+                            "WeChat poll still failing"
+                        );
+                    }
+                    // Silent / Recovered are not reachable on the failure branch.
+                    _ => {}
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown_rx.changed() => {
+                        debug!("WeChat poll loop shutdown during backoff");
+                        break;
                     }
                 }
             }
@@ -294,7 +283,6 @@ async fn poll_loop(
 /// Exponential backoff delay for WeChat poll failures: `2^n` seconds,
 /// capped at `WEIXIN_MAX_BACKOFF` (10 minutes). `saturating_pow` guards
 /// against overflow on long failure streaks.
-#[allow(dead_code)] // wired into poll_loop in Task 2
 fn backoff_delay(consecutive_failures: u32) -> Duration {
     let secs = 2u64
         .saturating_pow(consecutive_failures)
@@ -317,7 +305,6 @@ enum PollLogAction {
     Recovered,
 }
 
-#[allow(dead_code)] // wired into poll_loop in Task 2
 fn poll_log_action(prev_failures: u32, succeeded: bool) -> PollLogAction {
     match (succeeded, prev_failures) {
         (true, 0) => PollLogAction::Silent,
