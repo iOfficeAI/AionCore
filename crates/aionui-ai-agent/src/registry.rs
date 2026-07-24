@@ -671,11 +671,17 @@ async fn validate_cli_availability(
     };
 
     match crate::cli_probe::validate(&meta).await {
-        Ok(()) => (meta, None),
-        Err(detail) => {
+        Ok(_) => (meta, None),
+        Err(failure) => {
             meta.available = false;
             meta.resolved_command = None;
-            (meta, Some(UnavailableReason::PrimaryUnusable { binary, detail }))
+            (
+                meta,
+                Some(UnavailableReason::PrimaryUnusable {
+                    binary,
+                    detail: failure.detail(),
+                }),
+            )
         }
     }
 }
