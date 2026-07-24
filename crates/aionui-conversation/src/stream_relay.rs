@@ -488,7 +488,14 @@ impl StreamRelay {
                             self.adapter.persist_tool_group(entries).await;
                         }
                         AgentStreamEvent::Tips(data) => {
-                            if matches!(data.tip_type, TipType::Success | TipType::Warning | TipType::Info) {
+                            // Only a Success tip blocks auto-replay: it can represent
+                            // completed work product. Warning/Info tips are system
+                            // diagnostics (e.g. codex rejecting a mode seed against a
+                            // dead thread, ELECTRON-3Q0) — counting them as visible
+                            // output made every such failed attempt "unsafe to
+                            // replay", so the transparent dead-anchor recovery never
+                            // fired on cron turns.
+                            if matches!(data.tip_type, TipType::Success) {
                                 attempt.saw_visible_output = true;
                             }
                             if data.code.as_deref() == Some("ACP_EMPTY_TURN_NEEDS_AUTH") {
@@ -1322,6 +1329,61 @@ mod tests {
             saw_error |= event.data["type"] == "error";
         }
         assert!(saw_error, "unsafe errors are still broadcast");
+    }
+
+    // ELECTRON-3Q0: a Warning/Info tip is a system diagnostic (e.g. codex
+    // rejecting a mode seed against a dead thread), NOT assistant output — it
+    // must not make a failed attempt unsafe to auto-replay, or the dead-anchor
+    // recovery never fires on cron turns (the mode seed always precedes the send).
+    #[tokio::test]
+    async fn warning_tip_before_retryable_error_stays_clean_for_replay() {
+        use aionui_ai_agent::protocol::events::{TipType, TipsEventData};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, rx) = broadcast::channel(8);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "msg-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        )
+        .with_turn_completion(false)
+        .with_defer_clean_terminal_errors(true);
+
+        tx.send(AgentStreamEvent::Tips(TipsEventData {
+            content: "Codex rejected mode change".into(),
+            tip_type: TipType::Warning,
+            code: None,
+            params: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Error(ErrorEventData {
+            message: "codex rejected the turn request: thread not found: 0199-dead".into(),
+            code: Some(AgentErrorCode::UserAgentSessionNotFound),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let outcome = relay.consume(rx).await;
+
+        assert!(
+            !outcome.attempt.saw_visible_output,
+            "a Warning tip is not assistant output"
+        );
+        assert!(
+            outcome.attempt.safe_to_auto_replay(),
+            "the failed attempt must stay eligible for the dead-anchor auto-replay"
+        );
     }
 
     #[tokio::test]

@@ -347,7 +347,7 @@ impl ConversationTurnOrchestrator {
         })
     }
 
-    pub(crate) async fn run_user_turn(self, input: TurnStartInput) -> ConversationTurnResult {
+    pub(crate) async fn run_user_turn(self, mut input: TurnStartInput) -> ConversationTurnResult {
         let mut turn_claim = input.turn_claim;
         let conv_id = input.conversation.id.clone();
         let turn_id = input.turn_id.clone();
@@ -456,6 +456,15 @@ impl ConversationTurnOrchestrator {
                             &attempt_result.outcome,
                             &self.task_manager,
                         )
+                        .await;
+                    // ELECTRON-3Q0: attempt 1's dead-anchor self-heal cleared
+                    // `acp_session.session_id` mid-turn (persist_side_effects runs
+                    // BEFORE the terminal reaches this loop). The turn-start
+                    // snapshot still holds the stale anchor — refresh ONLY the
+                    // anchor fields so the rebuilt task opens Fresh instead of
+                    // re-resuming the same dead session.
+                    self.service
+                        .refresh_resume_anchor_for_replay(&conv_id, &mut input.build_options)
                         .await;
                     replayed = true;
                     continue;

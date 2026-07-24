@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, now_ms};
 use aionui_session::{
-    Command, CommandMeta, ContentBlock, SessionBackend, SessionEnvelope, SessionEvent, ToolResultContent,
+    BackendError, Command, CommandMeta, ContentBlock, SessionBackend, SessionEnvelope, SessionEvent, ToolResultContent,
 };
 use futures_util::stream::BoxStream;
 use tokio::sync::broadcast;
@@ -943,11 +943,38 @@ impl IAgentTask for SessionAgentTask {
             session_id: self.runtime.session_id(),
         }));
         self.runtime.set_status(ConversationStatus::Running);
-        self.backend
-            .dispatch(cmd)
-            .await
-            .map(|_receipt| ())
-            .map_err(|e| AgentSendError::from_agent_error(AgentError::bad_gateway(e.to_string())))
+        match self.backend.dispatch(cmd).await {
+            Ok(_receipt) => Ok(()),
+            // Dead resume anchor surfaced at DISPATCH time (codex rejected the
+            // thread/resume → bound-thread poison, ELECTRON-3Q0): the stored anchor
+            // can never resume again — clear it NOW so the auto-replay (and any
+            // later send) rebuilds Fresh. The stream-side self-heal
+            // (`is_dead_resume_anchor`) cannot cover this path: a dispatch error
+            // never becomes a `TurnResult` on the event pump.
+            Err(BackendError::SessionNotFound(detail)) => {
+                if let Some(repo) = self.session_repo.as_ref() {
+                    match repo.clear_session_id(&self.conversation_id).await {
+                        Ok(_) => tracing::info!(
+                            conversation_id = %self.conversation_id,
+                            "send: cleared dead resume anchor (backend session not found) — next attempt opens Fresh"
+                        ),
+                        Err(err) => tracing::warn!(
+                            conversation_id = %self.conversation_id,
+                            error = %err,
+                            "send: clear_session_id failed"
+                        ),
+                    }
+                }
+                // The "Session not found" prefix classifies as
+                // `UserAgentSessionNotFound` (retryable) so `TurnRecoveryPolicy`
+                // auto-replays once — with the anchor cleared above, the replay
+                // opens Fresh and recovers transparently.
+                Err(AgentSendError::from_agent_error(AgentError::not_found(format!(
+                    "Session not found: {detail}"
+                ))))
+            }
+            Err(e) => Err(AgentSendError::from_agent_error(AgentError::bad_gateway(e.to_string()))),
+        }
     }
 
     async fn cancel(&self) -> Result<(), AgentError> {
@@ -3689,6 +3716,69 @@ mod persist_tests {
             selections.get(EFFORT_CONFIG_KEY).map(String::as_str),
             Some("high"),
             "the chosen effort must be persisted into config_selections"
+        );
+    }
+
+    /// A backend whose dispatch reports the session as gone (codex resume-poison:
+    /// `bound_thread_within` fails fast after a rejected thread/resume).
+    struct DeadSessionBackend;
+
+    #[async_trait::async_trait]
+    impl SessionBackend for DeadSessionBackend {
+        async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            Err(BackendError::SessionNotFound(
+                "codex thread/resume failed: no rollout found for thread id th-dead".into(),
+            ))
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    // ELECTRON-3Q0 fix B2: a DISPATCH-time dead-session error never becomes a
+    // `TurnResult` on the event pump, so the stream-side self-heal
+    // (`is_dead_resume_anchor`) cannot clear the anchor for it. send_message must
+    // clear it directly and classify the failure as the retryable
+    // UserAgentSessionNotFound so the turn orchestrator auto-replays (Fresh).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_dispatch_session_not_found_clears_anchor_and_classifies() {
+        let (repo, _db) = seeded_repo().await;
+        repo.update_session_id("conv-1", "dead-anchor").await.unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(DeadSessionBackend);
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "/w".into(),
+            backend,
+            Some(repo.clone()),
+        );
+
+        let err = crate::agent_task::IAgentTask::send_message(
+            task.as_ref(),
+            SendMessageData {
+                content: "hi".into(),
+                msg_id: "m1".into(),
+                turn_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("dispatch fails with SessionNotFound");
+
+        assert_eq!(
+            err.code(),
+            Some(aionui_api_types::AgentErrorCode::UserAgentSessionNotFound),
+            "classified as the retryable session-not-found so TurnRecoveryPolicy replays once"
+        );
+        let row = repo.get("conv-1").await.unwrap().expect("row exists");
+        assert!(
+            row.session_id.is_none(),
+            "a dispatch-time dead session must clear the resume anchor — the replay/next send opens Fresh"
         );
     }
 

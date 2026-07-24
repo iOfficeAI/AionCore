@@ -519,6 +519,21 @@ fn unknown_upstream_classification() -> ClassifiedError {
 }
 
 fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
+    // codex dead resume anchor (ELECTRON-3Q0): `thread/resume` against a threadId
+    // with no on-disk rollout / `turn/start` against a threadId unknown to the
+    // process (verified: samples/codex-cli/0.144.1/dead_resume.jsonl). MUST
+    // precede `classify_provider_text` — its generic "not found" arm would
+    // misread this as a non-retryable provider-endpoint 404 and block the
+    // auto-replay that recovers the conversation (the anchor is already cleared
+    // by the time the replay decision runs).
+    if lower.contains("no rollout found for thread id") || lower.contains("thread not found:") {
+        return Some(agent_error(
+            "The Agent session was not found",
+            AgentErrorCode::UserAgentSessionNotFound,
+            true,
+            AgentErrorResolutionKind::ReconnectAgent,
+        ));
+    }
     if lower.contains("agent process exited before initialize handshake completed") {
         return Some(agent_error(
             "The selected Agent exited before it finished starting",
@@ -1847,6 +1862,25 @@ mod tests {
         assert_eq!(acp_err.stream_error().retryable, Some(false));
         assert_eq!(acp_err.stream_error().feedback_recommended, Some(false));
         assert!(acp_err.stream_error().resolution.is_none());
+    }
+
+    // ELECTRON-3Q0: the codex dead-thread rejections (verified:
+    // samples/codex-cli/0.144.1/dead_resume.jsonl) are a dead SESSION, not a
+    // provider-endpoint 404 — they must classify as the retryable
+    // UserAgentSessionNotFound (the anchor is already cleared; the auto-replay
+    // reopens Fresh). The generic "not found" arm previously swallowed them as
+    // the non-retryable UserLlmProviderEndpointNotFound, blocking the replay.
+    #[test]
+    fn classifies_codex_dead_thread_as_retryable_session_not_found() {
+        for detail in [
+            "codex rejected the turn request: thread not found: 0199-dead",
+            "codex thread/resume failed: no rollout found for thread id 0199-dead",
+        ] {
+            let err = AgentSendError::from_agent_error(AgentError::bad_gateway(detail));
+            assert_eq!(err.code(), Some(AgentErrorCode::UserAgentSessionNotFound), "{detail}");
+            assert_eq!(err.stream_error().retryable, Some(true), "{detail}");
+            assert_eq!(err.ownership(), Some(AgentErrorOwnership::UserAgent), "{detail}");
+        }
     }
 
     #[test]

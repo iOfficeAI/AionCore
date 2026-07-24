@@ -13,7 +13,7 @@ use aionui_common::{AgentType, WorkspacePathValidationError, validate_workspace_
 use aionui_db::models::ConversationRow;
 use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository};
 use chrono::Datelike;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::convert::string_to_enum;
 use crate::error::ConversationError;
@@ -232,7 +232,7 @@ impl<'a> SessionContextBuilder<'a> {
             .await?;
         let session_id = session_row.as_ref().and_then(|row| row.session_id.clone());
         let session_snapshot = self
-            .load_acp_session_snapshot(row, &config, session_id.as_deref())
+            .load_acp_session_snapshot(&row.id, &config, session_id.as_deref())
             .await?;
 
         Ok(AcpSessionBuildContext {
@@ -315,13 +315,13 @@ impl<'a> SessionContextBuilder<'a> {
 
     async fn load_acp_session_snapshot(
         &self,
-        row: &ConversationRow,
+        conversation_id: &str,
         config: &AcpBuildExtra,
         session_id: Option<&str>,
     ) -> Result<Option<PersistedSessionState>, ConversationError> {
         if session_id.is_none() {
             debug!(
-                conversation_id = %row.id,
+                conversation_id,
                 "session_context: skipping ACP runtime snapshot before session assignment"
             );
             return Ok(None);
@@ -329,7 +329,7 @@ impl<'a> SessionContextBuilder<'a> {
 
         let db_state = self
             .acp_session_repo
-            .load_runtime_state(&row.id)
+            .load_runtime_state(conversation_id)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load acp_session runtime state: {e}")))?;
         let snapshot = db_state.map(decode_persisted_session_state);
@@ -343,11 +343,52 @@ impl<'a> SessionContextBuilder<'a> {
                 .is_some_and(|value| !value.is_empty())
         {
             debug!(
-                conversation_id = %row.id,
+                conversation_id,
                 "session_context: using legacy ACP extra.current_model_id as startup seed"
             );
         }
         Ok(snapshot)
+    }
+
+    /// Re-resolve ONLY the resume anchor (`session_id` + its runtime snapshot)
+    /// into an already-built `BuildTaskOptions`, leaving every turn-scoped field
+    /// (model, skills, workspace, config) frozen.
+    ///
+    /// Used by the turn orchestrator's auto-replay (ELECTRON-3Q0): the turn-start
+    /// snapshot deliberately freezes the turn's parameters, but the resume anchor
+    /// is backend CONNECTION state — attempt 1's dead-anchor self-heal clears
+    /// `acp_session.session_id` mid-turn, and the replay must see that clear.
+    /// Replaying the frozen snapshot re-resumed the same dead session and failed
+    /// identically, defeating the self-heal. Non-ACP kinds carry no anchor → no-op.
+    pub(crate) async fn refresh_resume_anchor(
+        &self,
+        conversation_id: &str,
+        options: &mut BuildTaskOptions,
+    ) -> Result<(), ConversationError> {
+        let AgentSessionKind::Acp(ctx) = &mut options.context.kind else {
+            return Ok(());
+        };
+        let session_row = self
+            .acp_session_repo
+            .get(conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load acp_session row: {e}")))?;
+        let session_id = session_row.as_ref().and_then(|row| row.session_id.clone());
+        if session_id == ctx.session_id {
+            return Ok(());
+        }
+        let session_snapshot = self
+            .load_acp_session_snapshot(conversation_id, &ctx.config, session_id.as_deref())
+            .await?;
+        info!(
+            conversation_id,
+            had_anchor = ctx.session_id.is_some(),
+            has_anchor = session_id.is_some(),
+            "session_context: refreshed resume anchor for replay (turn-start snapshot was stale)"
+        );
+        ctx.session_id = session_id;
+        ctx.session_snapshot = session_snapshot;
+        Ok(())
     }
 }
 
@@ -1183,5 +1224,88 @@ mod tests {
             Some(aionrs_seed("auto", Some("yolo"))),
         );
         assert_eq!(ctx.config.session_mode.as_deref(), Some("auto_edit"));
+    }
+
+    // ELECTRON-3Q0 fix C: the auto-replay must see attempt 1's mid-turn anchor
+    // clear. refresh_resume_anchor re-resolves ONLY session_id + session_snapshot
+    // into the frozen turn-start snapshot; every turn-scoped field stays put.
+    #[tokio::test]
+    async fn refresh_resume_anchor_picks_up_midturn_clear_and_freezes_the_rest() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-claude-test", "claude").await;
+        repos
+            .acp_session_repo
+            .create(&CreateAcpSessionParams {
+                conversation_id: "conv-1",
+                agent_source: "builtin",
+                agent_id: "builtin-claude-test",
+            })
+            .await
+            .unwrap();
+        repos
+            .acp_session_repo
+            .update_session_id("conv-1", "dead-anchor")
+            .await
+            .unwrap();
+        let row = row("acp", serde_json::json!({ "backend": "claude" }), None);
+        let mut options = repos.builder().build_options(&row, None).await.unwrap();
+
+        // The dead-anchor self-heal (session layer) clears the anchor mid-turn.
+        repos.acp_session_repo.clear_session_id("conv-1").await.unwrap();
+        repos
+            .builder()
+            .refresh_resume_anchor("conv-1", &mut options)
+            .await
+            .unwrap();
+
+        let acp = acp_context(options.context);
+        assert_eq!(
+            acp.session_id, None,
+            "the replay must open Fresh — replaying the stale turn-start anchor re-resumes the dead session"
+        );
+        assert!(
+            acp.session_snapshot.is_none(),
+            "no anchor → no resume snapshot (mirrors build_acp_context's skip)"
+        );
+        assert_eq!(
+            acp.config.backend.as_deref(),
+            Some("claude"),
+            "turn-scoped config stays frozen — only the anchor fields refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_resume_anchor_noop_when_anchor_unchanged() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-claude-test", "claude").await;
+        repos
+            .acp_session_repo
+            .create(&CreateAcpSessionParams {
+                conversation_id: "conv-1",
+                agent_source: "builtin",
+                agent_id: "builtin-claude-test",
+            })
+            .await
+            .unwrap();
+        repos
+            .acp_session_repo
+            .update_session_id("conv-1", "live-anchor")
+            .await
+            .unwrap();
+        let row = row("acp", serde_json::json!({ "backend": "claude" }), None);
+        let mut options = repos.builder().build_options(&row, None).await.unwrap();
+
+        repos
+            .builder()
+            .refresh_resume_anchor("conv-1", &mut options)
+            .await
+            .unwrap();
+
+        let acp = acp_context(options.context);
+        assert_eq!(
+            acp.session_id.as_deref(),
+            Some("live-anchor"),
+            "an unchanged anchor is left exactly as the turn-start snapshot had it"
+        );
     }
 }

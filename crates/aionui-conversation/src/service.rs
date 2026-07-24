@@ -3345,6 +3345,22 @@ impl ConversationService {
             .await
     }
 
+    /// Re-read the persisted resume anchor into a turn's `BuildTaskOptions`
+    /// before an auto-replay (see `SessionContextBuilder::refresh_resume_anchor`).
+    /// Best-effort: a refresh failure keeps the turn-start snapshot (= the
+    /// pre-fix behavior) and warns, so the replay itself still runs.
+    pub(crate) async fn refresh_resume_anchor_for_replay(&self, conv_id: &str, options: &mut BuildTaskOptions) {
+        let builder =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo);
+        if let Err(err) = builder.refresh_resume_anchor(conv_id, options).await {
+            warn!(
+                conversation_id = %conv_id,
+                error = %err,
+                "replay: resume-anchor refresh failed — replaying with the turn-start snapshot"
+            );
+        }
+    }
+
     fn apply_conversation_runtime_context(
         &self,
         build_opts: &mut BuildTaskOptions,

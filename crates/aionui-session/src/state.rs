@@ -364,7 +364,15 @@ pub fn is_unrecoverable_resume_error(reason: &ErrorReason) -> bool {
     matches!(
         reason,
         ErrorReason::Backend { message, .. }
+            // claude: `--resume <uuid>` against an unknown session exits with
+            // "No conversation found with session ID: <uuid>".
             if message.contains("No conversation found") || message.contains("error_during_execution")
+            // codex: thread/resume against a threadId with no on-disk rollout
+            // ("no rollout found for thread id <uuid>") and turn/start against a
+            // threadId unknown to the process ("thread not found: <uuid>").
+            // verified: samples/codex-cli/0.144.1/dead_resume.jsonl
+            || message.contains("no rollout found for thread id")
+            || message.contains("thread not found:")
     )
 }
 
@@ -622,6 +630,23 @@ mod tests {
             is_unrecoverable_resume_error(&backend(None, "error_during_execution")),
             "the error_during_execution subtype (stderr-only cause) MUST self-heal"
         );
+        // codex dead-anchor wire messages, as carried into the synthesized
+        // terminals (verified: samples/codex-cli/0.144.1/dead_resume.jsonl):
+        // thread/resume against a threadId with no on-disk rollout, and
+        // turn/start against a threadId unknown to the process.
+        assert!(is_unrecoverable_resume_error(&backend(
+            None,
+            "codex thread/resume failed: no rollout found for thread id 0199-dead"
+        )));
+        assert!(is_unrecoverable_resume_error(&backend(
+            None,
+            "codex rejected the turn request: thread not found: 0199-dead"
+        )));
+        // A codex transient failure must NOT clear the anchor.
+        assert!(!is_unrecoverable_resume_error(&backend(
+            None,
+            "codex rejected the turn request: server overloaded, please retry"
+        )));
         // A genuine backend error that is NOT a bad resume → false (must NOT
         // clear the session id / evict on a normal 429 or auth failure).
         assert!(!is_unrecoverable_resume_error(&backend(Some(429), "rate limited")));
