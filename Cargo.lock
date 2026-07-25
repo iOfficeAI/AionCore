@@ -778,7 +778,9 @@ version = "0.1.53"
 dependencies = [
  "aionui-common",
  "aionui-db",
+ "async-trait",
  "chrono",
+ "notify",
  "serde",
  "tempfile",
  "thiserror 2.0.18",

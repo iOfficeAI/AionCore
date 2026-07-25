@@ -10,6 +10,7 @@
 
 pub mod canonical;
 pub mod containment;
+pub mod runtime;
 mod service;
 pub mod types;
 
