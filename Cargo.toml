@@ -7,6 +7,8 @@ members = [
     "crates/aionui-api-types",
     "crates/aionui-realtime",
     "crates/aionui-runtime",
+    "crates/aionui-process",
+    "crates/aionui-session",
     "crates/aionui-auth",
     "crates/aionui-system",
     "crates/aionui-file",
@@ -19,13 +21,14 @@ members = [
     "crates/aionui-channel",
     "crates/aionui-team-prompts",
     "crates/aionui-team",
+    "crates/aionui-project",
     "crates/aionui-cron",
     "crates/aionui-assistant",
     "crates/aionui-app",
 ]
 
 [workspace.package]
-version = "0.1.47"
+version = "0.1.52"
 edition = "2024"
 license = "MIT"
 
@@ -37,6 +40,8 @@ aionui-db = { path = "crates/aionui-db" }
 aionui-api-types = { path = "crates/aionui-api-types" }
 aionui-realtime = { path = "crates/aionui-realtime" }
 aionui-runtime = { path = "crates/aionui-runtime" }
+aionui-process = { path = "crates/aionui-process" }
+aionui-session = { path = "crates/aionui-session" }
 aionui-auth = { path = "crates/aionui-auth" }
 aionui-system = { path = "crates/aionui-system" }
 aionui-file = { path = "crates/aionui-file" }
@@ -49,16 +54,17 @@ aionui-extension = { path = "crates/aionui-extension" }
 aionui-channel = { path = "crates/aionui-channel" }
 aionui-team-prompts = { path = "crates/aionui-team-prompts" }
 aionui-team = { path = "crates/aionui-team" }
+aionui-project = { path = "crates/aionui-project" }
 aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
-aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.3" }
-aion-providers = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.3" }
-aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.3" }
-aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.3" }
-aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.3" }
-aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.3" }
+aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.7" }
+aion-providers = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.7" }
+aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.7" }
+aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.7" }
+aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.7" }
+aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.7" }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }
@@ -101,6 +107,7 @@ aes-gcm = "0.10"
 
 # UUID
 uuid = { version = "1", features = ["v7"] }
+url = "2"
 
 # HTTP client — use rustls with native roots to align backend trust with the host system.
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls-native-roots"], default-features = false }
@@ -141,6 +148,7 @@ zstd = "0.13"
 cron = "0.15"
 chrono = "0.4"
 chrono-tz = "0.10"
+iana-time-zone = "0.1"
 
 # Shell
 open = "5"
@@ -180,6 +188,7 @@ http-body-util = "0.1"
 # Testing
 tempfile = "3"
 wiremock = "0.6"
+proptest = "1"
 
 # Random
 getrandom = "0.2"

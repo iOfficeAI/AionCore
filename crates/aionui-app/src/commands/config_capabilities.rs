@@ -58,6 +58,9 @@ pub(crate) fn data() -> Value {
                 no_input(&["capabilities"], "Print this agent-readable capability contract.", false),
                 no_input(&["context"], "Read the current runtime context and current conversation assistant.", false),
             ]),
+            domain("conversation", &[
+                stdin(&["conversation", "rename"], "Rename a conversation.", &["conversation_id", "name"], &["conversation_id"], true, false),
+            ]),
             domain("assistants", &[
                 no_input(&["assistants", "list"], "List assistants.", false),
                 stdin(&["assistants", "get"], "Read one assistant.", &["assistant_id", "locale"], &["assistant_id"], false, false),

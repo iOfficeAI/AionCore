@@ -7,6 +7,7 @@ use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{
     ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
+    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
 };
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
@@ -37,6 +38,7 @@ use aionui_db::{
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
+use aionui_project::{ProjectService, canonical};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
 use chrono::Datelike;
@@ -49,7 +51,7 @@ use crate::convert::{
     row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
 };
 use crate::error::ConversationError;
-use crate::session_context::SessionContextBuilder;
+use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
@@ -317,9 +319,13 @@ pub struct ConversationService {
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
+    /// Project-bind side branch (optional). `None` → binding is a no-op, so
+    /// conversation create/read behaves exactly as before.
+    project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
+    runtime_token_service: Option<Arc<RuntimeTokenService>>,
 
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -389,9 +395,11 @@ impl ConversationService {
             assistant_preference_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
+            project_service: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
+            runtime_token_service: None,
 
             conversation_repo,
             agent_metadata_repo,
@@ -410,6 +418,11 @@ impl ConversationService {
         self
     }
 
+    pub fn with_runtime_token_service(mut self, runtime_token_service: Arc<RuntimeTokenService>) -> Self {
+        self.runtime_token_service = Some(runtime_token_service);
+        self
+    }
+
     pub fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, ConversationError> {
         let ws_path = auto_workspace_parent(&self.workspace_root).join(format!("team-temp-{team_id}"));
         std::fs::create_dir_all(&ws_path)
@@ -420,6 +433,50 @@ impl ConversationService {
     pub fn with_mcp_server_repo(&self, repo: Arc<dyn IMcpServerRepository>) {
         if let Ok(mut guard) = self.mcp_server_repo.write() {
             *guard = Some(repo);
+        }
+    }
+
+    /// Inject the project-bind service (project-bind side branch). When unset,
+    /// [`Self::bind_project_best_effort`] is a no-op.
+    pub fn with_project_service(&self, project_service: Arc<ProjectService>) {
+        if let Ok(mut guard) = self.project_service.write() {
+            *guard = Some(project_service);
+        }
+    }
+
+    /// Project-bind side branch: resolve the owner's workspace into a
+    /// project/folder and backfill `conversations.project_id`/`folder_id`.
+    ///
+    /// Best-effort by contract: a missing service, a bad URI, a resolve
+    /// failure, or an update failure are all logged at `warn` and swallowed.
+    /// This must NEVER affect conversation creation or reads.
+    async fn bind_project_best_effort(&self, conversation_id: &str, workspace_path: &str) {
+        let project_service = self.project_service.read().ok().and_then(|guard| guard.clone());
+        let Some(project_service) = project_service else {
+            return;
+        };
+        let uri = match canonical::to_file_uri(Path::new(workspace_path)) {
+            Ok(uri) => uri,
+            Err(err) => {
+                warn!(conversation_id = %conversation_id, error = err.code(), "project bind skipped: bad workspace uri");
+                return;
+            }
+        };
+        match project_service.resolve_existing(uri).await {
+            Ok(out) => {
+                let update = ConversationRowUpdate {
+                    project_id: Some(out.project.project_id),
+                    folder_id: Some(out.folder.folder_id),
+                    updated_at: Some(now_ms()),
+                    ..Default::default()
+                };
+                if let Err(err) = self.conversation_repo.update(conversation_id, &update).await {
+                    warn!(conversation_id = %conversation_id, error = %ErrorChain(&err), "project bind: backfill update failed");
+                }
+            }
+            Err(err) => {
+                warn!(conversation_id = %conversation_id, error = err.code(), "project bind skipped");
+            }
         }
     }
 
@@ -1104,9 +1161,21 @@ impl ConversationService {
             pinned_at: None,
             created_at: now,
             updated_at: now,
+            project_id: None,
+            folder_id: None,
         };
 
         self.conversation_repo.create(&row).await?;
+
+        // Project-bind side branch (best-effort; never affects creation).
+        // Uses the workspace the existing flow already decided + created.
+        if let Some(workspace) = extra
+            .get("workspace")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            self.bind_project_best_effort(&id, workspace).await;
+        }
 
         if let Some(snapshot) = assistant_snapshot.as_ref() {
             let resolved_skill_ids = serde_json::to_string(&snapshot.resolved_defaults.skill_ids).map_err(|e| {
@@ -1737,6 +1806,15 @@ impl ConversationService {
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra)
             .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
         self.backfill_extra_inplace(&row.id, &mut extra).await;
+        // Project-bind side branch: lazily backfill owner binding on read.
+        if row.project_id.is_none()
+            && let Some(workspace) = extra
+                .get("workspace")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        {
+            self.bind_project_best_effort(&row.id, workspace).await;
+        }
         let mut response = row_to_response_with_extra(row, extra, &self.workspace_root)?;
         self.attach_assistant_identity(&mut response).await?;
         response.runtime = Some(self.runtime_summary_for(id).await);
@@ -1913,6 +1991,8 @@ impl ConversationService {
             extra: merged_extra,
             status: None,
             updated_at: Some(now),
+            project_id: None,
+            folder_id: None,
         };
 
         self.conversation_repo.update(id, &updates).await?;
@@ -3209,6 +3289,34 @@ pub(crate) fn agent_error_top_level_code(error: &AgentError) -> &'static str {
 }
 
 impl ConversationService {
+    /// Loads the persisted runtime permission gate inputs for an aionrs
+    /// rebuild. Returns `None` for non-aionrs conversations and for aionrs
+    /// conversations without a persisted assistant snapshot (assistant-less
+    /// sessions are out of scope — spec §5). This is the only place a
+    /// `conversation_repo` handle is needed, so the seed is computed here and
+    /// threaded into `SessionContextBuilder` (spec §7.3, A-2).
+    async fn load_aionrs_permission_seed(
+        &self,
+        row: &aionui_db::models::ConversationRow,
+    ) -> Result<Option<AionrsRuntimePermissionSeed>, ConversationError> {
+        if row.r#type != AgentType::Aionrs.serde_name() {
+            return Ok(None);
+        }
+        let snapshot = self
+            .conversation_repo
+            .get_assistant_snapshot(&row.id)
+            .await
+            .map_err(|e| {
+                ConversationError::internal(format!(
+                    "Failed to load assistant snapshot for aionrs permission seed: {e}"
+                ))
+            })?;
+        Ok(snapshot.map(|snapshot| AionrsRuntimePermissionSeed {
+            default_permission_mode: snapshot.default_permission_mode,
+            resolved_permission_value: snapshot.resolved_permission_value,
+        }))
+    }
+
     /// Build typed agent runtime context from a conversation database row.
     ///
     /// Raw `conversation.extra` parsing lives in [`SessionContextBuilder`]
@@ -3219,8 +3327,9 @@ impl ConversationService {
         row: &aionui_db::models::ConversationRow,
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
+        let seed = self.load_aionrs_permission_seed(row).await?;
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options(row)
+            .build_options(row, seed)
             .await
     }
 
@@ -3230,9 +3339,26 @@ impl ConversationService {
         workspace_override: Option<&str>,
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
+        let seed = self.load_aionrs_permission_seed(row).await?;
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options_with_workspace_override(row, workspace_override)
+            .build_options_with_workspace_override(row, workspace_override, seed)
             .await
+    }
+
+    /// Re-read the persisted resume anchor into a turn's `BuildTaskOptions`
+    /// before an auto-replay (see `SessionContextBuilder::refresh_resume_anchor`).
+    /// Best-effort: a refresh failure keeps the turn-start snapshot (= the
+    /// pre-fix behavior) and warns, so the replay itself still runs.
+    pub(crate) async fn refresh_resume_anchor_for_replay(&self, conv_id: &str, options: &mut BuildTaskOptions) {
+        let builder =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo);
+        if let Err(err) = builder.refresh_resume_anchor(conv_id, options).await {
+            warn!(
+                conversation_id = %conv_id,
+                error = %err,
+                "replay: resume-anchor refresh failed — replaying with the turn-start snapshot"
+            );
+        }
     }
 
     fn apply_conversation_runtime_context(
@@ -3241,12 +3367,31 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
     ) {
+        let runtime_token = self.runtime_token_for_build(build_opts, user_id, conversation_id);
         build_opts.apply_conversation_runtime_context(
             user_id,
             conversation_id,
             self.runtime_helper_bin.as_deref(),
             self.runtime_base_url.as_deref(),
+            runtime_token.as_deref(),
         );
+    }
+
+    fn runtime_token_for_build(
+        &self,
+        build_opts: &BuildTaskOptions,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Option<String> {
+        build_opts.context.team.as_ref()?;
+        let service = self.runtime_token_service.as_ref()?;
+        let issue = service.issue(
+            user_id,
+            conversation_id,
+            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
+        );
+        Some(issue.token)
     }
 
     /// Ensure native skill links exist in the runtime workspace. Auto

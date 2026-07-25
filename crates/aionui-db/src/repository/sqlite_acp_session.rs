@@ -76,6 +76,17 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn clear_session_id(&self, conversation_id: &str) -> Result<bool, DbError> {
+        let now = now_ms();
+        let result =
+            sqlx::query("UPDATE acp_session SET session_id = NULL, last_active_at = ? WHERE conversation_id = ?")
+                .bind(now)
+                .bind(conversation_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn delete(&self, conversation_id: &str) -> Result<bool, DbError> {
         let result = sqlx::query("DELETE FROM acp_session WHERE conversation_id = ?")
             .bind(conversation_id)
@@ -261,6 +272,27 @@ mod tests {
     async fn update_session_id_missing_row_returns_false() {
         let (repo, _db) = setup().await;
         assert!(!repo.update_session_id("nope", "sid").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn clear_session_id_nulls_field_but_keeps_row() {
+        let (repo, _db) = setup().await;
+        repo.create(&create_params("conv-1")).await.unwrap();
+        repo.update_session_id("conv-1", "sess-abc").await.unwrap();
+
+        assert!(repo.clear_session_id("conv-1").await.unwrap());
+        let fetched = repo.get("conv-1").await.unwrap().unwrap();
+        assert_eq!(fetched.session_id, None, "the resume anchor must be nulled");
+        assert_eq!(
+            fetched.session_status, "idle",
+            "the row (and its config) survives the clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_session_id_missing_row_returns_false() {
+        let (repo, _db) = setup().await;
+        assert!(!repo.clear_session_id("nope").await.unwrap());
     }
 
     #[tokio::test]

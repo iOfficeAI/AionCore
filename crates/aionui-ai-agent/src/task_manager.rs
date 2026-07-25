@@ -12,7 +12,8 @@ use tracing::{debug, info, warn};
 use crate::active_lease::ActiveLeaseRegistry;
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
-use crate::types::{BuildTaskOptions, RuntimeCapabilities};
+use crate::runtime_token::{RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
+use crate::types::{AIONUI_RUNTIME_TOKEN_ENV, BuildTaskOptions, RuntimeCapabilities};
 
 /// Factory function that creates an [`AgentInstance`] from build options.
 ///
@@ -88,6 +89,7 @@ pub struct WorkerTaskManagerImpl {
     tasks: DashMap<String, TaskSlot>,
     factory: AgentFactory,
     active_leases: Arc<ActiveLeaseRegistry>,
+    runtime_token_service: Option<Arc<RuntimeTokenService>>,
 }
 
 impl WorkerTaskManagerImpl {
@@ -100,7 +102,13 @@ impl WorkerTaskManagerImpl {
             tasks: DashMap::new(),
             factory,
             active_leases,
+            runtime_token_service: None,
         }
+    }
+
+    pub fn with_runtime_token_service(mut self, runtime_token_service: Arc<RuntimeTokenService>) -> Self {
+        self.runtime_token_service = Some(runtime_token_service);
+        self
     }
 
     /// Look up a fully-initialised instance by conversation id.
@@ -113,6 +121,35 @@ impl WorkerTaskManagerImpl {
     fn initialised_managed_task(&self, conversation_id: &str) -> Option<ManagedAgentTask> {
         self.tasks.get(conversation_id).and_then(|slot| slot.get().cloned())
     }
+
+    fn invalidate_runtime_tokens(&self, conversation_id: &str) {
+        if let Some(service) = &self.runtime_token_service {
+            service.invalidate_conversation_id(conversation_id);
+        }
+    }
+
+    fn refresh_runtime_token_for_new_task(&self, options: &mut BuildTaskOptions) {
+        if options.context.team.is_none() {
+            return;
+        }
+        let Some(service) = &self.runtime_token_service else {
+            return;
+        };
+        let issue = service.issue(
+            options.context.conversation.user_id.clone(),
+            options.context.conversation.conversation_id.clone(),
+            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
+        );
+        options
+            .context
+            .runtime_env
+            .retain(|(key, _)| key != AIONUI_RUNTIME_TOKEN_ENV);
+        options
+            .context
+            .runtime_env
+            .push((AIONUI_RUNTIME_TOKEN_ENV.to_owned(), issue.token));
+    }
 }
 
 #[async_trait]
@@ -124,7 +161,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
     async fn get_or_build_task(
         &self,
         conversation_id: &str,
-        options: BuildTaskOptions,
+        mut options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
         if let Some(existing) = self.initialised_managed_task(conversation_id)
             && !existing.runtime_capabilities.satisfies(&options.runtime_capabilities)
@@ -134,6 +171,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                 "Rebuilding agent task because runtime capabilities changed"
             );
             self.kill(conversation_id, Some(AgentKillReason::RuntimeCapabilityChanged))?;
+            self.refresh_runtime_token_for_new_task(&mut options);
         }
 
         // Atomically obtain the per-conversation slot. `DashMap::entry` is
@@ -166,6 +204,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
 
     fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         if let Some((id, slot)) = self.tasks.remove(conversation_id) {
+            self.invalidate_runtime_tokens(&id);
             let agent_type = slot.get().map(|managed| managed.agent.agent_type());
             if matches!(reason, Some(AgentKillReason::IdleTimeout)) {
                 info!(
@@ -190,6 +229,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         reason: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         if let Some((id, slot)) = self.tasks.remove(conversation_id) {
+            self.invalidate_runtime_tokens(&id);
             let agent_type = slot.get().map(|managed| managed.agent.agent_type());
             if matches!(reason, Some(AgentKillReason::IdleTimeout)) {
                 info!(
@@ -229,6 +269,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         let mut waits = Vec::new();
         for key in keys {
             if let Some((id, slot)) = self.tasks.remove(&key) {
+                self.invalidate_runtime_tokens(&id);
                 info!(conversation_id = %id, "Clearing agent task");
                 if let Some(managed) = slot.get() {
                     waits.push(managed.agent.kill_and_wait(None));
@@ -311,6 +352,7 @@ mod tests {
     use super::*;
     use crate::agent_task::{IAgentTask, IMockAgent};
     use crate::protocol::events::AgentStreamEvent;
+    use crate::runtime_token::RuntimeTokenError;
     use crate::session_context::{
         AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
     };
@@ -432,6 +474,28 @@ mod tests {
         })
     }
 
+    fn make_team_options_with_runtime_token(conversation_id: &str, runtime_token: &str) -> BuildTaskOptions {
+        let mut options = make_options(conversation_id);
+        let team = aionui_api_types::TeamSessionBinding {
+            team_id: "team-1".into(),
+            slot_id: Some("slot-1".into()),
+            role: Some("leader".into()),
+            runtime_seed: Default::default(),
+            mcp: None,
+        };
+        options.context.team = Some(team.clone());
+        if let AgentSessionKind::Acp(context) = &mut options.context.kind {
+            context.team = Some(team);
+            context.belongs_to_team = true;
+        }
+        options
+            .context
+            .runtime_env
+            .push((AIONUI_RUNTIME_TOKEN_ENV.to_owned(), runtime_token.to_owned()));
+        options.runtime_capabilities.conversation_runtime_context_version = Some(CONVERSATION_RUNTIME_CONTEXT_VERSION);
+        options
+    }
+
     fn mock_instance(agent: MockAgent) -> AgentInstance {
         AgentInstance::Mock(Arc::new(agent))
     }
@@ -529,6 +593,70 @@ mod tests {
 
         assert!(!same_mock(&h1, &h2));
         assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn capability_rebuild_refreshes_runtime_token_after_killing_existing_task() {
+        let runtime_tokens = Arc::new(RuntimeTokenService::new());
+        let old_issue = runtime_tokens.issue(
+            "user-1",
+            "conv-1",
+            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
+        );
+        let observed_tokens = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let factory: AgentFactory = Arc::new({
+            let observed_tokens = Arc::clone(&observed_tokens);
+            move |opts: BuildTaskOptions| {
+                let observed_tokens = Arc::clone(&observed_tokens);
+                async move {
+                    if let Some((_, token)) = opts
+                        .context
+                        .runtime_env
+                        .iter()
+                        .find(|(key, _)| key == AIONUI_RUNTIME_TOKEN_ENV)
+                    {
+                        observed_tokens.lock().unwrap().push(token.clone());
+                    }
+                    Ok(mock_instance(MockAgent::new(opts.conversation_id(), None)))
+                }
+                .boxed()
+            }
+        });
+        let mgr = WorkerTaskManagerImpl::new(factory).with_runtime_token_service(Arc::clone(&runtime_tokens));
+        let h1 = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
+
+        let h2 = mgr
+            .get_or_build_task(
+                "conv-1",
+                make_team_options_with_runtime_token("conv-1", &old_issue.token),
+            )
+            .await
+            .unwrap();
+
+        assert!(!same_mock(&h1, &h2));
+        let tokens = observed_tokens.lock().unwrap().clone();
+        assert_eq!(tokens.len(), 1);
+        assert_ne!(tokens[0], old_issue.token);
+        assert_eq!(
+            runtime_tokens.validate(
+                Some(&old_issue.token),
+                "user-1",
+                "conv-1",
+                RuntimeTokenScope::TeamCall,
+                TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            ),
+            Err(RuntimeTokenError::Unknown)
+        );
+        runtime_tokens
+            .validate(
+                Some(&tokens[0]),
+                "user-1",
+                "conv-1",
+                RuntimeTokenScope::TeamCall,
+                TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            )
+            .unwrap();
     }
 
     #[tokio::test]
@@ -646,6 +774,32 @@ mod tests {
 
         assert_eq!(killed.load(Ordering::SeqCst), 1);
         assert_eq!(mgr.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn kill_and_wait_invalidates_runtime_tokens_for_removed_task() {
+        let runtime_tokens = Arc::new(RuntimeTokenService::new());
+        let issue = runtime_tokens.issue(
+            "user-1",
+            "conv-1",
+            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
+        );
+        let mgr = make_manager().with_runtime_token_service(Arc::clone(&runtime_tokens));
+        mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
+
+        mgr.kill_and_wait("conv-1", Some(AgentKillReason::IdleTimeout)).await;
+
+        assert_eq!(
+            runtime_tokens.validate(
+                Some(&issue.token),
+                "user-1",
+                "conv-1",
+                RuntimeTokenScope::TeamCall,
+                TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            ),
+            Err(RuntimeTokenError::Unknown)
+        );
     }
 
     #[tokio::test]

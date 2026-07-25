@@ -262,6 +262,9 @@ pub struct ConversationRowUpdate {
     pub extra: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<TimestampMs>,
+    /// Project binding (project-bind side branch); `Some` sets the column.
+    pub project_id: Option<String>,
+    pub folder_id: Option<String>,
 }
 
 /// Partial update payload for a message row.

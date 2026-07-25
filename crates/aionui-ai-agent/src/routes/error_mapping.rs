@@ -38,6 +38,10 @@ fn acp_error_to_api_error(err: AcpError) -> ApiError {
         AcpError::OtherProtocolError { .. } => ApiError::BadGateway(acp_error_public_message(&err)),
         AcpError::NotConnected => ApiError::BadGateway(acp_error_public_message(&err)),
         AcpError::InitTimeout { .. } => ApiError::BadGateway(acp_error_public_message(&err)),
+        // Short config/mode/model RPC timeout: connection is alive, the agent
+        // just did not answer in time. Surface as a retryable Timeout so the
+        // user can immediately retry the config change (see ELECTRON-3MS).
+        AcpError::RequestTimeout { .. } => ApiError::Timeout(acp_error_public_message(&err)),
     }
 }
 
@@ -57,6 +61,7 @@ fn acp_error_public_message(err: &AcpError) -> String {
         AcpError::OtherProtocolError { code, .. } => format!("Agent protocol error (code {code})"),
         AcpError::NotConnected => "ACP protocol is not connected.".to_owned(),
         AcpError::InitTimeout { .. } => "Agent initialization timed out.".to_owned(),
+        AcpError::RequestTimeout { .. } => "Agent did not respond to the request in time.".to_owned(),
     }
 }
 

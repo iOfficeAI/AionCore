@@ -82,6 +82,26 @@ impl RouterBuildError {
     }
 }
 
+/// Map an assistant bootstrap failure to a router build error.
+///
+/// A [`AssistantError::ConcurrentBootstrapContention`] is benign and recoverable
+/// (a transient concurrent-startup race), so it gets a distinct boundary stage
+/// (`router.assistant.bootstrap.concurrency_contended`) that AionUi maps to a
+/// gentle "retry/restart" message instead of the "local data corruption" false
+/// alarm. The boundary code stays `BOOTSTRAP_SERVER_FAILED`; only the stage
+/// differs (Sentry 135525166). All other errors keep the original stage.
+fn assistant_bootstrap_build_error(error: AssistantError) -> RouterBuildError {
+    if matches!(error, AssistantError::ConcurrentBootstrapContention(_)) {
+        RouterBuildError::new(
+            "router.assistant.bootstrap.concurrency_contended",
+            "assistant storage bootstrap contended under concurrent startup",
+        )
+        .with_source(error)
+    } else {
+        RouterBuildError::new("router.assistant.bootstrap", "failed to bootstrap assistant storage").with_source(error)
+    }
+}
+
 impl std::fmt::Display for RouterBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.stage, self.message)
@@ -195,9 +215,11 @@ pub async fn build_module_states(
     );
 
     let assistant = build_assistant_state(services);
-    assistant.service.bootstrap_assistant_storage().await.map_err(|error| {
-        RouterBuildError::new("router.assistant.bootstrap", "failed to bootstrap assistant storage").with_source(error)
-    })?;
+    assistant
+        .service
+        .bootstrap_assistant_storage()
+        .await
+        .map_err(assistant_bootstrap_build_error)?;
     let cron = build_cron_state(services);
     // Cron builds its own ConversationService (not a clone of the shared one),
     // so wire the assistant rule dispatcher here — otherwise scheduled runs
@@ -359,7 +381,10 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
 
     SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),
-        client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(pool.clone()))),
+        client_pref_service: ClientPrefService::with_keep_awake_controller(
+            Arc::new(SqliteClientPreferenceRepository::new(pool.clone())),
+            Arc::new(aionui_system::SystemKeepAwakeController::new()),
+        ),
         provider_service: ProviderService::new(provider_repo.clone(), encryption_key),
         model_fetch_service: ModelFetchService::new(provider_repo, encryption_key, http_client.clone()),
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
@@ -649,6 +674,7 @@ pub fn build_team_state(
         backend_binary_path,
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
+    service.with_project_service(Arc::new(services.project_service.clone()));
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),
@@ -692,6 +718,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     conv_service.with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(
         services.database.pool().clone(),
     )));
+    conv_service.with_project_service(Arc::new(services.project_service.clone()));
 
     let executor = Arc::new(aionui_cron::executor::JobExecutor::new(
         services.worker_task_manager.clone(),
@@ -848,6 +875,18 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    // T-B4 — concurrent-startup contention gets a distinct boundary stage so it
+    // is not misreported as local data corruption (Sentry 135525166).
+    #[test]
+    fn concurrent_contention_maps_to_distinct_bootstrap_stage() {
+        let contended =
+            assistant_bootstrap_build_error(AssistantError::ConcurrentBootstrapContention("contended".into()));
+        assert_eq!(contended.stage(), "router.assistant.bootstrap.concurrency_contended");
+
+        let other = assistant_bootstrap_build_error(AssistantError::Internal("boom".into()));
+        assert_eq!(other.stage(), "router.assistant.bootstrap");
+    }
+
     use crate::AppConfig;
     use aionui_ai_agent::types::{AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, BuildTaskOptions, SendMessageData};
     use aionui_ai_agent::{
@@ -923,10 +962,8 @@ mod tests {
 
         Arc::new(WorkerTaskManagerImpl::new(factory))
     }
-
-    fn capturing_worker_task_manager(
-        captured_env: Arc<Mutex<Vec<Vec<(String, String)>>>>,
-    ) -> Arc<dyn IWorkerTaskManager> {
+    type CapturedEnv = Vec<Vec<(String, String)>>;
+    fn capturing_worker_task_manager(captured_env: Arc<Mutex<CapturedEnv>>) -> Arc<dyn IWorkerTaskManager> {
         let factory = Arc::new(move |opts: BuildTaskOptions| {
             let captured_env = captured_env.clone();
             Box::pin(async move {
@@ -943,7 +980,7 @@ mod tests {
         Arc::new(WorkerTaskManagerImpl::new(factory))
     }
 
-    async fn wait_for_captured_env(captured_env: &Arc<Mutex<Vec<Vec<(String, String)>>>>) -> Vec<(String, String)> {
+    async fn wait_for_captured_env(captured_env: &Arc<Mutex<CapturedEnv>>) -> Vec<(String, String)> {
         for _ in 0..50 {
             if let Some(env) = captured_env.lock().unwrap().first().cloned() {
                 return env;
@@ -967,8 +1004,6 @@ mod tests {
             source: "generated",
             owner_type: "system",
             source_ref: Some("bare-channel-aionrs"),
-            source_version: None,
-            source_hash: None,
             name: "Bare Channel Aionrs",
             name_i18n: "{}",
             description: Some("Channel state regression assistant"),
@@ -976,9 +1011,8 @@ mod tests {
             avatar_type: "emoji",
             avatar_value: Some("A"),
             agent_id: "632f31d2",
-            rule_resource_type: "inline",
+            rule_resource_type: "user_file",
             rule_resource_ref: None,
-            rule_inline_content: Some(""),
             recommended_prompts: "[]",
             recommended_prompts_i18n: "{}",
             default_model_mode: "auto",

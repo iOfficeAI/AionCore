@@ -23,6 +23,9 @@ aws-sdk-bedrock.workspace = true
 semver.workspace = true
 dirs.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
+
 [dev-dependencies]
 tower = { workspace = true }
 http-body-util.workspace = true

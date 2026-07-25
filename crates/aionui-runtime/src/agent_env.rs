@@ -20,7 +20,20 @@ static FULL_SHELL_ENV: OnceCell<Vec<(OsString, OsString)>> = OnceCell::const_new
 /// Electron `spawn(..., { env })` behavior without spreading shell variables to
 /// unrelated backend code.
 pub async fn agent_process_env() -> Vec<(OsString, OsString)> {
-    build_agent_process_env(std::env::vars_os().collect(), full_shell_env().await.to_vec())
+    let current_env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let shell_env = full_shell_env().await.to_vec();
+    let env = build_agent_process_env(current_env.clone(), shell_env.clone());
+    tracing::info!(
+        current_var_count = current_env.len(),
+        shell_var_count = shell_env.len(),
+        final_var_count = env.len(),
+        current_network_env_keys = ?present_network_env_keys(&current_env),
+        shell_network_env_keys = ?present_network_env_keys(&shell_env),
+        final_network_env_keys = ?present_network_env_keys(&env),
+        final_path_entry_count = path_entry_count(get_env_value(&env, "PATH").map(|value| value.as_os_str())),
+        "agent subprocess environment prepared"
+    );
+    env
 }
 
 async fn full_shell_env() -> &'static Vec<(OsString, OsString)> {
@@ -47,7 +60,14 @@ fn build_agent_process_env(
 }
 
 fn clean_agent_env(env: &mut BTreeMap<OsString, OsString>) {
-    for key in ["NODE_OPTIONS", "NODE_INSPECT", "NODE_DEBUG", "CLAUDECODE"] {
+    for key in [
+        "NODE_OPTIONS",
+        "NODE_INSPECT",
+        "NODE_DEBUG",
+        "CLAUDECODE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    ] {
         remove_env_key(env, key);
     }
     env.retain(|key, _| !env_key_starts_with(key, "npm_"));
@@ -105,13 +125,47 @@ fn merge_path_values(current: Option<&std::ffi::OsStr>, shell: Option<&std::ffi:
     }
 }
 
+const NETWORK_ENV_KEYS: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+];
+
+fn present_network_env_keys(env: &[(OsString, OsString)]) -> Vec<&'static str> {
+    NETWORK_ENV_KEYS
+        .iter()
+        .copied()
+        .filter(|key| get_env_value(env, key).is_some())
+        .collect()
+}
+
+fn path_entry_count(path: Option<&std::ffi::OsStr>) -> usize {
+    path.map(|value| {
+        std::env::split_paths(value)
+            .filter(|path| !path.as_os_str().is_empty())
+            .count()
+    })
+    .unwrap_or(0)
+}
+
 #[cfg(unix)]
 async fn load_full_shell_env() -> Vec<(OsString, OsString)> {
     let Some(shell) = std::env::var_os("SHELL") else {
+        tracing::info!("SHELL is not set; skipping full shell env probe for agent subprocesses");
         return Vec::new();
     };
     if !Path::new(&shell).is_absolute() {
-        tracing::debug!(shell = %shell.to_string_lossy(), "SHELL is not absolute, skipping full shell env probe");
+        tracing::info!(shell = %shell.to_string_lossy(), "SHELL is not absolute; skipping full shell env probe for agent subprocesses");
         return Vec::new();
     }
 
@@ -141,7 +195,12 @@ async fn load_full_shell_env() -> Vec<(OsString, OsString)> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed = parse_env_output(&stdout);
-    tracing::info!(var_count = parsed.len(), "full shell env loaded for agent subprocesses");
+    tracing::info!(
+        var_count = parsed.len(),
+        network_env_keys = ?present_network_env_keys(&parsed),
+        path_entry_count = path_entry_count(get_env_value(&parsed, "PATH").map(|value| value.as_os_str())),
+        "full shell env loaded for agent subprocesses"
+    );
     parsed
 }
 
@@ -220,6 +279,9 @@ printf '%s\n' \
   'PATH=/shell/bin:/current/bin' \
   'NODE_OPTIONS=--inspect' \
   'CLAUDECODE=1' \
+  'SSL_CERT_FILE=/tmp/shell-cert.pem' \
+  'SSL_CERT_DIR=/tmp/shell-certs' \
+  'NODE_EXTRA_CA_CERTS=/tmp/shell-node-extra.pem' \
   'npm_lifecycle_event=start'
 "#,
             );
@@ -235,6 +297,9 @@ printf '%s\n' \
                 .env("AIONUI_OVERLAY", "from-current")
                 .env("NODE_OPTIONS", "--require parent")
                 .env("CLAUDECODE", "1")
+                .env("SSL_CERT_FILE", "/tmp/current-cert.pem")
+                .env("SSL_CERT_DIR", "/tmp/current-certs")
+                .env("NODE_EXTRA_CA_CERTS", "/tmp/current-node-extra.pem")
                 .env("npm_config_cache", "/tmp/parent-cache")
                 .output()
                 .unwrap();
@@ -259,6 +324,12 @@ printf '%s\n' \
         assert_eq!(value("AIONUI_OVERLAY").as_deref(), Some("from-shell"));
         assert_eq!(value("NODE_OPTIONS"), None);
         assert_eq!(value("CLAUDECODE"), None);
+        assert_eq!(value("SSL_CERT_FILE"), None);
+        assert_eq!(value("SSL_CERT_DIR"), None);
+        assert_eq!(
+            value("NODE_EXTRA_CA_CERTS").as_deref(),
+            Some("/tmp/shell-node-extra.pem")
+        );
         assert_eq!(value("npm_config_cache"), None);
         assert_eq!(value("npm_lifecycle_event"), None);
 

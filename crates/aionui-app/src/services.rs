@@ -6,18 +6,19 @@ use std::sync::Arc;
 use crate::config::{AppConfig, derive_encryption_key};
 use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
-    WorkerTaskManagerImpl, build_agent_factory,
+    RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
 };
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    IProjectStore, ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
-    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProviderRepository, SqliteSkillRepository,
-    SqliteUserRepository,
+    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository,
+    SqliteSkillRepository, SqliteUserRepository,
 };
+use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 
 pub struct AppServices {
@@ -30,8 +31,12 @@ pub struct AppServices {
     pub event_bus: Arc<BroadcastEventBus>,
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
     pub active_lease_registry: Arc<ActiveLeaseRegistry>,
+    pub runtime_token_service: Arc<RuntimeTokenService>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    /// Project-bind service (project-bind side branch). Shared by conversation
+    /// and team wiring to bind/backfill project/folder rows. Cheap to clone.
+    pub project_service: ProjectService,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -83,6 +88,8 @@ impl AppServices {
             task_manager_delete_hook: self.task_manager_delete_hook.clone(),
             runtime_helper_bin: self.runtime_helper_bin.clone(),
             runtime_base_url: self.runtime_base_url.clone(),
+            runtime_token_service: self.runtime_token_service.clone(),
+            project_service: self.project_service.clone(),
         });
         self
     }
@@ -134,6 +141,9 @@ impl AppServices {
             .hydrate()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to hydrate agent registry: {e}"))?;
+        // Settle any slow version probes off the readiness path (#675):
+        // hydrate never waits beyond the inline budget per agent.
+        agent_registry.spawn_slow_probe_recheck();
 
         let acp_session_repo: Arc<dyn IAcpSessionRepository> =
             Arc::new(SqliteAcpSessionRepository::new(database.pool().clone()));
@@ -142,6 +152,13 @@ impl AppServices {
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
+
+        // Project-bind service (side branch). temp_root mirrors the existing
+        // conversation temp-workspace root (`work_dir/conversations`) so
+        // `resolve_existing` classifies auto workspaces as temp and
+        // user-picked directories as standard.
+        let project_store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(database.pool().clone()));
+        let project_service = ProjectService::new(project_store, work_dir.join("conversations"));
 
         // Skill paths need app resource dir (for builtin rules) + data dir
         // (for user skills + materialized views). AcpSkillManager uses these
@@ -164,6 +181,19 @@ impl AppServices {
         let runtime_helper_bin = backend_binary_path.to_string_lossy().into_owned();
         let runtime_base_url = config.local_base_url();
 
+        // Session-model port: the subprocess spawner the clean-slate claude/codex
+        // SessionBackend uses. Registry-backed (feature 001) so spawned processes are
+        // reap-gateable; a fresh per-run epoch (no cross-run reap authority is required
+        // for the port's spawn path). claude/codex always run through the direct-CLI
+        // SessionAgentTask now — the spawner is unconditionally wired.
+        let process_registry = Arc::new(aionui_process::FileRegistryStore::new(&data_dir));
+        let machine_id = aionui_process::local_machine_id(&data_dir);
+        let session_spawner: Arc<dyn aionui_process::Spawner> = Arc::new(aionui_process::RealSpawner::new(
+            process_registry,
+            uuid::Uuid::now_v7(),
+            machine_id,
+        ));
+
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
             provider_repo,
@@ -175,16 +205,18 @@ impl AppServices {
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
+            session_spawner,
         });
 
         // Agent factory is now wired. Future extension/custom agents
         // that get written to `agent_metadata` will show up after the
         // relevant service calls `AgentRegistry::hydrate`.
         let active_lease_registry = Arc::new(ActiveLeaseRegistry::new());
-        let task_manager_concrete = Arc::new(WorkerTaskManagerImpl::new_with_active_leases(
-            factory,
-            active_lease_registry.clone(),
-        ));
+        let runtime_token_service = Arc::new(RuntimeTokenService::new());
+        let task_manager_concrete = Arc::new(
+            WorkerTaskManagerImpl::new_with_active_leases(factory, active_lease_registry.clone())
+                .with_runtime_token_service(runtime_token_service.clone()),
+        );
         let worker_task_manager: Arc<dyn IWorkerTaskManager> = task_manager_concrete.clone();
         let task_manager_delete_hook: Arc<dyn OnConversationDelete> = task_manager_concrete;
         let conversation_runtime_state = Arc::new(ConversationRuntimeStateService::default());
@@ -200,6 +232,8 @@ impl AppServices {
             task_manager_delete_hook: Some(task_manager_delete_hook.clone()),
             runtime_helper_bin: runtime_helper_bin.clone(),
             runtime_base_url: runtime_base_url.clone(),
+            runtime_token_service: runtime_token_service.clone(),
+            project_service: project_service.clone(),
         });
 
         Ok(Self {
@@ -212,8 +246,10 @@ impl AppServices {
             event_bus,
             worker_task_manager,
             active_lease_registry,
+            runtime_token_service,
             conversation_runtime_state,
             conversation_service,
+            project_service,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
@@ -244,6 +280,8 @@ struct ConversationServiceDeps<'a> {
     task_manager_delete_hook: Option<Arc<dyn OnConversationDelete>>,
     runtime_helper_bin: String,
     runtime_base_url: String,
+    runtime_token_service: Arc<RuntimeTokenService>,
+    project_service: ProjectService,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -261,7 +299,8 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
         Arc::new(SqliteAcpSessionRepository::new(deps.database.pool().clone())),
     )
     .with_runtime_state(deps.conversation_runtime_state)
-    .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url);
+    .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url)
+    .with_runtime_token_service(deps.runtime_token_service);
     service.with_mcp_server_repo(Arc::new(SqliteMcpServerRepository::new(deps.database.pool().clone())));
     service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
         deps.database.pool().clone(),
@@ -275,6 +314,7 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     if let Some(hook) = deps.task_manager_delete_hook {
         service.with_delete_hook(hook);
     }
+    service.with_project_service(Arc::new(deps.project_service));
     service
 }
 

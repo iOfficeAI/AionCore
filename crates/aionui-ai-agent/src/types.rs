@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use aion_config::compat::OpenAiApiMode;
+use aion_types::message::ImageInputCapability;
 use serde::{Deserialize, Serialize};
 
 use crate::session_context::AgentSessionContext;
@@ -48,11 +50,16 @@ impl BuildTaskOptions {
         conversation_id: &str,
         helper_bin: Option<&str>,
         base_url: Option<&str>,
+        runtime_token: Option<&str>,
     ) {
         self.context.runtime_env.retain(|(key, _)| {
             !matches!(
                 key.as_str(),
-                AIONUI_USER_ID_ENV | AIONUI_CONVERSATION_ID_ENV | AIONUI_HELPER_BIN_ENV | AIONUI_BASE_URL_ENV
+                AIONUI_USER_ID_ENV
+                    | AIONUI_CONVERSATION_ID_ENV
+                    | AIONUI_HELPER_BIN_ENV
+                    | AIONUI_BASE_URL_ENV
+                    | AIONUI_RUNTIME_TOKEN_ENV
             )
         });
         self.context
@@ -71,6 +78,11 @@ impl BuildTaskOptions {
                 .runtime_env
                 .push((AIONUI_BASE_URL_ENV.to_owned(), base_url.to_owned()));
         }
+        if let Some(runtime_token) = runtime_token {
+            self.context
+                .runtime_env
+                .push((AIONUI_RUNTIME_TOKEN_ENV.to_owned(), runtime_token.to_owned()));
+        }
         self.runtime_capabilities.conversation_runtime_context_version = Some(CONVERSATION_RUNTIME_CONTEXT_VERSION);
     }
 }
@@ -79,6 +91,7 @@ pub const AIONUI_USER_ID_ENV: &str = "AIONUI_USER_ID";
 pub const AIONUI_CONVERSATION_ID_ENV: &str = "AIONUI_CONVERSATION_ID";
 pub const AIONUI_HELPER_BIN_ENV: &str = "AIONUI_HELPER_BIN";
 pub const AIONUI_BASE_URL_ENV: &str = "AIONUI_BASE_URL";
+pub const AIONUI_RUNTIME_TOKEN_ENV: &str = "AIONUI_RUNTIME_TOKEN";
 pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -100,6 +113,8 @@ impl RuntimeCapabilities {
 /// Provider-specific compat overrides resolved in the factory.
 #[derive(Debug, Clone, Default)]
 pub struct AionrsCompatOverrides {
+    pub(crate) openai_api_mode: Option<OpenAiApiMode>,
+    pub(crate) image_input: Option<ImageInputCapability>,
     pub max_tokens_field: Option<String>,
     pub api_path: Option<String>,
 }
@@ -117,7 +132,8 @@ pub struct AionrsResolvedConfig {
     pub base_url: Option<String>,
     /// System prompt override.
     pub system_prompt: Option<String>,
-    /// Optional max tokens per response.
+    /// Internal response cap for specialized flows such as provider health probes.
+    /// Normal AionUi conversations leave this unset.
     pub max_tokens: Option<u32>,
     /// Max agentic turns.
     pub max_turns: Option<usize>,
@@ -184,6 +200,7 @@ mod tests {
             runtime_env: vec![
                 (AIONUI_USER_ID_ENV.into(), "old-user".into()),
                 (AIONUI_CONVERSATION_ID_ENV.into(), "old-conv".into()),
+                (AIONUI_RUNTIME_TOKEN_ENV.into(), "old-token".into()),
                 ("EXISTING".into(), "1".into()),
             ],
             team: None,
@@ -202,6 +219,7 @@ mod tests {
             "conv-1",
             Some("/Applications/AionUi/aioncore"),
             Some("http://127.0.0.1:25808"),
+            Some("runtime-token-1"),
         );
 
         assert_eq!(
@@ -234,6 +252,21 @@ mod tests {
                 .context
                 .runtime_env
                 .contains(&(AIONUI_BASE_URL_ENV.to_owned(), "http://127.0.0.1:25808".to_owned()))
+        );
+        assert!(
+            options
+                .context
+                .runtime_env
+                .contains(&(AIONUI_RUNTIME_TOKEN_ENV.to_owned(), "runtime-token-1".to_owned()))
+        );
+        assert_eq!(
+            options
+                .context
+                .runtime_env
+                .iter()
+                .filter(|(key, _)| key == AIONUI_RUNTIME_TOKEN_ENV)
+                .count(),
+            1
         );
         assert!(options.context.runtime_env.contains(&("EXISTING".into(), "1".into())));
         assert_eq!(
@@ -345,7 +378,6 @@ mod tests {
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
         assert!(extra.system_prompt.is_none());
         assert!(extra.preset_rules.is_none());
-        assert_eq!(extra.max_tokens, None);
         assert!(extra.max_turns.is_none());
         assert!(extra.max_tool_call_malformed_turns.is_none());
         assert!(extra.max_tool_call_failure_turns.is_none());
@@ -361,18 +393,17 @@ mod tests {
             "max_tool_call_failure_turns": 3
         });
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
-        assert_eq!(extra.system_prompt.unwrap(), "You are a helpful assistant.");
-        assert_eq!(extra.max_tokens, Some(4096));
+        assert_eq!(extra.system_prompt.as_deref(), Some("You are a helpful assistant."));
         assert_eq!(extra.max_turns.unwrap(), 10);
         assert_eq!(extra.max_tool_call_malformed_turns.unwrap(), 2);
         assert_eq!(extra.max_tool_call_failure_turns.unwrap(), 3);
+        assert!(serde_json::to_value(extra).unwrap().get("max_tokens").is_none());
     }
 
     #[test]
     fn aionrs_build_extra_serde_with_preset_rules() {
         let json = json!({
-            "preset_rules": "You are a data analyst.",
-            "max_tokens": 8192
+            "preset_rules": "You are a data analyst."
         });
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
         assert!(extra.system_prompt.is_none());

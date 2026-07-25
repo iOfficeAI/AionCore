@@ -283,10 +283,7 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .await
             .map_err(map_conversation_update_error)
     }
-}
 
-#[async_trait]
-impl TeamConversationLookupPort for TeamConversationAdapters {
     async fn lookup_team_binding_by_conversation(
         &self,
         conversation_id: &str,
@@ -314,6 +311,16 @@ impl TeamConversationLookupPort for TeamConversationAdapters {
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned),
         }))
+    }
+}
+
+#[async_trait]
+impl TeamConversationLookupPort for TeamConversationAdapters {
+    async fn lookup_team_binding_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TeamConversationBindingLookup>, TeamError> {
+        <Self as TeamConversationProvisioningPort>::lookup_team_binding_by_conversation(self, conversation_id).await
     }
 }
 

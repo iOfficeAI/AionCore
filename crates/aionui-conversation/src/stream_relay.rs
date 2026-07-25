@@ -32,6 +32,11 @@ pub struct TurnAttemptSummary {
     pub persisted_assistant_output: bool,
     pub terminal_error: Option<ErrorEventData>,
     pub terminal_error_deferred: bool,
+    /// The turn ended benignly (a Finish, not an Error) but the agent signalled
+    /// that it needs sign-in — an `ACP_EMPTY_TURN_NEEDS_AUTH` tip. Lets the turn
+    /// orchestrator reflect "needs auth" into the agent's availability even
+    /// though the turn itself is not an error.
+    pub needs_auth: bool,
 }
 
 impl TurnAttemptSummary {
@@ -43,6 +48,7 @@ impl TurnAttemptSummary {
         self.saw_visible_output |= other.saw_visible_output;
         self.saw_tool_or_side_effect |= other.saw_tool_or_side_effect;
         self.persisted_assistant_output |= other.persisted_assistant_output;
+        self.needs_auth |= other.needs_auth;
         if other.terminal_error.is_some() {
             self.terminal_error = other.terminal_error.clone();
         }
@@ -289,6 +295,15 @@ impl StreamRelay {
                     }
 
                     match &event {
+                        AgentStreamEvent::SegmentBreak => {
+                            // Intra-turn soft boundary (see AgentStreamEvent::SegmentBreak):
+                            // close the current text/thinking segment so the next batch of
+                            // text starts a fresh bubble, but do NOT terminate the relay and
+                            // do NOT forward this event to the WebSocket.
+                            self.complete_active_thinking(&mut active_thinking).await;
+                            self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+                                .await;
+                        }
                         AgentStreamEvent::Thinking(data) => {
                             if data.status.as_deref() == Some("done") {
                                 self.complete_active_thinking(&mut active_thinking).await;
@@ -473,8 +488,18 @@ impl StreamRelay {
                             self.adapter.persist_tool_group(entries).await;
                         }
                         AgentStreamEvent::Tips(data) => {
-                            if matches!(data.tip_type, TipType::Success | TipType::Warning | TipType::Info) {
+                            // Only a Success tip blocks auto-replay: it can represent
+                            // completed work product. Warning/Info tips are system
+                            // diagnostics (e.g. codex rejecting a mode seed against a
+                            // dead thread, ELECTRON-3Q0) — counting them as visible
+                            // output made every such failed attempt "unsafe to
+                            // replay", so the transparent dead-anchor recovery never
+                            // fired on cron turns.
+                            if matches!(data.tip_type, TipType::Success) {
                                 attempt.saw_visible_output = true;
+                            }
+                            if data.code.as_deref() == Some("ACP_EMPTY_TURN_NEEDS_AUTH") {
+                                attempt.needs_auth = true;
                             }
                             self.forward_to_websocket(&event);
                             if matches!(data.tip_type, TipType::Success | TipType::Warning | TipType::Info) {
@@ -587,6 +612,7 @@ impl StreamRelay {
             AgentStreamEvent::System(_) => "System",
             AgentStreamEvent::RequestTrace(_) => "RequestTrace",
             AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
+            AgentStreamEvent::SegmentBreak => "SegmentBreak",
         }
     }
 
@@ -930,6 +956,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn needs_auth_tip_sets_summary_flag_on_finish() {
+        use aionui_ai_agent::protocol::events::{TipType, TipsEventData};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+
+        // An agent that connected but isn't signed in: needs-auth tip, then a
+        // benign end_turn (Finish). Terminal stays non-error, but the summary
+        // must flag needs_auth so the orchestrator can reflect it into availability.
+        tx.send(AgentStreamEvent::Tips(TipsEventData {
+            content: String::new(),
+            tip_type: TipType::Info,
+            code: Some("ACP_EMPTY_TURN_NEEDS_AUTH".into()),
+            params: Some(serde_json::json!({ "hint": "Run `kilo auth login` in the terminal" })),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert_eq!(
+            outcome.terminal,
+            RelayTerminal::Finish,
+            "needs-auth empty turn is a benign finish"
+        );
+        assert!(outcome.attempt.needs_auth, "needs-auth tip must set the summary flag");
+    }
+
+    #[tokio::test]
+    async fn plain_empty_turn_tip_does_not_set_needs_auth() {
+        use aionui_ai_agent::protocol::events::{TipType, TipsEventData};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Tips(TipsEventData {
+            content: String::new(),
+            tip_type: TipType::Info,
+            code: Some("ACP_EMPTY_TURN".into()),
+            params: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert!(
+            !outcome.attempt.needs_auth,
+            "a plain empty turn must NOT be treated as needs-auth"
+        );
+    }
+
+    #[tokio::test]
     async fn run_text_tool_text_splits_text_segments() {
         use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 
@@ -981,6 +1078,72 @@ mod tests {
                 text_event_msg_ids.push(evt.data["msg_id"].as_str().unwrap_or_default().to_owned());
             }
         }
+        assert_eq!(text_event_msg_ids.len(), 2);
+        assert_eq!(text_event_msg_ids[0], "asst-1");
+        assert_ne!(text_event_msg_ids[0], text_event_msg_ids[1]);
+    }
+
+    // A SegmentBreak (emitted by the direct-CLI pump when it suppresses a
+    // non-blocking Workflow's launch result) must split text into two bubbles
+    // just like a tool call does — but WITHOUT terminating the relay and
+    // WITHOUT being forwarded to the WebSocket as its own frame.
+    #[tokio::test]
+    async fn segment_break_splits_text_without_forwarding_or_terminating() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+
+        let mut ws_rx = bus.subscribe();
+        let rx = tx.subscribe();
+
+        // launch reply -> SegmentBreak -> completion reply -> Finish
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "launching workflow".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::SegmentBreak).unwrap();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "workflow done".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        // Two persisted text segments under two different msg_ids.
+        let inserts = repo.take_inserts();
+        let text_msgs: Vec<_> = inserts.iter().filter(|msg| msg.r#type == "text").collect();
+        assert_eq!(text_msgs.len(), 2, "SegmentBreak should split text into two segments");
+        assert_eq!(text_msgs[0].id, "asst-1");
+        assert_ne!(text_msgs[0].id, text_msgs[1].id);
+
+        // The two text frames reach the WS under two msg_ids, and no
+        // `segment_break` frame is ever forwarded.
+        let mut text_event_msg_ids = Vec::new();
+        let mut saw_segment_break_frame = false;
+        while let Ok(evt) = ws_rx.try_recv() {
+            if evt.name == "message.stream" {
+                if evt.data["type"] == "text" || evt.data["type"] == "content" {
+                    text_event_msg_ids.push(evt.data["msg_id"].as_str().unwrap_or_default().to_owned());
+                }
+                if evt.data["type"] == "segment_break" {
+                    saw_segment_break_frame = true;
+                }
+            }
+        }
+        assert!(
+            !saw_segment_break_frame,
+            "SegmentBreak must never be forwarded to the WS"
+        );
         assert_eq!(text_event_msg_ids.len(), 2);
         assert_eq!(text_event_msg_ids[0], "asst-1");
         assert_ne!(text_event_msg_ids[0], text_event_msg_ids[1]);
@@ -1166,6 +1329,61 @@ mod tests {
             saw_error |= event.data["type"] == "error";
         }
         assert!(saw_error, "unsafe errors are still broadcast");
+    }
+
+    // ELECTRON-3Q0: a Warning/Info tip is a system diagnostic (e.g. codex
+    // rejecting a mode seed against a dead thread), NOT assistant output — it
+    // must not make a failed attempt unsafe to auto-replay, or the dead-anchor
+    // recovery never fires on cron turns (the mode seed always precedes the send).
+    #[tokio::test]
+    async fn warning_tip_before_retryable_error_stays_clean_for_replay() {
+        use aionui_ai_agent::protocol::events::{TipType, TipsEventData};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, rx) = broadcast::channel(8);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "msg-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        )
+        .with_turn_completion(false)
+        .with_defer_clean_terminal_errors(true);
+
+        tx.send(AgentStreamEvent::Tips(TipsEventData {
+            content: "Codex rejected mode change".into(),
+            tip_type: TipType::Warning,
+            code: None,
+            params: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Error(ErrorEventData {
+            message: "codex rejected the turn request: thread not found: 0199-dead".into(),
+            code: Some(AgentErrorCode::UserAgentSessionNotFound),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let outcome = relay.consume(rx).await;
+
+        assert!(
+            !outcome.attempt.saw_visible_output,
+            "a Warning tip is not assistant output"
+        );
+        assert!(
+            outcome.attempt.safe_to_auto_replay(),
+            "the failed attempt must stay eligible for the dead-anchor auto-replay"
+        );
     }
 
     #[tokio::test]

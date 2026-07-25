@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","cwd":"/tmp","session_id":"00000000-0000-0000-0000-000000000001","tools":[],"mcp_servers":[],"model":"claude-opus-4-5","permissionMode":"bypassPermissions","apiKeySource":"none","claude_code_version":"2.1.0"}
+{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"00000000-0000-0000-0000-000000000001","total_cost_usd":0.0}

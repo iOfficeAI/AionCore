@@ -79,14 +79,8 @@ pub const WEIXIN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Maximum file size for WeChat file handling (200 MB).
 pub const WEIXIN_MAX_FILE_SIZE: u64 = 200 * 1024 * 1024;
 
-/// Maximum consecutive failures before WeChat applies longer backoff.
-pub const WEIXIN_MAX_RETRIES: u32 = 3;
-
-/// Short retry delay between WeChat poll attempts on failure.
-pub const WEIXIN_RETRY_DELAY: Duration = Duration::from_secs(2);
-
-/// Longer backoff delay after max consecutive failures.
-pub const WEIXIN_BACKOFF_DELAY: Duration = Duration::from_secs(30);
+/// Maximum backoff delay between WeChat poll retries (10 minutes).
+pub const WEIXIN_MAX_BACKOFF: Duration = Duration::from_secs(600);
 
 /// Long-polling timeout for WeChat getupdates (matches iLink API).
 pub const WEIXIN_POLL_TIMEOUT: Duration = Duration::from_secs(35);
@@ -164,10 +158,8 @@ mod tests {
     fn weixin_constants() {
         assert_eq!(WEIXIN_RESPONSE_TIMEOUT, Duration::from_secs(300));
         assert_eq!(WEIXIN_MAX_FILE_SIZE, 200 * 1024 * 1024);
-        assert_eq!(WEIXIN_MAX_RETRIES, 3);
-        assert_eq!(WEIXIN_RETRY_DELAY, Duration::from_secs(2));
-        assert_eq!(WEIXIN_BACKOFF_DELAY, Duration::from_secs(30));
         assert_eq!(WEIXIN_POLL_TIMEOUT, Duration::from_secs(35));
         assert_eq!(WEIXIN_API_TIMEOUT, Duration::from_secs(15));
+        assert_eq!(WEIXIN_MAX_BACKOFF, Duration::from_secs(600));
     }
 }

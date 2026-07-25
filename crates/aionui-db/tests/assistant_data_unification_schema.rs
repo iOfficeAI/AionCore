@@ -54,6 +54,9 @@ async fn assistant_definition_table_has_expected_default_columns() {
     assert!(columns.iter().any(|name| name == "default_mcp_ids"));
     assert!(columns.iter().any(|name| name == "avatar_type"));
     assert!(columns.iter().any(|name| name == "avatar_value"));
+    assert!(!columns.iter().any(|name| name == "rule_inline_content"));
+    assert!(!columns.iter().any(|name| name == "source_version"));
+    assert!(!columns.iter().any(|name| name == "source_hash"));
 
     let overlay_columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('assistant_overlays')")
         .fetch_all(db.pool())

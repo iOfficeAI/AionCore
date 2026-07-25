@@ -198,6 +198,8 @@ mod tests {
             pinned_at: None,
             created_at: now_ms(),
             updated_at: now_ms(),
+            project_id: None,
+            folder_id: None,
         }
     }
 

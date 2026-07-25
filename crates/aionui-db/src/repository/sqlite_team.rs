@@ -23,8 +23,8 @@ impl ITeamRepository for SqliteTeamRepository {
 
     async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, created_at, updated_at, project_id, folder_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.user_id)
@@ -37,6 +37,8 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(&row.agents_version)
         .bind(row.created_at)
         .bind(row.updated_at)
+        .bind(&row.project_id)
+        .bind(&row.folder_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -82,6 +84,12 @@ impl ITeamRepository for SqliteTeamRepository {
         if params.session_mode.is_some() {
             set_clauses.push("session_mode = ?");
         }
+        if params.project_id.is_some() {
+            set_clauses.push("project_id = ?");
+        }
+        if params.folder_id.is_some() {
+            set_clauses.push("folder_id = ?");
+        }
 
         if set_clauses.is_empty() {
             return Ok(());
@@ -105,6 +113,12 @@ impl ITeamRepository for SqliteTeamRepository {
         }
         if let Some(ref session_mode) = params.session_mode {
             query = query.bind(session_mode);
+        }
+        if let Some(ref project_id) = params.project_id {
+            query = query.bind(project_id);
+        }
+        if let Some(ref folder_id) = params.folder_id {
+            query = query.bind(folder_id);
         }
         query = query.bind(now_ms());
         query = query.bind(team_id);

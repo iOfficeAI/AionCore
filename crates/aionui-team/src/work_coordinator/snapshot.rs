@@ -23,6 +23,17 @@ impl SlotWorkCoordinator {
         }
     }
 
+    /// Publish a single slot's current work snapshot, independent of any run.
+    /// Callers compute the snapshot while holding the state lock, drop it, then
+    /// call this (mirroring `publish_run_summaries`) so run-less transitions are
+    /// still observable to the frontend. A `None` snapshot (slot removed) is a
+    /// no-op.
+    pub(super) fn publish_slot_work_snapshot(&self, snapshot: Option<SlotWorkSnapshot>) {
+        if let Some(snapshot) = snapshot {
+            self.run_causality.publish_slot_work(snapshot);
+        }
+    }
+
     pub(super) fn all_run_ids(state: &CoordinatorState) -> BTreeSet<String> {
         state
             .intents

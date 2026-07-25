@@ -166,6 +166,8 @@ impl StubConvRepo {
                 pinned_at: None,
                 created_at: 1000,
                 updated_at: 1000,
+                project_id: None,
+                folder_id: None,
             });
         row.extra = extra.to_string();
     }
@@ -212,6 +214,8 @@ impl IConversationRepository for StubConvRepo {
                 pinned_at: None,
                 created_at: 1000,
                 updated_at: 1000,
+                project_id: None,
+                folder_id: None,
             }
         } else if id == "conv_mode_hermes" {
             aionui_db::models::ConversationRow {
@@ -242,6 +246,8 @@ impl IConversationRepository for StubConvRepo {
                 pinned_at: None,
                 created_at: 1000,
                 updated_at: 1000,
+                project_id: None,
+                folder_id: None,
             }
         } else if id == "conv_mode_default" {
             aionui_db::models::ConversationRow {
@@ -272,6 +278,8 @@ impl IConversationRepository for StubConvRepo {
                 pinned_at: None,
                 created_at: 1000,
                 updated_at: 1000,
+                project_id: None,
+                folder_id: None,
             }
         } else if id == "conv_mode_codex" {
             aionui_db::models::ConversationRow {
@@ -302,6 +310,8 @@ impl IConversationRepository for StubConvRepo {
                 pinned_at: None,
                 created_at: 1000,
                 updated_at: 1000,
+                project_id: None,
+                folder_id: None,
             }
         } else if id == "conv_mode_claude" {
             aionui_db::models::ConversationRow {
@@ -332,6 +342,8 @@ impl IConversationRepository for StubConvRepo {
                 pinned_at: None,
                 created_at: 1000,
                 updated_at: 1000,
+                project_id: None,
+                folder_id: None,
             }
         } else if id == "conv_mode_stale_backend" {
             aionui_db::models::ConversationRow {
@@ -362,6 +374,8 @@ impl IConversationRepository for StubConvRepo {
                 pinned_at: None,
                 created_at: 1000,
                 updated_at: 1000,
+                project_id: None,
+                folder_id: None,
             }
         } else if id == "conv_mode_aionrs" {
             aionui_db::models::ConversationRow {
@@ -392,6 +406,8 @@ impl IConversationRepository for StubConvRepo {
                 pinned_at: None,
                 created_at: 1000,
                 updated_at: 1000,
+                project_id: None,
+                folder_id: None,
             }
         } else if id == "conv_mode_assistant_stale_backend" {
             aionui_db::models::ConversationRow {
@@ -415,6 +431,8 @@ impl IConversationRepository for StubConvRepo {
                 pinned_at: None,
                 created_at: 1000,
                 updated_at: 1000,
+                project_id: None,
+                folder_id: None,
             }
         } else if id == "conv_mode_missing_assistant_stale_backend" {
             aionui_db::models::ConversationRow {
@@ -437,6 +455,8 @@ impl IConversationRepository for StubConvRepo {
                 pinned_at: None,
                 created_at: 1000,
                 updated_at: 1000,
+                project_id: None,
+                folder_id: None,
             }
         } else if id == "conv_mode_assistant_snapshot" {
             aionui_db::models::ConversationRow {
@@ -458,6 +478,8 @@ impl IConversationRepository for StubConvRepo {
                 pinned_at: None,
                 created_at: 1000,
                 updated_at: 1000,
+                project_id: None,
+                folder_id: None,
             }
         } else {
             aionui_db::models::ConversationRow {
@@ -474,6 +496,8 @@ impl IConversationRepository for StubConvRepo {
                 pinned_at: None,
                 created_at: 1000,
                 updated_at: 1000,
+                project_id: None,
+                folder_id: None,
             }
         };
 
@@ -547,6 +571,8 @@ impl IConversationRepository for StubConvRepo {
                 pinned_at: None,
                 created_at: 1000,
                 updated_at: 1000,
+                project_id: None,
+                folder_id: None,
             });
         if let Some(extra) = &updates.extra {
             row.extra = extra.clone();
@@ -992,8 +1018,6 @@ async fn seed_assistant_definition(
         source: "user",
         owner_type: "user",
         source_ref: Some(assistant_id),
-        source_version: None,
-        source_hash: None,
         name: assistant_id,
         name_i18n: "{}",
         description: Some("test assistant"),
@@ -1001,9 +1025,8 @@ async fn seed_assistant_definition(
         avatar_type: "emoji",
         avatar_value: Some("🤖"),
         agent_id,
-        rule_resource_type: "inline",
+        rule_resource_type: "user_file",
         rule_resource_ref: None,
-        rule_inline_content: None,
         recommended_prompts: "[]",
         recommended_prompts_i18n: "{}",
         default_model_mode: "auto",

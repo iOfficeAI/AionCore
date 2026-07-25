@@ -123,6 +123,9 @@ struct SendMessageParams {
     to: String,
     /// Message content.
     message: String,
+    /// Absolute attachment paths to forward to the target agent.
+    #[serde(default)]
+    files: Vec<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -247,12 +250,16 @@ struct DescribeAssistantParams {
 impl TeamStdioServer {
     #[tool(
         name = "team_send_message",
-        description = "Send a message to a teammate or broadcast to all (to=\"*\")."
+        description = "Send a message to a teammate or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files."
     )]
     async fn send_message(&self, Parameters(params): Parameters<SendMessageParams>) -> CallToolResult {
         self.forward_to_tcp(
             "team_send_message",
-            &serde_json::json!({ "to": params.to, "message": params.message }),
+            &serde_json::json!({
+                "to": params.to,
+                "message": params.message,
+                "files": params.files,
+            }),
         )
         .await
     }

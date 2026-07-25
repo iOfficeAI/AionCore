@@ -1,13 +1,49 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+duplicate_versions="$(
+    find crates/aionui-db/migrations -maxdepth 1 -type f -name '*.sql' -print \
+        | awk -F/ '
+            {
+                name = $NF
+                if (name ~ /^[0-9]+_/) {
+                    version = name
+                    sub(/_.*/, "", version)
+                    version += 0
+                    count[version]++
+                    files[version] = files[version] (files[version] == "" ? "" : ", ") name
+                }
+            }
+            END {
+                for (version in count) {
+                    if (count[version] > 1) {
+                        print version ": " files[version]
+                    }
+                }
+            }
+        ' \
+        | sort
+)"
+
+if [[ -n "$duplicate_versions" ]]; then
+    cat >&2 <<'EOF'
+Duplicate database migration versions are not allowed.
+
+Rename the later migration to the next unused numeric prefix.
+
+Duplicate versions:
+EOF
+    echo "$duplicate_versions" >&2
+    exit 1
+fi
+
 if [[ "${AIONCORE_ALLOW_MAIN_MIGRATION_EDIT:-}" == "1" ]]; then
     echo "AIONCORE_ALLOW_MAIN_MIGRATION_EDIT=1; skipping migration immutability check"
     exit 0
 fi
-
-repo_root="$(git rev-parse --show-toplevel)"
-cd "$repo_root"
 
 base_ref="${AIONCORE_MIGRATION_BASE_REF:-}"
 if [[ -z "$base_ref" ]]; then

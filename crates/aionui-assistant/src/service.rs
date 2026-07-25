@@ -23,13 +23,84 @@ use aionui_db::{
 };
 use aionui_extension::{AssistantClassifier, AssistantRuleDispatcher, ExtensionError};
 use serde_json;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent_catalog::AssistantAgentCatalogPort;
 #[cfg(test)]
 use crate::builtin::BuiltinAssistant;
 use crate::builtin::{AvatarAsset, BuiltinAssistantRegistry};
 use crate::error::AssistantError;
+
+/// Max attempts (initial + retries) and per-retry backoff for a bootstrap step
+/// contended by a concurrent startup (Sentry 135525166 Option B).
+const BOOTSTRAP_RETRY_MAX_ATTEMPTS: u32 = 5;
+const BOOTSTRAP_RETRY_BACKOFF_MS: [u64; 4] = [50, 100, 200, 400];
+
+/// Whether an assistant error is transient SQLite busy/locked contention. Repos
+/// convert `DbError` into `AssistantError::Internal(other.to_string())`, so the
+/// service can only classify by text — reusing the same markers as
+/// `DbError::is_busy` (single source of truth).
+fn assistant_error_is_busy(error: &AssistantError) -> bool {
+    matches!(error, AssistantError::Internal(message) if aionui_db::message_indicates_busy(message))
+}
+
+/// Whether an assistant error is a UNIQUE constraint violation — either the
+/// explicit `Conflict` variant (from `DbError::Conflict`) or a UNIQUE message
+/// surfaced through `Internal`.
+fn assistant_error_is_unique(error: &AssistantError) -> bool {
+    match error {
+        AssistantError::Conflict(_) => true,
+        AssistantError::Internal(message) => aionui_db::message_indicates_unique_violation(message),
+        _ => false,
+    }
+}
+
+/// Run one bootstrap step with bounded concurrent-startup retry (Sentry 135525166
+/// Option B). Free function (no `self`) so the retry policy is unit-testable.
+///
+/// - `Ok(())` → done.
+/// - UNIQUE conflict → treated as already-applied by a concurrent startup
+///   (idempotent convergence), returns `Ok(())`.
+/// - SQLITE_BUSY → retried with backoff; if still busy after the budget,
+///   returns [`AssistantError::ConcurrentBootstrapContention`].
+/// - any other error → returned immediately (real errors are not swallowed).
+async fn retry_bootstrap_step<'a, F>(step_name: &'static str, op: F) -> Result<(), AssistantError>
+where
+    F: Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AssistantError>> + Send + 'a>>,
+{
+    for attempt in 0..BOOTSTRAP_RETRY_MAX_ATTEMPTS {
+        match op().await {
+            Ok(()) => return Ok(()),
+            Err(error) if assistant_error_is_unique(&error) => {
+                debug!(
+                    step = step_name,
+                    "bootstrap step already applied by a concurrent startup (unique conflict treated as done)"
+                );
+                return Ok(());
+            }
+            Err(error) if assistant_error_is_busy(&error) => {
+                if attempt + 1 >= BOOTSTRAP_RETRY_MAX_ATTEMPTS {
+                    return Err(AssistantError::ConcurrentBootstrapContention(format!(
+                        "bootstrap step '{step_name}' contended after retries"
+                    )));
+                }
+                let backoff = BOOTSTRAP_RETRY_BACKOFF_MS[(attempt as usize).min(BOOTSTRAP_RETRY_BACKOFF_MS.len() - 1)];
+                warn!(
+                    step = step_name,
+                    attempt = attempt + 1,
+                    backoff_ms = backoff,
+                    "bootstrap step contended under concurrent startup (busy); retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    // The loop always returns above; this satisfies the type checker.
+    Err(AssistantError::ConcurrentBootstrapContention(format!(
+        "bootstrap step '{step_name}' contended after retries"
+    )))
+}
 
 /// Aggregated business logic for `/api/assistants/*` and rule/skill dispatch.
 pub struct AssistantService {
@@ -106,12 +177,35 @@ impl AssistantService {
     /// Bootstrap unified assistant storage from builtin assets and the
     /// legacy mirror tables.
     pub async fn bootstrap_assistant_storage(&self) -> Result<(), AssistantError> {
-        self.materialize_builtin_definitions().await?;
-        self.soft_delete_removed_builtin_definitions().await?;
-        self.sync_legacy_user_assistants_to_new_tables().await?;
-        self.reconcile_user_avatar_assets().await?;
-        self.sync_legacy_overrides_to_new_states().await?;
-        self.reconcile_generated_assistants().await?;
+        // Each step already re-runs idempotently on every startup. Wrap each in
+        // bounded concurrent-startup retry so a transient SQLITE_BUSY is retried
+        // and a UNIQUE conflict (another startup already inserted the row) is
+        // treated as done, instead of bubbling up as a fatal BOOTSTRAP_SERVER_FAILED
+        // (Sentry 135525166 Option B). We do NOT widen any startup lock here.
+        retry_bootstrap_step("materialize_builtin_definitions", || {
+            Box::pin(self.materialize_builtin_definitions())
+        })
+        .await?;
+        retry_bootstrap_step("soft_delete_removed_builtin_definitions", || {
+            Box::pin(self.soft_delete_removed_builtin_definitions())
+        })
+        .await?;
+        retry_bootstrap_step("sync_legacy_user_assistants_to_new_tables", || {
+            Box::pin(self.sync_legacy_user_assistants_to_new_tables())
+        })
+        .await?;
+        retry_bootstrap_step("reconcile_user_avatar_assets", || {
+            Box::pin(self.reconcile_user_avatar_assets())
+        })
+        .await?;
+        retry_bootstrap_step("sync_legacy_overrides_to_new_states", || {
+            Box::pin(self.sync_legacy_overrides_to_new_states())
+        })
+        .await?;
+        retry_bootstrap_step("reconcile_generated_assistants", || {
+            Box::pin(async { self.reconcile_generated_assistants().await.map(|_| ()) })
+        })
+        .await?;
         Ok(())
     }
 
@@ -177,8 +271,6 @@ impl AssistantService {
                     source: "builtin",
                     owner_type: "system",
                     source_ref: Some(&builtin.id),
-                    source_version: None,
-                    source_hash: None,
                     name: &builtin.name,
                     name_i18n: &name_i18n,
                     description: builtin.description.as_deref(),
@@ -192,7 +284,6 @@ impl AssistantService {
                         "none"
                     },
                     rule_resource_ref: builtin.rule_file.as_ref().map(|_| builtin.id.as_str()),
-                    rule_inline_content: None,
                     recommended_prompts: &recommended_prompts,
                     recommended_prompts_i18n: &recommended_prompts_i18n,
                     default_model_mode,
@@ -341,12 +432,21 @@ impl AssistantService {
                 .await
                 .map_err(|e| AssistantError::Internal(format!("get assistant overlay: {e}")))?;
 
+            // The legacy `assistant_overrides` table only seeds first-time
+            // migration. Once an overlay row exists it is authoritative — it
+            // reflects the user's toggles written via `set_state`. Re-applying
+            // the (never-updated) legacy row on every startup would clobber
+            // those toggles, so skip any assistant that already has an overlay.
+            if existing_state.is_some() {
+                continue;
+            }
+
             self.state_repo
                 .upsert(&UpsertAssistantOverlayParams {
                     assistant_definition_id: &definition.id,
                     enabled: override_row.enabled,
                     sort_order: override_row.sort_order,
-                    agent_id_override: existing_state.as_ref().and_then(|row| row.agent_id_override.as_deref()),
+                    agent_id_override: None,
                     last_used_at: override_row.last_used_at,
                 })
                 .await
@@ -452,13 +552,17 @@ impl AssistantService {
                 || definition.avatar_type != avatar_type
                 || definition.avatar_value.as_deref() != avatar_value
                 || definition.agent_id != row.id
-                || definition.source_ref.as_deref() != Some(row.id.as_str());
+                || definition.source_ref.as_deref() != Some(row.id.as_str())
+                || definition.rule_resource_type != "user_file"
+                || definition.rule_resource_ref.as_deref() != Some(assistant_id.as_str());
 
             definition.name = row.name.clone();
             definition.avatar_type = avatar_type.to_string();
             definition.avatar_value = avatar_value.map(ToOwned::to_owned);
             definition.agent_id = row.id.clone();
             definition.source_ref = Some(row.id.clone());
+            definition.rule_resource_type = "user_file".into();
+            definition.rule_resource_ref = Some(assistant_id.clone());
             if should_upgrade_skill_defaults {
                 definition.default_skills_mode = "fixed".into();
             }
@@ -471,8 +575,6 @@ impl AssistantService {
                     source: "generated".into(),
                     owner_type: "system".into(),
                     source_ref: Some(row.id.clone()),
-                    source_version: None,
-                    source_hash: None,
                     name: row.name.clone(),
                     name_i18n: "{}".into(),
                     description: row.description.clone(),
@@ -484,9 +586,8 @@ impl AssistantService {
                     },
                     avatar_value: avatar_value.map(ToOwned::to_owned),
                     agent_id: row.id.clone(),
-                    rule_resource_type: "none".into(),
-                    rule_resource_ref: None,
-                    rule_inline_content: None,
+                    rule_resource_type: "user_file".into(),
+                    rule_resource_ref: Some(assistant_id.clone()),
                     recommended_prompts: "[]".into(),
                     recommended_prompts_i18n: "{}".into(),
                     default_model_mode: "auto".into(),
@@ -585,8 +686,6 @@ impl AssistantService {
                 source: "user",
                 owner_type: "user",
                 source_ref: Some(&row.id),
-                source_version: None,
-                source_hash: None,
                 name: &row.name,
                 name_i18n: &name_i18n,
                 description: row.description.as_deref(),
@@ -596,7 +695,6 @@ impl AssistantService {
                 agent_id: &agent_id,
                 rule_resource_type: "user_file",
                 rule_resource_ref: Some(&row.id),
-                rule_inline_content: None,
                 recommended_prompts: &recommended_prompts,
                 recommended_prompts_i18n: &recommended_prompts_i18n,
                 default_model_mode: "auto",
@@ -1548,12 +1646,20 @@ impl AssistantService {
     /// create the conversation with `assistant: None`, so no UI locale reaches
     /// rule resolution and the localized file would otherwise be missed.
     fn read_user_rule_with_fallback(&self, id: &str, locale: Option<&str>) -> String {
-        let content = read_file_or_empty(&self.user_rule_path(id, locale));
-        if content.is_empty() {
-            read_first_assistant_md(&self.user_rules_dir(), id)
-        } else {
-            content
+        let rules_dir = self.user_rules_dir();
+        let content = read_assistant_md_with_legacy(&rules_dir, id, locale);
+        if !content.is_empty() {
+            return content;
         }
+
+        if locale.is_some_and(|value| !value.is_empty()) {
+            let locale_less = read_assistant_md_with_legacy(&rules_dir, id, None);
+            if !locale_less.is_empty() {
+                return locale_less;
+            }
+        }
+
+        read_first_assistant_md(&rules_dir, id)
     }
 
     /// Write an assistant rule file. User-authored and generated assistants
@@ -1591,8 +1697,7 @@ impl AssistantService {
         match self.classify_source(id).await {
             AssistantSource::Builtin => Ok(String::new()),
             AssistantSource::Generated | AssistantSource::User => {
-                let path = self.user_skill_path(id, locale);
-                Ok(read_file_or_empty(&path))
+                Ok(read_assistant_md_with_legacy(&self.user_skills_dir(), id, locale))
             }
         }
     }
@@ -2163,11 +2268,7 @@ impl AssistantService {
                 agent: projection.agent.clone(),
             },
             rules: AssistantRulesResponse {
-                content: if rules_content.is_empty() {
-                    definition.rule_inline_content.clone().unwrap_or_default()
-                } else {
-                    rules_content.to_owned()
-                },
+                content: rules_content.to_owned(),
                 storage_mode: definition.rule_resource_type.clone(),
             },
             prompts: AssistantPromptsResponse {
@@ -2616,8 +2717,6 @@ fn upsert_params_from_definition(definition: &AssistantDefinitionRow) -> UpsertA
         source: &definition.source,
         owner_type: &definition.owner_type,
         source_ref: definition.source_ref.as_deref(),
-        source_version: definition.source_version.as_deref(),
-        source_hash: definition.source_hash.as_deref(),
         name: &definition.name,
         name_i18n: &definition.name_i18n,
         description: definition.description.as_deref(),
@@ -2627,7 +2726,6 @@ fn upsert_params_from_definition(definition: &AssistantDefinitionRow) -> UpsertA
         agent_id: &definition.agent_id,
         rule_resource_type: &definition.rule_resource_type,
         rule_resource_ref: definition.rule_resource_ref.as_deref(),
-        rule_inline_content: definition.rule_inline_content.as_deref(),
         recommended_prompts: &definition.recommended_prompts,
         recommended_prompts_i18n: &definition.recommended_prompts_i18n,
         default_model_mode: &definition.default_model_mode,
@@ -2743,6 +2841,15 @@ fn normalize_json_array_string(raw: Option<&str>, field: &str) -> Result<String,
 // ---------------------------------------------------------------------------
 
 fn assistant_md_path(dir: &Path, id: &str, locale: Option<&str>) -> PathBuf {
+    let id = encode_filename_component(id);
+    let filename = match locale {
+        Some(loc) if !loc.is_empty() => format!("{id}.{}.md", encode_filename_component(loc)),
+        _ => format!("{id}.md"),
+    };
+    dir.join(filename)
+}
+
+fn legacy_assistant_md_path(dir: &Path, id: &str, locale: Option<&str>) -> PathBuf {
     let filename = match locale {
         Some(loc) if !loc.is_empty() => format!("{id}.{loc}.md"),
         _ => format!("{id}.md"),
@@ -2750,48 +2857,148 @@ fn assistant_md_path(dir: &Path, id: &str, locale: Option<&str>) -> PathBuf {
     dir.join(filename)
 }
 
+fn legacy_filename_component_is_safe(value: &str) -> bool {
+    !value.bytes().any(|byte| matches!(byte, b'/' | b'\\' | b'\0'))
+}
+
+fn encode_filename_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
+}
+
 fn read_file_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-/// Read the first available `{id}.*.md` rule file in `dir`, preferring the
-/// locale-less `{id}.md`. Used as a fallback when a rule is resolved without a
-/// locale (e.g. scheduled/cron runs, which create the conversation with
-/// `assistant: None`) and the exact `{id}.{locale}.md` file is therefore not
-/// found. Returns an empty string when no rule file exists.
+fn read_assistant_md_with_legacy(dir: &Path, id: &str, locale: Option<&str>) -> String {
+    let path = assistant_md_path(dir, id, locale);
+    let content = read_file_or_empty(&path);
+    if !content.is_empty() {
+        return content;
+    }
+
+    if !legacy_filename_component_is_safe(id) || locale.is_some_and(|value| !legacy_filename_component_is_safe(value)) {
+        return String::new();
+    }
+
+    let legacy_path = legacy_assistant_md_path(dir, id, locale);
+    if legacy_path == path {
+        return String::new();
+    }
+    let legacy_content = read_file_or_empty(&legacy_path);
+    if legacy_content.is_empty() {
+        return String::new();
+    }
+
+    match std::fs::write(&path, &legacy_content) {
+        Ok(()) => {
+            info!(
+                assistant_id = id,
+                locale = locale.unwrap_or_default(),
+                "migrated legacy assistant markdown path"
+            );
+            if let Err(error) = std::fs::remove_file(&legacy_path) {
+                warn!(
+                    assistant_id = id,
+                    locale = locale.unwrap_or_default(),
+                    %error,
+                    "failed to remove legacy assistant markdown path after migration"
+                );
+            }
+        }
+        Err(error) => {
+            warn!(
+                assistant_id = id,
+                locale = locale.unwrap_or_default(),
+                %error,
+                "failed to migrate legacy assistant markdown path"
+            );
+        }
+    }
+    legacy_content
+}
+
+/// Read the first available assistant markdown file in `dir`, preferring the
+/// locale-less file. Both encoded filenames and pre-encoding legacy filenames
+/// are recognized.
 fn read_first_assistant_md(dir: &Path, id: &str) -> String {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return String::new();
     };
-    let prefix = format!("{id}.");
-    let exact = format!("{id}.md");
-    let mut fallback: Option<PathBuf> = None;
+    let encoded_id = encode_filename_component(id);
+    let encoded_prefix = format!("{encoded_id}.");
+    let encoded_exact = format!("{encoded_id}.md");
+    let legacy_prefix = format!("{id}.");
+    let legacy_exact = format!("{id}.md");
+    let mut candidates = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == exact {
-            return read_file_or_empty(&entry.path());
-        }
-        if fallback.is_none() && name.starts_with(&prefix) && name.ends_with(".md") {
-            fallback = Some(entry.path());
+        let name = name.to_string_lossy().into_owned();
+        let priority = if name == encoded_exact || name == legacy_exact {
+            0
+        } else if name.starts_with(&encoded_prefix) && name.ends_with(".md") {
+            1
+        } else if name.starts_with(&legacy_prefix) && name.ends_with(".md") {
+            2
+        } else {
+            continue;
+        };
+        candidates.push((priority, name, entry.path()));
+    }
+    candidates.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+    for (_, _, path) in candidates {
+        let content = read_file_or_empty(&path);
+        if !content.is_empty() {
+            return content;
         }
     }
-    fallback.map(|path| read_file_or_empty(&path)).unwrap_or_default()
+    String::new()
 }
 
-/// Remove every `{id}*.md` file in `dir`. Returns `true` if any file was
-/// deleted.
+/// Remove encoded and pre-encoding legacy markdown files for an assistant.
 fn remove_assistant_md_files(dir: &Path, id: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
     let mut deleted = false;
-    let prefix = format!("{id}.");
-    let exact = format!("{id}.md");
+    if legacy_filename_component_is_safe(id) {
+        let legacy_path = legacy_assistant_md_path(dir, id, None);
+        if legacy_path != assistant_md_path(dir, id, None) {
+            match std::fs::remove_file(&legacy_path) {
+                Ok(()) => deleted = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => warn!(
+                    assistant_id = id,
+                    %error,
+                    "failed to remove legacy assistant markdown path"
+                ),
+            }
+        }
+    }
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return deleted;
+    };
+    let encoded_id = encode_filename_component(id);
+    let encoded_prefix = format!("{encoded_id}.");
+    let encoded_exact = format!("{encoded_id}.md");
+    let legacy_prefix = format!("{id}.");
+    let legacy_exact = format!("{id}.md");
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == exact || (name.starts_with(&prefix) && name.ends_with(".md")) {
+        if name == encoded_exact
+            || name == legacy_exact
+            || ((name.starts_with(&encoded_prefix) || name.starts_with(&legacy_prefix)) && name.ends_with(".md"))
+        {
             if let Err(e) = std::fs::remove_file(entry.path()) {
                 warn!("failed to remove {}: {e}", entry.path().display());
                 continue;
@@ -2848,10 +3055,107 @@ mod tests {
     use aionui_db::{
         CreateProviderParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
         SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-        SqliteProviderRepository, init_database_memory,
+        SqliteProviderRepository, UpsertOverrideParams, init_database_memory,
     };
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    // T-B2 — bounded concurrent-startup retry policy (Sentry 135525166 Option B).
+    fn busy_error() -> AssistantError {
+        AssistantError::Internal("Database query failed: database is locked".to_string())
+    }
+
+    #[tokio::test]
+    async fn retry_step_succeeds_after_transient_busy() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_bootstrap_step("materialize_builtin_definitions", || {
+            Box::pin(async {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n < 2 { Err(busy_error()) } else { Ok(()) }
+            })
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_step_reports_contention_when_busy_persists() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_bootstrap_step("materialize_builtin_definitions", || {
+            Box::pin(async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(busy_error())
+            })
+        })
+        .await;
+
+        assert!(matches!(result, Err(AssistantError::ConcurrentBootstrapContention(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), BOOTSTRAP_RETRY_MAX_ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn retry_step_treats_unique_conflict_as_done_without_retry() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_bootstrap_step("materialize_builtin_definitions", || {
+            Box::pin(async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(AssistantError::Conflict("assistant_definitions.id".to_string()))
+            })
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_step_returns_other_errors_immediately() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_bootstrap_step("materialize_builtin_definitions", || {
+            Box::pin(async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(AssistantError::Internal("disk full".to_string()))
+            })
+        })
+        .await;
+
+        assert!(matches!(result, Err(AssistantError::Internal(message)) if message == "disk full"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    // T-B3 — bootstrap must stay idempotent on an existing, already-populated
+    // database when re-run (simulating re-entry / concurrent restart). No
+    // duplicate definitions, no failure (Sentry 135525166 Option B; spec §9).
+    #[tokio::test]
+    async fn bootstrap_assistant_storage_is_idempotent_across_repeated_runs() {
+        let fx = fixture_with_builtins(vec![
+            mk_builtin("builtin-a", "Builtin A"),
+            mk_builtin("builtin-b", "Builtin B"),
+        ])
+        .await;
+
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+        let after_first = fx.definition_repo.list().await.unwrap();
+
+        // Re-run bootstrap on the now non-empty database multiple times.
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+        let after_repeat = fx.definition_repo.list().await.unwrap();
+
+        assert_eq!(
+            after_first.len(),
+            2,
+            "both builtins should be materialized on the first run"
+        );
+        assert_eq!(
+            after_repeat.len(),
+            after_first.len(),
+            "repeated bootstrap must not duplicate assistant definitions"
+        );
+    }
 
     struct Fixture {
         service: AssistantService,
@@ -2859,6 +3163,7 @@ mod tests {
         state_repo: Arc<dyn IAssistantOverlayRepository>,
         preference_repo: Arc<dyn IAssistantPreferenceRepository>,
         repo: Arc<dyn IAssistantRepository>,
+        override_repo: Arc<dyn IAssistantOverrideRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
         agent_rows: Arc<Mutex<Vec<aionui_api_types::AgentManagementRow>>>,
         _tmp: TempDir,
@@ -2971,7 +3276,7 @@ mod tests {
                 state_repo: state_repo.clone(),
                 preference_repo: preference_repo.clone(),
                 repo: repo.clone(),
-                override_repo: orepo,
+                override_repo: orepo.clone(),
                 provider_repo: provider_repo.clone(),
                 builtin: builtin_reg,
                 agent_catalog: Some(Arc::new(StubAgentCatalog {
@@ -2988,6 +3293,7 @@ mod tests {
             state_repo,
             preference_repo,
             repo,
+            override_repo: orepo,
             provider_repo,
             agent_rows,
             _tmp: tmp,
@@ -3009,6 +3315,7 @@ mod tests {
             model_protocols: None,
             model_enabled: None,
             model_health: None,
+            model_settings: "{}",
             bedrock_config: None,
             is_full_url: false,
         })
@@ -3113,8 +3420,6 @@ mod tests {
                 source: "generated",
                 owner_type: "system",
                 source_ref: Some(agent_id),
-                source_version: None,
-                source_hash: None,
                 name: "Historical generated agent",
                 name_i18n: "{}",
                 description: None,
@@ -3124,7 +3429,6 @@ mod tests {
                 agent_id,
                 rule_resource_type: "none",
                 rule_resource_ref: None,
-                rule_inline_content: None,
                 recommended_prompts: "[]",
                 recommended_prompts_i18n: "{}",
                 default_model_mode: "auto",
@@ -3171,8 +3475,6 @@ mod tests {
                 source: "user",
                 owner_type: "user",
                 source_ref: Some("custom-canonical-only"),
-                source_version: None,
-                source_hash: None,
                 name: "Canonical Only",
                 name_i18n: "{}",
                 description: None,
@@ -3182,7 +3484,6 @@ mod tests {
                 agent_id: "aionrs",
                 rule_resource_type: "user_file",
                 rule_resource_ref: Some("custom-canonical-only"),
-                rule_inline_content: None,
                 recommended_prompts: "[]",
                 recommended_prompts_i18n: "{}",
                 default_model_mode: "auto",
@@ -3263,6 +3564,64 @@ mod tests {
         );
     }
 
+    /// Regression for the legacy-override clobber bug: once the user has
+    /// toggled an assistant (writing the authoritative `assistant_overlays`
+    /// row), a subsequent restart must NOT overwrite that value back to the
+    /// stale `assistant_overrides` row. The legacy sync only seeds first-time
+    /// migration; an existing overlay is authoritative.
+    #[tokio::test]
+    async fn bootstrap_does_not_clobber_user_toggle_with_stale_legacy_override() {
+        let fx = fixture_with_builtins(vec![mk_builtin("assistant-a", "Assistant A")]).await;
+
+        // Legacy row written by an older app version: disabled.
+        fx.override_repo
+            .upsert(&UpsertOverrideParams {
+                assistant_id: "assistant-a",
+                enabled: false,
+                sort_order: 0,
+                last_used_at: None,
+            })
+            .await
+            .unwrap();
+
+        // First launch after upgrade: legacy row seeds the overlay (disabled).
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("assistant-a")
+            .await
+            .unwrap()
+            .expect("definition exists");
+        let seeded_enabled = fx.state_repo.get(&definition.id).await.unwrap().unwrap().enabled;
+        assert!(
+            !seeded_enabled,
+            "legacy override should seed the overlay on first migration"
+        );
+
+        // User toggles the assistant ON — writes the authoritative overlay.
+        fx.service
+            .set_state(
+                "assistant-a",
+                SetAssistantStateRequest {
+                    enabled: Some(true),
+                    sort_order: None,
+                    last_used_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        let toggled_enabled = fx.state_repo.get(&definition.id).await.unwrap().unwrap().enabled;
+        assert!(toggled_enabled, "user toggle should be reflected in the overlay");
+
+        // Restart: bootstrap runs again. It must NOT revert the user's toggle.
+        fx.service.bootstrap_assistant_storage().await.unwrap();
+        let after_restart_enabled = fx.state_repo.get(&definition.id).await.unwrap().unwrap().enabled;
+        assert!(
+            after_restart_enabled,
+            "restart must not clobber the user's toggle with the stale legacy override"
+        );
+    }
+
     #[tokio::test]
     async fn bootstrap_skips_dirty_generated_assistant_definitions() {
         let fx = fixture().await;
@@ -3281,8 +3640,6 @@ mod tests {
                 source: "generated",
                 owner_type: "system",
                 source_ref: Some("agent-dirty"),
-                source_version: None,
-                source_hash: None,
                 name: "Dirty",
                 name_i18n: "{}",
                 description: None,
@@ -3292,7 +3649,6 @@ mod tests {
                 agent_id: "agent-dirty",
                 rule_resource_type: "none",
                 rule_resource_ref: None,
-                rule_inline_content: None,
                 recommended_prompts: "[]",
                 recommended_prompts_i18n: "{}",
                 default_model_mode: "auto",
@@ -3386,8 +3742,6 @@ mod tests {
                 source: "generated",
                 owner_type: "system",
                 source_ref: Some("agent-claude"),
-                source_version: None,
-                source_hash: None,
                 name: "Claude",
                 name_i18n: "{}",
                 description: None,
@@ -3397,7 +3751,6 @@ mod tests {
                 agent_id: "agent-claude",
                 rule_resource_type: "none",
                 rule_resource_ref: None,
-                rule_inline_content: None,
                 recommended_prompts: "[]",
                 recommended_prompts_i18n: "{}",
                 default_model_mode: "auto",
@@ -5495,6 +5848,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_rule_user_fallback_skips_empty_files() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("u1".into()),
+                name: "A".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        fx.service.write_rule("u1", None, "").await.unwrap();
+        fx.service
+            .write_rule("u1", Some("zh-TW"), "available rule")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fx.service.read_rule("u1", Some("en-US")).await.unwrap(),
+            "available rule"
+        );
+    }
+
+    #[tokio::test]
     async fn write_rule_builtin_rejects() {
         let fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
         let err = fx
@@ -5522,6 +5898,88 @@ mod tests {
             .unwrap();
         let content = fx.service.read_rule("bare:agent-claude", Some("en-US")).await.unwrap();
         assert_eq!(content, "rule body");
+        assert!(
+            fx._tmp
+                .path()
+                .join("assistant-rules/bare%3Aagent-claude.en-US.md")
+                .is_file()
+        );
+        assert!(
+            !fx._tmp
+                .path()
+                .join("assistant-rules/bare:agent-claude.en-US.md")
+                .exists()
+        );
+
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("bare:agent-claude")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.rule_resource_type, "user_file");
+        assert_eq!(definition.rule_resource_ref.as_deref(), Some("bare:agent-claude"));
+    }
+
+    #[test]
+    fn legacy_generated_rule_path_is_migrated_to_encoded_filename() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("assistant-rules");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy_path = legacy_assistant_md_path(&dir, "bare:632f31d2", None);
+        std::fs::write(&legacy_path, "legacy rule").unwrap();
+
+        assert_eq!(
+            read_assistant_md_with_legacy(&dir, "bare:632f31d2", None),
+            "legacy rule"
+        );
+
+        let encoded_path = assistant_md_path(&dir, "bare:632f31d2", None);
+        assert_eq!(
+            encoded_path.file_name().and_then(|name| name.to_str()),
+            Some("bare%3A632f31d2.md")
+        );
+        assert_eq!(std::fs::read_to_string(encoded_path).unwrap(), "legacy rule");
+        assert!(!legacy_path.exists());
+    }
+
+    #[tokio::test]
+    async fn generated_rule_with_requested_locale_falls_back_to_legacy_locale_less_path() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "632f31d2",
+                "aionrs",
+                aionui_api_types::AgentManagementStatus::Online,
+            )],
+            ..Default::default()
+        })
+        .await;
+        let dir = fx._tmp.path().join("assistant-rules");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy_path = legacy_assistant_md_path(&dir, "bare:632f31d2", None);
+        std::fs::write(&legacy_path, "legacy locale-less rule").unwrap();
+
+        assert_eq!(
+            fx.service.read_rule("bare:632f31d2", Some("zh-CN")).await.unwrap(),
+            "legacy locale-less rule"
+        );
+
+        let encoded_path = assistant_md_path(&dir, "bare:632f31d2", None);
+        assert_eq!(
+            std::fs::read_to_string(encoded_path).unwrap(),
+            "legacy locale-less rule"
+        );
+        assert!(!legacy_path.exists());
+    }
+
+    #[test]
+    fn assistant_markdown_path_encodes_path_separators_and_percent() {
+        let path = assistant_md_path(Path::new("rules"), "../bare:%2F", Some(r"en\US"));
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("%2E%2E%2Fbare%3A%252F.en%5CUS.md")
+        );
+        assert_eq!(path.parent(), Some(Path::new("rules")));
     }
 
     #[tokio::test]
@@ -5750,6 +6208,7 @@ mod tests {
                 model_protocols: None,
                 model_enabled: None,
                 model_health: None,
+                model_settings: "{}",
                 bedrock_config: None,
                 is_full_url: false,
             })

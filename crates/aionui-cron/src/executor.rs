@@ -2815,6 +2815,8 @@ mod tests {
                 pinned_at: None,
                 created_at: 0,
                 updated_at: 0,
+                project_id: None,
+                folder_id: None,
             }))
         }
 
@@ -2941,6 +2943,8 @@ mod tests {
                     pinned_at: None,
                     created_at: 0,
                     updated_at: 0,
+                    project_id: None,
+                    folder_id: None,
                 },
                 updates: Mutex::new(Vec::new()),
                 inserted_messages: Mutex::new(Vec::new()),
@@ -3219,6 +3223,9 @@ mod tests {
             _conversation_id: &str,
             _session_id: &str,
         ) -> Result<bool, aionui_db::DbError> {
+            Ok(false)
+        }
+        async fn clear_session_id(&self, _conversation_id: &str) -> Result<bool, aionui_db::DbError> {
             Ok(false)
         }
         async fn delete(&self, _conversation_id: &str) -> Result<bool, aionui_db::DbError> {

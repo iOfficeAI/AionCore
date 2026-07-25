@@ -28,6 +28,8 @@ fn make_conversation(suffix: &str) -> ConversationRow {
         pinned_at: None,
         created_at: now,
         updated_at: now,
+        project_id: None,
+        folder_id: None,
     }
 }
 

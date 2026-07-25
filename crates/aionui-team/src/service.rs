@@ -3,15 +3,15 @@ mod response_builder;
 pub(crate) mod spawn_support;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock, Weak};
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionPhase, TeamSessionStatus,
-    TeamSessionStatusPayload, WebSocketMessage,
+    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus,
+    TeamSessionStatusPayload, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
+    TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -19,9 +19,9 @@ use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
     ITeamRepository, UpdateTeamParams,
 };
+use aionui_project::{ProjectService, canonical};
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
-use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::error::TeamError;
@@ -29,7 +29,6 @@ use crate::event_loop::{AgentLoopContext, EventLoopRegistrationError};
 use crate::events::{
     TEAM_CREATED_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT, TEAM_SESSION_STATUS_CHANGED_EVENT, TeamEventEmitter,
 };
-use crate::mcp::TeamMcpStdioConfig;
 use crate::member_runtime::{
     AttachLease, AttachOutcome, AttachWaiter, BeginRemove, MemberRuntimeFailure, MemberRuntimeSnapshot, ReserveAttach,
 };
@@ -37,10 +36,12 @@ use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogPort};
 use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
+use crate::runtime_tools::{
+    ResolvedTeamToolContext, agent_for_conversation, error_payload, execute_with_scheduler, role_to_tool_role,
+};
 use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
 use crate::team_run::TeamRunManager;
 use crate::types::{Team, TeamAgent, TeammateRole};
-use crate::work_coordinator::RuntimeConstraint;
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
 
@@ -79,96 +80,10 @@ impl IdleCleanupCoordinator for TeamIdleCleanupCoordinator {
     }
 }
 
-struct TeamAgentRebuildOutcome {
-    agent: TeamAgent,
-    duration_ms: u128,
-    result: Result<(), TeamError>,
-}
-
 struct MemberRuntimeReconcileWork {
     agent: TeamAgent,
     waiter: AttachWaiter,
     owner: Option<AttachLease>,
-}
-
-const TEAM_REBUILD_MAX_CONCURRENCY: usize = 3;
-const TEAM_REBUILD_START_STAGGER: std::time::Duration = std::time::Duration::from_secs(3);
-
-fn format_rebuild_agent_identity(agent: &TeamAgent) -> String {
-    format!(
-        "{} (backend={}, model={}, role={}, slot_id={}, conversation_id={})",
-        agent.name, agent.backend, agent.model, agent.role, agent.slot_id, agent.conversation_id
-    )
-}
-
-fn spawn_rebuild_agent_process(
-    jobs: &mut JoinSet<TeamAgentRebuildOutcome>,
-    provisioner: TeamAgentProvisioner,
-    task_manager: Arc<dyn IWorkerTaskManager>,
-    user_id: String,
-    agent: TeamAgent,
-    cfg: TeamMcpStdioConfig,
-) {
-    jobs.spawn(async move {
-        let team_id = cfg.team_id.clone();
-        info!(
-            team_id = %team_id,
-            slot_id = %agent.slot_id,
-            agent_name = %agent.name,
-            conversation_id = %agent.conversation_id,
-            backend = %agent.backend,
-            model = %agent.model,
-            role = %agent.role,
-            "team agent rebuild attach started"
-        );
-        let attach_started_at = Instant::now();
-        let result = provisioner
-            .attach_agent_process(&user_id, &agent, cfg, &task_manager)
-            .await;
-        let duration_ms = attach_started_at.elapsed().as_millis();
-        match &result {
-            Ok(()) => info!(
-                team_id = %team_id,
-                slot_id = %agent.slot_id,
-                agent_name = %agent.name,
-                conversation_id = %agent.conversation_id,
-                backend = %agent.backend,
-                model = %agent.model,
-                role = %agent.role,
-                duration_ms,
-                "team agent rebuild attach finished"
-            ),
-            Err(error) => warn!(
-                team_id = %team_id,
-                slot_id = %agent.slot_id,
-                agent_name = %agent.name,
-                conversation_id = %agent.conversation_id,
-                backend = %agent.backend,
-                model = %agent.model,
-                role = %agent.role,
-                duration_ms,
-                error = %error,
-                "team agent rebuild attach failed"
-            ),
-        }
-        TeamAgentRebuildOutcome {
-            agent,
-            duration_ms,
-            result,
-        }
-    });
-}
-
-async fn join_next_rebuild_outcome(
-    jobs: &mut JoinSet<TeamAgentRebuildOutcome>,
-) -> Result<Option<TeamAgentRebuildOutcome>, TeamError> {
-    match jobs.join_next().await {
-        Some(Ok(outcome)) => Ok(Some(outcome)),
-        Some(Err(error)) => Err(TeamError::InvalidRequest(format!(
-            "team agent rebuild task failed: {error}"
-        ))),
-        None => Ok(None),
-    }
 }
 
 pub struct TeamSessionService {
@@ -194,6 +109,9 @@ pub struct TeamSessionService {
     /// Per-team mutex serializing `ensure_session` so concurrent callers cannot
     /// race and start two sessions for the same team.
     ensure_session_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Project-bind side branch (optional). `None` → team binding is a no-op,
+    /// so team create/read behaves exactly as before.
+    project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
     /// Back-pointer used by [`TeamSession::spawn_agent`] to reach DB-facing
     /// orchestration without threading the service through every session method.
     /// Stored as `Weak` so the session map does not create a strong cycle with
@@ -272,6 +190,7 @@ impl TeamSessionService {
             sessions: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
+            project_service: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
         })
     }
@@ -284,6 +203,60 @@ impl TeamSessionService {
             self.provider_repo.clone(),
             self.conversation_port.clone(),
         )
+    }
+
+    /// Inject the project-bind service (project-bind side branch). When unset,
+    /// binding/backfill are no-ops.
+    pub fn with_project_service(&self, project_service: Arc<ProjectService>) {
+        if let Ok(mut guard) = self.project_service.write() {
+            *guard = Some(project_service);
+        }
+    }
+
+    /// Resolve a team workspace into `(project_id, folder_id)`. Best-effort:
+    /// missing service / empty workspace / bad URI / resolve error → `(None, None)`,
+    /// logged at `warn`. Never affects team create/read.
+    async fn resolve_binding_best_effort(&self, workspace: &str) -> (Option<String>, Option<String>) {
+        let project_service = self.project_service.read().ok().and_then(|guard| guard.clone());
+        let Some(project_service) = project_service else {
+            return (None, None);
+        };
+        if workspace.trim().is_empty() {
+            return (None, None);
+        }
+        let uri = match canonical::to_file_uri(Path::new(workspace)) {
+            Ok(uri) => uri,
+            Err(err) => {
+                warn!(error = err.code(), "team project bind skipped: bad workspace uri");
+                return (None, None);
+            }
+        };
+        match project_service.resolve_existing(uri).await {
+            Ok(out) => (Some(out.project.project_id), Some(out.folder.folder_id)),
+            Err(err) => {
+                warn!(error = err.code(), "team project bind skipped");
+                (None, None)
+            }
+        }
+    }
+
+    /// Lazily backfill `teams.project_id`/`folder_id` on read. Best-effort;
+    /// no-op when already bound, workspace empty, or service unset.
+    async fn backfill_team_binding_best_effort(&self, row: &TeamRow) {
+        if row.project_id.is_some() || row.workspace.trim().is_empty() {
+            return;
+        }
+        let (Some(project_id), Some(folder_id)) = self.resolve_binding_best_effort(&row.workspace).await else {
+            return;
+        };
+        let params = UpdateTeamParams {
+            project_id: Some(project_id),
+            folder_id: Some(folder_id),
+            ..Default::default()
+        };
+        if let Err(err) = self.repo.update_team(&row.id, &params).await {
+            warn!(team_id = %row.id, error = %err, "team project bind: backfill update failed");
+        }
     }
 
     async fn load_owned_team(&self, user_id: &str, team_id: &str) -> Result<Team, TeamError> {
@@ -397,6 +370,9 @@ impl TeamSessionService {
         let team_workspace = provisioned.team_workspace;
         let agents_json = serde_json::to_string(&agents)?;
 
+        // Project-bind side branch (best-effort; never affects team creation).
+        let (project_id, folder_id) = self.resolve_binding_best_effort(&team_workspace).await;
+
         let row = TeamRow {
             id: team_id.clone(),
             user_id: user_id.to_owned(),
@@ -409,6 +385,8 @@ impl TeamSessionService {
             agents_version: "1.0.1".into(),
             created_at: now,
             updated_at: now,
+            project_id,
+            folder_id,
         };
         self.repo.create_team(&row).await?;
 
@@ -458,7 +436,20 @@ impl TeamSessionService {
     }
 
     pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {
-        let team = self.load_owned_team(user_id, team_id).await?;
+        let row = self
+            .repo
+            .get_team(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+        if row.user_id != user_id {
+            return Err(TeamError::Forbidden(format!(
+                "team {team_id} is not owned by current user"
+            )));
+        }
+        // Project-bind side branch: lazily backfill binding only when a single
+        // team is opened (never during list_teams / lease renew).
+        self.backfill_team_binding_best_effort(&row).await;
+        let team = Team::from_row(&row)?;
         self.build_team_response(&team).await
     }
 
@@ -557,6 +548,8 @@ impl TeamSessionService {
                 agent.clone(),
                 self.task_manager.clone(),
                 reservation,
+                // User-initiated add: failures surface inline, do not wake leader.
+                false,
             );
             info!(
                 team_id = %team_id,
@@ -934,56 +927,38 @@ impl TeamSessionService {
             |_| {},
         );
 
-        if let Err(e) = self
-            .rebuild_agent_processes(team_id, &session, &user_id, &agents_snapshot)
-            .await
-        {
-            self.broadcast_session_status(
-                team_id,
-                TeamSessionStatus::Failed,
-                Some(TeamSessionPhase::AttachingAgents),
-                |p| {
-                    p.error = Some(e.to_string());
-                },
-            );
-            session.stop();
-            self.cleanup_bootstrap_runtime_tasks(&agents_snapshot).await;
-            return Err(e);
-        }
+        let service = self
+            .self_ref
+            .upgrade()
+            .ok_or_else(|| TeamError::InvalidRequest("team service is shutting down".to_owned()))?;
 
-        if let Err(error) = self.spawn_event_loops(&session, &user_id, &agents_snapshot) {
-            warn!(
-                team_id,
-                generation = session.generation(),
-                error = %error,
-                "team bootstrap event loop registration failed"
-            );
-            session.stop();
-            self.cleanup_bootstrap_runtime_tasks(&agents_snapshot).await;
-            self.broadcast_session_status(
-                team_id,
-                TeamSessionStatus::Failed,
-                Some(TeamSessionPhase::AttachingAgents),
-                |payload| payload.error = Some(error.to_string()),
-            );
-            return Err(error);
-        }
-
-        if agents_snapshot
+        // Leader-only warmup: only the lead slot is attached at first start.
+        // Teammates stay dormant (Absent in the registry) until a delivery
+        // lazily wakes them (spec 5.1).
+        let Some(leader) = agents_snapshot
             .iter()
-            .any(|agent| !session.member_runtimes().seed_ready(agent.slot_id.clone()))
-        {
-            let error = TeamError::InvalidRequest("failed to seed bootstrap member runtime registry".to_owned());
+            .find(|agent| agent.role == TeammateRole::Lead)
+            .cloned()
+        else {
+            let error = TeamError::InvalidRequest("team has no lead agent".to_owned());
+            self.broadcast_session_status(
+                team_id,
+                TeamSessionStatus::Failed,
+                Some(TeamSessionPhase::AttachingAgents),
+                |p| p.error = Some(error.to_string()),
+            );
             session.stop();
-            self.cleanup_bootstrap_runtime_tasks(&agents_snapshot).await;
             return Err(error);
-        }
-        for agent in &agents_snapshot {
-            session
-                .work_coordinator()
-                .set_runtime_constraint(&agent.slot_id, RuntimeConstraint::Ready);
-        }
+        };
 
+        // Publish the session BEFORE attaching so the single attach path
+        // (`attach_member_runtime`) observes it as the current published
+        // session. Drop the startup guards before awaiting the attach: that
+        // path re-acquires the membership lock (via `refresh_member_runtime_status`)
+        // and the ensure lock (via `cleanup_stale_member_runtime_task` on
+        // failure), so holding them here would deadlock. Concurrent ensures
+        // that were blocked on membership_guard now observe the published
+        // session and take the reconciliation path instead of cold-starting.
         let slow_monitor_handle = Self::spawn_slow_monitor(session.clone());
         let entry = SessionEntry {
             session: session.clone(),
@@ -991,9 +966,60 @@ impl TeamSessionService {
         };
         self.sessions.insert(team_id.to_owned(), entry);
         drop(membership_guard);
+        drop(ensure_guard);
 
-        for agent in &agents_snapshot {
-            self.broadcast_agent_runtime_status(team_id, agent, TeamAgentRuntimeStatus::Ready, None);
+        self.broadcast_agent_runtime_status(team_id, &leader, TeamAgentRuntimeStatus::Pending, None);
+        let leader_outcome = match session.member_runtimes().reserve_attach(&leader.slot_id, false) {
+            ReserveAttach::Start(lease) => {
+                attach_member_runtime(
+                    Arc::clone(&service),
+                    session.clone(),
+                    user_id.clone(),
+                    leader.clone(),
+                    self.task_manager.clone(),
+                    lease,
+                    // Leader cold-start failure bubbles to a session-level Failed
+                    // (full-screen card), not an inline per-member notice.
+                    false,
+                )
+                .await
+            }
+            ReserveAttach::Join(waiter) | ReserveAttach::Removing(waiter) => waiter.wait().await,
+            ReserveAttach::AlreadyReady => AttachOutcome::Ready,
+            ReserveAttach::SessionStopped => AttachOutcome::SessionStopped,
+        };
+
+        match leader_outcome {
+            AttachOutcome::Ready | AttachOutcome::Removed => {}
+            AttachOutcome::Failed(failure) => {
+                self.broadcast_session_status(
+                    team_id,
+                    TeamSessionStatus::Failed,
+                    Some(TeamSessionPhase::AttachingAgents),
+                    |p| p.error = Some(failure.public_reason.clone()),
+                );
+                session.stop();
+                self.sessions.remove(team_id);
+                return Err(TeamError::MemberRuntimeFailed {
+                    team_id: team_id.to_owned(),
+                    slot_id: leader.slot_id.clone(),
+                    conversation_id: leader.conversation_id.clone(),
+                    public_reason: failure.public_reason,
+                });
+            }
+            AttachOutcome::SessionStopped => {
+                session.stop();
+                self.sessions.remove(team_id);
+                return Err(TeamError::InvalidRequest(
+                    "team session stopped during leader warmup".to_owned(),
+                ));
+            }
+        }
+
+        // Teammates start dormant; the leader's Ready was already broadcast by
+        // its successful attach.
+        for agent in agents_snapshot.iter().filter(|a| a.role != TeammateRole::Lead) {
+            self.broadcast_agent_runtime_status(team_id, agent, TeamAgentRuntimeStatus::Dormant, None);
         }
 
         self.broadcast_session_status(
@@ -1036,7 +1062,16 @@ impl TeamSessionService {
             if !scheduler_slots.contains(&agent.slot_id) {
                 session.scheduler().add_agent(agent).await;
             }
-            let reservation = match session.member_runtimes().snapshot(&agent.slot_id) {
+            let snapshot = session.member_runtimes().snapshot(&agent.slot_id);
+            // Skip dormant teammates: an Absent non-lead member was never
+            // triggered, so a re-ensure (second warmupSession, model switch,
+            // retry) must NOT wake it, or it would punch through lazy warmup
+            // (spec 5.1). The leader, Ready-repair, Failed-retry, and in-flight
+            // members still reconcile.
+            if matches!(snapshot, MemberRuntimeSnapshot::Absent) && agent.role != TeammateRole::Lead {
+                continue;
+            }
+            let reservation = match snapshot {
                 MemberRuntimeSnapshot::Ready if self.task_manager.get_task(&agent.conversation_id).is_none() => {
                     session.member_runtimes().reserve_repair(&agent.slot_id)
                 }
@@ -1093,7 +1128,11 @@ impl TeamSessionService {
         session: Arc<TeamSession>,
         work: Vec<MemberRuntimeReconcileWork>,
     ) -> Result<(), TeamError> {
-        if !work.is_empty() {
+        // Session-level `Starting` is leader-scoped (spec 5.4/5.5): only a
+        // leader (re)attach may raise the overlay. Reconciliation that touches
+        // only teammates (Ready-repair, Failed-retry of a non-lead member) keeps
+        // its progress inline via `agentRuntimeStatusChanged`.
+        if work.iter().any(|item| item.agent.role == TeammateRole::Lead) {
             self.publish_member_runtime_starting_if_current(&session);
         }
         let mut waiters = Vec::with_capacity(work.len());
@@ -1109,6 +1148,9 @@ impl TeamSessionService {
                     item.agent.clone(),
                     self.task_manager.clone(),
                     owner,
+                    // Reconciliation repairs runtimes without a fresh delivery to
+                    // re-delegate; failures surface via runtime status only.
+                    false,
                 ));
             }
             waiters.push((item.agent, waiter));
@@ -1150,18 +1192,28 @@ impl TeamSessionService {
             match outcome {
                 AttachOutcome::Ready | AttachOutcome::Removed => {}
                 AttachOutcome::Failed(failure) => {
-                    self.broadcast_session_status(
-                        team_id,
-                        TeamSessionStatus::Failed,
-                        Some(TeamSessionPhase::AttachingAgents),
-                        |payload| payload.error = Some(failure.public_reason.clone()),
-                    );
-                    return Err(TeamError::MemberRuntimeFailed {
-                        team_id: team_id.to_owned(),
-                        slot_id: agent.slot_id,
-                        conversation_id: agent.conversation_id,
-                        public_reason: failure.public_reason,
-                    });
+                    // Session-level Failed / the whole-team error are leader-scoped
+                    // (spec 5.4/5.5): only a leader failure raises the full-screen
+                    // failure card and blocks the team. A teammate reconciliation
+                    // failure stays inline — its `agentRuntimeStatusChanged=failed`
+                    // already fired in `attach_member_runtime` — and the team stays
+                    // usable because the leader is ready. `ensure_session` (invoked
+                    // on mount, model switches, and before sends via warmupSession)
+                    // must not fail just because an unrelated teammate is broken.
+                    if agent.role == TeammateRole::Lead {
+                        self.broadcast_session_status(
+                            team_id,
+                            TeamSessionStatus::Failed,
+                            Some(TeamSessionPhase::AttachingAgents),
+                            |payload| payload.error = Some(failure.public_reason.clone()),
+                        );
+                        return Err(TeamError::MemberRuntimeFailed {
+                            team_id: team_id.to_owned(),
+                            slot_id: agent.slot_id,
+                            conversation_id: agent.conversation_id,
+                            public_reason: failure.public_reason,
+                        });
+                    }
                 }
                 AttachOutcome::SessionStopped => {
                     return Err(TeamError::InvalidRequest(
@@ -1175,14 +1227,6 @@ impl TeamSessionService {
             payload.server_count = Some(current_agents.len());
         });
         Ok(())
-    }
-
-    async fn cleanup_bootstrap_runtime_tasks(&self, agents: &[TeamAgent]) {
-        for agent in agents {
-            self.task_manager
-                .kill_and_wait(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
-                .await;
-        }
     }
 
     pub(crate) async fn cleanup_stale_member_runtime_task(
@@ -1251,6 +1295,18 @@ impl TeamSessionService {
             error: None,
         };
         customize(&mut payload);
+        // Session-level status drives the full-screen warmup overlay (leader-only,
+        // spec 5.4/5.5). This is a low-volume lifecycle boundary per team, so log
+        // at info for production diagnosability — the reason is already the
+        // sanitized public failure text, never a raw payload.
+        info!(
+            team_id = %payload.team_id,
+            status = ?payload.status,
+            phase = ?payload.phase,
+            server_count = ?payload.server_count,
+            error = payload.error.as_deref().unwrap_or(""),
+            "team session status broadcast"
+        );
         let event = WebSocketMessage::new(
             TEAM_SESSION_STATUS_CHANGED_EVENT,
             serde_json::to_value(payload).expect("serialize team session status payload"),
@@ -1316,207 +1372,11 @@ impl TeamSessionService {
             .broadcast_agent_runtime_status(agent, status, error);
     }
 
-    async fn rebuild_agent_processes(
-        &self,
-        team_id: &str,
-        session: &TeamSession,
-        user_id: &str,
-        agents: &[TeamAgent],
-    ) -> Result<(), TeamError> {
-        let provisioner = self.provisioner();
-        let task_manager = self.task_manager.clone();
-        let started_at = Instant::now();
-        let mut rebuild_jobs: Vec<TeamAgent> = agents.to_vec();
-        rebuild_jobs.sort_by_key(|agent| match agent.role {
-            TeammateRole::Lead => 0,
-            TeammateRole::Teammate => 1,
-        });
-
-        info!(
-            team_id,
-            agent_count = agents.len(),
-            max_concurrency = TEAM_REBUILD_MAX_CONCURRENCY,
-            start_stagger_ms = TEAM_REBUILD_START_STAGGER.as_millis(),
-            "team agent rebuild started"
-        );
-
-        let mut outcomes = Vec::new();
-        let mut jobs = JoinSet::new();
-        let mut failed = false;
-
-        for (launched_count, agent) in rebuild_jobs.into_iter().enumerate() {
-            while jobs.len() >= TEAM_REBUILD_MAX_CONCURRENCY {
-                if let Some(outcome) = join_next_rebuild_outcome(&mut jobs).await? {
-                    failed = outcome.result.is_err();
-                    outcomes.push(outcome);
-                }
-                if failed {
-                    break;
-                }
-            }
-            if failed {
-                break;
-            }
-
-            if launched_count > 0 {
-                let stagger = tokio::time::sleep(TEAM_REBUILD_START_STAGGER);
-                tokio::pin!(stagger);
-                loop {
-                    tokio::select! {
-                        _ = &mut stagger => break,
-                        outcome = join_next_rebuild_outcome(&mut jobs), if !jobs.is_empty() => {
-                            if let Some(outcome) = outcome? {
-                                failed = outcome.result.is_err();
-                                outcomes.push(outcome);
-                            }
-                            if failed {
-                                break;
-                            }
-                        }
-                    }
-                }
-                if failed {
-                    break;
-                }
-            }
-
-            let cfg = session.mcp_stdio_config(&agent.slot_id);
-            self.broadcast_agent_runtime_status(team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
-            spawn_rebuild_agent_process(
-                &mut jobs,
-                provisioner.clone(),
-                task_manager.clone(),
-                user_id.to_owned(),
-                agent,
-                cfg,
-            );
-        }
-
-        while let Some(outcome) = join_next_rebuild_outcome(&mut jobs).await? {
-            outcomes.push(outcome);
-        }
-
-        let mut success_count = 0usize;
-        let mut failures: Vec<&TeamAgentRebuildOutcome> = Vec::new();
-        for outcome in &outcomes {
-            match &outcome.result {
-                Ok(()) => success_count += 1,
-                Err(_) => failures.push(outcome),
-            }
-        }
-
-        info!(
-            team_id,
-            agent_count = agents.len(),
-            success_count,
-            failure_count = failures.len(),
-            duration_ms = started_at.elapsed().as_millis(),
-            max_concurrency = TEAM_REBUILD_MAX_CONCURRENCY,
-            start_stagger_ms = TEAM_REBUILD_START_STAGGER.as_millis(),
-            "team agent rebuild completed"
-        );
-
-        if failures.is_empty() {
-            return Ok(());
-        }
-
-        let first_error = failures
-            .first()
-            .map(|outcome| {
-                let error = outcome
-                    .result
-                    .as_ref()
-                    .err()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "unknown rebuild failure".to_owned());
-                format!("{}: {error}", format_rebuild_agent_identity(&outcome.agent))
-            })
-            .unwrap_or_else(|| "unknown rebuild failure".to_owned());
-
-        for failure in &failures {
-            let error = failure
-                .result
-                .as_ref()
-                .err()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "unknown rebuild failure".to_owned());
-            self.broadcast_agent_runtime_status(
-                team_id,
-                &failure.agent,
-                TeamAgentRuntimeStatus::Failed,
-                Some(error.clone()),
-            );
-            warn!(
-                team_id,
-                slot_id = %failure.agent.slot_id,
-                agent_name = %failure.agent.name,
-                conversation_id = %failure.agent.conversation_id,
-                backend = %failure.agent.backend,
-                model = %failure.agent.model,
-                role = %failure.agent.role,
-                duration_ms = failure.duration_ms,
-                error = %error,
-                "warmup failed during rebuild"
-            );
-        }
-
-        for success in outcomes.iter().filter(|outcome| outcome.result.is_ok()) {
-            info!(
-                team_id,
-                slot_id = %success.agent.slot_id,
-                agent_name = %success.agent.name,
-                conversation_id = %success.agent.conversation_id,
-                backend = %success.agent.backend,
-                model = %success.agent.model,
-                role = %success.agent.role,
-                "cleaning up successfully attached agent after rebuild failure"
-            );
-            self.task_manager
-                .kill_and_wait(&success.agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
-                .await;
-        }
-
-        Err(TeamError::InvalidRequest(format!(
-            "failed to attach rebuilt agent: {first_error}"
-        )))
-    }
-
-    /// Spawn per-agent event loops that drain the mailbox whenever notified.
-    /// Each agent gets its own tokio task that runs until the session shuts down.
-    fn spawn_event_loops(
-        &self,
-        session: &Arc<TeamSession>,
-        user_id: &str,
-        agents: &[TeamAgent],
-    ) -> Result<(), TeamError> {
-        let registry = session.event_loops();
-
-        for agent in agents {
-            let ctx = AgentLoopContext {
-                team_id: session.team_id().to_owned(),
-                slot_id: agent.slot_id.clone(),
-                user_id: user_id.to_owned(),
-                session: session.clone(),
-                scheduler: session.scheduler().clone(),
-                mailbox: session.mailbox().clone(),
-                turn_port: self.turn_port.clone(),
-                registry: registry.clone(),
-            };
-            registry.spawn(&agent.slot_id, ctx).map_err(|error| {
-                TeamError::InvalidRequest(format!(
-                    "failed to register bootstrap event loop for slot {}: {error:?}",
-                    agent.slot_id
-                ))
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Register an event loop for a dynamically spawned agent.
+    /// Register an event loop for an attaching agent.
     ///
-    /// Called by [`TeamSession::spawn_agent`] after `attach_spawned_agent_process`
-    /// succeeds so the newly booted agent gets its own drain loop — exactly as
-    /// `spawn_event_loops` does for the initial members during `ensure_session`.
+    /// Called from `attach_member_runtime` (the single attach path used by
+    /// leader cold-start, reconciliation, `add_agent`, `spawn_agent`, and lazy
+    /// wakeup) after the agent process warms up, so it gets its own drain loop.
     pub(crate) fn register_event_loop(
         &self,
         session: &Arc<TeamSession>,
@@ -1616,31 +1476,43 @@ impl TeamSessionService {
             return;
         };
 
-        let mut failed_reason = None;
-        let mut pending = false;
-        for agent in &team.agents {
-            match expected.member_runtimes().snapshot(&agent.slot_id) {
-                MemberRuntimeSnapshot::Ready => {}
-                MemberRuntimeSnapshot::Failed { failure, .. } => {
-                    failed_reason.get_or_insert(failure.public_reason);
-                }
-                MemberRuntimeSnapshot::Absent
-                | MemberRuntimeSnapshot::Attaching { .. }
-                | MemberRuntimeSnapshot::Removing { .. } => pending = true,
-                MemberRuntimeSnapshot::SessionStopped => return,
-            }
-        }
+        // Session-level status is leader-scoped: "Ready = leader ready = team
+        // usable" (spec 5.2). It drives the full-screen warmup overlay, which
+        // must reflect the leader only (spec 5.4/5.5). Teammate runtimes
+        // (dormant/pending/ready/failed) are surfaced per-member via
+        // `agentRuntimeStatusChanged` and must NOT flip the session status, or
+        // the overlay would resurface on lazy wakeup / add-member and a teammate
+        // failure would raise the full-screen failure card.
+        let Some(leader) = team.agents.iter().find(|agent| agent.role == TeammateRole::Lead) else {
+            // No lead in the roster is a malformed team; bootstrap already
+            // reports it. Nothing to publish here.
+            return;
+        };
 
-        if let Some(reason) = failed_reason {
-            self.publish_member_runtime_failed_if_current(expected, &reason);
-        } else if pending {
-            self.publish_member_runtime_starting_if_current(expected);
-        } else {
-            let _ = self.with_published_session(expected, |_| {
-                self.broadcast_session_status(expected.team_id(), TeamSessionStatus::Ready, None, |payload| {
-                    payload.server_count = Some(team.agents.len());
+        match expected.member_runtimes().snapshot(&leader.slot_id) {
+            MemberRuntimeSnapshot::Ready => {
+                let _ = self.with_published_session(expected, |_| {
+                    self.broadcast_session_status(expected.team_id(), TeamSessionStatus::Ready, None, |payload| {
+                        payload.server_count = Some(team.agents.len());
+                    });
                 });
-            });
+            }
+            MemberRuntimeSnapshot::Failed { failure, .. } => {
+                self.publish_member_runtime_failed_if_current(expected, &failure.public_reason);
+            }
+            // An in-flight leader attach/remove (cold start, repair, retry) is
+            // the only case that legitimately raises the overlay again. The lead
+            // cannot be removed, so `Removing` is defensive.
+            MemberRuntimeSnapshot::Attaching { .. } | MemberRuntimeSnapshot::Removing { .. } => {
+                self.publish_member_runtime_starting_if_current(expected);
+            }
+            // The leader is attached at bootstrap and never dormant in steady
+            // state; treat a stray Absent defensively as in-flight rather than
+            // prematurely declaring Ready.
+            MemberRuntimeSnapshot::Absent => {
+                self.publish_member_runtime_starting_if_current(expected);
+            }
+            MemberRuntimeSnapshot::SessionStopped => {}
         }
     }
 
@@ -1673,6 +1545,109 @@ impl TeamSessionService {
 
     pub fn get_session_scheduler(&self, team_id: &str) -> Option<Arc<crate::scheduler::TeammateManager>> {
         self.sessions.get(team_id).map(|e| e.session.scheduler().clone())
+    }
+
+    pub async fn resolve_team_tool_context(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<ResolvedTeamToolContext, TeamToolErrorPayload> {
+        let Some(binding_lookup) = self
+            .conversation_port
+            .lookup_team_binding_by_conversation(conversation_id)
+            .await
+            .map_err(|error| error_payload(TeamToolErrorCode::RuntimeContextMissing, error.to_string()))?
+        else {
+            return Err(error_payload(
+                TeamToolErrorCode::ConversationNotFound,
+                "conversation not found",
+            ));
+        };
+
+        if binding_lookup.user_id != user_id {
+            return Err(error_payload(
+                TeamToolErrorCode::PermissionDenied,
+                "conversation does not belong to user",
+            ));
+        }
+
+        let Some(team_id) = binding_lookup.team_id.clone() else {
+            return Ok(ResolvedTeamToolContext {
+                response: TeamToolContextResponse {
+                    in_team: false,
+                    conversation_id: conversation_id.to_owned(),
+                    team_id: None,
+                    team_name: None,
+                    slot_id: None,
+                    role: None,
+                    agent_name: None,
+                    transport: None,
+                    allowed_tools: Vec::new(),
+                },
+                context: None,
+            });
+        };
+
+        let team_row = self
+            .repo
+            .get_team(&team_id)
+            .await
+            .map_err(|error| error_payload(TeamToolErrorCode::RuntimeContextMissing, error.to_string()))?
+            .ok_or_else(|| error_payload(TeamToolErrorCode::TeamNotFound, "team not found"))?;
+        if team_row.user_id != user_id {
+            return Err(error_payload(
+                TeamToolErrorCode::PermissionDenied,
+                "team does not belong to user",
+            ));
+        }
+
+        let binding = TeamSessionBinding {
+            team_id: team_id.clone(),
+            slot_id: binding_lookup.slot_id,
+            role: binding_lookup.role,
+            runtime_seed: Default::default(),
+            mcp: None,
+        };
+        let agents: Vec<crate::types::TeamAgent> = serde_json::from_str(&team_row.agents)
+            .map_err(|error| error_payload(TeamToolErrorCode::RuntimeContextMissing, error.to_string()))?;
+        let agent = agent_for_conversation(&agents, conversation_id, &binding)?;
+        let context = crate::tool_executor::TeamToolContext {
+            team_id: team_id.clone(),
+            caller_slot_id: agent.slot_id.clone(),
+            caller_role: agent.role,
+            user_id: Some(user_id.to_owned()),
+            conversation_id: Some(conversation_id.to_owned()),
+            transport: TeamToolTransport::CliAssumed,
+        };
+        let allowed_tools = aionui_api_types::team_tool_descriptors_for_role(role_to_tool_role(agent.role))
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+        Ok(ResolvedTeamToolContext {
+            response: TeamToolContextResponse {
+                in_team: true,
+                conversation_id: conversation_id.to_owned(),
+                team_id: Some(team_id),
+                team_name: Some(team_row.name),
+                slot_id: Some(agent.slot_id.clone()),
+                role: Some(role_to_tool_role(agent.role)),
+                agent_name: Some(agent.name.clone()),
+                transport: Some(TeamToolTransport::CliAssumed),
+                allowed_tools,
+            },
+            context: Some(context),
+        })
+    }
+
+    pub async fn execute_team_tool(
+        &self,
+        context: &crate::tool_executor::TeamToolContext,
+        call: TeamToolCall,
+    ) -> Result<serde_json::Value, TeamToolErrorPayload> {
+        let scheduler = self
+            .get_session_scheduler(&context.team_id)
+            .ok_or_else(|| error_payload(TeamToolErrorCode::TeamNotFound, "active team session not found"))?;
+        execute_with_scheduler(&scheduler, &self.self_ref, context, call).await
     }
 
     #[cfg(test)]
@@ -1774,6 +1749,8 @@ impl TeamSessionService {
                 member_count = agents.len(),
                 "team idle cleanup stopping idle team session"
             );
+            info!(team_id, reason = "idle_cleanup", "broadcasting team session stopped");
+            self.broadcast_session_status(&team_id, TeamSessionStatus::Stopped, None, |_| {});
             self.stop_session_unchecked(&team_id);
             for agent in agents {
                 self.task_manager
@@ -1825,6 +1802,42 @@ impl TeamSessionService {
             Arc::clone(&entry.session)
         };
         session.send_message_to_agent(slot_id, content, files).await
+    }
+
+    /// Directed retry/wakeup for a single member runtime (dormant or failed),
+    /// reusing the one attach path. Backs the send-box "retry start" entry.
+    /// `reserve_attach(slot, true)` retries a `Failed` member; a dormant
+    /// (`Absent`) member is attached fresh. Non-blocking: the attach runs in
+    /// the background and any preserved unread mailbox rows are re-drained by
+    /// the member's event loop via `reconcile_mailbox`.
+    pub async fn attach_agent_runtime(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        self.ensure_session_inner(team_id).await?;
+        let session = {
+            let entry = self
+                .sessions
+                .get(team_id)
+                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+            Arc::clone(&entry.session)
+        };
+        let agent = session.scheduler().get_agent(slot_id).await?;
+        let service = self
+            .self_ref
+            .upgrade()
+            .ok_or_else(|| TeamError::InvalidRequest("team service is shutting down".to_owned()))?;
+        let reservation = session.member_runtimes().reserve_attach(slot_id, true);
+        self.broadcast_agent_runtime_status(team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
+        spawn_attach_agent_process_bg(
+            service,
+            Arc::clone(&session),
+            user_id.to_owned(),
+            agent,
+            self.task_manager.clone(),
+            reservation,
+            // Directed user retry: failures surface inline, do not wake the leader.
+            false,
+        );
+        Ok(())
     }
 
     pub async fn cancel_run(
@@ -1937,6 +1950,7 @@ impl TeamSessionService {
         from_slot_id: &str,
         to_slot_id: &str,
         content: &str,
+        files: Option<Vec<String>>,
     ) -> Result<AgentMessageQueueResult, TeamError> {
         self.require_active_team_run_for_team_work(team_id).await?;
         let session = {
@@ -1947,7 +1961,7 @@ impl TeamSessionService {
             Arc::clone(&entry.session)
         };
         session
-            .send_agent_message_from_agent(from_slot_id, to_slot_id, content)
+            .send_agent_message_from_agent(from_slot_id, to_slot_id, content, files)
             .await
     }
 
@@ -2398,32 +2412,43 @@ mod tests {
             .unwrap();
 
         svc.ensure_session("user-test", &created.id).await.unwrap();
+        // Leader-only warmup: only the lead runtime exists after first start;
+        // the worker stays dormant (spec 5.1), so repair now targets the lead.
         task_manager.insert_mode_agent(&lead.conversation_id);
-        task_manager.insert_mode_agent(&worker.conversation_id);
         task_manager.reset_kills();
         let original_session = Arc::clone(&svc.sessions.get(&created.id).expect("session").session);
         let original_generation = original_session.generation();
-        task_manager.remove(&worker.conversation_id);
+        // Simulate the lead runtime disappearing so reconciliation repairs it in place.
+        task_manager.remove(&lead.conversation_id);
 
         svc.ensure_session("user-test", &created.id).await.unwrap();
 
         let current_session = Arc::clone(&svc.sessions.get(&created.id).expect("session").session);
         assert!(Arc::ptr_eq(&original_session, &current_session));
         assert_eq!(current_session.generation(), original_generation);
-        assert_eq!(task_manager.kills(), vec![worker.conversation_id.clone()]);
+        assert_eq!(task_manager.kills(), vec![lead.conversation_id.clone()]);
         assert!(current_session.event_loops().has(&lead.slot_id));
-        assert!(current_session.event_loops().has(&worker.slot_id));
+        // The dormant worker is never woken by reconciliation (spec 5.1).
+        assert!(!current_session.event_loops().has(&worker.slot_id));
 
         let events = broadcaster.events_by_name("team.agentRuntimeStatusChanged");
-        let statuses: Vec<&str> = events
+        let lead_statuses: Vec<&str> = events
+            .iter()
+            .filter(|event| {
+                event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(lead.slot_id.as_str())
+            })
+            .map(|event| event.data.get("status").and_then(serde_json::Value::as_str).unwrap())
+            .collect();
+        assert_eq!(lead_statuses, vec!["pending", "ready", "pending", "ready"]);
+
+        let worker_statuses: Vec<&str> = events
             .iter()
             .filter(|event| {
                 event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(worker.slot_id.as_str())
             })
             .map(|event| event.data.get("status").and_then(serde_json::Value::as_str).unwrap())
             .collect();
-
-        assert_eq!(statuses, vec!["pending", "ready", "pending", "ready"]);
+        assert_eq!(worker_statuses, vec!["dormant"]);
     }
 
     #[tokio::test]
@@ -2521,6 +2546,76 @@ mod tests {
         assert!(unhandled.is_empty());
         assert_eq!(svc.session_count_for_test(), 0);
         assert_eq!(task_manager.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_cleanup_broadcasts_team_session_stopped() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Idle Cleanup Stopped Broadcast"))
+            .await
+            .unwrap();
+        let lead = created.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+        task_manager.insert_idle_finished_agent(&lead.conversation_id);
+        task_manager.insert_idle_finished_agent(&worker.conversation_id);
+
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+
+        let unhandled = svc
+            .cleanup_idle_team_runtime_tasks(vec![lead.conversation_id.clone()], &ActiveLeaseRegistry::new(), 300_000)
+            .await;
+
+        assert!(unhandled.is_empty());
+        assert_eq!(svc.session_count_for_test(), 0);
+        assert_eq!(task_manager.active_count(), 0);
+
+        let stopped_events: Vec<_> = broadcaster
+            .events_by_name("team.sessionStatusChanged")
+            .into_iter()
+            .filter(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("stopped"))
+            .collect();
+        assert_eq!(
+            stopped_events.len(),
+            1,
+            "idle cleanup must broadcast exactly one stopped status"
+        );
+        assert_eq!(
+            stopped_events[0]
+                .data
+                .get("team_id")
+                .and_then(serde_json::Value::as_str),
+            Some(created.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_session_does_not_broadcast_team_session_stopped() {
+        let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster();
+        let created = svc
+            .create_team(
+                "user-test",
+                single_agent_team_request("Explicit Stop No Stopped Broadcast"),
+            )
+            .await
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+
+        svc.stop_session("user-test", &created.id).await.unwrap();
+
+        let stopped_count = broadcaster
+            .events_by_name("team.sessionStatusChanged")
+            .into_iter()
+            .filter(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("stopped"))
+            .count();
+        assert_eq!(stopped_count, 0, "explicit stop must not broadcast a stopped status");
     }
 
     #[test]
@@ -2819,6 +2914,8 @@ mod tests {
                 pinned_at: None,
                 created_at: now_ms(),
                 updated_at: now_ms(),
+                project_id: None,
+                folder_id: None,
             })
             .await
             .unwrap();
@@ -2841,6 +2938,8 @@ mod tests {
                 pinned_at: None,
                 created_at: now_ms(),
                 updated_at: now_ms(),
+                project_id: None,
+                folder_id: None,
             })
             .await
             .unwrap();

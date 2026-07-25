@@ -240,13 +240,7 @@ pub(crate) async fn run_server(
         let prepare_started = Instant::now();
         info!("startup: managed runtime background preparation started");
         let result = async {
-            runtime_prepare_service.ensure_node_runtime(scope.clone()).await?;
-            runtime_prepare_service
-                .ensure_managed_acp_tool(scope.clone(), "codex-acp")
-                .await?;
-            runtime_prepare_service
-                .ensure_managed_acp_tool(scope, "claude-agent-acp")
-                .await?;
+            runtime_prepare_service.ensure_node_runtime(scope).await?;
             Ok::<(), aionui_system::SystemError>(())
         }
         .await;
@@ -267,10 +261,14 @@ pub(crate) async fn run_server(
     });
 
     // Kick off the idle-ACP-agent reaper. `start_idle_scanner` returns
-    // immediately with a `JoinHandle`; the scanner task polls every 60 s
-    // and kills ACP agents whose `status == Finished` + last_activity
-    // exceeds the default 5-minute idle threshold. The watch channel
-    // propagates graceful-shutdown so the scanner exits on SIGINT/SIGTERM.
+    // immediately with a `JoinHandle`; the scanner task polls on the scan
+    // interval and kills ACP agents idle beyond their timeout — solo
+    // (single-chat) agents at the solo threshold, team sessions cleaned as a
+    // whole at the team threshold. Thresholds and scan interval default to
+    // 10 min / 30 min / 60 s and are overridable via AIONUI_IDLE_TIMEOUT_SECS,
+    // AIONUI_TEAM_IDLE_TIMEOUT_SECS, and AIONUI_IDLE_SCAN_INTERVAL_SECS. The
+    // watch channel propagates graceful-shutdown so the scanner exits on
+    // SIGINT/SIGTERM.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (shutdown_error_tx, shutdown_error_rx) = tokio::sync::oneshot::channel::<BootstrapError>();
     let idle_cleanup_coordinator: Arc<dyn aionui_ai_agent::IdleCleanupCoordinator> =
@@ -278,15 +276,18 @@ pub(crate) async fn run_server(
             router_runtime.team_service.clone(),
             services.active_lease_registry.clone(),
         ));
+    let (solo_timeout_secs, team_timeout_secs, scan_interval_secs) = aionui_ai_agent::resolve_idle_config_from_env();
     let idle_scanner_handle = aionui_ai_agent::start_idle_scanner_with_coordinator(
         services.worker_task_manager.clone(),
         shutdown_rx,
-        None,
-        None,
+        Some(solo_timeout_secs),
+        Some(team_timeout_secs),
+        Some(scan_interval_secs),
         Some(idle_cleanup_coordinator),
     );
     let conversation_runtime_state = services.conversation_runtime_state.clone();
     let worker_task_manager = services.worker_task_manager.clone();
+    let client_pref_service = router_runtime.client_pref_service.clone();
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -314,6 +315,14 @@ pub(crate) async fn run_server(
                         Err(_) => warn!(active_task_count, "worker task manager shutdown timed out"),
                     }
                 }
+            }
+            if let Err(error) = client_pref_service.release_keep_awake_for_shutdown().await {
+                warn!(
+                    code = "BOOTSTRAP_DEGRADED_KEEP_AWAKE_RELEASE",
+                    stage = "shutdown.keep_awake.release",
+                    error = %error,
+                    "keep-awake shutdown release failed"
+                );
             }
             let _ = shutdown_tx.send(true);
         })

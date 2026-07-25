@@ -468,6 +468,7 @@ async fn execute_send_message_writes_to_mailbox() {
     let action = SchedulerAction::SendMessage {
         to: "worker-1".into(),
         message: "Do task X".into(),
+        files: vec!["/tmp/image.png".into()],
     };
     mgr.execute_action("lead-1", &action).await.unwrap();
 
@@ -475,6 +476,7 @@ async fn execute_send_message_writes_to_mailbox() {
     assert_eq!(unread.len(), 1);
     assert_eq!(unread[0].content, "Do task X");
     assert_eq!(unread[0].from_agent_id, "lead-1");
+    assert_eq!(unread[0].files.as_deref(), Some(&["/tmp/image.png".into()][..]));
 }
 
 #[tokio::test]
@@ -489,6 +491,7 @@ async fn execute_broadcast_message_writes_to_all_others() {
     let action = SchedulerAction::SendMessage {
         to: "*".into(),
         message: "Attention all".into(),
+        files: Vec::new(),
     };
     mgr.execute_action("lead-1", &action).await.unwrap();
 
@@ -727,6 +730,7 @@ async fn finalize_turn_executes_actions_and_marks_idle() {
         SchedulerAction::SendMessage {
             to: "lead-1".into(),
             message: "Done with sub-task".into(),
+            files: Vec::new(),
         },
     ];
 

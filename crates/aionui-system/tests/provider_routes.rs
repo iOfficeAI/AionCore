@@ -257,6 +257,49 @@ async fn create_provider_with_optional_fields() {
 }
 
 #[tokio::test]
+async fn create_provider_persists_model_settings() {
+    let (_app, db) = setup().await;
+    let mut body = sample_create_body();
+    body["models"] = json!(["gpt-5.6-sol"]);
+    body["model_settings"] = json!({
+        "gpt-5.6-sol": {
+            "image_input": "supported",
+            "openai_api_mode": "responses"
+        }
+    });
+
+    let create_app = system_routes(build_state(&db));
+    let create_resp = create_app
+        .oneshot(json_request("POST", "/api/providers", body))
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    let list_app = system_routes(build_state(&db));
+    let list_resp = list_app.oneshot(get_request("/api/providers")).await.unwrap();
+    let list_json = body_json(list_resp).await;
+    assert_eq!(
+        list_json["data"][0]["model_settings"]["gpt-5.6-sol"]["image_input"],
+        "supported"
+    );
+    assert_eq!(
+        list_json["data"][0]["model_settings"]["gpt-5.6-sol"]["openai_api_mode"],
+        "responses"
+    );
+}
+
+#[tokio::test]
+async fn create_provider_rejects_unknown_model_setting_value() {
+    let (app, _db) = setup().await;
+    let mut body = sample_create_body();
+    body["model_settings"] = json!({"gpt-5.6-sol": {"image_input": "sometimes"}});
+
+    let resp = app.oneshot(json_request("POST", "/api/providers", body)).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn create_provider_missing_platform() {
     let (app, _db) = setup().await;
     let body = json!({
@@ -361,6 +404,37 @@ async fn update_provider_api_key_returns_plaintext() {
     let json = body_json(resp).await;
     let api_key = json["data"]["api_key"].as_str().unwrap();
     assert_eq!(api_key, "new-key-abcdefgh");
+}
+
+#[tokio::test]
+async fn update_provider_replaces_model_settings() {
+    let (_app, db) = setup().await;
+    let (_, id) = create_one(&db).await;
+
+    let update_app = system_routes(build_state(&db));
+    let resp = update_app
+        .oneshot(json_request(
+            "PUT",
+            &format!("/api/providers/{id}"),
+            json!({
+                "model_settings": {
+                    "gpt-4o": {
+                        "image_input": "unsupported",
+                        "openai_api_mode": "chat_completions"
+                    }
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["model_settings"]["gpt-4o"]["image_input"], "unsupported");
+    assert_eq!(
+        json["data"]["model_settings"]["gpt-4o"]["openai_api_mode"],
+        "chat_completions"
+    );
 }
 
 #[tokio::test]

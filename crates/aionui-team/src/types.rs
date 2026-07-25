@@ -643,6 +643,8 @@ mod tests {
             agents_version: "1.0.1".into(),
             created_at: 1000,
             updated_at: 2000,
+            project_id: None,
+            folder_id: None,
         };
         let team = Team::from_row(&row).unwrap();
         assert_eq!(team.id, "t1");
@@ -697,6 +699,8 @@ mod tests {
             agents_version: "1.0.1".into(),
             created_at: 0,
             updated_at: 0,
+            project_id: None,
+            folder_id: None,
         };
         assert!(Team::from_row(&row).is_err());
     }

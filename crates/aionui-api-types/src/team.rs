@@ -288,6 +288,11 @@ pub enum TeamRunStatus {
 #[serde(rename_all = "snake_case")]
 pub enum TeamRunSource {
     UserMessage,
+    /// A team run opened by a system/lifecycle wake (member add/remove,
+    /// recovery drain, idle settle, spawn welcome) rather than a user message,
+    /// so every agent turn runs inside exactly one run and run-scoped tools are
+    /// always permitted. Distinguished from `UserMessage` for observability.
+    SystemLifecycle,
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,6 +406,20 @@ pub struct TeamSendMessageQueuedResponse {
     pub target: TeamSlotWorkPayload,
 }
 
+/// Per-slot work-state broadcast, emitted whenever a single slot's work state
+/// transitions — independently of any team run.
+///
+/// `team.run*` events carry `slot_work` only for slots bound to the active
+/// tracked run, so a slot that starts/finishes work outside a run (e.g. a
+/// leader self-wake draining its mailbox for a membership-change notice) would
+/// otherwise leave the frontend's per-slot view stale until a full reconcile.
+/// This event closes that gap: the frontend updates the one slot verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamSlotWorkChangedPayload {
+    pub team_id: String,
+    pub slot_work: TeamSlotWorkPayload,
+}
+
 // ---------------------------------------------------------------------------
 // E. Team management — Response DTOs
 // ---------------------------------------------------------------------------
@@ -502,6 +521,9 @@ pub struct TeamAgentRenamedPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TeamAgentRuntimeStatus {
+    /// Never triggered — the teammate has not yet been lazily woken and does
+    /// not block team Ready.
+    Dormant,
     Pending,
     Ready,
     Failed,
@@ -527,6 +549,7 @@ pub enum TeamSessionStatus {
     Starting,
     Ready,
     Failed,
+    Stopped,
 }
 
 /// Diagnostic phase for team session startup.
@@ -1254,6 +1277,7 @@ mod tests {
         assert_session_status_roundtrip(TeamSessionStatus::Starting, "starting");
         assert_session_status_roundtrip(TeamSessionStatus::Ready, "ready");
         assert_session_status_roundtrip(TeamSessionStatus::Failed, "failed");
+        assert_session_status_roundtrip(TeamSessionStatus::Stopped, "stopped");
     }
 
     #[test]
@@ -1493,5 +1517,15 @@ mod tests {
             TeamSessionBinding::team_id_marker_from_extra_str(extra).as_deref(),
             Some("team-9")
         );
+    }
+
+    #[test]
+    fn team_agent_runtime_status_dormant_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(TeamAgentRuntimeStatus::Dormant).unwrap(),
+            json!("dormant")
+        );
+        let parsed: TeamAgentRuntimeStatus = serde_json::from_value(json!("dormant")).unwrap();
+        assert_eq!(parsed, TeamAgentRuntimeStatus::Dormant);
     }
 }

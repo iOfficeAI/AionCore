@@ -88,6 +88,8 @@ async fn insert_team(services: &aionui_app::AppServices, user_id: &str, team_id:
         agents_version: "1.0.1".to_owned(),
         created_at: now_ms(),
         updated_at: now_ms(),
+        project_id: None,
+        folder_id: None,
     })
     .await
     .unwrap();

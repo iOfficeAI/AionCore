@@ -671,6 +671,77 @@ async fn agent_overrides_roundtrip_and_management_summary() {
 }
 
 #[tokio::test]
+async fn npx_bridged_agent_rejects_command_override() {
+    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+
+    // Seed a builtin npx-bridged ACP row (command == "npx", bridge_binary != binary_name),
+    // mirroring the ACP Registry agents such as Kilo.
+    services
+        .agent_registry
+        .repo_handle()
+        .upsert(&UpsertAgentMetadataParams {
+            id: "npx-agent",
+            icon: None,
+            name: "npx-agent",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("kilo"),
+            agent_type: "acp",
+            agent_source: "builtin",
+            agent_source_info: Some(r#"{"binary_name":"kilo","bridge_binary":"npx"}"#),
+            enabled: true,
+            command: Some("npx"),
+            args: Some(r#"["-y","@kilocode/cli","acp"]"#),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: Some("{}"),
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 1,
+        })
+        .await
+        .unwrap();
+    services.agent_registry.hydrate().await.unwrap();
+    services.agent_registry.refresh_availability().await;
+
+    // A launch-path (command) override must be rejected for bridge-launched rows,
+    // otherwise the npx wrapper args get forwarded to the resolved binary.
+    let command_body = json!({
+        "command_override": "C:\\Users\\aixux\\AppData\\Roaming\\npm\\kilo.cmd"
+    });
+    let req = json_with_token("PUT", "/api/agents/npx-agent/overrides", command_body, &token, &csrf);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Env-only overrides remain allowed for the same npx agent (API keys, proxies, …).
+    let env_body = json!({
+        "env_override": [{"name": "ANTHROPIC_API_KEY", "value": "sk-x"}]
+    });
+    let req = json_with_token("PUT", "/api/agents/npx-agent/overrides", env_body, &token, &csrf);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The rejected command override must not have been persisted.
+    let greq = get_with_token("/api/agents/npx-agent/overrides", &token);
+    let gbody = body_json(app.clone().oneshot(greq).await.unwrap()).await;
+    assert!(gbody["data"]["command_override"].is_null());
+    assert!(
+        gbody["data"]["env_override"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "ANTHROPIC_API_KEY")
+    );
+}
+
+#[tokio::test]
 async fn internal_aion_cli_rejects_overrides() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;

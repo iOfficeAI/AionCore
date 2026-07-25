@@ -1,4 +1,6 @@
 use crate::governance::with_team_governance;
+use crate::team_tool_usage::build_team_tool_usage;
+use aionui_api_types::TeamToolTransport;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -20,10 +22,7 @@ results.${workspaceSection}
 - Do NOT mention teammate proposals, recommended assistants, or confirmation workflow until there is a concrete task that may actually need more teammates
 
 ## Team Coordination Tools
-You MUST use the `team_*` MCP tools for ALL team coordination.
-Your platform may provide similarly named built-in tools (e.g. SendMessage,
-TeamCreate, TaskCreate, Agent). Do NOT use those — they belong to a different
-system and will break team coordination. Always use the `team_*` versions.
+{{TEAM_TOOL_USAGE}}
 
 Your first team turn must call `team_members` to get the current roster. After
 that, call `team_members` before delegating work, adding or removing teammates,
@@ -87,7 +86,7 @@ When the user explicitly asks to dismiss/fire/shut down teammates:
 4. After all teammates confirm shutdown, report the final results to the user
 
 ## Important Rules
-- ALWAYS use the team_* tools for coordination, not plain text instructions
+- Use Team tools for coordination, not plain text instructions
 - Do NOT call team_spawn_agent immediately just because the task sounds broad, hard, or multi-step
 - When you think new teammates are needed, first explain why in one short sentence, then recommend the teammate lineup
 - ${presetFormattingImportantRule}
@@ -159,6 +158,7 @@ pub struct LeadPromptParams<'a> {
     pub available_assistants: &'a [AvailableAssistant],
     pub renamed_agents: &'a HashMap<String, String>,
     pub team_workspace: Option<&'a str>,
+    pub tool_transport: TeamToolTransport,
 }
 
 pub struct TeammatePromptParams<'a> {
@@ -168,6 +168,7 @@ pub struct TeammatePromptParams<'a> {
     pub teammates: &'a [TeamPromptAgent],
     pub renamed_agents: &'a HashMap<String, String>,
     pub team_workspace: Option<&'a str>,
+    pub tool_transport: TeamToolTransport,
 }
 
 pub fn build_lead_prompt(params: &LeadPromptParams<'_>) -> String {
@@ -195,6 +196,10 @@ fn build_lead_role_prompt(params: &LeadPromptParams<'_>) -> String {
     LEAD_PROMPT_TEMPLATE
         .replace("{{AGENT_NAME}}", &params.agent.name)
         .replace("{{AGENT_SLOT_ID}}", &params.agent.slot_id)
+        .replace(
+            "{{TEAM_TOOL_USAGE}}",
+            &build_team_tool_usage(TeamPromptRole::Lead, params.tool_transport),
+        )
         .replace(PLACEHOLDER_WORKSPACE_SECTION, &workspace_section)
         .replace(PLACEHOLDER_PRESET_FORMATTING_STEP_RULE, preset_formatting_step_rule)
         .replace(
@@ -230,10 +235,7 @@ Team: {{TEAM_NAME}}
 Leader: {{LEADER_NAME}} (slot_id: {{LEADER_SLOT_ID}}){{WORKSPACE}}
 
 ## Team Coordination Tools
-You MUST use the `team_*` MCP tools for ALL team coordination.
-Your platform may provide similarly named built-in tools (e.g. SendMessage,
-TaskCreate, TaskUpdate). Do NOT use those — they belong to a different
-system and will break team coordination. Always use the `team_*` versions.
+{{TEAM_TOOL_USAGE}}
 
 Use `team_task_list` and `team_members` to check current team state.
 Display names are only for user-facing text. For tool arguments such as
@@ -298,6 +300,10 @@ Always use the team workspace path for any project-related operations."
         .replace("{{TEAM_NAME}}", params.team_name)
         .replace("{{LEADER_NAME}}", &params.leader.name)
         .replace("{{LEADER_SLOT_ID}}", &params.leader.slot_id)
+        .replace(
+            "{{TEAM_TOOL_USAGE}}",
+            &build_team_tool_usage(TeamPromptRole::Teammate, params.tool_transport),
+        )
         .replace("{{WORKSPACE}}", &workspace_section)
 }
 
@@ -336,6 +342,7 @@ mod tests {
             available_assistants: &assistants,
             renamed_agents: &renamed,
             team_workspace: None,
+            tool_transport: TeamToolTransport::Mcp,
         });
 
         assert!(prompt.starts_with("## Team Governance"));
@@ -362,6 +369,7 @@ mod tests {
             teammates: &[],
             renamed_agents: &HashMap::new(),
             team_workspace: None,
+            tool_transport: TeamToolTransport::Mcp,
         });
 
         assert!(prompt.contains("## Team Governance"));

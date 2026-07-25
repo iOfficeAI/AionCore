@@ -16,7 +16,7 @@ use crate::service::{
 use crate::stream_relay::{RelayOutcome, StreamRelay, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use crate::turn_recovery_policy::{TurnRecoveryDecision, TurnRecoveryPolicy};
-use aionui_api_types::SendMessageRequest;
+use aionui_api_types::{AgentErrorCode, SendMessageRequest};
 
 fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
     match &options.context.kind {
@@ -222,7 +222,7 @@ impl ConversationTurnOrchestrator {
                 .map(str::trim)
                 .filter(|mode| !mode.is_empty())
             {
-                match apply_required_runtime_mode(&agent, mode).await {
+                match apply_required_runtime_mode(&agent, backend.as_deref(), mode).await {
                     Ok(()) => {
                         info!(
                             conversation_id = %input.conv_id,
@@ -347,7 +347,7 @@ impl ConversationTurnOrchestrator {
         })
     }
 
-    pub(crate) async fn run_user_turn(self, input: TurnStartInput) -> ConversationTurnResult {
+    pub(crate) async fn run_user_turn(self, mut input: TurnStartInput) -> ConversationTurnResult {
         let mut turn_claim = input.turn_claim;
         let conv_id = input.conversation.id.clone();
         let turn_id = input.turn_id.clone();
@@ -364,6 +364,7 @@ impl ConversationTurnOrchestrator {
         let mut replayed = false;
         let mut replay_started_at = None;
         let mut final_error_message;
+        let mut auth_failure = false;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
@@ -391,6 +392,10 @@ impl ConversationTurnOrchestrator {
                     break result.status == ConversationTurnStatus::Failed;
                 }
             };
+
+            // Track the final attempt's auth signal so the post-loop availability
+            // write-back can reflect "needs sign-in" (last iteration wins).
+            auth_failure = terminal_is_auth_failure(&attempt_result.outcome);
 
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
             if !attempt_result.outcome.terminal.is_error() {
@@ -452,6 +457,15 @@ impl ConversationTurnOrchestrator {
                             &self.task_manager,
                         )
                         .await;
+                    // ELECTRON-3Q0: attempt 1's dead-anchor self-heal cleared
+                    // `acp_session.session_id` mid-turn (persist_side_effects runs
+                    // BEFORE the terminal reaches this loop). The turn-start
+                    // snapshot still holds the stale anchor — refresh ONLY the
+                    // anchor fields so the rebuilt task opens Fresh instead of
+                    // re-resuming the same dead session.
+                    self.service
+                        .refresh_resume_anchor_for_replay(&conv_id, &mut input.build_options)
+                        .await;
                     replayed = true;
                     continue;
                 }
@@ -483,7 +497,20 @@ impl ConversationTurnOrchestrator {
             }
         };
 
-        if !final_failed {
+        if auth_failure {
+            // The agent connected (detection saw it online) but a real turn hit
+            // an explicit auth signal — write "needs sign-in" back to its
+            // availability so the list stops showing it as plainly usable.
+            record_agent_session_failure(
+                &self.service,
+                availability_agent_id(&input.build_options).as_deref(),
+                "auth_required",
+                final_error_message
+                    .as_deref()
+                    .unwrap_or("Agent requires sign-in to run."),
+            )
+            .await;
+        } else if !final_failed {
             record_agent_session_success(&self.service, availability_agent_id(&input.build_options).as_deref()).await;
         }
 
@@ -515,8 +542,116 @@ fn availability_agent_id(options: &BuildTaskOptions) -> Option<String> {
     }
 }
 
-async fn apply_required_runtime_mode(agent: &AgentInstance, mode: &str) -> Result<(), AgentError> {
-    agent.set_config_option("mode", mode).await?;
+/// True when the turn's terminal is an explicit authentication signal: an
+/// `ACP_EMPTY_TURN_NEEDS_AUTH` benign tip (the agent connected but isn't signed
+/// in and returned an empty end_turn), or an Error terminal carrying an
+/// auth/login error code. Used to reflect "needs sign-in" into the agent's
+/// availability even when detection (initialize + session/new, no prompt)
+/// showed it online. Non-auth outcomes — generic empty turns, billing,
+/// rate-limit, context, network — are deliberately excluded so we don't flip an
+/// agent to unavailable for transient or unrelated failures.
+fn terminal_is_auth_failure(outcome: &RelayOutcome) -> bool {
+    if outcome.attempt.needs_auth {
+        return true;
+    }
+    matches!(
+        outcome.terminal.code(),
+        Some(
+            AgentErrorCode::UserAgentAuthRequired
+                | AgentErrorCode::UserLlmProviderAuthFailed
+                | AgentErrorCode::UserLlmProviderAwsSsoExpired
+        )
+    )
+}
+
+/// codex's canonical full-access mode id (migration 021 / `full_auto_mode_id`,
+/// `aionui_common::enums`). What cron's forced full-auto — and a resumed full-access
+/// session — persist as `required_runtime_mode`.
+const CODEX_CANONICAL_FULL_ACCESS_MODE: &str = "agent-full-access";
+/// The LEGACY bare token codex's LIVE catalog actually advertises for the full-access
+/// tier (`:danger-full-access`→`full-access`, codex_conn `fill_discovery` /
+/// `profile_id_to_legacy_value`).
+const CODEX_LEGACY_FULL_ACCESS_MODE: &str = "full-access";
+
+/// ELECTRON-3Q0: align codex's persisted canonical full-access id to whatever the
+/// LIVE catalog exposes, mirroring what AcpAgentManager reconcile already does via
+/// `normalize_requested_mode_for_available_values`. codex persists the canonical
+/// `agent-full-access` (cron forces it for scheduled tasks) but codex's live catalog
+/// advertises the legacy bare token `full-access`, so the unnormalized apply hit
+/// `set_config_option`'s REJECT ("mode 'agent-full-access' is not one of the available
+/// modes") and failed every cron turn before the send.
+///
+/// Narrow by design (only the required-mode auto-apply path calls this): downgrade
+/// ONLY the canonical full-access id, ONLY when the live catalog lacks it but does
+/// carry the legacy token. Every other case returns the value unchanged — a live
+/// catalog that carries the canonical id keeps it, and a catalog with NO full-access
+/// tier at all leaves the value so `set_config_option` still REJECTs (never silently
+/// pick a weaker mode). Non-codex backends and non-full-access modes pass straight
+/// through. An empty catalog is left untouched too (set_config_option is permissive
+/// on an empty/not-yet-discovered catalog).
+fn normalize_required_mode_for_catalog(backend: Option<&str>, mode: &str, available_ids: &[String]) -> String {
+    if backend != Some("codex") || mode != CODEX_CANONICAL_FULL_ACCESS_MODE {
+        return mode.to_owned();
+    }
+    let has_canonical = available_ids.iter().any(|id| id == CODEX_CANONICAL_FULL_ACCESS_MODE);
+    let has_legacy = available_ids.iter().any(|id| id == CODEX_LEGACY_FULL_ACCESS_MODE);
+    if !has_canonical && has_legacy {
+        return CODEX_LEGACY_FULL_ACCESS_MODE.to_owned();
+    }
+    mode.to_owned()
+}
+
+/// Read the live mode-catalog ids for normalization. Only consulted when a codex
+/// canonical full-access id is being applied (see `resolve_required_runtime_mode`);
+/// a catalog read failure returns None so the caller falls back to the requested mode
+/// unnormalized (= pre-fix behavior).
+async fn live_mode_catalog_ids(agent: &AgentInstance) -> Option<Vec<String>> {
+    match agent.get_config_options().await {
+        Ok(resp) => Some(
+            resp.config_options
+                .into_iter()
+                .find(|opt| opt.id == "mode")
+                .map(|opt| opt.options.into_iter().map(|o| o.value).collect())
+                .unwrap_or_default(),
+        ),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "apply mode: live catalog read failed — applying the requested mode unnormalized"
+            );
+            None
+        }
+    }
+}
+
+/// Resolve the mode to actually apply. For codex's canonical full-access id, align it
+/// to the live catalog (ELECTRON-3Q0); every other backend/mode is returned verbatim
+/// without touching the catalog.
+async fn resolve_required_runtime_mode(agent: &AgentInstance, backend: Option<&str>, mode: &str) -> String {
+    if backend != Some("codex") || mode != CODEX_CANONICAL_FULL_ACCESS_MODE {
+        return mode.to_owned();
+    }
+    let Some(available_ids) = live_mode_catalog_ids(agent).await else {
+        return mode.to_owned();
+    };
+    let effective = normalize_required_mode_for_catalog(backend, mode, &available_ids);
+    if effective != mode {
+        info!(
+            requested = mode,
+            effective = %effective,
+            "apply mode: aligned codex canonical full-access to the live catalog (ELECTRON-3Q0)"
+        );
+    }
+    effective
+}
+
+async fn apply_required_runtime_mode(
+    agent: &AgentInstance,
+    backend: Option<&str>,
+    mode: &str,
+) -> Result<(), AgentError> {
+    let effective = resolve_required_runtime_mode(agent, backend, mode).await;
+    agent.set_config_option("mode", &effective).await?;
     Ok(())
 }
 
@@ -574,5 +709,137 @@ async fn record_agent_session_success(service: &ConversationService, agent_id: O
             error = %ErrorChain(&error),
             "Failed to record agent availability session success"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stream_relay::RelayTerminal;
+
+    fn finish_outcome(needs_auth: bool) -> RelayOutcome {
+        RelayOutcome {
+            system_responses: vec![],
+            terminal: RelayTerminal::Finish,
+            attempt: TurnAttemptSummary {
+                needs_auth,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn error_outcome(code: AgentErrorCode) -> RelayOutcome {
+        RelayOutcome {
+            system_responses: vec![],
+            terminal: RelayTerminal::Error {
+                code: Some(code),
+                retryable: None,
+            },
+            attempt: TurnAttemptSummary::default(),
+        }
+    }
+
+    // ELECTRON-3Q0: cron forces codex's canonical full-access id (`agent-full-access`,
+    // `full_auto_mode_id`) but codex's LIVE catalog advertises the legacy bare token
+    // (`full-access`). The direct-CLI turn-time apply must align the two, mirroring
+    // AcpAgentManager reconcile — otherwise `set_config_option` REJECTs
+    // ("mode 'agent-full-access' is not one of the available modes") and every cron
+    // turn fails before the send.
+    #[test]
+    fn codex_canonical_full_access_downgrades_to_legacy_when_catalog_lacks_canonical() {
+        let ids = vec!["auto".to_string(), "full-access".to_string(), "read-only".to_string()];
+        assert_eq!(
+            normalize_required_mode_for_catalog(Some("codex"), "agent-full-access", &ids),
+            "full-access",
+            "canonical id absent but legacy present → downgrade so set_config_option accepts"
+        );
+    }
+
+    #[test]
+    fn codex_canonical_full_access_kept_when_catalog_has_it() {
+        let ids = vec!["auto".to_string(), "agent-full-access".to_string()];
+        assert_eq!(
+            normalize_required_mode_for_catalog(Some("codex"), "agent-full-access", &ids),
+            "agent-full-access",
+            "a live catalog that carries the canonical id keeps it verbatim"
+        );
+    }
+
+    #[test]
+    fn codex_full_access_left_for_local_reject_when_no_full_access_tier() {
+        // No full-access tier at all → leave the value so set_config_option still
+        // REJECTs; never silently pick a weaker mode.
+        let ids = vec!["auto".to_string(), "read-only".to_string()];
+        assert_eq!(
+            normalize_required_mode_for_catalog(Some("codex"), "agent-full-access", &ids),
+            "agent-full-access"
+        );
+    }
+
+    #[test]
+    fn non_full_access_required_mode_passes_through() {
+        let ids = vec!["auto".to_string(), "full-access".to_string()];
+        assert_eq!(
+            normalize_required_mode_for_catalog(Some("codex"), "auto", &ids),
+            "auto",
+            "only the canonical full-access id is normalized; other required modes pass through"
+        );
+    }
+
+    #[test]
+    fn non_codex_backend_never_normalized() {
+        let ids = vec!["full-access".to_string()];
+        assert_eq!(
+            normalize_required_mode_for_catalog(Some("claude"), "agent-full-access", &ids),
+            "agent-full-access",
+            "the codex canonical/legacy mapping must not touch other backends"
+        );
+    }
+
+    #[test]
+    fn empty_catalog_leaves_mode_unchanged() {
+        // An empty / not-yet-discovered catalog is permissive at set_config_option,
+        // so leave the requested value untouched here.
+        assert_eq!(
+            normalize_required_mode_for_catalog(Some("codex"), "agent-full-access", &[]),
+            "agent-full-access"
+        );
+    }
+
+    #[test]
+    fn needs_auth_empty_turn_is_auth_failure() {
+        assert!(terminal_is_auth_failure(&finish_outcome(true)));
+    }
+
+    #[test]
+    fn plain_finish_is_not_auth_failure() {
+        // A generic empty turn (or any normal finish) must NOT flip availability.
+        assert!(!terminal_is_auth_failure(&finish_outcome(false)));
+    }
+
+    #[test]
+    fn explicit_auth_error_codes_are_auth_failure() {
+        assert!(terminal_is_auth_failure(&error_outcome(
+            AgentErrorCode::UserAgentAuthRequired
+        )));
+        assert!(terminal_is_auth_failure(&error_outcome(
+            AgentErrorCode::UserLlmProviderAuthFailed
+        )));
+        assert!(terminal_is_auth_failure(&error_outcome(
+            AgentErrorCode::UserLlmProviderAwsSsoExpired
+        )));
+    }
+
+    #[test]
+    fn non_auth_errors_are_not_auth_failure() {
+        assert!(!terminal_is_auth_failure(&error_outcome(
+            AgentErrorCode::UnknownUpstreamError
+        )));
+        assert!(!terminal_is_auth_failure(&error_outcome(
+            AgentErrorCode::UserLlmProviderRateLimited
+        )));
+        assert!(!terminal_is_auth_failure(&error_outcome(
+            AgentErrorCode::UserLlmProviderBillingRequired
+        )));
     }
 }

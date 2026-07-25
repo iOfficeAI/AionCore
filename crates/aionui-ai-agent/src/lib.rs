@@ -12,13 +12,20 @@ pub mod error;
 pub mod factory;
 pub(crate) mod idle_scanner;
 pub mod manager;
+/// Neutral MCP resolution for the session-model port (claude/codex). Ported from
+/// clean-slate `aionui-agent-context::mcp_resolve` — the SSOT that turns a
+/// conversation's configured MCP servers into the SDK-free `SessionMcpServer`
+/// shape the `SessionBackend` stack carries in `SessionConfig.init.mcp_servers`.
+pub(crate) mod mcp_resolve;
 pub mod ollama;
 pub(crate) mod persistence;
 pub mod protocol;
 pub mod registry;
 pub mod routes;
 pub(crate) mod runtime_status;
+pub mod runtime_token;
 pub(crate) mod services;
+pub mod session_agent;
 pub mod session_context;
 pub mod shared_kernel;
 pub mod task_manager;
@@ -37,13 +44,19 @@ pub use capability::skill_manager::{
 };
 pub use error::AgentError;
 pub use factory::{AgentFactoryDeps, build_agent_factory};
-pub use idle_scanner::{IdleCleanupCoordinator, start_idle_scanner, start_idle_scanner_with_coordinator};
+pub use idle_scanner::{
+    IdleCleanupCoordinator, resolve_idle_config_from_env, start_idle_scanner, start_idle_scanner_with_coordinator,
+};
 pub use persistence::AcpSessionSyncService;
 pub use protocol::error::AcpError;
 pub use protocol::events::AgentStreamEvent;
 pub use protocol::send_error::AgentSendError;
 pub use registry::{AgentRegistry, UnavailableReason};
 pub use routes::{AgentRouterState, RemoteAgentRouterState, agent_routes, remote_agent_routes};
+pub use runtime_token::{
+    RuntimeTokenClaims, RuntimeTokenError, RuntimeTokenIssue, RuntimeTokenScope, RuntimeTokenService,
+    TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+};
 pub use services::AgentAvailabilityFeedbackPort;
 pub use services::AgentService;
 pub use services::RemoteAgentService;

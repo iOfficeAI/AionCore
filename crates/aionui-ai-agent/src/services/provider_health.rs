@@ -16,7 +16,10 @@ use aionui_db::{IProviderRepository, models::Provider};
 use regex::Regex;
 use tracing::{info, warn};
 
-use crate::factory::aionrs::{map_aionrs_provider, resolve_aionrs_url_and_compat, resolve_bedrock_config};
+use crate::factory::aionrs::{
+    map_aionrs_provider, resolve_aionrs_url_and_compat_with_mode, resolve_bedrock_config,
+    resolve_model_compat_overrides,
+};
 use crate::types::AionrsResolvedConfig;
 
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -67,8 +70,16 @@ impl ProviderHealthCheckService {
         let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &self.encryption_key)
             .map_err(|e| AgentError::internal(e.to_string()))?;
         let provider = map_aionrs_provider(&row.platform, model_id, row.model_protocols.as_deref())?;
-        let (base_url, compat_overrides) =
-            resolve_aionrs_url_and_compat(&row.platform, &row.base_url, &provider, row.is_full_url);
+        let model_overrides = resolve_model_compat_overrides(model_id, &row.model_settings)?;
+        let (base_url, mut compat_overrides) = resolve_aionrs_url_and_compat_with_mode(
+            &row.platform,
+            &row.base_url,
+            &provider,
+            model_id,
+            row.is_full_url,
+            model_overrides.openai_api_mode,
+        );
+        compat_overrides.image_input = model_overrides.image_input;
         let bedrock_config = if row.platform == "bedrock" {
             resolve_bedrock_config(row.bedrock_config.as_deref())
         } else {
@@ -216,6 +227,12 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
     config.session.enabled = false;
     config.mcp.servers.clear();
     config.file_cache.enabled = false;
+    if let Some(image_input) = config_extra.compat_overrides.image_input {
+        config.compat.image_input = Some(image_input);
+    }
+    if let Some(mode) = config_extra.compat_overrides.openai_api_mode {
+        config.compat.transport.openai_api_mode = Some(mode);
+    }
     if let Some(field) = config_extra.compat_overrides.max_tokens_field {
         config.compat.transport.max_tokens_field = Some(field);
     }
@@ -316,6 +333,7 @@ pub(crate) fn extract_http_status(message: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aion_config::compat::OpenAiApiMode;
     use aionui_common::encrypt_string;
     use aionui_db::{CreateProviderParams, DbError, UpdateProviderParams};
 
@@ -368,6 +386,7 @@ mod tests {
             model_protocols: None,
             model_enabled: None,
             model_health: None,
+            model_settings: "{}".into(),
             bedrock_config: None,
             is_full_url: false,
             created_at: 0,
@@ -383,6 +402,18 @@ mod tests {
 
         assert_eq!(config.max_tokens, Some(HEALTH_CHECK_MAX_TOKENS));
         assert_eq!(config.max_turns, Some(1));
+    }
+
+    #[test]
+    fn resolve_probe_config_uses_responses_for_openai_gpt_5_6() {
+        let mut provider = test_provider();
+        provider.platform = "openai".to_owned();
+        provider.base_url = "https://api.openai.com/v1".to_owned();
+
+        let config = test_service().resolve_probe_config(&provider, "gpt-5.6-sol").unwrap();
+
+        assert_eq!(config.compat_overrides.openai_api_mode, Some(OpenAiApiMode::Responses));
+        assert_eq!(config.compat_overrides.api_path.as_deref(), Some("/responses"));
     }
 
     #[test]

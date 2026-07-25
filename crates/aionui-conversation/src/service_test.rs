@@ -10,10 +10,12 @@ use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{
-    AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, BuildTaskOptions, CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData,
+    AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, AIONUI_RUNTIME_TOKEN_ENV, BuildTaskOptions,
+    CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData,
 };
 use aionui_ai_agent::{
     AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager,
+    RuntimeTokenService,
 };
 
 use aionui_api_types::{
@@ -280,6 +282,12 @@ impl IConversationRepository for MockRepo {
         }
         if let Some(updated_at) = updates.updated_at {
             row.updated_at = updated_at;
+        }
+        if let Some(project_id) = &updates.project_id {
+            row.project_id = Some(project_id.clone());
+        }
+        if let Some(folder_id) = &updates.folder_id {
+            row.folder_id = Some(folder_id.clone());
         }
         Ok(())
     }
@@ -949,6 +957,10 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
         *self.session_id.lock().unwrap() = Some(session_id.to_owned());
         Ok(true)
     }
+    async fn clear_session_id(&self, _conversation_id: &str) -> Result<bool, DbError> {
+        *self.session_id.lock().unwrap() = None;
+        Ok(true)
+    }
     async fn delete(&self, _conversation_id: &str) -> Result<bool, DbError> {
         Ok(false)
     }
@@ -1264,8 +1276,6 @@ async fn upsert_test_assistant_definition_with_thought_level(
         source: "builtin",
         owner_type: "system",
         source_ref: Some(assistant_id),
-        source_version: None,
-        source_hash: None,
         name: assistant_id,
         name_i18n: "{}",
         description: Some("desc"),
@@ -1275,7 +1285,6 @@ async fn upsert_test_assistant_definition_with_thought_level(
         agent_id,
         rule_resource_type: "builtin_asset",
         rule_resource_ref: Some(assistant_id),
-        rule_inline_content: None,
         recommended_prompts: "[]",
         recommended_prompts_i18n: "{}",
         default_model_mode,
@@ -1354,6 +1363,8 @@ async fn insert_conversation_with_type(repo: &Arc<MockRepo>, user_id: &str, agen
         pinned_at: None,
         created_at: 1,
         updated_at: 1,
+        project_id: None,
+        folder_id: None,
     };
     repo.create(&row).await.unwrap();
     row
@@ -1385,6 +1396,85 @@ async fn create_returns_conversation_with_defaults() {
     assert_eq!(events[0].data["action"], "created");
     assert_eq!(events[0].data["conversation_id"], resp.id);
     assert_eq!(events[0].data["source"], "aionui");
+}
+
+// ── Project-bind side branch tests ─────────────────────────────────
+
+async fn make_injected_project_service(temp_root: &std::path::Path) -> std::sync::Arc<aionui_project::ProjectService> {
+    // A real store on an in-memory DB; temp_root mirrors the app wiring
+    // (`work_dir/conversations`) so classification matches production. The
+    // Database handle is leaked so the shared in-memory pool outlives the test.
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let store: std::sync::Arc<dyn aionui_db::IProjectStore> =
+        std::sync::Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
+    std::mem::forget(db);
+    std::sync::Arc::new(aionui_project::ProjectService::new(
+        store,
+        temp_root.join("conversations"),
+    ))
+}
+
+#[tokio::test]
+async fn create_side_branch_backfills_project_binding_when_injected() {
+    let work_root = tempfile::tempdir().unwrap();
+    let (svc, _bc, repo, _task_mgr) = make_service_with_workspace_root(work_root.path().to_path_buf());
+    svc.with_project_service(make_injected_project_service(work_root.path()).await);
+
+    // Custom workspace outside temp_root → classified standard.
+    let ws = tempfile::tempdir().unwrap();
+    let mut req = make_create_req();
+    req.extra = json!({ "workspace": ws.path().to_string_lossy(), "backend": "claude" });
+
+    let resp = svc.create("user_1", req).await.unwrap();
+
+    let row = repo.get(&resp.id).await.unwrap().unwrap();
+    assert!(
+        row.project_id.is_some(),
+        "create side branch should backfill project_id"
+    );
+    assert!(row.folder_id.is_some(), "create side branch should backfill folder_id");
+    // The transitional workspace string must be untouched by the side branch.
+    assert_eq!(resp.extra["workspace"], ws.path().to_string_lossy().as_ref());
+}
+
+#[tokio::test]
+async fn create_without_project_service_leaves_binding_null() {
+    // Best-effort contract: no ProjectService injected → binding stays NULL and
+    // create still succeeds (the side branch is a pure no-op).
+    let (svc, _bc, repo, _task_mgr) = make_service();
+    let resp = svc.create("user_1", make_create_req()).await.unwrap();
+    let row = repo.get(&resp.id).await.unwrap().unwrap();
+    assert!(row.project_id.is_none());
+    assert!(row.folder_id.is_none());
+}
+
+#[tokio::test]
+async fn list_does_not_backfill_but_get_does() {
+    let work_root = tempfile::tempdir().unwrap();
+    let (svc, _bc, repo, _task_mgr) = make_service_with_workspace_root(work_root.path().to_path_buf());
+
+    // Create WITHOUT the project service so the row starts unbound.
+    let ws = tempfile::tempdir().unwrap();
+    let mut req = make_create_req();
+    req.extra = json!({ "workspace": ws.path().to_string_lossy(), "backend": "claude" });
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert!(repo.get(&resp.id).await.unwrap().unwrap().project_id.is_none());
+
+    svc.with_project_service(make_injected_project_service(work_root.path()).await);
+
+    // Narrowed contract: list is a pure read — it must NOT backfill, so the
+    // conversation list stays fast and side-effect free.
+    let _ = svc.list("user_1", ListConversationsQuery::default()).await.unwrap();
+    assert!(
+        repo.get(&resp.id).await.unwrap().unwrap().project_id.is_none(),
+        "list must not backfill"
+    );
+
+    // Opening the single conversation via get → lazy backfill.
+    let _ = svc.get("user_1", &resp.id).await.unwrap();
+    let row = repo.get(&resp.id).await.unwrap().unwrap();
+    assert!(row.project_id.is_some(), "get should lazily backfill project_id");
+    assert!(row.folder_id.is_some());
 }
 
 #[tokio::test]
@@ -3893,6 +3983,75 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
 }
 
 #[tokio::test]
+async fn set_config_option_does_not_persist_preference_on_error() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo, definition_repo, overlay_repo, preference_repo) =
+        make_service_with_mock_task_manager_and_assistant_support(task_mgr.clone()).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_acp_auto",
+        "assistant-acp-auto",
+        "codex",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_acp_auto",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            assistant_definition_id: "asstdef_acp_auto",
+            last_model_id: Some("original-model"),
+            last_permission_value: Some("original-mode"),
+            last_thought_level_value: Some("original-low"),
+            last_skill_ids: "[]",
+            last_disabled_builtin_skill_ids: "[]",
+            last_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-auto").await;
+
+    // Agent reports a session-change conflict (mirrors the legacy ACK-then-
+    // session-changed race): the service must return the error and leave the
+    // persisted preference untouched.
+    let agent = Arc::new(
+        MockAgent::new(&conv.id).with_set_config_option_error(AgentError::conflict(
+            "Active ACP session changed while applying config option",
+        )),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+
+    let result = svc
+        .set_config_option(
+            &conv.id,
+            "model",
+            SetConfigOptionRequest {
+                value: "gpt-5.5".to_owned(),
+            },
+        )
+        .await;
+    assert!(result.is_err(), "conflict from agent must surface as error");
+
+    let pref_after = preference_repo.get("asstdef_acp_auto").await.unwrap().unwrap();
+    assert_eq!(
+        pref_after.last_model_id.as_deref(),
+        Some("original-model"),
+        "preference must not be written when set_config_option errors"
+    );
+}
+
+#[tokio::test]
 async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixed() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, repo, definition_repo, overlay_repo, preference_repo) =
@@ -5023,11 +5182,18 @@ async fn send_message_records_agent_availability_feedback_on_send_failure() {
     let failures = feedback.failures.lock().unwrap().clone();
     assert_eq!(
         failures,
-        vec![RecordedAvailabilityFailure {
-            agent_id: "agent-feedback-1".into(),
-            code: "session_send_failed".into(),
-            message: "provider returned 401 invalid api key".into(),
-        }]
+        vec![
+            RecordedAvailabilityFailure {
+                agent_id: "agent-feedback-1".into(),
+                code: "session_send_failed".into(),
+                message: "provider returned 401 invalid api key".into(),
+            },
+            RecordedAvailabilityFailure {
+                agent_id: "agent-feedback-1".into(),
+                code: "auth_required".into(),
+                message: "provider returned 401 invalid api key".into(),
+            },
+        ]
     );
 }
 
@@ -5643,6 +5809,43 @@ async fn warmup_injects_conversation_runtime_context() {
 }
 
 #[tokio::test]
+async fn warmup_injects_runtime_token_for_mcp_team_conversation() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let svc = svc.with_runtime_token_service(Arc::new(RuntimeTokenService::new()));
+    let mut req = make_create_req();
+    req.extra = serde_json::json!({
+        "teamId": "team-1",
+        "slot_id": "slot-1",
+        "role": "lead",
+        "team_mcp_stdio_config": {
+            "team_id": "team-1",
+            "port": 4242,
+            "token": "mcp-token",
+            "slot_id": "slot-1",
+            "binary_path": "/tmp/aioncore"
+        }
+    });
+    let conv = svc.create("user_1", req).await.unwrap();
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new(&conv.id),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.warmup("user_1", &conv.id, &task_mgr_dyn).await.unwrap();
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 1);
+    assert!(
+        options[0]
+            .context
+            .runtime_env
+            .iter()
+            .any(|(key, value)| key == AIONUI_RUNTIME_TOKEN_ENV && !value.is_empty()),
+        "MCP Team conversations should receive AIONUI_RUNTIME_TOKEN for CLI fallback"
+    );
+}
+
+#[tokio::test]
 async fn warmup_rejects_legacy_runtime_conversations_as_archived() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
@@ -6121,8 +6324,6 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             source: "builtin",
             owner_type: "system",
             source_ref: Some("preset-1"),
-            source_version: None,
-            source_hash: None,
             name: "Preset",
             name_i18n: "{}",
             description: Some("desc"),
@@ -6132,7 +6333,6 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             agent_id: "claude",
             rule_resource_type: "builtin_asset",
             rule_resource_ref: Some("preset-1"),
-            rule_inline_content: None,
             recommended_prompts: "[]",
             recommended_prompts_i18n: "{}",
             default_model_mode: "auto",
@@ -6284,8 +6484,6 @@ async fn existing_conversation_reads_current_assistant_identity() {
             source: "user",
             owner_type: "user",
             source_ref: Some("live-identity"),
-            source_version: None,
-            source_hash: None,
             name: "Old Name",
             name_i18n: "{}",
             description: None,
@@ -6295,7 +6493,6 @@ async fn existing_conversation_reads_current_assistant_identity() {
             agent_id: "claude",
             rule_resource_type: "none",
             rule_resource_ref: None,
-            rule_inline_content: None,
             recommended_prompts: "[]",
             recommended_prompts_i18n: "{}",
             default_model_mode: "auto",
@@ -6343,8 +6540,6 @@ async fn existing_conversation_reads_current_assistant_identity() {
             source: "user",
             owner_type: "user",
             source_ref: Some("live-identity"),
-            source_version: None,
-            source_hash: None,
             name: "New Name",
             name_i18n: "{}",
             description: None,
@@ -6354,7 +6549,6 @@ async fn existing_conversation_reads_current_assistant_identity() {
             agent_id: "claude",
             rule_resource_type: "none",
             rule_resource_ref: None,
-            rule_inline_content: None,
             recommended_prompts: "[]",
             recommended_prompts_i18n: "{}",
             default_model_mode: "auto",
@@ -6417,8 +6611,6 @@ async fn create_routes_asset_avatar_in_assistant_identity_through_backend() {
             source: "user",
             owner_type: "user",
             source_ref: Some("custom-data-avatar"),
-            source_version: None,
-            source_hash: None,
             name: "Data Avatar",
             name_i18n: "{}",
             description: None,
@@ -6428,7 +6620,6 @@ async fn create_routes_asset_avatar_in_assistant_identity_through_backend() {
             agent_id: "claude",
             rule_resource_type: "none",
             rule_resource_ref: None,
-            rule_inline_content: None,
             recommended_prompts: "[]",
             recommended_prompts_i18n: "{}",
             default_model_mode: "auto",
@@ -6578,8 +6769,6 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
             source: "builtin",
             owner_type: "system",
             source_ref: Some("preset-1"),
-            source_version: None,
-            source_hash: None,
             name: "Preset",
             name_i18n: "{}",
             description: Some("desc"),
@@ -6589,7 +6778,6 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
             agent_id: "claude",
             rule_resource_type: "builtin_asset",
             rule_resource_ref: Some("preset-1"),
-            rule_inline_content: None,
             recommended_prompts: "[]",
             recommended_prompts_i18n: "{}",
             default_model_mode: "auto",
@@ -6742,8 +6930,6 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
             source: "builtin",
             owner_type: "system",
             source_ref: Some("preset-fixed"),
-            source_version: None,
-            source_hash: None,
             name: "Preset Fixed",
             name_i18n: "{}",
             description: Some("desc"),
@@ -6753,7 +6939,6 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
             agent_id: "claude",
             rule_resource_type: "builtin_asset",
             rule_resource_ref: Some("preset-fixed"),
-            rule_inline_content: None,
             recommended_prompts: "[]",
             recommended_prompts_i18n: "{}",
             default_model_mode: "auto",
@@ -6843,8 +7028,6 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
             source: "builtin",
             owner_type: "system",
             source_ref: Some("preset-auto"),
-            source_version: None,
-            source_hash: None,
             name: "Preset Unset",
             name_i18n: "{}",
             description: Some("desc"),
@@ -6854,7 +7037,6 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
             agent_id: "claude",
             rule_resource_type: "builtin_asset",
             rule_resource_ref: Some("preset-auto"),
-            rule_inline_content: None,
             recommended_prompts: "[]",
             recommended_prompts_i18n: "{}",
             default_model_mode: "auto",
@@ -7128,6 +7310,8 @@ async fn get_backfills_legacy_row_and_persists() {
         pinned_at: None,
         created_at: 0,
         updated_at: 0,
+        project_id: None,
+        folder_id: None,
     };
     repo.create(&legacy_row).await.unwrap();
 
@@ -7176,6 +7360,8 @@ async fn list_backfills_mixed_rows() {
         pinned_at: None,
         created_at: 1,
         updated_at: 1,
+        project_id: None,
+        folder_id: None,
     };
     // Row 2: already migrated.
     let modern = ConversationRow {
@@ -7196,6 +7382,8 @@ async fn list_backfills_mixed_rows() {
         pinned_at: None,
         created_at: 2,
         updated_at: 2,
+        project_id: None,
+        folder_id: None,
     };
     repo.create(&legacy).await.unwrap();
     repo.create(&modern).await.unwrap();
@@ -7282,4 +7470,155 @@ async fn insert_raw_message_persists_row_and_broadcasts_stream() {
     assert_eq!(data["position"], "left");
     assert_eq!(data["data"]["content"], "from teammate");
     assert_eq!(data["data"]["teammate_message"], true);
+}
+
+// ── aionrs rebuild permission seed (Sentry 135525584) ──────────────
+
+/// Inserts an aionrs conversation whose `extra.session_mode` is the create-time
+/// value and persists an assistant snapshot carrying the runtime permission
+/// gate inputs (`default_permission_mode` / `resolved_permission_value`).
+async fn seed_aionrs_conversation_with_snapshot(
+    repo: &Arc<MockRepo>,
+    session_mode: &str,
+    default_permission_mode: &str,
+    resolved_permission_value: Option<&str>,
+) -> ConversationRow {
+    let row = ConversationRow {
+        id: format!("aionrs-seed-{}", aionui_common::generate_short_id()),
+        user_id: "user_1".into(),
+        name: "aionrs seed".into(),
+        r#type: "aionrs".into(),
+        extra: json!({
+            "session_mode": session_mode,
+            "workspace": ensure_test_workspace_path()
+        })
+        .to_string(),
+        model: None,
+        status: Some("finished".into()),
+        source: Some("aionui".into()),
+        channel_chat_id: None,
+        pinned: false,
+        pinned_at: None,
+        created_at: 1,
+        updated_at: 1,
+        project_id: None,
+        folder_id: None,
+    };
+    repo.create(&row).await.unwrap();
+    repo.upsert_assistant_snapshot(&UpsertConversationAssistantSnapshotParams {
+        conversation_id: &row.id,
+        assistant_definition_id: "asstdef-seed",
+        assistant_id: "assistant-seed",
+        assistant_source: "builtin",
+        agent_id: "agent-seed",
+        rules_content: "",
+        default_model_mode: "auto",
+        resolved_model_id: None,
+        default_permission_mode,
+        resolved_permission_value,
+        default_thought_level_mode: "auto",
+        resolved_thought_level_value: None,
+        default_skills_mode: "auto",
+        resolved_skill_ids: "[]",
+        resolved_disabled_builtin_skill_ids: "[]",
+        default_mcps_mode: "auto",
+        resolved_mcp_ids: "[]",
+    })
+    .await
+    .unwrap();
+    row
+}
+
+fn aionrs_session_mode(options: &BuildTaskOptions) -> Option<String> {
+    match &options.context.kind {
+        AgentSessionKind::Aionrs(ctx) => ctx.config.session_mode.clone(),
+        AgentSessionKind::Acp(_) => panic!("expected Aionrs build options"),
+    }
+}
+
+#[tokio::test]
+async fn aionrs_rebuild_auto_mode_preserves_runtime_yolo() {
+    // AC#1: an `auto` aionrs session that was switched to yolo at runtime must
+    // keep yolo after a rebuild (model switch / agent restart).
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let row = seed_aionrs_conversation_with_snapshot(&repo, "default", "auto", Some("yolo")).await;
+
+    let options = svc.build_task_options(&row).await.unwrap();
+
+    assert_eq!(aionrs_session_mode(&options).as_deref(), Some("yolo"));
+}
+
+#[tokio::test]
+async fn aionrs_rebuild_existing_data_auto_overrides_create_time_seed() {
+    // AC#2: existing data — create-time non-yolo seed is overridden by the
+    // authoritative resolved runtime value.
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let row = seed_aionrs_conversation_with_snapshot(&repo, "auto_edit", "auto", Some("yolo")).await;
+
+    let options = svc.build_task_options(&row).await.unwrap();
+
+    assert_eq!(aionrs_session_mode(&options).as_deref(), Some("yolo"));
+}
+
+#[tokio::test]
+async fn aionrs_rebuild_fixed_mode_blocks_runtime_escalation() {
+    // AC#3 (hard safety gate): a `fixed` assistant must NOT adopt the runtime
+    // residue, even if `resolved_permission_value` was written to yolo.
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let row = seed_aionrs_conversation_with_snapshot(&repo, "default", "fixed", Some("yolo")).await;
+
+    let options = svc.build_task_options(&row).await.unwrap();
+
+    assert_eq!(aionrs_session_mode(&options).as_deref(), Some("default"));
+}
+
+#[tokio::test]
+async fn cron_required_runtime_mode_wins_over_resolved_permission_seed() {
+    // AC#5 (hard): the per-turn `required_runtime_mode` override runs AFTER
+    // rebuild and MUST keep priority over the rebuild permission seed. Even for
+    // an `auto` aionrs session whose snapshot resolved value is yolo, a cron
+    // turn pinned to "default" applies "default" to the agent — the seed must
+    // not bypass or reorder this override.
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let row = seed_aionrs_conversation_with_snapshot(&repo, "default", "auto", Some("yolo")).await;
+    broadcaster.take_events();
+
+    let agent = Arc::new(
+        MockAgent::new(&row.id)
+            .with_mode("yolo")
+            .with_config_options(vec![AcpConfigOptionDto {
+                id: "mode".to_owned(),
+                name: Some("Mode".to_owned()),
+                label: None,
+                description: None,
+                category: Some("mode".to_owned()),
+                option_type: "select".to_owned(),
+                current_value: Some("yolo".to_owned()),
+                options: Vec::new(),
+            }]),
+    );
+    task_mgr.insert_agent(&row.id, AgentInstance::Mock(agent.clone()));
+
+    let outcome = svc
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".to_owned(),
+            conversation_id: row.id.clone(),
+            content: "run scheduled task".to_owned(),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+            required_runtime_mode: Some("default".to_owned()),
+            persist_user_message: true,
+            user_message_hidden: true,
+            on_started: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
+    assert_eq!(
+        agent.set_config_option_calls.lock().unwrap().as_slice(),
+        &[("mode".to_owned(), "default".to_owned())],
+        "cron required-runtime-mode must override the rebuild permission seed"
+    );
 }
