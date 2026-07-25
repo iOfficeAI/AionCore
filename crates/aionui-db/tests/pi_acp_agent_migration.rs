@@ -28,6 +28,8 @@ async fn pi_acp_builtin_metadata_is_seeded() {
         serde_json::from_str(pi.agent_capabilities.as_deref().expect("seeded capabilities")).unwrap();
     assert_eq!(capabilities["load_session"], true);
     assert_eq!(capabilities["session_capabilities"]["list"], serde_json::json!({}));
+    // pi-acp >= 0.0.32 advertises session/delete (migration 029).
+    assert_eq!(capabilities["session_capabilities"]["delete"], serde_json::json!({}));
     assert_eq!(capabilities["mcp_capabilities"]["http"], false);
     assert_eq!(capabilities["mcp_capabilities"]["sse"], false);
 

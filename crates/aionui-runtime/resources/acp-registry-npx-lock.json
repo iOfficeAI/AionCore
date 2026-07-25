@@ -49,7 +49,7 @@
     "pi": {
       "registry_json_id": "pi-acp",
       "package": "pi-acp",
-      "version": "0.0.31"
+      "version": "0.0.32"
     },
     "sigit": {
       "registry_json_id": "sigit",
