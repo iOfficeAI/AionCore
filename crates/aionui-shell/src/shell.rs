@@ -258,7 +258,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::opener::NoopSystemOpener;
+    use crate::opener::{ISystemOpener, NoopSystemOpener};
     use std::fs;
 
     #[test]
@@ -398,6 +398,82 @@ mod tests {
         svc.open_folder_with(dir.path().to_str().unwrap(), ToolType::Zed)
             .await
             .unwrap();
+    }
+
+    /// Recording opener: captures the program/args of the last run_command.
+    struct RecordingOpener {
+        available: std::collections::HashSet<&'static str>,
+        last: std::sync::Mutex<Option<(String, Vec<String>)>>,
+    }
+
+    impl RecordingOpener {
+        fn with_tools(tools: &[&'static str]) -> Self {
+            Self {
+                available: tools.iter().copied().collect(),
+                last: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn last_command(&self) -> Option<(String, Vec<String>)> {
+            self.last.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ISystemOpener for RecordingOpener {
+        fn open_detached(&self, _target: &str) -> Result<(), ShellError> {
+            Ok(())
+        }
+
+        async fn run_command(&self, program: &str, args: &[&str]) -> Result<(), ShellError> {
+            *self.last.lock().unwrap() = Some((program.to_owned(), args.iter().map(|s| (*s).to_owned()).collect()));
+            Ok(())
+        }
+
+        fn is_tool_available(&self, tool_name: &str) -> bool {
+            self.available.contains(tool_name)
+        }
+    }
+
+    #[tokio::test]
+    async fn open_folder_zed_invokes_zed_cli_with_folder_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let opener = Arc::new(RecordingOpener::with_tools(&["zed"]));
+        let svc = ShellService::new(opener.clone());
+        svc.open_folder_with(dir.path().to_str().unwrap(), ToolType::Zed)
+            .await
+            .unwrap();
+        let (program, args) = opener.last_command().expect("run_command should be called");
+        assert_eq!(program, "zed");
+        assert_eq!(args.len(), 1);
+        // Canonicalized path may differ by OS separators; ensure the folder is the arg.
+        let opened = std::path::Path::new(&args[0]);
+        assert_eq!(opened.canonicalize().unwrap(), dir.path().canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn check_tool_zed_false_when_cli_unavailable() {
+        let opener = Arc::new(RecordingOpener::with_tools(&[])); // nothing on PATH
+        let svc = ShellService::new(opener);
+        // On CI macOS without Zed.app this is false; if Zed.app exists on the
+        // developer machine the macOS app CLI fallback may still detect it.
+        // Assert only the PATH-empty + no-app path via the recording opener's
+        // available set: detect_zed also checks the filesystem for the app CLI.
+        // So we only assert that when PATH has no zed and we're not relying on
+        // app fallback for this unit (filesystem is env-dependent).
+        let _ = svc.check_tool_installed(ToolType::Zed).await;
+        // Stronger assertion: open fails with ToolNotInstalled when both PATH
+        // and (if present) app CLI are missing. Skip hard false assert when
+        // local machine has /Applications/Zed.app.
+        if !std::path::Path::new("/Applications/Zed.app/Contents/MacOS/cli").exists() {
+            assert!(!svc.check_tool_installed(ToolType::Zed).await);
+            let dir = tempfile::tempdir().unwrap();
+            let err = svc
+                .open_folder_with(dir.path().to_str().unwrap(), ToolType::Zed)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ShellError::ToolNotInstalled(ref name) if name == "zed"));
+        }
     }
 
     #[tokio::test]
