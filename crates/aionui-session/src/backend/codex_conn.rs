@@ -1266,6 +1266,13 @@ async fn reader_task(
     // the turn somehow ends with idle but no completed (defensive), this is flushed
     // as a clean terminal at EOF so the FSM never hangs Running.
     let mut idle_pending = false;
+    // Deferred `status→systemError` (mirrors idle_pending): the status carries no
+    // detail, so we wait for the rich follow-up (error{willRetry:false} or
+    // turn/completed — live capture 0.145.0 shows both arrive within ms) instead
+    // of synthesizing the opaque terminal immediately. The deadline bounds the
+    // wait so an unfollowed systemError still terminates the turn.
+    let mut system_error_pending = false;
+    let mut system_error_deadline: Option<tokio::time::Instant> = None;
 
     let mut lines = BufReader::new(stdout).lines();
     // Unbounded mid-turn read (AGENTS.md §"出了问题必须查到根因": NO mid-turn
@@ -1274,8 +1281,39 @@ async fn reader_task(
     // agentMessage. A wedged turn is ended by user Cancel, per the no-auto-timeout
     // design; startup binding is the only thing bounded, via bound_thread_within).
     // A REAL fatal signal (error{willRetry:false}) still synthesizes a terminal below.
+    // The ONLY bounded read is the SYSTEM_ERROR_GRACE below, armed strictly AFTER
+    // codex has already declared the thread fatally errored (status→systemError) —
+    // it cannot false-kill a healthy turn.
     loop {
-        match lines.next_line().await {
+        let next = match system_error_deadline {
+            Some(deadline) if system_error_pending && !terminated => {
+                match tokio::time::timeout_at(deadline, lines.next_line()).await {
+                    Ok(read) => read,
+                    Err(_elapsed) => {
+                        // Grace expired: no rich follow-up arrived after systemError
+                        // (never observed live — defensive bound). Fall back to the
+                        // opaque terminal so the FSM leaves Running.
+                        terminated = true;
+                        system_error_pending = false;
+                        system_error_deadline = None;
+                        *active_turn_id.lock().await = None;
+                        turn_in_flight.store(false, Ordering::SeqCst);
+                        emit(
+                            &event_tx,
+                            &session_id,
+                            turn_gen.load(Ordering::SeqCst),
+                            synth_error_terminal("codex reported a system error".into()),
+                        );
+                        continue;
+                    }
+                }
+            }
+            _ => lines.next_line().await,
+        };
+        if !system_error_pending || terminated {
+            system_error_deadline = None;
+        }
+        match next {
             Ok(Some(line)) => {
                 let line = line.trim();
                 if line.is_empty() {
@@ -1342,6 +1380,8 @@ async fn reader_task(
                         if m == "turn/started" {
                             terminated = false; // a new turn can terminate once (R8 reset)
                             idle_pending = false; // and a fresh turn has no deferred idle
+                            system_error_pending = false; // nor a deferred systemError
+                            system_error_deadline = None;
                             // Capture the active turn id (optimistic token needed by
                             // turn/interrupt{turnId} + turn/steer{expectedTurnId}).
                             if let Some(tid) = params.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
@@ -1352,7 +1392,14 @@ async fn reader_task(
                         // (deferred), then the authoritative turn/completed produces
                         // the rich terminal (M3). Exactly ONE TurnResult per turn.
                         if m == "turn/completed" || m == "thread/status/changed" {
-                            if let Some(ev) = reconcile_terminal(m, params, &mut terminated, &mut idle_pending) {
+                            let was_pending = system_error_pending;
+                            if let Some(ev) = reconcile_terminal(
+                                m,
+                                params,
+                                &mut terminated,
+                                &mut idle_pending,
+                                &mut system_error_pending,
+                            ) {
                                 // Turn ended → clear the active turn id (a stale token
                                 // would make a later steer/interrupt target a dead turn).
                                 *active_turn_id.lock().await = None;
@@ -1360,6 +1407,11 @@ async fn reader_task(
                                 // idle timer may suspend the now-idle process.
                                 turn_in_flight.store(false, Ordering::SeqCst);
                                 emit(&event_tx, &session_id, cur, ev);
+                            } else if system_error_pending && !was_pending {
+                                // systemError was just deferred: arm the bounded grace
+                                // for the rich follow-up (error{willRetry:false} /
+                                // turn/completed). Intervening frames do NOT extend it.
+                                system_error_deadline = Some(tokio::time::Instant::now() + SYSTEM_ERROR_GRACE);
                             }
                             continue;
                         }
@@ -1417,6 +1469,8 @@ async fn reader_task(
                         {
                             if !terminated {
                                 terminated = true;
+                                system_error_pending = false; // the fatal error IS the rich follow-up
+                                system_error_deadline = None;
                                 *active_turn_id.lock().await = None;
                                 turn_in_flight.store(false, Ordering::SeqCst);
                                 let message = params
@@ -1656,6 +1710,20 @@ async fn reader_task(
     // F-4: the reader loop ended (process exited / stdout EOF) → the turn (if any)
     // is terminal. Clear the turn-active flag so the idle timer is unblocked.
     turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // Deferred-systemError flush: the stream ended (EOF) before the rich follow-up
+    // arrived. Emit the opaque error terminal so the turn still ends as an error —
+    // this keeps the pre-defer behavior for the process-death path.
+    if system_error_pending && !terminated {
+        terminated = true;
+        *active_turn_id.lock().await = None;
+        emit(
+            &event_tx,
+            &session_id,
+            turn_gen.load(Ordering::SeqCst),
+            synth_error_terminal("codex reported a system error".into()),
+        );
+    }
 
     // M3 defensive flush: the stream ended with a deferred `status→idle` but NO
     // authoritative `turn/completed` ever arrived (not observed in real codex, but
@@ -2809,11 +2877,21 @@ fn map_plan_status(s: &str) -> crate::event::PlanStatus {
 /// the reader's `flush_pending_terminal`), so the FSM never hangs Running.
 /// `idle_pending` resets per turn on `turn/started`. Returns Some only for the
 /// authoritative `turn/completed`; `idle` returns None (deferred).
+///
+/// `status→systemError` is deferred the same way (`system_error_pending`): the
+/// status carries no detail (schema: SystemErrorThreadStatus has only `type`),
+/// while the follow-ups — `error{willRetry:false}` and `turn/completed{failed}`
+/// — carry the real cause and arrive within ms (live capture 0.145.0, bedrock
+/// stream failure). Emitting here won the terminal race and replaced the rich
+/// message with an opaque "codex reported a system error". The reader bounds
+/// the deferral with SYSTEM_ERROR_GRACE and flushes at EOF, so the FSM still
+/// never hangs Running if the follow-up is missing.
 fn reconcile_terminal(
     method: &str,
     params: &Value,
     terminated: &mut bool,
     idle_pending: &mut bool,
+    system_error_pending: &mut bool,
 ) -> Option<SessionEvent> {
     match method {
         "turn/completed" => {
@@ -2822,6 +2900,7 @@ fn reconcile_terminal(
             }
             *terminated = true;
             *idle_pending = false; // the authoritative terminal supersedes the deferred idle
+            *system_error_pending = false; // …and resolves a deferred systemError with the rich cause
             Some(map_turn_completed(params))
         }
         "thread/status/changed" => {
@@ -2840,19 +2919,24 @@ fn reconcile_terminal(
                     *idle_pending = true;
                     None
                 }
-                // systemError is a FATAL session fault (ThreadStatus::SystemError,
-                // v2/thread.rs). codex does NOT reliably follow it with a turn/completed
-                // (protocol audit MED) — so treat it as a terminal here instead of
-                // advisory, else the FSM hangs Running until process EOF. Synthesize an
-                // is_error terminal; a later turn/completed is absorbed (terminated +
-                // I10). NOT a watchdog — this is a response to a REAL fault signal.
+                // systemError is a FATAL session fault, but the status itself carries
+                // NO detail (schema-verified: SystemErrorThreadStatus has only `type`,
+                // codex 0.145.0 generate-json-schema v2/ThreadStatusChangedNotification.json).
+                // The rich cause rides the follow-ups (live capture 0.145.0, bedrock
+                // stream failure: systemError → error{willRetry:false} same ms →
+                // turn/completed{failed, turn.error.message} +5ms) — synthesizing here
+                // used to WIN the terminal race and the opaque "codex reported a system
+                // error" masked the real cause (e.g. "failed to load AWS credentials").
+                // So DEFER like idle: set pending, emit nothing; the fatal error branch
+                // or turn/completed produces the rich terminal. The reader bounds the
+                // wait with SYSTEM_ERROR_GRACE (and flushes at EOF) so a hypothetical
+                // unfollowed systemError still cannot hang the FSM Running.
                 "systemError" => {
                     if *terminated {
                         return None;
                     }
-                    *terminated = true;
-                    *idle_pending = false;
-                    Some(synth_error_terminal("codex reported a system error".into()))
+                    *system_error_pending = true;
+                    None
                 }
                 // active / other → advisory (no terminal).
                 _ => None,
@@ -2883,6 +2967,13 @@ fn synth_clean_terminal() -> SessionEvent {
 /// Running and the composer unlocks instead of spinning forever. `epoch:0` is restamped
 /// by the orchestrator from the live turn_gen; a later real `turn/completed` for the
 /// same turn is idempotently absorbed by the reducer's terminal-absorbing law (I10).
+/// Grace window for a deferred `systemError`: how long the reader waits for the
+/// rich follow-up (`error{willRetry:false}` / `turn/completed`) before falling
+/// back to the opaque synthesized terminal. Live capture (0.145.0, bedrock
+/// stream failure) shows the follow-ups arrive within milliseconds — this bound
+/// only exists so a hypothetical unfollowed systemError cannot hang the FSM.
+const SYSTEM_ERROR_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn synth_error_terminal(message: String) -> SessionEvent {
     SessionEvent::TurnResult {
         is_error: true,
@@ -4242,9 +4333,10 @@ mod tests {
         );
     }
 
-    /// Protocol-audit fix (MED): thread/status/changed → systemError is a FATAL fault
-    /// that codex may NOT follow with a turn/completed → must be a synthesized terminal
-    /// (was treated as advisory → FSM hangs Running). A later turn/completed is absorbed.
+    /// thread/status/changed → systemError with NO follow-up before EOF: the
+    /// deferred systemError is flushed as an is_error terminal when the stream
+    /// ends, so the FSM never hangs Running (pre-defer behavior preserved for
+    /// the process-death path).
     #[tokio::test]
     async fn codex_system_error_status_synthesizes_terminal() {
         let sys_err = drive_codex(&[
@@ -4257,6 +4349,133 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, SessionEvent::TurnResult { is_error: true, .. })),
             "thread/status/changed→systemError must synthesize an is_error terminal (not hang), got {sys_err:?}"
+        );
+    }
+
+    /// systemError carries NO detail (schema: SystemErrorThreadStatus has only
+    /// `type`; codex 0.145.0 generate-json-schema v2/ThreadStatusChangedNotification.json)
+    /// — the rich cause rides the `turn/completed` that follows it (live capture
+    /// 0.145.0, bedrock stream failure: systemError → error{willRetry:false} same
+    /// ms → turn/completed{failed, turn.error.message} +5ms). The deferred
+    /// systemError must let turn/completed produce the terminal so result_text
+    /// keeps the real cause instead of the opaque "codex reported a system error".
+    #[tokio::test]
+    async fn codex_system_error_then_turn_completed_preserves_rich_error() {
+        let events = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"turn":{"id":"t1"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"thread/status/changed","params":{"threadId":"th1","status":{"type":"systemError"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th1","turn":{"id":"t1","status":"failed","error":{"message":"stream disconnected before completion: failed to load AWS credentials: an error occurred while loading credentials","codexErrorInfo":"other"}}}}"#,
+        ])
+        .await;
+        let terminals: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::TurnResult {
+                    is_error, result_text, ..
+                } => Some((*is_error, result_text.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminals.len(), 1, "exactly one terminal, got {terminals:?}");
+        assert!(terminals[0].0, "failed turn → is_error terminal");
+        assert!(
+            terminals[0].1.contains("failed to load AWS credentials"),
+            "terminal must keep the rich turn/completed error, got {:?}",
+            terminals[0].1
+        );
+    }
+
+    /// Same live-captured sequence, cut before turn/completed: the fatal
+    /// `error{{willRetry:false}}` that follows systemError also carries the rich
+    /// cause and must win over the opaque synthesized text.
+    #[tokio::test]
+    async fn codex_system_error_then_fatal_error_preserves_rich_error() {
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(
+            concat!(
+                r#"{"jsonrpc":"2.0","method":"turn/started","params":{"turn":{"id":"t1"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","method":"thread/status/changed","params":{"threadId":"th1","status":{"type":"systemError"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","method":"error","params":{"threadId":"th1","turnId":"t1","willRetry":false,"error":{"message":"stream disconnected before completion: failed to load AWS credentials: an error occurred while loading credentials","codexErrorInfo":"other"}}}"#,
+                "\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        );
+        let releaser = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        backend.mark_turn_in_flight_for_test();
+        let mut events = backend.events();
+        releaser();
+
+        let tr = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::TurnResult {
+                    is_error, result_text, ..
+                } = env.event
+                {
+                    return Some((is_error, result_text));
+                }
+            }
+            None
+        })
+        .await
+        .expect("timed out")
+        .expect("a TurnResult");
+        assert!(tr.0, "fatal after systemError → is_error terminal");
+        assert!(
+            tr.1.contains("failed to load AWS credentials"),
+            "terminal must keep the rich fatal-error message, got {:?}",
+            tr.1
+        );
+    }
+
+    /// Defensive fallback: systemError with NO follow-up on a STILL-OPEN stream
+    /// (not observed live — capture shows error+turn/completed follow within ms)
+    /// must still terminate the turn after the bounded grace instead of hanging
+    /// Running forever. NOT a mid-turn watchdog: it only arms after codex has
+    /// already declared the thread fatally errored. Gated SEGMENTS (second one
+    /// never released) keep stdout open so the terminal can ONLY come from the
+    /// grace timer — a gated tail would EOF and exercise the flush path instead.
+    #[tokio::test]
+    async fn codex_system_error_with_no_followup_times_out_with_generic_terminal() {
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![
+            concat!(
+                r#"{"jsonrpc":"2.0","method":"turn/started","params":{"turn":{"id":"t1"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","method":"thread/status/changed","params":{"threadId":"th1","status":{"type":"systemError"}}}"#,
+                "\n",
+            )
+            .as_bytes()
+            .to_vec(),
+            // never released — keeps the stream open past the grace deadline
+            b"{}\n".to_vec(),
+        ]);
+        let releaser = fake.segment_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        backend.mark_turn_in_flight_for_test();
+        let mut events = backend.events();
+        releaser();
+
+        let tr = tokio::time::timeout(SYSTEM_ERROR_GRACE + std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::TurnResult {
+                    is_error, result_text, ..
+                } = env.event
+                {
+                    return Some((is_error, result_text));
+                }
+            }
+            None
+        })
+        .await
+        .expect("timed out waiting for the grace fallback")
+        .expect("a TurnResult");
+        assert!(tr.0, "unfollowed systemError → is_error terminal");
+        assert!(
+            tr.1.contains("codex reported a system error"),
+            "fallback keeps the generic text, got {:?}",
+            tr.1
         );
     }
 
