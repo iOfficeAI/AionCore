@@ -2292,17 +2292,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_without_active_run_queues_background_work() {
+    async fn shutdown_without_active_run_opens_system_lifecycle_run() {
         let session = start_session().await;
 
         session
             .shutdown_agent("lead-1", "worker-1", Some("done".into()))
             .await
-            .expect("background caller may queue shutdown work");
+            .expect("leader may shut down a teammate");
 
         let unread = session.mailbox().peek_unread("t1", "worker-1").await.unwrap();
         assert_eq!(unread.len(), 1);
-        assert!(session.team_run_manager().current_active_run_id().is_none());
+        // A run-scoped shutdown wake with no inheritable run now converges into a
+        // SystemLifecycle run at the enqueue choke-point instead of enqueuing
+        // run-less background work.
+        assert!(session.team_run_manager().current_active_run_id().is_some());
+        let payload = session
+            .team_run_manager()
+            .current_payload(&session.work_coordinator.snapshot())
+            .expect("shutdown wake must open a run payload");
+        assert_eq!(payload.source, aionui_api_types::TeamRunSource::SystemLifecycle);
+        assert!(!payload.has_user_intervention);
         session.stop();
     }
 
@@ -2711,7 +2720,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_turn_is_reported_running_without_a_team_run() {
+    async fn shutdown_turn_is_reported_running_inside_a_system_run() {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
@@ -2745,7 +2754,15 @@ mod tests {
         let slot = session.work_coordinator.slot_snapshot("worker-1").unwrap();
         assert_eq!(slot.state, SlotPhase::Running);
         assert_eq!(slot.active_turn_id.as_deref(), Some("turn-background"));
-        assert!(session.team_run_manager.current_active_run_id().is_none());
+        // The shutdown wake now converges into a SystemLifecycle run at the
+        // enqueue choke-point, so the reported-running turn lives inside a run
+        // rather than being run-less.
+        assert!(session.team_run_manager.current_active_run_id().is_some());
+        let payload = session
+            .team_run_manager
+            .current_payload(&session.work_coordinator.snapshot())
+            .expect("shutdown wake must open a run payload");
+        assert_eq!(payload.source, aionui_api_types::TeamRunSource::SystemLifecycle);
 
         release_tx.send(()).unwrap();
         session.stop();

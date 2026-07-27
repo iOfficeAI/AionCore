@@ -120,15 +120,27 @@ impl SlotWorkCoordinator {
                 created_new_run: false,
                 user_intervention: false,
             },
-            CausalBinding::InheritRunningBatch { caller_slot_id } => RunBinding {
-                team_run_id: state
+            CausalBinding::InheritRunningBatch { caller_slot_id } => {
+                let inherited = state
                     .slots
                     .get(caller_slot_id)
                     .and_then(|caller| caller.active.as_ref())
-                    .and_then(|active| active.batch.team_run_ids.first().cloned()),
-                created_new_run: false,
-                user_intervention: false,
-            },
+                    .and_then(|active| active.batch.team_run_ids.first().cloned());
+                match inherited {
+                    // Inherit the caller's active run when there is one.
+                    Some(team_run_id) => RunBinding {
+                        team_run_id: Some(team_run_id),
+                        created_new_run: false,
+                        user_intervention: false,
+                    },
+                    // No inheritable run: a run-scoped wake (send/shutdown) is a
+                    // legitimate work initiation and must live in a run, so fall
+                    // back to attach-or-create a SystemLifecycle run (same as
+                    // SystemInitiated). Closes "no active team run for
+                    // run-scoped wake" at the single enqueue choke-point.
+                    None => self.run_causality.bind_system_enqueue(&request),
+                }
+            }
             CausalBinding::UserVisible | CausalBinding::ActiveRunOrBackground => {
                 self.run_causality.bind_enqueue(&request)
             }

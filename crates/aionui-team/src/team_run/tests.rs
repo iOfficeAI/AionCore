@@ -207,7 +207,9 @@ fn mcp_message_inherits_the_callers_running_batch_causality() {
             },
         })
         .unwrap();
-    assert_eq!(background_child.team_run_id, None);
+    // Post-fix: an InheritRunningBatch wake with no inheritable run no longer
+    // goes run-less; bind_system_enqueue attaches it to the active run.
+    assert_eq!(background_child.team_run_id, unrelated_user.team_run_id);
 
     coordinator.abort_enqueue(&background_child, "test_complete");
     coordinator.abort_enqueue(&unrelated_user, "test_complete");
@@ -329,6 +331,41 @@ fn system_initiated_without_active_run_opens_system_lifecycle_run() {
         !payload.has_user_intervention,
         "a system run must not be flagged as user-intervened"
     );
+}
+
+#[test]
+fn inherit_running_batch_without_active_run_opens_system_lifecycle_run() {
+    // A run-scoped wake (team_send_message / team_shutdown_agent both build
+    // InheritRunningBatch) issued while the caller has no inheritable active
+    // run must now open a SystemLifecycle run instead of going run-less.
+    let (coordinator, manager) = coordinator_and_manager();
+    coordinator.set_runtime_constraint("worker-1", RuntimeConstraint::Ready);
+
+    // "lead-1" has no active batch/run: nothing to inherit.
+    let lease = coordinator
+        .acquire_enqueue(EnqueueRequest {
+            slot_id: "worker-1".into(),
+            role: TeamRunTargetRole::Teammate,
+            source: WorkSource::McpSendMessage,
+            binding: CausalBinding::InheritRunningBatch {
+                caller_slot_id: "lead-1".into(),
+            },
+        })
+        .unwrap();
+    assert!(
+        lease.team_run_id.is_some(),
+        "run-scoped wake with no inheritable run must ensure a run"
+    );
+
+    coordinator.commit_enqueue(&lease, Some("m1".into())).unwrap();
+    let ReconcileDecision::Claim(_batch) = coordinator.next("worker-1") else {
+        panic!("wake intent must be claimable");
+    };
+
+    assert!(manager.current_active_run_id().is_some());
+    let payload = manager.current_payload(&coordinator.snapshot()).unwrap();
+    assert_eq!(payload.source, TeamRunSource::SystemLifecycle);
+    assert!(!payload.has_user_intervention);
 }
 
 #[test]

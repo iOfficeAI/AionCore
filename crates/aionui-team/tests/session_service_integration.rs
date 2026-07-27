@@ -5065,7 +5065,7 @@ async fn leader_spawn_then_immediate_ensure_joins_the_same_attach_operation() {
 }
 
 #[tokio::test]
-async fn lead_send_agent_message_in_session_requires_active_team_run() {
+async fn lead_send_agent_message_without_active_run_opens_system_lifecycle_run() {
     let svc = setup();
     let created = svc
         .create_team(
@@ -5079,9 +5079,11 @@ async fn lead_send_agent_message_in_session_requires_active_team_run() {
         .await
         .expect("create team");
 
+    // Session loaded with NO active team run: this is the run-less window in
+    // which the leader autonomously wakes a teammate.
     svc.ensure_session("user1", &created.id)
         .await
-        .expect("session should be loaded without active Team Run");
+        .expect("session should load without an active team run");
 
     let lead_slot_id = created
         .leader_assistant_id
@@ -5094,11 +5096,64 @@ async fn lead_send_agent_message_in_session_requires_active_team_run() {
         .map(|agent| agent.slot_id.clone())
         .expect("seeded teammate slot");
 
-    let err = svc
+    // Pre-fix: this returned Err("no active team run for run-scoped wake").
+    // Post-fix: the wake is a legitimate work initiation and succeeds.
+    let result = svc
         .send_agent_message_from_agent(&created.id, &lead_slot_id, &worker_slot_id, "Do this", None)
         .await
-        .expect_err("leader direct message should require active Team Run");
-    assert!(err.to_string().contains("no active team run"));
+        .expect("run-less run-scoped wake must now succeed");
+    assert!(result.team_run_id.is_some(), "the wake must land inside a team run");
+
+    let run_state = svc.get_run_state("user1", &created.id).await.unwrap();
+    let active_run = run_state
+        .active_run
+        .expect("run-scoped wake must open/attach an active team run");
+    assert_eq!(active_run.source, TeamRunSource::SystemLifecycle);
+    assert!(!active_run.has_user_intervention);
+}
+
+#[tokio::test]
+async fn lead_shutdown_agent_without_active_run_opens_system_lifecycle_run() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Alpha".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    svc.ensure_session("user1", &created.id)
+        .await
+        .expect("session should load without an active team run");
+
+    let lead_slot_id = created
+        .leader_assistant_id
+        .clone()
+        .expect("created team should have a lead slot");
+    let worker_slot_id = created
+        .assistants
+        .iter()
+        .find(|agent| agent.role == "teammate")
+        .map(|agent| agent.slot_id.clone())
+        .expect("seeded teammate slot");
+
+    // team_shutdown_agent shares the same InheritRunningBatch binding as send
+    // and is NOT gated by the (now-deleted) guard. Pre-fix it enqueued run-less
+    // ("background") and opened NO run; post-fix it lands in an active run.
+    svc.shutdown_agent_in_session(&created.id, &lead_slot_id, &worker_slot_id, Some("done".into()))
+        .await
+        .expect("leader shutdown of a teammate must succeed");
+
+    let run_state = svc.get_run_state("user1", &created.id).await.unwrap();
+    let active_run = run_state
+        .active_run
+        .expect("shutdown wake must open/attach an active team run");
+    assert_eq!(active_run.source, TeamRunSource::SystemLifecycle);
+    assert!(!active_run.has_user_intervention);
 }
 
 #[tokio::test]
