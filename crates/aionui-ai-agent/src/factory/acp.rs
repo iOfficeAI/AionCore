@@ -102,14 +102,8 @@ pub(super) async fn build(
         return Ok(instance);
     }
 
-    let mut command_spec = resolve_agent_command_spec_with_ollama(
-        &meta,
-        &config,
-        &ctx.workspace,
-        &ctx.conversation_id,
-        deps.broadcaster.clone(),
-    )
-    .await?;
+    let mut command_spec =
+        resolve_agent_command_spec(&meta, &ctx.workspace, &ctx.conversation_id, deps.broadcaster.clone()).await?;
     apply_acp_launch_policy(
         &mut command_spec,
         AcpLaunchPolicyInput {
@@ -119,6 +113,12 @@ pub(super) async fn build(
             runtime_env: &ctx.runtime_env,
         },
     );
+
+    // Inject Ollama provider env vars AFTER apply_acp_launch_policy so
+    // they are the last variables in the vec and override any same-name
+    // variables from the catalog, cc-switch, or host runtime_env (e.g.
+    // OPENAI_API_KEY from the host must not overwrite OPENAI_API_KEY=ollama).
+    inject_ollama_env(&mut command_spec, &meta, &config);
     let session_snapshot = build_context.session_snapshot;
 
     // Load user-configured MCP servers from the DB so they reach
@@ -225,20 +225,63 @@ pub(super) async fn build(
     Ok(instance)
 }
 
+/// Inject Ollama provider env vars into `spec.env` (appended last) when
+/// the session configuration requests it and the agent is compatible.
+///
+/// Must be called **after** apply_acp_launch_policy so Ollama vars are
+/// truly the last entries and override any same-name variables from the
+/// catalog, cc-switch, or host runtime_env.
+fn inject_ollama_env(
+    spec: &mut CommandSpec,
+    meta: &aionui_api_types::AgentMetadata,
+    config: &aionui_api_types::AcpBuildExtra,
+) {
+    if !config.use_ollama || !meta.ollama_compatible {
+        return;
+    }
+
+    let Some(ref model) = config.ollama_model else {
+        warn!(
+            agent = %meta.name,
+            backend = ?meta.backend,
+            "use_ollama=true but ollama_model is missing; falling back to native launch"
+        );
+        return;
+    };
+
+    let backend = meta.backend.as_deref().unwrap_or("");
+    if let Some(ollama_env) = build_ollama_env(backend, model) {
+        info!(
+            agent = %meta.name,
+            backend = ?meta.backend,
+            model = %model,
+            "Routing agent model calls to local Ollama via env injection"
+        );
+        // Appended last so the Ollama route overrides any same-name
+        // variables from the catalog, launch policy (runtime_env,
+        // cc-switch), or user overrides.
+        spec.env.extend(ollama_env);
+    } else {
+        // Shouldn't happen: ollama_compatible is computed from the
+        // same backend list that build_ollama_env covers (enforced by
+        // a unit test in crate::ollama).
+        warn!(
+            agent = %meta.name,
+            backend = ?meta.backend,
+            "Agent marked ollama_compatible but no env mapping found; falling back to native launch"
+        );
+    }
+}
+
 /// Resolve the agent command spec, optionally routing the agent's model
 /// calls to a local Ollama server when the session configuration requests
 /// it and the agent is compatible.
 ///
-/// The Ollama path keeps the agent's native ACP command (so the stdio
-/// handshake still works) and injects the provider environment variables
-/// that `ollama launch` would inject. Spawning `ollama launch` itself does
-/// not work here: it starts the agent's interactive TUI, which never
-/// answers the ACP initialize request, so the handshake times out.
-///
-/// Falls back to the standard command resolution when:
-/// - `config.use_ollama` is not set
-/// - The agent is not `ollama_compatible`
-/// - No `ollama_model` was supplied
+/// Deprecated: the factory now calls resolve_agent_command_spec +
+/// inject_ollama_env separately so Ollama env is applied after
+/// apply_acp_launch_policy. Kept as a test helper for the unit
+/// tests below.
+#[allow(dead_code)] // used by tests below
 async fn resolve_agent_command_spec_with_ollama(
     meta: &aionui_api_types::AgentMetadata,
     config: &aionui_api_types::AcpBuildExtra,
@@ -247,44 +290,7 @@ async fn resolve_agent_command_spec_with_ollama(
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
 ) -> Result<CommandSpec, AgentError> {
     let mut spec = resolve_agent_command_spec(meta, workspace, conversation_id, broadcaster).await?;
-
-    if config.use_ollama && meta.ollama_compatible {
-        // Routing to Ollama requires an explicit model: the injected
-        // provider variables map the agent's default model aliases onto
-        // it. If the caller didn't supply one, keep the native launch so
-        // the agent can still start.
-        let Some(ref model) = config.ollama_model else {
-            warn!(
-                agent = %meta.name,
-                backend = ?meta.backend,
-                "use_ollama=true but ollama_model is missing; falling back to native launch"
-            );
-            return Ok(spec);
-        };
-
-        let backend = meta.backend.as_deref().unwrap_or("");
-        if let Some(ollama_env) = build_ollama_env(backend, model) {
-            info!(
-                agent = %meta.name,
-                backend = ?meta.backend,
-                model = %model,
-                "Routing agent model calls to local Ollama via env injection"
-            );
-            // Appended last so the Ollama route overrides any same-name
-            // variables from the catalog or user overrides.
-            spec.env.extend(ollama_env);
-        } else {
-            // Shouldn't happen in practice because ollama_compatible is
-            // computed from the same backend list that build_ollama_env
-            // covers (enforced by a unit test in crate::ollama).
-            warn!(
-                agent = %meta.name,
-                backend = ?meta.backend,
-                "Agent marked ollama_compatible but no env mapping found; falling back to native launch"
-            );
-        }
-    }
-
+    inject_ollama_env(&mut spec, meta, config);
     Ok(spec)
 }
 
@@ -1246,5 +1252,51 @@ mod tests {
         // Supplying a model alone must never toggle the Ollama route.
         assert_eq!(anthropic_base_urls(&spec), vec!["https://api.anthropic.com"]);
         assert!(spec.env.iter().all(|var| var.name != "ANTHROPIC_AUTH_TOKEN"));
+    }
+
+    /// Simulate the full factory ordering: resolve → apply_acp_launch_policy
+    /// (with a host OPENAI_API_KEY in runtime_env) → inject_ollama_env.
+    /// The Ollama vars must be last and override the host's key.
+    #[tokio::test]
+    async fn ollama_env_overrides_runtime_env() {
+        let meta = ollama_test_meta("qwen", true);
+        let mut spec = resolve_agent_command_spec(
+            &meta,
+            "/tmp/workspace",
+            "conv-ollama",
+            Arc::new(BroadcastEventBus::new(16)),
+        )
+        .await
+        .expect("resolved command spec");
+
+        // Simulate a host that has a real OPENAI_API_KEY set.
+        apply_acp_launch_policy(
+            &mut spec,
+            AcpLaunchPolicyInput {
+                metadata: &meta,
+                config: &ollama_config(true, Some("qwen3:14b")),
+                session_snapshot: None,
+                runtime_env: &[("OPENAI_API_KEY".into(), "sk-real-host-key".into())],
+            },
+        );
+
+        // inject_ollama_env runs AFTER apply_acp_launch_policy in the
+        // real factory — verify it overrides the host key.
+        inject_ollama_env(&mut spec, &meta, &ollama_config(true, Some("qwen3:14b")));
+
+        let last = |name: &str| {
+            spec.env
+                .iter()
+                .rev()
+                .find(|var| var.name == name)
+                .map(|var| var.value.as_str())
+        };
+        // The Ollama-injected value must win over the host's real key.
+        assert_eq!(last("OPENAI_API_KEY"), Some("ollama"));
+        assert_eq!(last("OPENAI_MODEL"), Some("qwen3:14b"));
+        assert_eq!(
+            last("OPENAI_BASE_URL"),
+            Some(aionui_common::constants::OLLAMA_OPENAI_BASE_URL)
+        );
     }
 }
