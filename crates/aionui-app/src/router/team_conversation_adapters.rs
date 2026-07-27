@@ -6,20 +6,25 @@ use aionui_conversation::{
     ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
     ConversationService,
 };
-use aionui_db::IConversationRepository;
-use aionui_db::models::MessageRow;
+use aionui_db::models::{AgentMetadataRow, MessageRow};
+use aionui_db::{IAgentMetadataRepository, IConversationRepository};
 use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-    AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationCreateRequest,
-    TeamConversationCreateResult, TeamConversationLookupPort, TeamConversationProvisioningPort, TeamError,
-    TeamProjectionMessageStore,
+    AgentTurnStarted, AgentTurnStatus, NativeSlashCommandPort, SlashCatalogSource, SlashCommandRecognition,
+    TeamConversationBindingLookup, TeamConversationCreateRequest, TeamConversationCreateResult,
+    TeamConversationLookupPort, TeamConversationProvisioningPort, TeamError, TeamProjectionMessageStore,
 };
 use async_trait::async_trait;
 use tracing::info;
 
+/// Vendor label of the codex builtin backend (its `agent_metadata.backend`), used
+/// to decide when the static codex command catalog is the right fallback source.
+const CODEX_BACKEND: &str = "codex";
+
 pub struct TeamConversationAdapters {
     conversation_service: ConversationService,
     conversation_repo: Arc<dyn IConversationRepository>,
+    agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     task_manager: Arc<dyn IWorkerTaskManager>,
 }
 
@@ -27,11 +32,13 @@ impl TeamConversationAdapters {
     pub fn new(
         conversation_service: ConversationService,
         conversation_repo: Arc<dyn IConversationRepository>,
+        agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
         task_manager: Arc<dyn IWorkerTaskManager>,
     ) -> Self {
         Self {
             conversation_service,
             conversation_repo,
+            agent_metadata_repo,
             task_manager,
         }
     }
@@ -136,6 +143,134 @@ impl AgentTurnCancellationPort for TeamConversationAdapters {
             .map(|_| ())
             .map_err(map_conversation_turn_error)
     }
+}
+
+#[async_trait]
+impl NativeSlashCommandPort for TeamConversationAdapters {
+    /// ELECTRON-3RN recognition predicate. Splits the leading command name with
+    /// the SHARED grammar owner (`aionui_session::slash_command_name`, same
+    /// function codex's `route_slash_command` uses) then tests membership against
+    /// the backend's self-advertised catalog via a live→cached→static degradation
+    /// chain. Never asserts anything about an external CLI's behaviour; a name the
+    /// backend does not advertise (or an unresolvable catalog) falls back to the
+    /// ordinary wrapped wake (zero regression).
+    async fn recognize(&self, conversation_id: &str, content: &str) -> SlashCommandRecognition {
+        let Some(name) = aionui_session::slash_command_name(content) else {
+            return SlashCommandRecognition::NotCommand;
+        };
+        let name = name.to_owned();
+        match self.resolve_slash_catalog(conversation_id).await {
+            Some((catalog, source)) => {
+                if catalog.iter().any(|command| command == &name) {
+                    SlashCommandRecognition::Recognized { command: name, source }
+                } else {
+                    SlashCommandRecognition::NotInCatalog { name }
+                }
+            }
+            None => SlashCommandRecognition::CatalogUnavailable { name },
+        }
+    }
+}
+
+impl TeamConversationAdapters {
+    /// Resolve the native slash-command NAME catalog for a conversation via the
+    /// degradation chain (spec §8-1): (a) live backend session capabilities,
+    /// (b) the persisted `agent_metadata.available_commands` snapshot, (c) the
+    /// static codex builtin catalog. Returns `None` when none resolve (chain (d)).
+    async fn resolve_slash_catalog(&self, conversation_id: &str) -> Option<(Vec<String>, SlashCatalogSource)> {
+        // (a) live: a running backend session's current capabilities are the
+        // freshest, authoritative source (even if the list happens to be empty).
+        if let Some(task) = self.task_manager.get_task(conversation_id)
+            && let Ok(items) = task.get_slash_commands().await
+        {
+            let names = items.into_iter().map(|item| item.command).collect();
+            return Some((names, SlashCatalogSource::Live));
+        }
+
+        // (b)/(c) require the conversation's agent_metadata row.
+        let row = self.resolve_agent_metadata(conversation_id).await;
+
+        // (b) cached: a non-empty persisted discovery snapshot.
+        if let Some(row) = &row
+            && let Some(raw) = row.available_commands.as_deref()
+        {
+            let names = parse_available_command_names(raw);
+            if !names.is_empty() {
+                return Some((names, SlashCatalogSource::Cached));
+            }
+        }
+
+        // (c) static: codex has a builtin catalog even before any discovery.
+        if let Some(row) = &row
+            && row.backend.as_deref() == Some(CODEX_BACKEND)
+        {
+            let names = aionui_session::codex_capabilities()
+                .slash_commands
+                .into_iter()
+                .map(|command| command.name)
+                .collect();
+            return Some((names, SlashCatalogSource::Static));
+        }
+
+        // (d) nothing resolvable → caller falls back to the wrapped wake.
+        None
+    }
+
+    /// Best-effort resolution of a conversation's `agent_metadata` row, reusing
+    /// the same identity sources the conversation layer uses: the persisted
+    /// assistant snapshot's `agent_id`, then `extra.agent_id`, then the builtin
+    /// row for `extra.backend`. Any failure yields `None` (→ catalog unavailable).
+    async fn resolve_agent_metadata(&self, conversation_id: &str) -> Option<AgentMetadataRow> {
+        if let Ok(Some(snapshot)) = self.conversation_repo.get_assistant_snapshot(conversation_id).await {
+            let agent_id = snapshot.agent_id.trim();
+            if !agent_id.is_empty()
+                && let Ok(Some(row)) = self.agent_metadata_repo.get(agent_id).await
+            {
+                return Some(row);
+            }
+        }
+
+        let row = self.conversation_repo.get(conversation_id).await.ok().flatten()?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+
+        if let Some(agent_id) = extra
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            && let Ok(Some(row)) = self.agent_metadata_repo.get(agent_id).await
+        {
+            return Some(row);
+        }
+
+        if let Some(backend) = extra
+            .get("backend")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            && let Ok(Some(row)) = self.agent_metadata_repo.find_builtin_by_backend(backend).await
+        {
+            return Some(row);
+        }
+
+        None
+    }
+}
+
+/// Extract the command NAMEs from a persisted `available_commands` snapshot
+/// (a JSON array of `{ "name", "description" }` objects). Malformed JSON yields
+/// an empty list so the caller falls through to the next catalog source.
+fn parse_available_command_names(raw: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("name").and_then(serde_json::Value::as_str).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[async_trait]
@@ -360,6 +495,19 @@ fn map_conversation_turn_error(error: ConversationError) -> AgentTurnExecutionEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_available_command_names_extracts_names() {
+        // The persisted snapshot shape written by the registry:
+        // a JSON array of `{ "name", "description" }` objects.
+        let raw = r#"[{"name":"compact","description":"summarize"},{"name":"init","description":"agents.md"}]"#;
+        assert_eq!(parse_available_command_names(raw), vec!["compact", "init"]);
+        // Empty array → no names.
+        assert!(parse_available_command_names("[]").is_empty());
+        // Malformed JSON → empty (caller falls through to the next catalog source).
+        assert!(parse_available_command_names("not json").is_empty());
+        assert!(parse_available_command_names("{}").is_empty());
+    }
 
     #[test]
     fn active_agent_missing_maps_to_team_runtime_not_ready() {

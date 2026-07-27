@@ -58,7 +58,7 @@ pub use backend::{
     ConversationSession, McpServerSpec, McpTransport, MsgStatus, Orchestrator, PendingMessage, PendingPermissionView,
     PermissionDecision, QuestionAnswer, SessionBackend, SessionConfig, SessionEnvelope, SessionInfoKind, SessionInit,
     SessionSpec, StateSnapshot, Tier2Checkpoint, TransitionReason, acp_capabilities, codex_capabilities, command_name,
-    rehydrate,
+    rehydrate, slash_command_name,
 };
 pub use capability::{
     BlockSet, Capabilities, CapabilityTier, CommandSet, ModeInfo, ModelInfo, PromptAcceptedSource, SignalSet,

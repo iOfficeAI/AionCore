@@ -38,7 +38,8 @@ use aionui_team::event_loop::AgentLoopContext;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
 use aionui_team::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-    AgentTurnSource, AgentTurnStarted, AgentTurnStatus,
+    AgentTurnSource, AgentTurnStarted, AgentTurnStatus, NativeSlashCommandPort, NoopNativeSlashCommandPort,
+    SlashCatalogSource, SlashCommandRecognition,
 };
 use aionui_team::service::TeamSessionService;
 use aionui_team::{TeamAgent, TeamProjectionMessageStore, TeamSession, TeammateRole};
@@ -639,7 +640,7 @@ async fn setup_session_with_turn_recorder() -> (
     Arc<Mutex<Vec<SendMessageData>>>,
     Arc<Mutex<Vec<AgentTurnRequest>>>,
 ) {
-    setup_session_with_turn_recorder_inner(true).await
+    setup_session_with_turn_recorder_inner(true, Arc::new(NoopNativeSlashCommandPort)).await
 }
 
 async fn setup_session_with_turn_recorder_without_loops() -> (
@@ -649,11 +650,26 @@ async fn setup_session_with_turn_recorder_without_loops() -> (
     Arc<Mutex<Vec<SendMessageData>>>,
     Arc<Mutex<Vec<AgentTurnRequest>>>,
 ) {
-    setup_session_with_turn_recorder_inner(false).await
+    setup_session_with_turn_recorder_inner(false, Arc::new(NoopNativeSlashCommandPort)).await
+}
+
+/// Variant with a custom slash-command recognizer injected — for the
+/// ELECTRON-3RN command-path tests.
+async fn setup_session_with_slash_recognizer(
+    slash_port: Arc<dyn NativeSlashCommandPort>,
+) -> (
+    Arc<TeamSession>,
+    Arc<StubTaskManager>,
+    Arc<MockTeamRepo>,
+    Arc<Mutex<Vec<SendMessageData>>>,
+    Arc<Mutex<Vec<AgentTurnRequest>>>,
+) {
+    setup_session_with_turn_recorder_inner(true, slash_port).await
 }
 
 async fn setup_session_with_turn_recorder_inner(
     register_loops: bool,
+    slash_port: Arc<dyn NativeSlashCommandPort>,
 ) -> (
     Arc<TeamSession>,
     Arc<StubTaskManager>,
@@ -704,7 +720,7 @@ async fn setup_session_with_turn_recorder_inner(
     .await
     .expect("TeamSession::start failed");
 
-    let session = Arc::new(session);
+    let session = Arc::new(session.with_slash_command_port(slash_port));
     if register_loops {
         register_test_event_loops(&session);
     }
@@ -1878,6 +1894,161 @@ async fn s11_shutdown_approved_interception() {
     assert!(
         raw_sentinel.is_empty(),
         "raw shutdown_approved sentinel must not land in lead mailbox; got {raw_sentinel:?}"
+    );
+
+    session.stop();
+}
+
+// ===========================================================================
+// ELECTRON-3RN: native slash command path (bare command turn, no wrapping)
+// ===========================================================================
+
+/// Configurable recognizer stub. Parses the leading command name with the same
+/// grammar as the shared parser (start with `/`, name to first whitespace,
+/// non-empty), then answers per its configured catalog. `available=false`
+/// simulates the degradation-chain-exhausted case (catalog unavailable).
+struct FakeSlashPort {
+    recognized: Vec<String>,
+    available: bool,
+    source: SlashCatalogSource,
+}
+
+impl FakeSlashPort {
+    fn recognizing(names: &[&str]) -> Self {
+        Self {
+            recognized: names.iter().map(|s| s.to_string()).collect(),
+            available: true,
+            source: SlashCatalogSource::Live,
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            recognized: Vec::new(),
+            available: false,
+            source: SlashCatalogSource::Live,
+        }
+    }
+
+    fn parse_name(content: &str) -> Option<String> {
+        let stripped = content.strip_prefix('/')?;
+        let name: String = stripped.chars().take_while(|c| !c.is_whitespace()).collect();
+        if name.is_empty() { None } else { Some(name) }
+    }
+}
+
+#[async_trait]
+impl NativeSlashCommandPort for FakeSlashPort {
+    async fn recognize(&self, _conversation_id: &str, content: &str) -> SlashCommandRecognition {
+        let Some(name) = Self::parse_name(content) else {
+            return SlashCommandRecognition::NotCommand;
+        };
+        if !self.available {
+            return SlashCommandRecognition::CatalogUnavailable { name };
+        }
+        if self.recognized.contains(&name) {
+            SlashCommandRecognition::Recognized {
+                command: name,
+                source: self.source,
+            }
+        } else {
+            SlashCommandRecognition::NotInCatalog { name }
+        }
+    }
+}
+
+fn last_turn_content(requests: &Arc<Mutex<Vec<AgentTurnRequest>>>, slot_id: &str) -> String {
+    let log = requests.lock().unwrap();
+    log.iter()
+        .rev()
+        .find(|r| r.slot_id == slot_id)
+        .unwrap_or_else(|| panic!("no turn request for slot {slot_id}; requests: {log:?}"))
+        .content
+        .clone()
+}
+
+/// AC1/AC2/AC9 + AC6 (member entry): a recognized `/compact` sent to a member
+/// produces a turn whose first content block is the BARE command — no
+/// `## New Messages` wrapping, byte-identical to a direct send.
+#[tokio::test]
+async fn recognized_command_is_sent_bare_to_member() {
+    let (session, _tm, _repo, _sent, turn_requests) =
+        setup_session_with_slash_recognizer(Arc::new(FakeSlashPort::recognizing(&["compact"]))).await;
+
+    session
+        .send_message_to_agent("worker-1", "/compact", None)
+        .await
+        .expect("send_message_to_agent must succeed");
+
+    wait_until_turn_count(&turn_requests, 1).await;
+    let content = last_turn_content(&turn_requests, "worker-1");
+    assert_eq!(
+        content, "/compact",
+        "command turn must send the bare command verbatim (AC2/AC9)"
+    );
+    assert!(!content.contains("## New Messages"), "command turn must NOT be wrapped");
+
+    session.stop();
+}
+
+/// AC6 (Lead entry): the Lead entry point (`send_message`) recognizes commands too.
+#[tokio::test]
+async fn recognized_command_is_sent_bare_to_lead() {
+    let (session, _tm, _repo, _sent, turn_requests) =
+        setup_session_with_slash_recognizer(Arc::new(FakeSlashPort::recognizing(&["compact"]))).await;
+
+    session
+        .send_message("/compact", None)
+        .await
+        .expect("send_message must succeed");
+
+    wait_until_turn_count(&turn_requests, 1).await;
+    let content = last_turn_content(&turn_requests, "lead-1");
+    assert_eq!(content, "/compact");
+    assert!(!content.contains("## New Messages"));
+
+    session.stop();
+}
+
+/// AC4 (negative): a `/`-prefixed message whose name is not in the catalog, and a
+/// plain message, both fall back to the ordinary WRAPPED wake turn.
+#[tokio::test]
+async fn unrecognized_slash_and_plain_text_fall_back_to_wrapped_wake() {
+    let (session, _tm, _repo, _sent, turn_requests) =
+        setup_session_with_slash_recognizer(Arc::new(FakeSlashPort::recognizing(&["compact"]))).await;
+
+    // `/etc/hosts ...` — name "etc" is not an advertised command → NotInCatalog.
+    session
+        .send_message_to_agent("worker-1", "/etc/hosts is broken", None)
+        .await
+        .expect("send must succeed");
+    wait_until_turn_count(&turn_requests, 1).await;
+    let content = last_turn_content(&turn_requests, "worker-1");
+    assert!(
+        content.contains("## New Messages"),
+        "unrecognized slash must use the wrapped wake"
+    );
+    assert_ne!(content, "/etc/hosts is broken");
+
+    session.stop();
+}
+
+/// AC7: when the command catalog is unavailable (degradation chain exhausted), a
+/// `/`-prefixed message falls back to the wrapped wake with zero regression.
+#[tokio::test]
+async fn catalog_unavailable_falls_back_to_wrapped_wake() {
+    let (session, _tm, _repo, _sent, turn_requests) =
+        setup_session_with_slash_recognizer(Arc::new(FakeSlashPort::unavailable())).await;
+
+    session
+        .send_message_to_agent("worker-1", "/compact", None)
+        .await
+        .expect("send must succeed");
+    wait_until_turn_count(&turn_requests, 1).await;
+    let content = last_turn_content(&turn_requests, "worker-1");
+    assert!(
+        content.contains("## New Messages"),
+        "catalog-unavailable must fall back to the wrapped wake (AC7)"
     );
 
     session.stop();

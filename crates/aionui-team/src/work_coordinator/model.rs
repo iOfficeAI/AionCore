@@ -129,6 +129,12 @@ pub(crate) struct WorkBatch {
     pub(crate) highest_priority: WorkPriority,
     pub(crate) team_run_ids: Vec<String>,
     pub(crate) operation_id: u64,
+    /// True when this batch is a single recognized user slash command
+    /// (`WorkSource::UserCommand`). The wake path sends the bare command as the
+    /// turn's first content block instead of wrapping it in a wake payload
+    /// (ELECTRON-3RN). A command is always batched alone (never merged with
+    /// other unread messages).
+    pub(crate) is_command: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

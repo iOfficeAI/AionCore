@@ -33,7 +33,10 @@ use crate::member_runtime::{
     AttachLease, AttachOutcome, AttachWaiter, BeginRemove, MemberRuntimeFailure, MemberRuntimeSnapshot, ReserveAttach,
 };
 use crate::message_projection::TeamProjectionMessageStore;
-use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogPort};
+use crate::ports::{
+    AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, NoopNativeSlashCommandPort,
+    TeamAssistantCatalogPort,
+};
 use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
 use crate::runtime_tools::{
@@ -99,6 +102,9 @@ pub struct TeamSessionService {
     task_manager: Arc<dyn IWorkerTaskManager>,
     turn_port: Arc<dyn AgentTurnExecutionPort>,
     cancellation_port: Arc<dyn AgentTurnCancellationPort>,
+    /// Native slash-command recognizer injected into each `TeamSession`
+    /// (ELECTRON-3RN). No-op by default (see `NoopNativeSlashCommandPort`).
+    slash_command_port: Arc<dyn NativeSlashCommandPort>,
     backend_binary_path: Arc<PathBuf>,
     prompt_dump: TeamPromptDumpConfig,
     sessions: Arc<DashMap<String, SessionEntry>>,
@@ -150,6 +156,7 @@ impl TeamSessionService {
             task_manager,
             turn_port,
             cancellation_port,
+            Arc::new(NoopNativeSlashCommandPort),
             backend_binary_path,
             TeamPromptDumpConfig::disabled(),
         )
@@ -169,6 +176,7 @@ impl TeamSessionService {
         task_manager: Arc<dyn IWorkerTaskManager>,
         turn_port: Arc<dyn AgentTurnExecutionPort>,
         cancellation_port: Arc<dyn AgentTurnCancellationPort>,
+        slash_command_port: Arc<dyn NativeSlashCommandPort>,
         backend_binary_path: Arc<PathBuf>,
         prompt_dump: TeamPromptDumpConfig,
     ) -> Arc<Self> {
@@ -185,6 +193,7 @@ impl TeamSessionService {
             task_manager,
             turn_port,
             cancellation_port,
+            slash_command_port,
             backend_binary_path,
             prompt_dump,
             sessions: Arc::new(DashMap::new()),
@@ -906,7 +915,7 @@ impl TeamSessionService {
         )
         .await
         {
-            Ok(session) => Arc::new(session),
+            Ok(session) => Arc::new(session.with_slash_command_port(self.slash_command_port.clone())),
             Err(e) => {
                 self.broadcast_session_status(
                     team_id,

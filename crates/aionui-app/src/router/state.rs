@@ -44,8 +44,9 @@ use aionui_system::{
     VersionCheckService,
 };
 use aionui_team::{
-    AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogEntry, TeamAssistantCatalogPort,
-    TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState, TeamSessionService,
+    AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, TeamAssistantCatalogEntry,
+    TeamAssistantCatalogPort, TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState,
+    TeamSessionService,
 };
 
 use crate::config::derive_encryption_key;
@@ -650,11 +651,13 @@ pub fn build_team_state(
     let adapters = Arc::new(TeamConversationAdapters::new(
         conv_service,
         conv_repo,
+        Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
         services.worker_task_manager.clone(),
     ));
     let conversation_port: Arc<dyn TeamConversationProvisioningPort> = adapters.clone();
     let projection_store: Arc<dyn TeamProjectionMessageStore> = adapters.clone();
     let turn_port: Arc<dyn AgentTurnExecutionPort> = adapters.clone();
+    let slash_command_port: Arc<dyn NativeSlashCommandPort> = adapters.clone();
     let cancellation_port: Arc<dyn AgentTurnCancellationPort> = adapters;
     let service = TeamSessionService::new_with_prompt_dump(
         team_repo,
@@ -671,6 +674,7 @@ pub fn build_team_state(
         services.worker_task_manager.clone(),
         turn_port,
         cancellation_port,
+        slash_command_port,
         backend_binary_path,
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
