@@ -2053,3 +2053,95 @@ async fn catalog_unavailable_falls_back_to_wrapped_wake() {
 
     session.stop();
 }
+
+// AC11 log capture. A thread-local subscriber cannot reliably capture a callsite
+// that other tests in the same binary also hit (tracing caches per-callsite
+// interest globally). So we install ONE process-global capturing subscriber
+// (which rebuilds the interest cache) that routes every event into a THREAD-LOCAL
+// buffer. Each `#[tokio::test]` runs its whole flow — including spawned tasks —
+// on its own current-thread runtime thread, so a test only ever sees its own
+// events; we clear the buffer at the start and read it at the end.
+thread_local! {
+    static AC11_LOG_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct Ac11ThreadLocalWriter;
+impl std::io::Write for Ac11ThreadLocalWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        AC11_LOG_BUF.with(|cell| cell.borrow_mut().extend_from_slice(buf));
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Ac11ThreadLocalWriter {
+    type Writer = Ac11ThreadLocalWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        Ac11ThreadLocalWriter
+    }
+}
+
+fn install_ac11_capturing_subscriber() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Ac11ThreadLocalWriter)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        // Setting a global default rebuilds tracing's interest cache, so the
+        // recognition callsite is re-evaluated against this subscriber even if a
+        // prior test already hit it under the no-op default. Ignore the error if
+        // some other harness already installed a global default.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+}
+
+/// AC11 (§14): the recognition-hit `info` log must carry the command NAME +
+/// source correlation fields (`command`, `source`, `team_id`, `slot_id`,
+/// `conversation_id`) but NEVER the raw `content`/args (no sensitive payload).
+#[tokio::test]
+async fn recognized_command_log_carries_name_and_source_not_content() {
+    install_ac11_capturing_subscriber();
+    AC11_LOG_BUF.with(|cell| cell.borrow_mut().clear());
+
+    let (session, _tm, _repo, _sent, turn_requests) =
+        setup_session_with_slash_recognizer(Arc::new(FakeSlashPort::recognizing(&["compact"]))).await;
+
+    // The arg after the command name is a distinctive marker: it MUST NOT appear
+    // in any production-visible log (it is a stand-in for sensitive payload).
+    const SENSITIVE_ARG: &str = "sensitive-payload-should-not-log";
+    session
+        .send_message_to_agent("worker-1", &format!("/compact {SENSITIVE_ARG}"), None)
+        .await
+        .expect("send_message_to_agent must succeed");
+
+    wait_until_turn_count(&turn_requests, 1).await;
+
+    let logs = AC11_LOG_BUF.with(|cell| String::from_utf8(cell.borrow().clone()).expect("utf8 logs"));
+    assert!(
+        logs.contains("team user slash command recognized"),
+        "the recognition info log must be emitted: {logs}"
+    );
+    // Correlation fields present (AC11).
+    assert!(
+        logs.contains("command=compact"),
+        "log must carry the command NAME: {logs}"
+    );
+    assert!(logs.contains("source="), "log must carry the catalog source: {logs}");
+    assert!(logs.contains("team_id="), "log must carry team_id: {logs}");
+    assert!(logs.contains("slot_id="), "log must carry slot_id: {logs}");
+    assert!(
+        logs.contains("conversation_id="),
+        "log must carry conversation_id: {logs}"
+    );
+    // Sensitive payload absent (AC11 / §14): the command args / full content are
+    // never logged at a production-visible level.
+    assert!(
+        !logs.contains(SENSITIVE_ARG),
+        "production log must NOT contain command args/content: {logs}"
+    );
+
+    session.stop();
+}
