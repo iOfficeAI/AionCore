@@ -330,7 +330,7 @@ pub struct AgentManagementRow {
     #[serde(default)]
     pub env_override_key_count: usize,
 
-    /// Whether this agent can be launched via Ollama Launch.
+    /// Whether this agent supports Ollama model routing via provider env injection.
     #[serde(default)]
     pub ollama_compatible: bool,
 }

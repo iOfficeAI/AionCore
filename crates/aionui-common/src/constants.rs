@@ -103,6 +103,11 @@ fn bool_field(value: &serde_json::Value, key: &str) -> bool {
 /// Default local Ollama server address used for environment injection.
 pub const OLLAMA_DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
 
+/// OpenAI-compatible endpoint of the local Ollama server, used by backends
+/// that speak the OpenAI wire protocol (e.g. qwen-code).
+/// Always `{OLLAMA_DEFAULT_BASE_URL}/v1`.
+pub const OLLAMA_OPENAI_BASE_URL: &str = "http://127.0.0.1:11434/v1";
+
 /// Backends that can run against a local Ollama server.
 ///
 /// AionCore enables this by injecting the same provider environment

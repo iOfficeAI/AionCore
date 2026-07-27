@@ -5,7 +5,9 @@
 
 use aionui_ai_agent::ollama::build_ollama_env;
 use aionui_api_types::AcpBuildExtra;
-use aionui_common::constants::{OLLAMA_COMPATIBLE_BACKENDS, OLLAMA_DEFAULT_BASE_URL, is_ollama_supported_agent};
+use aionui_common::constants::{
+    OLLAMA_COMPATIBLE_BACKENDS, OLLAMA_DEFAULT_BASE_URL, OLLAMA_OPENAI_BASE_URL, is_ollama_supported_agent,
+};
 
 #[test]
 fn compatible_backends_have_env_mappings() {
@@ -49,7 +51,7 @@ fn qwen_env_routes_to_local_ollama() {
     // Mirrors what `ollama launch qwen` injects (captured on 0.32.1);
     // qwen-code speaks the OpenAI wire protocol, hence the /v1 endpoint.
     assert_eq!(get("OPENAI_API_KEY"), Some("ollama"));
-    assert_eq!(get("OPENAI_BASE_URL"), Some("http://127.0.0.1:11434/v1"));
+    assert_eq!(get("OPENAI_BASE_URL"), Some(OLLAMA_OPENAI_BASE_URL));
     assert_eq!(get("OPENAI_MODEL"), Some("llama3.2"));
 }
 
