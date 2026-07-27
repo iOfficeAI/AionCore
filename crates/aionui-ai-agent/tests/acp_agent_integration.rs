@@ -195,6 +195,7 @@ fn event_type_name(event: &AgentStreamEvent) -> &'static str {
         AgentStreamEvent::SlashCommandsUpdated(_) => "SlashCommandsUpdated",
         AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
         AgentStreamEvent::SegmentBreak => "SegmentBreak",
+        AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
     }
 }
 

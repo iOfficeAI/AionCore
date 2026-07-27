@@ -33,14 +33,16 @@ use agent_client_protocol::schema::{
     SetSessionModelResponse,
 };
 use agent_client_protocol::{
-    Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification, on_receive_request,
+    Agent, Client, ConnectionTo, Lines, Responder, on_receive_notification, on_receive_request,
 };
 use aionui_common::ErrorChain;
+use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 use tracing::{debug, info, warn};
 
+use crate::protocol::acp_dialect;
 use crate::protocol::error::AcpError;
 use crate::protocol::events::{self as stream_event, AgentStreamEvent};
 
@@ -514,7 +516,44 @@ async fn run_sdk_background(
     alive: Arc<AtomicBool>,
     replay_suppression: Arc<AtomicBool>,
 ) {
-    let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
+    // Tolerant transport: intercept incoming lines *before* the SDK parses them
+    // so CodeBuddy's non-standard dialect notifications (`session_end` /
+    // `compact-maxtoken`) are absorbed into an internal signal instead of
+    // surfacing a `-32602` deserialization error and being silently dropped.
+    // We use the vendored `Lines` transport — the crate's documented
+    // first-party interception point — whose newline framing is equivalent to
+    // `ByteStreams` (which internally splits stdout on `\n` and appends `\n` on
+    // writes). Only the two recognised shapes are absorbed; every other line,
+    // including genuinely malformed input, is forwarded unchanged.
+    let dialect_event_tx = event_tx.clone();
+    let incoming = FramedRead::new(stdout, LinesCodec::new())
+        .map_err(std::io::Error::other)
+        .filter_map(move |line: std::io::Result<String>| {
+            let dialect_event_tx = dialect_event_tx.clone();
+            async move {
+                match line {
+                    Ok(line) => match acp_dialect::classify_incoming_line(&line) {
+                        acp_dialect::LineDisposition::Forward(line) => Some(Ok(line)),
+                        acp_dialect::LineDisposition::Absorb(kind) => {
+                            log_acp_dialect_absorbed(kind, &line);
+                            // `broadcast::send` is synchronous and non-blocking; a
+                            // send error only means no active subscriber for this
+                            // turn (nothing to correlate against), which is fine.
+                            let _ = dialect_event_tx.send(AgentStreamEvent::AcpDialectSignal(
+                                stream_event::AcpDialectSignalData { kind },
+                            ));
+                            None
+                        }
+                    },
+                    Err(err) => Some(Err(err)),
+                }
+            }
+        });
+    // Pin the sink item type to `String` (LinesCodec encodes any `AsRef<str>`,
+    // so the item type would otherwise be ambiguous) — `Lines` requires a
+    // `Sink<String>`.
+    let outgoing = SinkExt::<String>::sink_map_err(FramedWrite::new(stdin, LinesCodec::new()), std::io::Error::other);
+    let transport = Lines::new(outgoing, incoming);
 
     // `init_tx` / `ready_tx` are consumed inside the main_fn closure; wrap
     // them in Option so we can .take() without moving out of captured state.
@@ -855,6 +894,26 @@ fn log_agent_notify(method: &str, body: &str) {
             "[ACP] <- ${method}"
         );
     }
+}
+
+/// Log that the tolerant transport layer absorbed a CodeBuddy dialect
+/// notification the stock ACP schema would otherwise `-32602`-reject.
+///
+/// Low-volume, production-diagnostic (`info`): once the layer absorbs a line
+/// the SDK never sees it, so the SDK's `-32602 warn` disappears — this restores
+/// that visibility. Records only the signal kind and non-sensitive correlation
+/// context (`session_id`, the sessionUpdate/compactType marker); never the
+/// compaction summary, prompt, tokens, or other payload.
+fn log_acp_dialect_absorbed(kind: stream_event::AcpDialectSignalKind, line: &str) {
+    let (session_id, marker) = acp_dialect::absorbed_log_context(line);
+    info!(
+        direction = "agent_notify",
+        method = "session/update",
+        dialect_signal = ?kind,
+        session_id = session_id.as_deref().unwrap_or("none"),
+        marker = marker.as_deref().unwrap_or("none"),
+        "[ACP] absorbed CodeBuddy dialect notification (tolerant layer); not forwarded to SDK"
+    );
 }
 
 /// Log an inbound request from the agent (e.g. session/request_permission).

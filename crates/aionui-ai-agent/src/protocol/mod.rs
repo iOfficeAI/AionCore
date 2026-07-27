@@ -1,4 +1,5 @@
 pub(crate) mod acp;
+pub(crate) mod acp_dialect;
 
 pub(crate) mod custom_agent_probe;
 pub(crate) mod error;
