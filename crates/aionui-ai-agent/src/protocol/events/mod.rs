@@ -64,6 +64,13 @@ pub enum AgentStreamEvent {
     /// under one turn). The relay consumes it internally and never forwards it
     /// to the WebSocket, so no frontend renderer is required.
     SegmentBreak,
+    /// Internal-only signal: the tolerant transport layer absorbed a CodeBuddy
+    /// dialect notification (`session_end` / `compact-maxtoken`) that the stock
+    /// ACP schema hard-rejects as `-32602`. Consumed by the empty-turn judgment
+    /// within the turn/near-window; never counts as user-visible output and is
+    /// never forwarded to the WebSocket. Mirrors `SegmentBreak`'s "relay consumes
+    /// internally, never forwards" contract.
+    AcpDialectSignal(AcpDialectSignalData),
 }
 
 /// Data for the `Start` event.
@@ -112,6 +119,24 @@ pub enum TipType {
 pub struct FinishEventData {
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+/// Kind of CodeBuddy ACP dialect signal absorbed by the tolerant transport
+/// layer before the stock ACP schema can hard-reject it as `-32602`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpDialectSignalKind {
+    /// Non-standard `session_end` terminal marker (carries `stopReason:"end_turn"`).
+    SessionEnd,
+    /// Emergency auto-compaction / max-token pressure notification
+    /// (`compact-maxtoken` message id or `codebuddy.ai/compactType` meta marker).
+    TokenPressure,
+}
+
+/// Data for the internal-only [`AgentStreamEvent::AcpDialectSignal`] event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpDialectSignalData {
+    pub kind: AcpDialectSignalKind,
 }
 
 #[cfg(test)]

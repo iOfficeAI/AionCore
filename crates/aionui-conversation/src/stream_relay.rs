@@ -304,6 +304,13 @@ impl StreamRelay {
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
                         }
+                        AgentStreamEvent::AcpDialectSignal(_) => {
+                            // Internal-only turn/near-window signal (see
+                            // AgentStreamEvent::AcpDialectSignal): consumed by the ACP
+                            // empty-turn judgment, never rendered. Explicitly dropped here so
+                            // the catch-all below does not forward it to the WebSocket, and
+                            // it is never persisted.
+                        }
                         AgentStreamEvent::Thinking(data) => {
                             if data.status.as_deref() == Some("done") {
                                 self.complete_active_thinking(&mut active_thinking).await;
@@ -613,6 +620,7 @@ impl StreamRelay {
             AgentStreamEvent::RequestTrace(_) => "RequestTrace",
             AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
             AgentStreamEvent::SegmentBreak => "SegmentBreak",
+            AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
         }
     }
 
@@ -1023,6 +1031,100 @@ mod tests {
         assert!(
             !outcome.attempt.needs_auth,
             "a plain empty turn must NOT be treated as needs-auth"
+        );
+    }
+
+    // issue 136586749 (F4): the new ACP_EMPTY_TURN_TOKEN_LIMIT tip is a
+    // token/context-class outcome. It must NOT reflect needs-auth (which would
+    // wrongly mark the agent unavailable), yet must still be forwarded + persisted
+    // like any other Info tip. Guards the relay's needs-auth attribution.
+    #[tokio::test]
+    async fn token_limit_tip_does_not_set_needs_auth_and_is_forwarded() {
+        use aionui_ai_agent::protocol::events::{TipType, TipsEventData};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Tips(TipsEventData {
+            content: String::new(),
+            tip_type: TipType::Info,
+            code: Some("ACP_EMPTY_TURN_TOKEN_LIMIT".into()),
+            params: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+        assert!(
+            !outcome.attempt.needs_auth,
+            "a token-limit tip must NOT be reflected as needs-auth (contrast ACP_EMPTY_TURN_NEEDS_AUTH)"
+        );
+
+        let inserts = repo.take_inserts();
+        assert!(
+            inserts.iter().any(|m| m.r#type == "tips"),
+            "the token-limit Info tip is persisted"
+        );
+
+        let mut saw_tip = false;
+        while let Ok(evt) = ws_rx.try_recv() {
+            if evt.name == "message.stream" && evt.data["type"] == "tips" {
+                saw_tip |= evt.data["data"]["code"] == "ACP_EMPTY_TURN_TOKEN_LIMIT";
+            }
+        }
+        assert!(saw_tip, "the token-limit tip must be forwarded to the WS");
+    }
+
+    // issue 136586749 (B-3): AcpDialectSignal is an internal-only turn/near-window
+    // signal. Like SegmentBreak it must never reach the WS and must not persist.
+    #[tokio::test]
+    async fn acp_dialect_signal_is_not_forwarded_or_persisted() {
+        use aionui_ai_agent::protocol::events::{AcpDialectSignalData, AcpDialectSignalKind};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::AcpDialectSignal(AcpDialectSignalData {
+            kind: AcpDialectSignalKind::TokenPressure,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let mut saw_dialect_frame = false;
+        while let Ok(evt) = ws_rx.try_recv() {
+            if evt.name == "message.stream" && evt.data["type"] == "acp_dialect_signal" {
+                saw_dialect_frame = true;
+            }
+        }
+        assert!(!saw_dialect_frame, "AcpDialectSignal must never be forwarded to the WS");
+        assert!(
+            repo.take_inserts().is_empty(),
+            "AcpDialectSignal must not be persisted as a message"
         );
     }
 
