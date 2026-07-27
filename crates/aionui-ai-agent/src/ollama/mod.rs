@@ -65,16 +65,18 @@ pub fn build_ollama_env(backend: &str, model: &str) -> Option<Vec<EnvVar>> {
         "qwen" => Some(vec![
             // VERSION-SENSITIVE: captured from `ollama launch qwen` (Ollama 0.32.1)
             // and verified end-to-end against qwen-code 0.19.10 with a clean HOME.
-            // If qwen-code changes its auth resolution in a future version (e.g.
-            // requires `--auth-type openai` even when OPENAI_API_KEY is set),
-            // this mapping may need CLI flags added.
+            // If qwen-code changes its auth resolution in a future version,
+            // this mapping may need to be updated.
             //
             // `ollama launch qwen` starts the qwen-code TUI with these variables
-            // plus `--model <m>` and `--auth-type openai` CLI flags. The flags are
-            // redundant for headless ACP: with OPENAI_API_KEY set, `qwen --acp`
-            // resolves the openai auth path and OPENAI_MODEL pins the session model
-            // (the session reports the runtime-derived model id
-            // `$runtime|openai|<model>(openai)`).
+            // plus `--model <m>` and `--auth-type openai` CLI flags. Both flags
+            // are also required for headless ACP: without --auth-type=openai the
+            // ACP bridge starts but the prompt turn fails (the openai auth path
+            // is not resolved from OPENAI_API_KEY alone). The CLI flags are
+            // injected in inject_ollama_env alongside the env vars.
+            //
+            // The session reports the runtime-derived model id
+            // `$runtime|openai|<model>(openai)`.
             env_var("OPENAI_API_KEY", "ollama"),
             env_var("OPENAI_BASE_URL", OLLAMA_OPENAI_BASE_URL),
             env_var("OPENAI_MODEL", model),

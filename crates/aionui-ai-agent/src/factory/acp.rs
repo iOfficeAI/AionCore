@@ -261,6 +261,17 @@ fn inject_ollama_env(
         // variables from the catalog, launch policy (runtime_env,
         // cc-switch), or user overrides.
         spec.env.extend(ollama_env);
+
+        // Some backends also need CLI flags that `ollama launch` passes
+        // alongside the env vars. qwen-code requires `--auth-type=openai`
+        // to resolve the OpenAI auth path even when OPENAI_API_KEY is set
+        // (verified against qwen-code 0.19.10 — without it the ACP bridge
+        // starts but the prompt turn fails).
+        if backend == "qwen" {
+            spec.args.push("--auth-type=openai".into());
+            spec.args.push("--model".into());
+            spec.args.push(model.clone());
+        }
     } else {
         // Shouldn't happen: ollama_compatible is computed from the
         // same backend list that build_ollama_env covers (enforced by
@@ -1298,5 +1309,15 @@ mod tests {
             last("OPENAI_BASE_URL"),
             Some(aionui_common::constants::OLLAMA_OPENAI_BASE_URL)
         );
+
+        // qwen-code requires --auth-type=openai and --model <model>
+        // (the same CLI flags `ollama launch qwen` passes).
+        let has_auth_flag = spec.args.iter().any(|a| a == "--auth-type=openai");
+        assert!(has_auth_flag, "qwen Ollama route must inject --auth-type=openai");
+        let model_pos = spec.args.iter().position(|a| a == "--model");
+        assert!(model_pos.is_some(), "qwen Ollama route must inject --model");
+        if let Some(pos) = model_pos {
+            assert_eq!(spec.args.get(pos + 1).map(|s| s.as_str()), Some("qwen3:14b"));
+        }
     }
 }
