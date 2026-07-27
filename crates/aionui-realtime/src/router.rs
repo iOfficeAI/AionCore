@@ -11,6 +11,16 @@ pub trait MessageRouter: Send + Sync {
     /// Called for any message whose `name` is not handled internally
     /// by the WebSocket layer (i.e. not `pong` or `subscribe-show-open`).
     fn route(&self, conn_id: ConnectionId, name: &str, data: serde_json::Value) -> bool;
+
+    /// Notify the router that a connection has closed.
+    ///
+    /// Called once by the WebSocket layer after the receive loop for `conn_id`
+    /// exits (client disconnect, transport error, or backpressure close), so
+    /// stateful routers can release per-connection state (e.g. drop a session's
+    /// filesystem subscriptions). Default is a no-op for stateless routers.
+    fn on_disconnect(&self, conn_id: ConnectionId) {
+        let _ = conn_id;
+    }
 }
 
 /// A no-op message router that reports every message as unhandled.
@@ -50,5 +60,35 @@ mod tests {
         let handled = router.route(ConnectionId(42), "test", json!(null));
 
         assert!(!handled);
+    }
+
+    #[test]
+    fn on_disconnect_default_is_noop() {
+        // Stateless routers inherit the default no-op; must not panic.
+        let router: Box<dyn MessageRouter> = Box::new(NoopMessageRouter);
+        router.on_disconnect(ConnectionId(7));
+    }
+
+    #[test]
+    fn on_disconnect_override_receives_conn_id() {
+        use std::sync::Mutex;
+
+        struct RecordingRouter {
+            disconnected: Mutex<Vec<ConnectionId>>,
+        }
+        impl MessageRouter for RecordingRouter {
+            fn route(&self, _conn_id: ConnectionId, _name: &str, _data: serde_json::Value) -> bool {
+                false
+            }
+            fn on_disconnect(&self, conn_id: ConnectionId) {
+                self.disconnected.lock().unwrap().push(conn_id);
+            }
+        }
+
+        let router = RecordingRouter {
+            disconnected: Mutex::new(Vec::new()),
+        };
+        router.on_disconnect(ConnectionId(99));
+        assert_eq!(router.disconnected.lock().unwrap().as_slice(), &[ConnectionId(99)]);
     }
 }

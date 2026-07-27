@@ -36,7 +36,7 @@ use aionui_mcp::{
 use aionui_office::{
     ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
 };
-use aionui_realtime::{NoopMessageRouter, WsHandlerState};
+use aionui_realtime::{MessageRouter, WsHandlerState};
 use aionui_shell::ShellRouterState;
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
@@ -848,12 +848,14 @@ pub async fn build_extension_states(
     (ext_state, hub_state, skill_state)
 }
 
-/// Build the default `WsHandlerState` from application services.
-pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
+/// Build the `WsHandlerState` from application services with an explicit inbound
+/// `router`. Callers supply the filesystem-monitor router in production and a
+/// no-op router for router-only/test assembly.
+pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) -> WsHandlerState {
     if services.local {
         return WsHandlerState {
             manager: services.ws_manager.clone(),
-            router: Arc::new(NoopMessageRouter),
+            router,
             token_validator: Arc::new(|_| true),
             token_extractor: Arc::new(|_| Some("local".into())),
         };
@@ -866,7 +868,7 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
 
     WsHandlerState {
         manager: services.ws_manager.clone(),
-        router: Arc::new(NoopMessageRouter),
+        router,
         token_validator,
         token_extractor,
     }
