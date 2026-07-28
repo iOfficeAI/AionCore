@@ -184,12 +184,28 @@ impl TeamConversationAdapters {
     /// static codex builtin catalog. Returns `None` when none resolve (chain (d)).
     async fn resolve_slash_catalog(&self, conversation_id: &str) -> Option<(Vec<String>, SlashCatalogSource)> {
         // (a) live: a running backend session's current capabilities are the
-        // freshest, authoritative source (even if the list happens to be empty).
+        // freshest, authoritative source. A NON-EMPTY list is authoritative and
+        // short-circuits the chain. An EMPTY live list is NOT treated as
+        // authoritative here: a backend's live `slash_commands` can be transiently
+        // empty before its discovery handshake completes (e.g. claude's
+        // `control_request{initialize}` response has not landed yet, so
+        // `discovered_caps.slash_commands` is still `[]`), yet the same commands
+        // are already present in the persisted snapshot (b). Returning the empty
+        // live list would yield `CatalogEmpty`, disable every team slash command
+        // (e.g. `/compact`), and force the wrapped-wake fallback — masking
+        // commands the backend genuinely supports. So an empty live list falls
+        // through to cached/static instead of short-circuiting.
         if let Some(task) = self.task_manager.get_task(conversation_id) {
             match task.get_slash_commands().await {
                 Ok(items) => {
-                    let names = items.into_iter().map(|item| item.command).collect();
-                    return Some((names, SlashCatalogSource::Live));
+                    let names: Vec<String> = items.into_iter().map(|item| item.command).collect();
+                    if let Some(adopted) = live_catalog_or_none(names) {
+                        return Some((adopted, SlashCatalogSource::Live));
+                    }
+                    // Empty live list: fall through to cached/static. A backend
+                    // that genuinely advertises no commands surfaces as an empty
+                    // cached snapshot or a final `None`, both of which correctly
+                    // degrade to the wrapped wake.
                 }
                 // A live fetch fault is caught only here (composition layer); the
                 // raw error exists nowhere else, so log it at `warn` before
@@ -323,6 +339,32 @@ impl TeamConversationAdapters {
         }
 
         None
+    }
+}
+
+/// Decide whether a live-fetched slash-command catalog should be adopted as the
+/// authoritative result, or whether the degradation chain should keep falling
+/// through to cached/static.
+///
+/// Returns:
+/// - `Some(names)` when the live list is non-empty — a populated live catalog is
+///   the freshest, authoritative source and short-circuits the chain.
+/// - `None` when the live list is empty — a backend's live `slash_commands` can
+///   be transiently empty before its discovery handshake completes (e.g. the
+///   claude backend's `control_request{initialize}` response has not landed yet,
+///   so `discovered_caps.slash_commands` is still `[]`), yet the same commands
+///   may already be present in the persisted snapshot. Treating the empty live
+///   list as authoritative would yield `CatalogEmpty`, disable every team slash
+///   command (e.g. `/compact`), and force the wrapped-wake fallback — masking
+///   commands the backend genuinely supports. Returning `None` lets the chain
+///   reach the cached snapshot instead. A backend that genuinely advertises no
+///   commands surfaces as an empty cached snapshot or a final unresolved `None`,
+///   both of which correctly degrade to the wrapped wake.
+fn live_catalog_or_none(names: Vec<String>) -> Option<Vec<String>> {
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
     }
 }
 
@@ -584,6 +626,28 @@ mod tests {
         // (caller logs a `warn` and falls through to the next catalog source).
         assert_eq!(parse_available_command_names("not json"), None);
         assert_eq!(parse_available_command_names("{}"), None);
+    }
+
+    #[test]
+    fn live_catalog_adopted_only_when_non_empty() {
+        // A populated live catalog is adopted as authoritative and short-circuits
+        // the degradation chain.
+        assert_eq!(
+            live_catalog_or_none(vec!["compact".to_owned(), "init".to_owned()]),
+            Some(vec!["compact".to_owned(), "init".to_owned()])
+        );
+        // A single command is still a valid live catalog.
+        assert_eq!(
+            live_catalog_or_none(vec!["compact".to_owned()]),
+            Some(vec!["compact".to_owned()])
+        );
+        // An EMPTY live list is NOT adopted: it must fall through to cached/static
+        // so a backend whose live `slash_commands` is transiently empty (e.g. the
+        // claude backend before its `initialize` discovery response lands) can
+        // still be served from the persisted snapshot. Returning the empty list
+        // here would yield `CatalogEmpty` and mask supported commands (regression
+        // fixed for `/compact` in team mode, issue #3750).
+        assert_eq!(live_catalog_or_none(Vec::<String>::new()), None);
     }
 
     #[test]
