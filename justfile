@@ -82,7 +82,9 @@ push *ARGS: migration-check lint-fix fmt _auto-commit-fixes test
 _auto-commit-fixes:
     @{{auto_commit_script}}
 
-# Update aionrs dependency (e.g. just update-aionrs or just update-aionrs v0.1.19)
+# Update aionrs dependency: bump Cargo.toml tag, then open a PR whose body
+# carries aionrs feat/fix/perf as conventional footer for release-please.
+# e.g. `just update-aionrs` (latest) or `just update-aionrs v0.2.9`
 update-aionrs *TAG:
     @{{update_aionrs_script}} {{TAG}}
 
