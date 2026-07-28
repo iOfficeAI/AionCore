@@ -70,9 +70,9 @@ impl SqliteConversationRepository {
         Ok(())
     }
 
-    async fn upsert_message_once(&self, message: &MessageRow) -> Result<(), sqlx::Error> {
+    async fn upsert_message_once(&self, message: &MessageRow) -> Result<(), DbError> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO messages \
                 (id, conversation_id, msg_id, type, content, position, \
                  status, hidden, created_at) \
@@ -100,7 +100,8 @@ impl SqliteConversationRepository {
                 END, \
                 position = COALESCE(messages.position, excluded.position), \
                 hidden = excluded.hidden, \
-                created_at = MIN(messages.created_at, excluded.created_at)",
+                created_at = MIN(messages.created_at, excluded.created_at) \
+             WHERE messages.conversation_id = excluded.conversation_id",
         )
         .bind(&message.id)
         .bind(&message.conversation_id)
@@ -113,6 +114,14 @@ impl SqliteConversationRepository {
         .bind(message.created_at)
         .execute(&mut *tx)
         .await?;
+
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Err(DbError::Conflict(format!(
+                "message id '{}' belongs to another conversation",
+                message.id
+            )));
+        }
 
         bump_conversation_updated_at(&mut tx, &message.conversation_id, message.created_at).await?;
         tx.commit().await?;
@@ -692,7 +701,7 @@ impl IConversationRepository for SqliteConversationRepository {
     }
 
     async fn upsert_message(&self, message: &MessageRow) -> Result<(), DbError> {
-        self.upsert_message_once(message).await.map_err(DbError::from)
+        self.upsert_message_once(message).await
     }
 
     async fn update_message(&self, id: &str, updates: &MessageRowUpdate) -> Result<(), DbError> {
@@ -1175,6 +1184,45 @@ mod tests {
             repo.get(&conv.id).await.unwrap().unwrap().updated_at,
             9_000,
             "older upsert must not move updated_at backward"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_message_rejects_cross_conversation_id_collision() {
+        let (repo, _db) = setup().await;
+        let first_conversation = sample_conversation(SYSTEM_USER_ID);
+        let mut second_conversation = sample_conversation(SYSTEM_USER_ID);
+        second_conversation.updated_at = 1;
+        repo.create(&first_conversation).await.unwrap();
+        repo.create(&second_conversation).await.unwrap();
+
+        let mut first_message = sample_message(&first_conversation.id);
+        first_message.id = "shared-tool-call-id".to_string();
+        first_message.content = r#"{"name":"Glob","input":{"pattern":"*.rs"}}"#.to_string();
+        repo.upsert_message(&first_message).await.unwrap();
+
+        let mut colliding_message = sample_message(&second_conversation.id);
+        colliding_message.id = first_message.id.clone();
+        colliding_message.content = r#"{"name":"Glob","input":{"pattern":"*.md"}}"#.to_string();
+        let error = repo.upsert_message(&colliding_message).await.unwrap_err();
+
+        assert!(matches!(error, DbError::Conflict(message) if message.contains("shared-tool-call-id")));
+        let persisted = repo
+            .get_message(&first_conversation.id, &first_message.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.content, first_message.content);
+        assert!(
+            repo.get_message(&second_conversation.id, &colliding_message.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repo.get(&second_conversation.id).await.unwrap().unwrap().updated_at,
+            second_conversation.updated_at,
+            "a rejected cross-conversation upsert must not bump conversation recency"
         );
     }
 
