@@ -56,7 +56,9 @@ impl ProjectService {
                     let abs = resolved.absolute_path.ok_or_else(|| ProjectError::ChatFileMissing {
                         path: relative_path.clone(),
                     })?;
-                    if !Path::new(&abs).is_file() {
+                    // A project ref may point at a file or a folder (the tree
+                    // allows attaching a directory); require only that it exists.
+                    if !Path::new(&abs).exists() {
                         return Err(ProjectError::ChatFileMissing { path: abs });
                     }
                     paths.push(abs);

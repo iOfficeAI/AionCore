@@ -49,6 +49,28 @@ async fn resolves_project_file_and_inlines_marker() {
 }
 
 #[tokio::test]
+async fn resolves_project_directory_ref() {
+    let (service, pe_id, dir, upload_root) = setup().await;
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+
+    // A folder attachment (tree right-click on a directory) must resolve, not
+    // be rejected as a missing file.
+    let out = service
+        .resolve_chat_message(
+            "look here",
+            &[ChatFileRef::Project {
+                pe_id,
+                relative_path: "sub".into(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.files.len(), 1);
+    assert!(std::path::Path::new(&out.files[0]).is_dir());
+}
+
+#[tokio::test]
 async fn empty_files_leaves_content_unchanged() {
     let (service, _pe, _dir, upload_root) = setup().await;
     let out = service
