@@ -11,10 +11,12 @@
 pub mod canonical;
 pub mod containment;
 pub mod monitor;
+pub mod routes;
 pub mod runtime;
 mod service;
 pub mod types;
 
+pub use routes::{ProjectRouterState, project_routes};
 pub use service::ProjectService;
 pub use types::{
     AttachInput, FileOp, FolderDto, ProjectDetail, ProjectError, ProjectExplorerEntry, ProjectExplorerView,

@@ -450,16 +450,20 @@ impl ConversationService {
     /// Best-effort by contract: a missing service, a bad URI, a resolve
     /// failure, or an update failure are all logged at `warn` and swallowed.
     /// This must NEVER affect conversation creation or reads.
-    async fn bind_project_best_effort(&self, conversation_id: &str, workspace_path: &str) {
+    /// Returns `true` iff a project binding was actually applied (project_id
+    /// backfilled + the row update succeeded), so a lazy-read caller can emit a
+    /// `conversation.listChanged` and let the client refetch the now-bound id.
+    /// All failure modes return `false` and are swallowed (best-effort contract).
+    async fn bind_project_best_effort(&self, conversation_id: &str, workspace_path: &str) -> bool {
         let project_service = self.project_service.read().ok().and_then(|guard| guard.clone());
         let Some(project_service) = project_service else {
-            return;
+            return false;
         };
         let uri = match canonical::to_file_uri(Path::new(workspace_path)) {
             Ok(uri) => uri,
             Err(err) => {
                 warn!(conversation_id = %conversation_id, error = err.code(), "project bind skipped: bad workspace uri");
-                return;
+                return false;
             }
         };
         match project_service.resolve_existing(uri).await {
@@ -470,12 +474,17 @@ impl ConversationService {
                     updated_at: Some(now_ms()),
                     ..Default::default()
                 };
-                if let Err(err) = self.conversation_repo.update(conversation_id, &update).await {
-                    warn!(conversation_id = %conversation_id, error = %ErrorChain(&err), "project bind: backfill update failed");
+                match self.conversation_repo.update(conversation_id, &update).await {
+                    Ok(_) => true,
+                    Err(err) => {
+                        warn!(conversation_id = %conversation_id, error = %ErrorChain(&err), "project bind: backfill update failed");
+                        false
+                    }
                 }
             }
             Err(err) => {
                 warn!(conversation_id = %conversation_id, error = err.code(), "project bind skipped");
+                false
             }
         }
     }
@@ -1806,18 +1815,27 @@ impl ConversationService {
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra)
             .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
         self.backfill_extra_inplace(&row.id, &mut extra).await;
-        // Project-bind side branch: lazily backfill owner binding on read.
-        if row.project_id.is_none()
+        // Project-bind side branch: lazily backfill owner binding on read. The
+        // `row` snapshot predates the backfill, so this response still carries
+        // the old (null) project_id; on a real None→Some backfill we broadcast
+        // `conversation.listChanged(updated)` so the client refetches and picks
+        // up the now-bound project_id (parity with create-time delivery).
+        let project_backfilled = if row.project_id.is_none()
             && let Some(workspace) = extra
                 .get("workspace")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
         {
-            self.bind_project_best_effort(&row.id, workspace).await;
-        }
+            self.bind_project_best_effort(&row.id, workspace).await
+        } else {
+            false
+        };
         let mut response = row_to_response_with_extra(row, extra, &self.workspace_root)?;
         self.attach_assistant_identity(&mut response).await?;
         response.runtime = Some(self.runtime_summary_for(id).await);
+        if project_backfilled {
+            self.broadcast_list_changed(id, "updated", response.source.as_ref());
+        }
         Ok(response)
     }
 
@@ -4258,6 +4276,7 @@ mod tests {
             pinned_at: None,
             channel_chat_id: None,
             assistant: None,
+            project_id: None,
             created_at: 0,
             modified_at: 0,
             extra: json!({}),

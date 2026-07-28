@@ -30,6 +30,7 @@ use aionui_extension::{extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
 use aionui_mcp::mcp_routes;
 use aionui_office::{office_proxy_routes, office_routes};
+use aionui_project::project_routes;
 use aionui_realtime::{NoopMessageRouter, WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
 use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
@@ -192,6 +193,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let file_authenticated =
         file_routes(states.file).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // Project control-plane routes protected by auth middleware
+    let project_authenticated =
+        project_routes(states.project).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // MCP routes protected by auth middleware
     let mcp_authenticated =
         mcp_routes(states.mcp).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -259,6 +264,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(agent_authenticated)
         .merge(connection_test_authenticated)
         .merge(file_authenticated)
+        .merge(project_authenticated)
         .merge(mcp_authenticated)
         .merge(extension_authenticated)
         .merge(hub_authenticated)
