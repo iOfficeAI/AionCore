@@ -21,7 +21,7 @@ tracing.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true
 regex.workspace = true
-agent-client-protocol = "0.11.1"
+agent-client-protocol = "2.0.0"
 futures-util.workspace = true
 
 [dev-dependencies]

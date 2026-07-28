@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::AvailableCommand;
+use agent_client_protocol::schema::v1::AvailableCommand;
 use serde::{Deserialize, Serialize};
 
 /// Data for the `AgentStatus` event.

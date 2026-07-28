@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     SessionConfigSelectOptions, SessionModeState, SessionModelState,
 };
@@ -310,7 +310,7 @@ fn flatten_select_options(options: &SessionConfigSelectOptions) -> Vec<&SessionC
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         ModelInfo, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode,
         SessionModeState, SessionModelState,
     };

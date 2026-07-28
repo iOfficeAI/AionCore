@@ -15,7 +15,7 @@ use crate::protocol::send_error::AgentSendError;
 use crate::registry::CatalogSender;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     AvailableCommand, CancelNotification, SessionConfigOptionCategory, SessionId, SessionModelState,
     SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, UsageUpdate,
 };
@@ -1629,7 +1629,7 @@ mod tests {
     use crate::manager::acp::{AcpAgentManager, AcpSession};
     use crate::protocol::error::{AcpError, CloseReason};
     use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, SessionId as DomainSessionId};
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         AvailableCommand, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     };
     use aionui_api_types::{AgentHandshake, AgentMetadata, AgentSource, AgentSourceInfo, BehaviorPolicy};

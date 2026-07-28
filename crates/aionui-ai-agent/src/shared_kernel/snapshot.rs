@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use agent_client_protocol::schema::UsageUpdate;
+use agent_client_protocol::schema::v1::UsageUpdate;
 
 use super::{ConfigKey, ConfigValue, ModeId, ModelId};
 

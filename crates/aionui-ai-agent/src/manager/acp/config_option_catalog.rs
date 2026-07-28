@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     ModelInfo, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     SessionConfigSelectOptions, SessionMode, SessionModeState, SessionModelState,
 };
@@ -149,7 +149,7 @@ fn find_select<'a>(
     options: &'a [SessionConfigOption],
     ids: &[&str],
     category: &SessionConfigOptionCategory,
-) -> Option<&'a agent_client_protocol::schema::SessionConfigSelect> {
+) -> Option<&'a agent_client_protocol::schema::v1::SessionConfigSelect> {
     options
         .iter()
         .find_map(|option| {
@@ -169,7 +169,7 @@ fn find_select<'a>(
         })
 }
 
-fn select_from_kind(kind: &SessionConfigKind) -> Option<&agent_client_protocol::schema::SessionConfigSelect> {
+fn select_from_kind(kind: &SessionConfigKind) -> Option<&agent_client_protocol::schema::v1::SessionConfigSelect> {
     match kind {
         SessionConfigKind::Select(select) => Some(select),
         _ => None,
@@ -294,7 +294,7 @@ fn non_empty_or_first(current: String, first: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption, SessionMode,
     };
     use serde_json::json;

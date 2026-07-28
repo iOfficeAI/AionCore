@@ -465,7 +465,7 @@ impl AgentInstance {
 /// [`AgentInstance::get_model`]. Mirrors the helper formerly living in
 /// `services/agent.rs`; do not duplicate — if the shape of
 /// `ModelInfoPayload` changes, update it here.
-fn map_sdk_model_to_payload(m: agent_client_protocol::schema::SessionModelState) -> ModelInfoPayload {
+fn map_sdk_model_to_payload(m: agent_client_protocol::schema::v1::SessionModelState) -> ModelInfoPayload {
     let available: Vec<ModelInfoEntry> = m
         .available_models
         .iter()

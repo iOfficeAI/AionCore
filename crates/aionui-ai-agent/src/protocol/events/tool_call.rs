@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::Meta as SdkMeta;
+use agent_client_protocol::schema::v1::Meta as SdkMeta;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

@@ -2029,7 +2029,7 @@ fn spawn_event_pump(
                     let commands = slash_commands
                         .iter()
                         .map(|c| {
-                            agent_client_protocol::schema::AvailableCommand::new(
+                            agent_client_protocol::schema::v1::AvailableCommand::new(
                                 c.name.clone(),
                                 c.description.clone().unwrap_or_default(),
                             )

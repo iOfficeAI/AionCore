@@ -3,7 +3,7 @@
 //! `#[path = "session_tests.rs"] mod tests;` from `session.rs`, so
 //! `super::*` resolves to the `session` module's private scope.
 
-use agent_client_protocol::schema::{ModelInfo, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode};
+use agent_client_protocol::schema::v1::{ModelInfo, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode};
 
 use super::*;
 
@@ -234,7 +234,7 @@ fn apply_observed_mode_does_not_change_desired() {
 
 #[test]
 fn apply_observed_mode_syncs_advertised_current_without_losing_available() {
-    use agent_client_protocol::schema::SessionMode;
+    use agent_client_protocol::schema::v1::SessionMode;
     let mut session = make_session();
     session.apply_advertised_modes(SessionModeState::new(
         "default",
@@ -252,7 +252,7 @@ fn apply_observed_mode_syncs_advertised_current_without_losing_available() {
 
 #[test]
 fn apply_observed_model_syncs_advertised_current_without_losing_available() {
-    use agent_client_protocol::schema::ModelInfo;
+    use agent_client_protocol::schema::v1::ModelInfo;
     let mut session = make_session();
     session.apply_advertised_models(SessionModelState::new(
         "claude-sonnet-4",
@@ -310,7 +310,7 @@ fn confirm_mode_aligns_desired_and_current() {
 
 #[test]
 fn confirm_model_aligns_desired_and_current() {
-    use agent_client_protocol::schema::ModelInfo;
+    use agent_client_protocol::schema::v1::ModelInfo;
     let mut session = AcpSession::new(None, None, HashMap::new());
     session.apply_advertised_models(SessionModelState::new(
         "claude-sonnet-4",
@@ -359,7 +359,7 @@ fn confirm_mode_preserves_available_mode_catalog() {
 
 #[test]
 fn confirm_model_preserves_available_model_catalog() {
-    use agent_client_protocol::schema::ModelInfo;
+    use agent_client_protocol::schema::v1::ModelInfo;
     let mut session = AcpSession::new(None, None, HashMap::new());
     session.apply_advertised_models(SessionModelState::new(
         "claude-sonnet-4",
@@ -532,7 +532,7 @@ fn set_desired_model_no_op_when_unchanged() {
 
 #[test]
 fn set_desired_model_validates_against_advertised() {
-    use agent_client_protocol::schema::ModelInfo;
+    use agent_client_protocol::schema::v1::ModelInfo;
     let mut session = make_session();
     session.apply_advertised_models(SessionModelState::new(
         "claude-sonnet-4",
@@ -547,7 +547,7 @@ fn set_desired_model_validates_against_advertised() {
 
 #[test]
 fn can_select_model_reports_unavailable_advertised_model() {
-    use agent_client_protocol::schema::ModelInfo;
+    use agent_client_protocol::schema::v1::ModelInfo;
     let mut session = make_session();
     session.apply_advertised_models(SessionModelState::new(
         "claude-sonnet-4",
@@ -608,7 +608,7 @@ fn new_with_initial_model_sets_desired_model() {
 
 #[test]
 fn clear_invalid_desired_model_drops_stale_initial_model() {
-    use agent_client_protocol::schema::ModelInfo;
+    use agent_client_protocol::schema::v1::ModelInfo;
 
     let mut session = AcpSession::new(None, Some(ModelId::new("deepseek-v4-pro")), HashMap::new());
     session.apply_advertised_models(SessionModelState::new(
@@ -882,7 +882,7 @@ fn apply_advertised_config_options_merges_partial_updates_and_keeps_model_reason
             .iter()
             .find(|option| option.id.to_string() == "reasoning_effort")
             .and_then(|option| match &option.kind {
-                agent_client_protocol::schema::SessionConfigKind::Select(select) => {
+                agent_client_protocol::schema::v1::SessionConfigKind::Select(select) => {
                     Some(select.current_value.to_string())
                 }
                 _ => None,
@@ -1291,7 +1291,7 @@ fn startup_model_seed_prevents_opencode_default_model_config_from_remaining_sele
             .config_options()
             .and_then(|options| options.iter().find(|option| option.id.to_string() == "model"))
             .and_then(|option| match &option.kind {
-                agent_client_protocol::schema::SessionConfigKind::Select(select) => {
+                agent_client_protocol::schema::v1::SessionConfigKind::Select(select) => {
                     Some(select.current_value.to_string())
                 }
                 _ => None,

@@ -9,7 +9,7 @@ use crate::protocol::events::{
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::SessionId as DomainSessionId;
 use crate::types::SendMessageData;
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     AuthMethod, ContentBlock, LoadSessionRequest, PromptRequest, SessionId, StopReason,
 };
 use aionui_api_types::SlashCommandItem;
@@ -560,7 +560,7 @@ mod tests {
     use crate::manager::acp::{AcpSession, AcpSessionEvent};
     use crate::protocol::error::AcpError;
     use crate::shared_kernel::SessionId as DomainSessionId;
-    use agent_client_protocol::schema::AgentCapabilities;
+    use agent_client_protocol::schema::v1::AgentCapabilities;
     fn make_session() -> AcpSession {
         AcpSession::new(None, None, Default::default())
     }
@@ -753,7 +753,7 @@ mod tests {
         AgentStreamEvent, FinishEventData, StartEventData, TextEventData, ThinkingEventData, TipType,
         ToolCallEventData, ToolCallStatus,
     };
-    use agent_client_protocol::schema::StopReason;
+    use agent_client_protocol::schema::v1::StopReason;
     use aionui_api_types::{AgentErrorCode, SlashCommandCompletionBehavior, SlashCommandItem};
     use tokio::sync::broadcast;
 

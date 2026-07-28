@@ -1,5 +1,5 @@
 use crate::shared_kernel::PersistedSessionState;
-use agent_client_protocol::schema::{EnvVariable, McpServer, McpServerStdio, NewSessionRequest};
+use agent_client_protocol::schema::v1::{EnvVariable, McpServer, McpServerStdio, NewSessionRequest};
 use aionui_api_types::AgentMetadata;
 use aionui_api_types::{AcpBuildExtra, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 use aionui_common::CommandSpec;

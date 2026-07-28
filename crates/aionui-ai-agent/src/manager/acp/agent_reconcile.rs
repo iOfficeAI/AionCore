@@ -5,7 +5,7 @@ use crate::manager::acp::mode_normalize::normalize_requested_mode_for_available_
 use crate::manager::acp::session::PendingStartupConfigSeedResult;
 use crate::protocol::error::AcpError;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId};
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     SessionId, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest,
 };
 use std::collections::VecDeque;

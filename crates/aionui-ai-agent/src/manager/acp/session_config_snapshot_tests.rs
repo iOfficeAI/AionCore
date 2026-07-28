@@ -1,6 +1,6 @@
 //! Unit tests for partial real ACP config option snapshots and set-path routing.
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     ModelInfo, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode,
     SessionModeState, SessionModelState,
 };
