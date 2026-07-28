@@ -129,7 +129,11 @@ fn diff(old: &BTreeMap<String, EntryFact>, fresh: &BTreeMap<String, EntryFact>) 
             && let Some(idx) = added
                 .iter()
                 .enumerate()
-                .position(|(i, (_, af))| !used_added[i] && af.inode == rf.inode)
+                // A rename preserves kind. Requiring `af.kind == rf.kind` stops a
+                // same-name file→dir kind change from being read as a rename when
+                // the OS reuses the freed inode for the new entry (Linux does;
+                // macOS assigns a fresh inode) — that case is remove + add.
+                .position(|(i, (_, af))| !used_added[i] && af.inode == rf.inode && af.kind == rf.kind)
         {
             used_added[idx] = true;
             changes.push(Change::Renamed {

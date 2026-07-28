@@ -170,6 +170,38 @@ fn file_fact(inode: u64) -> EntryFact {
     }
 }
 
+fn dir_fact(inode: u64) -> EntryFact {
+    EntryFact {
+        kind: Kind::Dir,
+        inode,
+        symlink_target: None,
+    }
+}
+
+#[test]
+fn diff_same_inode_kind_change_is_remove_add_not_rename() {
+    // Same name "x", same inode, but File→Dir. Reproduces the Linux inode-reuse
+    // case (freed file inode reassigned to the new dir) deterministically, with
+    // no dependency on real-FS inode behavior. A rename preserves kind, so a
+    // kind change must be Removed + Added even when the inode collides — never a
+    // (nonsensical) self-rename `Renamed { from: "x", to: "x" }`.
+    let old = BTreeMap::from([("x".to_owned(), file_fact(7))]);
+    let fresh = BTreeMap::from([("x".to_owned(), dir_fact(7))]);
+
+    let mut changes = diff(&old, &fresh);
+    changes.sort_by_key(|c| format!("{c:?}"));
+    assert_eq!(
+        changes,
+        vec![
+            Change::Added {
+                name: "x".to_owned(),
+                kind: Kind::Dir
+            },
+            Change::Removed { name: "x".to_owned() },
+        ]
+    );
+}
+
 #[test]
 fn diff_inode_zero_rename_degrades_to_remove_add() {
     // Same content moved a→b, but the provider reports inode 0 (unknown) for
