@@ -127,6 +127,7 @@ mod tests {
             "glm-acp-agent",
             "grok",
             "kilo",
+            "mimo-code",
             "nova",
             "sigit",
             "amp-acp",
