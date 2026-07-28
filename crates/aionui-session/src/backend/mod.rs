@@ -251,4 +251,17 @@ pub struct SessionConfig {
     /// into the F-4 wake recipe (rides the cloned `config`) so a resume re-spawn
     /// uses the same binary (R16 continuity).
     pub cli_program: Option<std::path::PathBuf>,
+    /// The resolved initial reasoning-effort ("thought level") for the session.
+    /// codex applies it inside its DETACHED post-open startup sequence — validated
+    /// model reconcile → best-effort wait for the model settings response →
+    /// validated effort (against the EFFECTIVE model's advertised efforts) — with
+    /// NO first-turn gate: codex's `thread/settings/update{effort}` only affects
+    /// SUBSEQUENT turns (ThreadSettingsUpdateParams,
+    /// samples/codex-cli/0.137.0/schema-full), so an effort applied after (or
+    /// racing) the first `turn/start` may briefly run that turn at the launch
+    /// default (a declared limitation of this compact fix). claude ignores this
+    /// field: its effort rides a post-open control_request the orchestration layer
+    /// sequences before the first prompt (stdin ordering is the claude contract).
+    /// `None` = no seed.
+    pub reasoning_effort: Option<String>,
 }

@@ -181,9 +181,20 @@ impl BackendConnection for CodexConnection {
         // config → nothing to reconcile). The two are SEQUENCED (model first) only to keep
         // the two writes deterministic — SetMode no longer depends on current_model
         // (feature 012置换: permissions channel), but sequencing keeps the wire order stable.
-        if matches!(spec, SessionSpec::Fresh { .. }) && (config.model.is_some() || config.mode.is_some()) {
+        if matches!(spec, SessionSpec::Fresh { .. })
+            && (config.model.is_some() || config.mode.is_some() || config.reasoning_effort.is_some())
+        {
             let backend = Arc::new(backend);
-            spawn_codex_reconcile(backend.clone(), config.model.clone(), config.mode.clone());
+            // Best-effort DETACHED startup apply (minimal branch): the seed is
+            // applied post-open with no gate on the first turn — a prompt racing
+            // these writes may briefly run on codex's launch defaults, matching
+            // current upstream behaviour for model/mode (see Limitations).
+            spawn_codex_bootstrap(
+                backend.clone(),
+                config.model.clone(),
+                config.mode.clone(),
+                config.reasoning_effort.clone(),
+            );
             return Ok(backend);
         }
 
@@ -218,18 +229,126 @@ const CODEX_RECONCILE_POLLS: u32 = 100;
 /// model+mode (it deliberately did not embed `config.model`, and codex has no
 /// `thread/start` mode param at all). This detached task applies the requested model
 /// then mode, each validated against its discovered catalog. The two are SEQUENCED —
-/// model MUST settle first because `SetMode` builds a `collaborationMode` around the
-/// tracked `current_model`; running them concurrently could fire `SetMode` while
-/// `current_model` is still the (possibly-invalid) optimistic seed or already cleared.
-fn spawn_codex_reconcile(backend: Arc<CodexSessionBackend>, model: Option<String>, mode: Option<String>) {
+/// a deterministic wire order (model settings write, drained, then mode) so the mode
+/// apply is validated against the model codex actually kept rather than the optimistic
+/// seed. We do NOT assert anything about codex's internal `SetMode`/`collaborationMode`
+/// coupling — that is unverified; the ordering is our own conservative choice, not a
+/// documented codex requirement.
+fn spawn_codex_bootstrap(
+    backend: Arc<CodexSessionBackend>,
+    model: Option<String>,
+    mode: Option<String>,
+    effort: Option<String>,
+) {
     tokio::spawn(async move {
         if let Some(model) = model {
             reconcile_codex_model(&backend, model).await;
+            // Barrier: wait for the settings ACK (the JSON-RPC response drains the
+            // pending_set entry) before the dependent effort apply — JSON-RPC gives
+            // no cross-request ordering guarantee, so "wrote model before effort"
+            // is not "applied model before effort".
+            //
+            // KNOWN LIMITATION (minimal branch): `await_pending_set_drained`
+            // treats ANY response — success OR JSON-RPC error — as "drained", so
+            // an explicit model-set ERROR still lets this detached sequence
+            // proceed to the effort write (validated against the REQUESTED model,
+            // not the one codex actually kept). The backend stays authoritative
+            // and the reader's structured reject reconcile corrects the effort;
+            // a result-correlated drain would need the hardened transport state
+            // machine, out of this compact fix's scope. Characterized by
+            // `model_settings_error_still_lets_effort_attempt_run` (fail-open).
+            await_pending_set_drained(&backend, "model\u{2192}").await;
         }
         if let Some(mode) = mode {
             reconcile_codex_mode(&backend, mode).await;
         }
+        if let Some(effort) = effort {
+            bootstrap_apply_effort(&backend, effort).await;
+        }
     });
+}
+
+/// Wait (bounded, same poll cadence as the reconcile) until no in-flight
+/// `thread/settings/update` whose label starts with `prefix` remains unanswered —
+/// the reader removes a `pending_set` entry when its JSON-RPC response arrives
+/// (success OR error), so absence means "a terminal response was observed and the
+/// entry drained" — NOT that the setting was accepted; the result is not classified
+/// here. `false` = the bound elapsed with the request still unanswered (the bootstrap
+/// proceeds — a wedged
+/// settings response must not brick the session; the turn path stays usable).
+async fn await_pending_set_drained(backend: &CodexSessionBackend, prefix: &str) -> bool {
+    for _ in 0..CODEX_RECONCILE_POLLS {
+        let pending = backend
+            .pending_set
+            .lock()
+            .await
+            .values()
+            .any(|label| label.starts_with(prefix));
+        if !pending {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tracing::warn!(prefix = %prefix, "codex bootstrap: settings ack never arrived within the poll bound");
+    false
+}
+
+/// Apply the seeded reasoning effort as the LAST step of the DETACHED startup
+/// sequence: validate it against the EFFECTIVE model's advertised efforts (the
+/// tracked current after the model reconcile, else the catalog default; an
+/// unknown/empty list stays permissive, matching ACP `is_*_valid`), dispatch the
+/// settings update, then best-effort wait for its response (see
+/// `await_pending_set_drained` — the drain treats success and error alike, so
+/// this is NOT a confirmed acknowledgement). An out-of-catalog seed is dropped
+/// WITHOUT a wire write and surfaced as the same structured
+/// `config_option_rejected` a backend reject emits, so the task runtime clears
+/// its optimistic highlight instead of advertising a level the model cannot run.
+async fn bootstrap_apply_effort(backend: &CodexSessionBackend, effort: String) {
+    let effective_model = {
+        let live = backend.current_model.lock().await.clone();
+        let disc = backend.discovered.lock().unwrap_or_else(|e| e.into_inner());
+        live.or_else(|| disc.default_model.clone())
+    };
+    let supported = {
+        let disc = backend.discovered.lock().unwrap_or_else(|e| e.into_inner());
+        match effective_model
+            .as_deref()
+            .and_then(|id| disc.models.iter().find(|m| m.id == id))
+        {
+            Some(model) if !model.reasoning_efforts.is_empty() => model.reasoning_efforts.contains(&effort),
+            // Unknown model / no advertised efforts → permissive (absent catalog
+            // cannot invalidate); codex itself still rejects an unsupported value.
+            _ => true,
+        }
+    };
+    if !supported {
+        tracing::warn!(
+            effort = %effort,
+            model = ?effective_model,
+            "codex bootstrap: seeded effort not advertised by the effective model; dropping (structured reject emitted)"
+        );
+        let _ = backend.event_tx.send(SessionEnvelope {
+            session_id: backend.session_id.clone(),
+            turn_gen: backend.turn_gen.load(std::sync::atomic::Ordering::SeqCst),
+            event: SessionEvent::AdapterSpecific {
+                tag: "config_option_rejected".to_string(),
+                payload: json!({
+                    "option_id": "effort",
+                    "value": effort,
+                    "error": "not supported by the effective model",
+                }),
+            },
+        });
+        return;
+    }
+    // Write via the shared helper directly (the detached seed has no dispatch
+    // gate on the minimal branch — a manual pick racing it just wins on the wire).
+    if let Err(e) = backend.write_effort_settings_update(&effort).await {
+        tracing::warn!(effort = %effort, error = %e, "codex bootstrap: effort write failed (session usable, seed not applied)");
+        return;
+    }
+    await_pending_set_drained(backend, "effort\u{2192}").await;
+    tracing::info!(effort = %effort, "codex bootstrap: seeded reasoning effort settings written (response drained; not a confirmed ack)");
 }
 
 /// Wait for a codex `*/list` catalog to populate `discovered`, returning the id list.
@@ -251,6 +370,37 @@ async fn await_codex_catalog(
     Vec::new()
 }
 
+/// Round-11 (minimal-branch correctness): re-push a CatalogUpdated carrying the
+/// HONEST currents from `discovered` after the optimistic open-time model seed
+/// was dropped — an earlier frame may already have advertised the requested
+/// (invalid) model as current, and without this corrected push it stands
+/// forever. current_model = the tracked live model (now cleared) or the
+/// catalog default; current_effort = that model's defaultReasoningEffort.
+async fn emit_corrected_codex_catalog(backend: &CodexSessionBackend) {
+    let live_model = backend.current_model.lock().await.clone();
+    let (models, modes, current_model, current_effort) = {
+        let disc = backend.discovered.lock().unwrap_or_else(|e| e.into_inner());
+        let effective = live_model.or_else(|| disc.default_model.clone());
+        let current_effort = effective
+            .as_deref()
+            .and_then(|id| disc.default_efforts.get(id).cloned());
+        (disc.models.clone(), disc.modes.clone(), effective, current_effort)
+    };
+    emit(
+        &backend.event_tx,
+        &backend.session_id,
+        backend.turn_gen.load(std::sync::atomic::Ordering::SeqCst),
+        SessionEvent::CatalogUpdated {
+            models,
+            modes,
+            slash_commands: Vec::new(),
+            current_model,
+            current_mode: None,
+            current_effort,
+        },
+    );
+}
+
 /// Apply `requested` model the ACP way: wait for `model/list` to fill the catalog, then
 ///   - if `requested` IS in the catalog → dispatch a `SetModel` (validated apply;
 ///     success converges via `thread/settings/updated`);
@@ -265,13 +415,21 @@ async fn reconcile_codex_model(backend: &CodexSessionBackend, requested: String)
     let catalog = await_codex_catalog(backend, |d| d.models.iter().map(|m| m.id.clone()).collect()).await;
 
     if catalog.is_empty() {
-        // Never learned the catalog → cannot validate. Leave codex on its launch
-        // default (the safe choice) rather than bind a possibly-invalid model.
+        // Never learned the catalog (reconcile timeout) → cannot validate. Leave
+        // codex on its launch default rather than bind a possibly-invalid model.
+        // Round-11: CLEAR the optimistic open-time seed and push corrected
+        // currents — otherwise a model/list arriving LATER (after this timeout)
+        // would run the discovery-emit path with the still-set requested seed as
+        // `current_model` and stamp the (possibly-invalid) model with no one left
+        // to correct it. With the seed cleared, that late emit serves the honest
+        // discovered default instead.
         tracing::warn!(
             requested_model = %requested,
             "codex model reconcile: model/list never populated; leaving thread on codex default \
              (requested model NOT applied — cannot validate)"
         );
+        *backend.current_model.lock().await = None;
+        emit_corrected_codex_catalog(backend).await;
         return;
     }
 
@@ -286,6 +444,9 @@ async fn reconcile_codex_model(backend: &CodexSessionBackend, requested: String)
              (thread stays on codex default)"
         );
         *backend.current_model.lock().await = None;
+        // Corrected push: re-advertise the honest default so a stale earlier
+        // frame that named the invalid model as current does not stand.
+        emit_corrected_codex_catalog(backend).await;
         return;
     }
 
@@ -713,6 +874,19 @@ pub struct CodexSessionBackend {
     /// `map_notification` → ConfigChanged, live-verified), so emitting here too would
     /// duplicate the ConfigChanged. The codex analogue of acp_conn's `pending_set`.
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    /// The rpc id of the LATEST `thread/settings/update{effort}` dispatch (0 = none
+    /// yet; real rpc ids start at 1). A rejection reconciles (structured
+    /// `config_option_rejected`) ONLY when its rpc id matches — a late reject of a
+    /// SUPERSEDED effort set must not tear down the newer value it no longer speaks
+    /// for. rpc ids are minted monotonically, so equality against the latest is an
+    /// exact "is this reject about the current value" test.
+    latest_effort_set_rpc: Arc<std::sync::atomic::AtomicU64>,
+    /// TEST SEAM (compiled out of production via `#[cfg(test)]`): when set, the
+    /// NEXT `write_frame` fails with a synthetic transport error and resets the
+    /// flag — lets a test exercise the settings write-error rollback path
+    /// deterministically without a broken pipe.
+    #[cfg(test)]
+    fail_next_write: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One in-flight prompt-carrying client request (GAP-A correlation entry).
@@ -753,6 +927,18 @@ struct Discovered {
     /// For codex this holds the fixed permission-tier mode enum mapped from
     /// `permissionProfile/list` (feature 012), NOT collaborationMode.
     modes: Vec<crate::capability::ModeInfo>,
+    /// The model `model/list` marks `isDefault: true` — codex's own launch default
+    /// (wire field verified against the calibrated capture fixture,
+    /// samples/codex-cli/0.137.0/appserver-methods/catalog.jsonl). Serves as
+    /// `capabilities().current_model` when config supplied no model: a fresh thread
+    /// runs on exactly this model (`thread/start` embeds no model; the reconcile only
+    /// overrides it when a model was requested).
+    default_model: Option<String>,
+    /// Per-model `defaultReasoningEffort` from the same response (same capture) —
+    /// the effort codex runs a model at unless a `thread/settings/update{effort}`
+    /// overrides it. Keyed by model id; consulted for the CURRENT model to serve
+    /// `capabilities().current_effort` when no explicit effort was set.
+    default_efforts: std::collections::HashMap<String, String>,
 }
 
 /// What `CodexSessionBackend::wake_handle` needs to re-spawn the codex app-server
@@ -798,6 +984,13 @@ struct CodexReaderState {
     /// terminal (TurnResult / Detached). The idle timer reads it so a streaming turn
     /// is never suspended mid-flight.
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// Live current model (open-time config seed, then SetModel switches / the
+    /// reconcile's clear). The reader stamps it onto `CatalogUpdated.current_model`
+    /// so the push reflects the REQUESTED/current model, not the catalog default,
+    /// for a configured session.
+    current_model: Arc<Mutex<Option<String>>>,
+    /// Mirror of `CodexSessionBackend.latest_effort_set_rpc` (stale-reject guard).
+    latest_effort_set_rpc: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Spawn a codex JSON-RPC reader over `stdout`/`io` using the shared state. Used
@@ -827,6 +1020,8 @@ fn start_codex_reader(
             state.discovered,
             state.stdin,
             state.turn_in_flight,
+            state.current_model,
+            state.latest_effort_set_rpc,
         )
         .await;
     })
@@ -954,6 +1149,9 @@ impl CodexSessionBackend {
         let resume_poison = Arc::new(Mutex::new(None));
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
         let turn_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let latest_effort_set_rpc = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(test)]
+        let fail_next_write = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (event_tx, _) = broadcast::channel(1024);
 
         let (stdin, stdout) = match io.take_stdio().await {
@@ -978,6 +1176,8 @@ impl CodexSessionBackend {
             discovered: discovered.clone(),
             stdin: stdin.clone(),
             turn_in_flight: turn_in_flight.clone(),
+            current_model: current_model.clone(),
+            latest_effort_set_rpc: latest_effort_set_rpc.clone(),
         };
         let reader = start_codex_reader(&reader_state, stdout, io.clone());
 
@@ -1032,11 +1232,18 @@ impl CodexSessionBackend {
             pending_resume,
             resume_poison,
             discovered,
+            latest_effort_set_rpc,
+            #[cfg(test)]
+            fail_next_write,
         }
     }
 
     /// Write one JSON-RPC frame (request or response) to stdin as a single line.
     async fn write_frame(&self, frame: Value) -> Result<(), BackendError> {
+        #[cfg(test)]
+        if self.fail_next_write.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(BackendError::Transport("write frame tripped (test seam)".into()));
+        }
         let mut guard = self.stdin.lock().await;
         let stdin = guard
             .as_mut()
@@ -1057,6 +1264,52 @@ impl CodexSessionBackend {
 
     fn next_rpc_id(&self) -> u64 {
         self.rpc_id.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The shared `thread/settings/update{effort}` write (wake → bound thread →
+    /// pending_set registration + latest-set stamp → frame). Used by BOTH the
+    /// dispatch arm (a manual thinking-level pick) and the detached startup
+    /// bootstrap seed. Neither is serialized against the other on the wire — there
+    /// is no gate coupling them; a manual pick racing the seed is simply last wire
+    /// write wins, and the reader's latest-set stamp + structured reject reconcile
+    /// keep the tracked effort consistent with whichever write codex answered last.
+    async fn write_effort_settings_update(&self, value: &str) -> Result<CommandReceipt, BackendError> {
+        // F-4: between-turn config write → wake a suspended session first.
+        self.suspend
+            .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
+            .await?;
+        let tid = self.bound_thread().await?;
+        let id = self.next_rpc_id();
+        // Register the rpc id so the reader claims the response: a JSON-RPC error
+        // (codex rejected the effort) surfaces as a Notice instead of being
+        // dropped (success converges via thread/settings/updated).
+        self.pending_set
+            .lock()
+            .await
+            .insert(id, format!("effort\u{2192}{value}"));
+        // Stale-reject guard: this rpc id now speaks for the current value.
+        // `swap` captures the PRIOR latest so a write error can RESTORE it
+        // (round-12 P1-1): if a previous set A is still pending and this set B's
+        // write fails, leaving latest at B would strand A's late reject (its
+        // is-latest check fails). Restore A and REMOVE the failed pending B
+        // (else it leaks and could mask a later real reject).
+        let prior_latest = self.latest_effort_set_rpc.swap(id, Ordering::SeqCst);
+        let frame = json!({
+            "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
+            "params": { "threadId": tid, "effort": value }
+        });
+        if let Err(e) = self.write_frame(frame).await {
+            self.pending_set.lock().await.remove(&id);
+            let _ = self
+                .latest_effort_set_rpc
+                .compare_exchange(id, prior_latest, Ordering::SeqCst, Ordering::SeqCst);
+            return Err(e);
+        }
+        Ok(CommandReceipt {
+            accepted: true,
+            admission: Admission::NoTurn,
+            turn_gen: self.turn_gen.load(Ordering::SeqCst),
+        })
     }
 
     /// Resolve the bound backend threadId, waiting briefly for the async
@@ -1239,6 +1492,8 @@ async fn reader_task(
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    current_model: Arc<Mutex<Option<String>>>,
+    latest_effort_set_rpc: Arc<std::sync::atomic::AtomicU64>,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1488,7 +1743,41 @@ async fn reader_task(
                             continue;
                         }
                         for ev in map_notification(m, params) {
-                            emit(&event_tx, &session_id, cur, ev);
+                            // Round-11 (A->B default effort): a model-switch
+                            // confirmation (ConfigChanged carrying a new model) is
+                            // the ONLY signal codex sends — it does NOT follow with
+                            // a fresh catalog. Re-emit a CatalogUpdated snapshot
+                            // carrying the NEW model's OWN defaultReasoningEffort so
+                            // the picker shows B's default, not A's carried-over
+                            // effort (A default=medium -> B default=high must not
+                            // keep showing medium). Emitted AFTER the ConfigChanged.
+                            if let SessionEvent::ConfigChanged {
+                                model: Some(new_model), ..
+                            } = &ev
+                            {
+                                let (models, modes, current_effort) = {
+                                    let disc = discovered.lock().unwrap_or_else(|e| e.into_inner());
+                                    let eff = disc.default_efforts.get(new_model).cloned();
+                                    (disc.models.clone(), disc.modes.clone(), eff)
+                                };
+                                let new_model = new_model.clone();
+                                emit(&event_tx, &session_id, cur, ev);
+                                emit(
+                                    &event_tx,
+                                    &session_id,
+                                    cur,
+                                    SessionEvent::CatalogUpdated {
+                                        models,
+                                        modes,
+                                        slash_commands: Vec::new(),
+                                        current_model: Some(new_model),
+                                        current_mode: None,
+                                        current_effort,
+                                    },
+                                );
+                            } else {
+                                emit(&event_tx, &session_id, cur, ev);
+                            }
                         }
                     }
                     _ => {
@@ -1610,9 +1899,25 @@ async fn reader_task(
                                         // `config_options` on open, never re-fetches and the
                                         // selectors stay disabled. (codex's modes come from
                                         // permissionProfile/list — the fixed permission-tier enum.)
-                                        let (models, modes) = {
+                                        // Currents stamped for the EFFECTIVE model: the
+                                        // live tracked model (open-time config seed /
+                                        // SetModel switches — cleared by the reconcile if
+                                        // invalid) wins over the catalog's isDefault
+                                        // fallback, so a configured session's push
+                                        // confirms the REQUESTED model instead of
+                                        // resetting the highlight to codex's launch
+                                        // default. current_effort is that model's
+                                        // defaultReasoningEffort (codex-observed).
+                                        // Interactive switches still win at the pump
+                                        // (its runtime overrides take precedence).
+                                        let live_model = current_model.lock().await.clone();
+                                        let (models, modes, current_model_now, current_effort_now) = {
                                             let disc = discovered.lock().unwrap_or_else(|e| e.into_inner());
-                                            (disc.models.clone(), disc.modes.clone())
+                                            let effective = live_model.or_else(|| disc.default_model.clone());
+                                            let current_effort = effective
+                                                .as_deref()
+                                                .and_then(|id| disc.default_efforts.get(id).cloned());
+                                            (disc.models.clone(), disc.modes.clone(), effective, current_effort)
                                         };
                                         emit(
                                             &event_tx,
@@ -1626,6 +1931,9 @@ async fn reader_task(
                                                 // so the agent_metadata writeback + the frontend
                                                 // AvailableCommands push see it (ELECTRON-3PX).
                                                 slash_commands: builtin_slash_commands(),
+                                                current_model: current_model_now,
+                                                current_mode: None,
+                                                current_effort: current_effort_now,
                                             },
                                         );
                                     }
@@ -1685,6 +1993,36 @@ async fn reader_task(
                                     set = %label,
                                     "codex thread/settings/update (SetMode/SetModel/effort) rejected by agent: {message}"
                                 );
+                                // Stale-reject guard: only a rejection of the LATEST
+                                // effort set reconciles state — a superseded set's late
+                                // reject (high -> low -> high) speaks for a value that is
+                                // no longer current; clearing on it would tear down the
+                                // newer, possibly-accepted value. Stale effort rejects
+                                // are logged (the error! above) and claim the pending
+                                // entry, but emit neither the structured signal nor the
+                                // Notice (the level they name may be active again).
+                                let is_stale_effort = label.starts_with("effort\u{2192}")
+                                    && latest_effort_set_rpc.load(Ordering::SeqCst) != rid;
+                                if is_stale_effort {
+                                    continue;
+                                }
+                                // Structured reject for an EFFORT set (label minted by
+                                // dispatch as "effort→<value>"): the task-level pump
+                                // holds its own optimistic effort highlight (seeded from
+                                // the assistant default) and must clear it so the picker
+                                // stops advertising a level codex refused. Same tag the
+                                // claude reader emits (sniff_set_config_reject).
+                                if let Some(value) = label.strip_prefix("effort\u{2192}") {
+                                    emit(
+                                        &event_tx,
+                                        &session_id,
+                                        turn_gen.load(Ordering::SeqCst),
+                                        SessionEvent::AdapterSpecific {
+                                            tag: "config_option_rejected".to_string(),
+                                            payload: json!({ "option_id": "effort", "value": value, "error": message }),
+                                        },
+                                    );
+                                }
                                 emit(
                                     &event_tx,
                                     &session_id,
@@ -1956,11 +2294,24 @@ fn fill_discovery(kind: DiscoveryKind, result: &Value, discovered: &Arc<std::syn
         DiscoveryKind::Models => {
             let arr = list("data", "models");
             let present = arr.is_some();
+            // Defaults ride the same response (capture: model item carries `isDefault`
+            // and `defaultReasoningEffort` alongside the efforts list). Collected here
+            // so `capabilities()` can serve current_model/current_effort for a session
+            // that never switched — before this the currents stayed None and the picker
+            // showed no active selection (the thought-level display gap).
+            let mut default_model: Option<String> = None;
+            let mut default_efforts: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             let models = arr
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|m| {
                             let id = m.get("id").and_then(Value::as_str)?.to_string();
+                            if m.get("isDefault").and_then(Value::as_bool) == Some(true) && default_model.is_none() {
+                                default_model = Some(id.clone());
+                            }
+                            if let Some(effort) = m.get("defaultReasoningEffort").and_then(Value::as_str) {
+                                default_efforts.insert(id.clone(), effort.to_string());
+                            }
                             Some(ModelInfo {
                                 id,
                                 name: m.get("displayName").and_then(Value::as_str).unwrap_or("").to_string(),
@@ -1989,7 +2340,10 @@ fn fill_discovery(kind: DiscoveryKind, result: &Value, discovered: &Arc<std::syn
             if present && models.is_empty() {
                 tracing::warn!("codex model/list parsed to empty (wire shape may have drifted from result.data[])");
             }
-            discovered.lock().unwrap_or_else(|e| e.into_inner()).models = models;
+            let mut disc = discovered.lock().unwrap_or_else(|e| e.into_inner());
+            disc.models = models;
+            disc.default_model = default_model;
+            disc.default_efforts = default_efforts;
         }
         DiscoveryKind::Permissions => {
             // codex's mode axis IS the permission axis. This is the DISCOVERY half of the
@@ -3637,29 +3991,11 @@ impl SessionBackend for CodexSessionBackend {
             Command::SetConfigOption { option_id, value }
                 if matches!(option_id.as_str(), "effort" | "reasoning_effort" | "thought_level") =>
             {
-                // F-4: between-turn config write → wake a suspended session first.
-                self.suspend
-                    .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
-                    .await?;
-                let tid = self.bound_thread().await?;
-                let id = self.next_rpc_id();
-                // Register the rpc id so the reader claims the response: a JSON-RPC error
-                // (codex rejected the effort) surfaces as a Notice instead of being
-                // dropped (success converges via thread/settings/updated).
-                self.pending_set
-                    .lock()
-                    .await
-                    .insert(id, format!("effort\u{2192}{value}"));
-                let frame = json!({
-                    "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
-                    "params": { "threadId": tid, "effort": value }
-                });
-                self.write_frame(frame).await?;
-                Ok(CommandReceipt {
-                    accepted: true,
-                    admission: Admission::NoTurn,
-                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
-                })
+                // NOTE (minimal branch): a manual pick racing the detached
+                // startup seed has no serialization gate — last wire write wins;
+                // the seed apply is near-instant post-open in practice (see
+                // Limitations).
+                self.write_effort_settings_update(&value).await
             }
             Command::SetConfigOption { .. } => Err(BackendError::CommandNotSupported {
                 command: "set_config_option",
@@ -3698,6 +4034,20 @@ impl SessionBackend for CodexSessionBackend {
         }
         if !disc.modes.is_empty() {
             caps.available_modes = disc.modes.clone();
+        }
+        // Currents from the discovered defaults, None-only fill (an open-time
+        // `config.model` seed stays authoritative — the reconcile applies exactly it):
+        // a thread codex started without an explicit model runs on the `isDefault`
+        // model at its `defaultReasoningEffort`, so serving them as currents reflects
+        // what the session actually runs, not a guess.
+        if caps.current_model.is_none() {
+            caps.current_model = disc.default_model.clone();
+        }
+        if caps.current_effort.is_none() {
+            caps.current_effort = caps
+                .current_model
+                .as_deref()
+                .and_then(|id| disc.default_efforts.get(id).cloned());
         }
         caps
     }
@@ -6892,6 +7242,22 @@ mod tests {
             "permissionProfile/list built-ins → legacy bare tokens, got {:?}",
             caps.available_modes
         );
+        // The wire's `isDefault:true` model IS what a thread codex started without an
+        // explicit model runs on, and its `defaultReasoningEffort` is the effort it
+        // runs at — both must surface as capabilities currents (the fixture always
+        // carried them; the parser used to drop them → currents stayed None → the
+        // picker showed no active model/thinking selection — the #609 direct-path
+        // regression against the #574 defaults).
+        assert_eq!(
+            caps.current_model.as_deref(),
+            Some("openai.gpt-5.5"),
+            "isDefault:true surfaces as current_model when config seeded none"
+        );
+        assert_eq!(
+            caps.current_effort.as_deref(),
+            Some("medium"),
+            "the default model's defaultReasoningEffort surfaces as current_effort"
+        );
     }
 
     /// The FIX (async catalog-arrival signal): each `model/list` /
@@ -6939,6 +7305,602 @@ mod tests {
         assert!(
             saw_both,
             "a CatalogUpdated snapshot carrying both the model and the mode must be broadcast"
+        );
+    }
+
+    /// Round-11 P2 (characterization of the KNOWN model-error fail-open): the
+    /// best-effort drain barrier treats a JSON-RPC ERROR on the model settings
+    /// write the SAME as a success (pending entry gone == "drained"), so the
+    /// detached seed still proceeds to the effort write despite the model set
+    /// having been rejected. This pins the documented limitation (the backend
+    /// stays authoritative; the reject reconcile corrects the effort) — a
+    /// result-correlated drain is out of the compact fix's scope.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn model_settings_error_still_lets_effort_attempt_run() {
+        let started = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-fo"}}}"#;
+        let model_resp = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"model-a","displayName":"A","supportedReasoningEfforts":[{"reasoningEffort":"medium"},{"reasoningEffort":"high"}],"defaultReasoningEffort":"medium","isDefault":true},{"id":"model-b","displayName":"B","supportedReasoningEfforts":[{"reasoningEffort":"medium"},{"reasoningEffort":"high"}],"defaultReasoningEffort":"high","isDefault":false}],"nextCursor":null}}"#;
+        // The model settings write (rpc id 1) gets a JSON-RPC ERROR, released
+        // only after it is on the wire.
+        let err1 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"model unavailable\"}}\n"
+            .as_bytes()
+            .to_vec();
+        let fake =
+            FakeAgentIo::never_exits(format!("{started}\n{model_resp}\n").into_bytes()).with_gated_segments(vec![err1]);
+        let captured = fake.captured_stdin();
+        let release = fake.segment_releaser();
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-fo", Box::new(fake)).await);
+        backend.pending_discovery.lock().await.insert(50, DiscoveryKind::Models);
+        let _events = backend.events();
+        for _ in 0..80 {
+            let filled = !backend
+                .discovered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .models
+                .is_empty();
+            if filled && backend.thread_binding.lock().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        spawn_codex_bootstrap(backend.clone(), Some("model-b".into()), None, Some("high".into()));
+        // Model settings write appears.
+        let mut wire = String::new();
+        for _ in 0..80 {
+            wire = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if wire.contains("\"model\":\"model-b\"") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            wire.contains("\"model\":\"model-b\""),
+            "model settings written, got: {wire}"
+        );
+        // Release the ERROR response → the drain treats it as drained (fail-open)
+        // → the effort write STILL goes out (documented limitation).
+        release();
+        let mut effort_seen = false;
+        for _ in 0..80 {
+            wire = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if wire.contains("\"effort\":\"high\"") {
+                effort_seen = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            effort_seen,
+            "documented fail-open: a model-set error still lets the effort attempt run, got: {wire}"
+        );
+    }
+
+    /// Round-11 Fix B (production discovery order): permissionProfile/list
+    /// arrives BEFORE model/list (codex answers modes first), the configured
+    /// model model-x is absent from the model/list, and the open-time optimistic
+    /// seed is model-x. Intermediate discovery pushes may still carry model-x,
+    /// but the LAST CatalogUpdated after the reconcile must be corrected:
+    /// current_model = the honest default model-a, current_effort = A's default,
+    /// the modes discovered earlier are RETAINED, model-x is no longer current,
+    /// and NO thread/settings/update{model:model-x} was ever written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn permissions_before_model_invalid_configured_model_final_catalog_corrected() {
+        use futures_util::StreamExt as _;
+        // Permissions FIRST (id 52), then model/list (id 50) WITHOUT model-x.
+        let perm_resp = r#"{"jsonrpc":"2.0","id":52,"result":{"data":[{"id":":read-only","description":null},{"id":":workspace","description":null}],"nextCursor":null}}"#;
+        let model_resp = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"model-a","displayName":"A","supportedReasoningEfforts":[{"reasoningEffort":"medium"},{"reasoningEffort":"high"}],"defaultReasoningEffort":"medium","isDefault":true}],"nextCursor":null}}"#;
+        let fake = FakeAgentIo::never_exits(format!("{perm_resp}\n{model_resp}\n").into_bytes());
+        let captured = fake.captured_stdin();
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-pbm", Box::new(fake)).await);
+        {
+            let mut pd = backend.pending_discovery.lock().await;
+            pd.insert(52, DiscoveryKind::Permissions);
+            pd.insert(50, DiscoveryKind::Models);
+        }
+        // Open-time optimistic seed for the (invalid) configured model.
+        *backend.current_model.lock().await = Some("model-x".to_string());
+        let mut events = backend.events();
+        // Run the reconcile inline; it waits for the model/list, then drops
+        // model-x and emits the corrected push. Discovery pushes emitted by the
+        // reader (permissions, then models) buffer in the subscribed receiver.
+        reconcile_codex_model(&backend, "model-x".to_string()).await;
+        // Drain every buffered CatalogUpdated + a short tail; keep the LAST.
+        let mut last_catalog: Option<(Option<String>, Option<String>, Vec<String>)> = None;
+        for _ in 0..40 {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), events.next()).await {
+                Ok(Some(env)) => {
+                    if let SessionEvent::CatalogUpdated {
+                        current_model,
+                        current_effort,
+                        modes,
+                        ..
+                    } = env.event
+                    {
+                        last_catalog = Some((
+                            current_model,
+                            current_effort,
+                            modes.iter().map(|m| m.id.clone()).collect(),
+                        ));
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    if last_catalog.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+        let (model, effort, modes) = last_catalog.expect("a corrected CatalogUpdated must be the last frame");
+        assert_eq!(
+            model.as_deref(),
+            Some("model-a"),
+            "the final catalog must name the honest default, not model-x"
+        );
+        assert_eq!(
+            effort.as_deref(),
+            Some("medium"),
+            "the final catalog carries model-a's default effort"
+        );
+        assert!(
+            modes.contains(&"read-only".to_string()) && modes.contains(&"auto".to_string()),
+            "the modes discovered before the model must be retained, got: {modes:?}"
+        );
+        let wire = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        assert!(
+            !wire.contains("\"model\":\"model-x\""),
+            "no thread/settings/update{{model:model-x}} may ever be written for the invalid model, got: {wire}"
+        );
+    }
+
+    /// Round-11 Fix B (empty/timeout branch): when the model/list never
+    /// populates (reconcile timeout), the optimistic open-time model seed must
+    /// be CLEARED and corrected currents pushed — otherwise a model/list
+    /// arriving LATER would run the discovery-emit path with the stale requested
+    /// seed as current_model and stamp a possibly-invalid model with no one left
+    /// to correct it. (Uses the real ~5s reconcile poll timeout.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_timeout_clears_optimistic_model_seed() {
+        use futures_util::StreamExt as _;
+        // No model/list is ever fed → discovered stays empty → reconcile times out.
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let backend = CodexSessionBackend::build_with_io("codex-to", Box::new(fake)).await;
+        // Open-time optimistic seed for a configured model we can never validate.
+        *backend.current_model.lock().await = Some("model-x".to_string());
+        let mut events = backend.events();
+        reconcile_codex_model(&backend, "model-x".to_string()).await;
+        assert!(
+            backend.current_model.lock().await.is_none(),
+            "a reconcile timeout must clear the unvalidated optimistic model seed"
+        );
+        // A corrected CatalogUpdated was emitted (empty catalog → current_model None).
+        let mut saw_corrected = false;
+        for _ in 0..20 {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), events.next()).await {
+                Ok(Some(env)) => {
+                    if let SessionEvent::CatalogUpdated { current_model, .. } = env.event {
+                        assert!(
+                            current_model.is_none(),
+                            "the corrected push must not name the invalid seed"
+                        );
+                        saw_corrected = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(saw_corrected, "the timeout must emit a corrected catalog push");
+    }
+
+    /// Round-11 Fix C (backend): a model-switch confirmation
+    /// (thread/settings/updated{model:B}) must re-emit a CatalogUpdated snapshot
+    /// carrying B's OWN defaultReasoningEffort — codex sends only the
+    /// ConfigChanged, never a fresh catalog, so without this the picker keeps
+    /// A's effort. A/B share the same effort set but different defaults.
+    #[tokio::test]
+    async fn model_switch_reemits_catalog_with_new_model_default_effort() {
+        use futures_util::StreamExt as _;
+        // model-a default medium, model-b default high; SAME effort set.
+        let model_resp = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"model-a","displayName":"A","supportedReasoningEfforts":[{"reasoningEffort":"medium"},{"reasoningEffort":"high"}],"defaultReasoningEffort":"medium","isDefault":true},{"id":"model-b","displayName":"B","supportedReasoningEfforts":[{"reasoningEffort":"medium"},{"reasoningEffort":"high"}],"defaultReasoningEffort":"high","isDefault":false}],"nextCursor":null}}"#;
+        let settings = r#"{"jsonrpc":"2.0","method":"thread/settings/updated","params":{"threadId":"th1","threadSettings":{"model":"model-b","activePermissionProfile":null,"collaborationMode":{"mode":"default","settings":{"model":"model-b"}}}}}"#;
+        let fake = FakeAgentIo::never_exits(format!("{model_resp}\n{settings}\n").into_bytes());
+        let backend = CodexSessionBackend::build_with_io("codex-switch", Box::new(fake)).await;
+        backend.pending_discovery.lock().await.insert(50, DiscoveryKind::Models);
+        let mut events = backend.events();
+        // Collect until the post-ConfigChanged snapshot for model-b arrives.
+        let mut saw_config_changed = false;
+        let mut snapshot_effort = None;
+        for _ in 0..120 {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await {
+                Ok(Some(env)) => match env.event {
+                    SessionEvent::ConfigChanged { model: Some(m), .. } if m == "model-b" => {
+                        saw_config_changed = true;
+                    }
+                    SessionEvent::CatalogUpdated {
+                        current_model,
+                        current_effort,
+                        ..
+                    } if saw_config_changed && current_model.as_deref() == Some("model-b") => {
+                        snapshot_effort = Some(current_effort);
+                        break;
+                    }
+                    _ => {}
+                },
+                _ => break,
+            }
+        }
+        assert!(saw_config_changed, "the switch must emit ConfigChanged{{model-b}}");
+        assert_eq!(
+            snapshot_effort.flatten().as_deref(),
+            Some("high"),
+            "the re-emitted snapshot must carry model-b's OWN default effort (high), not A's medium"
+        );
+    }
+
+    /// Round-11 Fix B: dropping an INVALID configured model must emit a CORRECTED
+    /// CatalogUpdated — an earlier frame may already have advertised the
+    /// requested-but-invalid model as current, and without the correction it
+    /// stands forever. The push carries the honest catalog default + its effort.
+    #[tokio::test]
+    async fn invalid_configured_model_drop_emits_corrected_catalog() {
+        use futures_util::StreamExt as _;
+        let model_resp = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"model-a","displayName":"A","supportedReasoningEfforts":[{"reasoningEffort":"medium"}],"defaultReasoningEffort":"medium","isDefault":true}],"nextCursor":null}}"#;
+        let fake = FakeAgentIo::never_exits(format!("{model_resp}\n").into_bytes());
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-drop", Box::new(fake)).await);
+        backend.pending_discovery.lock().await.insert(50, DiscoveryKind::Models);
+        // Open-time optimistic seed for the (invalid) configured model.
+        *backend.current_model.lock().await = Some("model-x".to_string());
+        let mut events = backend.events();
+        // Wait for the discovery-driven catalog to fill.
+        for _ in 0..80 {
+            if !backend
+                .discovered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .models
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        reconcile_codex_model(&backend, "model-x".to_string()).await;
+        assert!(
+            backend.current_model.lock().await.is_none(),
+            "the invalid optimistic seed must be cleared"
+        );
+        let mut corrected = None;
+        for _ in 0..80 {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await {
+                Ok(Some(env)) => {
+                    if let SessionEvent::CatalogUpdated {
+                        current_model,
+                        current_effort,
+                        ..
+                    } = env.event
+                        && current_model.as_deref() == Some("model-a")
+                    {
+                        corrected = Some((current_model, current_effort));
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let (_, current_effort) = corrected.expect("the drop must emit a corrected catalog push");
+        assert_eq!(
+            current_effort.as_deref(),
+            Some("medium"),
+            "the corrected push carries the honest default currents"
+        );
+    }
+
+    /// The catalog push must also carry the discovered CURRENTS (isDefault model +
+    /// its defaultReasoningEffort): the task-level event pump holds no backend Arc,
+    /// so the pushed config-options frame can only highlight what rides the event —
+    /// before these fields the push always sent `current_value: null` for a session
+    /// the user had not switched, and the picker showed no active selection.
+    #[tokio::test]
+    async fn model_list_response_catalog_updated_carries_currents() {
+        use futures_util::StreamExt as _;
+        // Same calibrated capture shape as b_codex_model_list_response_fills_* above
+        // (samples/codex-cli/0.137.0/appserver-methods/catalog.jsonl).
+        let model_resp = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"openai.gpt-5.5","displayName":"GPT-5.5","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"medium"}],"defaultReasoningEffort":"medium","isDefault":true}],"nextCursor":null}}"#;
+        let fake = FakeAgentIo::never_exits(format!("{model_resp}\n").into_bytes());
+        let backend = CodexSessionBackend::build_with_io("codex-cur", Box::new(fake)).await;
+        backend.pending_discovery.lock().await.insert(50, DiscoveryKind::Models);
+        let mut events = backend.events();
+        let mut found = None;
+        for _ in 0..80 {
+            if let Ok(Some(env)) = tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await
+                && let SessionEvent::CatalogUpdated {
+                    models,
+                    current_model,
+                    current_effort,
+                    ..
+                } = env.event
+                && !models.is_empty()
+            {
+                found = Some((current_model, current_effort));
+                break;
+            }
+        }
+        let (current_model, current_effort) = found.expect("a CatalogUpdated must be broadcast");
+        assert_eq!(
+            current_model.as_deref(),
+            Some("openai.gpt-5.5"),
+            "isDefault rides the event"
+        );
+        assert_eq!(
+            current_effort.as_deref(),
+            Some("medium"),
+            "the default model's defaultReasoningEffort rides the event"
+        );
+    }
+
+    /// A rejected `thread/settings/update{effort}` (JSON-RPC error response claimed
+    /// via `pending_set`) must emit the STRUCTURED `config_option_rejected` signal
+    /// (in addition to the free-text Notice) so the task-level pump can clear its
+    /// optimistic effort highlight — the Notice alone left the picker advertising a
+    /// level codex refused.
+    /// Round-12 P1-1 (codex): effort set A is written and pending (rpc 1); set
+    /// B's write FAILS. The rollback must REMOVE B's pending entry AND restore A
+    /// as the latest effort rpc, so A's LATE JSON-RPC error still reconciles.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_error_restores_prior_latest_rpc_so_late_reject_reconciles() {
+        use futures_util::StreamExt as _;
+        let started = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-p11"}}}"#;
+        // A's late error is for rpc id 1 (the first effort write), gated until B fails.
+        let reject_a = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"unsupported reasoning effort"}}"#;
+        let fake = FakeAgentIo::never_exits(format!("{started}\n").into_bytes())
+            .with_gated_tail(format!("{reject_a}\n").into_bytes());
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-p11", Box::new(fake)).await;
+        let mut events = backend.events();
+        for _ in 0..80 {
+            if backend.thread_binding.lock().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // Set A "high" → rpc 1, pending{1}, latest=1.
+        backend
+            .dispatch(Command::SetConfigOption {
+                option_id: "effort".into(),
+                value: "high".into(),
+            })
+            .await
+            .expect("A accepted");
+        // Set B "low" with the next write tripped → rollback restores A.
+        backend.fail_next_write.store(true, std::sync::atomic::Ordering::SeqCst);
+        let b = backend
+            .dispatch(Command::SetConfigOption {
+                option_id: "effort".into(),
+                value: "low".into(),
+            })
+            .await;
+        assert!(b.is_err(), "B's tripped write must surface as Err, got: {b:?}");
+        assert_eq!(
+            backend.latest_effort_set_rpc.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failed B write must RESTORE A (rpc 1) as the latest effort rpc"
+        );
+        assert!(
+            !backend.pending_set.lock().await.contains_key(&2),
+            "B's failed pending entry must be removed (no leak)"
+        );
+        // Release A's late reject → it must reconcile (structured signal).
+        release();
+        let signalled = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if matches!(&env.event, SessionEvent::AdapterSpecific { tag, .. } if tag == "config_option_rejected") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            signalled,
+            "A's late reject must reconcile (never dropped as non-latest)"
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_set_rejection_emits_config_option_rejected() {
+        use futures_util::StreamExt as _;
+        let err_resp = r#"{"jsonrpc":"2.0","id":77,"error":{"code":-32602,"message":"unsupported reasoning effort"}}"#;
+        // Gated tail: the error frame is released only AFTER the pending/latest
+        // registration below, so the reader can never race past the setup.
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(format!("{err_resp}\n").into_bytes());
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-rej", Box::new(fake)).await;
+        // Live path: dispatch(SetConfigOption{effort}) registers the rpc id → label
+        // AND marks it as the latest effort set (stale-reject guard).
+        backend
+            .latest_effort_set_rpc
+            .store(77, std::sync::atomic::Ordering::SeqCst);
+        backend
+            .pending_set
+            .lock()
+            .await
+            .insert(77, "effort\u{2192}xhigh".to_string());
+        let mut events = backend.events();
+        release();
+        let mut rejected = None;
+        let mut saw_notice = false;
+        for _ in 0..80 {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await {
+                Ok(Some(env)) => match env.event {
+                    SessionEvent::AdapterSpecific { tag, payload } if tag == "config_option_rejected" => {
+                        rejected = Some(payload);
+                    }
+                    SessionEvent::Notice { .. } => {
+                        saw_notice = true;
+                        break;
+                    }
+                    _ => {}
+                },
+                _ => break,
+            }
+        }
+        let payload = rejected.expect("a rejected effort set must emit config_option_rejected");
+        assert_eq!(payload.get("option_id").and_then(Value::as_str), Some("effort"));
+        assert_eq!(payload.get("value").and_then(Value::as_str), Some("xhigh"));
+        assert!(saw_notice, "the user-facing Notice still rides alongside");
+    }
+
+    /// P: a LATE reject of a SUPERSEDED effort set must emit neither the structured
+    /// signal nor the Notice — high→low→high where the first high's JSON-RPC error
+    /// arrives after the third set; correlated by rpc id against the latest set.
+    #[tokio::test]
+    async fn stale_effort_set_rejection_is_ignored() {
+        use futures_util::StreamExt as _;
+        let err_resp = r#"{"jsonrpc":"2.0","id":77,"error":{"code":-32602,"message":"unsupported reasoning effort"}}"#;
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(format!("{err_resp}\n").into_bytes());
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-stale", Box::new(fake)).await;
+        backend
+            .pending_set
+            .lock()
+            .await
+            .insert(77, "effort\u{2192}high".to_string());
+        // Two newer sets happened; rpc 93 is the latest.
+        backend
+            .latest_effort_set_rpc
+            .store(93, std::sync::atomic::Ordering::SeqCst);
+        let mut events = backend.events();
+        release();
+        let saw_reconcile = tokio::time::timeout(std::time::Duration::from_millis(600), async {
+            while let Some(env) = events.next().await {
+                match env.event {
+                    SessionEvent::Notice { .. } => return true,
+                    SessionEvent::AdapterSpecific { ref tag, .. } if tag == "config_option_rejected" => return true,
+                    _ => {}
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            !saw_reconcile,
+            "a stale reject must emit neither Notice nor structured signal"
+        );
+        assert!(
+            backend.pending_set.lock().await.is_empty(),
+            "the stale pending entry is still claimed (no leak)"
+        );
+    }
+
+    /// A CONFIGURED session's catalog push must confirm the REQUESTED model (the
+    /// live tracked current), not reset the highlight to the catalog's isDefault —
+    /// and the effort current must follow that model's defaultReasoningEffort.
+    #[tokio::test]
+    async fn model_list_catalog_updated_prefers_configured_model_over_default() {
+        use futures_util::StreamExt as _;
+        // Both models carry defaults (calibrated shape); isDefault is gpt-5.5, but
+        // the session was CONFIGURED for gpt-5.4.
+        let model_resp = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"openai.gpt-5.5","displayName":"GPT-5.5","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"medium"}],"defaultReasoningEffort":"medium","isDefault":true},{"id":"openai.gpt-5.4","displayName":"gpt-5.4","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"}],"defaultReasoningEffort":"high","isDefault":false}],"nextCursor":null}}"#;
+        let fake = FakeAgentIo::never_exits(format!("{model_resp}\n").into_bytes());
+        let backend = CodexSessionBackend::build_with_io("codex-cfg", Box::new(fake)).await;
+        // Live path: `spawn` seeds the tracked current from config.model.
+        *backend.current_model.lock().await = Some("openai.gpt-5.4".to_string());
+        backend.pending_discovery.lock().await.insert(50, DiscoveryKind::Models);
+        let mut events = backend.events();
+        let mut found = None;
+        for _ in 0..80 {
+            if let Ok(Some(env)) = tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await
+                && let SessionEvent::CatalogUpdated {
+                    models,
+                    current_model,
+                    current_effort,
+                    ..
+                } = env.event
+                && !models.is_empty()
+            {
+                found = Some((current_model, current_effort));
+                break;
+            }
+        }
+        let (current_model, current_effort) = found.expect("a CatalogUpdated must be broadcast");
+        assert_eq!(
+            current_model.as_deref(),
+            Some("openai.gpt-5.4"),
+            "the configured/tracked model wins over the catalog isDefault"
+        );
+        assert_eq!(
+            current_effort.as_deref(),
+            Some("high"),
+            "the effort current follows the CONFIGURED model's defaultReasoningEffort"
+        );
+    }
+
+    /// The DETACHED startup seed on the wire (minimal branch — no first-turn
+    /// gate): configured non-default model B with a seeded effort. Expected
+    /// outbound order: settings{model B} → its ack consumed (the best-effort
+    /// drain barrier) → settings{effort}. The first turn is NOT gated on these
+    /// writes (see Limitations).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn detached_seed_applies_model_then_effort_in_order() {
+        let started = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-boot"}}}"#;
+        let model_resp = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"model-a","displayName":"A","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"medium"}],"defaultReasoningEffort":"medium","isDefault":true},{"id":"model-b","displayName":"B","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"}],"defaultReasoningEffort":"high","isDefault":false}],"nextCursor":null}}"#;
+        let ack1 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n"
+            .as_bytes()
+            .to_vec();
+        let fake =
+            FakeAgentIo::never_exits(format!("{started}\n{model_resp}\n").into_bytes()).with_gated_segments(vec![ack1]);
+        let captured = fake.captured_stdin();
+        let release = fake.segment_releaser();
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-boot", Box::new(fake)).await);
+        backend.pending_discovery.lock().await.insert(50, DiscoveryKind::Models);
+        let _events = backend.events();
+        for _ in 0..80 {
+            let filled = !backend
+                .discovered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .models
+                .is_empty();
+            if filled && backend.thread_binding.lock().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        spawn_codex_bootstrap(backend.clone(), Some("model-b".into()), None, Some("high".into()));
+        // Model settings write first; the effort write waits for the model ACK
+        // (best-effort drain barrier keeps the wire order deterministic).
+        let mut wire = String::new();
+        for _ in 0..80 {
+            wire = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if wire.contains("\"model\":\"model-b\"") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            wire.contains("\"model\":\"model-b\""),
+            "model settings written, got: {wire}"
+        );
+        assert!(
+            !wire.contains("\"effort\""),
+            "the effort write waits for the model ACK: {wire}"
+        );
+        release();
+        for _ in 0..80 {
+            wire = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if wire.contains("\"effort\":\"high\"") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let model_at = wire.find("\"model\":\"model-b\"").expect("model settings on wire");
+        let effort_at = wire.find("\"effort\":\"high\"").expect("effort settings on wire");
+        assert!(
+            model_at < effort_at,
+            "outbound order must be model → effort, got: {wire}"
         );
     }
 

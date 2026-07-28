@@ -448,6 +448,26 @@ pub struct ClaudeSessionBackend {
     /// `std::sync::Mutex` (NOT tokio) so the sync reader `process_batch` closure can
     /// lock it without awaiting — mirrors `current_mode_override`.
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// The ctl-id of the LATEST `set_config_option(effort)` dispatch. A rejection is
+    /// reconciled (clear `current_effort` + structured `config_option_rejected`) ONLY
+    /// when its request_id matches this — a late reject for a SUPERSEDED set (e.g.
+    /// high→low→high where the first high's reject arrives after the third set) must
+    /// not tear down the newer value it no longer speaks for. ctl ids are minted
+    /// monotonically, so equality against the latest is an exact "is this reject
+    /// about the current value" test.
+    latest_effort_ctl: Arc<std::sync::Mutex<Option<String>>>,
+    /// TEST SEAM (compiled out of production via `#[cfg(test)]`): when set, the
+    /// NEXT immediate control write in `write_or_queue_control_prepared` fails with
+    /// a synthetic transport error and resets the flag — exercises the effort
+    /// write-error rollback path deterministically.
+    #[cfg(test)]
+    fail_next_write: Arc<std::sync::atomic::AtomicBool>,
+    /// TEST SEAM (compiled out of production via `#[cfg(test)]`): when armed, the
+    /// NEXT immediate control write PARKS on this notify BEFORE writing — lets a
+    /// test process a reject WHILE a dispatch is mid-write, mutation-proving the
+    /// pre-stamp (a post-write stamp would resurrect the refused level).
+    #[cfg(test)]
+    write_hold: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>>,
 }
 
 /// One outstanding claude `can_use_tool` request, stored so `AnswerPermission` can
@@ -508,7 +528,6 @@ struct ClaudeReaderState {
     discovered_model: Arc<std::sync::Mutex<Option<String>>>,
     /// #98/#101: shared catalog the reader fills from the initialize control_response.
     discovered_caps: Arc<std::sync::Mutex<DiscoveredCaps>>,
-    want_init_model: bool,
     /// F-4 turn-active flag: set true on dispatch(Send), cleared by the reader at a
     /// turn terminal (TurnResult / Detached). The idle timer reads it so a streaming
     /// turn is never suspended mid-flight (see SuspendController::suspend_if_idle).
@@ -524,6 +543,16 @@ struct ClaudeReaderState {
     /// `sniff_set_config_reject` can surface a rejection as a `Notice{Warning}`
     /// (shared Arc with `ClaudeSessionBackend.pending_set_config`).
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// CP-1 mirror (shared Arc with `ClaudeSessionBackend.current_effort`): the
+    /// optimistically-tracked effort level. `sniff_set_config_reject` CLEARS it when
+    /// claude rejects the set — without the clear, `capabilities().current_effort`
+    /// kept advertising a level claude refused (the same lying-picker bug
+    /// `sniff_mode_reject` fixes for mode). Deliberately NOT stamped into
+    /// `CatalogUpdated` (it is optimistic, not observed — see
+    /// `sniff_control_initialize`).
+    current_effort: Arc<std::sync::Mutex<Option<String>>>,
+    /// Mirror of `ClaudeSessionBackend.latest_effort_ctl` (stale-reject guard).
+    latest_effort_ctl: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Spawn a claude stdout reader over `stdout`/`io` using the shared state. Used
@@ -545,10 +574,11 @@ fn start_claude_reader(
             state.pending_perms,
             state.discovered_model,
             state.discovered_caps,
-            state.want_init_model,
             state.turn_in_flight,
             state.current_mode_override,
             state.pending_set_config,
+            state.current_effort,
+            state.latest_effort_ctl,
         )
         .await;
     })
@@ -585,9 +615,16 @@ impl ClaudeSessionBackend {
         // #99: shared with the reader so a rejected set_config_option(effort) surfaces
         // a Notice instead of being silently dropped.
         let pending_set_config = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        // B-CLAUDE-INIT: only let the wire fill current_model when config did NOT
-        // supply one (config is authoritative; the init frame is the fallback).
-        let want_init_model = config.model.is_none();
+        // CP-1: shared with the reader so it can clear the optimistic value on a
+        // rejected set (no lying picker).
+        let current_effort = Arc::new(std::sync::Mutex::new(None));
+        // P: stale-reject guard — the reader only reconciles a reject whose ctl-id
+        // matches the LATEST effort set.
+        let latest_effort_ctl: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        #[cfg(test)]
+        let fail_next_write = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(test)]
+        let write_hold: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>> = Arc::new(std::sync::Mutex::new(None));
         let (event_tx, _) = broadcast::channel(1024);
 
         let stdio = io.take_stdio().await;
@@ -603,10 +640,11 @@ impl ClaudeSessionBackend {
             pending_perms: pending_perms.clone(),
             discovered_model: discovered_model.clone(),
             discovered_caps: discovered_caps.clone(),
-            want_init_model,
             turn_in_flight: turn_in_flight.clone(),
             current_mode_override: current_mode_override.clone(),
             pending_set_config: pending_set_config.clone(),
+            current_effort: current_effort.clone(),
+            latest_effort_ctl: latest_effort_ctl.clone(),
         };
         let reader = start_claude_reader(&reader_state, stdout, io.clone());
 
@@ -659,9 +697,14 @@ impl ClaudeSessionBackend {
             discovered_caps,
             pending_controls: Arc::new(Mutex::new(Vec::new())),
             control_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            current_effort: Arc::new(std::sync::Mutex::new(None)),
+            current_effort,
             current_mode_override,
             pending_set_config,
+            latest_effort_ctl,
+            #[cfg(test)]
+            fail_next_write,
+            #[cfg(test)]
+            write_hold,
         }
     }
 
@@ -801,23 +844,71 @@ impl ClaudeSessionBackend {
         efforts.is_empty() || efforts.contains(&value)
     }
 
-    async fn write_or_queue_control(&self, request: serde_json::Value) -> Result<String, BackendError> {
+    /// Mint the next `ctl-N` request id. Split from the write so a caller can
+    /// register reader-side correlation state (pending maps, latest-set stamps)
+    /// BEFORE the frame is on the wire — registering after the write races a fast
+    /// control_response, which the reader would then find unclaimed and drop.
+    fn mint_ctl_id(&self) -> String {
         use std::sync::atomic::Ordering;
-        let request_id = format!("ctl-{}", self.control_seq.fetch_add(1, Ordering::SeqCst) + 1);
+        format!("ctl-{}", self.control_seq.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    async fn write_or_queue_control(&self, request: serde_json::Value) -> Result<String, BackendError> {
+        let request_id = self.mint_ctl_id();
+        self.write_or_queue_control_prepared(&request_id, request).await?;
+        Ok(request_id)
+    }
+
+    /// Write (or mid-turn queue) a control_request under a PRE-MINTED id (see
+    /// [`mint_ctl_id`]).
+    async fn write_or_queue_control_prepared(
+        &self,
+        request_id: &str,
+        request: serde_json::Value,
+    ) -> Result<(), BackendError> {
+        use std::sync::atomic::Ordering;
         let frame = serde_json::json!({
             "type": "control_request",
             "request_id": request_id,
             "request": request,
         });
-        if self.turn_in_flight.load(Ordering::SeqCst) {
-            let subtype = control_subtype(&frame);
-            let mut q = self.pending_controls.lock().await;
-            q.retain(|f| control_subtype(f) != subtype);
-            q.push(frame);
-            return Ok(request_id);
+        // TOCTOU guard: the in-flight check and the control write happen under the
+        // SAME stdin lock `dispatch(Send)` writes the prompt through, and Send sets
+        // `turn_in_flight` BEFORE acquiring that lock. So either this task observes
+        // in-flight=false while HOLDING the lock — the prompt cannot have been
+        // written yet, the control lands strictly before it (the ordering the
+        // pending-queue exists to guarantee) — or it observes true and queues for
+        // the next Send's drain. The old check-then-lock shape allowed a Send to
+        // complete entirely between the check and the write, landing the control
+        // MID-TURN (exactly what the queue is meant to prevent).
+        {
+            let mut guard = self.stdin.lock().await;
+            if !self.turn_in_flight.load(Ordering::SeqCst) {
+                #[cfg(test)]
+                {
+                    if self.fail_next_write.swap(false, Ordering::SeqCst) {
+                        return Err(BackendError::Transport("control write tripped (test seam)".into()));
+                    }
+                    let hold = self.write_hold.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if let Some(notify) = hold {
+                        notify.notified().await;
+                    }
+                }
+                let stdin = guard
+                    .as_mut()
+                    .ok_or_else(|| BackendError::Transport("claude stdin unavailable".into()))?;
+                self.adapter
+                    .write_control_response(stdin, &frame)
+                    .await
+                    .map_err(|e| BackendError::Transport(format!("write control_request: {e}")))?;
+                return Ok(());
+            }
         }
-        self.write_control_frame(&frame).await?;
-        Ok(request_id)
+        let subtype = control_subtype(&frame);
+        let mut q = self.pending_controls.lock().await;
+        q.retain(|f| control_subtype(f) != subtype);
+        q.push(frame);
+        Ok(())
     }
 
     /// G-A: interrupt the in-flight turn — write `control_request{subtype:"interrupt"}`
@@ -1079,10 +1170,11 @@ async fn reader_task(
     pending_perms: Arc<std::sync::Mutex<std::collections::HashMap<String, PendingPerm>>>,
     discovered_model: Arc<std::sync::Mutex<Option<String>>>,
     discovered_caps: Arc<std::sync::Mutex<DiscoveredCaps>>,
-    want_init_model: bool,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
     current_mode_override: Arc<std::sync::Mutex<Option<String>>>,
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    current_effort: Arc<std::sync::Mutex<Option<String>>>,
+    latest_effort_ctl: Arc<std::sync::Mutex<Option<String>>>,
 ) {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
@@ -1146,13 +1238,21 @@ async fn reader_task(
                 // parse_system drops). Done on the RAW frame so parse_chunk's
                 // event stream stays zero-diff. Emits Provisioning per MCP
                 // server (parity with codex mcpServerStatus→Provisioning).
-                sniff_init(v, want_init_model, &discovered_model, &event_tx, &session_id, cur_gen);
+                sniff_init(v, &discovered_model, &event_tx, &session_id, cur_gen);
                 // #98/#101: sniff the `control_request{initialize}` RESPONSE for the
                 // selectable model list + slash commands (claude's only catalog
                 // channel — the data init frame above carries neither). Fills
                 // discovered_caps; capabilities() merges it on read. Done on the RAW
                 // frame (parse_chunk drops control frames to opaque).
-                sniff_control_initialize(v, &discovered_caps, &event_tx, &session_id, cur_gen);
+                sniff_control_initialize(
+                    v,
+                    &discovered_caps,
+                    &discovered_model,
+                    &current_mode_override,
+                    &event_tx,
+                    &session_id,
+                    cur_gen,
+                );
                 // AUTHORITATIVE mode signal (design §9.10.1 option A / README #10):
                 // claude stamps `permissionMode` on system/init AND system/status. This
                 // single inbound path confirms EVERY mode change — user-driven (a
@@ -1170,7 +1270,15 @@ async fn reader_task(
                 // no handler before and was SILENTLY DROPPED. Routed by the ctl-id we
                 // minted + registered in pending_set_config → surface a Notice{Warning}.
                 // SUCCESS is silent (claude does not echo effort); the entry is just removed.
-                sniff_set_config_reject(v, &pending_set_config, &event_tx, &session_id, cur_gen);
+                sniff_set_config_reject(
+                    v,
+                    &pending_set_config,
+                    &latest_effort_ctl,
+                    &current_effort,
+                    &event_tx,
+                    &session_id,
+                    cur_gen,
+                );
                 // NO set_model reader-side reconcile (design §9.10.1, Optimistic tier).
                 // LIVE-PROBED (2.1.187, protocols/samples/claude-cli/2.1.187/_all_set_model.jsonl):
                 // claude's set_model control_response is a BARE {subtype:"success"} — no
@@ -1549,15 +1657,16 @@ fn register_or_clear_pending(
 }
 
 /// B-CLAUDE-INIT: sniff a raw `system/init` frame for discovery data the legacy
-/// `parse_system` drops. Captures `model` into `discovered_model` (only when
-/// `want_init_model`, i.e. config supplied none) and emits a `Provisioning` event
+/// `parse_system` drops. ALWAYS captures `model` into `discovered_model` (the
+/// authoritative observed current for every session — the old `want_init_model`
+/// skip-when-configured gate is gone, see the call-site note) and emits a
+/// `Provisioning` event
 /// per `mcp_servers[]` entry (connected→ToolsReady, failed→LoadFailed,
 /// needs-auth→Degraded) — parity with codex `mcpServerStatus→Provisioning`, so a
 /// failed/needs-auth MCP server is visible on the claude seam too. No-op for any
 /// non-init frame. Done on the raw frame (NOT parse_chunk) to keep zero-diff.
 fn sniff_init(
     frame: &serde_json::Value,
-    want_init_model: bool,
     discovered_model: &Arc<std::sync::Mutex<Option<String>>>,
     event_tx: &broadcast::Sender<SessionEnvelope>,
     session_id: &str,
@@ -1569,7 +1678,14 @@ fn sniff_init(
     {
         return;
     }
-    if want_init_model && let Some(model) = frame.get("model").and_then(Value::as_str) {
+    // ALWAYS observe the init model — claude stamps the model it ACTUALLY runs
+    // (including a config-requested one, resolved) on system/init, so this is the
+    // authoritative observed current for CatalogUpdated. Config authority for
+    // `capabilities().current_model` is preserved separately by its None-only merge;
+    // the old `want_init_model` gate (skip when config supplied a model) left
+    // `discovered_model` empty for configured sessions and the catalog push then
+    // carried `current_model: None` — wiping the model highlight it should confirm.
+    if let Some(model) = frame.get("model").and_then(Value::as_str) {
         *discovered_model.lock().unwrap_or_else(|e| e.into_inner()) = Some(model.to_string());
     }
     // Addendum 9 parity (codex thread/started, acp session/new|load): lower the
@@ -1681,9 +1797,12 @@ fn sniff_mode(
 /// those keys is unambiguously the initialize reply. No-op for any other frame
 /// (can_use_tool success, set_model ack, etc. carry no `models`). Done on the RAW
 /// frame (parse_chunk drops control frames to opaque) — keeps the parse zero-diff.
+#[allow(clippy::too_many_arguments)]
 fn sniff_control_initialize(
     frame: &serde_json::Value,
     discovered_caps: &Arc<std::sync::Mutex<DiscoveredCaps>>,
+    discovered_model: &Arc<std::sync::Mutex<Option<String>>>,
+    current_mode_override: &Arc<std::sync::Mutex<Option<String>>>,
     event_tx: &broadcast::Sender<SessionEnvelope>,
     session_id: &str,
     turn_gen: u64,
@@ -1769,6 +1888,17 @@ fn sniff_control_initialize(
     // selector stays disabled. Carry claude's fixed permission modes too: the
     // frontend replaces the WHOLE config_options snapshot on this frame, so omitting
     // modes would wipe the (synchronously-available) mode picker — a fresh regression.
+    // Stamp the OBSERVED currents only: `discovered_model` is the model claude
+    // itself reported on system/init (authoritative, config-requested sessions
+    // included); `current_mode_override` is reconciled to claude's own
+    // set_permission_mode ack / system-status track. `current_effort` is
+    // deliberately NOT stamped: claude never echoes effort, so our tracker is
+    // purely OPTIMISTIC — baking it into the event would let a later reject
+    // re-push resurrect the very value the backend refused (the pump would read
+    // it back out of its retained catalog). The effort highlight rides solely on
+    // the task-runtime override, which the reject reconcile clears.
+    let current_model = discovered_model.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let current_mode = current_mode_override.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let _ = event_tx.send(SessionEnvelope {
         session_id: session_id.to_string(),
         turn_gen,
@@ -1776,6 +1906,9 @@ fn sniff_control_initialize(
             models: parsed_models,
             modes: crate::adapter::claude_permission_modes(),
             slash_commands: parsed_commands,
+            current_model,
+            current_mode,
+            current_effort: None,
         },
     });
 }
@@ -1841,6 +1974,8 @@ fn sniff_mode_reject(
 fn sniff_set_config_reject(
     frame: &serde_json::Value,
     pending_set_config: &Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    latest_effort_ctl: &Arc<std::sync::Mutex<Option<String>>>,
+    current_effort: &Arc<std::sync::Mutex<Option<String>>>,
     event_tx: &broadcast::Sender<SessionEnvelope>,
     session_id: &str,
     turn_gen: u64,
@@ -1867,12 +2002,49 @@ fn sniff_set_config_reject(
         // current_effort already reflects it. Just drop the pending entry (done above).
         return;
     }
+    // Stale-reject guard: only a rejection of the LATEST effort set reconciles
+    // state. A superseded set's late reject (high -> low -> high; the first high's
+    // error lands after the third set) speaks for a value that is no longer
+    // current — clearing on it would tear down the newer, possibly-accepted value.
+    // A stale reject is logged and dropped whole (its Notice would also mislead:
+    // the level it names may be active again via a newer accepted set).
+    let is_latest = latest_effort_ctl.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(request_id);
     let err = response.get("error").and_then(Value::as_str).unwrap_or("set rejected");
+    if !is_latest {
+        tracing::info!(
+            session_id = %session_id,
+            set = %label,
+            "claude set_config_option(effort) rejected for a SUPERSEDED set; ignoring: {err}"
+        );
+        return;
+    }
     tracing::error!(
         session_id = %session_id,
         set = %label,
         "claude set_config_option(effort) rejected: {err}"
     );
+    // The set did not take → clear the optimistic tracker IF it still holds the
+    // rejected value, so `capabilities().current_effort` stops advertising a level
+    // claude refused (the mode analogue is `sniff_mode_reject`). A later successful
+    // set may already have overwritten it — only a matching value is cleared.
+    let rejected_value = label.split('\u{2192}').nth(1).unwrap_or("").to_string();
+    {
+        let mut cur = current_effort.lock().unwrap_or_else(|e| e.into_inner());
+        if cur.as_deref() == Some(rejected_value.as_str()) {
+            *cur = None;
+        }
+    }
+    // Structured reject signal for the task-level pump (it seeded/holds its own
+    // optimistic effort highlight and must clear it too — it cannot parse the
+    // free-text Notice below). Same envelope pattern as `mode_switch_rejected`.
+    let _ = event_tx.send(SessionEnvelope {
+        session_id: session_id.to_string(),
+        turn_gen,
+        event: SessionEvent::AdapterSpecific {
+            tag: "config_option_rejected".to_string(),
+            payload: serde_json::json!({ "option_id": "effort", "value": rejected_value, "error": err }),
+        },
+    });
     let _ = event_tx.send(SessionEnvelope {
         session_id: session_id.to_string(),
         turn_gen,
@@ -2398,24 +2570,68 @@ impl SessionBackend for ClaudeSessionBackend {
                     } else {
                         serde_json::json!({ "effortLevel": value })
                     };
-                    let request_id = self
-                        .write_or_queue_control(serde_json::json!({
-                            "subtype": "apply_flag_settings",
-                            "settings": settings,
-                        }))
-                        .await?;
-                    // #99: register the minted ctl-id so the reader surfaces a REJECTION
-                    // (bad effort value → control_response{error}) as a Notice instead of
-                    // silently dropping it. Success is silent (claude does not echo effort);
-                    // the reader just removes the entry on a matching success.
+                    // #99: register the minted ctl-id BEFORE the frame hits the wire —
+                    // a fast control_response would otherwise find the pending map
+                    // empty and the rejection would be silently dropped. The reader
+                    // surfaces a REJECTION (bad effort value → control_response{error})
+                    // as a Notice + structured signal; success just removes the entry.
+                    let request_id = self.mint_ctl_id();
                     self.pending_set_config
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(request_id, format!("effort\u{2192}{value}"));
-                    // CP-1: claude does not echo effort back, so remember it here →
-                    // `capabilities().current_effort` highlights the active level for
-                    // the picker (the frontend confirms by re-reading get_config_options).
-                    *self.current_effort.lock().unwrap_or_else(|e| e.into_inner()) = Some(value.clone());
+                        .insert(request_id.clone(), format!("effort\u{2192}{value}"));
+                    // Stale-reject guard: remember which ctl-id speaks for the CURRENT
+                    // value, so the reader ignores a late reject of a superseded set.
+                    // Capture the PRIOR latest so a synchronous write error can RESTORE
+                    // it (round-12 P1-1): if a previous set A is still pending on the
+                    // wire and this set B's write fails, clearing latest to None would
+                    // strand A's late reject (its is-latest check would fail and it
+                    // would never reconcile). Restoring A keeps it reconcilable.
+                    let prior_latest_ctl = self
+                        .latest_effort_ctl
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .replace(request_id.clone());
+                    // CP-1 fast-reject fix (round-11): PRE-STAMP the optimistic
+                    // current BEFORE the write. claude does not echo effort, so the
+                    // tracker is the picker's source. Stamping it AFTER the write
+                    // let a FAST reject (control_response arriving before this arm
+                    // returned) clear the tracker (by-value) and then be RE-SET by
+                    // the post-write stamp — resurrecting the refused level. With
+                    // the pre-stamp the reader's by-value clear is the last write,
+                    // so a fast reject leaves the tracker cleared. The prior value
+                    // is restored on a synchronous write error (the frame never
+                    // left, so nothing is optimistically in effect).
+                    let prior_effort = {
+                        let mut cur = self.current_effort.lock().unwrap_or_else(|e| e.into_inner());
+                        (*cur).replace(value.clone())
+                    };
+                    if let Err(e) = self
+                        .write_or_queue_control_prepared(
+                            &request_id,
+                            serde_json::json!({
+                                "subtype": "apply_flag_settings",
+                                "settings": settings,
+                            }),
+                        )
+                        .await
+                    {
+                        // The frame never left: roll the correlation state back so the
+                        // dead id can neither leak nor mask a later real reject, and
+                        // restore the previous optimistic current.
+                        self.pending_set_config
+                            .lock()
+                            .unwrap_or_else(|g| g.into_inner())
+                            .remove(&request_id);
+                        {
+                            let mut latest = self.latest_effort_ctl.lock().unwrap_or_else(|g| g.into_inner());
+                            if latest.as_deref() == Some(request_id.as_str()) {
+                                *latest = prior_latest_ctl;
+                            }
+                        }
+                        *self.current_effort.lock().unwrap_or_else(|g| g.into_inner()) = prior_effort;
+                        return Err(e);
+                    }
                     let cur_gen = self.turn_gen.load(Ordering::SeqCst);
                     Ok(CommandReceipt {
                         accepted: true,
@@ -3517,6 +3733,102 @@ mod tests {
         );
     }
 
+    /// Startup ordering on the WIRE: an effort set dispatched before the first
+    /// Send (the task-level startup barrier drains the seed this way) must land on
+    /// stdin strictly BEFORE the prompt — the first turn runs at the seeded level.
+    #[tokio::test]
+    async fn effort_set_before_first_send_lands_before_the_prompt() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = ClaudeSessionBackend::build_with_io("s-order", Box::new(fake)).await;
+
+        backend
+            .dispatch(Command::SetConfigOption {
+                option_id: "effort".into(),
+                value: "high".into(),
+            })
+            .await
+            .expect("effort set accepted");
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("hi".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect("send accepted");
+
+        // The capture drains asynchronously — poll until both frames landed.
+        let mut written = String::new();
+        for _ in 0..40 {
+            written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if written.contains("apply_flag_settings") && written.contains("\"hi\"") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let effort_at = written
+            .find("apply_flag_settings")
+            .expect("the effort control_request must be written");
+        let prompt_at = written.find("\"hi\"").expect("the prompt must be written");
+        assert!(
+            effort_at < prompt_at,
+            "the effort control frame must precede the prompt on stdin, got: {written}"
+        );
+    }
+
+    /// TOCTOU shape: with a turn in flight, `write_or_queue_control` must QUEUE the
+    /// control (checked and written under the same stdin lock the prompt path
+    /// uses), never write it mid-turn; the queued frame drains at the head of the
+    /// NEXT Send, before its prompt.
+    #[tokio::test]
+    async fn effort_set_mid_turn_is_queued_and_drains_before_next_prompt() {
+        use std::sync::atomic::Ordering;
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = ClaudeSessionBackend::build_with_io("s-queue", Box::new(fake)).await;
+
+        // A turn is in flight (dispatch(Send) sets this before taking the stdin lock).
+        backend.turn_in_flight.store(true, Ordering::SeqCst);
+        backend
+            .dispatch(Command::SetConfigOption {
+                option_id: "effort".into(),
+                value: "high".into(),
+            })
+            .await
+            .expect("effort set accepted (queued)");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !String::from_utf8_lossy(&captured.lock().await.clone()).contains("apply_flag_settings"),
+            "a mid-turn effort set must be queued, not written"
+        );
+
+        // Turn ends; the next Send drains the queue BEFORE its prompt.
+        backend.turn_in_flight.store(false, Ordering::SeqCst);
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("next".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect("send accepted");
+        let mut written = String::new();
+        for _ in 0..40 {
+            written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if written.contains("apply_flag_settings") && written.contains("\"next\"") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let effort_at = written
+            .find("apply_flag_settings")
+            .expect("the queued effort control must drain");
+        let prompt_at = written.find("\"next\"").expect("the prompt must be written");
+        assert!(
+            effort_at < prompt_at,
+            "the drained control must precede the next prompt, got: {written}"
+        );
+    }
+
     /// §C5 HARD acceptance: claude parse ZERO-DIFF. The new ClaudeSessionBackend
     /// MUST surface exactly the SessionEvent sequence the legacy
     /// `ClaudeAdapter::parse_chunk` produces for the same bytes — the wrapping
@@ -4089,6 +4401,159 @@ mod tests {
         assert!(matches!(err, BackendError::CommandNotSupported { command } if command == "set_config_option"));
     }
 
+    /// Round-12 P1-1 (claude): set A is written and pending; set B's write FAILS.
+    /// The rollback must RESTORE A as the latest effort ctl (not clear it to
+    /// None), so A's LATE reject still reconciles (clears the tracker + emits the
+    /// structured signal). Without the restore, A's reject would fail its
+    /// is-latest check and be silently dropped, leaving the refused level active.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_error_restores_prior_latest_so_late_reject_reconciles() {
+        use futures_util::StreamExt as _;
+        // A's late reject (ctl-1) is gated until after B's write fails.
+        let reject_a = concat!(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"ctl-1","error":"unknown effort level: high"}}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(reject_a);
+        let release = fake.stdout_releaser();
+        let backend = ClaudeSessionBackend::build_with_io("s-p11", Box::new(fake)).await;
+        let mut events = backend.events();
+        // Set A "high" → written (ctl-1), pending, latest=ctl-1, current=high.
+        backend
+            .dispatch(Command::SetConfigOption {
+                option_id: "effort".into(),
+                value: "high".into(),
+            })
+            .await
+            .expect("A accepted");
+        // Set B "low" with the NEXT write tripped → the rollback must restore A.
+        backend.fail_next_write.store(true, std::sync::atomic::Ordering::SeqCst);
+        let b = backend
+            .dispatch(Command::SetConfigOption {
+                option_id: "effort".into(),
+                value: "low".into(),
+            })
+            .await;
+        assert!(b.is_err(), "B's tripped write must surface as Err, got: {b:?}");
+        // A must still be the latest ctl (restored), and its pending entry intact.
+        assert_eq!(
+            backend
+                .latest_effort_ctl
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref(),
+            Some("ctl-1"),
+            "the failed B write must RESTORE A as the latest effort ctl"
+        );
+        // Release A's late reject → it must reconcile (structured signal + clear).
+        release();
+        let signalled = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if matches!(&env.event, SessionEvent::AdapterSpecific { tag, .. } if tag == "config_option_rejected") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            signalled,
+            "A's late reject must reconcile (never dropped as non-latest)"
+        );
+        assert!(
+            backend
+                .current_effort
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "the reconcile must clear the tracker"
+        );
+    }
+
+    /// Round-11/12 A2 (MUTATION-PROVING): the effort set PRE-STAMPS the
+    /// optimistic current BEFORE the wire write. This test parks the dispatch
+    /// mid-write (write_hold) and lets the reader process the reject WHILE the
+    /// dispatch is still writing — so a post-write stamp (the mutation) would
+    /// re-set the refused level AFTER the reader cleared it, leaving
+    /// current_effort = high. With the pre-stamp the reader's by-value clear is
+    /// the last write and current_effort ends None. Asserting None after the
+    /// dispatch returns therefore KILLS the post-stamp mutation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn effort_reject_during_write_clears_tracker_prestamp_mutation_proving() {
+        // The effort dispatch mints ctl-1; its reject is gated until the dispatch
+        // has parked on the write hold (pending registered, current pre-stamped).
+        let reject = concat!(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"ctl-1","error":"unknown effort level: high"}}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(reject);
+        let release_reject = fake.stdout_releaser();
+        let backend = std::sync::Arc::new(ClaudeSessionBackend::build_with_io("s-mp", Box::new(fake)).await);
+        // Arm the write hold: the dispatch will park mid-write.
+        let hold = std::sync::Arc::new(tokio::sync::Notify::new());
+        *backend.write_hold.lock().unwrap() = Some(hold.clone());
+        let dispatch = {
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                backend
+                    .dispatch(Command::SetConfigOption {
+                        option_id: "effort".into(),
+                        value: "high".into(),
+                    })
+                    .await
+            })
+        };
+        // Wait until the dispatch has registered the pending correlation and
+        // pre-stamped the current (it is now parked on the write hold).
+        for _ in 0..80 {
+            let pending = backend
+                .pending_set_config
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("ctl-1");
+            let stamped = backend.capabilities().current_effort.as_deref() == Some("high");
+            if pending && stamped {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            backend
+                .pending_set_config
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("ctl-1"),
+            "the dispatch must have registered the pending before parking"
+        );
+        // Release the reject → the reader clears the tracker WHILE the dispatch
+        // is still parked mid-write.
+        release_reject();
+        for _ in 0..80 {
+            if backend.capabilities().current_effort.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            backend.capabilities().current_effort.is_none(),
+            "the reader must clear the tracker while the dispatch is mid-write"
+        );
+        // Now let the write complete and the dispatch return.
+        hold.notify_one();
+        dispatch.await.unwrap().expect("dispatch returns");
+        // MUTATION KILL: a post-write stamp would have re-set high here.
+        assert!(
+            backend.capabilities().current_effort.is_none(),
+            "after the dispatch returns the tracker must STILL be cleared (no post-write stamp resurrects the refused level)"
+        );
+        *backend.write_hold.lock().unwrap() = None;
+    }
+
     /// #1 effort catalog validation (ACP `clear_invalid_desired_*` ported to effort).
     /// Once the initialize control_response has advertised a model with a bounded
     /// `supportedEffortLevels` set, a `SetConfigOption{effort}` for a level OUTSIDE that
@@ -4638,12 +5103,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn b_claude_init_does_not_override_config_model() {
-        // config model is authoritative: when build_with_io seeds a model (it does
-        // not — defaults None — so we test the inverse: when config HAS a model, the
-        // init wire model must NOT overwrite it). build_with_io uses default config
-        // (None), so here we assert the wire fills it; the config-wins path is
-        // covered by the want_init_model gate (config.model.is_none()).
+    async fn b_claude_init_populates_model_when_config_absent() {
+        // build_with_io uses the default config (model = None), so the init-wire model
+        // is the only source: assert the reader fills `capabilities().current_model`
+        // from the `system/init` frame. This test does NOT exercise the config-supplied
+        // path (that would need a configured build_with_io); it only pins the
+        // wire-fills-when-absent direction.
         let init = r#"{"type":"system","subtype":"init","session_id":"s","model":"wire-model","tools":[]}"#;
         let fake = FakeAgentIo::never_exits(format!("{init}\n").into_bytes());
         let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
@@ -4731,6 +5196,7 @@ mod tests {
                     models,
                     modes,
                     slash_commands,
+                    ..
                 } = env.event
             {
                 catalog = Some((models, modes, slash_commands));
@@ -4751,6 +5217,52 @@ mod tests {
         );
         assert_eq!(slash_commands.len(), 1, "slash commands ride the event");
         assert_eq!(slash_commands[0].name, "verify");
+    }
+
+    /// The catalog push must carry the OBSERVED currents (system/init model), and
+    /// must NOT carry the optimistic effort tracker: claude never echoes effort, so
+    /// stamping our optimistic value into the event would let a later reject
+    /// re-push resurrect the refused level out of the pump's retained catalog. The
+    /// effort highlight rides solely on the task-runtime override.
+    #[tokio::test]
+    async fn control_initialize_catalog_updated_carries_observed_currents_only() {
+        use futures_util::StreamExt as _;
+        // A system/init (fills discovered_model) followed by the initialize response.
+        let init_frame = r#"{"type":"system","subtype":"init","model":"claude-opus-4-8","session_id":"s-cur"}"#;
+        let init_resp = r#"{"type":"control_response","response":{"subtype":"success","request_id":"ctl-1","response":{"models":[{"value":"claude-opus-4-8","displayName":"Opus","supportedEffortLevels":["low","high"]}]}}}"#;
+        let fake =
+            FakeAgentIo::never_exits(Vec::new()).with_gated_tail(format!("{init_frame}\n{init_resp}\n").into_bytes());
+        let release = fake.stdout_releaser();
+        let backend = ClaudeSessionBackend::build_with_io("s-cur", Box::new(fake)).await;
+        // Even with an optimistic effort tracked (live path: dispatch stored it),
+        // the event must not carry it.
+        *backend.current_effort.lock().unwrap_or_else(|e| e.into_inner()) = Some("high".to_string());
+        let mut events = backend.events();
+        release();
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Ok(Some(env)) = tokio::time::timeout(std::time::Duration::from_millis(200), events.next()).await
+                && let SessionEvent::CatalogUpdated {
+                    current_model,
+                    current_effort,
+                    ..
+                } = env.event
+            {
+                found = Some((current_model, current_effort));
+                break;
+            }
+        }
+        let (current_model, current_effort) = found.expect("a CatalogUpdated must be broadcast on initialize");
+        assert_eq!(
+            current_model.as_deref(),
+            Some("claude-opus-4-8"),
+            "the system/init observed model rides the event"
+        );
+        assert_eq!(
+            current_effort, None,
+            "the OPTIMISTIC effort tracker must NOT ride the event (observed-only)"
+        );
     }
 
     /// A non-initialize success control_response (e.g. a set_model ack, which has no
@@ -5257,16 +5769,25 @@ mod tests {
         let release = fake.stdout_releaser();
         let backend = ClaudeSessionBackend::build_with_io("s-effort-err", Box::new(fake)).await;
         // Register the in-flight effort set keyed on the id we minted (live path:
-        // dispatch(SetConfigOption{effort}) does this).
+        // dispatch(SetConfigOption{effort}) does this) AND the optimistic current
+        // it stored — the reject must roll BOTH back.
         backend.set_pending_set_config_for_test("ctl-9", "effort\u{2192}ultra");
+        *backend.current_effort.lock().unwrap_or_else(|e| e.into_inner()) = Some("ultra".to_string());
+        // Live path: the dispatch that registered ctl-9 also marked it latest.
+        *backend.latest_effort_ctl.lock().unwrap_or_else(|e| e.into_inner()) = Some("ctl-9".to_string());
 
         let mut events = backend.events();
         release();
 
-        let notice = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (rejected, notice) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut rejected = None;
             while let Some(env) = events.next().await {
-                if let SessionEvent::Notice { level, message } = env.event {
-                    return Some((level, message));
+                match env.event {
+                    SessionEvent::AdapterSpecific { tag, payload } if tag == "config_option_rejected" => {
+                        rejected = Some(payload);
+                    }
+                    SessionEvent::Notice { level, message } => return Some((rejected, (level, message))),
+                    _ => {}
                 }
             }
             None
@@ -5280,6 +5801,24 @@ mod tests {
             "the Notice carries the label + claude's error message, got: {}",
             notice.1
         );
+        // The structured reject signal precedes the Notice so the task-level pump can
+        // clear its own optimistic highlight (it cannot parse the free-text Notice).
+        let payload = rejected.expect("a config_option_rejected must ride alongside the Notice");
+        assert_eq!(
+            payload.get("value").and_then(serde_json::Value::as_str),
+            Some("ultra"),
+            "the rejected value rides the structured payload"
+        );
+        // The optimistic current_effort was rolled back — capabilities() must no
+        // longer advertise a level claude refused (the mode analogue: sniff_mode_reject).
+        assert!(
+            backend
+                .current_effort
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "the rejected optimistic current_effort must be cleared"
+        );
         // The matching pending entry was claimed; the permission-mode error (ctl-1)
         // never had one, so it produced no effort Notice and left no leak.
         assert!(
@@ -5289,6 +5828,66 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty(),
             "the pending_set_config entry is claimed (no leak)"
+        );
+    }
+
+    /// P: a LATE reject of a SUPERSEDED effort set must reconcile NOTHING — the
+    /// high→low→high interleaving where the FIRST high's error control_response
+    /// arrives after the THIRD set: clearing on it would tear down the newer value
+    /// it no longer speaks for. Correlated by ctl-id against the latest set.
+    #[tokio::test]
+    async fn stale_effort_reject_is_ignored() {
+        let tail = concat!(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"ctl-3","error":"unknown effort level: high"}}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(tail);
+        let release = fake.stdout_releaser();
+        let backend = ClaudeSessionBackend::build_with_io("s-stale", Box::new(fake)).await;
+        // The FIRST set (ctl-3, "high") is still pending, but two newer sets have
+        // happened since; the LATEST (ctl-7) re-selected "high" and succeeded.
+        backend.set_pending_set_config_for_test("ctl-3", "effort\u{2192}high");
+        *backend.current_effort.lock().unwrap_or_else(|e| e.into_inner()) = Some("high".to_string());
+        *backend.latest_effort_ctl.lock().unwrap_or_else(|e| e.into_inner()) = Some("ctl-7".to_string());
+
+        let mut events = backend.events();
+        release();
+
+        // Drain briefly: NO Notice and NO config_option_rejected may surface.
+        let saw_reconcile = tokio::time::timeout(std::time::Duration::from_millis(600), async {
+            while let Some(env) = events.next().await {
+                match env.event {
+                    SessionEvent::Notice { .. } => return true,
+                    SessionEvent::AdapterSpecific { ref tag, .. } if tag == "config_option_rejected" => return true,
+                    _ => {}
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            !saw_reconcile,
+            "a stale reject must emit neither Notice nor structured signal"
+        );
+        assert_eq!(
+            backend
+                .current_effort
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref(),
+            Some("high"),
+            "the current value the stale reject no longer speaks for must survive"
+        );
+        assert!(
+            backend
+                .pending_set_config
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "the stale pending entry is still claimed (no leak)"
         );
     }
 

@@ -36,6 +36,10 @@ use aionui_common::AgentType;
 use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStateParams};
 use aionui_realtime::EventBroadcaster;
 
+use crate::session_catalog::{
+    CatalogPreload, EFFORT_CONFIG_KEY, catalog_partial_from_caps, resolve_current_model_efforts, resolve_initial_effort,
+};
+
 const EVENT_CHANNEL_CAPACITY: usize = 512;
 
 // Option ids for the generic tool-approval card. `confirm()` maps the incoming
@@ -44,34 +48,6 @@ const EVENT_CHANNEL_CAPACITY: usize = 512;
 const PERM_ALLOW: &str = "allow";
 const PERM_ALLOW_ALWAYS: &str = "allow_always";
 const PERM_REJECT: &str = "reject";
-
-/// The `config_selections` key under which a claude session's chosen reasoning-effort
-/// level is persisted. claude emits NO `ConfigChanged` for effort (only mode/model), so
-/// `set_config_option` persists it here directly and `build_session_instance` re-applies
-/// it after open (there is no spawn-time effort flag; it rides a post-open
-/// control_request). The three accepted incoming option ids (`effort`/`reasoning_effort`/
-/// `thought_level`) all normalize to this one storage key.
-const EFFORT_CONFIG_KEY: &str = "effort";
-
-/// Resolve the reasoning-effort catalog to surface for the effort picker, mirroring the
-/// backend's `effort_is_supported` current-model precedence: the efforts of the resolved
-/// current model if it can be pinned, else the union across all advertised models (so we
-/// don't hide a level some selectable model supports when the current model is ambiguous /
-/// not-yet-known). Empty result = no effort axis → the caller omits the option entirely.
-fn resolve_current_model_efforts(models: &[aionui_session::ModelInfo], current_model: Option<&str>) -> Vec<String> {
-    if let Some(model) = current_model.and_then(|id| models.iter().find(|m| m.id == id)) {
-        return model.reasoning_efforts.clone();
-    }
-    let mut union: Vec<String> = Vec::new();
-    for m in models {
-        for e in &m.reasoning_efforts {
-            if !union.contains(e) {
-                union.push(e.clone());
-            }
-        }
-    }
-    union
-}
 
 /// Shared, cheaply-cloneable runtime state for a session task: the broadcast sender
 /// the translator writes and `subscribe()` reads, plus liveness bookkeeping.
@@ -97,12 +73,30 @@ struct SessionRuntime {
     mode_override: std::sync::Mutex<Option<String>>,
     model_override: std::sync::Mutex<Option<String>>,
     /// Optimistic reasoning-effort ("thought level") selection, symmetric with
-    /// mode/model. claude emits NO `ConfigChanged`/echo for effort (unlike model/mode),
-    /// so the streaming catalog push — which runs in the backend-Arc-free event pump and
-    /// cannot read `capabilities().current_effort` — reads the highlight from here. REST
-    /// (`get_config_options`) prefers this over the (synchronously-seeded) caps value so
-    /// the observed re-read confirms the switch. `None` until the user picks a level.
+    /// mode/model. Neither backend emits a `ConfigChanged`/echo for effort (unlike
+    /// model/mode), so the streaming catalog push — which runs in the backend-Arc-free
+    /// event pump and cannot read `capabilities().current_effort` — reads the highlight
+    /// from here. REST (`get_config_options`) prefers this over the caps value so the
+    /// observed re-read confirms the switch. Seeded at build with the resolved initial
+    /// effort (persisted selection → assistant-default `thought_level`), overwritten by
+    /// interactive switches, and CLEARED by the pump's reconciles (catalog-arrival
+    /// invalidation / backend reject / failed initial dispatch) so it never advertises
+    /// a level the backend refused.
     effort_override: std::sync::Mutex<Option<String>>,
+    /// The resolved initial effort still WAITING to be applied to the backend.
+    /// Drained atomically by the FIRST `send_message` (startup barrier: the seed is
+    /// dispatched — and awaited — strictly before the first prompt, so the first
+    /// turn runs at the configured level; the old detached-spawn apply could lose
+    /// that race). INVALIDATED by a manual effort switch: `set_config_option` takes
+    /// it first, so a still-undelivered seed can never overwrite the user's pick.
+    /// `None` = nothing pending (no seed, already drained, or invalidated).
+    pending_startup_effort: std::sync::Mutex<Option<String>>,
+    /// Serializes every effort-affecting op: the startup-seed drain, a manual
+    /// switch's invalidate+persist, AND the pump's reject rollback RMW on the
+    /// persisted selection. Held by the RUNTIME (not the task) so the event pump
+    /// — which owns only an `Arc<SessionRuntime>` — can reach it and cannot
+    /// clobber a concurrently persisted newer pick with a stale map.
+    effort_ops_gate: tokio::sync::Mutex<()>,
 }
 
 impl SessionRuntime {
@@ -146,74 +140,29 @@ impl SessionRuntime {
     fn effort_override(&self) -> Option<String> {
         self.effort_override.lock().ok().and_then(|g| g.clone())
     }
-}
-
-/// Cold-start catalog snapshot extracted from a persisted `agent_metadata`
-/// handshake, in the SAME `aionui_session` shape the getters read off live
-/// `capabilities()` — so serving the preload is a drop-in fallback with no shape
-/// translation at read time. Empty vectors + `None` currents = nothing persisted.
-#[derive(Default, Clone)]
-struct CatalogPreload {
-    available_models: Vec<aionui_session::ModelInfo>,
-    current_model: Option<String>,
-    available_modes: Vec<aionui_session::ModeInfo>,
-    current_mode: Option<String>,
-}
-
-impl CatalogPreload {
-    /// Parse the persisted handshake's `available_models` / `available_modes`
-    /// columns into the live-capabilities shape. Reuses the ACP path's
-    /// `extract_models_from_value` / `extract_modes_from_value` (the same
-    /// multi-shape parser that accepts both the `{available_models:[{id,label}]}`
-    /// column shape `spawn_catalog_writeback` persists AND a live-claude handshake),
-    /// so the two paths stay byte-compatible. `reasoning_efforts` is intentionally
-    /// dropped: the handshake catalog does not carry per-model efforts, and the
-    /// getters this feeds do not surface efforts.
-    fn from_handshake(handshake: &aionui_api_types::AgentHandshake) -> Self {
-        use crate::manager::acp::config_option_catalog::{extract_models_from_value, extract_modes_from_value};
-        let (available_models, current_model) = handshake
-            .available_models
-            .as_ref()
-            .and_then(extract_models_from_value)
-            .map(|state| {
-                let models = state
-                    .available_models
-                    .iter()
-                    .map(|m| aionui_session::ModelInfo {
-                        id: m.model_id.to_string(),
-                        name: m.name.clone(),
-                        description: m.description.clone(),
-                        reasoning_efforts: Vec::new(),
-                    })
-                    .collect::<Vec<_>>();
-                let current = state.current_model_id.to_string();
-                (models, (!current.is_empty()).then_some(current))
-            })
-            .unwrap_or_default();
-        let (available_modes, current_mode) = handshake
-            .available_modes
-            .as_ref()
-            .and_then(extract_modes_from_value)
-            .map(|state| {
-                let modes = state
-                    .available_modes
-                    .iter()
-                    .map(|m| aionui_session::ModeInfo {
-                        id: m.id.to_string(),
-                        name: m.name.clone(),
-                        description: m.description.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                let current = state.current_mode_id.to_string();
-                (modes, (!current.is_empty()).then_some(current))
-            })
-            .unwrap_or_default();
-        Self {
-            available_models,
-            current_model,
-            available_modes,
-            current_mode,
+    /// Startup-barrier drain: take the pending seed (exactly-once). Called by
+    /// `send_message` before the first prompt.
+    fn take_startup_effort(&self) -> Option<String> {
+        self.pending_startup_effort.lock().ok().and_then(|mut g| g.take())
+    }
+    /// Manual-switch invalidation: a user pick supersedes an undelivered seed.
+    fn invalidate_startup_effort(&self) {
+        if let Ok(mut g) = self.pending_startup_effort.lock() {
+            *g = None;
         }
+    }
+    /// Reconcile-on-reject / catalog-arrival reconcile: drop the optimistic effort
+    /// highlight IF it still holds `value` (a later switch may have overwritten it —
+    /// only a matching value is cleared). Returns whether a clear happened, so the
+    /// pump knows to re-push a corrected config-options frame.
+    fn clear_effort_override_if(&self, value: &str) -> bool {
+        if let Ok(mut g) = self.effort_override.lock()
+            && g.as_deref() == Some(value)
+        {
+            *g = None;
+            return true;
+        }
+        false
     }
 }
 
@@ -287,6 +236,13 @@ pub struct SessionAgentTask {
     /// paths with no persisted catalog (fresh agent, tests). Mirrors the ACP path's
     /// `preload_advertised_catalogs` "fill-when-empty, live-overwrites" semantics.
     catalog_preload: CatalogPreload,
+    /// Serializes every effort-affecting task operation — the startup-seed drain
+    /// (take + dispatch) in `send_message` and a manual effort switch
+    /// (invalidate + dispatch) in `set_config_option` — so their steps can never
+    /// interleave: without it, a first send could TAKE the seed while a manual
+    /// pick is mid-dispatch, landing the stale seed on the wire AFTER the pick
+    /// (wire ends on the seed, runtime/DB on the pick). The backend stdin lock
+    /// only orders individual writes; this gate orders the task-level intent.
     /// Command-id counter for `CommandMeta` (dispatch correlation).
     command_seq: AtomicI64,
     /// Resolved prompt-dump target (see [`SessionPromptDump`]). `None` when
@@ -320,6 +276,8 @@ impl SessionAgentTask {
             session_repo,
             CatalogPreload::default(),
             None,
+            None,
+            None,
         )
     }
 
@@ -337,6 +295,8 @@ impl SessionAgentTask {
         session_repo: Option<Arc<dyn IAcpSessionRepository>>,
         handshake: &aionui_api_types::AgentHandshake,
         prompt_dump: Option<SessionPromptDump>,
+        initial_effort: Option<String>,
+        startup_effort: Option<String>,
     ) -> Arc<Self> {
         Self::build(
             agent_type,
@@ -346,9 +306,12 @@ impl SessionAgentTask {
             session_repo,
             CatalogPreload::from_handshake(handshake),
             prompt_dump,
+            initial_effort,
+            startup_effort,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build(
         agent_type: AgentType,
         conversation_id: String,
@@ -357,6 +320,8 @@ impl SessionAgentTask {
         session_repo: Option<Arc<dyn IAcpSessionRepository>>,
         catalog_preload: CatalogPreload,
         prompt_dump: Option<SessionPromptDump>,
+        initial_effort: Option<String>,
+        startup_effort: Option<String>,
     ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let runtime = Arc::new(SessionRuntime {
@@ -366,7 +331,19 @@ impl SessionAgentTask {
             session_id: std::sync::Mutex::new(None),
             mode_override: std::sync::Mutex::new(None),
             model_override: std::sync::Mutex::new(None),
-            effort_override: std::sync::Mutex::new(None),
+            // Seeded with the resolved initial effort (persisted config_selections
+            // effort → else create-time config.thought_level) so REST
+            // `get_config_options` AND the CatalogUpdated push surface a non-null
+            // current_value from the first frame — without this the UI pill shows only
+            // the model until the user manually picks a level.
+            effort_override: std::sync::Mutex::new(initial_effort),
+            // The value queued for the startup-barrier apply (drained by the first
+            // send, invalidated by a manual switch). `None` when the BACKEND owns
+            // the startup apply (codex: the DETACHED post-open sequence applies the
+            // seed via `SessionConfig.reasoning_effort`, so a task-level re-apply
+            // would double-write).
+            pending_startup_effort: std::sync::Mutex::new(startup_effort),
+            effort_ops_gate: tokio::sync::Mutex::new(()),
         });
         // Subscribe to the backend's event stream HERE (sync), then hand ONLY the
         // stream to the pump — never a backend Arc (see `spawn_event_pump` for why
@@ -709,6 +686,19 @@ impl SessionAgentTask {
         // capabilities snapshot may simply not have the list yet). Only a NON-empty
         // catalog that omits `value` rejects. Other option ids (effort/thought_level)
         // are validated by the backend itself (claude effort catalog check).
+        // Effort aliases: take the effort-ops gate for the WHOLE manual switch and
+        // invalidate the pending startup seed BEFORE the first await point — the
+        // user's intent supersedes the seed the moment the switch is requested. The
+        // gate serializes this dispatch against the first send's seed drain, so the
+        // wire can never end on a stale seed written after the pick.
+        let is_effort_alias = matches!(option_id, "effort" | "reasoning_effort" | "thought_level");
+        let _effort_gate = if is_effort_alias {
+            let gate = self.runtime.effort_ops_gate.lock().await;
+            self.runtime.invalidate_startup_effort();
+            Some(gate)
+        } else {
+            None
+        };
         let caps = self.backend.capabilities();
         // A NON-empty catalog that omits `value` is the only rejection case (empty
         // catalog = permissive, per the comment above). `known` = catalog carries value.
@@ -769,15 +759,19 @@ impl SessionAgentTask {
             "mode" => self.runtime.set_mode_override(value.to_string()),
             "model" => self.runtime.set_model_override(value.to_string()),
             "effort" | "reasoning_effort" | "thought_level" => {
+                // (The pending startup seed was already invalidated — before dispatch,
+                // under the effort-ops gate — at the top of this function.)
                 // Optimistic highlight: claude emits no effort echo, so the streaming
                 // catalog push reads the current level from this override.
                 self.runtime.set_effort_override(value.to_string());
                 // Persist the chosen effort into `config_selections` so it survives a
                 // respawn/resume. Unlike mode/model (persisted by the pump on
                 // ConfigChanged), claude emits no ConfigChanged for effort, so this is
-                // the ONLY place the choice is durably recorded. Backend already accepted
-                // + validated it (dispatch above); best-effort persist (a DB failure must
-                // not fail the switch the CLI already applied).
+                // the ONLY place the choice is durably recorded. We optimistically record
+                // it after the adapter ACCEPTED the dispatched command (above) — not proof
+                // the CLI validated/applied the level; an explicit reject on the wire is
+                // compensated by the pump (reject → unpersist). Best-effort persist: a DB
+                // failure must not fail a switch the adapter already accepted.
                 self.persist_effort(value).await;
             }
             _ => {
@@ -791,7 +785,6 @@ impl SessionAgentTask {
         // Effort is emitted under the canonical id `reasoning_effort` (category
         // `thought_level`); a caller may address it via any of its aliases, so match by
         // category for the effort axis and by id otherwise.
-        let is_effort_alias = matches!(option_id, "effort" | "reasoning_effort" | "thought_level");
         let observed = snapshot
             .config_options
             .iter()
@@ -818,8 +811,10 @@ impl SessionAgentTask {
     /// [`EFFORT_CONFIG_KEY`]) so it survives a respawn/resume. Reads the existing
     /// selections first and MERGES (rather than overwriting the whole map) so any other
     /// future config key is preserved. Best-effort: a repo miss/failure is logged, not
-    /// propagated — the backend already applied the effort, and losing only the
-    /// persistence (not the live switch) is the safe degradation. No-op without a repo.
+    /// propagated — the record is written optimistically after the adapter accepted the
+    /// command (an explicit wire reject is compensated by the pump's unpersist), and
+    /// losing only the persistence (not the live switch) is the safe degradation. No-op
+    /// without a repo.
     async fn persist_effort(&self, value: &str) {
         let Some(repo) = self.session_repo.as_ref() else {
             return;
@@ -923,6 +918,37 @@ impl IAgentTask for SessionAgentTask {
         // DEV (`--dump-prompts`): borrow the final blocks BEFORE they move into
         // Command::Send. No-op / best-effort — never affects the dispatch.
         self.dump_session_cli_final_input(&content, Some(data.msg_id.as_str()));
+
+        // Startup barrier: apply the still-pending initial effort BEFORE the first
+        // prompt, awaited — so the first turn runs at the configured level instead of
+        // racing a detached apply. The take AND the dispatch happen under the
+        // effort-ops gate, serialized against a concurrent manual switch (which
+        // invalidates the seed under the same gate before its own dispatch) — the
+        // wire can therefore never end on a stale seed written after a user pick.
+        // The backend validates the value; a dispatch failure rolls the optimistic
+        // highlight back and never fails the send (the session is usable, only the
+        // seed is lost).
+        {
+            let _gate = self.runtime.effort_ops_gate.lock().await;
+            if let Some(effort) = self.runtime.take_startup_effort() {
+                match self
+                    .backend
+                    .dispatch(Command::SetConfigOption {
+                        option_id: EFFORT_CONFIG_KEY.to_owned(),
+                        value: effort.clone(),
+                    })
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::info!(conv_id = %self.conversation_id, effort = %effort, "session-port: applied initial reasoning effort before first prompt");
+                    }
+                    Err(e) => {
+                        self.runtime.clear_effort_override_if(&effort);
+                        tracing::warn!(conv_id = %self.conversation_id, effort = %effort, error = %e, "session-port: applying initial effort failed (send proceeds, effort not applied)");
+                    }
+                }
+            }
+        }
 
         let cmd = Command::Send {
             content,
@@ -1256,23 +1282,44 @@ pub async fn build_session_instance(
         }
     }
 
-    // #4 — the persisted reasoning-effort level (claude only). There is no spawn-time
-    // effort flag (effort rides a post-open control_request, NOT `--`args like
-    // model/mode), so it cannot go into `SessionConfig`; instead we re-apply it AFTER
-    // open. codex effort is not a standalone selection (it rides collaborationMode via
-    // SetMode), so this is claude-scoped. Read from the snapshot's config_selections
-    // (the map `set_config_option` persisted under EFFORT_CONFIG_KEY).
-    let persisted_effort = (backend_label == "claude")
-        .then(|| {
-            session_snapshot.and_then(|s| {
-                s.config_selections
-                    .iter()
-                    .find(|(k, _)| k.as_str() == EFFORT_CONFIG_KEY)
-                    .map(|(_, v)| v.as_str().to_owned())
-            })
-        })
-        .flatten()
-        .filter(|s| !s.is_empty());
+    // #4 — the initial reasoning-effort level. There is no spawn-time effort flag,
+    // and the two backends take DIFFERENT seed paths:
+    //   * claude has no `SessionConfig` effort slot — the seed rides a post-open
+    //     control_request, dispatched by the task-level first-send drain (below).
+    //   * codex DOES carry the seed on the session config: `SessionConfig.reasoning_effort`
+    //     (set below, codex-only) is applied inside codex's detached post-open sequence
+    //     via `thread/settings/update{effort}` — verified codex_conn.rs `SetConfigOption`
+    //     arm against samples/codex-cli/0.137.0/schema-full/ClientRequest.json
+    //     ThreadSettingsUpdateParams.
+    // Historically this read ONLY the
+    // persisted selection and ONLY for claude ("codex effort is not standalone" —
+    // stale: codex has had a first-class `thread/settings/update{effort}` wire since
+    // the port, see the dispatch arm), and `config.thought_level` was ignored
+    // entirely, so a fresh chat with an assistant-default thinking level opened with
+    // no effort applied and a null current_value in the picker (the #609 regression
+    // against the #574 defaults).
+    //
+    // The seed is validated against the best catalog knowledge available at open —
+    // the persisted-handshake preload (the live capabilities are empty until the
+    // async initialize/model-list lands) — mirroring the legacy path's
+    // `pending_startup_config` drop-invalid semantics. An unknown catalog is
+    // permissive; the pump's catalog-arrival + reject reconciles cover that window.
+    let catalog_preload = CatalogPreload::from_handshake(&metadata.handshake);
+    let known_efforts = resolve_current_model_efforts(
+        &catalog_preload.available_models,
+        session_snapshot
+            .and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned()))
+            .or_else(|| config.current_model_id.clone())
+            .as_deref(),
+    );
+    let initial_effort = resolve_initial_effort(session_snapshot, config, &known_efforts);
+    // codex applies the seed itself, inside its DETACHED post-open sequence
+    // (validated model reconcile → best-effort model-response wait → validated
+    // effort; NO first-turn gate) — hand it over via the session config. claude
+    // keeps the task-level first-send drain (stdin ordering is its contract).
+    if backend_label == "codex" {
+        session_config.reasoning_effort = initial_effort.clone();
+    }
 
     // DEV (`--dump-prompts`): dump the resolved SessionConfig BEFORE it moves
     // into open_session. Best-effort — a failure only warns, never fails open.
@@ -1327,25 +1374,6 @@ pub async fn build_session_instance(
             e => AgentError::bad_gateway(format!("open {backend_label} session: {e}")),
         })?;
 
-    // Re-apply the persisted effort now that the session is open. The backend validates
-    // it against the current model's advertised catalog (permissive until the catalog
-    // is discovered) and drops it if unsupported — the same clear_invalid_desired_*
-    // semantics as the codex model/mode reconcile. Best-effort: a dispatch failure must
-    // not fail the open (the session is usable; only the persisted effort is lost).
-    if let Some(effort) = persisted_effort {
-        if let Err(e) = backend
-            .dispatch(Command::SetConfigOption {
-                option_id: EFFORT_CONFIG_KEY.to_owned(),
-                value: effort.clone(),
-            })
-            .await
-        {
-            tracing::warn!(conv_id = %conversation_id, effort = %effort, error = %e, "session-port: re-applying persisted effort failed (session usable, effort not restored)");
-        } else {
-            tracing::info!(conv_id = %conversation_id, effort = %effort, "session-port: re-applied persisted reasoning effort after open");
-        }
-    }
-
     // GAP #7 (G5): project the backend's discovered catalog back into agent_metadata
     // so the cold-start picker stays fresh. Best-effort, detached, off the open path.
     if let Some((agent_id, catalog_tx)) = catalog_writeback {
@@ -1367,7 +1395,32 @@ pub async fn build_session_instance(
         acp_session_repo,
         &metadata.handshake,
         prompt_dump,
+        // The runtime's optimistic effort highlight (REST and the CatalogUpdated
+        // push report one consistent non-null current_value from the first frame).
+        initial_effort.clone(),
+        // The task-level startup seed the first send drains — claude only: codex's
+        // seed was handed to the backend via `SessionConfig.reasoning_effort` and
+        // is applied inside its DETACHED post-open sequence, which a task-level
+        // re-apply would double-write.
+        if backend_label == "claude" {
+            initial_effort
+        } else {
+            None
+        },
     );
+
+    // The first-send startup barrier is CLAUDE-ONLY (the seed above is `None` for
+    // codex). For claude, the resolved initial effort is NOT dispatched here: it rides
+    // the task runtime as a pending startup seed and is applied — awaited — by the
+    // FIRST `send_message`, strictly before the first prompt (the startup barrier).
+    // This guarantees claude's first turn runs at the seeded level (the old detached
+    // apply could lose that race) and lets a manual switch invalidate a not-yet-delivered
+    // seed. Codex takes the OTHER path entirely: its seed rode `SessionConfig` and is
+    // applied by the detached post-open bootstrap sequence — there is NO first-turn gate
+    // on codex, so its first prompt may race the seed apply (last wire write wins,
+    // reconciled by the reader's structured reject). Until the drain (claude) or the
+    // detached apply (codex), REST and the catalog push already highlight the seed via
+    // the runtime override.
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
 }
 
@@ -1550,85 +1603,6 @@ pub fn spawn_catalog_writeback(
     });
 }
 
-/// Project a backend's discovered `Capabilities` (modes / models / slash commands)
-/// into an `AgentHandshake` partial for the `agent_metadata` catalog. Verbatim port
-/// of clean-slate `session_runtime::catalog_partial_from_caps`: emits both the ACP
-/// `config_options[]` wire shape AND the top-level `available_modes`/`available_models`
-/// columns directly (the shape-stable path that keeps the codex model picker from
-/// going empty).
-fn catalog_partial_from_caps(caps: &aionui_session::Capabilities) -> Option<aionui_api_types::AgentHandshake> {
-    let mut config_options = Vec::new();
-    if !caps.available_modes.is_empty() {
-        config_options.push(serde_json::json!({
-            "id": "mode",
-            "category": "mode",
-            "type": "select",
-            "currentValue": caps.current_mode,
-            "options": caps.available_modes.iter().map(|m| serde_json::json!({
-                "value": m.id, "name": m.name, "description": m.description,
-            })).collect::<Vec<_>>(),
-        }));
-    }
-    if !caps.available_models.is_empty() {
-        config_options.push(serde_json::json!({
-            "id": "model",
-            "category": "model",
-            "type": "select",
-            "currentValue": caps.current_model,
-            "options": caps.available_models.iter().map(|m| serde_json::json!({
-                "value": m.id, "name": m.name, "description": m.description,
-            })).collect::<Vec<_>>(),
-        }));
-    }
-    let available_commands = if caps.slash_commands.is_empty() {
-        None
-    } else {
-        Some(serde_json::json!(
-            caps.slash_commands
-                .iter()
-                .map(|c| serde_json::json!({
-                    "name": c.name, "description": c.description,
-                }))
-                .collect::<Vec<_>>()
-        ))
-    };
-    if config_options.is_empty() && available_commands.is_none() {
-        return None;
-    }
-    let config_options = if config_options.is_empty() {
-        None
-    } else {
-        Some(serde_json::Value::Array(config_options))
-    };
-    // Also project the top-level `available_modes`/`available_models` fields directly
-    // (shape: `{available_models:[{id,label}]}`), which `apply_handshake` persists to
-    // the catalog columns VERBATIM — the authoritative, shape-stable path (matches what
-    // a live claude handshake stores), so the codex model picker never goes empty.
-    let available_modes = (!caps.available_modes.is_empty()).then(|| {
-        serde_json::json!({
-            "available_modes": caps.available_modes.iter().map(|m| serde_json::json!({
-                "id": m.id, "name": m.name, "description": m.description,
-            })).collect::<Vec<_>>(),
-            "current_mode_id": caps.current_mode,
-        })
-    });
-    let available_models = (!caps.available_models.is_empty()).then(|| {
-        serde_json::json!({
-            "available_models": caps.available_models.iter().map(|m| serde_json::json!({
-                "id": m.id, "label": m.name,
-            })).collect::<Vec<_>>(),
-            "current_model_id": caps.current_model,
-        })
-    });
-    Some(aionui_api_types::AgentHandshake {
-        config_options,
-        available_modes,
-        available_models,
-        available_commands,
-        ..Default::default()
-    })
-}
-
 /// Map a conversation's requested mode → the codex `thread/start.sandbox` string
 /// (`SandboxMode`: `read-only` / `workspace-write` / `danger-full-access`, verified
 /// `codex-cli/0.137.0/schema-full/ClientRequest.json` §SandboxMode), or `None` to keep
@@ -1721,6 +1695,159 @@ fn session_event_name(e: &SessionEvent) -> &'static str {
 }
 
 /// Drain the backend's `events()` and re-broadcast each as an `AgentStreamEvent`.
+/// The pump's retained copy of the latest `CatalogUpdated` payload: the option
+/// lists plus the backend-reported currents that rode the event. Needed because
+/// the pump deliberately holds NO backend Arc (see `spawn_event_pump`) — this is
+/// its only material for rebuilding a config-options frame outside a catalog push
+/// (the `config_option_rejected` reconcile).
+struct LastCatalog {
+    models: Vec<aionui_session::ModelInfo>,
+    modes: Vec<aionui_session::ModeInfo>,
+    current_model: Option<String>,
+    current_mode: Option<String>,
+    current_effort: Option<String>,
+}
+
+/// Project a catalog (+ currents) into the `AcpConfigOption` push frame. Per axis
+/// the current highlight is the task-runtime's optimistic override (the user's
+/// latest interactive switch / the open-time effort seed) falling back to the
+/// backend-reported current from the event — the same precedence
+/// `get_config_options` (REST) applies over `capabilities()`, so push and REST
+/// stay one consistent source of truth. `None` = nothing to push (both lists
+/// empty; an empty-snapshot frame would only clobber the frontend's picker).
+fn build_catalog_frame(runtime: &SessionRuntime, catalog: &LastCatalog) -> Option<serde_json::Value> {
+    let mut config_options: Vec<aionui_api_types::AcpConfigOptionDto> = Vec::new();
+    if !catalog.modes.is_empty() {
+        config_options.push(aionui_api_types::AcpConfigOptionDto {
+            id: "mode".into(),
+            name: Some("Mode".into()),
+            label: None,
+            description: None,
+            category: Some("mode".into()),
+            option_type: "select".into(),
+            current_value: runtime.mode_override().or_else(|| catalog.current_mode.clone()),
+            options: catalog
+                .modes
+                .iter()
+                .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
+                    value: m.id.clone(),
+                    name: Some(m.name.clone()),
+                    label: None,
+                    description: m.description.clone(),
+                })
+                .collect(),
+        });
+    }
+    if !catalog.models.is_empty() {
+        config_options.push(aionui_api_types::AcpConfigOptionDto {
+            id: "model".into(),
+            name: Some("Model".into()),
+            label: None,
+            description: None,
+            category: Some("model".into()),
+            option_type: "select".into(),
+            current_value: runtime.model_override().or_else(|| catalog.current_model.clone()),
+            options: catalog
+                .models
+                .iter()
+                .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
+                    value: m.id.clone(),
+                    name: Some(m.name.clone()),
+                    label: None,
+                    description: m.description.clone(),
+                })
+                .collect(),
+        });
+    }
+    // Reasoning-effort axis (claude `supportedEffortLevels` / codex
+    // `supportedReasoningEfforts`). The frontend REPLACES its whole config-options
+    // snapshot on this frame, so effort MUST ride along or a late catalog push would
+    // wipe the effort option REST surfaced. Emitted only when the effective current
+    // model advertises efforts (union fallback when the current model is unknown).
+    let effective_model = runtime.model_override().or_else(|| catalog.current_model.clone());
+    let efforts = resolve_current_model_efforts(&catalog.models, effective_model.as_deref());
+    if !efforts.is_empty() {
+        config_options.push(aionui_api_types::AcpConfigOptionDto {
+            id: "reasoning_effort".into(),
+            name: Some("Thinking".into()),
+            label: None,
+            description: None,
+            category: Some("thought_level".into()),
+            option_type: "select".into(),
+            // The observed fallback is validated against the resolved efforts: a
+            // current the effective model does not advertise must not render (it
+            // would be its own lie — e.g. a stale current from a pre-switch model).
+            current_value: runtime
+                .effort_override()
+                .or_else(|| catalog.current_effort.clone())
+                .filter(|e| efforts.iter().any(|x| x == e)),
+            options: efforts
+                .iter()
+                .map(|e| aionui_api_types::AcpConfigSelectOptionDto {
+                    value: e.clone(),
+                    name: Some(e.clone()),
+                    label: None,
+                    description: None,
+                })
+                .collect(),
+        });
+    }
+    if config_options.is_empty() {
+        return None;
+    }
+    serde_json::to_value(serde_json::json!({ "config_options": config_options })).ok()
+}
+
+/// Round-11 (minimal-branch reject correctness): remove the REJECTED effort
+/// value from the persisted `config_selections` so the next open does not
+/// re-seed a level the backend refused. Mirrors `persist_effort` but retains
+/// out any legacy-alias key holding the rejected value. Runs under the caller's
+/// shared effort-ops gate so it cannot clobber a concurrently persisted newer
+/// pick. Best-effort: a DB error only warns.
+async fn unpersist_rejected_effort(repo: &dyn IAcpSessionRepository, conversation_id: &str, rejected: &str) {
+    let mut selections: std::collections::HashMap<String, String> = match repo.load_runtime_state(conversation_id).await
+    {
+        Ok(Some(state)) => state
+            .config_selections_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default(),
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(conversation_id = %conversation_id, error = %err, "reject rollback: load_runtime_state failed");
+            return;
+        }
+    };
+    let before = selections.len();
+    // Round-12 P1-3: compare TRIMMED — a persisted value with surrounding
+    // whitespace (` high `) is the same selection as the rejected `high` and
+    // must not survive the reject (resolve_initial_effort trims too, so an
+    // untrimmed survivor would re-seed the refused level on the next open).
+    let rejected_trimmed = rejected.trim();
+    selections.retain(|key, value| {
+        !(crate::session_catalog::EFFORT_ALIAS_KEYS.contains(&key.as_str()) && value.trim() == rejected_trimmed)
+    });
+    if selections.len() == before {
+        return;
+    }
+    let json = match serde_json::to_string(&selections) {
+        Ok(j) => j,
+        Err(err) => {
+            tracing::warn!(conversation_id = %conversation_id, error = %err, "reject rollback: encode config_selections failed");
+            return;
+        }
+    };
+    let params = SaveRuntimeStateParams {
+        config_selections_json: Some(Some(&json)),
+        ..Default::default()
+    };
+    if let Err(err) = repo.save_runtime_state(conversation_id, &params).await {
+        tracing::warn!(conversation_id = %conversation_id, error = %err, "reject rollback: save_runtime_state failed");
+    } else {
+        tracing::info!(conversation_id = %conversation_id, effort = %rejected, "reject rollback: rejected effort removed from persisted config_selections");
+    }
+}
+
 fn spawn_event_pump(
     mut events: BoxStream<'static, SessionEnvelope>,
     runtime: Arc<SessionRuntime>,
@@ -1790,6 +1917,11 @@ fn spawn_event_pump(
         // clean shutdown) would be misread as a mid-turn crash. Set on the terminal
         // TurnResult, reset on the next TurnStarted.
         let mut terminal_result_seen = false;
+        // The latest discovered catalog (+ the backend-reported currents that rode
+        // its CatalogUpdated), kept so a later `config_option_rejected` reconcile can
+        // re-push a corrected config-options frame — the pump owns no backend Arc, so
+        // this is its only source for rebuilding the snapshot.
+        let mut last_catalog: Option<LastCatalog> = None;
         while let Some(env) = events.next().await {
             runtime.touch();
             tracing::debug!(conv_id = %conversation_id, event = session_event_name(&env.event), "session-pump: backend event");
@@ -1837,83 +1969,50 @@ fn spawn_event_pump(
                 models,
                 modes,
                 slash_commands,
+                current_model,
+                current_mode,
+                current_effort,
             } = &env.event
             {
-                let mut config_options: Vec<aionui_api_types::AcpConfigOptionDto> = Vec::new();
-                if !modes.is_empty() {
-                    config_options.push(aionui_api_types::AcpConfigOptionDto {
-                        id: "mode".into(),
-                        name: Some("Mode".into()),
-                        label: None,
-                        description: None,
-                        category: Some("mode".into()),
-                        option_type: "select".into(),
-                        current_value: runtime.mode_override(),
-                        options: modes
-                            .iter()
-                            .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
-                                value: m.id.clone(),
-                                name: Some(m.name.clone()),
-                                label: None,
-                                description: m.description.clone(),
-                            })
-                            .collect(),
-                    });
-                }
-                if !models.is_empty() {
-                    config_options.push(aionui_api_types::AcpConfigOptionDto {
-                        id: "model".into(),
-                        name: Some("Model".into()),
-                        label: None,
-                        description: None,
-                        category: Some("model".into()),
-                        option_type: "select".into(),
-                        current_value: runtime.model_override(),
-                        options: models
-                            .iter()
-                            .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
-                                value: m.id.clone(),
-                                name: Some(m.name.clone()),
-                                label: None,
-                                description: m.description.clone(),
-                            })
-                            .collect(),
-                    });
-                }
-                // Reasoning-effort axis (claude per-model `supportedEffortLevels`). The
-                // frontend REPLACES its whole config-options snapshot on this frame, so we
-                // MUST re-emit effort here too — otherwise a late catalog push would wipe
-                // the effort option that `get_config_options` (REST) surfaced. The pump has
-                // no backend Arc, so the current model is resolved from the pushed catalog
-                // and the highlight comes from the runtime's optimistic effort override
-                // (claude emits no effort echo). Emitted only when the current model
-                // advertises efforts (union fallback when the current model is unknown).
-                let efforts = resolve_current_model_efforts(models, runtime.model_override().as_deref());
-                if !efforts.is_empty() {
-                    config_options.push(aionui_api_types::AcpConfigOptionDto {
-                        id: "reasoning_effort".into(),
-                        name: Some("Thinking".into()),
-                        label: None,
-                        description: None,
-                        category: Some("thought_level".into()),
-                        option_type: "select".into(),
-                        current_value: runtime.effort_override(),
-                        options: efforts
-                            .iter()
-                            .map(|e| aionui_api_types::AcpConfigSelectOptionDto {
-                                value: e.clone(),
-                                name: Some(e.clone()),
-                                label: None,
-                                description: None,
-                            })
-                            .collect(),
-                    });
-                }
-                // No categories (both lists empty) → nothing to re-project; a spurious
-                // empty-snapshot frame would only clobber the frontend's picker.
-                if !config_options.is_empty()
-                    && let Ok(v) = serde_json::to_value(serde_json::json!({ "config_options": config_options }))
+                // Catalog-arrival reconcile for the seeded effort highlight: the seed
+                // was validated against the (possibly stale/absent) persisted preload;
+                // the LIVE catalog is authoritative. A non-empty live effort list that
+                // omits the optimistic override falsifies it → clear, so this push and
+                // every later REST read fall back to the backend-reported current
+                // instead of advertising a level the model cannot run.
+                let effective_model = runtime.model_override().or_else(|| current_model.clone());
+                let efforts = resolve_current_model_efforts(models, effective_model.as_deref());
+                if let Some(override_effort) = runtime.effort_override()
+                    && !efforts.is_empty()
+                    && !efforts.iter().any(|e| e == &override_effort)
+                    && runtime.clear_effort_override_if(&override_effort)
                 {
+                    tracing::warn!(
+                        conv_id = %conversation_id,
+                        effort = %override_effort,
+                        "session-pump: seeded effort is not in the live catalog; highlight cleared"
+                    );
+                }
+                // Remember the latest catalog (+ its backend-reported currents) so a
+                // later `config_option_rejected` can re-push a corrected frame without
+                // a backend Arc.
+                // Round-12 P1-2: a CatalogUpdated that carries `current_mode: None`
+                // means "this frame has no mode info", NOT "clear the mode". The
+                // model-switch follow-up snapshot (and the discovery/invalid-model
+                // pushes) omit the mode, so REPLACING it with None would wipe the
+                // mode confirmed by the preceding ConfigChanged. Preserve the
+                // last-known mode when the event omits it.
+                let merged_mode = current_mode
+                    .clone()
+                    .or_else(|| last_catalog.as_ref().and_then(|c| c.current_mode.clone()));
+                last_catalog = Some(LastCatalog {
+                    models: models.clone(),
+                    modes: modes.clone(),
+                    current_model: current_model.clone(),
+                    current_mode: merged_mode,
+                    current_effort: current_effort.clone(),
+                });
+                if let Some(v) = build_catalog_frame(&runtime, last_catalog.as_ref().unwrap()) {
                     let _ = runtime.tx.send(AgentStreamEvent::AcpConfigOption(v));
                 }
                 // Slash-command catalog. claude advertises its command list in the
@@ -1939,6 +2038,63 @@ fn spawn_event_pump(
                         .send(AgentStreamEvent::AvailableCommands(AvailableCommandsEventData {
                             commands,
                         }));
+                }
+                continue;
+            }
+
+            // Reconcile-on-reject: the backend refused a config-option set (claude
+            // `sniff_set_config_reject` / the codex `thread/settings/update` error
+            // claim — both emit this structured tag alongside their user-facing
+            // Notice, and only for the LATEST set, never a superseded one). Clear
+            // every trace of the refused value — the optimistic runtime highlight AND
+            // the retained catalog's current (a codex catalog default can never BE
+            // the refused value, but scrubbing by value keeps the invariant local) —
+            // then re-push a corrected frame UNCONDITIONALLY: even when the runtime
+            // override was already cleared by an earlier catalog-arrival reconcile,
+            // the frontend may still be rendering the refused value from the last
+            // pushed frame, and only a fresh push corrects it.
+            if let SessionEvent::AdapterSpecific { tag, payload } = &env.event
+                && tag == "config_option_rejected"
+            {
+                let option_id = payload.get("option_id").and_then(serde_json::Value::as_str);
+                let value = payload.get("value").and_then(serde_json::Value::as_str);
+                if option_id == Some("effort")
+                    && let Some(value) = value
+                {
+                    // Round-11 (current-chat correctness): take the SHARED
+                    // effort-ops gate at the VERY START of the reconcile, BEFORE
+                    // clearing the runtime override / catalog / persisted
+                    // selection. The task's `set_config_option` holds this same
+                    // gate across its optimistic dispatch+persist, so a FAST
+                    // reject that arrives mid-dispatch blocks HERE until the task
+                    // has finished writing — our clear+unpersist then runs AFTER
+                    // the optimistic write, leaving runtime/DB clean. Clearing
+                    // before the gate would let the task re-set the override and
+                    // re-persist the refused value after our scrub.
+                    let _gate = runtime.effort_ops_gate.lock().await;
+                    let cleared = runtime.clear_effort_override_if(value);
+                    if let Some(catalog) = last_catalog.as_mut()
+                        && catalog.current_effort.as_deref() == Some(value)
+                    {
+                        catalog.current_effort = None;
+                    }
+                    // The refused value must also leave the persisted selection,
+                    // or the next open re-seeds it (resolve_initial_effort reads
+                    // config_selections first). Same gate.
+                    if let Some(repo) = session_repo.as_ref() {
+                        unpersist_rejected_effort(repo.as_ref(), &conversation_id, value).await;
+                    }
+                    tracing::info!(
+                        conv_id = %conversation_id,
+                        effort = %value,
+                        override_cleared = cleared,
+                        "session-pump: backend rejected the effort set; highlight reconciled"
+                    );
+                    if let Some(catalog) = last_catalog.as_ref()
+                        && let Some(v) = build_catalog_frame(&runtime, catalog)
+                    {
+                        let _ = runtime.tx.send(AgentStreamEvent::AcpConfigOption(v));
+                    }
                 }
                 continue;
             }
@@ -2064,6 +2220,52 @@ fn spawn_event_pump(
             // a repo error is warn-logged, never fatal to the stream.
             if let Some(repo) = session_repo.as_ref() {
                 persist_side_effects(repo.as_ref(), &conversation_id, &env.event).await;
+            }
+
+            // A confirmed mode/model switch (startup reconcile or interactive) updates
+            // the retained catalog's currents and re-pushes the config-options frame,
+            // so the picker highlight follows the switch without waiting for the next
+            // catalog discovery. This is what keeps a CONFIGURED codex session honest:
+            // the startup reconcile's SetModel lands as ConfigChanged after the first
+            // CatalogUpdated, and without this re-push the frontend would keep the
+            // pre-reconcile highlight. A model change also re-validates the effort
+            // highlight — a level the new model does not advertise is cleared (same
+            // catalog-arrival semantics as above).
+            if let SessionEvent::ConfigChanged { mode, model } = &env.event
+                && let Some(catalog) = last_catalog.as_mut()
+            {
+                if let Some(mode) = mode {
+                    catalog.current_mode = Some(mode.clone());
+                }
+                if let Some(model) = model {
+                    catalog.current_model = Some(model.clone());
+                    // Round-11: the OBSERVED effort current belonged to the PREVIOUS
+                    // model — reset it UNCONDITIONALLY on a model switch, even to a
+                    // value the new model also supports (A default=medium -> B
+                    // default=high would otherwise keep showing medium while codex
+                    // runs B at high). The backend's follow-up catalog push
+                    // re-supplies the NEW model's own default effort.
+                    catalog.current_effort = None;
+                    // A user's explicit override that the new model does not advertise
+                    // is also cleared (an override the new model DOES support stays —
+                    // it is the user's intent, re-applied by the picker).
+                    let efforts = resolve_current_model_efforts(&catalog.models, Some(model.as_str()));
+                    if !efforts.is_empty()
+                        && let Some(override_effort) = runtime.effort_override()
+                        && !efforts.iter().any(|e| e == &override_effort)
+                        && runtime.clear_effort_override_if(&override_effort)
+                    {
+                        tracing::warn!(
+                            conv_id = %conversation_id,
+                            effort = %override_effort,
+                            model = %model,
+                            "session-pump: model switch invalidates the effort highlight; cleared"
+                        );
+                    }
+                }
+                if let Some(v) = build_catalog_frame(&runtime, catalog) {
+                    let _ = runtime.tx.send(AgentStreamEvent::AcpConfigOption(v));
+                }
             }
             for mut ev in translate_event(env.event, &conversation_id, terminal_result_seen) {
                 // Keep the tool name alive across a call's multi-frame lifecycle (see
@@ -2694,6 +2896,202 @@ mod build_mapping_tests {
             current_model_id: model.map(ModelId::new),
             ..Default::default()
         }
+    }
+
+    fn snapshot_with_effort(effort: &str) -> PersistedSessionState {
+        use crate::shared_kernel::{ConfigKey, ConfigValue};
+        let mut s = PersistedSessionState::default();
+        s.config_selections
+            .insert(ConfigKey::new(EFFORT_CONFIG_KEY), ConfigValue::new(effort));
+        s
+    }
+
+    fn extra_with_thought_level(level: Option<&str>) -> AcpBuildExtra {
+        AcpBuildExtra {
+            thought_level: level.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    // ── resolve_initial_effort: the seed precedence + validation ────────────
+
+    // Fresh session (no snapshot): the assistant-default `config.thought_level`
+    // resolved at create time IS the initial effort — the #609 regression dropped
+    // it entirely (persisted-only, claude-only).
+    #[test]
+    fn initial_effort_falls_back_to_config_thought_level() {
+        let cfg = extra_with_thought_level(Some("high"));
+        assert_eq!(resolve_initial_effort(None, &cfg, &[]).as_deref(), Some("high"));
+    }
+
+    // The interactive-switch-persisted selection wins over the create-time default —
+    // the same snapshot-wins precedence spec_mode_model applies to mode/model.
+    #[test]
+    fn initial_effort_persisted_selection_wins_over_default() {
+        let cfg = extra_with_thought_level(Some("high"));
+        let snap = snapshot_with_effort("low");
+        assert_eq!(resolve_initial_effort(Some(&snap), &cfg, &[]).as_deref(), Some("low"));
+    }
+
+    // Empty strings are noise (an unset column), never a seed.
+    #[test]
+    fn initial_effort_empty_values_are_filtered() {
+        assert_eq!(
+            resolve_initial_effort(None, &extra_with_thought_level(Some("")), &[]),
+            None
+        );
+        assert_eq!(resolve_initial_effort(None, &extra_with_thought_level(None), &[]), None);
+    }
+
+    // Legacy parity: `has_persisted_config_for_category` keys on the PRESENCE of a
+    // persisted selection, not its content — an explicitly-cleared (empty) level
+    // BLOCKS the create-time default instead of resurrecting it.
+    #[test]
+    fn initial_effort_empty_persisted_value_blocks_the_default() {
+        let snap = snapshot_with_effort("");
+        assert_eq!(
+            resolve_initial_effort(Some(&snap), &extra_with_thought_level(Some("medium")), &[]),
+            None,
+            "an empty persisted selection means cleared, not fall-through"
+        );
+    }
+
+    // Upgrade compatibility: the legacy ACP path persisted the RAW wire option id —
+    // any effort alias must restore, with the canonical `effort` key winning when
+    // several coexist.
+    #[test]
+    fn initial_effort_restores_from_legacy_alias_keys() {
+        use crate::shared_kernel::{ConfigKey, ConfigValue};
+        for alias in ["reasoning_effort", "thought_level", "thinking_budget", "thinking"] {
+            let mut snap = PersistedSessionState::default();
+            snap.config_selections
+                .insert(ConfigKey::new(alias), ConfigValue::new("low"));
+            assert_eq!(
+                resolve_initial_effort(Some(&snap), &extra_with_thought_level(Some("high")), &[]).as_deref(),
+                Some("low"),
+                "legacy alias `{alias}` must restore and win over the default"
+            );
+        }
+        // Canonical `effort` wins over a coexisting legacy alias (deterministic
+        // precedence, not HashMap iteration order).
+        let mut snap = snapshot_with_effort("medium");
+        snap.config_selections.insert(
+            crate::shared_kernel::ConfigKey::new("thinking"),
+            crate::shared_kernel::ConfigValue::new("low"),
+        );
+        assert_eq!(
+            resolve_initial_effort(Some(&snap), &extra_with_thought_level(None), &[]).as_deref(),
+            Some("medium"),
+            "the canonical effort key wins over legacy aliases"
+        );
+    }
+
+    // Round-11 legacy trim: a whitespace-only value is effectively absent — a
+    // blank persisted value BLOCKS the default (like empty), and a create-time
+    // value with surrounding whitespace is trimmed to its bare level.
+    #[test]
+    fn initial_effort_trims_whitespace_legacy_parity() {
+        // Whitespace-only persisted → cleared → blocks the default.
+        let snap = snapshot_with_effort("   ");
+        assert_eq!(
+            resolve_initial_effort(Some(&snap), &extra_with_thought_level(Some("high")), &[]),
+            None,
+            "a whitespace-only persisted value is cleared and blocks the default"
+        );
+        // Padded create-time default → trimmed to the bare level.
+        assert_eq!(
+            resolve_initial_effort(None, &extra_with_thought_level(Some("  high  ")), &[]).as_deref(),
+            Some("high"),
+            "a padded create-time value is trimmed to its bare level"
+        );
+        // Whitespace-only create-time default → absent.
+        assert_eq!(
+            resolve_initial_effort(None, &extra_with_thought_level(Some("   ")), &[]),
+            None,
+            "a whitespace-only create-time value is absent"
+        );
+    }
+
+    // A known catalog that omits the value drops the seed (the legacy
+    // pending_startup_config ValueNotSelectable semantics — never highlight a level
+    // the model can't run); a known catalog that contains it passes it through.
+    #[test]
+    fn initial_effort_validated_against_known_catalog() {
+        let cfg = extra_with_thought_level(Some("ultra"));
+        let known: Vec<String> = vec!["low".into(), "medium".into(), "high".into()];
+        assert_eq!(
+            resolve_initial_effort(None, &cfg, &known),
+            None,
+            "an out-of-catalog value must be dropped"
+        );
+        let cfg_ok = extra_with_thought_level(Some("medium"));
+        assert_eq!(resolve_initial_effort(None, &cfg_ok, &known).as_deref(), Some("medium"));
+    }
+
+    // An EMPTY/unknown catalog is permissive (matches ACP is_*_valid: an absent
+    // catalog cannot invalidate; the backend re-validates on dispatch and the pump
+    // reconciles on catalog arrival / reject).
+    #[test]
+    fn initial_effort_unknown_catalog_is_permissive() {
+        let cfg = extra_with_thought_level(Some("anything"));
+        assert_eq!(resolve_initial_effort(None, &cfg, &[]).as_deref(), Some("anything"));
+    }
+
+    // ── efforts round-trip: catalog_partial_from_caps → persisted handshake →
+    //    CatalogPreload::from_handshake ────────────────────────────────────────
+
+    // The write-back projects per-model reasoning_efforts + a thought_level config
+    // option (with the current), and the preload parser restores the efforts — the
+    // full persistence round-trip that keeps the thinking picker (and seed
+    // validation) alive across a cold start. Before this the write-back dropped the
+    // efforts and the preload zeroed them.
+    #[test]
+    fn catalog_partial_and_preload_round_trip_reasoning_efforts() {
+        let caps = aionui_session::Capabilities {
+            available_models: vec![aionui_session::ModelInfo {
+                id: "opus".into(),
+                name: "Opus".into(),
+                description: None,
+                reasoning_efforts: vec!["low".into(), "high".into()],
+            }],
+            current_model: Some("opus".into()),
+            current_effort: Some("high".into()),
+            ..Default::default()
+        };
+        let partial = catalog_partial_from_caps(&caps).expect("a catalog projects a partial");
+
+        // The thought axis rides config_options with its current.
+        let cfg = partial.config_options.as_ref().expect("config_options present");
+        let thought = cfg
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["category"] == "thought_level")
+            .expect("a thought_level option must be projected");
+        assert_eq!(thought["currentValue"], "high");
+        assert_eq!(
+            thought["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o["value"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["low", "high"]
+        );
+
+        // And the preload restores the per-model efforts from the persisted column.
+        let handshake = aionui_api_types::AgentHandshake {
+            available_models: partial.available_models.clone(),
+            ..Default::default()
+        };
+        let preload = CatalogPreload::from_handshake(&handshake);
+        assert_eq!(preload.available_models.len(), 1);
+        assert_eq!(
+            preload.available_models[0].reasoning_efforts,
+            vec!["low".to_string(), "high".to_string()],
+            "reasoning_efforts must survive the persist/parse round-trip"
+        );
+        assert_eq!(preload.current_model.as_deref(), Some("opus"));
     }
 
     #[test]
@@ -4361,6 +4759,9 @@ mod pump_tests {
                 description: None,
             }],
             slash_commands: Vec::new(),
+            current_model: None,
+            current_mode: None,
+            current_effort: None,
         })];
         let frames = drain_script(script).await;
         let config = frames
@@ -4424,6 +4825,9 @@ mod pump_tests {
                     description: None,
                 },
             ],
+            current_model: None,
+            current_mode: None,
+            current_effort: None,
         })];
         let frames = drain_script(script).await;
         let commands = frames
@@ -4456,6 +4860,9 @@ mod pump_tests {
             }],
             modes: Vec::new(),
             slash_commands: Vec::new(),
+            current_model: None,
+            current_mode: None,
+            current_effort: None,
         })];
         let frames = drain_script(script).await;
         assert!(
@@ -4463,6 +4870,784 @@ mod pump_tests {
                 .iter()
                 .any(|f| matches!(f, AgentStreamEvent::AvailableCommands(_))),
             "empty slash_commands must not emit an AvailableCommands frame"
+        );
+    }
+
+    /// Extract each pushed AcpConfigOption frame's per-axis current_value
+    /// (`(mode, model, effort)`) in emit order.
+    fn config_frame_currents(frames: &[AgentStreamEvent]) -> Vec<(Option<String>, Option<String>, Option<String>)> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                AgentStreamEvent::AcpConfigOption(v) => {
+                    let opts = v.get("config_options")?.as_array()?;
+                    let cur = |cat: &str| {
+                        opts.iter()
+                            .find(|o| o.get("category").and_then(serde_json::Value::as_str) == Some(cat))
+                            .and_then(|o| o.get("current_value"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    };
+                    Some((cur("mode"), cur("model"), cur("thought_level")))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A one-model catalog whose event carries backend-reported currents.
+    fn catalog_with_currents(current_effort: Option<&str>) -> SessionEvent {
+        use aionui_session::{ModeInfo, ModelInfo};
+        SessionEvent::CatalogUpdated {
+            models: vec![ModelInfo {
+                id: "opus".into(),
+                name: "Opus".into(),
+                description: None,
+                reasoning_efforts: vec!["low".into(), "medium".into(), "high".into()],
+            }],
+            modes: vec![ModeInfo {
+                id: "default".into(),
+                name: "Default".into(),
+                description: None,
+            }],
+            slash_commands: Vec::new(),
+            current_model: Some("opus".into()),
+            current_mode: Some("default".into()),
+            current_effort: current_effort.map(str::to_string),
+        }
+    }
+
+    // The event's backend-reported currents light the pushed frame's highlight when
+    // the runtime holds no overrides — the fresh-session case: a seeded/default
+    // selection is visible from the FIRST catalog push, not only after an
+    // interactive switch (the #609-vs-#574 thought-level display regression fix).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_updated_event_currents_light_the_highlight() {
+        let frames = drain_script(vec![env(catalog_with_currents(Some("medium")))]).await;
+        let currents = config_frame_currents(&frames);
+        assert_eq!(
+            currents,
+            vec![(
+                Some("default".to_string()),
+                Some("opus".to_string()),
+                Some("medium".to_string())
+            )],
+            "event currents must ride the pushed frame when no override is set"
+        );
+    }
+
+    // The runtime's optimistic overrides (user's interactive switch / open-time
+    // effort seed) WIN over the event's backend-reported currents — the same
+    // precedence `get_config_options` (REST) applies, so push and REST agree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_updated_runtime_overrides_win_over_event_currents() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
+            script: vec![env(catalog_with_currents(Some("medium")))],
+            gate: gate.clone(),
+        });
+        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
+        task.runtime.set_effort_override("high".into());
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        gate.notify_one();
+        let mut frames = Vec::new();
+        while let Ok(Ok(ev)) = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+            frames.push(ev);
+        }
+        let currents = config_frame_currents(&frames);
+        assert_eq!(
+            currents.first().map(|c| c.2.clone()),
+            Some(Some("high".to_string())),
+            "the optimistic effort override must win over the event current"
+        );
+    }
+
+    // Catalog-arrival reconcile: a seeded effort the LIVE catalog does not advertise
+    // is falsified — the override is cleared and the pushed frame falls back to the
+    // backend-reported current (never highlight a level the model can't run; the
+    // legacy pending-seed path dropped such values before dispatch).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_arrival_clears_seeded_effort_not_in_catalog() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
+            script: vec![env(catalog_with_currents(Some("medium")))],
+            gate: gate.clone(),
+        });
+        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
+        // Seeded from a stale preload: "ultra" is NOT in the live catalog's efforts.
+        task.runtime.set_effort_override("ultra".into());
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        gate.notify_one();
+        let mut frames = Vec::new();
+        while let Ok(Ok(ev)) = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+            frames.push(ev);
+        }
+        let currents = config_frame_currents(&frames);
+        assert_eq!(
+            currents.first().map(|c| c.2.clone()),
+            Some(Some("medium".to_string())),
+            "an out-of-catalog seed must be cleared; the frame falls back to the event current"
+        );
+        assert!(
+            task.runtime.effort_override().is_none(),
+            "the invalid override must be cleared, not just masked in the frame"
+        );
+    }
+
+    // Reconcile-on-reject: a backend `config_option_rejected` (claude control_response
+    // error / codex JSON-RPC error) clears the optimistic highlight AND re-pushes a
+    // corrected frame from the last-known catalog, so the picker reflects reality
+    // without waiting for the next catalog push or REST read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn config_option_rejected_clears_override_and_repushes_frame() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
+            script: vec![
+                env(catalog_with_currents(None)),
+                env(SessionEvent::AdapterSpecific {
+                    tag: "config_option_rejected".into(),
+                    payload: serde_json::json!({ "option_id": "effort", "value": "high", "error": "nope" }),
+                }),
+            ],
+            gate: gate.clone(),
+        });
+        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
+        // The open-time seed the backend then rejects. IN the catalog (validation
+        // passed) — the reject is the backend's own veto.
+        task.runtime.set_effort_override("high".into());
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        gate.notify_one();
+        let mut frames = Vec::new();
+        while let Ok(Ok(ev)) = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+            frames.push(ev);
+        }
+        let currents = config_frame_currents(&frames);
+        assert_eq!(currents.len(), 2, "the reject must re-push a corrected frame");
+        assert_eq!(
+            currents[0].2.as_deref(),
+            Some("high"),
+            "the first push carries the (still-optimistic) seed"
+        );
+        assert_eq!(
+            currents[1].2, None,
+            "the re-push after the reject must no longer highlight the refused level"
+        );
+        assert!(task.runtime.effort_override().is_none(), "the override must be cleared");
+    }
+
+    /// A backend whose `dispatch(SetConfigOption{effort})` emits the
+    /// `config_option_rejected` signal INLINE — modelling a reject that is
+    /// causally AFTER the wire write (as a real reader would), so the pump's
+    /// reject reconcile genuinely races the task's optimistic override+persist.
+    struct RejectOnDispatchBackend {
+        tx: broadcast::Sender<SessionEnvelope>,
+    }
+    impl RejectOnDispatchBackend {
+        fn new() -> Self {
+            let (tx, _) = broadcast::channel(16);
+            Self { tx }
+        }
+    }
+    #[async_trait::async_trait]
+    impl SessionBackend for RejectOnDispatchBackend {
+        async fn dispatch(&self, c: Command) -> Result<CommandReceipt, BackendError> {
+            if let Command::SetConfigOption { option_id, value } = &c
+                && matches!(option_id.as_str(), "effort" | "reasoning_effort" | "thought_level")
+            {
+                let _ = self.tx.send(SessionEnvelope {
+                    session_id: "conv-1".into(),
+                    turn_gen: 1,
+                    event: SessionEvent::AdapterSpecific {
+                        tag: "config_option_rejected".into(),
+                        payload: serde_json::json!({ "option_id": "effort", "value": value, "error": "nope" }),
+                    },
+                });
+            }
+            Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::NoTurn,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            let rx = self.tx.subscribe();
+            futures_util::stream::unfold(rx, |mut rx| async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(env) => return Some((env, rx)),
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            })
+            .boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    /// Round-11 Fix A (deterministic fast-reject DURING dispatch): the reject is
+    /// emitted inline by `dispatch`, so the pump's reconcile races the task's
+    /// optimistic override+persist. Because the task holds the shared
+    /// effort-ops gate from BEFORE dispatch through persist, and the pump takes
+    /// the SAME gate at the start of its reject arm, the reconcile runs strictly
+    /// AFTER the optimistic write — final state is clean at EVERY layer: runtime
+    /// override cleared, config_selections free of the refused value, and a
+    /// rebuild does NOT re-seed it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fast_reject_during_dispatch_leaves_every_layer_clean() {
+        use aionui_db::{CreateAcpSessionParams, SqliteAcpSessionRepository, init_database_memory};
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(db.pool().clone()));
+        repo.create(&CreateAcpSessionParams {
+            conversation_id: "conv-1",
+            agent_source: "builtin",
+            agent_id: "claude",
+        })
+        .await
+        .unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(RejectOnDispatchBackend::new());
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "/w".into(),
+            backend,
+            Some(repo.clone()),
+        );
+        // The user's optimistic pick — dispatch emits the reject inline; the task
+        // still sets its override + persists under the gate.
+        let _ = task.set_config_option("effort", "high").await;
+        // Let the pump's gated reconcile run (it blocked on the gate until the
+        // set_config_option above released it).
+        for _ in 0..80 {
+            let state = repo.load_runtime_state("conv-1").await.unwrap();
+            let persisted_clean = state
+                .as_ref()
+                .and_then(|s| s.config_selections_json.as_deref())
+                .map(|j| !j.contains("high"))
+                .unwrap_or(true);
+            if task.runtime.effort_override().is_none() && persisted_clean {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            task.runtime.effort_override().is_none(),
+            "the runtime override must end cleared after the reject reconcile"
+        );
+        let state = repo.load_runtime_state("conv-1").await.unwrap().expect("state");
+        assert!(
+            !state.config_selections_json.as_deref().unwrap_or("").contains("high"),
+            "the refused value must be removed from config_selections, got: {:?}",
+            state.config_selections_json
+        );
+        // Rebuild parity: resolving the initial effort from the persisted state
+        // must NOT re-seed the refused level.
+        let persisted: std::collections::HashMap<String, String> = state
+            .config_selections_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default();
+        assert!(
+            !persisted.values().any(|v| v == "high"),
+            "a rebuild must not re-seed the refused effort"
+        );
+    }
+
+    /// Round-11 Fix A: an explicit backend reject must ALSO remove the refused
+    /// value from the persisted `config_selections` (real sqlite repo), or the
+    /// next open re-seeds a level the backend refused. The old code cleared only
+    /// the in-memory override; the persisted value survived.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reject_unpersists_refused_effort_from_config_selections() {
+        use aionui_db::{CreateAcpSessionParams, SqliteAcpSessionRepository, init_database_memory};
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(db.pool().clone()));
+        repo.create(&CreateAcpSessionParams {
+            conversation_id: "conv-1",
+            agent_source: "builtin",
+            agent_id: "claude",
+        })
+        .await
+        .unwrap();
+        // A PERSISTED interactive selection the backend then rejects.
+        let selections = serde_json::json!({ "reasoning_effort": "high" }).to_string();
+        repo.save_runtime_state(
+            "conv-1",
+            &SaveRuntimeStateParams {
+                config_selections_json: Some(Some(&selections)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
+            script: vec![
+                env(catalog_with_currents(None)),
+                env(SessionEvent::AdapterSpecific {
+                    tag: "config_option_rejected".into(),
+                    payload: serde_json::json!({ "option_id": "effort", "value": "high", "error": "nope" }),
+                }),
+            ],
+            gate: gate.clone(),
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "/w".into(),
+            backend,
+            Some(repo.clone()),
+        );
+        task.runtime.set_effort_override("high".into());
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        gate.notify_one();
+        while let Ok(Ok(_)) = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {}
+        assert!(task.runtime.effort_override().is_none(), "the override must be cleared");
+        let state = repo.load_runtime_state("conv-1").await.unwrap().expect("state");
+        assert!(
+            !state.config_selections_json.as_deref().unwrap_or("").contains("high"),
+            "the refused value must be REMOVED from the persisted selection, got: {:?}",
+            state.config_selections_json
+        );
+    }
+
+    /// Round-12 P1-3: a persisted selection with surrounding whitespace (` high `)
+    /// is the SAME selection as the rejected `high` and must be removed on reject
+    /// (unpersist compares trimmed) — otherwise resolve_initial_effort (which
+    /// trims) would re-seed the refused level on the next open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reject_unpersists_whitespace_padded_selection() {
+        use aionui_db::{CreateAcpSessionParams, SqliteAcpSessionRepository, init_database_memory};
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(db.pool().clone()));
+        repo.create(&CreateAcpSessionParams {
+            conversation_id: "conv-1",
+            agent_source: "builtin",
+            agent_id: "claude",
+        })
+        .await
+        .unwrap();
+        // Persisted with padding — the same level, differently stored.
+        let selections = serde_json::json!({ "reasoning_effort": " high " }).to_string();
+        repo.save_runtime_state(
+            "conv-1",
+            &SaveRuntimeStateParams {
+                config_selections_json: Some(Some(&selections)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
+            script: vec![
+                env(catalog_with_currents(None)),
+                env(SessionEvent::AdapterSpecific {
+                    tag: "config_option_rejected".into(),
+                    payload: serde_json::json!({ "option_id": "effort", "value": "high", "error": "nope" }),
+                }),
+            ],
+            gate: gate.clone(),
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "/w".into(),
+            backend,
+            Some(repo.clone()),
+        );
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        gate.notify_one();
+        while let Ok(Ok(_)) = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {}
+        let state = repo.load_runtime_state("conv-1").await.unwrap().expect("state");
+        assert!(
+            !state.config_selections_json.as_deref().unwrap_or("").contains("high"),
+            "the whitespace-padded selection must be removed on reject (trim-symmetry), got: {:?}",
+            state.config_selections_json
+        );
+    }
+
+    /// Round-11 Fix C: on an A->B model switch the picker must end on B's OWN
+    /// default effort, NOT A's carried-over effort — even when B ALSO supports
+    /// the old effort (A default=medium -> B default=high while codex runs B at
+    /// high). The backend emits a corrected CatalogUpdated carrying B's default
+    /// AFTER the ConfigChanged; the pump resets the stale current on the switch
+    /// (no transient "B · medium" lie) and then reflects the backend's default_B.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_switch_lands_on_new_model_default_effort() {
+        use aionui_session::{ModeInfo, ModelInfo};
+        let models = vec![
+            ModelInfo {
+                id: "model-a".into(),
+                name: "A".into(),
+                description: None,
+                reasoning_efforts: vec!["medium".into(), "high".into()],
+            },
+            ModelInfo {
+                id: "model-b".into(),
+                name: "B".into(),
+                description: None,
+                // SAME effort set as A, DIFFERENT default (the trap).
+                reasoning_efforts: vec!["medium".into(), "high".into()],
+            },
+        ];
+        let modes = vec![ModeInfo {
+            id: "default".into(),
+            name: "Default".into(),
+            description: None,
+        }];
+        let catalog_a = SessionEvent::CatalogUpdated {
+            models: models.clone(),
+            modes: modes.clone(),
+            slash_commands: Vec::new(),
+            current_model: Some("model-a".into()),
+            current_mode: Some("default".into()),
+            current_effort: Some("medium".into()),
+        };
+        // The backend's corrected snapshot that rides the switch (round-11 emit):
+        // model-b with ITS OWN default effort "high".
+        let catalog_b = SessionEvent::CatalogUpdated {
+            models,
+            modes,
+            slash_commands: Vec::new(),
+            current_model: Some("model-b".into()),
+            current_mode: None,
+            current_effort: Some("high".into()),
+        };
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
+            script: vec![
+                env(catalog_a),
+                env(SessionEvent::ConfigChanged {
+                    mode: None,
+                    model: Some("model-b".into()),
+                }),
+                env(catalog_b),
+            ],
+            gate: gate.clone(),
+        });
+        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        gate.notify_one();
+        let mut frames = Vec::new();
+        while let Ok(Ok(ev)) = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+            frames.push(ev);
+        }
+        let currents = config_frame_currents(&frames);
+        // tuple = (mode, model, effort)
+        assert_eq!(
+            currents.last().map(|c| c.2.clone()),
+            Some(Some("high".to_string())),
+            "the picker must end on B's own default effort (high), not A's medium"
+        );
+        assert_eq!(
+            currents.last().map(|c| c.1.clone()),
+            Some(Some("model-b".to_string())),
+            "the final catalog names the switched-to model B"
+        );
+        // Round-12 P1-2: the follow-up snapshot carries current_mode:None but must
+        // NOT wipe the mode confirmed earlier — the final frame retains it.
+        assert_eq!(
+            currents.last().map(|c| c.0.clone()),
+            Some(Some("default".to_string())),
+            "the model-switch follow-up must not erase the retained mode"
+        );
+        // And it must never transiently keep A's medium after the switch.
+        assert!(
+            !currents.iter().skip(1).any(|c| c.2.as_deref() == Some("medium")),
+            "no post-switch frame may keep the previous model's effort, got: {currents:?}"
+        );
+    }
+
+    /// Records every dispatched command (startup-barrier ordering assertions).
+    struct RecordingBackend {
+        commands: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecordingBackend {
+        fn new() -> (Arc<Self>, Arc<std::sync::Mutex<Vec<String>>>) {
+            let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    commands: commands.clone(),
+                }),
+                commands,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for RecordingBackend {
+        async fn dispatch(&self, c: Command) -> Result<CommandReceipt, BackendError> {
+            let label = match &c {
+                Command::Send { .. } => "send".to_string(),
+                Command::SetConfigOption { option_id, value } => format!("set:{option_id}={value}"),
+                other => format!("{other:?}"),
+            };
+            self.commands.lock().unwrap_or_else(|e| e.into_inner()).push(label);
+            let admission = match c {
+                Command::Send { .. } => Admission::Started,
+                _ => Admission::NoTurn,
+            };
+            Ok(CommandReceipt {
+                accepted: true,
+                admission,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::pending().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    fn task_with_seed(backend: Arc<dyn SessionBackend>, seed: Option<&str>) -> Arc<SessionAgentTask> {
+        SessionAgentTask::new_with_preload(
+            AgentType::Acp,
+            "conv-1".into(),
+            "/w".into(),
+            backend,
+            None,
+            &aionui_api_types::AgentHandshake::default(),
+            None,
+            seed.map(str::to_string),
+            seed.map(str::to_string),
+        )
+    }
+
+    fn send_data(msg: &str) -> SendMessageData {
+        SendMessageData {
+            content: msg.into(),
+            msg_id: format!("m-{msg}"),
+            turn_id: None,
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+        }
+    }
+
+    // Startup barrier: the seeded effort is dispatched — and awaited — strictly
+    // BEFORE the first prompt, and exactly once (the second send must not re-apply).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_seed_is_applied_before_the_first_prompt() {
+        let (backend, commands) = RecordingBackend::new();
+        let task = task_with_seed(backend, Some("high"));
+        crate::agent_task::IAgentTask::send_message(task.as_ref(), send_data("one"))
+            .await
+            .unwrap();
+        crate::agent_task::IAgentTask::send_message(task.as_ref(), send_data("two"))
+            .await
+            .unwrap();
+        assert_eq!(
+            commands.lock().unwrap().as_slice(),
+            ["set:effort=high", "send", "send"],
+            "the seed must land before the first prompt and never re-apply"
+        );
+    }
+
+    // Manual-switch invalidation: a user pick BEFORE the first send supersedes the
+    // undelivered seed — the drain must dispatch nothing (the stale default may
+    // never overwrite the pick).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_switch_invalidates_the_startup_seed() {
+        let (backend, commands) = RecordingBackend::new();
+        let task = task_with_seed(backend, Some("low"));
+        task.set_config_option("effort", "high").await.unwrap();
+        crate::agent_task::IAgentTask::send_message(task.as_ref(), send_data("one"))
+            .await
+            .unwrap();
+        assert_eq!(
+            commands.lock().unwrap().as_slice(),
+            ["set:effort=high", "send"],
+            "the manual pick must be the only effort set; the seed is invalidated"
+        );
+        assert_eq!(
+            task.runtime.effort_override().as_deref(),
+            Some("high"),
+            "the highlight follows the manual pick"
+        );
+    }
+
+    /// The reviewer's race, made deterministic: a manual pick whose dispatch is
+    /// STILL IN FLIGHT (holding the effort-ops gate) while the first send arrives.
+    /// The send's drain must serialize behind the gate and find the seed already
+    /// invalidated — the wire must end on the pick, with the stale seed never
+    /// written (previously: send could take the seed mid-manual and write
+    /// high → low → prompt while runtime/DB said high).
+    struct BlockingRecordingBackend {
+        commands: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Dispatches whose label equals `block_label` park here until notified.
+        block_label: String,
+        release: Arc<tokio::sync::Notify>,
+        blocked: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for BlockingRecordingBackend {
+        async fn dispatch(&self, c: Command) -> Result<CommandReceipt, BackendError> {
+            let label = match &c {
+                Command::Send { .. } => "send".to_string(),
+                Command::SetConfigOption { option_id, value } => format!("set:{option_id}={value}"),
+                other => format!("{other:?}"),
+            };
+            if label == self.block_label {
+                self.blocked.notify_one();
+                self.release.notified().await;
+            }
+            self.commands.lock().unwrap_or_else(|e| e.into_inner()).push(label);
+            let admission = match c {
+                Command::Send { .. } => Admission::Started,
+                _ => Admission::NoTurn,
+            };
+            Ok(CommandReceipt {
+                accepted: true,
+                admission,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::pending().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_manual_pick_beats_in_flight_seed_drain() {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let blocked = Arc::new(tokio::sync::Notify::new());
+        let backend: Arc<dyn SessionBackend> = Arc::new(BlockingRecordingBackend {
+            commands: commands.clone(),
+            block_label: "set:effort=high".into(),
+            release: release.clone(),
+            blocked: blocked.clone(),
+        });
+        let task = task_with_seed(backend, Some("low"));
+
+        // Manual pick: acquires the gate, invalidates the seed, then its dispatch
+        // parks mid-flight.
+        let manual = {
+            let task = task.clone();
+            tokio::spawn(async move { task.set_config_option("effort", "high").await })
+        };
+        blocked.notified().await; // manual is now mid-dispatch, holding the gate
+
+        // First send arrives while the manual is in flight: its drain must wait on
+        // the gate and then find NO seed.
+        let send = {
+            let task = task.clone();
+            tokio::spawn(
+                async move { crate::agent_task::IAgentTask::send_message(task.as_ref(), send_data("one")).await },
+            )
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        release.notify_one();
+        manual.await.unwrap().unwrap();
+        send.await.unwrap().unwrap();
+
+        assert_eq!(
+            commands.lock().unwrap().as_slice(),
+            ["set:effort=high", "send"],
+            "the pick must be the only effort write; the stale seed may never follow it"
+        );
+        assert_eq!(
+            task.runtime.effort_override().as_deref(),
+            Some("high"),
+            "runtime highlight ends on the pick"
+        );
+    }
+
+    // No seed → no startup dispatch at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_seed_means_no_startup_dispatch() {
+        let (backend, commands) = RecordingBackend::new();
+        let task = task_with_seed(backend, None);
+        crate::agent_task::IAgentTask::send_message(task.as_ref(), send_data("one"))
+            .await
+            .unwrap();
+        assert_eq!(commands.lock().unwrap().as_slice(), ["send"]);
+    }
+
+    // A confirmed model switch (startup reconcile / interactive) re-pushes the
+    // catalog frame with the NEW currents, and invalidates an effort highlight the
+    // new model does not advertise.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn config_changed_updates_currents_and_repushes_catalog() {
+        use aionui_session::{ModeInfo, ModelInfo};
+        let catalog = SessionEvent::CatalogUpdated {
+            models: vec![
+                ModelInfo {
+                    id: "opus".into(),
+                    name: "Opus".into(),
+                    description: None,
+                    reasoning_efforts: vec!["low".into(), "high".into()],
+                },
+                ModelInfo {
+                    id: "haiku".into(),
+                    name: "Haiku".into(),
+                    description: None,
+                    reasoning_efforts: vec!["minimal".into()],
+                },
+            ],
+            modes: vec![ModeInfo {
+                id: "default".into(),
+                name: "Default".into(),
+                description: None,
+            }],
+            slash_commands: Vec::new(),
+            current_model: Some("opus".into()),
+            current_mode: None,
+            current_effort: None,
+        };
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
+            script: vec![
+                env(catalog),
+                env(SessionEvent::ConfigChanged {
+                    mode: Some("plan".into()),
+                    model: Some("haiku".into()),
+                }),
+            ],
+            gate: gate.clone(),
+        });
+        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
+        // Seeded highlight valid for opus but NOT for haiku.
+        task.runtime.set_effort_override("high".into());
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        gate.notify_one();
+        let mut frames = Vec::new();
+        while let Ok(Ok(ev)) = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+            frames.push(ev);
+        }
+        let currents = config_frame_currents(&frames);
+        assert_eq!(currents.len(), 2, "the ConfigChanged must re-push the catalog frame");
+        assert_eq!(
+            currents[1].0.as_deref(),
+            Some("plan"),
+            "the re-push carries the switched mode"
+        );
+        assert_eq!(
+            currents[1].1.as_deref(),
+            Some("haiku"),
+            "the re-push carries the switched model"
+        );
+        assert_eq!(
+            currents[1].2, None,
+            "an effort the new model does not advertise must no longer highlight"
+        );
+        assert!(
+            task.runtime.effort_override().is_none(),
+            "the invalidated override must be cleared, not just masked"
         );
     }
 
@@ -4528,6 +5713,8 @@ mod pump_tests {
                 dir: tmp.path().to_path_buf(),
                 backend: "claude",
             }),
+            None,
+            None,
         );
         crate::agent_task::IAgentTask::send_message(
             task.as_ref(),
@@ -4569,6 +5756,8 @@ mod pump_tests {
                 dir: tmp.path().to_path_buf(),
                 backend: "codex",
             }),
+            None,
+            None,
         );
         // Inject an image directly onto the task's dump path via a content slice
         // containing an Image block.
@@ -4602,6 +5791,8 @@ mod pump_tests {
             backend,
             None,
             CatalogPreload::default(),
+            None,
+            None,
             None,
         );
         crate::agent_task::IAgentTask::send_message(
@@ -5103,6 +6294,8 @@ mod pump_tests {
             None,
             &handshake_with_catalog(),
             None,
+            None,
+            None,
         );
 
         // get_model serves the preloaded catalog + persisted current model.
@@ -5161,6 +6354,8 @@ mod pump_tests {
             None,
             &stale,
             None,
+            None,
+            None,
         );
         let m = task.get_model().await.unwrap().model_info.expect("model_info");
         assert_eq!(
@@ -5214,6 +6409,8 @@ mod pump_tests {
             backend,
             None,
             &handshake_with_catalog(),
+            None,
+            None,
             None,
         );
 
