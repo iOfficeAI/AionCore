@@ -19,6 +19,7 @@ use tokio::sync::broadcast::error::TryRecvError;
 use super::agent::sdk_to_snake_value;
 use super::agent_close::STDERR_PEEK_LINES;
 use super::error_mapping::{AcpSendFailure, is_acp_session_not_found, is_missing_resumed_session};
+use super::legacy_session_model::LegacySessionModelState;
 use tracing::warn;
 
 #[derive(Debug)]
@@ -38,13 +39,16 @@ impl AcpAgentManager {
     /// Returns the CLI-assigned session id.
     pub(super) async fn open_session_new(&self) -> Result<String, AgentError> {
         let req = self.params.new_session_request();
-        let session_response = self.protocol.new_session(req).await?;
+        let (session_response, legacy_models) = self.protocol.new_session(req).await?;
 
         let sid = session_response.session_id.to_string();
 
         {
             let mut session = self.session.write().await;
-            if let Some(models) = session_response.models {
+            if let Some(models) = legacy_models
+                .as_ref()
+                .and_then(LegacySessionModelState::from_state_value)
+            {
                 session.apply_advertised_models(models);
             }
             if let Some(modes) = session_response.modes {
@@ -126,7 +130,7 @@ impl AcpAgentManager {
             meta.insert("claudeCode".into(), Value::Object(claude_code));
 
             let req = self.params.new_session_request().meta(meta);
-            let new_response = match self.protocol.new_session(req).await {
+            let (new_response, legacy_models) = match self.protocol.new_session(req).await {
                 Ok(r) => r,
                 Err(e) if is_missing_resumed_session(&e, session_id) => {
                     return self.rebuild_after_acp_session_not_found(session_id, e).await;
@@ -137,7 +141,10 @@ impl AcpAgentManager {
 
             {
                 let mut session = self.session.write().await;
-                if let Some(models) = new_response.models {
+                if let Some(models) = legacy_models
+                    .as_ref()
+                    .and_then(LegacySessionModelState::from_state_value)
+                {
                     session.apply_advertised_models(models);
                 }
                 if let Some(modes) = new_response.modes {
@@ -178,7 +185,7 @@ impl AcpAgentManager {
             if !self.params.mcp_servers.is_empty() {
                 load_req = load_req.mcp_servers(self.params.mcp_servers.clone());
             }
-            let load_response = match self.protocol.load_session(load_req).await {
+            let (load_response, legacy_models) = match self.protocol.load_session(load_req).await {
                 Ok(r) => r,
                 Err(e) if is_acp_session_not_found(&e) => {
                     return self.rebuild_after_acp_session_not_found(session_id, e).await;
@@ -188,7 +195,10 @@ impl AcpAgentManager {
 
             {
                 let mut session = self.session.write().await;
-                if let Some(models) = load_response.models {
+                if let Some(models) = legacy_models
+                    .as_ref()
+                    .and_then(LegacySessionModelState::from_state_value)
+                {
                     session.apply_advertised_models(models);
                 }
                 if let Some(mut modes) = load_response.modes {

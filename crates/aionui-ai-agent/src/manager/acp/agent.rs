@@ -16,8 +16,8 @@ use crate::registry::CatalogSender;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::v1::{
-    AvailableCommand, CancelNotification, SessionConfigOptionCategory, SessionId, SessionModelState,
-    SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, UsageUpdate,
+    AvailableCommand, CancelNotification, SessionConfigOptionCategory, SessionId, SessionNotification,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, UsageUpdate,
 };
 use aionui_api_types::{
     AgentHandshake, ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionResponse,
@@ -77,6 +77,7 @@ fn build_acp_final_input_dump_value(
 
 use super::config_option_catalog::{extract_models_from_value, extract_modes_from_value};
 use super::config_options::{ConfigSetPath, ConfigSetPathError, ConfigSnapshot, resolve_set_path};
+use super::legacy_session_model::LegacySessionModelState;
 use super::mode_normalize::normalize_requested_mode;
 use super::mode_normalize::normalize_requested_mode_for_available_values;
 use super::mode_normalize::{RequiredFullAutoMode, resolve_required_full_auto_mode};
@@ -695,7 +696,7 @@ impl AcpAgentManager {
     }
 
     /// Cached model info from the ACP backend, if any has been received.
-    pub(crate) async fn model(&self) -> Option<SessionModelState> {
+    pub(crate) async fn model(&self) -> Option<LegacySessionModelState> {
         self.session.read().await.model_info().cloned()
     }
 
@@ -869,7 +870,7 @@ impl AcpAgentManager {
                     .set_config_option(SetSessionConfigOptionRequest::new(
                         SessionId::new(session_id.clone()),
                         config_id.clone(),
-                        resolved_value.clone(),
+                        resolved_value.as_str(),
                     ))
                     .await
                     .map_err(|err| {
@@ -955,10 +956,7 @@ impl AcpAgentManager {
             }
             ConfigSetPath::LegacyModel => {
                 self.protocol
-                    .set_model(SetSessionModelRequest::new(
-                        SessionId::new(session_id.clone()),
-                        resolved_value.clone(),
-                    ))
+                    .set_model(&session_id, &resolved_value)
                     .await
                     .map_err(|err| {
                         warn!(
