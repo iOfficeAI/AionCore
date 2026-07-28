@@ -5573,7 +5573,14 @@ mod force_kill_tests {
         let backend: Arc<dyn SessionBackend> = Arc::new(TerminateCountingBackend {
             terminate_calls: Arc::clone(&counter),
         });
-        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
         (task, counter)
     }
 
