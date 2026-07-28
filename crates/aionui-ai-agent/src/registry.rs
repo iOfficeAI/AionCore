@@ -1807,9 +1807,12 @@ mod tests {
 
         // The second (user-b) handshake landed on the catalog: auth_methods is
         // present, and its config option merged in alongside the first.
+        // Key order follows the SDK's internally-tagged AuthMethod enum
+        // (tag key first); consumers parse this column as JSON, so ordering
+        // is not part of the contract.
         assert_eq!(
             default_row.auth_methods.as_deref(),
-            Some(r#"[{"id":"oauth","type":"agent"}]"#)
+            Some(r#"[{"type":"agent","id":"oauth"}]"#)
         );
         assert!(
             default_row
