@@ -41,6 +41,10 @@
       "package": "@kilocode/cli",
       "version": "7.4.16"
     },
+    "mimo-code": {
+      "package": "@mimo-ai/cli",
+      "version": "0.1.9"
+    },
     "nova": {
       "registry_json_id": "nova",
       "package": "@compass-ai/nova",
