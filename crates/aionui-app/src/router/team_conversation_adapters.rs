@@ -258,10 +258,28 @@ impl TeamConversationAdapters {
     /// assistant snapshot's `agent_id`, then `extra.agent_id`, then the builtin
     /// row for `extra.backend`. Any failure yields `None` (→ catalog unavailable).
     async fn resolve_agent_metadata(&self, conversation_id: &str) -> Option<AgentMetadataRow> {
+        // User-scoped repo reads need the conversation's owner; best-effort like
+        // the rest of this path — an unresolvable owner yields `None`.
+        let user_id = match self.owner_user_id(conversation_id).await {
+            Ok(Some(user_id)) => user_id,
+            Ok(None) => return None,
+            Err(error) => {
+                debug!(
+                    conversation_id = %conversation_id, %error,
+                    reason = "owner_lookup_failed",
+                    "conversation owner lookup failed while resolving agent_metadata"
+                );
+                return None;
+            }
+        };
         // A genuine repo `Err` (not `Ok(None)` — "not found" is the normal case
         // for many conversations and must stay silent) is logged at `debug`: it is
         // a development-detail fault on a best-effort path, not a production signal.
-        match self.conversation_repo.get_assistant_snapshot(conversation_id).await {
+        match self
+            .conversation_repo
+            .get_assistant_snapshot(&user_id, conversation_id)
+            .await
+        {
             Ok(Some(snapshot)) => {
                 let agent_id = snapshot.agent_id.trim();
                 if !agent_id.is_empty() {
@@ -284,7 +302,7 @@ impl TeamConversationAdapters {
             ),
         }
 
-        let row = match self.conversation_repo.get(conversation_id).await {
+        let row = match self.conversation_repo.get(&user_id, conversation_id).await {
             Ok(Some(row)) => row,
             Ok(None) => return None,
             Err(error) => {
