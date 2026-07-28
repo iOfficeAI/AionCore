@@ -416,6 +416,7 @@ dependencies = [
  "aionui-project",
  "aionui-realtime",
  "aionui-runtime",
+ "aionui-session",
  "aionui-shell",
  "aionui-system",
  "aionui-team",
@@ -940,6 +941,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

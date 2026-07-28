@@ -426,7 +426,8 @@ impl SlotWorkCoordinator {
         };
 
         let queued_ids = slot.queue(priority).iter().cloned().collect::<Vec<_>>();
-        let message_intent_ids = queued_ids
+        // Message intents (those carrying a mailbox row), in FIFO order.
+        let fifo_message_intent_ids = queued_ids
             .iter()
             .filter(|intent_id| {
                 state
@@ -436,9 +437,38 @@ impl SlotWorkCoordinator {
             })
             .cloned()
             .collect::<Vec<_>>();
-        if message_intent_ids.is_empty() {
+        if fifo_message_intent_ids.is_empty() {
             return ReconcileDecision::SettleSignals(queued_ids);
         }
+
+        // ELECTRON-3RN: isolate recognized slash commands into single-message
+        // batches (FIFO, no preemption). The queue head decides:
+        // - head is a `UserCommand` → this batch is exactly that one command, so
+        //   the native op is not fed the rest of the turn (the flaw that ruled
+        //   out option B);
+        // - head is an ordinary message → merge the leading run of ordinary
+        //   messages but STOP at the first `UserCommand` so a command is never
+        //   folded into a plain batch (existing multi-message merge, bounded).
+        let head_is_command = state
+            .intents
+            .get(&fifo_message_intent_ids[0])
+            .is_some_and(|intent| intent.source == WorkSource::UserCommand);
+        let (message_intent_ids, is_command) = if head_is_command {
+            (vec![fifo_message_intent_ids[0].clone()], true)
+        } else {
+            let mut selected = Vec::new();
+            for intent_id in &fifo_message_intent_ids {
+                let is_command_intent = state
+                    .intents
+                    .get(intent_id)
+                    .is_some_and(|intent| intent.source == WorkSource::UserCommand);
+                if is_command_intent {
+                    break;
+                }
+                selected.push(intent_id.clone());
+            }
+            (selected, false)
+        };
 
         state.next_operation_id = state.next_operation_id.saturating_add(1);
         let operation_id = state.next_operation_id;
@@ -469,6 +499,7 @@ impl SlotWorkCoordinator {
             highest_priority: priority,
             team_run_ids: team_run_ids.clone(),
             operation_id,
+            is_command,
         };
         let slot = state.slots.get_mut(slot_id).expect("selected slot exists");
         for intent_id in &message_intent_ids {
@@ -493,6 +524,7 @@ impl SlotWorkCoordinator {
             intent_count = batch.intent_ids.len(),
             message_count = batch.mailbox_message_ids.len(),
             priority = ?batch.highest_priority,
+            is_command = batch.is_command,
             "team work batch claimed"
         );
         ReconcileDecision::Claim(batch)

@@ -535,3 +535,104 @@ fn system_initiated_none_delegates_to_port() {
         "a None inherit must delegate to bind_system_enqueue"
     );
 }
+
+// ── ELECTRON-3RN: recognized slash commands batch alone (FIFO, no preempt) ──
+
+// AC3: when a command shares the queue with other unread messages, it is claimed
+// as a single-message batch (`is_command`), never merged with them — otherwise
+// the native op would swallow the rest of the turn (the flaw that ruled out B).
+#[test]
+fn command_intent_is_claimed_alone_not_merged() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserCommand, "c1");
+    enqueue(&coordinator, WorkSource::UserMessage, "m2");
+    enqueue(&coordinator, WorkSource::UserMessage, "m3");
+    coordinator.reconcile_mailbox(
+        "lead-1",
+        &["c1".into(), "m2".into(), "m3".into()],
+        TeamRunTargetRole::Lead,
+    );
+
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("command must be claimable");
+    };
+    assert!(batch.is_command, "a command batch must be flagged is_command");
+    assert_eq!(
+        batch.mailbox_message_ids,
+        vec!["c1"],
+        "command must not merge later messages"
+    );
+    assert_eq!(coordinator.mark_started(&batch, "turn-1"), StartCommitResult::Accepted);
+    assert_eq!(coordinator.complete_batch(&batch), CommitResult::Committed);
+
+    // The trailing ordinary messages merge as usual once the command completes.
+    let ReconcileDecision::Claim(rest) = coordinator.next("lead-1") else {
+        panic!("ordinary messages must follow the command");
+    };
+    assert!(!rest.is_command);
+    assert_eq!(rest.mailbox_message_ids, vec!["m2", "m3"]);
+}
+
+// AC3: an ordinary batch merges the leading run of plain messages but STOPS at
+// the first command, so the command is never folded into a plain batch.
+#[test]
+fn plain_batch_merge_stops_at_command() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    enqueue(&coordinator, WorkSource::UserMessage, "m2");
+    enqueue(&coordinator, WorkSource::UserCommand, "c3");
+    enqueue(&coordinator, WorkSource::UserMessage, "m4");
+    coordinator.reconcile_mailbox(
+        "lead-1",
+        &["m1".into(), "m2".into(), "c3".into(), "m4".into()],
+        TeamRunTargetRole::Lead,
+    );
+
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("plain messages must be claimable");
+    };
+    assert!(!first.is_command);
+    assert_eq!(
+        first.mailbox_message_ids,
+        vec!["m1", "m2"],
+        "merge must stop before the command"
+    );
+    assert_eq!(coordinator.mark_started(&first, "turn-1"), StartCommitResult::Accepted);
+    assert_eq!(coordinator.complete_batch(&first), CommitResult::Committed);
+
+    let ReconcileDecision::Claim(command) = coordinator.next("lead-1") else {
+        panic!("command must be claimed next, alone");
+    };
+    assert!(command.is_command);
+    assert_eq!(command.mailbox_message_ids, vec!["c3"]);
+}
+
+// AC3: a command sent while a batch is running queues in FIFO order and does not
+// preempt the active batch.
+#[test]
+fn command_during_running_batch_queues_without_preemption() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("first message must be claimable");
+    };
+    assert!(!first.is_command);
+    assert_eq!(coordinator.mark_started(&first, "turn-1"), StartCommitResult::Accepted);
+
+    // Command arrives mid-turn: it must NOT preempt the running batch.
+    enqueue(&coordinator, WorkSource::UserCommand, "c2");
+    let active = coordinator.slot_snapshot("lead-1").unwrap();
+    assert_eq!(active.active_batch.unwrap().mailbox_message_ids, vec!["m1"]);
+    assert_eq!(coordinator.next("lead-1"), ReconcileDecision::WaitingForCompletion);
+
+    // Once the active batch completes, the command is claimed alone.
+    assert_eq!(coordinator.complete_batch(&first), CommitResult::Committed);
+    let ReconcileDecision::Claim(second) = coordinator.next("lead-1") else {
+        panic!("queued command must follow the active batch");
+    };
+    assert!(second.is_command);
+    assert_eq!(second.mailbox_message_ids, vec!["c2"]);
+}

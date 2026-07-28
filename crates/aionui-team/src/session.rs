@@ -25,7 +25,10 @@ use crate::member_runtime::{
 use crate::message_projection::{
     TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
 };
-use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort};
+use crate::ports::{
+    AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, NoopNativeSlashCommandPort,
+    SlashCommandRecognition,
+};
 use crate::prompt_dump::{TeamPromptDumpConfig, TeamWakePromptDump, dump_team_wake_prompt};
 use crate::prompts::{build_lead_prompt_for_transport, build_teammate_prompt_for_transport, build_wake_payload};
 use crate::provisioning::PersistSpawnedAgentRequest;
@@ -90,6 +93,11 @@ pub struct TeamSession {
     turn_port: Arc<dyn AgentTurnExecutionPort>,
     cancellation_port: Arc<dyn AgentTurnCancellationPort>,
     projection_store: Arc<dyn TeamProjectionMessageStore>,
+    /// Recognizes whether a user message is a native backend slash command
+    /// (ELECTRON-3RN). Defaults to a no-op recognizer (every message is ordinary
+    /// text) unless the composition layer injects a real one via
+    /// [`TeamSession::with_slash_command_port`].
+    slash_command_port: Arc<dyn NativeSlashCommandPort>,
     team_run_manager: Arc<TeamRunManager>,
     work_coordinator: Arc<SlotWorkCoordinator>,
     /// Owner user_id for this team — needed when spawn_agent creates a
@@ -222,6 +230,7 @@ impl TeamSession {
             turn_port,
             cancellation_port,
             projection_store,
+            slash_command_port: Arc::new(NoopNativeSlashCommandPort),
             team_run_manager,
             work_coordinator,
             user_id,
@@ -232,6 +241,16 @@ impl TeamSession {
             prompt_dump,
             recovery_scan_completed: AtomicBool::new(false),
         })
+    }
+
+    /// Inject the composition-layer slash-command recognizer. Called once right
+    /// after `start*` so live team sessions recognize native backend commands;
+    /// omitted in unit tests that don't exercise recognition (the no-op default
+    /// keeps behaviour identical to the pre-fix wrapped-wake path).
+    #[must_use]
+    pub fn with_slash_command_port(mut self, port: Arc<dyn NativeSlashCommandPort>) -> Self {
+        self.slash_command_port = port;
+        self
     }
 
     pub fn team_id(&self) -> &str {
@@ -366,26 +385,43 @@ impl TeamSession {
                     .into_iter()
                     .map(|member| member.slot_id)
                     .collect();
-                let wake_body = build_wake_payload(&agent, &tasks, &claimed_unread, &current_slot_ids);
-                let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
-                let first_message = if needs_role_prompt {
-                    let tool_transport = self.team_tool_transport_for_agent(&agent).await?;
-                    let role_prompt = match agent.role {
-                        TeammateRole::Lead => build_lead_prompt_for_transport(
-                            &agent,
-                            &self.team.name,
-                            &self.scheduler.list_agents().await,
-                            &[],
-                            tool_transport,
-                        ),
-                        TeammateRole::Teammate => {
-                            let members = self.scheduler.list_agents().await;
-                            build_teammate_prompt_for_transport(&agent, &self.team.name, &members, tool_transport)
-                        }
-                    };
-                    format!("{role_prompt}\n\n{wake_body}")
+                let (first_message, needs_role_prompt) = if batch.is_command {
+                    // ELECTRON-3RN: a recognized slash command turn is sent bare —
+                    // the turn's first content block is the raw command so the
+                    // backend's native slash dispatch (e.g. codex
+                    // `route_slash_command` → `thread/compact/start`) matches,
+                    // byte-for-byte like a direct-session send (AC9). Skip
+                    // `build_wake_payload`'s `## New Messages` wrapping AND the
+                    // role-prompt prefix, and do NOT consume `needs_role_prompt` —
+                    // it belongs to the next real wake turn (AC2).
+                    let command = claimed_unread
+                        .first()
+                        .map(|message| message.content.clone())
+                        .unwrap_or_default();
+                    (command, false)
                 } else {
-                    wake_body
+                    let wake_body = build_wake_payload(&agent, &tasks, &claimed_unread, &current_slot_ids);
+                    let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
+                    let first_message = if needs_role_prompt {
+                        let tool_transport = self.team_tool_transport_for_agent(&agent).await?;
+                        let role_prompt = match agent.role {
+                            TeammateRole::Lead => build_lead_prompt_for_transport(
+                                &agent,
+                                &self.team.name,
+                                &self.scheduler.list_agents().await,
+                                &[],
+                                tool_transport,
+                            ),
+                            TeammateRole::Teammate => {
+                                let members = self.scheduler.list_agents().await;
+                                build_teammate_prompt_for_transport(&agent, &self.team.name, &members, tool_transport)
+                            }
+                        };
+                        format!("{role_prompt}\n\n{wake_body}")
+                    } else {
+                        wake_body
+                    };
+                    (first_message, needs_role_prompt)
                 };
 
                 match dump_team_wake_prompt(
@@ -587,10 +623,71 @@ impl TeamSession {
         self.ensure_member_runtime_lazy(slot_id, false).await?;
         self.publish_runtime_constraint(slot_id).await?;
         let agent = self.scheduler.get_agent(slot_id).await?;
-        let source = if self.team_run_manager.current_active_run_id().is_some() {
+        // Fallback classification when the message is NOT a recognized command:
+        // an active team run makes it an intervention, otherwise an ordinary
+        // user message (unchanged pre-fix behaviour → zero regression).
+        let fallback_source = if self.team_run_manager.current_active_run_id().is_some() {
             WorkSource::UserIntervention
         } else {
             WorkSource::UserMessage
+        };
+        // ELECTRON-3RN: recognize native slash commands ONLY at this user entry
+        // point (`send_message` / `send_message_to_agent` both funnel here), so
+        // `send_agent_message_from_agent` (agent→agent) is never treated as a
+        // command (§9-7). `content` is passed and stored verbatim — never
+        // trimmed or rewritten — so the dispatched command is byte-identical to
+        // a direct send (AC9). Logs carry only the command NAME + source, never
+        // `content`/args (§14).
+        let source = match self.slash_command_port.recognize(&agent.conversation_id, content).await {
+            SlashCommandRecognition::Recognized { command, source } => {
+                info!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    conversation_id = %agent.conversation_id,
+                    backend = %agent.backend,
+                    command = %command,
+                    source = source.as_str(),
+                    "team user slash command recognized; dispatching as bare command turn"
+                );
+                WorkSource::UserCommand
+            }
+            SlashCommandRecognition::CatalogEmpty { name } => {
+                warn!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    conversation_id = %agent.conversation_id,
+                    backend = %agent.backend,
+                    command = %name,
+                    reason = "catalog_empty",
+                    "team user message resembles a slash command but the backend command catalog resolved EMPTY; falling back to wrapped wake"
+                );
+                fallback_source
+            }
+            SlashCommandRecognition::CatalogUnavailable { name } => {
+                warn!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    conversation_id = %agent.conversation_id,
+                    backend = %agent.backend,
+                    command = %name,
+                    reason = "catalog_unavailable",
+                    "team user message resembles a slash command but the backend command catalog is unavailable; falling back to wrapped wake"
+                );
+                fallback_source
+            }
+            SlashCommandRecognition::NotInCatalog { name } => {
+                tracing::debug!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    conversation_id = %agent.conversation_id,
+                    backend = %agent.backend,
+                    command = %name,
+                    reason = "not_in_catalog",
+                    "team user message starts with '/' but name is not an advertised command; treating as ordinary text"
+                );
+                fallback_source
+            }
+            SlashCommandRecognition::NotCommand => fallback_source,
         };
         let lease = self.work_coordinator.acquire_enqueue(EnqueueRequest {
             slot_id: slot_id.to_owned(),

@@ -3757,16 +3757,13 @@ enum SlashRoute {
     Logout,
 }
 
-/// Parse a leading slash command from the first Text block. Faithful port of the
-/// bridge's `extract_slash_command` (thread.rs:4195): the text must START with
-/// `/`, the name runs to the first whitespace, `rest` is the trimmed remainder.
-/// An unknown name (or `/review-branch`//`/review-commit` with no argument, per
-/// the bridge's `if !rest.is_empty()` guards) returns `None` → the text goes to
-/// codex verbatim as a plain turn, exactly like the bridge's `_ =>` arm.
-fn route_slash_command(content: &[ContentBlock]) -> Option<SlashRoute> {
-    let Some(ContentBlock::Text(text)) = content.first() else {
-        return None;
-    };
+/// Parse a leading slash command NAME from raw text. Sole grammar owner, shared
+/// by codex's `route_slash_command` and the team recognition predicate so the two
+/// never drift. Rules (byte-identical to the historical inline logic in
+/// `route_slash_command`): the text must START with `/` (no leading whitespace
+/// tolerated), the name runs to the first Unicode whitespace, and must be
+/// non-empty. Returns the name without the leading `/`.
+pub fn slash_command_name(text: &str) -> Option<&str> {
     let stripped = text.strip_prefix('/')?;
     let name_end = stripped
         .char_indices()
@@ -3777,7 +3774,26 @@ fn route_slash_command(content: &[ContentBlock]) -> Option<SlashRoute> {
     if name.is_empty() {
         return None;
     }
-    let rest = stripped[name_end..].trim_start();
+    Some(name)
+}
+
+/// Parse a leading slash command from the first Text block. Faithful port of the
+/// bridge's `extract_slash_command` (thread.rs:4195): the text must START with
+/// `/`, the name runs to the first whitespace, `rest` is the trimmed remainder.
+/// An unknown name (or `/review-branch`//`/review-commit` with no argument, per
+/// the bridge's `if !rest.is_empty()` guards) returns `None` → the text goes to
+/// codex verbatim as a plain turn, exactly like the bridge's `_ =>` arm.
+///
+/// The NAME segment is parsed by the shared [`slash_command_name`] so this table
+/// and the team recognition predicate always agree on the grammar.
+fn route_slash_command(content: &[ContentBlock]) -> Option<SlashRoute> {
+    let Some(ContentBlock::Text(text)) = content.first() else {
+        return None;
+    };
+    let name = slash_command_name(text)?;
+    // `rest` is everything after the name (name_end is the byte length of the
+    // name because the name never contains a multi-byte prefix split), trimmed.
+    let rest = text[1 + name.len()..].trim_start();
     match name {
         "compact" => Some(SlashRoute::Compact),
         "init" => Some(SlashRoute::Init),
@@ -5368,6 +5384,69 @@ mod tests {
         assert_eq!(route_slash_command(&text("hello")), None);
         assert_eq!(route_slash_command(&text("/")), None);
         assert_eq!(route_slash_command(&[]), None);
+    }
+
+    /// The shared name parser owns the slash grammar. Assert it matches the
+    /// exact rules `route_slash_command` used inline before the extraction:
+    /// must start with `/` (no leading whitespace), name runs to the first
+    /// Unicode whitespace, must be non-empty, and the `/` is stripped.
+    #[test]
+    fn slash_command_name_parses_leading_name() {
+        assert_eq!(slash_command_name("/compact"), Some("compact"));
+        assert_eq!(slash_command_name("/review focus on X"), Some("review"));
+        assert_eq!(slash_command_name("/review-branch main"), Some("review-branch"));
+        // Trailing content after the first whitespace is ignored; a newline also
+        // terminates the name (Unicode whitespace).
+        assert_eq!(slash_command_name("/init\nmore"), Some("init"));
+        // Not a command: no leading slash, leading whitespace, or empty name.
+        assert_eq!(slash_command_name("hello"), None);
+        assert_eq!(slash_command_name(" /compact"), None);
+        assert_eq!(slash_command_name("/"), None);
+        assert_eq!(slash_command_name("/ compact"), None);
+    }
+
+    /// AC10 (ELECTRON-3RN): the two independently hard-coded codex command-name
+    /// sets — `builtin_slash_commands()` (the advertised catalog / recognition
+    /// source) and `route_slash_command()`'s match arms (the real translation to
+    /// native ops) — MUST stay in lock-step. If either table gains or loses a
+    /// command without the other following, this fails immediately.
+    #[test]
+    fn builtin_slash_commands_match_route_table() {
+        use std::collections::BTreeSet;
+
+        // Names the advertised catalog claims codex supports.
+        let advertised: BTreeSet<String> = builtin_slash_commands().into_iter().map(|c| c.name).collect();
+
+        // Every advertised name must actually route to a native op. `review-branch`
+        // / `review-commit` need a non-empty argument to satisfy their guards, so
+        // probe with an argument; a bare name would false-negative on those two.
+        for name in &advertised {
+            let probe = format!("/{name} arg");
+            assert!(
+                route_slash_command(&[ContentBlock::Text(probe.clone())]).is_some(),
+                "advertised command `{name}` does not route to a native op"
+            );
+        }
+
+        // And the reverse: no name routes that the catalog fails to advertise.
+        // Enumerate the full universe the route table recognizes today; if a new
+        // arm is added to `route_slash_command`, add it here AND to the catalog.
+        let route_universe = ["review", "review-branch", "review-commit", "init", "compact", "logout"];
+        for name in route_universe {
+            assert!(
+                route_slash_command(&[ContentBlock::Text(format!("/{name} arg"))]).is_some(),
+                "route universe entry `{name}` unexpectedly does not route"
+            );
+            assert!(
+                advertised.contains(name),
+                "route table recognizes `{name}` but the advertised catalog omits it"
+            );
+        }
+        let route_universe_set: BTreeSet<String> = route_universe.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            advertised, route_universe_set,
+            "advertised catalog and route table command-name sets diverged"
+        );
     }
 
     /// #101/ELECTRON-3PX: codex advertises the bridge's static 6-command table

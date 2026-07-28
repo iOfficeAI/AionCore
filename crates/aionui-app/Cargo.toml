@@ -27,6 +27,7 @@ aionui-file.workspace = true
 aionui-office.workspace = true
 aionui-shell.workspace = true
 aionui-ai-agent.workspace = true
+aionui-session.workspace = true
 aionui-mcp.workspace = true
 aionui-conversation.workspace = true
 aionui-extension.workspace = true
