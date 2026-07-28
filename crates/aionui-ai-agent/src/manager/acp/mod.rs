@@ -14,6 +14,7 @@ pub mod session;
 mod stderr_error_extractor;
 
 pub use agent::AcpAgentManager;
+pub use agent::RequiredFullAutoApplication;
 pub use agent_event_tracker::AcpSessionEvent;
 pub use agent_reconcile::ReconcileAction;
 pub use catalog_forwarder::CatalogForwarder;

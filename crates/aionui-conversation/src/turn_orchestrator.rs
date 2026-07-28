@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AgentError, AgentInstance, AgentSendError, AgentSessionKind, IWorkerTaskManager};
+use aionui_ai_agent::{
+    AgentError, AgentInstance, AgentSendError, AgentSessionKind, IWorkerTaskManager, RequiredFullAutoApplication,
+};
 use aionui_common::{AgentType, ConversationStatus, ErrorChain, now_ms};
 use aionui_db::models::ConversationRow;
 use tokio::sync::oneshot;
@@ -223,12 +225,35 @@ impl ConversationTurnOrchestrator {
                 .filter(|mode| !mode.is_empty())
             {
                 match apply_required_runtime_mode(&agent, backend.as_deref(), mode).await {
-                    Ok(()) => {
+                    Ok(RequiredFullAutoApplication::Applied { effective }) => {
                         info!(
                             conversation_id = %input.conv_id,
                             turn_id = %input.turn_id,
                             mode,
                             "Confirmed required runtime mode before agent turn"
+                        );
+                        if effective != mode {
+                            info!(
+                                requested = %mode,
+                                effective = %effective,
+                                backend = ?backend,
+                                conversation_id = %input.conv_id,
+                                "cron required mode remapped to backend-native full-auto"
+                            );
+                        }
+                    }
+                    Ok(RequiredFullAutoApplication::Skipped { resolved }) => {
+                        // look-before-leap: the resolved native YOLO is not
+                        // selectable on this backend. The sunk method already
+                        // logged a warn with backend/conversation_id/resolved;
+                        // keep the session's already-resolved mode and continue
+                        // this turn rather than failing the whole turn.
+                        info!(
+                            conversation_id = %input.conv_id,
+                            turn_id = %input.turn_id,
+                            mode,
+                            resolved = %resolved,
+                            "Skipped required runtime mode override — keeping session mode"
                         );
                     }
                     Err(err) => {
@@ -649,10 +674,19 @@ async fn apply_required_runtime_mode(
     agent: &AgentInstance,
     backend: Option<&str>,
     mode: &str,
-) -> Result<(), AgentError> {
+) -> Result<RequiredFullAutoApplication, AgentError> {
+    // a-pure (ELECTRON-3RQ): for metadata-bearing ACP agents (Kimi et al.),
+    // resolve cron's full-auto request to the backend-native YOLO id and apply
+    // it look-before-leap. This logic is sunk into aionui-ai-agent because the
+    // `yolo_id` it needs is only visible on the ACP manager's metadata.
+    if let Some(app) = agent.apply_required_full_auto_mode().await? {
+        return Ok(app);
+    }
+    // Retained legacy path for non-ACP variants (claude/codex Session, aionrs):
+    // codex ELECTRON-3Q0 catalog alignment + native pass-through.
     let effective = resolve_required_runtime_mode(agent, backend, mode).await;
     agent.set_config_option("mode", &effective).await?;
-    Ok(())
+    Ok(RequiredFullAutoApplication::Applied { effective })
 }
 
 fn send_error_display_message(error: &AgentSendError) -> String {
