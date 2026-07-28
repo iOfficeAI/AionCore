@@ -99,6 +99,17 @@ impl FsMonitorActor {
     /// Feed a command through the shard and fan any outputs out to the wire.
     /// Errors are logged, never fatal to the loop.
     pub(super) async fn drive(&mut self, command: Command) {
+        // Lifecycle/flow trace. Overflow (kernel dropped events → rescan) is a
+        // low-volume, production-diagnostic boundary → info; the affected watched
+        // dir (an absolute uri) stays at debug. High-frequency apply → debug.
+        match &command {
+            Command::Overflow { canonical } => {
+                tracing::info!("fs overflow: watcher dropped events, rescanning watched dir");
+                tracing::debug!(canonical = %canonical, "fs overflow rescan target");
+            }
+            Command::Apply { canonical, .. } => tracing::debug!(canonical = %canonical, "fs apply"),
+            _ => {}
+        }
         match self.shard.handle(command).await {
             Ok(outputs) => self.fan_out(outputs),
             Err(err) => tracing::warn!(error = %err, "fs monitor: shard command failed"),
@@ -132,6 +143,9 @@ impl FsMonitorActor {
         match event {
             FsInbound::Frame { session, frame } => self.dispatch_frame(&session, frame).await,
             FsInbound::Disconnect { session } => {
+                // Connection teardown — lifecycle boundary; releases the session's
+                // subscriptions (nodes go warm, reaper unmounts later).
+                tracing::info!(session = %session, "fs session disconnect");
                 let now = self.now();
                 self.drive(Command::DropSession { session, now }).await;
             }
@@ -154,6 +168,12 @@ impl FsMonitorActor {
         for output in outputs {
             match output {
                 ShardOutput::Snapshot { subscribers, snapshot } => {
+                    // High-frequency fan-out → debug; counts + subscriber count only.
+                    tracing::debug!(
+                        subscribers = subscribers.len(),
+                        entries = snapshot.entries.len(),
+                        "fs snapshot fan-out"
+                    );
                     for sub in &subscribers {
                         let target = wire::ResourceRef {
                             pe_id: sub.pe_id.clone(),
@@ -164,6 +184,11 @@ impl FsMonitorActor {
                     }
                 }
                 ShardOutput::Delta { subscribers, delta } => {
+                    tracing::debug!(
+                        subscribers = subscribers.len(),
+                        changes = delta.changes.len(),
+                        "fs delta fan-out"
+                    );
                     for sub in &subscribers {
                         let target = wire::ResourceRef {
                             pe_id: sub.pe_id.clone(),

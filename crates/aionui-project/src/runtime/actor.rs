@@ -254,11 +254,20 @@ impl Shard {
             Command::ReapTick { now } => {
                 // TTL-expired warm nodes, then over-budget warm nodes (warm-LRU),
                 // are unmounted + unwatched.
+                let mut grace_expired = 0usize;
                 for canonical in self.subs.reap(now) {
                     self.tree.unmount(&canonical);
+                    grace_expired += 1;
                 }
+                let mut budget_evicted = 0usize;
                 for canonical in self.subs.enforce_watch_budget(self.warm_budget) {
                     self.tree.unmount(&canonical);
+                    budget_evicted += 1;
+                }
+                // Low-volume lifecycle boundary (only when something was evicted);
+                // counts only, no paths.
+                if grace_expired + budget_evicted > 0 {
+                    tracing::info!(grace_expired, budget_evicted, "fs grace evict: unmounted warm nodes");
                 }
                 Ok(Vec::new())
             }

@@ -32,6 +32,8 @@ impl FsMonitorActor {
     pub(super) async fn dispatch_frame(&mut self, session: &str, frame: Value) {
         let parsed = serde_json::from_value::<wire::IncomingFrame>(frame);
         let Ok(incoming) = parsed else {
+            // Malformed inbound frame — safely handled (client bug / protocol drift).
+            tracing::warn!(session, "fs dispatch: malformed frame");
             self.push(
                 session,
                 wire::error(None, wire::CODE_INVALID_REQUEST, "invalid_request", Value::Null),
@@ -40,6 +42,8 @@ impl FsMonitorActor {
         };
         let id = incoming.id;
         let params = incoming.params;
+        // High-frequency per-frame trace: method + session only (dev diagnostics).
+        tracing::debug!(session, method = %incoming.method, "fs dispatch");
         match incoming.method.as_str() {
             "initialize" => self.handle_initialize(session, id, params),
             "fs/subscribe" => self.handle_subscribe(session, id, params).await,
@@ -49,10 +53,13 @@ impl FsMonitorActor {
             "fs/mkdir" => self.handle_mkdir(session, id, params).await,
             "fs/remove" => self.handle_remove(session, id, params).await,
             "fs/rename" => self.handle_rename(session, id, params).await,
-            _ => self.push(
-                session,
-                wire::error(id, wire::CODE_METHOD_NOT_FOUND, "method_not_found", Value::Null),
-            ),
+            other => {
+                tracing::warn!(session, method = %other, "fs dispatch: unknown method");
+                self.push(
+                    session,
+                    wire::error(id, wire::CODE_METHOD_NOT_FOUND, "method_not_found", Value::Null),
+                )
+            }
         }
     }
 
@@ -88,6 +95,8 @@ impl FsMonitorActor {
             return;
         };
 
+        let target_count = parsed.targets.len();
+
         // Phase 1: resolve + canonicalize every target before mutating the shard,
         // so a bad target fails the whole request atomically (no partial mount).
         let mut plan: Vec<(ResourceRef, String)> = Vec::new();
@@ -95,6 +104,7 @@ impl FsMonitorActor {
             let resolved = match self.resolve(&target, FileOp::Browse).await {
                 Ok(r) => r,
                 Err((code, message)) => {
+                    tracing::warn!(session, code = message, pe_id = %target.pe_id, "fs subscribe rejected");
                     self.push(session, wire::error(id.clone(), code, message, ref_data(&target)));
                     return;
                 }
@@ -104,6 +114,7 @@ impl FsMonitorActor {
             let canonical = match canonical::canonicalize(&resolved.resource_uri) {
                 Ok(c) => c.as_str().to_owned(),
                 Err(_) => {
+                    tracing::warn!(session, code = "provider_unavailable", pe_id = %target.pe_id, "fs subscribe rejected");
                     self.push(
                         session,
                         wire::error(
@@ -138,11 +149,19 @@ impl FsMonitorActor {
                 }
                 Err(err) => {
                     let (code, message) = wire::fs_error_to_rpc(&err);
+                    tracing::warn!(session, code = message, pe_id = %target.pe_id, "fs subscribe rejected");
                     self.push(session, wire::error(id.clone(), code, message, ref_data(&target)));
                     return;
                 }
             }
         }
+        // Subscription registration succeeded — lifecycle boundary (low volume).
+        tracing::info!(
+            session,
+            targets = target_count,
+            snapshots = snapshots.len(),
+            "fs subscribe"
+        );
         self.push(session, wire::success(id, json!({ "snapshots": snapshots })));
     }
 
@@ -153,6 +172,8 @@ impl FsMonitorActor {
         let Ok(parsed) = serde_json::from_value::<UnsubscribeParams>(params) else {
             return;
         };
+        // Subscription de-registration — lifecycle boundary (low volume).
+        tracing::info!(session, targets = parsed.targets.len(), "fs unsubscribe");
         let now = self.now();
         for target in parsed.targets {
             let Ok(resolved) = self.resolve(&target, FileOp::Browse).await else {
@@ -192,6 +213,8 @@ impl FsMonitorActor {
         };
         match self.runtime().provider().read(&resolved.resource_uri).await {
             Ok(bytes) => {
+                // Byte count only — never the content itself.
+                tracing::info!(session, op = "read", pe_id = %p.file.pe_id, rel = %p.file.relative_path, bytes = bytes.len(), "fs command ok");
                 let (content, encoding) = encode_content(bytes, p.encoding.unwrap_or_default());
                 self.push(
                     session,
@@ -200,6 +223,7 @@ impl FsMonitorActor {
             }
             Err(err) => {
                 let (code, message) = wire::fs_error_to_rpc(&err);
+                tracing::warn!(session, op = "read", pe_id = %p.file.pe_id, rel = %p.file.relative_path, code = message, "fs command failed");
                 self.push(session, wire::error(id, code, message, ref_data(&p.file)));
             }
         }
@@ -225,7 +249,7 @@ impl FsMonitorActor {
             }
         };
         let outcome = self.runtime().provider().write(&resolved.resource_uri, &bytes).await;
-        self.reply_unit(session, id, &p.file, outcome);
+        self.reply_unit(session, id, "write", &p.file, outcome);
     }
 
     async fn handle_mkdir(&mut self, session: &str, id: Option<Value>, params: Value) {
@@ -241,7 +265,7 @@ impl FsMonitorActor {
             }
         };
         let outcome = self.runtime().provider().mkdir(&resolved.resource_uri).await;
-        self.reply_unit(session, id, &p.dir, outcome);
+        self.reply_unit(session, id, "mkdir", &p.dir, outcome);
     }
 
     async fn handle_remove(&mut self, session: &str, id: Option<Value>, params: Value) {
@@ -261,7 +285,7 @@ impl FsMonitorActor {
             .provider()
             .remove(&resolved.resource_uri, p.recursive)
             .await;
-        self.reply_unit(session, id, &p.target, outcome);
+        self.reply_unit(session, id, "remove", &p.target, outcome);
     }
 
     async fn handle_rename(&mut self, session: &str, id: Option<Value>, params: Value) {
@@ -288,7 +312,7 @@ impl FsMonitorActor {
             .provider()
             .rename(&from.resource_uri, &to.resource_uri)
             .await;
-        self.reply_unit(session, id, &p.from, outcome);
+        self.reply_unit(session, id, "rename", &p.from, outcome);
     }
 
     // ── helpers ───────────────────────────────────────────────────────────
@@ -316,17 +340,23 @@ impl FsMonitorActor {
     }
 
     /// Reply `{}` on success, or map a provider error to a protocol error.
+    /// `op` is the command label used for structured logging (identifier only).
     fn reply_unit(
         &self,
         session: &str,
         id: Option<Value>,
+        op: &'static str,
         target: &ResourceRef,
         outcome: Result<(), crate::runtime::FsError>,
     ) {
         match outcome {
-            Ok(()) => self.push(session, wire::success(id, json!({}))),
+            Ok(()) => {
+                tracing::info!(session, op, pe_id = %target.pe_id, rel = %target.relative_path, "fs command ok");
+                self.push(session, wire::success(id, json!({})));
+            }
             Err(err) => {
                 let (code, message) = wire::fs_error_to_rpc(&err);
+                tracing::warn!(session, op, pe_id = %target.pe_id, rel = %target.relative_path, code = message, "fs command failed");
                 self.push(session, wire::error(id, code, message, ref_data(target)));
             }
         }
