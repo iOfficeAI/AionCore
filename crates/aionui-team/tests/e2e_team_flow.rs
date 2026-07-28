@@ -1910,6 +1910,10 @@ async fn s11_shutdown_approved_interception() {
 struct FakeSlashPort {
     recognized: Vec<String>,
     available: bool,
+    /// When true, any parsed `/name` resolves to `CatalogEmpty` — models a
+    /// backend whose catalog RESOLVED but is empty (e.g. a live fetch that
+    /// returned no commands). Distinct from `available=false` (CatalogUnavailable).
+    empty_catalog: bool,
     source: SlashCatalogSource,
 }
 
@@ -1918,6 +1922,7 @@ impl FakeSlashPort {
         Self {
             recognized: names.iter().map(|s| s.to_string()).collect(),
             available: true,
+            empty_catalog: false,
             source: SlashCatalogSource::Live,
         }
     }
@@ -1926,6 +1931,17 @@ impl FakeSlashPort {
         Self {
             recognized: Vec::new(),
             available: false,
+            empty_catalog: false,
+            source: SlashCatalogSource::Live,
+        }
+    }
+
+    /// The catalog resolved but is EMPTY → `CatalogEmpty` (§14 warn: `catalog_empty`).
+    fn empty() -> Self {
+        Self {
+            recognized: Vec::new(),
+            available: true,
+            empty_catalog: true,
             source: SlashCatalogSource::Live,
         }
     }
@@ -1945,6 +1961,9 @@ impl NativeSlashCommandPort for FakeSlashPort {
         };
         if !self.available {
             return SlashCommandRecognition::CatalogUnavailable { name };
+        }
+        if self.empty_catalog {
+            return SlashCommandRecognition::CatalogEmpty { name };
         }
         if self.recognized.contains(&name) {
             SlashCommandRecognition::Recognized {
@@ -2141,6 +2160,52 @@ async fn recognized_command_log_carries_name_and_source_not_content() {
     assert!(
         !logs.contains(SENSITIVE_ARG),
         "production log must NOT contain command args/content: {logs}"
+    );
+
+    session.stop();
+}
+
+/// A RESOLVED-but-EMPTY catalog (e.g. a live backend that returned no commands)
+/// must (1) fall back to the wrapped wake with zero regression, and (2) emit a
+/// production-visible `warn` (`reason=catalog_empty`) so the otherwise-silent
+/// "command list is empty → command silently ignored" boundary is diagnosable.
+/// `warn` is more severe than `info`, so the INFO-max capturing subscriber sees it.
+#[tokio::test]
+async fn empty_catalog_logs_warn_and_falls_back_to_wrapped_wake() {
+    install_ac11_capturing_subscriber();
+    AC11_LOG_BUF.with(|cell| cell.borrow_mut().clear());
+
+    let (session, _tm, _repo, _sent, turn_requests) =
+        setup_session_with_slash_recognizer(Arc::new(FakeSlashPort::empty())).await;
+
+    session
+        .send_message_to_agent("worker-1", "/compact", None)
+        .await
+        .expect("send must succeed");
+    wait_until_turn_count(&turn_requests, 1).await;
+
+    // (1) Zero regression: an empty catalog falls back to the wrapped wake.
+    let content = last_turn_content(&turn_requests, "worker-1");
+    assert!(
+        content.contains("## New Messages"),
+        "empty-catalog must fall back to the wrapped wake (zero regression): {content}"
+    );
+
+    // (2) The empty-catalog boundary is logged at a production-visible level.
+    let logs = AC11_LOG_BUF.with(|cell| String::from_utf8(cell.borrow().clone()).expect("utf8 logs"));
+    assert!(
+        logs.contains("catalog_empty"),
+        "empty catalog must emit a warn with reason=catalog_empty: {logs}"
+    );
+    // The command NAME correlates the log; the raw content is fine here (no args),
+    // but the field must be the NAME only.
+    assert!(
+        logs.contains("command=compact"),
+        "warn must carry the command NAME: {logs}"
+    );
+    assert!(
+        logs.contains("conversation_id="),
+        "warn must carry conversation_id: {logs}"
     );
 
     session.stop();

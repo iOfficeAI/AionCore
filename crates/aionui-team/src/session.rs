@@ -634,6 +634,18 @@ impl TeamSession {
                 );
                 WorkSource::UserCommand
             }
+            SlashCommandRecognition::CatalogEmpty { name } => {
+                warn!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    conversation_id = %agent.conversation_id,
+                    backend = %agent.backend,
+                    command = %name,
+                    reason = "catalog_empty",
+                    "team user message resembles a slash command but the backend command catalog resolved EMPTY; falling back to wrapped wake"
+                );
+                fallback_source
+            }
             SlashCommandRecognition::CatalogUnavailable { name } => {
                 warn!(
                     team_id = %self.team.id,

@@ -64,6 +64,13 @@ pub enum SlashCommandRecognition {
     /// Leading `/` with a non-empty name, but the name is not in the advertised
     /// catalog → ordinary body text (§14 debug: `not_in_catalog`).
     NotInCatalog { name: String },
+    /// Leading `/` with a non-empty name, but the catalog RESOLVED to an EMPTY
+    /// list (e.g. a live backend returned no commands). Distinct from
+    /// `NotInCatalog` (a populated catalog that simply lacks this name): an empty
+    /// catalog is an anomaly that silently disables every team command, so it is
+    /// surfaced separately and logged at `warn` (§14 warn: `catalog_empty`).
+    /// Still falls back to the wrapped wake turn (zero regression).
+    CatalogEmpty { name: String },
     /// Leading `/` with a non-empty name, but the catalog could not be resolved
     /// (degradation chain exhausted) → fall back to the wrapped wake turn
     /// (§14 warn: `catalog_unavailable`).
