@@ -168,6 +168,25 @@ impl SuspendController {
         false
     }
 
+    /// UNCONDITIONAL force-terminate (the `UserCancelTimeout` force-kill path):
+    /// tear the slot Active→Dormant regardless of `idle_ttl_ms`/`turn_active`
+    /// (that gating is what `suspend_if_idle` is for — here the caller has
+    /// already decided to kill). Ordering is load-bearing: abort the reader
+    /// FIRST, THEN group-kill the process. With the reader aborted it can no
+    /// longer observe the child's stdout EOF, so the kill does not surface a
+    /// `SessionEvent::Detached` that the pump would mis-read as a crash. Takes
+    /// the SAME `slot` lock as `ensure_awake`/`suspend_if_idle`, so it cannot
+    /// race a concurrent wake (single-actor, no TOCTOU).
+    pub async fn terminate(&self) {
+        let mut slot = self.slot.lock().await;
+        if let Slot::Active(handle) = std::mem::replace(&mut *slot, Slot::Dormant) {
+            handle.reader.abort(); // stop the reader FIRST → no Detached emitted
+            handle.io.terminate().await; // group-kill the CLI process tree (Layer A)
+            // `handle.io` drops here → releases the slot's io clone.
+        }
+        *self.current_abort.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     /// Sync teardown for the backend's `Drop`: abort the live reader (if any) so
     /// its `AgentIo` clone releases and the child is reaped. Does NOT touch the
     /// async `slot` (Drop cannot await); the mirrored `AbortHandle` is enough.
@@ -234,7 +253,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::FakeAgentIo;
+    use crate::testing::{CountingTerminateIo, FakeAgentIo};
+    use std::sync::atomic::AtomicUsize;
 
     /// Build a `ProcHandle` over a never-exiting fake process + a reader task that
     /// just parks (so abort is observable). Returns the handle + an abort handle to
@@ -343,6 +363,56 @@ mod tests {
             !ctrl.is_active().await,
             "failed wake leaves the slot Dormant, not half-spawned"
         );
+    }
+
+    /// Build an Active controller over a terminate-counting io + a parked reader.
+    /// Returns (controller, reader abort handle, terminate-call counter).
+    fn counting_ctrl() -> (SuspendController, AbortHandle, Arc<AtomicUsize>) {
+        let io = CountingTerminateIo::new();
+        let counter = io.terminate_counter();
+        let io: Arc<dyn AgentIo> = Arc::from(Box::new(io) as Box<dyn AgentIo>);
+        let reader = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let abort = reader.abort_handle();
+        let ctrl = SuspendController::active(ProcHandle::new(reader, io), None, 0);
+        (ctrl, abort, counter)
+    }
+
+    /// T1 (spec §10.2): `terminate` aborts the live reader FIRST and group-kills
+    /// the io EXACTLY ONCE, then leaves the slot Dormant with `current_abort`
+    /// cleared — the unconditional Active→Dormant teardown for the force-kill path.
+    #[tokio::test]
+    async fn terminate_aborts_reader_and_group_kills_once() {
+        let (ctrl, abort, counter) = counting_ctrl();
+        assert!(ctrl.is_active().await);
+
+        ctrl.terminate().await;
+
+        for _ in 0..40 {
+            if abort.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(abort.is_finished(), "terminate aborts the live reader");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "terminate group-kills the io exactly once"
+        );
+        assert!(!ctrl.is_active().await, "terminate leaves the slot Dormant");
+        assert!(ctrl.current_abort_handle().is_none(), "terminate clears current_abort");
+    }
+
+    /// `terminate` on an already-Dormant slot is a no-op: no io.terminate, no panic.
+    #[tokio::test]
+    async fn terminate_on_dormant_is_noop() {
+        let (ctrl, _abort, counter) = counting_ctrl();
+        ctrl.terminate().await; // Active → Dormant, counts once
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        ctrl.terminate().await; // already Dormant → no-op
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "second terminate is a no-op");
     }
 
     #[tokio::test]

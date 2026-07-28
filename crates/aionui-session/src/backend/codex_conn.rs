@@ -3147,6 +3147,14 @@ fn extract_http_status_from_message(message: &str) -> Option<u64> {
 
 #[async_trait::async_trait]
 impl SessionBackend for CodexSessionBackend {
+    /// Force-kill path (`UserCancelTimeout`): delegate to the suspend
+    /// controller's unconditional teardown (abort reader → group-kill the codex
+    /// CLI process tree), so the process dies even while an orchestrator still
+    /// holds an `Arc` to this backend.
+    async fn terminate(&self) {
+        self.suspend.terminate().await;
+    }
+
     async fn dispatch(&self, command: Command) -> Result<CommandReceipt, BackendError> {
         match command {
             Command::Send { content, metadata } => {
