@@ -677,6 +677,7 @@ version = "0.1.53"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
+ "aionui-project",
  "aionui-realtime",
  "async-trait",
  "axum",

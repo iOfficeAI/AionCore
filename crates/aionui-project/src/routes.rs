@@ -180,6 +180,16 @@ impl From<ProjectError> for ApiError {
             ProjectError::TempDirExists { .. } | ProjectError::WorkspaceMissing => {
                 (StatusCode::BAD_REQUEST, "invalid_request", None)
             }
+            ProjectError::UploadPathOutsideRoot { path } => (
+                StatusCode::BAD_REQUEST,
+                "upload_path_outside_root",
+                Some(json!({ "path": path })),
+            ),
+            ProjectError::ChatFileMissing { path } => (
+                StatusCode::NOT_FOUND,
+                "chat_file_missing",
+                Some(json!({ "path": path })),
+            ),
             ProjectError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", None),
         };
         // Never leak internal DB detail to clients (Security: no internal leakage).

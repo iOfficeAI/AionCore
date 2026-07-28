@@ -14,6 +14,7 @@ use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
+use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
     ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
     ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
@@ -38,7 +39,7 @@ use aionui_db::{
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
-use aionui_project::{ProjectService, canonical};
+use aionui_project::{ProjectService, ResolvedChatMessage, canonical};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
 use chrono::Datelike;
@@ -487,6 +488,39 @@ impl ConversationService {
                 false
             }
         }
+    }
+
+    /// Resolve a send's file attachments to absolute paths and re-inline them
+    /// into the message content (`[[AION_FILES]]` form) at the send boundary.
+    /// Atomic — a bad reference fails the whole send. Empty `files` is a no-op
+    /// (content unchanged), so callers without attachments never need the
+    /// project service.
+    async fn resolve_message_attachments(
+        &self,
+        content: &str,
+        files: &[ChatFileRef],
+    ) -> Result<ResolvedChatMessage, ConversationError> {
+        if files.is_empty() {
+            return Ok(ResolvedChatMessage {
+                content: content.to_owned(),
+                files: Vec::new(),
+            });
+        }
+        let project = self
+            .project_service
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| ConversationError::BadRequest {
+                reason: "project service unavailable; cannot resolve file attachments".to_owned(),
+            })?;
+        let upload_root = std::env::temp_dir().join("aionui");
+        project
+            .resolve_chat_message(content, files, &upload_root)
+            .await
+            .map_err(|err| ConversationError::BadRequest {
+                reason: err.to_string(),
+            })
     }
 
     pub fn with_assistant_definition_repo(&self, repo: Arc<dyn IAssistantDefinitionRepository>) {
@@ -2699,6 +2733,11 @@ impl ConversationService {
 
         reject_deprecated_runtime_row(&row)?;
 
+        // Resolve file attachments at the send boundary before any persist/claim
+        // (atomic: a bad reference fails the whole send). Produces the inlined
+        // `[[AION_FILES]]` content used for persistence, broadcast, and the turn.
+        let resolved = self.resolve_message_attachments(&req.content, &req.files).await?;
+
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
 
@@ -2712,7 +2751,7 @@ impl ConversationService {
             conversation_id: conversation_id.to_owned(),
             msg_id: Some(user_msg_id.clone()),
             r#type: "text".into(),
-            content: serde_json::json!({ "content": req.content }).to_string(),
+            content: serde_json::json!({ "content": resolved.content }).to_string(),
             position: Some("right".into()),
             status: Some("finish".into()),
             hidden: req.hidden,
@@ -2740,7 +2779,7 @@ impl ConversationService {
             serde_json::json!({
                 "conversation_id": conversation_id,
                 "msg_id": &user_msg_id,
-                "content": &req.content,
+                "content": &resolved.content,
                 "position": "right",
                 "status": "finish",
                 "hidden": req.hidden,
@@ -2781,7 +2820,9 @@ impl ConversationService {
         ConversationTurnOrchestrator::new(self.clone(), Arc::clone(task_manager)).spawn_user_turn(TurnStartInput {
             user_id: user_id.to_owned(),
             conversation: row,
-            request: req,
+            content: resolved.content,
+            files: resolved.files,
+            inject_skills: req.inject_skills,
             required_runtime_mode: None,
             build_options: build_opts,
             stored_workspace,
@@ -2900,12 +2941,9 @@ impl ConversationService {
             .run_user_turn(TurnStartInput {
                 user_id: request.user_id,
                 conversation: row,
-                request: SendMessageRequest {
-                    content: request.content,
-                    files: request.files,
-                    inject_skills: request.inject_skills,
-                    hidden: request.user_message_hidden,
-                },
+                content: request.content,
+                files: request.files,
+                inject_skills: request.inject_skills,
                 required_runtime_mode: request.required_runtime_mode,
                 build_options: build_opts,
                 stored_workspace,

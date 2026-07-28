@@ -449,6 +449,7 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         file_service,
         watch_service,
         snapshot_service,
+        project: Arc::new(services.project_service.clone()),
         allowed_roots,
         browse_roots,
     })

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, Weak};
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
+use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
     TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus,
@@ -1779,10 +1780,11 @@ impl TeamSessionService {
         user_id: &str,
         team_id: &str,
         content: &str,
-        files: Option<Vec<String>>,
+        files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id).await?;
+        let (content, files) = self.resolve_message_attachments(content, files).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1790,7 +1792,7 @@ impl TeamSessionService {
                 .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
             Arc::clone(&entry.session)
         };
-        session.send_message(content, files).await
+        session.send_message(&content, files).await
     }
 
     pub async fn send_message_to_agent(
@@ -1799,10 +1801,11 @@ impl TeamSessionService {
         team_id: &str,
         slot_id: &str,
         content: &str,
-        files: Option<Vec<String>>,
+        files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id).await?;
+        let (content, files) = self.resolve_message_attachments(content, files).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1810,7 +1813,35 @@ impl TeamSessionService {
                 .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
             Arc::clone(&entry.session)
         };
-        session.send_message_to_agent(slot_id, content, files).await
+        session.send_message_to_agent(slot_id, &content, files).await
+    }
+
+    /// Resolve a send's attachments to absolute paths and re-inline them into
+    /// the content (`[[AION_FILES]]` form) at the team send boundary. Atomic;
+    /// empty/absent `files` is a no-op needing no project service.
+    async fn resolve_message_attachments(
+        &self,
+        content: &str,
+        files: Option<Vec<ChatFileRef>>,
+    ) -> Result<(String, Option<Vec<String>>), TeamError> {
+        let files = match files {
+            Some(files) if !files.is_empty() => files,
+            _ => return Ok((content.to_owned(), None)),
+        };
+        let project = self
+            .project_service
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| {
+                TeamError::InvalidRequest("project service unavailable; cannot resolve file attachments".into())
+            })?;
+        let upload_root = std::env::temp_dir().join("aionui");
+        let resolved = project
+            .resolve_chat_message(content, &files, &upload_root)
+            .await
+            .map_err(|err| TeamError::InvalidRequest(err.to_string()))?;
+        Ok((resolved.content, Some(resolved.files)))
     }
 
     /// Directed retry/wakeup for a single member runtime (dormant or failed),

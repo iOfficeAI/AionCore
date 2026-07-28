@@ -173,6 +173,12 @@ pub enum ProjectError {
     #[error("unsupported resource scheme: {scheme}")]
     UnsupportedResourceScheme { scheme: String },
 
+    #[error("uploaded file path is outside the managed upload directory: {path}")]
+    UploadPathOutsideRoot { path: String },
+
+    #[error("attached file does not exist: {path}")]
+    ChatFileMissing { path: String },
+
     #[error(transparent)]
     Database(#[from] DbError),
 }
@@ -197,6 +203,8 @@ impl ProjectError {
             ProjectError::InvalidRelativePath { .. } => "invalid_relative_path",
             ProjectError::ResourceOutsideFolder { .. } => "resource_outside_folder",
             ProjectError::UnsupportedResourceScheme { .. } => "unsupported_resource_scheme",
+            ProjectError::UploadPathOutsideRoot { .. } => "upload_path_outside_root",
+            ProjectError::ChatFileMissing { .. } => "chat_file_missing",
             ProjectError::Database(_) => "internal_db_error",
         }
     }

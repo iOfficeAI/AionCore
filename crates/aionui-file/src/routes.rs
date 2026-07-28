@@ -93,6 +93,8 @@ pub struct FileRouterState {
     pub file_service: FileServiceRef,
     pub watch_service: FileWatchServiceRef,
     pub snapshot_service: SnapshotServiceRef,
+    /// Resolves pe-addressed copy targets (`/api/fs/copy`) to absolute dirs.
+    pub project: Arc<aionui_project::ProjectService>,
     pub allowed_roots: Vec<std::path::PathBuf>,
     /// Roots permitted by the shallow `/api/fs/browse` endpoint. This is
     /// typically wider than `allowed_roots` (it includes `cwd`, Windows
@@ -277,9 +279,23 @@ async fn copy_files(
     body: Result<Json<CopyFilesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CopyFilesResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    // Resolve the pe-addressed target to an absolute directory (containment +
+    // identity via the project service); device file paths are copied into it.
+    let resolved = state
+        .project
+        .resolve_reference(aionui_project::ReferenceInput {
+            pe_id: req.target.pe_id,
+            relative_path: req.target.relative_path,
+            op: aionui_project::FileOp::Write,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    let dir = resolved
+        .absolute_path
+        .ok_or_else(|| ApiError::BadRequest("copy target is not a local path".to_owned()))?;
     let result = state
         .file_service
-        .copy_files_to_workspace(&req.file_paths, &req.workspace, req.source_root.as_deref())
+        .copy_files_to_workspace(&req.file_paths, &dir, req.source_root.as_deref())
         .await?;
     Ok(Json(ApiResponse::ok(to_copy_response(result))))
 }

@@ -5,6 +5,7 @@ use aionui_common::{
 use serde::{Deserialize, Serialize};
 
 use crate::acp::AcpConfigOptionDto;
+use crate::chat_file::ChatFileRef;
 
 /// Per-MCP snapshot status stored in `conversation.extra`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,7 +95,7 @@ pub struct CloneConversationRequest {
 pub struct SendMessageRequest {
     pub content: String,
     #[serde(default)]
-    pub files: Vec<String>,
+    pub files: Vec<ChatFileRef>,
     #[serde(default)]
     pub inject_skills: Vec<String>,
     #[serde(default)]
@@ -802,13 +803,27 @@ mod tests {
     fn deserialize_send_message_full() {
         let raw = json!({
             "content": "Review this code",
-            "files": ["/tmp/a.rs"],
+            "files": [
+                { "kind": "project", "pe_id": "pe1", "relative_path": "src/a.rs" },
+                { "kind": "upload", "path": "/tmp/a.rs" }
+            ],
             "inject_skills": ["security-review"],
             "hidden": true
         });
         let req: SendMessageRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.content, "Review this code");
-        assert_eq!(req.files, vec!["/tmp/a.rs"]);
+        assert_eq!(
+            req.files,
+            vec![
+                ChatFileRef::Project {
+                    pe_id: "pe1".into(),
+                    relative_path: "src/a.rs".into()
+                },
+                ChatFileRef::Upload {
+                    path: "/tmp/a.rs".into()
+                },
+            ]
+        );
         assert_eq!(req.inject_skills, vec!["security-review"]);
         assert!(req.hidden);
     }

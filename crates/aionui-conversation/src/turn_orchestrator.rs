@@ -18,7 +18,7 @@ use crate::service::{
 use crate::stream_relay::{RelayOutcome, StreamRelay, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use crate::turn_recovery_policy::{TurnRecoveryDecision, TurnRecoveryPolicy};
-use aionui_api_types::{AgentErrorCode, SendMessageRequest};
+use aionui_api_types::AgentErrorCode;
 
 fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
     match &options.context.kind {
@@ -30,7 +30,13 @@ fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
 pub(crate) struct TurnStartInput {
     pub user_id: String,
     pub conversation: ConversationRow,
-    pub request: SendMessageRequest,
+    /// User message content, already resolved to the inlined `[[AION_FILES]]`
+    /// form (HTTP path resolves `ChatFileRef`s; internal agent turns pass a
+    /// pre-formed string).
+    pub content: String,
+    /// Attachment absolute paths, already resolved.
+    pub files: Vec<String>,
+    pub inject_skills: Vec<String>,
     pub required_runtime_mode: Option<String>,
     pub build_options: BuildTaskOptions,
     pub stored_workspace: String,
@@ -380,11 +386,11 @@ impl ConversationTurnOrchestrator {
         let allowed_skill_names = input.build_options.context.skills.clone();
         let first_turn_msg_id = ConversationService::mint_msg_id();
         let initial_send = SendMessageData {
-            content: input.request.content,
+            content: input.content,
             msg_id: first_turn_msg_id.clone(),
             turn_id: Some(turn_id.clone()),
-            files: input.request.files,
-            inject_skills: input.request.inject_skills,
+            files: input.files,
+            inject_skills: input.inject_skills,
         };
         let mut replayed = false;
         let mut replay_started_at = None;
