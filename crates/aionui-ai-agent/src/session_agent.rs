@@ -146,6 +146,33 @@ impl SessionRuntime {
     fn effort_override(&self) -> Option<String> {
         self.effort_override.lock().ok().and_then(|g| g.clone())
     }
+
+    /// Atomic clean-converge frame: if not already `Finished`, set status ←
+    /// `Finished` AND broadcast a clean `Finish` on `tx`. Idempotent in the
+    /// `Finished` absorbing state (a repeat cancel / a late real Finish is a
+    /// no-op — no second broadcast). This is the precise isomorph of the ACP
+    /// path's `AgentRuntime::emit_finish`: it drives the SAME convergence chain
+    /// (relay break → orchestrator releases the turn claim → `cancelling`
+    /// cleared → `Idle`) so the gate recovers in seconds on the `UserCancel`
+    /// force-kill path, WITHOUT waiting for the workflow to finish naturally.
+    /// It is emitted for a `UserCancelTimeout` kill BEFORE the process is torn
+    /// down, so the relay returns clean (a "cancelled", not a red crash card).
+    fn emit_finish_once(&self) {
+        let already = {
+            let mut g = self.status.lock().unwrap_or_else(|e| e.into_inner());
+            let was = matches!(*g, Some(ConversationStatus::Finished));
+            if !was {
+                *g = Some(ConversationStatus::Finished);
+            }
+            was
+        };
+        if already {
+            return;
+        }
+        let _ = self.tx.send(AgentStreamEvent::Finish(FinishEventData {
+            session_id: self.session_id(),
+        }));
+    }
 }
 
 /// Cold-start catalog snapshot extracted from a persisted `agent_metadata`
@@ -988,22 +1015,66 @@ impl IAgentTask for SessionAgentTask {
             .map_err(|e| AgentError::internal(e.to_string()))
     }
 
-    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
-        // Teardown is Drop-driven, by design. The `SessionBackend` trait exposes no
-        // close/shutdown command and no `wait_for_exit` (a crash flows out as
-        // `Detached`); the sole reaper is `Drop for ClaudeSessionBackend` /
-        // `CodexSessionBackend`, which aborts the reader and `kill_on_drop`s the
-        // child once the last `Arc<dyn SessionBackend>` is released.
-        //
-        // Both manager teardown paths — `TaskManager::kill` and `kill_and_wait` —
-        // FIRST `tasks.remove(conversation_id)`, dropping the `Arc<AgentInstance>`
-        // and hence this `SessionAgentTask` and its `backend` field. Because the
-        // event pump no longer captures a backend Arc (see `spawn_event_pump`),
-        // `self.backend` is the ONLY long-lived strong handle, so that removal drops
-        // the last Arc and fires the backend's `Drop`. This method therefore has no
-        // synchronous work to do — calling `close_session` here is impossible (we
-        // hold the session actor, not its `BackendConnection`) and unnecessary.
+    fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        // For the `UserCancelTimeout` force-kill path, Drop-driven teardown is NOT
+        // enough: during an in-flight turn the orchestrator legitimately holds an
+        // `Arc<SessionAgentTask>` clone, so `tasks.remove()` does not drop the last
+        // reference, `Drop` never fires, and the CLI + its workflow keep running
+        // until the workflow ends naturally (~minutes) — the user is gated the whole
+        // time (ELECTRON-3RW). So we (1) emit a clean `Finish` FIRST to converge the
+        // turn (gate recovers in seconds, no crash card), then (2) delegate real
+        // process teardown to the backend, which kills the process tree WITHOUT
+        // waiting for the last Arc to drop.
+        if matches!(reason, Some(AgentKillReason::UserCancelTimeout)) {
+            tracing::info!(
+                conversation_id = %self.conversation_id,
+                "session kill(UserCancelTimeout): emitted clean Finish + delegating backend terminate (was Drop-only no-op)"
+            );
+            // 1) clean converge FIRST: relay breaks → orchestrator releases the turn
+            //    claim → `cancelling` cleared → gate recovers (no red crash card).
+            self.runtime.emit_finish_once();
+            // 2) then real process teardown, fire-and-forget on this sync entry
+            //    (the awaitable variant is `kill_and_wait`).
+            let backend = self.backend.clone();
+            tokio::spawn(async move {
+                backend.terminate().await;
+            });
+            return Ok(());
+        }
+        // Non-`UserCancelTimeout` (idle cleanup): unchanged Drop-driven teardown. The
+        // `SessionBackend` trait exposes no close/shutdown command; the sole reaper is
+        // `Drop for ClaudeSessionBackend` / `CodexSessionBackend`, which aborts the
+        // reader and `kill_on_drop`s the child once the last `Arc` is released. An idle
+        // kill has no in-flight orchestrator Arc, so that removal drops the last Arc and
+        // fires the backend's `Drop`. Nothing synchronous to do here.
         Ok(())
+    }
+}
+
+impl SessionAgentTask {
+    /// Awaitable force-kill (aligns with `AcpAgentManager::kill_and_wait`): the
+    /// awaitable teardown entry the `UserCancel` watchdog uses. For a
+    /// `UserCancelTimeout` kill it emits the clean `Finish` synchronously FIRST
+    /// (so the gate recovers before the returned future is even polled), then
+    /// returns a future that awaits the backend's real process teardown. Any
+    /// other reason keeps the pre-existing Drop-driven semantics (nothing to
+    /// await). The strict order — clean converge, THEN terminate — is what keeps
+    /// the kill from surfacing as a crash (see `SuspendController::terminate`).
+    pub fn kill_and_wait(
+        &self,
+        reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        if matches!(reason, Some(AgentKillReason::UserCancelTimeout)) {
+            tracing::info!(
+                conversation_id = %self.conversation_id,
+                "session kill_and_wait(UserCancelTimeout): emitted clean Finish + awaiting backend terminate"
+            );
+            self.runtime.emit_finish_once(); // clean converge FIRST (sync)
+            let backend = self.backend.clone();
+            Box::pin(async move { backend.terminate().await }) // then terminate
+        } else {
+            Box::pin(std::future::ready(())) // unchanged (Drop-driven)
+        }
     }
 }
 
@@ -5241,5 +5312,195 @@ mod pump_tests {
             "current_mode must be the backend's snapshot-seeded value, not the stale preload's plan"
         );
         assert_eq!(task.mode().await.unwrap().mode, "default");
+    }
+}
+
+/// Layer D force-kill regression (spec §10.1/§10.2/§10.3/§10.7, plan §5 T4–T6):
+/// the direct-CLI `SessionAgentTask` kill path. Before this fix `kill` was a
+/// Drop-only no-op that silently failed while an orchestrator held an `Arc`
+/// clone of the task (ELECTRON-3RW). These tests pin the fixed behavior: a
+/// `UserCancelTimeout` kill emits a clean `Finish` AND really terminates the
+/// backend, even with an external `Arc` held; and it is idempotent + isolated
+/// from the non-force-kill reasons.
+#[cfg(test)]
+mod force_kill_tests {
+    use super::*;
+    use crate::agent_task::{AgentInstance, IAgentTask};
+    use crate::types::SendMessageData;
+    use aionui_common::{AgentKillReason, ConversationStatus};
+    use aionui_session::{
+        Admission, BackendError, Capabilities, Command, CommandReceipt, SessionBackend, SessionEnvelope,
+    };
+    use futures_util::stream::BoxStream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A backend whose `events()` NEVER terminates (the turn stays in flight —
+    /// no natural `Finish`, exactly the workflow-in-progress window), and whose
+    /// `terminate()` bumps a shared counter so the force-kill delegation is
+    /// observable without a real process.
+    struct TerminateCountingBackend {
+        terminate_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for TerminateCountingBackend {
+        async fn dispatch(&self, c: Command) -> Result<CommandReceipt, BackendError> {
+            let admission = match c {
+                Command::Send { .. } => Admission::Started,
+                _ => Admission::NoTurn,
+            };
+            Ok(CommandReceipt {
+                accepted: true,
+                admission,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            // Never yields → the turn never converges on its own; only kill can.
+            futures_util::stream::pending().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        async fn terminate(&self) {
+            self.terminate_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn build_task_with_counter() -> (Arc<SessionAgentTask>, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn SessionBackend> = Arc::new(TerminateCountingBackend {
+            terminate_calls: Arc::clone(&counter),
+        });
+        let task = SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None);
+        (task, counter)
+    }
+
+    /// Drive a turn to `Running` (emits `Start` on the runtime channel).
+    async fn start_turn(task: &SessionAgentTask) {
+        IAgentTask::send_message(
+            task,
+            SendMessageData {
+                content: "hello".into(),
+                msg_id: "m1".into(),
+                turn_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .expect("send accepted");
+    }
+
+    /// Return the next TERMINAL frame (`Finish`/`Error`), skipping lifecycle
+    /// frames like `Start`. `None` if none arrives within the bounded window.
+    async fn next_terminal(rx: &mut broadcast::Receiver<AgentStreamEvent>) -> Option<AgentStreamEvent> {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+                Ok(Ok(ev)) => match ev {
+                    AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_) => return Some(ev),
+                    _ => continue,
+                },
+                _ => return None,
+            }
+        }
+    }
+
+    /// T4: `UserCancelTimeout` on the Session path forces a clean `Finish` AND a
+    /// real backend `terminate`, even while an external `Arc<SessionAgentTask>`
+    /// (the orchestrator) is still held — the case the old Drop-only kill missed.
+    #[tokio::test]
+    async fn user_cancel_timeout_forces_clean_finish_and_terminate_with_external_arc() {
+        let (task, counter) = build_task_with_counter();
+        let mut rx = IAgentTask::subscribe(task.as_ref());
+        start_turn(task.as_ref()).await;
+        assert_eq!(
+            IAgentTask::status(task.as_ref()),
+            Some(ConversationStatus::Running),
+            "turn should be in flight before kill"
+        );
+
+        // An orchestrator legitimately holds a clone of the Arc for the whole turn.
+        let orchestrator_hold = Arc::clone(&task);
+
+        let inst = AgentInstance::Session(Arc::clone(&task));
+        inst.kill_and_wait(Some(AgentKillReason::UserCancelTimeout)).await;
+
+        // (a) clean Finish broadcast — NOT a crash Error.
+        let terminal = next_terminal(&mut rx).await.expect("a terminal frame after kill");
+        assert!(
+            matches!(terminal, AgentStreamEvent::Finish(_)),
+            "kill must broadcast a clean Finish (not Error), got {terminal:?}"
+        );
+        // (b) runtime converged to Finished.
+        assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Finished));
+        // (c) backend really terminated once — independent of the still-held Arc.
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "backend.terminate must be awaited exactly once"
+        );
+        assert!(
+            Arc::strong_count(&task) >= 2,
+            "orchestrator still holds the Arc — Drop did NOT fire, yet terminate ran"
+        );
+
+        drop(orchestrator_hold);
+        drop(inst);
+    }
+
+    /// T5: idempotence — a repeated force-kill (or a late real Finish) does not
+    /// re-broadcast; status stays `Finished`.
+    #[tokio::test]
+    async fn repeated_user_cancel_kill_does_not_double_broadcast() {
+        let (task, _counter) = build_task_with_counter();
+        let mut rx = IAgentTask::subscribe(task.as_ref());
+        start_turn(task.as_ref()).await;
+
+        let inst = AgentInstance::Session(Arc::clone(&task));
+        inst.kill_and_wait(Some(AgentKillReason::UserCancelTimeout)).await;
+        let first = next_terminal(&mut rx).await.expect("first Finish");
+        assert!(matches!(first, AgentStreamEvent::Finish(_)));
+        assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Finished));
+
+        // Second force-kill → emit_finish_once is a no-op in the Finished state.
+        inst.kill_and_wait(Some(AgentKillReason::UserCancelTimeout)).await;
+        let again = next_terminal(&mut rx).await;
+        assert!(again.is_none(), "no second Finish broadcast, got {again:?}");
+        assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Finished));
+    }
+
+    /// T6: isolation — non-`UserCancelTimeout` reasons keep the original
+    /// Drop-driven no-op: no injected Finish, no forced terminate, status
+    /// unchanged.
+    #[tokio::test]
+    async fn non_user_cancel_reason_keeps_drop_driven_noop() {
+        let (task, counter) = build_task_with_counter();
+        let mut rx = IAgentTask::subscribe(task.as_ref());
+        start_turn(task.as_ref()).await;
+
+        let inst = AgentInstance::Session(Arc::clone(&task));
+        inst.kill_and_wait(Some(AgentKillReason::IdleTimeout)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "idle kill must NOT force backend terminate"
+        );
+        // The explicit `None` kill forwarder is likewise a Drop-driven no-op.
+        assert!(IAgentTask::kill(task.as_ref(), None).is_ok());
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "explicit None kill must NOT force backend terminate"
+        );
+
+        // Neither non-force-kill broadcast a terminal frame; status stays Running.
+        let terminal = next_terminal(&mut rx).await;
+        assert!(
+            terminal.is_none(),
+            "non-UserCancel kill must not broadcast Finish/Error, got {terminal:?}"
+        );
+        assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Running));
     }
 }

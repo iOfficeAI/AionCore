@@ -239,12 +239,12 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.kill_and_wait(reason),
             Self::Aionrs(m) => m.kill_and_wait(reason),
-            // Session teardown is Drop-driven (dropping the last SessionBackend
-            // handle aborts its reader + reaps the child). Nothing to await here.
-            Self::Session(m) => {
-                let _ = m.kill(reason);
-                Box::pin(std::future::ready(()))
-            }
+            // Session: delegate to the task's awaitable kill. For a
+            // `UserCancelTimeout` this emits a clean `Finish` (turn converges,
+            // gate recovers) then really terminates the CLI process tree, even
+            // while this `Arc` clone is held by an in-flight orchestrator —
+            // where the old Drop-only no-op silently failed (ELECTRON-3RW).
+            Self::Session(m) => m.kill_and_wait(reason),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => {
                 let _ = m.kill(reason);

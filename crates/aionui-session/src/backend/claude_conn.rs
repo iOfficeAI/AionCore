@@ -2121,6 +2121,14 @@ fn sniff_task(
 
 #[async_trait::async_trait]
 impl SessionBackend for ClaudeSessionBackend {
+    /// Force-kill path (`UserCancelTimeout`): delegate to the suspend
+    /// controller's unconditional teardown (abort reader → group-kill the
+    /// claude CLI process tree), so the process dies even while an orchestrator
+    /// still holds an `Arc` to this backend.
+    async fn terminate(&self) {
+        self.suspend.terminate().await;
+    }
+
     async fn dispatch(&self, command: Command) -> Result<CommandReceipt, BackendError> {
         use std::sync::atomic::Ordering;
         match command {

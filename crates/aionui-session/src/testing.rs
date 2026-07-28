@@ -280,6 +280,59 @@ impl AgentIo for FakeAgentIo {
     }
 }
 
+/// An `AgentIo` that RECORDS `terminate()` calls (the `UserCancel` force-kill
+/// path). Delegates `take_stdio`/`wait_for_exit`/`peek_stderr` to an inner
+/// never-exiting `FakeAgentIo` (so a backend reader can drain it normally), and
+/// overrides `terminate` to bump a shared counter. Distinct from `FakeAgentIo`,
+/// whose `terminate` stays the default no-op (the Layer A isolation guarantee):
+/// this double exists ONLY to assert the force-kill delegation chain
+/// (`SessionBackend::terminate` → `SuspendController::terminate` → `io.terminate`).
+pub struct CountingTerminateIo {
+    inner: FakeAgentIo,
+    terminate_calls: Arc<AtomicUsize>,
+}
+
+impl CountingTerminateIo {
+    /// A never-exiting io whose `terminate()` calls are counted.
+    pub fn new() -> Self {
+        Self {
+            inner: FakeAgentIo::never_exits(Vec::new()),
+            terminate_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// A handle to the shared terminate-call counter. Clone it BEFORE the io is
+    /// moved into a backend/suspend controller to assert the count afterwards.
+    pub fn terminate_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.terminate_calls)
+    }
+}
+
+impl Default for CountingTerminateIo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentIo for CountingTerminateIo {
+    async fn take_stdio(&self) -> Option<(BoxedStdin, BoxedStdout)> {
+        self.inner.take_stdio().await
+    }
+
+    async fn wait_for_exit(&self) -> Option<ExitStatusLite> {
+        self.inner.wait_for_exit().await
+    }
+
+    async fn peek_stderr(&self, max_lines: usize) -> String {
+        self.inner.peek_stderr(max_lines).await
+    }
+
+    async fn terminate(&self) {
+        self.terminate_calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// A `Spawner` that records its call count and returns `Err`. Used by T14 to
 /// prove `start_turn` routes through the INJECTED spawner: a bypassing impl
 /// leaves the count at 0. Cannot return a real `ManagedProcess` (no public
