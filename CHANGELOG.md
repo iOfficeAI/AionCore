@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.53](https://github.com/iOfficeAI/AionCore/compare/v0.1.52...v0.1.53) (2026-07-28)
+
+
+### Features
+
+* **agents:** add MiMo Code builtin ACP agent ([#700](https://github.com/iOfficeAI/AionCore/issues/700)) ([3a2d7e4](https://github.com/iOfficeAI/AionCore/commit/3a2d7e48386fd608b752354f032657c442b13e1b))
+
+
+### Bug Fixes
+
+* **acp:** tolerate CodeBuddy dialect and stop misreporting empty turns as needs-auth ([#692](https://github.com/iOfficeAI/AionCore/issues/692)) ([572f3c1](https://github.com/iOfficeAI/AionCore/commit/572f3c10e1cd183c5dd759d1e10adff55655d6c9))
+* **ai-agent:** resolve cron full-auto mode to backend-native YOLO (ELECTRON-3RQ) ([#699](https://github.com/iOfficeAI/AionCore/issues/699)) ([0b06fb5](https://github.com/iOfficeAI/AionCore/commit/0b06fb582a4c2eff7827909b65a86e984a1f94cf))
+* **session:** force-kill direct-CLI turns on UserCancelTimeout ([#702](https://github.com/iOfficeAI/AionCore/issues/702)) ([34119ce](https://github.com/iOfficeAI/AionCore/commit/34119ce01ff6702be7428dfc33aba79add160fac))
+* **session:** preserve codex's real error when systemError precedes the terminal ([#694](https://github.com/iOfficeAI/AionCore/issues/694)) ([994e3fe](https://github.com/iOfficeAI/AionCore/commit/994e3fe27c9c673e28cda2de23828501066af04b))
+* **team:** converge run-scoped wakes into a run at the enqueue choke-point ([#690](https://github.com/iOfficeAI/AionCore/issues/690)) ([c6fdcde](https://github.com/iOfficeAI/AionCore/commit/c6fdcde549c9ebcd0aa91c018758b8bea960ea70))
+* **team:** dispatch native slash commands as bare command turns ([#696](https://github.com/iOfficeAI/AionCore/issues/696)) ([45d4e71](https://github.com/iOfficeAI/AionCore/commit/45d4e715e34749b75f9ba671f59e98766e2ed14d))
+
 ## [0.1.52](https://github.com/iOfficeAI/AionCore/compare/v0.1.51...v0.1.52) (2026-07-24)
 
 
