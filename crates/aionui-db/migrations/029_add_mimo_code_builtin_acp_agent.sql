@@ -10,8 +10,11 @@
 -- initialize ok (protocolVersion 1), session/new ok with the inherited
 -- build/plan/compose mode catalog. `mimo --version` prints the version,
 -- so the default PATH probe applies.
--- Skills: packages/opencode/src/skill/index.ts scans project
--- `.opencode/skills` (EXTERNAL_DIRS), same as upstream OpenCode.
+-- Skills: packages/opencode/src/skill/index.ts scans the product's own
+-- project `.mimocode/{skill,skills}` config dirs (config/paths.ts) plus
+-- the inherited `.opencode/.claude/.agents/.codex` skills dirs
+-- (EXTERNAL_DIRS); persist the MiMo-native dir first with the
+-- OpenCode-compat dir as fallback.
 -- yolo_id 'build' mirrors the established OpenCode ruling; the probe
 -- confirmed the identical inherited mode catalog.
 INSERT INTO agent_metadata
@@ -22,7 +25,7 @@ VALUES
     ('8f21c6d3', '/api/assets/logos/acp-registry/mimo-code.svg', 'MiMo Code',
      'mimo-code', 'acp', 'builtin', '{"binary_name":"mimo","bridge_binary":"npx"}',
      1, 'npx', '["-y","@mimo-ai/cli","acp"]', '[]',
-     '[".opencode/skills"]',
+     '[".mimocode/skills",".opencode/skills"]',
      '{"supports_side_question":false,"supports_team":false,"team_capable_override":false}',
      'build', 3320,
      unixepoch('now','subsec')*1000, unixepoch('now','subsec')*1000)

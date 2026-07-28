@@ -47,7 +47,7 @@ async fn verified_registry_npx_agents_use_stable_packages_and_conservative_team_
             "mimo-code",
             "mimo",
             r#"["-y","@mimo-ai/cli","acp"]"#,
-            Some(r#"[".opencode/skills"]"#),
+            Some(r#"[".mimocode/skills",".opencode/skills"]"#),
             Some("build"),
         ),
         (
