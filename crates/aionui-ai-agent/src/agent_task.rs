@@ -17,7 +17,7 @@ use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs}
 use tokio::sync::broadcast;
 
 use crate::error::AgentError;
-use crate::manager::acp::AcpAgentManager;
+use crate::manager::acp::{AcpAgentManager, RequiredFullAutoApplication};
 use crate::manager::aionrs::AionrsAgentManager;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
@@ -374,6 +374,19 @@ impl AgentInstance {
         }
     }
 
+    /// Apply cron's full-auto required-runtime-mode (a-pure, ELECTRON-3RQ) for
+    /// metadata-bearing ACP agents (Kimi et al.). Returns `Ok(None)` for
+    /// non-ACP variants (claude/codex `Session`, `Aionrs`, `Mock`) — the
+    /// `yolo_id` metadata this resolution needs is only visible on the ACP
+    /// manager, so the caller uses the retained legacy apply path (codex
+    /// ELECTRON-3Q0 catalog alignment + native pass-through) for the rest.
+    pub async fn apply_required_full_auto_mode(&self) -> Result<Option<RequiredFullAutoApplication>, AgentError> {
+        match self {
+            Self::Acp(m) => Ok(Some(m.apply_required_full_auto_mode().await?)),
+            _ => Ok(None),
+        }
+    }
+
     /// Returns the cached session usage as a snake_case JSON object. The
     /// structure mirrors the ACP SDK `UsageUpdate` schema
     /// (`used` / `size` / `cost` / `_meta`), normalised via
@@ -634,5 +647,64 @@ mod aionrs_config_option_tests {
             matches!(&error, AgentError::BadRequest(message) if message == "Config option 'thought_level' is not available"),
             "unexpected error: {error:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod required_full_auto_dispatch_tests {
+    use super::*;
+    use tokio::sync::broadcast;
+
+    /// Minimal non-ACP agent behind the `Mock` variant: exercises the
+    /// `apply_required_full_auto_mode` dispatch without a real CLI.
+    struct NoopMockAgent {
+        conversation_id: String,
+        event_tx: broadcast::Sender<AgentStreamEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl IAgentTask for NoopMockAgent {
+        fn agent_type(&self) -> AgentType {
+            AgentType::Acp
+        }
+        fn conversation_id(&self) -> &str {
+            &self.conversation_id
+        }
+        fn workspace(&self) -> &str {
+            "/tmp/test"
+        }
+        fn status(&self) -> Option<ConversationStatus> {
+            None
+        }
+        fn last_activity_at(&self) -> TimestampMs {
+            0
+        }
+        fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
+            self.event_tx.subscribe()
+        }
+        async fn send_message(&self, _data: SendMessageData) -> Result<(), AgentSendError> {
+            Ok(())
+        }
+        async fn cancel(&self) -> Result<(), AgentError> {
+            Ok(())
+        }
+        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+            Ok(())
+        }
+    }
+
+    impl IMockAgent for NoopMockAgent {}
+
+    /// Non-ACP variants (proxy for claude/codex `Session`, `Aionrs`) never
+    /// enter the a-pure path — they signal `Ok(None)` so the caller falls back
+    /// to the retained legacy apply path.
+    #[tokio::test]
+    async fn non_acp_variant_returns_none_for_full_auto_apply() {
+        let (event_tx, _rx) = broadcast::channel(4);
+        let instance = AgentInstance::Mock(Arc::new(NoopMockAgent {
+            conversation_id: "conv-mock".into(),
+            event_tx,
+        }));
+        assert!(matches!(instance.apply_required_full_auto_mode().await, Ok(None)));
     }
 }

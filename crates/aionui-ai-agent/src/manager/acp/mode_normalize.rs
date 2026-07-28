@@ -67,6 +67,35 @@ pub(crate) fn normalize_requested_mode_for_available_values<'a>(
     normalize_requested_mode(metadata, mode)
 }
 
+/// Outcome of resolving a cron full-auto request against a backend's live
+/// mode catalog. `Apply` carries the backend-native YOLO id to set; `Skip`
+/// carries the resolved id that was NOT selectable (look-before-leap: skip
+/// the override and keep the session's already-resolved mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RequiredFullAutoMode {
+    Apply(String),
+    Skip { resolved: String },
+}
+
+/// a-pure: a cron `required_runtime_mode` is ALWAYS a full-auto request
+/// (ELECTRON-3RQ). Ignore the incoming literal entirely; resolve "yolo" to
+/// the backend-native YOLO id (reusing the codex live-catalog alignment
+/// already in `normalize_requested_mode_for_available_values`), then
+/// look-before-leap: only `Apply` when the resolved id is actually in the
+/// advertised catalog, else `Skip`.
+pub(crate) fn resolve_required_full_auto_mode<'a>(
+    metadata: &AgentMetadata,
+    available_values: impl IntoIterator<Item = &'a str>,
+) -> RequiredFullAutoMode {
+    let values: Vec<String> = available_values.into_iter().map(ToOwned::to_owned).collect();
+    let resolved = normalize_requested_mode_for_available_values(metadata, "yolo", values.iter().map(String::as_str));
+    if values.iter().any(|v| v == &resolved) {
+        RequiredFullAutoMode::Apply(resolved)
+    } else {
+        RequiredFullAutoMode::Skip { resolved }
+    }
+}
+
 fn is_codex(metadata: &AgentMetadata) -> bool {
     matches!(metadata.backend.as_deref(), Some("codex"))
 }
@@ -300,5 +329,72 @@ mod tests {
     fn normalize_requested_mode_trims_and_returns_empty_for_blank() {
         let meta = metadata_with_yolo_id(Some("full-access"));
         assert_eq!(normalize_requested_mode(&meta, "   "), "");
+    }
+
+    // ── ELECTRON-3RQ: resolve_required_full_auto_mode (a-pure) ──────────
+    // All available-values are synthetic; no assertion depends on a real CLI.
+
+    /// Kimi (`yolo_id=NULL`, non-codex) resolves the full-auto request to the
+    /// generic `yolo` id and, when the catalog advertises it, applies it.
+    /// The function never receives the persisted literal — it always resolves
+    /// from "yolo", so a fossilised `bypassPermissions` cannot reach it.
+    #[test]
+    fn resolve_full_auto_kimi_applies_yolo_when_advertised() {
+        let meta = metadata_with_yolo_id(None);
+        assert_eq!(
+            resolve_required_full_auto_mode(&meta, ["yolo", "default", "read-only"]),
+            RequiredFullAutoMode::Apply("yolo".into())
+        );
+    }
+
+    /// Bad path: the resolved native YOLO is not in the live catalog →
+    /// look-before-leap `Skip` carrying the exact resolved id (specific
+    /// behaviour, not merely "not Apply").
+    #[test]
+    fn resolve_full_auto_skips_when_resolved_not_in_catalog() {
+        let meta = metadata_with_yolo_id(None);
+        assert_eq!(
+            resolve_required_full_auto_mode(&meta, ["default", "read-only"]),
+            RequiredFullAutoMode::Skip {
+                resolved: "yolo".into()
+            }
+        );
+    }
+
+    /// Regression (ELECTRON-3Q0): codex full-access alignment still holds when
+    /// resolving the full-auto request against a live catalog.
+    #[test]
+    fn resolve_full_auto_codex_aligns_to_live_catalog() {
+        let mut meta = metadata_with_yolo_id(Some("agent-full-access"));
+        meta.backend = Some("codex".into());
+
+        // Canonical id present → keep canonical.
+        assert_eq!(
+            resolve_required_full_auto_mode(&meta, ["agent-full-access", "read-only"]),
+            RequiredFullAutoMode::Apply("agent-full-access".into())
+        );
+        // Only the legacy token present → downgrade to legacy.
+        assert_eq!(
+            resolve_required_full_auto_mode(&meta, ["full-access", "read-only"]),
+            RequiredFullAutoMode::Apply("full-access".into())
+        );
+        // No full-access tier at all → resolved canonical id is unselectable → skip.
+        assert_eq!(
+            resolve_required_full_auto_mode(&meta, ["auto", "read-only"]),
+            RequiredFullAutoMode::Skip {
+                resolved: "agent-full-access".into()
+            }
+        );
+    }
+
+    /// Claude resolves the full-auto request to its native `bypassPermissions`
+    /// and applies it when advertised.
+    #[test]
+    fn resolve_full_auto_claude_applies_bypass_permissions() {
+        let meta = metadata_with_yolo_id(Some("bypassPermissions"));
+        assert_eq!(
+            resolve_required_full_auto_mode(&meta, ["bypassPermissions", "default"]),
+            RequiredFullAutoMode::Apply("bypassPermissions".into())
+        );
     }
 }
