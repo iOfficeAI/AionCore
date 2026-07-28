@@ -24,7 +24,7 @@
     "dirac": {
       "registry_json_id": "dirac",
       "package": "dirac-cli",
-      "version": "0.4.27"
+      "version": "0.4.28"
     },
     "glm-acp-agent": {
       "registry_json_id": "glm-acp-agent",
