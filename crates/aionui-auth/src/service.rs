@@ -92,16 +92,15 @@ impl AuthProvisionService {
         }
         // Move the corresponding on-disk files to the adopter's per-user roots
         // so the upgraded account can see its files (DB rows already point at
-        // it). Gated on the adoption window (sole external user), NOT on
-        // "rows moved this call": the on-disk move is idempotent and MUST be
-        // able to re-run after a partial failure — the first login may adopt
-        // the DB rows (adopted > 0) yet fail halfway through the file move, so
-        // a later login (adopted == 0, window still held) has to pick up the
-        // leftover files. The window predicate is false once a second external
-        // user exists, so files can never leak to a later account.
+        // it). Gated on the recorded one-shot adopter marker, NOT on "rows
+        // moved this call": the on-disk move is idempotent and MUST be able to
+        // re-run after a partial failure — the first login stamps the marker
+        // yet may fail halfway through the file move, so a later login of the
+        // SAME account has to pick up the leftover files. Only the stamped
+        // adopter matches, so files can never leak to any other account.
         // Best-effort; never fails provisioning.
         if let Some(fs_adopter) = &self.fs_adopter
-            && self.user_repo.is_sole_external_user(&user.id).await?
+            && self.user_repo.is_default_data_adopter(&user.id).await?
         {
             fs_adopter.adopt_filesystem(&user.id).await;
         }
