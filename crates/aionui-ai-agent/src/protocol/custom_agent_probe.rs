@@ -24,7 +24,6 @@ use tracing::{debug, warn};
 use crate::capability::cli_process::CliAgentProcess;
 use crate::protocol::acp::AcpProtocol;
 use crate::protocol::error::AcpError;
-use crate::protocol::npx_cache_repair::CorruptNpxCacheRepair;
 
 use agent_client_protocol::schema::NewSessionRequest;
 
@@ -125,64 +124,6 @@ async fn spawn_probe_process(
         .map_err(|e| format!("spawn failed: {e}"))
 }
 
-/// RAII guard that force-kills a probe's process tree when dropped.
-///
-/// Probe connections are throwaway, and some callers wrap this future in a
-/// `tokio::time::timeout`. On any exit — success, `?` early-return, or
-/// cancellation when the timeout fires and drops the future — we must reap the
-/// whole spawned process group. `kill_on_drop` only reaps the direct child, so
-/// an npx-spawned ACP grandchild (`codex-acp`, `codebuddy --acp`, …) would
-/// otherwise reparent to init and leak as an orphan.
-struct ProbeProcessGuard<'a> {
-    proc: &'a CliAgentProcess,
-}
-
-impl Drop for ProbeProcessGuard<'_> {
-    fn drop(&mut self) {
-        self.proc.force_kill_tree();
-    }
-}
-
-/// Probe a pre-built [`CommandSpec`] (used by the builtin managed-agent path).
-///
-/// Runs the same Step 2 handshake as [`try_connect_custom_agent`] —
-/// `initialize` followed by `session/new` — so auth-gated builtin agents
-/// (e.g. gemini logged out) surface as [`TryConnectCustomAgentResponse::FailAuth`]
-/// rather than appearing online.
-pub(crate) async fn acp_probe_command_spec(spec: CommandSpec) -> TryConnectCustomAgentResponse {
-    let mut corrupt_npx_cache_repair = CorruptNpxCacheRepair::default();
-
-    loop {
-        match acp_probe_command_spec_once(spec.clone()).await {
-            ProbeOutcome::Fail(error) => {
-                if let Some(cache_entry) = corrupt_npx_cache_repair.try_repair(&spec, &error) {
-                    tracing::info!(
-                        npm_npx_cache_entry = %cache_entry.display(),
-                        "Cleared corrupt npm npx cache after ACP probe startup crash; retrying probe once"
-                    );
-                    continue;
-                }
-
-                return TryConnectCustomAgentResponse::FailAcp { error };
-            }
-            outcome => return outcome.into_response(),
-        }
-    }
-}
-
-async fn acp_probe_command_spec_once(spec: CommandSpec) -> ProbeOutcome {
-    let proc = match CliAgentProcess::spawn_for_sdk(spec).await {
-        Ok(proc) => proc,
-        Err(e) => return ProbeOutcome::Fail(format!("spawn failed: {e}")),
-    };
-
-    // From here on, the process tree is reaped on every exit path, including
-    // cancellation when an outer timeout drops this future.
-    let _guard = ProbeProcessGuard { proc: &proc };
-
-    run_handshake(&proc).await
-}
-
 /// Result of the Step 2 probe (`initialize` + `session/new`).
 ///
 /// The probe reaches `session/new` so it can tell "reachable but not
@@ -280,80 +221,6 @@ mod tests {
             }
             other => panic!("expected FailCli, got {other:?}"),
         }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn probe_reaps_grandchild_when_caller_timeout_cancels_handshake() {
-        // The CLI backgrounds a long-lived grandchild then hangs without ever
-        // speaking ACP, so the handshake never completes. The caller wraps the
-        // probe in a tight timeout; when it fires the probe future is dropped
-        // mid-flight. The drop guard must still reap the whole process group,
-        // including the reparented grandchild (the production orphan leak).
-        use aionui_common::{CommandSpec, EnvVar};
-
-        let marker = tempfile::NamedTempFile::new().unwrap();
-        let marker_path = marker.path().to_string_lossy().into_owned();
-
-        let spec = CommandSpec {
-            command: "sh".into(),
-            args: vec![
-                "-c".into(),
-                // Background a sleeper, record its pid, then block forever
-                // while keeping stdout open and silent so ACP initialize never
-                // gets a response (we must NOT echo stdin — that would look
-                // like a malformed reply and make `connect` fail fast).
-                "sleep 60 & printf '%s' \"$!\" > \"$1\"; exec sleep 60".into(),
-                "probe-timeout-cleanup".into(),
-                marker_path.clone(),
-            ],
-            env: Vec::<EnvVar>::new(),
-            cwd: None,
-        };
-
-        // Warm the lazily-loaded shell-env cache so the spawn below is not
-        // racing a cold login-shell capture against our timeout.
-        let _ = aionui_runtime::agent_process_env().await;
-
-        let result = tokio::time::timeout(Duration::from_secs(2), acp_probe_command_spec(spec)).await;
-        assert!(
-            result.is_err(),
-            "handshake should not complete; outer timeout must fire"
-        );
-
-        let child_pid: u32 = {
-            // The marker is written very early; poll briefly in case of races.
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            loop {
-                if let Ok(contents) = std::fs::read_to_string(marker.path())
-                    && let Ok(pid) = contents.trim().parse::<u32>()
-                {
-                    break pid;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "grandchild pid marker never appeared"
-                );
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        };
-
-        fn is_pid_alive(pid: u32) -> bool {
-            let rc = unsafe { libc::kill(pid as i32, 0) };
-            if rc == 0 {
-                return true;
-            }
-            !matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH))
-        }
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while is_pid_alive(child_pid) && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(
-            !is_pid_alive(child_pid),
-            "grandchild pid={child_pid} should be reaped after the probe future is cancelled",
-        );
     }
 
     #[tokio::test]

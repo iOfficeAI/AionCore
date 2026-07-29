@@ -621,7 +621,7 @@ async fn trs2_run_state_returns_active_run_payload() {
     assert!(body["data"]["active_run"]["starting_batch_count"].is_number());
     assert!(body["data"]["active_run"]["running_batch_count"].is_number());
     assert!(body["data"]["active_run"]["active_enqueue_lease_count"].is_number());
-    assert!(body["data"]["active_run"]["slot_work"].as_array().unwrap().len() >= 1);
+    assert!(!body["data"]["active_run"]["slot_work"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

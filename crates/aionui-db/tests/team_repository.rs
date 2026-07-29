@@ -43,6 +43,8 @@ fn make_team_for_user(id: &str, user_id: &str, name: &str) -> TeamRow {
         agents_version: "1.0.1".into(),
         created_at: now,
         updated_at: now,
+        project_id: None,
+        folder_id: None,
     }
 }
 

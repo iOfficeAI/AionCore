@@ -13,7 +13,10 @@ impl ConversationScope {
     pub(crate) fn from_conversation(row: &ConversationRow) -> Result<Self, MemoryError> {
         let extra: Value = serde_json::from_str(&row.extra).map_err(|_| MemoryError::InvalidInput)?;
         let object = extra.as_object().ok_or(MemoryError::InvalidInput)?;
-        let project_id = aliased_string(object, &["project_id", "projectId"])?;
+        let project_id = match row.project_id.as_deref() {
+            Some(project_id) => Some(normalized_string(project_id)?),
+            None => aliased_string(object, &["project_id", "projectId"])?,
+        };
         let workspace_key = aliased_string(object, &["workspace_key", "workspaceKey", "workspace"])?
             .map(normalize_workspace_key)
             .transpose()?;
@@ -30,15 +33,17 @@ fn aliased_string(object: &Map<String, Value>, names: &[&str]) -> Result<Option<
     };
     match value {
         Value::Null => Ok(None),
-        Value::String(value) => {
-            let value = value.trim();
-            if value.is_empty() || value.len() > MAX_STRING_LENGTH {
-                Err(MemoryError::InvalidInput)
-            } else {
-                Ok(Some(value.to_owned()))
-            }
-        }
+        Value::String(value) => normalized_string(value).map(Some),
         _ => Err(MemoryError::InvalidInput),
+    }
+}
+
+fn normalized_string(value: &str) -> Result<String, MemoryError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_STRING_LENGTH {
+        Err(MemoryError::InvalidInput)
+    } else {
+        Ok(value.to_owned())
     }
 }
 

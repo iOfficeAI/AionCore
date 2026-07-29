@@ -10,6 +10,7 @@ mod mcp_server;
 mod memory;
 mod message;
 mod oauth_token;
+mod project;
 mod provider;
 mod remote_agent;
 mod skill;
@@ -40,6 +41,7 @@ pub use memory::{
 };
 pub use message::MessageRow;
 pub use oauth_token::OAuthTokenRow;
+pub use project::{FolderRow, ProjectExplorerRow, ProjectKind, ProjectRow, Role};
 pub use provider::Provider;
 pub use remote_agent::RemoteAgentRow;
 pub use skill::{SkillImportRecordRow, SkillRow};

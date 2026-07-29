@@ -711,6 +711,8 @@ mod tests {
             pinned_at: None,
             created_at: 1,
             updated_at: 2,
+            project_id: None,
+            folder_id: None,
         }
     }
 

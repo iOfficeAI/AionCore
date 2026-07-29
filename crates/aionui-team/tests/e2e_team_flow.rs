@@ -38,7 +38,8 @@ use aionui_team::event_loop::AgentLoopContext;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
 use aionui_team::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-    AgentTurnSource, AgentTurnStarted, AgentTurnStatus,
+    AgentTurnSource, AgentTurnStarted, AgentTurnStatus, NativeSlashCommandPort, NoopNativeSlashCommandPort,
+    SlashCatalogSource, SlashCommandRecognition,
 };
 use aionui_team::service::TeamSessionService;
 use aionui_team::{TeamAgent, TeamProjectionMessageStore, TeamSession, TeammateRole};
@@ -639,7 +640,7 @@ async fn setup_session_with_turn_recorder() -> (
     Arc<Mutex<Vec<SendMessageData>>>,
     Arc<Mutex<Vec<AgentTurnRequest>>>,
 ) {
-    setup_session_with_turn_recorder_inner(true).await
+    setup_session_with_turn_recorder_inner(true, Arc::new(NoopNativeSlashCommandPort)).await
 }
 
 async fn setup_session_with_turn_recorder_without_loops() -> (
@@ -649,11 +650,26 @@ async fn setup_session_with_turn_recorder_without_loops() -> (
     Arc<Mutex<Vec<SendMessageData>>>,
     Arc<Mutex<Vec<AgentTurnRequest>>>,
 ) {
-    setup_session_with_turn_recorder_inner(false).await
+    setup_session_with_turn_recorder_inner(false, Arc::new(NoopNativeSlashCommandPort)).await
+}
+
+/// Variant with a custom slash-command recognizer injected — for the
+/// ELECTRON-3RN command-path tests.
+async fn setup_session_with_slash_recognizer(
+    slash_port: Arc<dyn NativeSlashCommandPort>,
+) -> (
+    Arc<TeamSession>,
+    Arc<StubTaskManager>,
+    Arc<MockTeamRepo>,
+    Arc<Mutex<Vec<SendMessageData>>>,
+    Arc<Mutex<Vec<AgentTurnRequest>>>,
+) {
+    setup_session_with_turn_recorder_inner(true, slash_port).await
 }
 
 async fn setup_session_with_turn_recorder_inner(
     register_loops: bool,
+    slash_port: Arc<dyn NativeSlashCommandPort>,
 ) -> (
     Arc<TeamSession>,
     Arc<StubTaskManager>,
@@ -704,7 +720,7 @@ async fn setup_session_with_turn_recorder_inner(
     .await
     .expect("TeamSession::start failed");
 
-    let session = Arc::new(session);
+    let session = Arc::new(session.with_slash_command_port(slash_port));
     if register_loops {
         register_test_event_loops(&session);
     }
@@ -1878,6 +1894,318 @@ async fn s11_shutdown_approved_interception() {
     assert!(
         raw_sentinel.is_empty(),
         "raw shutdown_approved sentinel must not land in lead mailbox; got {raw_sentinel:?}"
+    );
+
+    session.stop();
+}
+
+// ===========================================================================
+// ELECTRON-3RN: native slash command path (bare command turn, no wrapping)
+// ===========================================================================
+
+/// Configurable recognizer stub. Parses the leading command name with the same
+/// grammar as the shared parser (start with `/`, name to first whitespace,
+/// non-empty), then answers per its configured catalog. `available=false`
+/// simulates the degradation-chain-exhausted case (catalog unavailable).
+struct FakeSlashPort {
+    recognized: Vec<String>,
+    available: bool,
+    /// When true, any parsed `/name` resolves to `CatalogEmpty` — models a
+    /// backend whose catalog RESOLVED but is empty (e.g. a live fetch that
+    /// returned no commands). Distinct from `available=false` (CatalogUnavailable).
+    empty_catalog: bool,
+    source: SlashCatalogSource,
+}
+
+impl FakeSlashPort {
+    fn recognizing(names: &[&str]) -> Self {
+        Self {
+            recognized: names.iter().map(|s| s.to_string()).collect(),
+            available: true,
+            empty_catalog: false,
+            source: SlashCatalogSource::Live,
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            recognized: Vec::new(),
+            available: false,
+            empty_catalog: false,
+            source: SlashCatalogSource::Live,
+        }
+    }
+
+    /// The catalog resolved but is EMPTY → `CatalogEmpty` (§14 warn: `catalog_empty`).
+    fn empty() -> Self {
+        Self {
+            recognized: Vec::new(),
+            available: true,
+            empty_catalog: true,
+            source: SlashCatalogSource::Live,
+        }
+    }
+
+    fn parse_name(content: &str) -> Option<String> {
+        let stripped = content.strip_prefix('/')?;
+        let name: String = stripped.chars().take_while(|c| !c.is_whitespace()).collect();
+        if name.is_empty() { None } else { Some(name) }
+    }
+}
+
+#[async_trait]
+impl NativeSlashCommandPort for FakeSlashPort {
+    async fn recognize(&self, _conversation_id: &str, content: &str) -> SlashCommandRecognition {
+        let Some(name) = Self::parse_name(content) else {
+            return SlashCommandRecognition::NotCommand;
+        };
+        if !self.available {
+            return SlashCommandRecognition::CatalogUnavailable { name };
+        }
+        if self.empty_catalog {
+            return SlashCommandRecognition::CatalogEmpty { name };
+        }
+        if self.recognized.contains(&name) {
+            SlashCommandRecognition::Recognized {
+                command: name,
+                source: self.source,
+            }
+        } else {
+            SlashCommandRecognition::NotInCatalog { name }
+        }
+    }
+}
+
+fn last_turn_content(requests: &Arc<Mutex<Vec<AgentTurnRequest>>>, slot_id: &str) -> String {
+    let log = requests.lock().unwrap();
+    log.iter()
+        .rev()
+        .find(|r| r.slot_id == slot_id)
+        .unwrap_or_else(|| panic!("no turn request for slot {slot_id}; requests: {log:?}"))
+        .content
+        .clone()
+}
+
+/// AC1/AC2/AC9 + AC6 (member entry): a recognized `/compact` sent to a member
+/// produces a turn whose first content block is the BARE command — no
+/// `## New Messages` wrapping, byte-identical to a direct send.
+#[tokio::test]
+async fn recognized_command_is_sent_bare_to_member() {
+    let (session, _tm, _repo, _sent, turn_requests) =
+        setup_session_with_slash_recognizer(Arc::new(FakeSlashPort::recognizing(&["compact"]))).await;
+
+    session
+        .send_message_to_agent("worker-1", "/compact", None)
+        .await
+        .expect("send_message_to_agent must succeed");
+
+    wait_until_turn_count(&turn_requests, 1).await;
+    let content = last_turn_content(&turn_requests, "worker-1");
+    assert_eq!(
+        content, "/compact",
+        "command turn must send the bare command verbatim (AC2/AC9)"
+    );
+    assert!(!content.contains("## New Messages"), "command turn must NOT be wrapped");
+
+    session.stop();
+}
+
+/// AC6 (Lead entry): the Lead entry point (`send_message`) recognizes commands too.
+#[tokio::test]
+async fn recognized_command_is_sent_bare_to_lead() {
+    let (session, _tm, _repo, _sent, turn_requests) =
+        setup_session_with_slash_recognizer(Arc::new(FakeSlashPort::recognizing(&["compact"]))).await;
+
+    session
+        .send_message("/compact", None)
+        .await
+        .expect("send_message must succeed");
+
+    wait_until_turn_count(&turn_requests, 1).await;
+    let content = last_turn_content(&turn_requests, "lead-1");
+    assert_eq!(content, "/compact");
+    assert!(!content.contains("## New Messages"));
+
+    session.stop();
+}
+
+/// AC4 (negative): a `/`-prefixed message whose name is not in the catalog, and a
+/// plain message, both fall back to the ordinary WRAPPED wake turn.
+#[tokio::test]
+async fn unrecognized_slash_and_plain_text_fall_back_to_wrapped_wake() {
+    let (session, _tm, _repo, _sent, turn_requests) =
+        setup_session_with_slash_recognizer(Arc::new(FakeSlashPort::recognizing(&["compact"]))).await;
+
+    // `/etc/hosts ...` — name "etc" is not an advertised command → NotInCatalog.
+    session
+        .send_message_to_agent("worker-1", "/etc/hosts is broken", None)
+        .await
+        .expect("send must succeed");
+    wait_until_turn_count(&turn_requests, 1).await;
+    let content = last_turn_content(&turn_requests, "worker-1");
+    assert!(
+        content.contains("## New Messages"),
+        "unrecognized slash must use the wrapped wake"
+    );
+    assert_ne!(content, "/etc/hosts is broken");
+
+    session.stop();
+}
+
+/// AC7: when the command catalog is unavailable (degradation chain exhausted), a
+/// `/`-prefixed message falls back to the wrapped wake with zero regression.
+#[tokio::test]
+async fn catalog_unavailable_falls_back_to_wrapped_wake() {
+    let (session, _tm, _repo, _sent, turn_requests) =
+        setup_session_with_slash_recognizer(Arc::new(FakeSlashPort::unavailable())).await;
+
+    session
+        .send_message_to_agent("worker-1", "/compact", None)
+        .await
+        .expect("send must succeed");
+    wait_until_turn_count(&turn_requests, 1).await;
+    let content = last_turn_content(&turn_requests, "worker-1");
+    assert!(
+        content.contains("## New Messages"),
+        "catalog-unavailable must fall back to the wrapped wake (AC7)"
+    );
+
+    session.stop();
+}
+
+// AC11 log capture. A thread-local subscriber cannot reliably capture a callsite
+// that other tests in the same binary also hit (tracing caches per-callsite
+// interest globally). So we install ONE process-global capturing subscriber
+// (which rebuilds the interest cache) that routes every event into a THREAD-LOCAL
+// buffer. Each `#[tokio::test]` runs its whole flow — including spawned tasks —
+// on its own current-thread runtime thread, so a test only ever sees its own
+// events; we clear the buffer at the start and read it at the end.
+thread_local! {
+    static AC11_LOG_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct Ac11ThreadLocalWriter;
+impl std::io::Write for Ac11ThreadLocalWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        AC11_LOG_BUF.with(|cell| cell.borrow_mut().extend_from_slice(buf));
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Ac11ThreadLocalWriter {
+    type Writer = Ac11ThreadLocalWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        Ac11ThreadLocalWriter
+    }
+}
+
+fn install_ac11_capturing_subscriber() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Ac11ThreadLocalWriter)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        // Setting a global default rebuilds tracing's interest cache, so the
+        // recognition callsite is re-evaluated against this subscriber even if a
+        // prior test already hit it under the no-op default. Ignore the error if
+        // some other harness already installed a global default.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+}
+
+/// AC11 (§14): the recognition-hit `info` log must carry the command NAME +
+/// source correlation fields (`command`, `source`, `team_id`, `slot_id`,
+/// `conversation_id`) but NEVER the raw `content`/args (no sensitive payload).
+#[tokio::test]
+async fn recognized_command_log_carries_name_and_source_not_content() {
+    install_ac11_capturing_subscriber();
+    AC11_LOG_BUF.with(|cell| cell.borrow_mut().clear());
+
+    let (session, _tm, _repo, _sent, turn_requests) =
+        setup_session_with_slash_recognizer(Arc::new(FakeSlashPort::recognizing(&["compact"]))).await;
+
+    // The arg after the command name is a distinctive marker: it MUST NOT appear
+    // in any production-visible log (it is a stand-in for sensitive payload).
+    const SENSITIVE_ARG: &str = "sensitive-payload-should-not-log";
+    session
+        .send_message_to_agent("worker-1", &format!("/compact {SENSITIVE_ARG}"), None)
+        .await
+        .expect("send_message_to_agent must succeed");
+
+    wait_until_turn_count(&turn_requests, 1).await;
+
+    let logs = AC11_LOG_BUF.with(|cell| String::from_utf8(cell.borrow().clone()).expect("utf8 logs"));
+    assert!(
+        logs.contains("team user slash command recognized"),
+        "the recognition info log must be emitted: {logs}"
+    );
+    // Correlation fields present (AC11).
+    assert!(
+        logs.contains("command=compact"),
+        "log must carry the command NAME: {logs}"
+    );
+    assert!(logs.contains("source="), "log must carry the catalog source: {logs}");
+    assert!(logs.contains("team_id="), "log must carry team_id: {logs}");
+    assert!(logs.contains("slot_id="), "log must carry slot_id: {logs}");
+    assert!(
+        logs.contains("conversation_id="),
+        "log must carry conversation_id: {logs}"
+    );
+    // Sensitive payload absent (AC11 / §14): the command args / full content are
+    // never logged at a production-visible level.
+    assert!(
+        !logs.contains(SENSITIVE_ARG),
+        "production log must NOT contain command args/content: {logs}"
+    );
+
+    session.stop();
+}
+
+/// A RESOLVED-but-EMPTY catalog (e.g. a live backend that returned no commands)
+/// must (1) fall back to the wrapped wake with zero regression, and (2) emit a
+/// production-visible `warn` (`reason=catalog_empty`) so the otherwise-silent
+/// "command list is empty → command silently ignored" boundary is diagnosable.
+/// `warn` is more severe than `info`, so the INFO-max capturing subscriber sees it.
+#[tokio::test]
+async fn empty_catalog_logs_warn_and_falls_back_to_wrapped_wake() {
+    install_ac11_capturing_subscriber();
+    AC11_LOG_BUF.with(|cell| cell.borrow_mut().clear());
+
+    let (session, _tm, _repo, _sent, turn_requests) =
+        setup_session_with_slash_recognizer(Arc::new(FakeSlashPort::empty())).await;
+
+    session
+        .send_message_to_agent("worker-1", "/compact", None)
+        .await
+        .expect("send must succeed");
+    wait_until_turn_count(&turn_requests, 1).await;
+
+    // (1) Zero regression: an empty catalog falls back to the wrapped wake.
+    let content = last_turn_content(&turn_requests, "worker-1");
+    assert!(
+        content.contains("## New Messages"),
+        "empty-catalog must fall back to the wrapped wake (zero regression): {content}"
+    );
+
+    // (2) The empty-catalog boundary is logged at a production-visible level.
+    let logs = AC11_LOG_BUF.with(|cell| String::from_utf8(cell.borrow().clone()).expect("utf8 logs"));
+    assert!(
+        logs.contains("catalog_empty"),
+        "empty catalog must emit a warn with reason=catalog_empty: {logs}"
+    );
+    // The command NAME correlates the log; the raw content is fine here (no args),
+    // but the field must be the NAME only.
+    assert!(
+        logs.contains("command=compact"),
+        "warn must carry the command NAME: {logs}"
+    );
+    assert!(
+        logs.contains("conversation_id="),
+        "warn must carry conversation_id: {logs}"
     );
 
     session.stop();

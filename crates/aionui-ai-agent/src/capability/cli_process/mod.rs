@@ -155,6 +155,7 @@ impl CliAgentProcess {
     /// own once the ACP transport closes, but `kill_on_drop` reaps only the
     /// direct child, leaving the grandchild (`codex-acp`, `codebuddy --acp`, …)
     /// to leak as an orphan.
+    #[allow(dead_code)] // Complete CliProcess lifecycle API
     pub fn force_kill_tree(&self) {
         if let Err(e) = force_kill(self.pid, self.process_group_id) {
             warn!(pid = self.pid, error = %e, "force_kill_tree failed");

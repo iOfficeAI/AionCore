@@ -1,0 +1,43 @@
+[package]
+name = "aionui-session"
+version.workspace = true
+edition.workspace = true
+
+# Feature 002: server-authoritative SessionState control plane. Domain layer.
+# Self-contained: depends ONLY on aionui-process (001) + aionui-common. Spawns
+# claude CLI directly (no ACP/SDK), frames+parses stream-json, synthesizes a
+# 5-state FSM whose unlock signal is a STATE TRANSITION (decoupled from any
+# blocking call return). NO production caller this iteration (same discipline
+# as 001) — built and verified in isolation; UI-unlock wiring is feature 003+.
+[dependencies]
+aionui-common.workspace = true
+aionui-process.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true }
+# claude's `--session-id`/`--resume` require a bare valid UUID; the seam mints
+# one when the logical id is not a UUID (claude_conn::claude_session_id_for).
+uuid = { workspace = true, features = ["v4"] }
+
+[features]
+# Exposes the in-crate test doubles (FakeAgentIo / FakeSpawner) to integration
+# tests and downstream verification. Gated so production builds never ship them.
+test-support = []
+
+[dev-dependencies]
+# Self-reference with test-support so the integration tests (tests/*.rs, separate
+# compilation units) see `testing::{FakeAgentIo, invariants}` + the backends'
+# `build_with_io` — all gated behind `cfg(any(test, feature = "test-support"))`,
+# which the bare integration build does NOT enable on its own.
+aionui-session = { path = ".", features = ["test-support"] }
+tokio = { workspace = true }
+proptest.workspace = true
+# live_cli_e2e.rs (#[ignore] LIVE tests): a tempdir-backed FileRegistryStore for
+# constructing a production RealSpawner without touching the real data dir.
+# Workspace-pinned; dev-only (never shipped). (uuid is a normal dep above.)
+tempfile.workspace = true

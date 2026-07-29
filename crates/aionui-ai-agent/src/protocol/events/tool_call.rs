@@ -110,6 +110,10 @@ pub enum ToolCallStatus {
     Running,
     Completed,
     Error,
+    /// The turn ended (cancel/crash) while this call was still open, so no
+    /// terminal ToolResult will ever arrive; emitted by the fold layer to
+    /// close the call instead of leaving it `Running` forever.
+    Canceled,
 }
 
 /// A single entry in a `ToolGroup` event.

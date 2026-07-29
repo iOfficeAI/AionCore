@@ -1,4 +1,4 @@
--- Deleted Memory rows retain only their opaque fingerprint and lifecycle metadata.
+-- Migration 034: deleted Memory rows retain only their opaque fingerprint and lifecycle metadata.
 DELETE FROM memory_sources
 WHERE memory_entry_id IN (
     SELECT id FROM memory_entries WHERE state = 'deleted'

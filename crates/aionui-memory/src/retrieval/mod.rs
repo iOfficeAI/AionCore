@@ -134,12 +134,43 @@ mod tests {
             pinned_at: None,
             created_at: 1,
             updated_at: 1,
+            project_id: None,
+            folder_id: None,
         };
         assert_eq!(
             ConversationScope::from_conversation(&row).unwrap(),
             ConversationScope {
                 project_id: Some("project-1".into()),
                 workspace_key: Some("C:/work/memory".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn target_prefers_the_authoritative_bound_project_column() {
+        let row = ConversationRow {
+            id: "conv-bound".into(),
+            user_id: "user-1".into(),
+            name: "Conversation".into(),
+            r#type: "gemini".into(),
+            extra: r#"{"workspace":"/work/memory"}"#.into(),
+            model: None,
+            status: None,
+            source: None,
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: 1,
+            updated_at: 1,
+            project_id: Some(" bound-project ".into()),
+            folder_id: Some("folder-1".into()),
+        };
+
+        assert_eq!(
+            ConversationScope::from_conversation(&row).unwrap(),
+            ConversationScope {
+                project_id: Some("bound-project".into()),
+                workspace_key: Some("/work/memory".into()),
             }
         );
     }

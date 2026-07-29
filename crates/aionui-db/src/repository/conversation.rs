@@ -45,7 +45,7 @@ pub trait IConversationRepository: Send + Sync {
         after: Option<&LegacyConversationCursor>,
         boundary: &LegacyConversationImportBoundary,
         limit: u32,
-    ) -> Result<Vec<ConversationRow>, DbError> {
+    ) -> Result<LegacyConversationImportPage, DbError> {
         let rows = self
             .list_paginated(
                 user_id,
@@ -66,7 +66,12 @@ pub trait IConversationRepository: Send + Sync {
             .collect::<Vec<_>>();
         rows.sort_by(|left, right| (left.updated_at, &left.id).cmp(&(right.updated_at, &right.id)));
         rows.truncate(limit as usize);
-        Ok(rows)
+        let next_after = rows.last().map(|row| LegacyConversationCursor {
+            updated_at: row.updated_at,
+            id: row.id.clone(),
+            sequence: None,
+        });
+        Ok(LegacyConversationImportPage { rows, next_after })
     }
 
     /// Returns the fixed upper watermark for a new legacy Memory import.
@@ -89,6 +94,7 @@ pub trait IConversationRepository: Send + Sync {
                 upper: LegacyConversationCursor {
                     updated_at: row.updated_at,
                     id: row.id.clone(),
+                    sequence: None,
                 },
                 max_sequence: i64::MAX,
             }))
@@ -269,6 +275,14 @@ pub struct MessagePageCursor {
 pub struct LegacyConversationCursor {
     pub updated_at: TimestampMs,
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LegacyConversationImportPage {
+    pub rows: Vec<ConversationRow>,
+    pub next_after: Option<LegacyConversationCursor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +356,9 @@ pub struct ConversationRowUpdate {
     pub extra: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<TimestampMs>,
+    /// Project binding (project-bind side branch); `Some` sets the column.
+    pub project_id: Option<String>,
+    pub folder_id: Option<String>,
 }
 
 /// Partial update payload for a message row.

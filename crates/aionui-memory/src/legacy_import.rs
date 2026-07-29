@@ -144,7 +144,7 @@ pub(crate) async fn ensure_legacy_import(
             }
         }
     };
-    let rows = conversations
+    let page = conversations
         .list_for_memory_import(
             user_id,
             cursor.after.as_ref(),
@@ -153,21 +153,15 @@ pub(crate) async fn ensure_legacy_import(
         )
         .await
         .map_err(crate::service::map_db_error)?;
-    let completed = rows.len() < LEGACY_IMPORT_PAGE_SIZE as usize;
+    let completed = page.rows.len() < LEGACY_IMPORT_PAGE_SIZE as usize;
     let max_conversation_sequence = cursor.boundary.max_sequence;
     let next_cursor = LegacyImportCursor {
         version: LEGACY_IMPORT_CURSOR_VERSION,
         boundary: cursor.boundary,
-        after: rows
-            .last()
-            .map(|row| LegacyConversationCursor {
-                updated_at: row.updated_at,
-                id: row.id.clone(),
-            })
-            .or(cursor.after),
+        after: page.next_after.or(cursor.after),
     };
     let mut summaries = Vec::new();
-    for row in &rows {
+    for row in &page.rows {
         let Some(imported) = legacy_summary(&row.extra) else {
             continue;
         };
@@ -221,7 +215,7 @@ pub(crate) async fn ensure_legacy_import(
 mod tests {
     use std::sync::Arc;
 
-    use aionui_db::models::ConversationRow;
+    use aionui_db::models::{ConversationRow, MessageRow};
     use aionui_db::{
         IConversationRepository, IMemoryRepository, ImportLegacyMemoryPageRow, LegacyMemorySummaryRow,
         SqliteConversationRepository, SqliteMemoryRepository, UpdateMemorySettingsRow, init_database_memory,
@@ -343,6 +337,8 @@ mod tests {
                     pinned_at: None,
                     created_at: index,
                     updated_at: index,
+                    project_id: None,
+                    folder_id: None,
                 })
                 .await
                 .unwrap();
@@ -362,6 +358,7 @@ mod tests {
         assert!(durable_cursor["boundary"]["upper"]["updated_at"].is_number());
         assert!(durable_cursor["boundary"]["max_sequence"].is_number());
         assert!(durable_cursor["after"]["updated_at"].is_number());
+        assert!(durable_cursor["after"]["sequence"].is_number());
         let first_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_memories WHERE user_id = ?")
             .bind(USER_ID)
             .fetch_one(db.pool())
@@ -454,6 +451,8 @@ mod tests {
                     pinned_at: None,
                     created_at: index,
                     updated_at: index,
+                    project_id: None,
+                    folder_id: None,
                 })
                 .await
                 .unwrap();
@@ -514,6 +513,8 @@ mod tests {
                     pinned_at: None,
                     created_at: index,
                     updated_at: 10,
+                    project_id: None,
+                    folder_id: None,
                 })
                 .await
                 .unwrap();
@@ -557,6 +558,8 @@ mod tests {
                 pinned_at: None,
                 created_at: 10,
                 updated_at: 10,
+                project_id: None,
+                folder_id: None,
             })
             .await
             .unwrap();
@@ -582,6 +585,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_sequence_snapshot_survives_message_activity_on_an_unscanned_conversation() {
+        let db = init_database_memory().await.unwrap();
+        let conversations = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+        let memory: Arc<dyn IMemoryRepository> = Arc::new(SqliteMemoryRepository::new(db.pool().clone()));
+        for index in 1..=34 {
+            conversations
+                .create(&ConversationRow {
+                    id: format!("message-bumped-{index:02}"),
+                    user_id: USER_ID.into(),
+                    name: "Message bump".into(),
+                    r#type: "acp".into(),
+                    extra: extra("Import despite message activity", &format!("turn-{index}")),
+                    model: None,
+                    status: Some("finished".into()),
+                    source: Some("aionui".into()),
+                    channel_chat_id: None,
+                    pinned: false,
+                    pinned_at: None,
+                    created_at: index,
+                    updated_at: index,
+                    project_id: None,
+                    folder_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        super::ensure_legacy_import(
+            &memory,
+            &(conversations.clone() as Arc<dyn IConversationRepository>),
+            USER_ID,
+        )
+        .await
+        .unwrap();
+        assert!(!memory.get_import_state(USER_ID).await.unwrap().unwrap().completed);
+
+        conversations
+            .insert_message(&MessageRow {
+                id: "message-bump".into(),
+                conversation_id: "message-bumped-33".into(),
+                turn_id: Some("turn-after-import-start".into()),
+                msg_id: Some("message-bump".into()),
+                r#type: "text".into(),
+                content: r#"{"content":"new activity"}"#.into(),
+                position: Some("right".into()),
+                status: Some("finish".into()),
+                hidden: false,
+                created_at: 1_000,
+            })
+            .await
+            .unwrap();
+
+        super::ensure_legacy_import(&memory, &(conversations as Arc<dyn IConversationRepository>), USER_ID)
+            .await
+            .unwrap();
+
+        assert!(memory.get_import_state(USER_ID).await.unwrap().unwrap().completed);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM conversation_memories
+                 WHERE user_id = ? AND conversation_id LIKE 'message-bumped-%'",
+            )
+            .bind(USER_ID)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            34,
+        );
+    }
+
+    #[tokio::test]
     async fn completion_trigger_imports_only_after_durable_turn_eligibility() {
         let db = init_database_memory().await.unwrap();
         let conversations = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
@@ -601,6 +675,8 @@ mod tests {
                 pinned_at: None,
                 created_at: 1,
                 updated_at: 1,
+                project_id: None,
+                folder_id: None,
             })
             .await
             .unwrap();
@@ -717,6 +793,8 @@ mod tests {
                 pinned_at: None,
                 created_at: 1,
                 updated_at: 1,
+                project_id: None,
+                folder_id: None,
             })
             .await
             .unwrap();
@@ -771,6 +849,8 @@ mod tests {
                     pinned_at: None,
                     created_at: index,
                     updated_at: index,
+                    project_id: None,
+                    folder_id: None,
                 })
                 .await
                 .unwrap();
@@ -829,6 +909,8 @@ mod tests {
                     pinned_at: None,
                     created_at: 1,
                     updated_at: 1,
+                    project_id: None,
+                    folder_id: None,
                 })
                 .await
                 .unwrap();

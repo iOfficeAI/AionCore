@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn pins_direct_npx_package() {
         let args = pin_registry_npx_args("pi", &strings(&["-y", "pi-acp"])).unwrap();
-        assert_eq!(args, ["-y", "pi-acp@0.0.31"]);
+        assert_eq!(args, ["-y", "pi-acp@0.0.32"]);
     }
 
     #[test]
@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn every_lock_entry_has_an_exact_version() {
         let lock = registry_npx_lock().unwrap();
-        assert_eq!(lock.agents.len(), 11);
+        assert_eq!(lock.agents.len(), 12);
         for package in lock.agents.values() {
             assert!(semver::Version::parse(&package.version).is_ok());
         }

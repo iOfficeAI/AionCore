@@ -417,6 +417,8 @@ async fn app_startup_recovers_expired_running_job_into_its_successor_once() {
             pinned_at: None,
             created_at: 1,
             updated_at: 1,
+            project_id: None,
+            folder_id: None,
         })
         .await
         .unwrap();

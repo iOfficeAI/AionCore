@@ -44,6 +44,13 @@ async fn verified_registry_npx_agents_use_stable_packages_and_conservative_team_
         ),
         ("kilo", "kilo", r#"["-y","@kilocode/cli","acp"]"#, None, None),
         (
+            "mimo-code",
+            "mimo",
+            r#"["-y","@mimo-ai/cli","acp"]"#,
+            Some(r#"[".mimocode/skills",".opencode/skills"]"#),
+            Some("build"),
+        ),
+        (
             "nova",
             "nova",
             r#"["-y","@compass-ai/nova","acp"]"#,

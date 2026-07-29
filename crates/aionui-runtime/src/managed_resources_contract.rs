@@ -4,8 +4,8 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 pub const MANAGED_RESOURCES_CONTRACT_FILE: &str = "manifest.json";
-pub const MANAGED_RESOURCES_CONTRACT_SCHEMA_VERSION: u8 = 1;
-const REQUIRED_ACP_TOOL_SLUGS: [&str; 2] = ["codex-acp", "claude-agent-acp"];
+pub const MANAGED_RESOURCES_CONTRACT_SCHEMA_VERSION: u8 = 2;
+const REQUIRED_CLI_NAMES: [&str; 2] = ["claude", "codex"];
 const SUPPORTED_RUNTIME_KEYS: [&str; 6] = [
     "win32-x64",
     "win32-arm64",
@@ -21,7 +21,7 @@ pub struct ManagedResourcesContract {
     pub schema_version: u8,
     pub runtime_key: String,
     pub node: ManagedNodeResourceContract,
-    pub acp_tools: Vec<ManagedAcpToolResourceContract>,
+    pub clis: Vec<ManagedCliResourceContract>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,20 +32,29 @@ pub struct ManagedNodeResourceContract {
     pub executable: String,
 }
 
+/// A bundled agent CLI (claude / codex). Unlike the removed ACP-tool contract
+/// there is no node bridge or local manifest — the CLI is a native binary (plus,
+/// for codex, sidecars under its `vendor/<triple>` subtree captured via
+/// `required_files` / `required_directories`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct ManagedAcpToolResourceContract {
-    pub slug: String,
+pub struct ManagedCliResourceContract {
+    pub name: String,
     pub version: String,
-    pub package_name: String,
+    /// Relative to the managed-resources root, e.g. `cli/claude/2.1.215/darwin-arm64`.
     pub root: String,
+    /// Must equal the contract `runtime_key`.
     pub platform_directory: String,
-    pub manifest: String,
-    pub entrypoint: String,
-    pub path_entries: Vec<String>,
+    /// The main executable, relative to `root` (e.g. `claude` or
+    /// `vendor/aarch64-apple-darwin/bin/codex`).
+    pub executable: String,
+    /// Extra files that must exist relative to `root` (e.g. codex sidecars
+    /// `codex-path/rg`, `codex-resources/zsh/bin/zsh`). May be empty (claude).
+    #[serde(default)]
     pub required_files: Vec<String>,
+    /// Extra directories that must exist relative to `root`. May be empty.
+    #[serde(default)]
     pub required_directories: Vec<String>,
-    pub platform_executable: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,23 +75,16 @@ impl ManagedResourcesContractError {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ToolLocalManifest {
-    entrypoint: String,
-    #[serde(default)]
-    path_entries: Vec<String>,
-}
-
 pub fn validate_contract(
     root: &Path,
     contract: &ManagedResourcesContract,
 ) -> Result<(), ManagedResourcesContractError> {
     validate_schema(contract)?;
     validate_node_schema(&contract.node)?;
-    validate_acp_tools_schema(contract)?;
+    validate_clis_schema(contract)?;
     validate_node_paths(root, &contract.node)?;
-    for tool in &contract.acp_tools {
-        validate_acp_tool_paths(root, tool)?;
+    for cli in &contract.clis {
+        validate_cli_paths(root, cli)?;
     }
     Ok(())
 }
@@ -138,57 +140,41 @@ fn validate_node_schema(node: &ManagedNodeResourceContract) -> Result<(), Manage
     Ok(())
 }
 
-fn validate_acp_tools_schema(contract: &ManagedResourcesContract) -> Result<(), ManagedResourcesContractError> {
-    let mut slugs = HashSet::new();
+fn validate_clis_schema(contract: &ManagedResourcesContract) -> Result<(), ManagedResourcesContractError> {
+    let mut names = HashSet::new();
 
-    for tool in &contract.acp_tools {
-        require_non_empty("acpTools[].slug", &tool.slug)?;
-        if !slugs.insert(tool.slug.as_str()) {
+    for cli in &contract.clis {
+        require_non_empty("clis[].name", &cli.name)?;
+        if !names.insert(cli.name.as_str()) {
             return Err(ManagedResourcesContractError::invalid(format!(
-                "duplicate acpTools slug {}",
-                tool.slug
+                "duplicate clis name {}",
+                cli.name
             )));
         }
 
-        let label = format!("acpTools[{}]", tool.slug);
-        require_non_empty(format!("{label}.version"), &tool.version)?;
-        require_non_empty(format!("{label}.packageName"), &tool.package_name)?;
-        validate_contract_relative_path_field(format!("{label}.root"), &tool.root)?;
-        require_non_empty(format!("{label}.platformDirectory"), &tool.platform_directory)?;
-        if tool.platform_directory != contract.runtime_key {
+        let label = format!("clis[{}]", cli.name);
+        require_non_empty(format!("{label}.version"), &cli.version)?;
+        validate_contract_relative_path_field(format!("{label}.root"), &cli.root)?;
+        require_non_empty(format!("{label}.platformDirectory"), &cli.platform_directory)?;
+        if cli.platform_directory != contract.runtime_key {
             return Err(ManagedResourcesContractError::invalid(format!(
-                "acpTools[{}].platformDirectory {} does not match runtimeKey {}",
-                tool.slug, tool.platform_directory, contract.runtime_key
+                "clis[{}].platformDirectory {} does not match runtimeKey {}",
+                cli.name, cli.platform_directory, contract.runtime_key
             )));
         }
-        validate_contract_relative_path_field(format!("{label}.manifest"), &tool.manifest)?;
-        validate_contract_relative_path_field(format!("{label}.entrypoint"), &tool.entrypoint)?;
-        for (index, entry) in tool.path_entries.iter().enumerate() {
-            validate_contract_relative_path_field(format!("{label}.pathEntries[{index}]"), entry)?;
-        }
-        if tool.required_files.is_empty() {
-            return Err(ManagedResourcesContractError::invalid(format!(
-                "{label}.requiredFiles must not be empty"
-            )));
-        }
-        for (index, entry) in tool.required_files.iter().enumerate() {
+        validate_contract_relative_path_field(format!("{label}.executable"), &cli.executable)?;
+        for (index, entry) in cli.required_files.iter().enumerate() {
             validate_contract_relative_path_field(format!("{label}.requiredFiles[{index}]"), entry)?;
         }
-        if tool.required_directories.is_empty() {
-            return Err(ManagedResourcesContractError::invalid(format!(
-                "{label}.requiredDirectories must not be empty"
-            )));
-        }
-        for (index, entry) in tool.required_directories.iter().enumerate() {
+        for (index, entry) in cli.required_directories.iter().enumerate() {
             validate_contract_relative_path_field(format!("{label}.requiredDirectories[{index}]"), entry)?;
         }
-        validate_contract_relative_path_field(format!("{label}.platformExecutable"), &tool.platform_executable)?;
     }
 
-    for required_slug in REQUIRED_ACP_TOOL_SLUGS {
-        if !slugs.contains(required_slug) {
+    for required_name in REQUIRED_CLI_NAMES {
+        if !names.contains(required_name) {
             return Err(ManagedResourcesContractError::invalid(format!(
-                "missing required acpTools slug {required_slug}"
+                "missing required clis name {required_name}"
             )));
         }
     }
@@ -214,49 +200,25 @@ fn validate_node_paths(root: &Path, node: &ManagedNodeResourceContract) -> Resul
     Ok(())
 }
 
-fn validate_acp_tool_paths(
-    root: &Path,
-    tool: &ManagedAcpToolResourceContract,
-) -> Result<(), ManagedResourcesContractError> {
-    let tool_root = root.join(&tool.root);
-    if !tool_root.is_dir() {
+fn validate_cli_paths(root: &Path, cli: &ManagedCliResourceContract) -> Result<(), ManagedResourcesContractError> {
+    let cli_root = root.join(&cli.root);
+    if !cli_root.is_dir() {
         return Err(ManagedResourcesContractError::invalid(format!(
             "required directory missing: {}",
-            tool_root.display()
+            cli_root.display()
         )));
     }
 
-    let manifest_path = tool_root.join(&tool.manifest);
-    if !manifest_path.is_file() {
+    let executable = cli_root.join(&cli.executable);
+    if !executable.is_file() {
         return Err(ManagedResourcesContractError::invalid(format!(
             "required file missing: {}",
-            manifest_path.display()
-        )));
-    }
-    let local_manifest = read_tool_local_manifest(&manifest_path)?;
-    if local_manifest.entrypoint != tool.entrypoint {
-        return Err(ManagedResourcesContractError::invalid(format!(
-            "local manifest entrypoint mismatch for {}: expected {}, got {}",
-            tool.slug, tool.entrypoint, local_manifest.entrypoint
-        )));
-    }
-    if local_manifest.path_entries != tool.path_entries {
-        return Err(ManagedResourcesContractError::invalid(format!(
-            "local manifest path_entries mismatch for {}",
-            tool.slug
+            executable.display()
         )));
     }
 
-    let entrypoint = tool_root.join(&tool.entrypoint);
-    if !entrypoint.is_file() {
-        return Err(ManagedResourcesContractError::invalid(format!(
-            "required file missing: {}",
-            entrypoint.display()
-        )));
-    }
-
-    for required_file in &tool.required_files {
-        let path = tool_root.join(required_file);
+    for required_file in &cli.required_files {
+        let path = cli_root.join(required_file);
         if !path.is_file() {
             return Err(ManagedResourcesContractError::invalid(format!(
                 "required file missing: {}",
@@ -264,8 +226,8 @@ fn validate_acp_tool_paths(
             )));
         }
     }
-    for required_directory in &tool.required_directories {
-        let path = tool_root.join(required_directory);
+    for required_directory in &cli.required_directories {
+        let path = cli_root.join(required_directory);
         if !path.is_dir() {
             return Err(ManagedResourcesContractError::invalid(format!(
                 "required directory missing: {}",
@@ -274,26 +236,7 @@ fn validate_acp_tool_paths(
         }
     }
 
-    let executable = tool_root.join(&tool.platform_executable);
-    if !executable.is_file() {
-        return Err(ManagedResourcesContractError::invalid(format!(
-            "required file missing: {}",
-            executable.display()
-        )));
-    }
-
     Ok(())
-}
-
-fn read_tool_local_manifest(path: &Path) -> Result<ToolLocalManifest, ManagedResourcesContractError> {
-    let contents = fs::read_to_string(path)
-        .map_err(|error| ManagedResourcesContractError::io("read local manifest", path, error))?;
-    serde_json::from_str(&contents).map_err(|error| {
-        ManagedResourcesContractError::invalid(format!(
-            "parse local managed ACP manifest failed for {}: {error}",
-            path.display()
-        ))
-    })
 }
 
 fn require_non_empty(field: impl std::fmt::Display, value: &str) -> Result<(), ManagedResourcesContractError> {
@@ -339,89 +282,72 @@ mod tests {
                 root: "node/node-v24.11.0-win-x64".into(),
                 executable: "node.exe".into(),
             },
-            acp_tools: vec![
-                ManagedAcpToolResourceContract {
-                    slug: "codex-acp".into(),
-                    version: "1.1.2".into(),
-                    package_name: "@agentclientprotocol/codex-acp".into(),
-                    root: "acp/codex-acp/1.1.2/win32-x64".into(),
+            clis: vec![
+                ManagedCliResourceContract {
+                    name: "claude".into(),
+                    version: "2.1.215".into(),
+                    root: "cli/claude/2.1.215/win32-x64".into(),
                     platform_directory: "win32-x64".into(),
-                    manifest: "manifest.json".into(),
-                    entrypoint: "node_modules/@agentclientprotocol/codex-acp/dist/index.js".into(),
-                    path_entries: vec!["node_modules/.bin".into()],
-                    required_files: vec!["package.json".into(), "package-lock.json".into()],
-                    required_directories: vec!["node_modules".into()],
-                    platform_executable:
-                        "node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe".into(),
+                    executable: "claude.exe".into(),
+                    required_files: vec![],
+                    required_directories: vec![],
                 },
-                ManagedAcpToolResourceContract {
-                    slug: "claude-agent-acp".into(),
-                    version: "0.58.1".into(),
-                    package_name: "@agentclientprotocol/claude-agent-acp".into(),
-                    root: "acp/claude-agent-acp/0.58.1/win32-x64".into(),
+                ManagedCliResourceContract {
+                    name: "codex".into(),
+                    version: "0.144.6".into(),
+                    root: "cli/codex/0.144.6/win32-x64".into(),
                     platform_directory: "win32-x64".into(),
-                    manifest: "manifest.json".into(),
-                    entrypoint: "node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js".into(),
-                    path_entries: vec!["node_modules/.bin".into()],
-                    required_files: vec!["package.json".into(), "package-lock.json".into()],
-                    required_directories: vec!["node_modules".into()],
-                    platform_executable: "node_modules/@anthropic-ai/claude-agent-sdk-win32-x64/claude.exe".into(),
+                    executable: "vendor/x86_64-pc-windows-msvc/bin/codex.exe".into(),
+                    required_files: vec!["vendor/x86_64-pc-windows-msvc/codex-path/rg.exe".into()],
+                    required_directories: vec!["vendor/x86_64-pc-windows-msvc".into()],
                 },
             ],
         }
     }
 
     #[test]
-    fn contract_serializes_v1_camel_case_schema() {
+    fn contract_serializes_v2_camel_case_schema() {
         let contract = example_contract("win32-x64");
         let value = serde_json::to_value(&contract).expect("serialize");
 
-        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["schemaVersion"], 2);
         assert_eq!(value["runtimeKey"], "win32-x64");
         assert!(value.get("schema_version").is_none());
-        assert_eq!(value["acpTools"][0]["packageName"], "@agentclientprotocol/codex-acp");
+        assert_eq!(value["clis"][0]["name"], "claude");
         assert_eq!(
-            value["acpTools"][0]["requiredFiles"],
-            serde_json::json!(["package.json", "package-lock.json"])
-        );
-        assert_eq!(
-            value["acpTools"][0]["requiredDirectories"],
-            serde_json::json!(["node_modules"])
+            value["clis"][1]["executable"],
+            "vendor/x86_64-pc-windows-msvc/bin/codex.exe"
         );
     }
 
     #[test]
-    fn validate_contract_rejects_duplicate_tool_slugs() {
+    fn validate_contract_rejects_duplicate_cli_names() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut contract = example_contract("win32-x64");
-        contract.acp_tools[1].slug = "codex-acp".into();
+        contract.clis[1].name = "claude".into();
 
-        let error = validate_contract(temp.path(), &contract).expect_err("duplicate slug should fail");
+        let error = validate_contract(temp.path(), &contract).expect_err("duplicate name should fail");
 
-        assert!(error.to_string().contains("duplicate acpTools slug codex-acp"));
+        assert!(error.to_string().contains("duplicate clis name claude"));
     }
 
     #[test]
-    fn validate_contract_rejects_missing_required_tool_slug() {
+    fn validate_contract_rejects_missing_required_cli_name() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut contract = example_contract("win32-x64");
-        contract.acp_tools.retain(|tool| tool.slug != "claude-agent-acp");
+        contract.clis.retain(|cli| cli.name != "codex");
 
-        let error = validate_contract(temp.path(), &contract).expect_err("missing required slug should fail");
+        let error = validate_contract(temp.path(), &contract).expect_err("missing required name should fail");
 
-        assert!(
-            error
-                .to_string()
-                .contains("missing required acpTools slug claude-agent-acp")
-        );
+        assert!(error.to_string().contains("missing required clis name codex"));
     }
 
     #[test]
     fn validate_contract_rejects_unsafe_relative_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
-        for bad in ["/abs/path", "acp\\codex-acp", "", "../escape", "acp/../escape"] {
+        for bad in ["/abs/path", "cli\\claude", "", "../escape", "cli/../escape"] {
             let mut contract = example_contract("win32-x64");
-            contract.acp_tools[0].root = bad.into();
+            contract.clis[0].root = bad.into();
 
             let error = validate_contract(temp.path(), &contract).expect_err("unsafe path should fail");
 
@@ -430,20 +356,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_contract_rejects_empty_required_strings_and_platform_mismatch() {
+    fn validate_contract_rejects_platform_mismatch() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut contract = example_contract("win32-x64");
-        contract.acp_tools[0].package_name.clear();
-
-        let error = validate_contract(temp.path(), &contract).expect_err("empty package name should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("acpTools[codex-acp].packageName is required")
-        );
-
-        let mut contract = example_contract("win32-x64");
-        contract.acp_tools[0].platform_directory = "linux-x64".into();
+        contract.clis[0].platform_directory = "linux-x64".into();
 
         let error = validate_contract(temp.path(), &contract).expect_err("platform mismatch should fail");
         assert!(
@@ -461,6 +377,9 @@ mod tests {
 
         let error = validate_contract(temp.path(), &contract).expect_err("missing paths should fail");
 
-        assert!(error.to_string().contains("required file missing"));
+        assert!(
+            error.to_string().contains("required file missing")
+                || error.to_string().contains("required directory missing")
+        );
     }
 }

@@ -101,6 +101,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         )
         .route("/api/teams/{id}/messages", post(send_message))
         .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
+        .route("/api/teams/{id}/agents/{slot_id}/attach", post(attach_agent))
         .route(
             "/api/teams/{id}/conversations/{conversation_id}/config-options",
             get(get_conversation_config_options),
@@ -228,6 +229,21 @@ async fn rename_agent(
     state
         .service
         .rename_agent(&user.id, &params.id, &params.slot_id, &req.name)
+        .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+/// Directed retry/wakeup of a single member runtime (dormant or failed).
+/// Backs the send-box "retry start" entry. State-changing → auth + CSRF apply
+/// via the team router middleware layer, same as add/remove/send.
+async fn attach_agent(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<AgentPathParams>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .attach_agent_runtime(&user.id, &params.id, &params.slot_id)
         .await?;
     Ok(Json(ApiResponse::success()))
 }

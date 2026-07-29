@@ -1824,6 +1824,8 @@ mod tests {
                     pinned_at: None,
                     created_at: 1,
                     updated_at: 1,
+                    project_id: None,
+                    folder_id: None,
                 },
                 messages: Vec::new(),
                 previous_summary: None,
@@ -4296,6 +4298,8 @@ mod tests {
             pinned_at: None,
             created_at: 1,
             updated_at: 1,
+            project_id: None,
+            folder_id: None,
         }
     }
 

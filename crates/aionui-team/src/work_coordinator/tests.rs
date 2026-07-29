@@ -8,6 +8,8 @@ use crate::{TeamError, work_source::WorkSource};
 #[derive(Default)]
 struct RecordingRunCausality {
     summaries: Mutex<Vec<RunWorkSummary>>,
+    slot_work: Mutex<Vec<SlotWorkSnapshot>>,
+    system_binds: Mutex<Vec<EnqueueRequest>>,
 }
 
 impl RunCausalityPort for RecordingRunCausality {
@@ -20,10 +22,23 @@ impl RunCausalityPort for RecordingRunCausality {
         }
     }
 
+    fn bind_system_enqueue(&self, request: &EnqueueRequest) -> RunBinding {
+        self.system_binds.lock().unwrap().push(request.clone());
+        RunBinding {
+            team_run_id: Some("system-run-1".to_owned()),
+            created_new_run: true,
+            user_intervention: false,
+        }
+    }
+
     fn abort_binding(&self, _binding: &RunBinding) {}
 
     fn apply_work_summary(&self, summary: RunWorkSummary) {
         self.summaries.lock().unwrap().push(summary);
+    }
+
+    fn publish_slot_work(&self, snapshot: SlotWorkSnapshot) {
+        self.slot_work.lock().unwrap().push(snapshot);
     }
 }
 
@@ -45,6 +60,49 @@ fn enqueue(coordinator: &SlotWorkCoordinator, source: WorkSource, message_id: &s
         })
         .unwrap();
     coordinator.commit_enqueue(&lease, Some(message_id.into())).unwrap();
+}
+
+fn coordinator_with_recorder() -> (SlotWorkCoordinator, Arc<RecordingRunCausality>) {
+    let recorder = Arc::new(RecordingRunCausality::default());
+    let coordinator = SlotWorkCoordinator::new("team-1".into(), "generation-1".into(), recorder.clone());
+    (coordinator, recorder)
+}
+
+// Regression: run-less work (Background binding → no team_run_id, e.g. a leader
+// self-wake draining its mailbox for a membership-change notice) produces NO run
+// summaries, so the ONLY way the frontend learns the slot moved Running→Idle is a
+// per-slot `team.slotWorkChanged`. Every batch-lifecycle transition must publish
+// the slot's current snapshot regardless of run association, or the send-box
+// spinner stays stuck until a full reconcile.
+#[test]
+fn run_less_batch_lifecycle_publishes_per_slot_work_snapshots() {
+    let (coordinator, recorder) = coordinator_with_recorder();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::McpSendMessage, "bg-1");
+
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("run-less batch must be claimable");
+    };
+    coordinator.mark_started(&batch, "turn-1");
+    assert_eq!(coordinator.complete_batch(&batch), CommitResult::Committed);
+
+    let snaps = recorder.slot_work.lock().unwrap();
+    assert!(
+        snaps
+            .iter()
+            .any(|snap| snap.slot_id == "lead-1" && snap.state == SlotPhase::Running),
+        "run-less start must publish a Running per-slot snapshot"
+    );
+    let last = snaps
+        .iter()
+        .rev()
+        .find(|snap| snap.slot_id == "lead-1")
+        .expect("run-less slot transitions must publish per-slot work snapshots");
+    assert_eq!(
+        last.state,
+        SlotPhase::Idle,
+        "the final published snapshot must be Idle so the frontend clears the spinner"
+    );
 }
 
 #[test]
@@ -418,4 +476,163 @@ fn late_terminal_after_cancel_is_rejected() {
     coordinator.cancel_run("run-1");
 
     assert_eq!(coordinator.complete_batch(&batch), CommitResult::StaleOwner);
+}
+
+#[test]
+fn system_initiated_inherit_uses_caller_batch_run() {
+    let (coordinator, recorder) = coordinator_with_recorder();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    // The caller runs a user batch that carries a team run id.
+    let caller = coordinator
+        .acquire_enqueue(EnqueueRequest {
+            slot_id: "lead-1".into(),
+            role: TeamRunTargetRole::Lead,
+            source: WorkSource::UserMessage,
+            binding: CausalBinding::UserVisible,
+        })
+        .unwrap();
+    let run_id = caller.team_run_id.clone().expect("user enqueue must carry a run");
+    coordinator.commit_enqueue(&caller, Some("m-user".into())).unwrap();
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("caller batch must be claimable");
+    };
+    assert_eq!(batch.team_run_ids, vec![run_id.clone()]);
+
+    // A system wake targeting a teammate inherits the caller's running run
+    // via the inline lookup, never falling back to the causality port.
+    let inherited = coordinator
+        .acquire_enqueue(EnqueueRequest {
+            slot_id: "worker-1".into(),
+            role: TeamRunTargetRole::Teammate,
+            source: WorkSource::SpawnWelcome,
+            binding: CausalBinding::SystemInitiated {
+                inherit_from: Some("lead-1".into()),
+            },
+        })
+        .unwrap();
+    assert_eq!(inherited.team_run_id.as_deref(), Some(run_id.as_str()));
+    assert!(
+        recorder.system_binds.lock().unwrap().is_empty(),
+        "an inherit hit must not delegate to bind_system_enqueue"
+    );
+}
+
+#[test]
+fn system_initiated_none_delegates_to_port() {
+    let (coordinator, recorder) = coordinator_with_recorder();
+    let lease = coordinator
+        .acquire_enqueue(EnqueueRequest {
+            slot_id: "lead-1".into(),
+            role: TeamRunTargetRole::Lead,
+            source: WorkSource::SpawnWelcome,
+            binding: CausalBinding::SystemInitiated { inherit_from: None },
+        })
+        .unwrap();
+    assert_eq!(lease.team_run_id.as_deref(), Some("system-run-1"));
+    assert_eq!(
+        recorder.system_binds.lock().unwrap().len(),
+        1,
+        "a None inherit must delegate to bind_system_enqueue"
+    );
+}
+
+// ── ELECTRON-3RN: recognized slash commands batch alone (FIFO, no preempt) ──
+
+// AC3: when a command shares the queue with other unread messages, it is claimed
+// as a single-message batch (`is_command`), never merged with them — otherwise
+// the native op would swallow the rest of the turn (the flaw that ruled out B).
+#[test]
+fn command_intent_is_claimed_alone_not_merged() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserCommand, "c1");
+    enqueue(&coordinator, WorkSource::UserMessage, "m2");
+    enqueue(&coordinator, WorkSource::UserMessage, "m3");
+    coordinator.reconcile_mailbox(
+        "lead-1",
+        &["c1".into(), "m2".into(), "m3".into()],
+        TeamRunTargetRole::Lead,
+    );
+
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("command must be claimable");
+    };
+    assert!(batch.is_command, "a command batch must be flagged is_command");
+    assert_eq!(
+        batch.mailbox_message_ids,
+        vec!["c1"],
+        "command must not merge later messages"
+    );
+    assert_eq!(coordinator.mark_started(&batch, "turn-1"), StartCommitResult::Accepted);
+    assert_eq!(coordinator.complete_batch(&batch), CommitResult::Committed);
+
+    // The trailing ordinary messages merge as usual once the command completes.
+    let ReconcileDecision::Claim(rest) = coordinator.next("lead-1") else {
+        panic!("ordinary messages must follow the command");
+    };
+    assert!(!rest.is_command);
+    assert_eq!(rest.mailbox_message_ids, vec!["m2", "m3"]);
+}
+
+// AC3: an ordinary batch merges the leading run of plain messages but STOPS at
+// the first command, so the command is never folded into a plain batch.
+#[test]
+fn plain_batch_merge_stops_at_command() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    enqueue(&coordinator, WorkSource::UserMessage, "m2");
+    enqueue(&coordinator, WorkSource::UserCommand, "c3");
+    enqueue(&coordinator, WorkSource::UserMessage, "m4");
+    coordinator.reconcile_mailbox(
+        "lead-1",
+        &["m1".into(), "m2".into(), "c3".into(), "m4".into()],
+        TeamRunTargetRole::Lead,
+    );
+
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("plain messages must be claimable");
+    };
+    assert!(!first.is_command);
+    assert_eq!(
+        first.mailbox_message_ids,
+        vec!["m1", "m2"],
+        "merge must stop before the command"
+    );
+    assert_eq!(coordinator.mark_started(&first, "turn-1"), StartCommitResult::Accepted);
+    assert_eq!(coordinator.complete_batch(&first), CommitResult::Committed);
+
+    let ReconcileDecision::Claim(command) = coordinator.next("lead-1") else {
+        panic!("command must be claimed next, alone");
+    };
+    assert!(command.is_command);
+    assert_eq!(command.mailbox_message_ids, vec!["c3"]);
+}
+
+// AC3: a command sent while a batch is running queues in FIFO order and does not
+// preempt the active batch.
+#[test]
+fn command_during_running_batch_queues_without_preemption() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("first message must be claimable");
+    };
+    assert!(!first.is_command);
+    assert_eq!(coordinator.mark_started(&first, "turn-1"), StartCommitResult::Accepted);
+
+    // Command arrives mid-turn: it must NOT preempt the running batch.
+    enqueue(&coordinator, WorkSource::UserCommand, "c2");
+    let active = coordinator.slot_snapshot("lead-1").unwrap();
+    assert_eq!(active.active_batch.unwrap().mailbox_message_ids, vec!["m1"]);
+    assert_eq!(coordinator.next("lead-1"), ReconcileDecision::WaitingForCompletion);
+
+    // Once the active batch completes, the command is claimed alone.
+    assert_eq!(coordinator.complete_batch(&first), CommitResult::Committed);
+    let ReconcileDecision::Claim(second) = coordinator.next("lead-1") else {
+        panic!("queued command must follow the active batch");
+    };
+    assert!(second.is_command);
+    assert_eq!(second.mailbox_message_ids, vec!["c2"]);
 }

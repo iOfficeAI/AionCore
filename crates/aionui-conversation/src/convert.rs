@@ -292,6 +292,8 @@ pub fn search_row_to_item(row: MessageSearchRow, data_dir: &Path) -> Result<Mess
         pinned_at: row.conversation_pinned_at,
         created_at: row.conversation_created_at,
         updated_at: row.conversation_updated_at,
+        project_id: None,
+        folder_id: None,
     };
 
     let conversation = row_to_response(conversation_row, data_dir)?;
@@ -333,6 +335,8 @@ mod tests {
             pinned_at: None,
             created_at: 1000,
             updated_at: 2000,
+            project_id: None,
+            folder_id: None,
         }
     }
 
@@ -387,6 +391,8 @@ mod tests {
             pinned_at: None,
             created_at: 1000,
             updated_at: 2000,
+            project_id: None,
+            folder_id: None,
         };
         let err = row_to_response(row, Path::new("/tmp/data")).unwrap_err();
         assert!(matches!(err, ConversationError::Internal { .. }));
@@ -483,6 +489,8 @@ mod tests {
             pinned_at: Some(5000),
             created_at: 1000,
             updated_at: 3000,
+            project_id: None,
+            folder_id: None,
         };
         let resp = row_to_response(row, Path::new("/tmp/data")).unwrap();
         assert!(resp.pinned);

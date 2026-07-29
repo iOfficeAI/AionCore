@@ -1,4 +1,4 @@
--- Migration 030: non-reusable conversation membership for bounded legacy Memory import snapshots.
+-- Migration 032: non-reusable conversation membership for bounded legacy Memory import snapshots.
 
 CREATE TABLE IF NOT EXISTS conversation_memory_import_sequences (
     conversation_id TEXT PRIMARY KEY NOT NULL,

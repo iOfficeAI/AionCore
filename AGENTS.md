@@ -9,6 +9,54 @@
 
 Project-specific rules and conventions for AI assistants and contributors.
 
+## High-Priority Rules
+
+### NEVER guess an agent CLI's behavior — only assert what an approved source proves
+
+Absolutely forbidden: inferring, guessing, or "reasoning about likely behavior" of any agent CLI
+(claude, codex, gemini, opencode, hermes, aionrs, …) — its wire protocol, message shapes, field
+semantics, timing, defaults, or capabilities — from a CLI's name, a plausible mental model, prior
+training knowledge, or how you *think* it probably works. Every claim about an agent CLI's behavior
+MUST be backed by one of these approved sources, cited explicitly by path:
+
+1. **Captured real data** — actual sampled wire traffic under
+   `~/aion/protocols/samples/` (e.g. `codex-cli/<ver>/`, `claude-cli/<ver>/`, `codex-acp/`,
+   `opencode/`, `capture/`). This is ground truth for what the CLI actually emitted.
+2. **The ACP library source** — `agent-client-protocol` (main crate + `agent-client-protocol-schema`),
+   vendored at `~/.cargo/registry/src/*/agent-client-protocol-*` — for the canonical ACP wire types
+   and semantics we translate to.
+3. **An official adapter's code** — the codex `app-server` machine-generated JSON schema under
+   `~/aion/protocols/samples/codex-cli/<ver>/schema-full/` (ground truth from the codex binary
+   itself), the official claude-code / claude-code-acp adapter source, or an equivalent
+   first-party adapter — for inferring a CLI's contract from the reference implementation.
+
+Additional reliable sources, when a claim can be grounded in them: **the CLI binary's own
+`--help` / self-describing schema output** (run it and read it), and **our own passing
+integration/live-e2e fixtures** that were recorded against the real CLI (not hand-authored
+mocks). If none of these can substantiate a claim, the honest answer is "not yet verified —
+need a capture/schema", and the next step is to capture or read a source — NOT to guess.
+
+When you state any agent-CLI behavior, cite the source inline: `verified: samples/codex-cli/0.137.0/schema-full/ClientRequest.json`
+or `verified: agent-client-protocol-schema-0.12.0/src/session.rs`. A claim with no such citation
+is a guess and violates this rule. This is a non-negotiable, standing constraint — it outranks
+convenience and applies to every statement, plan, commit message, and design doc.
+
+### Do NOT state a claim as fact until you have verified it in the code yourself
+
+This rule exists because of a repeated, costly failure mode: forming a confident conclusion from a *proxy* for the truth instead of the truth itself, then reporting it to the user as fact. Concrete instances that must never recur:
+
+- **Trusting a sub-agent's conclusion without checking its evidence.** A spawned agent reported "the frontend has NO question renderer; the break is in the frontend." That was false — the frontend renders whatever `options[]` the backend sends; the real bug was the backend hard-coding `[Allow, Reject]` options for an AskUserQuestion. The conclusion was relayed to the user verbatim. **A sub-agent's report is a lead, not a fact. Before you repeat any load-bearing claim from an agent, open the cited file:line and confirm it says what the agent said.**
+- **Declaring equivalence/correctness from a thin test.** A frame-by-frame A/B was run with one trivial prompt ("Reply PONG") that only exercised `start/text/finish`, then "core turn flow is equivalent" was declared. The prompt never triggered tool-output streaming, subagents, plans, permissions, AskUserQuestion, or mode-switch — where all the real divergences were. **A green result on inputs that don't exercise the behavior is not evidence about that behavior. Before claiming a class of behavior works, confirm your test actually produces that class of event.**
+
+Enforced behaviors:
+1. **Cite from primary source.** Any claim about what code does must be backed by a file you (this agent) have read this session — not a sub-agent's summary, not memory, not inference from names. Sub-agent findings must be spot-checked against the code before being surfaced.
+2. **Verify the negative before asserting absence.** Never say "X has no Y / feature Z doesn't exist / the frontend can't do this" until you have grepped for it AND read the relevant handler. Absence is a strong claim; a single missed file falsifies it (e.g. `sideQuestion.ts`, `MessageAcpPermission` rendering dynamic `options[]`).
+3. **Match the test to the claim.** When verifying behavior, the test input must exercise the exact events/paths the claim covers. Trivial/happy-path inputs prove only the trivial path. When you cannot exercise a path, say so explicitly rather than implying it passed.
+4. **Trace to the break, don't guess the layer.** For a cross-layer bug (backend→wire→frontend), follow the actual data through every link and locate where it diverges from expected. Do not attribute the break to a layer by plausibility.
+5. **Calibrate language to evidence.** Say "verified: <file:line>", "not yet checked", or "a sub-agent claims X (unverified)". Never launder an unverified lead into a flat assertion.
+
+See also the standing discipline in the root `AGENTS.md` / memory `aioncore-verification-blindspot-g6`: self-consistent-all-green ≠ correct — verify outward (against a real agent) AND against the old/reference implementation, not just against your own happy path.
+
 ## Logging
 
 When planning or changing a critical path or hard-to-observe flow, evaluate whether logging needs to change. In implementation plans for such changes, briefly state whether logs will be added, existing observability is sufficient, or logs are intentionally unnecessary. Do not add logs for simple refactors, test-only changes, UI copy/style changes, or when existing tests, errors, metrics, or logs already provide enough observability.

@@ -17,7 +17,7 @@ use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs}
 use tokio::sync::broadcast;
 
 use crate::error::AgentError;
-use crate::manager::acp::AcpAgentManager;
+use crate::manager::acp::{AcpAgentManager, RequiredFullAutoApplication};
 use crate::manager::aionrs::AionrsAgentManager;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
@@ -150,6 +150,10 @@ pub trait IMockAgent: IAgentTask {
 pub enum AgentInstance {
     Acp(Arc<AcpAgentManager>),
     Aionrs(Arc<AionrsAgentManager>),
+    /// clean-slate direct-CLI session model (claude/codex only). Wraps an
+    /// `aionui_session::SessionBackend` via [`SessionAgentTask`]. Every other
+    /// backend keeps the `Acp` path. See the session-model-port design doc.
+    Session(Arc<crate::session_agent::SessionAgentTask>),
     /// Test-only trait-object escape hatch used by downstream crates
     /// (conversation/cron/team/app tests) to inject fake agents without
     /// spinning up a real CLI or WebSocket connection. Gated behind
@@ -169,6 +173,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.as_ref(),
             Self::Aionrs(m) => m.as_ref(),
+            Self::Session(m) => m.as_ref(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.as_ref(),
         }
@@ -234,6 +239,12 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.kill_and_wait(reason),
             Self::Aionrs(m) => m.kill_and_wait(reason),
+            // Session: delegate to the task's awaitable kill. For a
+            // `UserCancelTimeout` this emits a clean `Finish` (turn converges,
+            // gate recovers) then really terminates the CLI process tree, even
+            // while this `Arc` clone is held by an in-flight orchestrator —
+            // where the old Drop-only no-op silently failed (ELECTRON-3RW).
+            Self::Session(m) => m.kill_and_wait(reason),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => {
                 let _ = m.kill(reason);
@@ -257,6 +268,9 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.get_confirmations(),
             Self::Aionrs(m) => m.get_confirmations(),
+            // Session permissions surface as AcpPermission stream events + are
+            // answered via confirm(); no separate cached-confirmation list yet.
+            Self::Session(m) => m.get_confirmations(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_confirmations(),
         }
@@ -273,6 +287,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.confirm(msg_id, call_id, data, always_allow),
             Self::Aionrs(m) => m.confirm(msg_id, call_id, data, always_allow),
+            Self::Session(m) => m.confirm(msg_id, call_id, data, always_allow),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.confirm(msg_id, call_id, data, always_allow),
         }
@@ -283,6 +298,8 @@ impl AgentInstance {
         match self {
             Self::Acp(_) => false,
             Self::Aionrs(m) => m.check_approval(action, command_type),
+            // Session (claude/codex) has no aionrs-style auto-approve list.
+            Self::Session(_) => false,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.check_approval(action, command_type),
         }
@@ -291,7 +308,7 @@ impl AgentInstance {
     /// Session key for test doubles that expose one.
     pub fn get_session_key(&self) -> Option<String> {
         match self {
-            Self::Acp(_) | Self::Aionrs(_) => None,
+            Self::Acp(_) | Self::Aionrs(_) | Self::Session(_) => None,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_session_key(),
         }
@@ -302,6 +319,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.mode().await,
             Self::Aionrs(m) => m.mode().await,
+            Self::Session(m) => m.mode().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.mode().await,
         }
@@ -324,6 +342,7 @@ impl AgentInstance {
                 Ok(GetModelInfoResponse { model_info })
             }
             Self::Aionrs(_) => Ok(GetModelInfoResponse { model_info: None }),
+            Self::Session(m) => m.get_model().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_model().await,
         }
@@ -333,6 +352,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.config_options().await,
             Self::Aionrs(m) => m.config_options().await,
+            Self::Session(m) => m.get_config_options().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_config_options().await,
         }
@@ -348,8 +368,22 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.set_config_option_confirmed(option_id, value).await,
             Self::Aionrs(m) => m.set_config_option(option_id, value).await,
+            Self::Session(m) => m.set_config_option(option_id, value).await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.set_config_option(option_id, value).await,
+        }
+    }
+
+    /// Apply cron's full-auto required-runtime-mode (a-pure, ELECTRON-3RQ) for
+    /// metadata-bearing ACP agents (Kimi et al.). Returns `Ok(None)` for
+    /// non-ACP variants (claude/codex `Session`, `Aionrs`, `Mock`) — the
+    /// `yolo_id` metadata this resolution needs is only visible on the ACP
+    /// manager, so the caller uses the retained legacy apply path (codex
+    /// ELECTRON-3Q0 catalog alignment + native pass-through) for the rest.
+    pub async fn apply_required_full_auto_mode(&self) -> Result<Option<RequiredFullAutoApplication>, AgentError> {
+        match self {
+            Self::Acp(m) => Ok(Some(m.apply_required_full_auto_mode().await?)),
+            _ => Ok(None),
         }
     }
 
@@ -371,6 +405,7 @@ impl AgentInstance {
                 Ok(Some(value))
             }
             Self::Aionrs(_) => Ok(None),
+            Self::Session(m) => m.get_usage().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_usage().await,
         }
@@ -383,6 +418,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.load_slash_commands().await,
             Self::Aionrs(m) => m.get_slash_commands().await,
+            Self::Session(m) => m.get_slash_commands().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_slash_commands().await,
         }
@@ -410,6 +446,10 @@ impl AgentInstance {
                 })
             }
             Self::Aionrs(_) => Ok(SideQuestionResponse {
+                status: "unsupported".into(),
+                answer: None,
+            }),
+            Self::Session(_) => Ok(SideQuestionResponse {
                 status: "unsupported".into(),
                 answer: None,
             }),
@@ -607,5 +647,64 @@ mod aionrs_config_option_tests {
             matches!(&error, AgentError::BadRequest(message) if message == "Config option 'thought_level' is not available"),
             "unexpected error: {error:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod required_full_auto_dispatch_tests {
+    use super::*;
+    use tokio::sync::broadcast;
+
+    /// Minimal non-ACP agent behind the `Mock` variant: exercises the
+    /// `apply_required_full_auto_mode` dispatch without a real CLI.
+    struct NoopMockAgent {
+        conversation_id: String,
+        event_tx: broadcast::Sender<AgentStreamEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl IAgentTask for NoopMockAgent {
+        fn agent_type(&self) -> AgentType {
+            AgentType::Acp
+        }
+        fn conversation_id(&self) -> &str {
+            &self.conversation_id
+        }
+        fn workspace(&self) -> &str {
+            "/tmp/test"
+        }
+        fn status(&self) -> Option<ConversationStatus> {
+            None
+        }
+        fn last_activity_at(&self) -> TimestampMs {
+            0
+        }
+        fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
+            self.event_tx.subscribe()
+        }
+        async fn send_message(&self, _data: SendMessageData) -> Result<(), AgentSendError> {
+            Ok(())
+        }
+        async fn cancel(&self) -> Result<(), AgentError> {
+            Ok(())
+        }
+        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+            Ok(())
+        }
+    }
+
+    impl IMockAgent for NoopMockAgent {}
+
+    /// Non-ACP variants (proxy for claude/codex `Session`, `Aionrs`) never
+    /// enter the a-pure path — they signal `Ok(None)` so the caller falls back
+    /// to the retained legacy apply path.
+    #[tokio::test]
+    async fn non_acp_variant_returns_none_for_full_auto_apply() {
+        let (event_tx, _rx) = broadcast::channel(4);
+        let instance = AgentInstance::Mock(Arc::new(NoopMockAgent {
+            conversation_id: "conv-mock".into(),
+            event_tx,
+        }));
+        assert!(matches!(instance.apply_required_full_auto_mode().await, Ok(None)));
     }
 }

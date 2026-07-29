@@ -34,13 +34,13 @@ async fn run_migrations_through(pool: &sqlx::SqlitePool, max_version: i64) {
 }
 
 #[tokio::test]
-async fn migration_029_upgrades_028_and_preserves_legacy_messages_with_null_turn_id() {
+async fn migration_031_upgrades_030_and_preserves_legacy_messages_with_null_turn_id() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 28).await;
+    run_migrations_through(&pool, 30).await;
     sqlx::query(
         "INSERT INTO users (id, username, email, password_hash, created_at, updated_at)
          VALUES ('system_default_user', 'system', 'system@aionui.local', '', 1, 1)",
@@ -63,7 +63,7 @@ async fn migration_029_upgrades_028_and_preserves_legacy_messages_with_null_turn
     .await
     .unwrap();
 
-    run_migrations_through(&pool, 29).await;
+    run_migrations_through(&pool, 31).await;
 
     let turn_id: Option<String> = sqlx::query_scalar("SELECT turn_id FROM messages WHERE id = 'legacy-msg'")
         .fetch_one(&pool)
@@ -73,13 +73,13 @@ async fn migration_029_upgrades_028_and_preserves_legacy_messages_with_null_turn
 }
 
 #[tokio::test]
-async fn migration_030_assigns_non_reusable_sequences_to_existing_and_new_conversations() {
+async fn migration_032_assigns_non_reusable_sequences_to_existing_and_new_conversations() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 29).await;
+    run_migrations_through(&pool, 31).await;
     sqlx::query(
         "INSERT INTO users (id,username,email,password_hash,created_at,updated_at)
          VALUES ('sequence-user','sequence-user','sequence@example.com','',1,1)",
@@ -98,7 +98,7 @@ async fn migration_030_assigns_non_reusable_sequences_to_existing_and_new_conver
         .unwrap();
     }
 
-    run_migrations_through(&pool, 30).await;
+    run_migrations_through(&pool, 32).await;
     let existing: Vec<(String, i64)> = sqlx::query_as(
         "SELECT conversation_id,sequence FROM conversation_memory_import_sequences
          WHERE user_id = 'sequence-user' ORDER BY sequence",
@@ -132,13 +132,13 @@ async fn migration_030_assigns_non_reusable_sequences_to_existing_and_new_conver
 }
 
 #[tokio::test]
-async fn migration_030_ddl_and_backfill_are_idempotent_when_reapplied() {
+async fn migration_032_ddl_and_backfill_are_idempotent_when_reapplied() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 29).await;
+    run_migrations_through(&pool, 31).await;
     sqlx::query(
         "INSERT INTO users (id,username,email,password_hash,created_at,updated_at)
          VALUES ('idempotent-user','idempotent-user','idempotent@example.com','',1,1)",
@@ -156,7 +156,7 @@ async fn migration_030_ddl_and_backfill_are_idempotent_when_reapplied() {
         .await
         .unwrap();
     }
-    let migration = include_str!("../migrations/030_memory_import_sequence.sql");
+    let migration = include_str!("../migrations/032_memory_import_sequence.sql");
     sqlx::raw_sql(migration).execute(&pool).await.unwrap();
     sqlx::raw_sql(migration).execute(&pool).await.unwrap();
 
@@ -207,13 +207,13 @@ async fn migration_030_ddl_and_backfill_are_idempotent_when_reapplied() {
 }
 
 #[tokio::test]
-async fn migration_031_adds_idempotent_immutable_retrieval_selections() {
+async fn migration_033_adds_idempotent_immutable_retrieval_selections() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 30).await;
+    run_migrations_through(&pool, 32).await;
     sqlx::query(
         "INSERT INTO users (id,username,email,password_hash,created_at,updated_at)
          VALUES ('preview-user','preview-user','preview@example.com','',1,1)",
@@ -247,7 +247,7 @@ async fn migration_031_adds_idempotent_immutable_retrieval_selections() {
     .await
     .unwrap();
 
-    let migration = include_str!("../migrations/031_memory_retrieval_selections.sql");
+    let migration = include_str!("../migrations/033_memory_retrieval_selections.sql");
     sqlx::raw_sql(migration).execute(&pool).await.unwrap();
     sqlx::raw_sql(migration).execute(&pool).await.unwrap();
 
@@ -343,13 +343,13 @@ async fn migration_031_adds_idempotent_immutable_retrieval_selections() {
 }
 
 #[tokio::test]
-async fn migration_032_scrubs_legacy_tombstones_and_is_idempotent() {
+async fn migration_034_scrubs_legacy_tombstones_and_is_idempotent() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 31).await;
+    run_migrations_through(&pool, 33).await;
     sqlx::query(
         "INSERT INTO users (id,username,email,password_hash,created_at,updated_at)
          VALUES ('tombstone-user','tombstone-user','tombstone@example.com','',1,1)",
@@ -393,7 +393,7 @@ async fn migration_032_scrubs_legacy_tombstones_and_is_idempotent() {
     .await
     .unwrap();
 
-    let migration = include_str!("../migrations/032_memory_tombstone_invariant.sql");
+    let migration = include_str!("../migrations/034_memory_tombstone_invariant.sql");
     sqlx::raw_sql(migration).execute(&pool).await.unwrap();
     sqlx::raw_sql(migration).execute(&pool).await.unwrap();
 
@@ -409,7 +409,7 @@ async fn migration_032_scrubs_legacy_tombstones_and_is_idempotent() {
 }
 
 #[tokio::test]
-async fn migration_029_creates_normalized_tables_constraints_and_required_indexes() {
+async fn migration_031_creates_normalized_tables_constraints_and_required_indexes() {
     let database = aionui_db::init_database_memory().await.unwrap();
     let pool = database.pool();
     let expected_tables = [
@@ -708,7 +708,7 @@ async fn migration_029_creates_normalized_tables_constraints_and_required_indexe
 }
 
 #[test]
-fn migration_versions_are_unique_and_memory_owns_029_through_032() {
+fn migration_versions_are_unique_and_app_operations_and_memory_own_030_through_034() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let full = Migrator::new(Path::new("migrations")).await.unwrap();
@@ -717,10 +717,11 @@ fn migration_versions_are_unique_and_memory_owns_029_through_032() {
             .iter()
             .map(|migration| migration.version)
             .collect::<Vec<_>>();
-        assert_eq!(versions.iter().filter(|version| **version == 29).count(), 1);
         assert_eq!(versions.iter().filter(|version| **version == 30).count(), 1);
         assert_eq!(versions.iter().filter(|version| **version == 31).count(), 1);
         assert_eq!(versions.iter().filter(|version| **version == 32).count(), 1);
+        assert_eq!(versions.iter().filter(|version| **version == 33).count(), 1);
+        assert_eq!(versions.iter().filter(|version| **version == 34).count(), 1);
         assert_eq!(versions.iter().copied().collect::<HashSet<_>>().len(), versions.len());
     });
 }

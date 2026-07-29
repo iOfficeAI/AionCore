@@ -120,17 +120,46 @@ impl SlotWorkCoordinator {
                 created_new_run: false,
                 user_intervention: false,
             },
-            CausalBinding::InheritRunningBatch { caller_slot_id } => RunBinding {
-                team_run_id: state
+            CausalBinding::InheritRunningBatch { caller_slot_id } => {
+                let inherited = state
                     .slots
                     .get(caller_slot_id)
                     .and_then(|caller| caller.active.as_ref())
-                    .and_then(|active| active.batch.team_run_ids.first().cloned()),
-                created_new_run: false,
-                user_intervention: false,
-            },
+                    .and_then(|active| active.batch.team_run_ids.first().cloned());
+                match inherited {
+                    // Inherit the caller's active run when there is one.
+                    Some(team_run_id) => RunBinding {
+                        team_run_id: Some(team_run_id),
+                        created_new_run: false,
+                        user_intervention: false,
+                    },
+                    // No inheritable run: a run-scoped wake (send/shutdown) is a
+                    // legitimate work initiation and must live in a run, so fall
+                    // back to attach-or-create a SystemLifecycle run (same as
+                    // SystemInitiated). Closes "no active team run for
+                    // run-scoped wake" at the single enqueue choke-point.
+                    None => self.run_causality.bind_system_enqueue(&request),
+                }
+            }
             CausalBinding::UserVisible | CausalBinding::ActiveRunOrBackground => {
                 self.run_causality.bind_enqueue(&request)
+            }
+            CausalBinding::SystemInitiated { inherit_from } => {
+                let inherited = inherit_from.as_ref().and_then(|caller_slot_id| {
+                    state
+                        .slots
+                        .get(caller_slot_id)
+                        .and_then(|caller| caller.active.as_ref())
+                        .and_then(|active| active.batch.team_run_ids.first().cloned())
+                });
+                match inherited {
+                    Some(team_run_id) => RunBinding {
+                        team_run_id: Some(team_run_id),
+                        created_new_run: false,
+                        user_intervention: false,
+                    },
+                    None => self.run_causality.bind_system_enqueue(&request),
+                }
             }
         };
         let lease = EnqueueLease {
@@ -217,6 +246,7 @@ impl SlotWorkCoordinator {
         let summaries = Self::run_summaries_locked(&state, lease.team_run_id.iter().cloned());
         drop(state);
         self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(Some(slot_snapshot.clone()));
 
         info!(
             team_id = %self.team_id,
@@ -255,12 +285,14 @@ impl SlotWorkCoordinator {
                     .values()
                     .any(|candidate| candidate.lease.team_run_id.as_ref() == Some(team_run_id))
         });
+        let slot_snapshot = Self::slot_snapshot_locked(&state, &lease.slot_id);
         let summaries = Self::run_summaries_locked(&state, lease.team_run_id.iter().cloned());
         drop(state);
         if remove_empty_run {
             self.run_causality.abort_binding(&record.binding);
         }
         self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
         debug!(
             team_id = %self.team_id,
             session_generation = %self.session_generation,
@@ -394,7 +426,8 @@ impl SlotWorkCoordinator {
         };
 
         let queued_ids = slot.queue(priority).iter().cloned().collect::<Vec<_>>();
-        let message_intent_ids = queued_ids
+        // Message intents (those carrying a mailbox row), in FIFO order.
+        let fifo_message_intent_ids = queued_ids
             .iter()
             .filter(|intent_id| {
                 state
@@ -404,9 +437,38 @@ impl SlotWorkCoordinator {
             })
             .cloned()
             .collect::<Vec<_>>();
-        if message_intent_ids.is_empty() {
+        if fifo_message_intent_ids.is_empty() {
             return ReconcileDecision::SettleSignals(queued_ids);
         }
+
+        // ELECTRON-3RN: isolate recognized slash commands into single-message
+        // batches (FIFO, no preemption). The queue head decides:
+        // - head is a `UserCommand` → this batch is exactly that one command, so
+        //   the native op is not fed the rest of the turn (the flaw that ruled
+        //   out option B);
+        // - head is an ordinary message → merge the leading run of ordinary
+        //   messages but STOP at the first `UserCommand` so a command is never
+        //   folded into a plain batch (existing multi-message merge, bounded).
+        let head_is_command = state
+            .intents
+            .get(&fifo_message_intent_ids[0])
+            .is_some_and(|intent| intent.source == WorkSource::UserCommand);
+        let (message_intent_ids, is_command) = if head_is_command {
+            (vec![fifo_message_intent_ids[0].clone()], true)
+        } else {
+            let mut selected = Vec::new();
+            for intent_id in &fifo_message_intent_ids {
+                let is_command_intent = state
+                    .intents
+                    .get(intent_id)
+                    .is_some_and(|intent| intent.source == WorkSource::UserCommand);
+                if is_command_intent {
+                    break;
+                }
+                selected.push(intent_id.clone());
+            }
+            (selected, false)
+        };
 
         state.next_operation_id = state.next_operation_id.saturating_add(1);
         let operation_id = state.next_operation_id;
@@ -437,6 +499,7 @@ impl SlotWorkCoordinator {
             highest_priority: priority,
             team_run_ids: team_run_ids.clone(),
             operation_id,
+            is_command,
         };
         let slot = state.slots.get_mut(slot_id).expect("selected slot exists");
         for intent_id in &message_intent_ids {
@@ -447,9 +510,11 @@ impl SlotWorkCoordinator {
             turn_id: None,
             started_at_ms: None,
         });
+        let slot_snapshot = Self::slot_snapshot_locked(&state, slot_id);
         let summaries = Self::run_summaries_locked(&state, team_run_ids);
         drop(state);
         self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
         info!(
             team_id = %self.team_id,
             session_generation = %self.session_generation,
@@ -459,6 +524,7 @@ impl SlotWorkCoordinator {
             intent_count = batch.intent_ids.len(),
             message_count = batch.mailbox_message_ids.len(),
             priority = ?batch.highest_priority,
+            is_command = batch.is_command,
             "team work batch claimed"
         );
         ReconcileDecision::Claim(batch)
@@ -500,9 +566,11 @@ impl SlotWorkCoordinator {
             active.turn_id = Some(turn_id.to_owned());
             active.started_at_ms = Some(now_ms());
         }
+        let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
         let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
         drop(state);
         self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
         if cancel_immediately {
             StartCommitResult::CancelImmediately
         } else {
@@ -526,9 +594,11 @@ impl SlotWorkCoordinator {
         for intent_id in batch.intent_ids.iter().rev() {
             slot.queue_mut(batch.highest_priority).push_front(intent_id.clone());
         }
+        let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
         let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
         drop(state);
         self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
         debug!(
             team_id = %self.team_id,
             session_generation = %self.session_generation,
@@ -757,6 +827,7 @@ impl SlotWorkCoordinator {
         let slot = Self::slot_snapshot_locked(&state, slot_id).expect("constrained slot exists");
         drop(state);
         self.publish_run_summaries(affected_run_summaries.clone());
+        self.publish_slot_work_snapshot(Some(slot.clone()));
         RuntimeConstraintUpdate {
             slot,
             terminal_message_ids,
@@ -917,9 +988,11 @@ impl SlotWorkCoordinator {
             .get_mut(&batch.slot_id)
             .expect("current batch slot exists")
             .active = None;
+        let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
         let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
         drop(state);
         self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
         info!(
             team_id = %self.team_id,
             session_generation = %self.session_generation,

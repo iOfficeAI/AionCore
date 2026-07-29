@@ -1,3 +1,4 @@
+-- Migration 033: immutable selections for bounded Memory retrieval snapshots.
 CREATE TABLE IF NOT EXISTS memory_retrieval_selections (
     retrieval_id TEXT NOT NULL,
     position INTEGER NOT NULL CHECK (position >= 0),

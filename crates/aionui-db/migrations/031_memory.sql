@@ -1,4 +1,4 @@
--- Migration 029: durable normalized Memory storage and canonical turn linkage.
+-- Migration 031: durable normalized Memory storage and canonical turn linkage.
 
 ALTER TABLE messages ADD COLUMN turn_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_turn_created
