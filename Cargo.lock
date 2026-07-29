@@ -683,6 +683,7 @@ dependencies = [
  "aionui-api-types",
  "aionui-auth",
  "aionui-common",
+ "aionui-project",
  "aionui-realtime",
  "async-trait",
  "axum",
@@ -783,13 +784,22 @@ dependencies = [
 name = "aionui-project"
 version = "0.1.53"
 dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
  "aionui-common",
  "aionui-db",
+ "async-trait",
+ "axum",
+ "base64",
  "chrono",
+ "http-body-util",
+ "notify",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
  "url",
 ]

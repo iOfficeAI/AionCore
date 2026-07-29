@@ -9,10 +9,16 @@
 //! critical and filesystem-free; the rest is service orchestration.
 
 pub mod canonical;
+pub mod chat_files;
 pub mod containment;
+pub mod monitor;
+pub mod routes;
+pub mod runtime;
 mod service;
 pub mod types;
 
+pub use chat_files::ResolvedChatMessage;
+pub use routes::{ProjectRouterState, project_routes};
 pub use service::ProjectService;
 pub use types::{
     AttachInput, FileOp, FolderDto, ProjectDetail, ProjectError, ProjectExplorerEntry, ProjectExplorerView,

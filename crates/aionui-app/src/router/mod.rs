@@ -1,5 +1,6 @@
 //! HTTP router assembly for the application.
 
+mod fs_monitor;
 mod health;
 mod routes;
 mod runtime_team_tools;

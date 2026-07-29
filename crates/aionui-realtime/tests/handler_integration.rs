@@ -385,7 +385,7 @@ async fn unknown_message_routed_to_message_router() {
         called: AtomicBool,
     }
     impl MessageRouter for TrackingRouter {
-        fn route(&self, _conn_id: ConnectionId, _name: &str, _data: Value) -> bool {
+        fn route(&self, _conn_id: ConnectionId, _user_id: &str, _name: &str, _data: Value) -> bool {
             self.called.store(true, Ordering::Relaxed);
             true
         }
