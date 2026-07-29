@@ -3352,11 +3352,15 @@ mod tests {
             .await;
         let job = fixture
             .service
-            .claim_job(USER_ID, "worker-1", 50)
+            .claim_job(USER_ID, "worker-1", 30_000)
             .await
             .unwrap()
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        sqlx::query("UPDATE memory_jobs SET lease_expires_at = 0 WHERE id = ?")
+            .bind(&job.id)
+            .execute(fixture._db.pool())
+            .await
+            .unwrap();
 
         assert_eq!(fixture.service.recover_expired_jobs().await.unwrap(), 1);
         assert_eq!(
