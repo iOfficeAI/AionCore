@@ -15,6 +15,7 @@ impl TeamSessionService {
             leader_assistant_id: team.lead_agent_id.clone(),
             created_at: team.created_at,
             updated_at: team.updated_at,
+            active_session_id: team.active_session_id.clone(),
         })
     }
 

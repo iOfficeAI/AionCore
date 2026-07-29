@@ -47,11 +47,20 @@ impl ITeamRepository for MockTeamRepo {
         Ok(())
     }
 
-    async fn read_unread_and_mark(&self, team_id: &str, to_agent_id: &str) -> Result<Vec<MailboxMessageRow>, DbError> {
+    async fn read_unread_and_mark(
+        &self,
+        team_id: &str,
+        session_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let mut state = self.state.lock().unwrap();
         let mut result = vec![];
         for msg in &mut state.messages {
-            if msg.team_id == team_id && msg.to_agent_id == to_agent_id && !msg.read {
+            if msg.team_id == team_id
+                && msg.session_id.as_deref() == Some(session_id)
+                && msg.to_agent_id == to_agent_id
+                && !msg.read
+            {
                 msg.read = true;
                 result.push(msg.clone());
             }
@@ -59,12 +68,19 @@ impl ITeamRepository for MockTeamRepo {
         Ok(result)
     }
 
-    async fn peek_unread(&self, team_id: &str, to_agent_id: &str) -> Result<Vec<MailboxMessageRow>, DbError> {
+    async fn peek_unread(
+        &self,
+        team_id: &str,
+        session_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let state = self.state.lock().unwrap();
         let result = state
             .messages
             .iter()
-            .filter(|m| m.team_id == team_id && m.to_agent_id == to_agent_id && !m.read)
+            .filter(|m| {
+                m.team_id == team_id && m.session_id.as_deref() == Some(session_id) && m.to_agent_id == to_agent_id && !m.read
+            })
             .cloned()
             .collect();
         Ok(result)
@@ -83,14 +99,14 @@ impl ITeamRepository for MockTeamRepo {
     async fn get_history(
         &self,
         team_id: &str,
+        session_id: &str,
         to_agent_id: &str,
         limit: Option<i64>,
     ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let state = self.state.lock().unwrap();
-        let iter = state
-            .messages
-            .iter()
-            .filter(|m| m.team_id == team_id && m.to_agent_id == to_agent_id);
+        let iter = state.messages.iter().filter(|m| {
+            m.team_id == team_id && m.session_id.as_deref() == Some(session_id) && m.to_agent_id == to_agent_id
+        });
         let msgs: Vec<_> = match limit {
             Some(n) => iter.take(n as usize).cloned().collect(),
             None => iter.cloned().collect(),
@@ -108,12 +124,19 @@ impl ITeamRepository for MockTeamRepo {
         Ok(())
     }
 
-    async fn find_task_by_id(&self, team_id: &str, task_id: &str) -> Result<Option<TeamTaskRow>, DbError> {
+    async fn find_task_by_id(
+        &self,
+        team_id: &str,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TeamTaskRow>, DbError> {
         let state = self.state.lock().unwrap();
         let found = state
             .tasks
             .iter()
-            .find(|t| t.team_id == team_id && t.id == task_id)
+            .find(|t| {
+                t.team_id == team_id && t.session_id.as_deref() == Some(session_id) && t.id == task_id
+            })
             .cloned();
         Ok(found)
     }
@@ -144,9 +167,14 @@ impl ITeamRepository for MockTeamRepo {
         Ok(())
     }
 
-    async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
+    async fn list_tasks(&self, team_id: &str, session_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
         let state = self.state.lock().unwrap();
-        let tasks = state.tasks.iter().filter(|t| t.team_id == team_id).cloned().collect();
+        let tasks = state
+            .tasks
+            .iter()
+            .filter(|t| t.team_id == team_id && t.session_id.as_deref() == Some(session_id))
+            .cloned()
+            .collect();
         Ok(tasks)
     }
 
@@ -178,6 +206,85 @@ impl ITeamRepository for MockTeamRepo {
 
     async fn delete_tasks_by_team(&self, team_id: &str) -> Result<(), DbError> {
         self.state.lock().unwrap().tasks.retain(|t| t.team_id != team_id);
+        Ok(())
+    }
+
+    async fn delete_mailbox_by_session(&self, team_id: &str, session_id: &str) -> Result<(), DbError> {
+        self.state.lock().unwrap().messages.retain(|m| {
+            !(m.team_id == team_id && m.session_id.as_deref() == Some(session_id))
+        });
+        Ok(())
+    }
+
+    async fn delete_tasks_by_session(&self, team_id: &str, session_id: &str) -> Result<(), DbError> {
+        self.state.lock().unwrap().tasks.retain(|t| {
+            !(t.team_id == team_id && t.session_id.as_deref() == Some(session_id))
+        });
+        Ok(())
+    }
+
+    // ── Team Sessions (migration 030) — in-memory stubs ───────────────
+
+    async fn create_team_session(
+        &self,
+        _row: &aionui_db::models::TeamSessionRow,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn list_team_sessions(&self, _team_id: &str) -> Result<Vec<aionui_db::models::TeamSessionRow>, DbError> {
+        Ok(vec![])
+    }
+
+    async fn get_team_session(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<aionui_db::models::TeamSessionRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn update_team_session(
+        &self,
+        _session_id: &str,
+        _params: &aionui_db::UpdateTeamSessionParams,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn delete_team_session(&self, _session_id: &str) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn delete_team_sessions_by_team(&self, _team_id: &str) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn bind_session_conversation(
+        &self,
+        _row: &aionui_db::models::TeamSessionAgentRow,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn list_session_agents(
+        &self,
+        _session_id: &str,
+    ) -> Result<Vec<aionui_db::models::TeamSessionAgentRow>, DbError> {
+        Ok(vec![])
+    }
+
+    async fn list_session_agents_by_team(
+        &self,
+        _team_id: &str,
+    ) -> Result<Vec<aionui_db::models::TeamSessionAgentRow>, DbError> {
+        Ok(vec![])
+    }
+
+    async fn delete_session_agents_by_session(&self, _session_id: &str) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn delete_session_agents_by_team(&self, _team_id: &str) -> Result<(), DbError> {
         Ok(())
     }
 }

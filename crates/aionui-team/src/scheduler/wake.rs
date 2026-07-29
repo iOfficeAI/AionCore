@@ -10,8 +10,8 @@ use crate::error::TeamError;
 impl TeammateManager {
     pub async fn build_wake_payload(&self, slot_id: &str) -> Result<WakePayload, TeamError> {
         let agent = self.get_agent(slot_id).await?;
-        let tasks = self.task_board.list_tasks(&self.team_id).await?;
-        let unread = self.mailbox.read_unread(&self.team_id, slot_id).await?;
+        let tasks = self.task_board.list_tasks(&self.team_id, &self.session_id).await?;
+        let unread = self.mailbox.read_unread(&self.team_id, &self.session_id, slot_id).await?;
         Ok(WakePayload {
             agent,
             tasks,

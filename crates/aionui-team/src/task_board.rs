@@ -31,13 +31,14 @@ impl TaskBoard {
     pub async fn create_task(
         &self,
         team_id: &str,
+        session_id: &str,
         subject: &str,
         description: Option<&str>,
         owner: Option<&str>,
         blocked_by: &[String],
     ) -> Result<TeamTask, TeamError> {
         for dep_id in blocked_by {
-            let dep = self.repo.find_task_by_id(team_id, dep_id).await?;
+            let dep = self.repo.find_task_by_id(team_id, session_id, dep_id).await?;
             if dep.is_none() {
                 return Err(TeamError::BlockedTaskNotFound(dep_id.clone()));
             }
@@ -59,6 +60,7 @@ impl TaskBoard {
             metadata: None,
             created_at: now,
             updated_at: now,
+            session_id: Some(session_id.to_owned()),
         };
 
         self.repo.create_task(&row).await?;
@@ -67,15 +69,21 @@ impl TaskBoard {
             self.repo.append_to_blocks(dep_id, &task_id).await?;
         }
 
-        debug!(team_id, task_id = %task_id, subject, "task created");
+        debug!(team_id, session_id, task_id = %task_id, subject, "task created");
 
         TeamTask::from_row(&row).map_err(TeamError::Json)
     }
 
-    pub async fn update_task(&self, team_id: &str, task_id: &str, update: &TaskUpdate) -> Result<TeamTask, TeamError> {
+    pub async fn update_task(
+        &self,
+        team_id: &str,
+        session_id: &str,
+        task_id: &str,
+        update: &TaskUpdate,
+    ) -> Result<TeamTask, TeamError> {
         let existing = self
             .repo
-            .find_task_by_id(team_id, task_id)
+            .find_task_by_id(team_id, session_id, task_id)
             .await?
             .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
 
@@ -95,17 +103,17 @@ impl TaskBoard {
 
         let updated = self
             .repo
-            .find_task_by_id(team_id, task_id)
+            .find_task_by_id(team_id, session_id, task_id)
             .await?
             .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
 
-        debug!(team_id, task_id, "task updated");
+        debug!(team_id, session_id, task_id, "task updated");
 
         TeamTask::from_row(&updated).map_err(TeamError::Json)
     }
 
-    pub async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTask>, TeamError> {
-        let rows = self.repo.list_tasks(team_id).await?;
+    pub async fn list_tasks(&self, team_id: &str, session_id: &str) -> Result<Vec<TeamTask>, TeamError> {
+        let rows = self.repo.list_tasks(team_id, session_id).await?;
         let tasks = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
         Ok(tasks)
     }
@@ -134,7 +142,7 @@ mod tests {
     // -- Helper ---------------------------------------------------------------
 
     async fn create_simple_task(board: &TaskBoard, team_id: &str, subject: &str) -> TeamTask {
-        board.create_task(team_id, subject, None, None, &[]).await.unwrap()
+        board.create_task(team_id, "s1", subject, None, None, &[]).await.unwrap()
     }
 
     // -- Tests ----------------------------------------------------------------
@@ -157,7 +165,7 @@ mod tests {
         let board = TaskBoard::new(repo);
 
         let task = board
-            .create_task("t1", "Design API", Some("REST endpoints"), Some("a1"), &[])
+            .create_task("t1", "s1", "Design API", Some("REST endpoints"), Some("a1"), &[])
             .await
             .unwrap();
         assert_eq!(task.description.as_deref(), Some("REST endpoints"));
@@ -171,13 +179,13 @@ mod tests {
 
         let task_a = create_simple_task(&board, "t1", "Task A").await;
         let task_b = board
-            .create_task("t1", "Task B", None, None, std::slice::from_ref(&task_a.id))
+            .create_task("t1", "s1", "Task B", None, None, std::slice::from_ref(&task_a.id))
             .await
             .unwrap();
 
         assert_eq!(task_b.blocked_by, vec![task_a.id.clone()]);
 
-        let updated_a = repo.find_task_by_id("t1", &task_a.id).await.unwrap().unwrap();
+        let updated_a = repo.find_task_by_id("t1", "s1", &task_a.id).await.unwrap().unwrap();
         let blocks_a: Vec<String> = serde_json::from_str(&updated_a.blocks).unwrap();
         assert_eq!(blocks_a, vec![task_b.id]);
     }
@@ -187,7 +195,7 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let board = TaskBoard::new(repo);
 
-        let result = board.create_task("t1", "X", None, None, &["nonexistent".into()]).await;
+        let result = board.create_task("t1", "s1", "X", None, None, &["nonexistent".into()]).await;
         assert!(matches!(result, Err(TeamError::BlockedTaskNotFound(_))));
     }
 
@@ -200,6 +208,7 @@ mod tests {
         let updated = board
             .update_task(
                 "t1",
+                "s1",
                 &task.id,
                 &TaskUpdate {
                     status: Some(TaskStatus::InProgress),
@@ -220,6 +229,7 @@ mod tests {
         let updated = board
             .update_task(
                 "t1",
+                "s1",
                 &task.id,
                 &TaskUpdate {
                     description: Some("New desc".into()),
@@ -238,7 +248,7 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let board = TaskBoard::new(repo);
 
-        let result = board.update_task("t1", "nonexistent", &TaskUpdate::default()).await;
+        let result = board.update_task("t1", "s1", "nonexistent", &TaskUpdate::default()).await;
         assert!(matches!(result, Err(TeamError::TaskNotFound(_))));
     }
 
@@ -249,7 +259,7 @@ mod tests {
 
         let task_a = create_simple_task(&board, "t1", "A").await;
         let task_b = board
-            .create_task("t1", "B", None, None, std::slice::from_ref(&task_a.id))
+            .create_task("t1", "s1", "B", None, None, std::slice::from_ref(&task_a.id))
             .await
             .unwrap();
 
@@ -258,6 +268,7 @@ mod tests {
         board
             .update_task(
                 "t1",
+                "s1",
                 &task_a.id,
                 &TaskUpdate {
                     status: Some(TaskStatus::Completed),
@@ -267,7 +278,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tasks = board.list_tasks("t1").await.unwrap();
+        let tasks = board.list_tasks("t1", "s1").await.unwrap();
         let b = tasks.iter().find(|t| t.id == task_b.id).unwrap();
         assert!(b.blocked_by.is_empty());
     }
@@ -279,17 +290,18 @@ mod tests {
 
         let task_a = create_simple_task(&board, "t1", "A").await;
         let task_b = board
-            .create_task("t1", "B", None, None, std::slice::from_ref(&task_a.id))
+            .create_task("t1", "s1", "B", None, None, std::slice::from_ref(&task_a.id))
             .await
             .unwrap();
         let task_c = board
-            .create_task("t1", "C", None, None, std::slice::from_ref(&task_a.id))
+            .create_task("t1", "s1", "C", None, None, std::slice::from_ref(&task_a.id))
             .await
             .unwrap();
 
         board
             .update_task(
                 "t1",
+                "s1",
                 &task_a.id,
                 &TaskUpdate {
                     status: Some(TaskStatus::Completed),
@@ -299,7 +311,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tasks = board.list_tasks("t1").await.unwrap();
+        let tasks = board.list_tasks("t1", "s1").await.unwrap();
         let b = tasks.iter().find(|t| t.id == task_b.id).unwrap();
         let c = tasks.iter().find(|t| t.id == task_c.id).unwrap();
         assert!(b.blocked_by.is_empty());
@@ -314,7 +326,7 @@ mod tests {
         let task_a = create_simple_task(&board, "t1", "A").await;
         let task_x = create_simple_task(&board, "t1", "X").await;
         let task_b = board
-            .create_task("t1", "B", None, None, &[task_a.id.clone(), task_x.id.clone()])
+            .create_task("t1", "s1", "B", None, None, &[task_a.id.clone(), task_x.id.clone()])
             .await
             .unwrap();
 
@@ -323,6 +335,7 @@ mod tests {
         board
             .update_task(
                 "t1",
+                "s1",
                 &task_a.id,
                 &TaskUpdate {
                     status: Some(TaskStatus::Completed),
@@ -332,7 +345,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tasks = board.list_tasks("t1").await.unwrap();
+        let tasks = board.list_tasks("t1", "s1").await.unwrap();
         let b = tasks.iter().find(|t| t.id == task_b.id).unwrap();
         assert_eq!(b.blocked_by, vec![task_x.id]);
     }
@@ -346,6 +359,7 @@ mod tests {
         let updated = board
             .update_task(
                 "t1",
+                "s1",
                 &task.id,
                 &TaskUpdate {
                     status: Some(TaskStatus::Completed),
@@ -362,7 +376,7 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let board = TaskBoard::new(repo);
 
-        let tasks = board.list_tasks("t1").await.unwrap();
+        let tasks = board.list_tasks("t1", "s1").await.unwrap();
         assert!(tasks.is_empty());
     }
 
@@ -375,7 +389,7 @@ mod tests {
         create_simple_task(&board, "t1", "B").await;
         create_simple_task(&board, "t2", "C").await;
 
-        let tasks = board.list_tasks("t1").await.unwrap();
+        let tasks = board.list_tasks("t1", "s1").await.unwrap();
         assert_eq!(tasks.len(), 2);
     }
 }

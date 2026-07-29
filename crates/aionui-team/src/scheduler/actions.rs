@@ -51,7 +51,7 @@ impl TeammateManager {
         blocked_by: &[String],
     ) -> Result<crate::types::TeamTask, TeamError> {
         self.task_board
-            .create_task(&self.team_id, subject, description, owner, blocked_by)
+            .create_task(&self.team_id, &self.session_id, subject, description, owner, blocked_by)
             .await
     }
 
@@ -73,7 +73,9 @@ impl TeammateManager {
             blocked_by,
             ..Default::default()
         };
-        self.task_board.update_task(&self.team_id, task_id, &update).await
+        self.task_board
+            .update_task(&self.team_id, &self.session_id, task_id, &update)
+            .await
     }
 
     pub async fn execute_action(
@@ -168,6 +170,7 @@ impl TeammateManager {
                 self.mailbox
                     .write_with_files(
                         &self.team_id,
+                        &self.session_id,
                         target,
                         from_slot_id,
                         MailboxMessageType::Message,
@@ -181,6 +184,7 @@ impl TeammateManager {
             self.mailbox
                 .write_with_files(
                     &self.team_id,
+                    &self.session_id,
                     to,
                     from_slot_id,
                     MailboxMessageType::Message,
@@ -232,6 +236,7 @@ impl TeammateManager {
         self.mailbox
             .write(
                 &self.team_id,
+                &self.session_id,
                 target_slot_id,
                 from_slot_id,
                 MailboxMessageType::ShutdownRequest,

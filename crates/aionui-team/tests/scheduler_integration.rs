@@ -71,6 +71,7 @@ fn setup_team(agents: &[TeamAgent]) -> TestHarness {
     let broadcaster = Arc::new(RecordingBroadcaster::new());
     let mgr = TeammateManager::new(
         "team-1".into(),
+        "sess-1".into(),
         agents,
         mailbox.clone(),
         task_board.clone(),
@@ -99,12 +100,20 @@ async fn aw1_wake_idle_agent_transitions_to_working_with_payload() {
     let h = setup_team(&agents);
 
     h.task_board
-        .create_task("team-1", "Task A", None, Some("w1"), &[])
+        .create_task("team-1", "sess-1", "Task A", None, Some("w1"), &[])
         .await
         .unwrap();
 
     h.mailbox
-        .write("team-1", "w1", "lead", MailboxMessageType::Message, "Do it", None)
+        .write(
+            "team-1",
+            "sess-1",
+            "w1",
+            "lead",
+            MailboxMessageType::Message,
+            "Do it",
+            None,
+        )
         .await
         .unwrap();
 
@@ -151,11 +160,11 @@ async fn aw2_wake_complete_finalize_executes_actions() {
 
     h.mgr.finalize_turn("w1", &actions).await.unwrap();
 
-    let tasks = h.task_board.list_tasks("team-1").await.unwrap();
+    let tasks = h.task_board.list_tasks("team-1", "sess-1").await.unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].subject, "Write tests");
 
-    let w2_msgs = h.mailbox.read_unread("team-1", "w2").await.unwrap();
+    let w2_msgs = h.mailbox.read_unread("team-1", "sess-1", "w2").await.unwrap();
     assert_eq!(w2_msgs.len(), 1);
     assert_eq!(w2_msgs[0].content, "Please review when done");
 
@@ -267,7 +276,7 @@ async fn ae1_send_message_action_writes_mailbox() {
         .await
         .unwrap();
 
-    let msgs = h.mailbox.read_unread("team-1", "w1").await.unwrap();
+    let msgs = h.mailbox.read_unread("team-1", "sess-1", "w1").await.unwrap();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].content, "Hello worker");
     assert_eq!(msgs[0].from_agent_id, "lead");
@@ -293,7 +302,7 @@ async fn ae2_task_create_action() {
         .await
         .unwrap();
 
-    let tasks = h.task_board.list_tasks("team-1").await.unwrap();
+    let tasks = h.task_board.list_tasks("team-1", "sess-1").await.unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].subject, "Build feature");
 }
@@ -323,7 +332,7 @@ async fn ae3_idle_notification_marks_idle_and_notifies_lead() {
 
     assert_eq!(h.mgr.get_status("w1").await.unwrap(), TeammateStatus::Idle);
 
-    let lead_msgs = h.mailbox.read_unread("team-1", "lead").await.unwrap();
+    let lead_msgs = h.mailbox.read_unread("team-1", "sess-1", "lead").await.unwrap();
     assert_eq!(lead_msgs.len(), 1);
     assert_eq!(lead_msgs[0].msg_type, MailboxMessageType::IdleNotification);
 
@@ -434,7 +443,15 @@ async fn full_workflow_lead_delegate_workers_idle_lead_rewake() {
 
     // 1. Wake lead with user message
     h.mailbox
-        .write("team-1", "lead", "user", MailboxMessageType::Message, "Build X", None)
+        .write(
+            "team-1",
+            "sess-1",
+            "lead",
+            "user",
+            MailboxMessageType::Message,
+            "Build X",
+            None,
+        )
         .await
         .unwrap();
 
@@ -486,7 +503,7 @@ async fn full_workflow_lead_delegate_workers_idle_lead_rewake() {
     assert_eq!(wake.as_deref(), Some("lead"), "all teammates idle → wake leader");
 
     // 6. Verify lead has idle notifications from both workers
-    let lead_msgs = h.mailbox.read_unread("team-1", "lead").await.unwrap();
+    let lead_msgs = h.mailbox.read_unread("team-1", "sess-1", "lead").await.unwrap();
     assert_eq!(lead_msgs.len(), 2);
 
     let summaries: Vec<_> = lead_msgs.iter().map(|m| m.content.as_str()).collect();
@@ -517,7 +534,7 @@ async fn shutdown_flow_lead_sends_request_to_target() {
         .await
         .unwrap();
 
-    let msgs = h.mailbox.read_unread("team-1", "w1").await.unwrap();
+    let msgs = h.mailbox.read_unread("team-1", "sess-1", "w1").await.unwrap();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].msg_type, MailboxMessageType::ShutdownRequest);
     assert_eq!(msgs[0].content, "No longer needed");
@@ -570,9 +587,9 @@ async fn broadcast_message_sends_to_all_except_sender() {
         .await
         .unwrap();
 
-    let w1_msgs = h.mailbox.read_unread("team-1", "w1").await.unwrap();
-    let w2_msgs = h.mailbox.read_unread("team-1", "w2").await.unwrap();
-    let lead_msgs = h.mailbox.read_unread("team-1", "lead").await.unwrap();
+    let w1_msgs = h.mailbox.read_unread("team-1", "sess-1", "w1").await.unwrap();
+    let w2_msgs = h.mailbox.read_unread("team-1", "sess-1", "w2").await.unwrap();
+    let lead_msgs = h.mailbox.read_unread("team-1", "sess-1", "lead").await.unwrap();
 
     assert_eq!(w1_msgs.len(), 1);
     assert_eq!(w2_msgs.len(), 1);

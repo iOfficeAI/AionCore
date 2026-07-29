@@ -25,7 +25,7 @@ async fn setup() -> (Mailbox, aionui_db::Database) {
 async fn mw1_write_text_message() {
     let (mailbox, _db) = setup().await;
     let msg = mailbox
-        .write("t1", "a1", "user", MailboxMessageType::Message, "hello", None)
+        .write("t1", "s1", "a1", "user", MailboxMessageType::Message, "hello", None)
         .await
         .unwrap();
     assert_eq!(msg.msg_type, MailboxMessageType::Message);
@@ -41,18 +41,19 @@ async fn mw1b_write_text_message_preserves_files_in_mailbox() {
     let msg = mailbox
         .write_with_files(
             "t1",
+            "s1",
             "a1",
             "user",
             MailboxMessageType::Message,
             "hello",
             None,
-            Some(&files),
+            Some(files.as_slice()),
         )
         .await
         .unwrap();
 
     assert_eq!(msg.files.as_deref(), Some(files.as_slice()));
-    let unread = mailbox.peek_unread("t1", "a1").await.unwrap();
+    let unread = mailbox.peek_unread("t1", "s1", "a1").await.unwrap();
     assert_eq!(unread.len(), 1);
     assert_eq!(unread[0].files.as_deref(), Some(files.as_slice()));
 }
@@ -63,6 +64,7 @@ async fn mw2_write_idle_notification_with_summary() {
     let msg = mailbox
         .write(
             "t1",
+            "s1",
             "lead",
             "a1",
             MailboxMessageType::IdleNotification,
@@ -81,6 +83,7 @@ async fn mw3_write_shutdown_request() {
     let msg = mailbox
         .write(
             "t1",
+            "s1",
             "a1",
             "lead",
             MailboxMessageType::ShutdownRequest,
@@ -101,6 +104,7 @@ async fn mr1_read_unread_returns_all_and_marks() {
         mailbox
             .write(
                 "t1",
+                "s1",
                 "a1",
                 "user",
                 MailboxMessageType::Message,
@@ -110,7 +114,7 @@ async fn mr1_read_unread_returns_all_and_marks() {
             .await
             .unwrap();
     }
-    let unread = mailbox.read_unread("t1", "a1").await.unwrap();
+    let unread = mailbox.read_unread("t1", "s1", "a1").await.unwrap();
     assert_eq!(unread.len(), 3);
 }
 
@@ -118,18 +122,18 @@ async fn mr1_read_unread_returns_all_and_marks() {
 async fn mr2_second_read_returns_empty() {
     let (mailbox, _db) = setup().await;
     mailbox
-        .write("t1", "a1", "user", MailboxMessageType::Message, "x", None)
+        .write("t1", "s1", "a1", "user", MailboxMessageType::Message, "x", None)
         .await
         .unwrap();
-    mailbox.read_unread("t1", "a1").await.unwrap();
-    let second = mailbox.read_unread("t1", "a1").await.unwrap();
+    mailbox.read_unread("t1", "s1", "a1").await.unwrap();
+    let second = mailbox.read_unread("t1", "s1", "a1").await.unwrap();
     assert!(second.is_empty());
 }
 
 #[tokio::test]
 async fn mr4_no_unread_messages() {
     let (mailbox, _db) = setup().await;
-    let unread = mailbox.read_unread("t1", "a1").await.unwrap();
+    let unread = mailbox.read_unread("t1", "s1", "a1").await.unwrap();
     assert!(unread.is_empty());
 }
 
@@ -140,12 +144,12 @@ async fn mh1_get_history_no_limit() {
     let (mailbox, _db) = setup().await;
     for i in 0..5 {
         mailbox
-            .write("t1", "a1", "user", MailboxMessageType::Message, &format!("m{i}"), None)
+            .write("t1", "s1", "a1", "user", MailboxMessageType::Message, &format!("m{i}"), None)
             .await
             .unwrap();
     }
-    mailbox.read_unread("t1", "a1").await.unwrap();
-    let history = mailbox.get_history("t1", "a1", None).await.unwrap();
+    mailbox.read_unread("t1", "s1", "a1").await.unwrap();
+    let history = mailbox.get_history("t1", "s1", "a1", None).await.unwrap();
     assert_eq!(history.len(), 5);
 }
 
@@ -154,18 +158,18 @@ async fn mh2_get_history_with_limit() {
     let (mailbox, _db) = setup().await;
     for i in 0..10 {
         mailbox
-            .write("t1", "a1", "user", MailboxMessageType::Message, &format!("m{i}"), None)
+            .write("t1", "s1", "a1", "user", MailboxMessageType::Message, &format!("m{i}"), None)
             .await
             .unwrap();
     }
-    let history = mailbox.get_history("t1", "a1", Some(5)).await.unwrap();
+    let history = mailbox.get_history("t1", "s1", "a1", Some(5)).await.unwrap();
     assert_eq!(history.len(), 5);
 }
 
 #[tokio::test]
 async fn mh3_empty_history() {
     let (mailbox, _db) = setup().await;
-    let history = mailbox.get_history("t1", "a1", None).await.unwrap();
+    let history = mailbox.get_history("t1", "s1", "a1", None).await.unwrap();
     assert!(history.is_empty());
 }
 
@@ -175,16 +179,16 @@ async fn mh3_empty_history() {
 async fn md1_delete_by_team_removes_all_messages() {
     let (mailbox, _db) = setup().await;
     mailbox
-        .write("t1", "a1", "user", MailboxMessageType::Message, "x", None)
+        .write("t1", "s1", "a1", "user", MailboxMessageType::Message, "x", None)
         .await
         .unwrap();
     mailbox
-        .write("t1", "a2", "user", MailboxMessageType::Message, "y", None)
+        .write("t1", "s1", "a2", "user", MailboxMessageType::Message, "y", None)
         .await
         .unwrap();
     mailbox.delete_by_team("t1").await.unwrap();
-    let h1 = mailbox.get_history("t1", "a1", None).await.unwrap();
-    let h2 = mailbox.get_history("t1", "a2", None).await.unwrap();
+    let h1 = mailbox.get_history("t1", "s1", "a1", None).await.unwrap();
+    let h2 = mailbox.get_history("t1", "s1", "a2", None).await.unwrap();
     assert!(h1.is_empty());
     assert!(h2.is_empty());
 }
@@ -193,15 +197,15 @@ async fn md1_delete_by_team_removes_all_messages() {
 async fn md2_delete_by_team_does_not_affect_other_teams() {
     let (mailbox, _db) = setup().await;
     mailbox
-        .write("t1", "a1", "user", MailboxMessageType::Message, "x", None)
+        .write("t1", "s1", "a1", "user", MailboxMessageType::Message, "x", None)
         .await
         .unwrap();
     mailbox
-        .write("t2", "a1", "user", MailboxMessageType::Message, "y", None)
+        .write("t2", "s1", "a1", "user", MailboxMessageType::Message, "y", None)
         .await
         .unwrap();
     mailbox.delete_by_team("t1").await.unwrap();
-    let h2 = mailbox.get_history("t2", "a1", None).await.unwrap();
+    let h2 = mailbox.get_history("t2", "s1", "a1", None).await.unwrap();
     assert_eq!(h2.len(), 1);
 }
 
@@ -211,17 +215,17 @@ async fn md2_delete_by_team_does_not_affect_other_teams() {
 async fn read_unread_scoped_to_target_agent() {
     let (mailbox, _db) = setup().await;
     mailbox
-        .write("t1", "a1", "user", MailboxMessageType::Message, "for-a1", None)
+        .write("t1", "s1", "a1", "user", MailboxMessageType::Message, "for-a1", None)
         .await
         .unwrap();
     mailbox
-        .write("t1", "a2", "user", MailboxMessageType::Message, "for-a2", None)
+        .write("t1", "s1", "a2", "user", MailboxMessageType::Message, "for-a2", None)
         .await
         .unwrap();
-    let a1_msgs = mailbox.read_unread("t1", "a1").await.unwrap();
+    let a1_msgs = mailbox.read_unread("t1", "s1", "a1").await.unwrap();
     assert_eq!(a1_msgs.len(), 1);
     assert_eq!(a1_msgs[0].content, "for-a1");
-    let a2_msgs = mailbox.read_unread("t1", "a2").await.unwrap();
+    let a2_msgs = mailbox.read_unread("t1", "s1", "a2").await.unwrap();
     assert_eq!(a2_msgs.len(), 1);
     assert_eq!(a2_msgs[0].content, "for-a2");
 }

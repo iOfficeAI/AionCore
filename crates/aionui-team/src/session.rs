@@ -84,6 +84,7 @@ pub struct SpawnAgentRequest {
 
 pub struct TeamSession {
     team: Team,
+    session_id: String,
     scheduler: Arc<TeammateManager>,
     mailbox: Arc<Mailbox>,
     task_board: Arc<TaskBoard>,
@@ -134,6 +135,7 @@ impl TeamSession {
     #[allow(clippy::too_many_arguments)]
     pub async fn start(
         team: Team,
+        session_id: String,
         repo: Arc<dyn ITeamRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
         backend_binary_path: Arc<PathBuf>,
@@ -146,6 +148,7 @@ impl TeamSession {
     ) -> Result<Self, TeamError> {
         Self::start_with_prompt_dump(
             team,
+            session_id,
             repo,
             broadcaster,
             backend_binary_path,
@@ -163,6 +166,7 @@ impl TeamSession {
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_prompt_dump(
         team: Team,
+        session_id: String,
         repo: Arc<dyn ITeamRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
         backend_binary_path: Arc<PathBuf>,
@@ -189,6 +193,7 @@ impl TeamSession {
 
         let scheduler = Arc::new(TeammateManager::new(
             team.id.clone(),
+            session_id.clone(),
             &team.agents,
             mailbox.clone(),
             task_board.clone(),
@@ -216,6 +221,7 @@ impl TeamSession {
 
         Ok(Self {
             team,
+            session_id,
             scheduler,
             mailbox,
             task_board,
@@ -250,6 +256,10 @@ impl TeamSession {
 
     pub fn team_id(&self) -> &str {
         &self.team.id
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     pub fn user_id(&self) -> &str {
@@ -340,7 +350,7 @@ impl TeamSession {
 
         let unread = self
             .mailbox
-            .peek_unread(&self.team.id, slot_id)
+            .peek_unread(&self.team.id, &self.session_id, slot_id)
             .await?
             .into_iter()
             .filter(|message| message.from_agent_id != slot_id)
@@ -507,7 +517,7 @@ impl TeamSession {
         // working (e.g. shutdown_request). Mirrors Claude's useMailboxBridge:
         // when isLoading becomes false, poll mailbox and submit if non-empty.
         if wake_target.as_deref() != Some(&slot_id) {
-            let has_unread = self.mailbox.has_unread(&self.team.id, &slot_id).await.unwrap_or(false);
+            let has_unread = self.mailbox.has_unread(&self.team.id, &self.session_id, &slot_id).await.unwrap_or(false);
             if has_unread {
                 return Ok(Some(slot_id));
             }
@@ -682,6 +692,7 @@ impl TeamSession {
             .mailbox
             .write_with_files(
                 &self.team.id,
+                &self.session_id,
                 slot_id,
                 "user",
                 MailboxMessageType::Message,
@@ -781,6 +792,7 @@ impl TeamSession {
             .mailbox
             .write_with_files(
                 &self.team.id,
+                &self.session_id,
                 to_slot_id,
                 from_slot_id,
                 MailboxMessageType::Message,
@@ -995,7 +1007,7 @@ impl TeamSession {
             }
             let unread = self
                 .mailbox
-                .peek_unread(&self.team.id, &agent.slot_id)
+                .peek_unread(&self.team.id, &self.session_id, &agent.slot_id)
                 .await?
                 .into_iter()
                 .filter(|message| message.from_agent_id != agent.slot_id)
@@ -1227,6 +1239,7 @@ impl TeamSession {
             self.mailbox
                 .write(
                     &self.team.id,
+                    &self.session_id,
                     &lead_slot_id,
                     slot_id,
                     MailboxMessageType::IdleNotification,
@@ -1252,6 +1265,7 @@ impl TeamSession {
         self.mailbox
             .write(
                 &self.team.id,
+                &self.session_id,
                 &lead_slot_id,
                 failed_slot_id,
                 MailboxMessageType::Message,
@@ -1275,7 +1289,7 @@ impl TeamSession {
             .ok_or_else(|| TeamError::AgentNotFound("lead".into()))?;
         let message_id = self
             .mailbox
-            .peek_unread(&self.team.id, &lead_slot_id)
+            .peek_unread(&self.team.id, &self.session_id, &lead_slot_id)
             .await?
             .into_iter()
             .rev()
@@ -1310,6 +1324,7 @@ impl TeamSession {
             .mailbox
             .write(
                 &self.team.id,
+                &self.session_id,
                 &agent.slot_id,
                 "team_system",
                 MailboxMessageType::Message,
@@ -1321,6 +1336,7 @@ impl TeamSession {
             .mailbox
             .write(
                 &self.team.id,
+                &self.session_id,
                 &lead_slot_id,
                 "team_system",
                 MailboxMessageType::Message,
@@ -1367,6 +1383,7 @@ impl TeamSession {
             .mailbox
             .write(
                 &self.team.id,
+                &self.session_id,
                 &lead_slot_id,
                 "team_system",
                 MailboxMessageType::Message,
@@ -1548,6 +1565,7 @@ impl TeamSession {
             .mailbox
             .write(
                 &self.team.id,
+                &self.session_id,
                 &new_agent.slot_id,
                 caller_slot_id,
                 MailboxMessageType::Message,
@@ -2219,6 +2237,7 @@ mod tests {
             lead_agent_id: Some("lead-1".into()),
             created_at: 1000,
             updated_at: 1000,
+            active_session_id: None,
         }
     }
 
@@ -2231,6 +2250,7 @@ mod tests {
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
         TeamSession::start_with_prompt_dump(
             make_team(),
+            "s1".to_owned(),
             repo,
             broadcaster,
             backend_path(),
@@ -2327,6 +2347,7 @@ mod tests {
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
         let session = TeamSession::start(
             make_team(),
+            "s1".to_owned(),
             repo_dyn,
             broadcaster,
             backend_path(),
@@ -2356,6 +2377,7 @@ mod tests {
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
         let session = TeamSession::start(
             make_team(),
+            "s1".to_owned(),
             repo_dyn,
             broadcaster,
             backend_path(),
@@ -2397,7 +2419,7 @@ mod tests {
             .await
             .expect("leader may shut down a teammate");
 
-        let unread = session.mailbox().peek_unread("t1", "worker-1").await.unwrap();
+        let unread = session.mailbox().peek_unread("t1", "s1", "worker-1").await.unwrap();
         assert_eq!(unread.len(), 1);
         // A run-scoped shutdown wake with no inheritable run now converges into a
         // SystemLifecycle run at the enqueue choke-point instead of enqueuing
@@ -2450,6 +2472,7 @@ mod tests {
         let stub_dyn: Arc<dyn IWorkerTaskManager> = stub.clone();
         let session = TeamSession::start(
             make_team(),
+            "s1".to_owned(),
             repo,
             broadcaster,
             backend_path(),
@@ -2483,6 +2506,7 @@ mod tests {
         let stub_dyn: Arc<dyn IWorkerTaskManager> = stub.clone();
         let session = TeamSession::start(
             make_team(),
+            "s1".to_owned(),
             repo,
             broadcaster,
             backend_path(),
@@ -2579,6 +2603,7 @@ mod tests {
             .mailbox()
             .write(
                 session.team_id(),
+                session.session_id(),
                 &lead,
                 "worker-1",
                 MailboxMessageType::Message,
@@ -2591,6 +2616,7 @@ mod tests {
             .mailbox()
             .write(
                 session.team_id(),
+                session.session_id(),
                 &lead,
                 "worker-2",
                 MailboxMessageType::Message,
@@ -2603,6 +2629,7 @@ mod tests {
             .mailbox()
             .write(
                 session.team_id(),
+                session.session_id(),
                 &worker,
                 &worker,
                 MailboxMessageType::Message,
@@ -2651,6 +2678,7 @@ mod tests {
             .mailbox()
             .write(
                 session.team_id(),
+                session.session_id(),
                 &lead,
                 "worker-1",
                 MailboxMessageType::Message,
@@ -2722,6 +2750,7 @@ mod tests {
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
         let session = TeamSession::start(
             make_team(),
+            "s1".to_owned(),
             repo_dyn,
             broadcaster,
             backend_path(),
@@ -2746,7 +2775,7 @@ mod tests {
             .await
             .unwrap();
 
-        let unread = session.mailbox.peek_unread("t1", "lead-1").await.unwrap();
+        let unread = session.mailbox.peek_unread("t1", "s1", "lead-1").await.unwrap();
         assert_eq!(unread.len(), 1);
         assert_eq!(
             unread[0].files.as_deref(),
@@ -2775,6 +2804,7 @@ mod tests {
             .mailbox
             .write(
                 "t1",
+                "s1",
                 "lead-1",
                 "user",
                 MailboxMessageType::Message,
@@ -2792,7 +2822,7 @@ mod tests {
 
         assert!(matches!(error, TeamError::InvalidRequest(_)));
         assert!(session.team_run_manager.current_active_run_id().is_none());
-        assert!(session.mailbox.peek_unread("t1", "lead-1").await.unwrap().is_empty());
+        assert!(session.mailbox.peek_unread("t1", "s1", "lead-1").await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2824,6 +2854,7 @@ mod tests {
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
         let session = TeamSession::start(
             make_team(),
+            "s1".to_owned(),
             repo,
             broadcaster,
             backend_path(),
@@ -2874,6 +2905,7 @@ mod tests {
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
         let session = TeamSession::start(
             make_team(),
+            "s1".to_owned(),
             repo_dyn,
             broadcaster,
             backend_path(),
@@ -2901,7 +2933,7 @@ mod tests {
         assert!(
             session
                 .mailbox
-                .peek_unread("t1", "lead-1")
+                .peek_unread("t1", "s1", "lead-1")
                 .await
                 .unwrap()
                 .iter()
@@ -3063,7 +3095,7 @@ mod tests {
             .await
             .unwrap();
 
-        let unread = session.mailbox.peek_unread("t1", "worker-1").await.unwrap();
+        let unread = session.mailbox.peek_unread("t1", "s1", "worker-1").await.unwrap();
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].files.as_deref(), Some(&["/tmp/x.md".into()][..]));
         assert_eq!(unread[0].content, "do X");
@@ -3076,7 +3108,7 @@ mod tests {
 
         session.send_message("", None).await.unwrap();
 
-        let unread = session.mailbox.peek_unread("t1", "lead-1").await.unwrap();
+        let unread = session.mailbox.peek_unread("t1", "s1", "lead-1").await.unwrap();
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].content, "");
         session.stop();
@@ -3089,6 +3121,7 @@ mod tests {
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
         TeamSession::start(
             team,
+            "s1".to_owned(),
             repo,
             broadcaster,
             backend_path(),
@@ -3111,6 +3144,7 @@ mod tests {
         let broadcaster: Arc<dyn EventBroadcaster> = recorder.clone();
         let session = TeamSession::start(
             team,
+            "s1".to_owned(),
             repo,
             broadcaster,
             backend_path(),

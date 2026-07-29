@@ -115,6 +115,7 @@ pub(crate) struct AgentSlot {
 
 pub struct TeammateManager {
     pub(crate) team_id: String,
+    pub(crate) session_id: String,
     pub(crate) slots: Mutex<HashMap<String, AgentSlot>>,
     pub(crate) mailbox: Arc<Mailbox>,
     pub(crate) task_board: Arc<TaskBoard>,
@@ -130,6 +131,7 @@ pub struct TeammateManager {
 impl TeammateManager {
     pub fn new(
         team_id: String,
+        session_id: String,
         agents: &[TeamAgent],
         mailbox: Arc<Mailbox>,
         task_board: Arc<TaskBoard>,
@@ -151,6 +153,7 @@ impl TeammateManager {
         let events = TeamEventEmitter::new(team_id.clone(), broadcaster);
         Self {
             team_id,
+            session_id,
             slots: Mutex::new(slots),
             mailbox,
             task_board,
@@ -175,7 +178,7 @@ impl TeammateManager {
     }
 
     pub async fn list_tasks(&self) -> Result<Vec<TeamTask>, TeamError> {
-        self.task_board.list_tasks(&self.team_id).await
+        self.task_board.list_tasks(&self.team_id, &self.session_id).await
     }
 
     pub async fn find_lead_slot_id(&self) -> Option<String> {

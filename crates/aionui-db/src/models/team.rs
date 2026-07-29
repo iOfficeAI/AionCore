@@ -22,6 +22,42 @@ pub struct TeamRow {
     pub project_id: Option<String>,
     /// Workspace folder binding; NULL until bound/backfilled.
     pub folder_id: Option<String>,
+    /// Currently active working session id. NULL only on legacy rows written
+    /// before migration 030; the service layer resolves it to the team's
+    /// primary session. Migration 030 backfills it for every existing team.
+    pub active_session_id: Option<String>,
+}
+
+/// Row mapping for the `team_sessions` table (migration 030).
+///
+/// A working session owned by a team. Each session has its own per-slot
+/// conversations (`team_session_agents`), mailbox messages, and task board.
+/// `is_primary = true` marks the one session auto-created with the team;
+/// it is undeletable and is the fallback target for session_id-less callers.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TeamSessionRow {
+    pub id: String,
+    pub team_id: String,
+    pub name: String,
+    /// SQLite stores booleans as INTEGER 0/1; sqlx maps this transparently.
+    pub is_primary: bool,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+/// Row mapping for the `team_session_agents` table (migration 030).
+///
+/// The concrete `conversation_id` minted for a `(session, slot)` pair. The
+/// team roster (`teams.agents` JSON) is the configuration template; this
+/// table holds the session-specific bindings.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TeamSessionAgentRow {
+    pub id: i64,
+    pub session_id: String,
+    pub team_id: String,
+    pub slot_id: String,
+    pub conversation_id: String,
+    pub created_at: TimestampMs,
 }
 
 /// Row mapping for the `mailbox` table.
@@ -43,6 +79,9 @@ pub struct MailboxMessageRow {
     pub files: Option<String>,
     pub read: bool,
     pub created_at: TimestampMs,
+    /// Owning team working session (migration 030). NULL only on legacy rows
+    /// not yet backfilled; new writes always carry it.
+    pub session_id: Option<String>,
 }
 
 /// Row mapping for the `team_tasks` table.
@@ -66,6 +105,9 @@ pub struct TeamTaskRow {
     pub metadata: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    /// Owning team working session (migration 030). NULL only on legacy rows
+    /// not yet backfilled; new writes always carry it.
+    pub session_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -88,6 +130,7 @@ mod tests {
             updated_at: 0,
             project_id: None,
             folder_id: None,
+            active_session_id: None,
         };
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&row.agents).expect("agents should be valid JSON");
         assert!(parsed.is_empty());
@@ -106,6 +149,7 @@ mod tests {
             files: None,
             read: false,
             created_at: 0,
+            session_id: None,
         };
         assert_eq!(row.msg_type, "message");
     }
@@ -145,6 +189,7 @@ mod tests {
             metadata: Some(r#"{"priority":"high"}"#.into()),
             created_at: 1000,
             updated_at: 2000,
+            session_id: None,
         };
         let json = serde_json::to_string(&row).expect("serialize");
         let restored: TeamTaskRow = serde_json::from_str(&json).expect("deserialize");

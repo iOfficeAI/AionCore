@@ -522,7 +522,7 @@ async fn we1_agent_status_change_event() {
         make_agent("lead-1", "Lead", TeammateRole::Lead),
         make_agent("w1", "Worker", TeammateRole::Teammate),
     ];
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new("t1".into(), "s1".into(), &agents, mailbox, task_board, bc.clone());
 
     mgr.set_status("w1", TeammateStatus::Working).await.unwrap();
 
@@ -545,7 +545,7 @@ async fn we2_agent_spawned_event() {
     let task_board = Arc::new(TaskBoard::new(repo));
     let bc = Arc::new(RecordingBroadcaster::new());
     let agents = vec![make_agent("lead-1", "Lead", TeammateRole::Lead)];
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new("t1".into(), "s1".into(), &agents, mailbox, task_board, bc.clone());
 
     let new_agent = make_agent("w2", "NewWorker", TeammateRole::Teammate);
     mgr.add_agent(&new_agent).await;
@@ -575,7 +575,7 @@ async fn we3_agent_removed_event() {
         make_agent("lead-1", "Lead", TeammateRole::Lead),
         make_agent("w1", "Worker", TeammateRole::Teammate),
     ];
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new("t1".into(), "s1".into(), &agents, mailbox, task_board, bc.clone());
 
     mgr.remove_agent("w1").await.unwrap();
 
@@ -603,7 +603,7 @@ async fn we4_agent_renamed_event() {
         make_agent("lead-1", "Lead", TeammateRole::Lead),
         make_agent("w1", "Worker", TeammateRole::Teammate),
     ];
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new("t1".into(), "s1".into(), &agents, mailbox, task_board, bc.clone());
 
     mgr.rename_agent("w1", "SuperWorker").await.unwrap();
 
