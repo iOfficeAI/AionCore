@@ -21,7 +21,7 @@ use aionui_db::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
     SqliteConversationRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    SqliteRemoteAgentRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -33,6 +33,7 @@ use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
 };
+use aionui_memory::MemoryRouterState;
 use aionui_office::{
     ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
 };
@@ -139,6 +140,7 @@ pub struct ModuleStates {
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
+    pub memory: MemoryRouterState,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -256,13 +258,15 @@ pub async fn build_module_states(
 
     let pool = services.database.pool().clone();
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
+    let settings_service = services.settings_service.clone();
     let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
         services.event_bus.clone(),
-        provider_repo,
+        provider_repo.clone(),
         encryption_key,
         services.data_dir.clone(),
+        settings_service.clone(),
     );
     services
         .conversation_service
@@ -274,7 +278,9 @@ pub async fn build_module_states(
         "startup: module states bundle started"
     );
     let states = ModuleStates {
-        system: build_module_state_phase(&boot, "system", || build_system_state(services)),
+        system: build_module_state_phase(&boot, "system", || {
+            build_system_state(services, provider_repo, settings_service)
+        }),
         conversation: build_module_state_phase(&boot, "conversation", || {
             build_conversation_state(
                 services,
@@ -306,6 +312,9 @@ pub async fn build_module_states(
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
+        memory: MemoryRouterState {
+            service: services.memory_service.clone(),
+        },
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -374,14 +383,17 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
 }
 
 /// Build the default `SystemRouterState` from application services.
-pub fn build_system_state(services: &AppServices) -> SystemRouterState {
+pub fn build_system_state(
+    services: &AppServices,
+    provider_repo: Arc<dyn IProviderRepository>,
+    settings_service: SettingsService,
+) -> SystemRouterState {
     let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
     let pool = services.database.pool().clone();
-    let provider_repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let http_client = reqwest::Client::new();
 
     SystemRouterState {
-        settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),
+        settings_service,
         client_pref_service: ClientPrefService::with_keep_awake_controller(
             Arc::new(SqliteClientPreferenceRepository::new(pool.clone())),
             Arc::new(aionui_system::SystemKeepAwakeController::new()),

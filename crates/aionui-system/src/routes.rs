@@ -7,11 +7,11 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 
 use aionui_api_types::{
-    ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest, EnsureNodeRuntimeRequest,
-    EnsureNodeRuntimeResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse, FetchModelsAnonymousRequest,
-    FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse, SystemInfoResponse,
-    SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
-    UpdateProviderRequest, UpdateSettingsRequest,
+    ApiResponse, AppOperationsModelResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest,
+    EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse,
+    FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse,
+    SystemInfoResponse, SystemSettingsResponse, UpdateAppOperationsModelRequest, UpdateCheckRequest, UpdateCheckResult,
+    UpdateClientPreferencesRequest, UpdateProviderRequest, UpdateSettingsRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -62,6 +62,8 @@ impl From<SystemError> for ApiError {
 /// - `PATCH /api/settings`                   — partial update backend settings
 /// - `GET  /api/settings/client`             — get client preferences
 /// - `PUT  /api/settings/client`             — batch update client preferences
+/// - `GET  /api/app-operations/model`        — get app operations model setting
+/// - `PUT  /api/app-operations/model`        — update app operations model setting
 /// - `GET  /api/providers`                   — list all providers
 /// - `POST /api/providers`                   — create a provider
 /// - `PUT  /api/providers/:id`               — update a provider
@@ -79,6 +81,10 @@ pub fn system_routes(state: SystemRouterState) -> Router {
         .route(
             "/api/settings/client",
             get(get_client_preferences).put(update_client_preferences),
+        )
+        .route(
+            "/api/app-operations/model",
+            get(get_app_operations_model).put(update_app_operations_model),
         )
         .route("/api/providers", get(list_providers).post(create_provider))
         // Literal-segment routes must register BEFORE the `/{id}` routes so
@@ -135,6 +141,32 @@ async fn update_settings(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(settings)))
+}
+
+async fn get_app_operations_model(
+    State(state): State<SystemRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<AppOperationsModelResponse>>, ApiError> {
+    let model = state
+        .settings_service
+        .get_app_operations_model()
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(model)))
+}
+
+async fn update_app_operations_model(
+    State(state): State<SystemRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    body: Result<Json<UpdateAppOperationsModelRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<AppOperationsModelResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let model = state
+        .settings_service
+        .update_app_operations_model(request)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(model)))
 }
 
 // ===========================================================================

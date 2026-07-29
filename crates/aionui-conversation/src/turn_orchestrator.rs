@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::agent_health_policy::{AgentHealthAction, AgentHealthPolicy};
+use crate::memory_port::{RecallMemoryInput, assemble_agent_prompt};
 use crate::runtime_state::RuntimeLifecycleState;
 use crate::runtime_state::TurnClaim;
 use crate::service::{
@@ -36,6 +37,8 @@ pub(crate) struct TurnStartInput {
     pub stored_workspace: String,
     pub turn_id: String,
     pub turn_claim: TurnClaim,
+    pub memory_eligible: bool,
+    pub persisted_turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +69,7 @@ struct TurnAttemptInput {
     required_runtime_mode: Option<String>,
     continuation_count: usize,
     defer_clean_terminal_errors: bool,
+    persisted_turn_id: Option<String>,
 }
 
 struct TurnAttemptResult {
@@ -137,9 +141,10 @@ impl ConversationTurnOrchestrator {
                 )
                 .await;
                 self.service
-                    .persist_and_broadcast_send_failure_tip(
+                    .persist_and_broadcast_send_failure_tip_with_turn_id(
                         &input.conv_id,
                         &input.turn_id,
+                        input.persisted_turn_id.as_deref(),
                         &send_error,
                         Some(top_level_code),
                     )
@@ -167,9 +172,10 @@ impl ConversationTurnOrchestrator {
                 "Failed to persist resolved workspace"
             );
             self.service
-                .persist_and_broadcast_send_failure_tip(
+                .persist_and_broadcast_send_failure_tip_with_turn_id(
                     &input.conv_id,
                     &input.turn_id,
+                    input.persisted_turn_id.as_deref(),
                     &send_error,
                     Some(top_level_code),
                 )
@@ -210,6 +216,7 @@ impl ConversationTurnOrchestrator {
                 self.service.conversation_repo().clone(),
                 self.service.broadcaster().clone(),
             )
+            .with_persisted_turn_id(input.persisted_turn_id.clone())
             .with_skill_resolver(self.service.skill_resolver())
             .with_allowed_skill_names(input.allowed_skill_names.clone())
             .with_runtime_state(Arc::clone(&runtime_state))
@@ -268,9 +275,10 @@ impl ConversationTurnOrchestrator {
                             "Failed to apply required runtime mode before agent turn"
                         );
                         self.service
-                            .persist_and_broadcast_send_failure_tip(
+                            .persist_and_broadcast_send_failure_tip_with_turn_id(
                                 &input.conv_id,
                                 &input.turn_id,
+                                input.persisted_turn_id.as_deref(),
                                 &send_error,
                                 Some(top_level_code),
                             )
@@ -379,8 +387,31 @@ impl ConversationTurnOrchestrator {
         let runtime_state = self.service.runtime_state();
         let allowed_skill_names = input.build_options.context.skills.clone();
         let first_turn_msg_id = ConversationService::mint_msg_id();
+        let original_prompt = input.request.content;
+        let memory_block = if input.memory_eligible {
+            match input.request.memory_retrieval_id.as_deref() {
+                Some(retrieval_id) => self
+                    .service
+                    .memory_port()
+                    .build_recall_block(RecallMemoryInput {
+                        user_id: input.user_id.clone(),
+                        conversation_id: conv_id.clone(),
+                        prompt: original_prompt.clone(),
+                        retrieval_id: retrieval_id.to_owned(),
+                        excluded_memory_ids: input.request.excluded_memory_ids.clone(),
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        warn!(conversation_id = %conv_id, turn_id = %turn_id, error = %error, "Memory recall unavailable; continuing without Memory");
+                        None
+                    }),
+                None => None,
+            }
+        } else {
+            None
+        };
         let initial_send = SendMessageData {
-            content: input.request.content,
+            content: assemble_agent_prompt(&original_prompt, memory_block.as_deref()),
             msg_id: first_turn_msg_id.clone(),
             turn_id: Some(turn_id.clone()),
             files: input.request.files,
@@ -390,6 +421,7 @@ impl ConversationTurnOrchestrator {
         let mut replay_started_at = None;
         let mut final_error_message;
         let mut auth_failure = false;
+        let mut persisted_assistant_output = false;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
@@ -408,6 +440,7 @@ impl ConversationTurnOrchestrator {
                     required_runtime_mode: input.required_runtime_mode.clone(),
                     continuation_count: 0,
                     defer_clean_terminal_errors: !replayed,
+                    persisted_turn_id: input.persisted_turn_id.clone(),
                 })
                 .await
             {
@@ -421,6 +454,7 @@ impl ConversationTurnOrchestrator {
             // Track the final attempt's auth signal so the post-loop availability
             // write-back can reflect "needs sign-in" (last iteration wins).
             auth_failure = terminal_is_auth_failure(&attempt_result.outcome);
+            persisted_assistant_output |= attempt_result.summary.persisted_assistant_output;
 
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
             if !attempt_result.outcome.terminal.is_error() {
@@ -500,7 +534,13 @@ impl ConversationTurnOrchestrator {
                     {
                         let send_error = AgentSendError::from_stream_error_data(data);
                         self.service
-                            .persist_and_broadcast_send_failure_tip(&conv_id, &turn_id, &send_error, None)
+                            .persist_and_broadcast_send_failure_tip_with_turn_id(
+                                &conv_id,
+                                &turn_id,
+                                input.persisted_turn_id.as_deref(),
+                                &send_error,
+                                None,
+                            )
                             .await;
                     }
 
@@ -539,20 +579,29 @@ impl ConversationTurnOrchestrator {
             record_agent_session_success(&self.service, availability_agent_id(&input.build_options).as_deref()).await;
         }
 
-        let was_deleting = turn_claim.release_for_turn(&turn_id);
+        let status = if final_failed {
+            ConversationTurnStatus::Failed
+        } else {
+            ConversationTurnStatus::Completed
+        };
+        let memory_eligible = memory_capture_eligible(input.memory_eligible, status, persisted_assistant_output);
         self.service
-            .complete_released_turn(&conv_id, &turn_id, was_deleting)
+            .finish_claimed_turn(&conv_id, &turn_id, &mut turn_claim, status, memory_eligible)
             .await;
 
         ConversationTurnResult {
-            status: if final_failed {
-                ConversationTurnStatus::Failed
-            } else {
-                ConversationTurnStatus::Completed
-            },
+            status,
             error_message: if final_failed { final_error_message } else { None },
         }
     }
+}
+
+fn memory_capture_eligible(requested: bool, status: ConversationTurnStatus, persisted_assistant_output: bool) -> bool {
+    requested
+        && match status {
+            ConversationTurnStatus::Completed => persisted_assistant_output,
+            ConversationTurnStatus::Failed => true,
+        }
 }
 
 fn availability_agent_id(options: &BuildTaskOptions) -> Option<String> {
@@ -875,5 +924,12 @@ mod tests {
         assert!(!terminal_is_auth_failure(&error_outcome(
             AgentErrorCode::UserLlmProviderBillingRequired
         )));
+    }
+
+    #[test]
+    fn memory_capture_eligibility_classifies_turn_status() {
+        assert!(memory_capture_eligible(true, ConversationTurnStatus::Completed, true,));
+        assert!(!memory_capture_eligible(true, ConversationTurnStatus::Completed, false,));
+        assert!(memory_capture_eligible(true, ConversationTurnStatus::Failed, false,));
     }
 }

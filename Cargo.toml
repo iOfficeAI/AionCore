@@ -24,6 +24,7 @@ members = [
     "crates/aionui-project",
     "crates/aionui-cron",
     "crates/aionui-assistant",
+    "crates/aionui-memory",
     "crates/aionui-app",
 ]
 
@@ -57,6 +58,7 @@ aionui-team = { path = "crates/aionui-team" }
 aionui-project = { path = "crates/aionui-project" }
 aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
+aionui-memory = { path = "crates/aionui-memory" }
 aionui-app = { path = "crates/aionui-app" }
 
 aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.8" }
@@ -77,6 +79,7 @@ http = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+unicode-normalization = "0.1"
 
 # Async utilities
 futures-util = "0.3"

@@ -123,7 +123,13 @@ impl StreamRelay {
         repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
     ) -> Self {
-        let adapter = StreamPersistenceAdapter::new(conversation_id.clone(), msg_id.clone(), repo, None);
+        let adapter = StreamPersistenceAdapter::new(
+            conversation_id.clone(),
+            Some(turn_id.clone()),
+            msg_id.clone(),
+            repo,
+            None,
+        );
         Self {
             conversation_id,
             msg_id,
@@ -142,6 +148,11 @@ impl StreamRelay {
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = Some(runtime_state);
+        self
+    }
+
+    pub fn with_persisted_turn_id(mut self, turn_id: Option<String>) -> Self {
+        self.adapter = self.adapter.with_turn_id(turn_id);
         self
     }
 
@@ -459,10 +470,8 @@ impl StreamRelay {
                             } else {
                                 self.finalize(&full_text_buffer, &text_segments, &event, terminal).await
                             };
+                            attempt.persisted_assistant_output |= outcome.attempt.persisted_assistant_output;
                             outcome.attempt = attempt.clone();
-                            if !full_text_buffer.is_empty() {
-                                outcome.attempt.persisted_assistant_output = true;
-                            }
                             if self.complete_turn && !deleting {
                                 self.adapter
                                     .complete_conversation(&self.broadcaster, &self.turn_id, None)
@@ -567,10 +576,8 @@ impl StreamRelay {
                         )
                         .await
                     };
+                    attempt.persisted_assistant_output |= outcome.attempt.persisted_assistant_output;
                     outcome.attempt = attempt.clone();
-                    if !full_text_buffer.is_empty() {
-                        outcome.attempt.persisted_assistant_output = true;
-                    }
                     if self.complete_turn && !deleting {
                         self.adapter
                             .complete_conversation(&self.broadcaster, &self.turn_id, None)
@@ -701,10 +708,11 @@ impl StreamRelay {
             let hidden = final_text.is_empty();
 
             let rewrite_segments = processed.message != text || hidden;
-            let overrides = self
+            let (overrides, persisted_visible_output) = self
                 .adapter
                 .persist_final_text(text_segments, status, &final_text, hidden, rewrite_segments)
                 .await;
+            outcome.attempt.persisted_assistant_output = persisted_visible_output;
             for override_event in overrides {
                 self.send_final_text_override(&override_event.msg_id, &override_event.text, override_event.hidden);
             }
@@ -2288,7 +2296,7 @@ mod tests {
         repo.set_not_found(true);
         let repo: Arc<dyn IConversationRepository> = repo;
         let bus: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
-        let adapter = StreamPersistenceAdapter::new("deleted-conv".into(), "msg-1".into(), repo, None);
+        let adapter = StreamPersistenceAdapter::new("deleted-conv".into(), None, "msg-1".into(), repo, None);
 
         adapter.complete_conversation(&bus, "turn-1", None).await;
     }

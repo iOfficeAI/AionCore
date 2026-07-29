@@ -29,6 +29,7 @@ use aionui_cron::cron_routes;
 use aionui_extension::{extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
 use aionui_mcp::mcp_routes;
+use aionui_memory::routes::memory_routes;
 use aionui_office::{office_proxy_routes, office_routes};
 use aionui_realtime::{WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
@@ -227,6 +228,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // handlers return 500 "not implemented"; T1b wires real service)
     let assistant_authenticated =
         assistant_routes(states.assistant).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let memory_authenticated =
+        memory_routes(states.memory).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Office proxy routes — exempt from auth (serve iframe content)
     let office_proxy = office_proxy_routes(states.office);
@@ -261,6 +264,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(office_authenticated)
         .merge(shell_authenticated)
         .merge(assistant_authenticated);
+    let router = router.merge(memory_authenticated);
 
     // Conditionally merge WeChat login SSE route (feature-gated)
     #[cfg(feature = "weixin")]

@@ -12,6 +12,16 @@ use crate::repository::conversation::{
     MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
 };
 
+const MAX_EXACT_TURN_MESSAGES: i64 = 128;
+const MAX_EXACT_TURN_BYTES: i64 = 64 * 1024;
+
+#[derive(sqlx::FromRow)]
+struct ConversationMemoryImportRow {
+    #[sqlx(flatten)]
+    conversation: ConversationRow,
+    import_sequence: i64,
+}
+
 /// Bump `conversations.updated_at` so the conversation-list sort
 /// (ORDER BY conversations.updated_at DESC) floats a conversation with fresh
 /// activity to the top. Persisting a message never used to touch this column,
@@ -48,12 +58,13 @@ impl SqliteConversationRepository {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO messages \
-                (id, conversation_id, msg_id, type, content, position, \
+                (id, conversation_id, turn_id, msg_id, type, content, position, \
                  status, hidden, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&message.id)
         .bind(&message.conversation_id)
+        .bind(&message.turn_id)
         .bind(&message.msg_id)
         .bind(&message.r#type)
         .bind(&message.content)
@@ -74,10 +85,11 @@ impl SqliteConversationRepository {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO messages \
-                (id, conversation_id, msg_id, type, content, position, \
+                (id, conversation_id, turn_id, msg_id, type, content, position, \
                  status, hidden, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET \
+                turn_id = COALESCE(messages.turn_id, excluded.turn_id), \
                 content = CASE \
                     WHEN messages.status IN ('finish', 'error') AND excluded.status = 'work' THEN \
                         CASE messages.type \
@@ -104,6 +116,7 @@ impl SqliteConversationRepository {
         )
         .bind(&message.id)
         .bind(&message.conversation_id)
+        .bind(&message.turn_id)
         .bind(&message.msg_id)
         .bind(&message.r#type)
         .bind(&message.content)
@@ -358,6 +371,73 @@ impl IConversationRepository for SqliteConversationRepository {
             total,
             has_more,
         })
+    }
+
+    async fn list_for_memory_import(
+        &self,
+        user_id: &str,
+        after: Option<&crate::repository::conversation::LegacyConversationCursor>,
+        boundary: &crate::repository::conversation::LegacyConversationImportBoundary,
+        limit: u32,
+    ) -> Result<crate::repository::conversation::LegacyConversationImportPage, DbError> {
+        let limit = limit.max(1);
+        let after_sequence = after.and_then(|cursor| cursor.sequence).unwrap_or(0);
+        let rows = sqlx::query_as::<_, ConversationMemoryImportRow>(
+            "SELECT conversations.*,membership.sequence AS import_sequence
+             FROM conversations
+             JOIN conversation_memory_import_sequences membership
+               ON membership.conversation_id = conversations.id
+              AND membership.user_id = conversations.user_id
+             WHERE conversations.user_id = ?
+               AND membership.sequence > ?
+               AND membership.sequence <= ?
+             ORDER BY membership.sequence ASC
+             LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(after_sequence)
+        .bind(boundary.max_sequence)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let next_after = rows
+            .last()
+            .map(|row| crate::repository::conversation::LegacyConversationCursor {
+                updated_at: row.conversation.updated_at,
+                id: row.conversation.id.clone(),
+                sequence: Some(row.import_sequence),
+            });
+        Ok(crate::repository::conversation::LegacyConversationImportPage {
+            rows: rows.into_iter().map(|row| row.conversation).collect(),
+            next_after,
+        })
+    }
+
+    async fn memory_import_upper_bound(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<crate::repository::conversation::LegacyConversationImportBoundary>, DbError> {
+        let row: Option<(i64, String, i64)> = sqlx::query_as(
+            "SELECT conversations.updated_at,conversations.id,membership.sequence
+             FROM conversations
+             JOIN conversation_memory_import_sequences membership
+               ON membership.conversation_id = conversations.id AND membership.user_id = conversations.user_id
+             WHERE conversations.user_id = ?
+             ORDER BY membership.sequence DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(updated_at, id, max_sequence)| {
+            crate::repository::conversation::LegacyConversationImportBoundary {
+                upper: crate::repository::conversation::LegacyConversationCursor {
+                    updated_at,
+                    id,
+                    sequence: Some(max_sequence),
+                },
+                max_sequence,
+            }
+        }))
     }
 
     // ── Extended queries ────────────────────────────────────────────
@@ -685,6 +765,60 @@ impl IConversationRepository for SqliteConversationRepository {
         .await?;
 
         Ok(row)
+    }
+
+    async fn list_messages_by_turn(
+        &self,
+        user_id: &str,
+        conv_id: &str,
+        turn_id: &str,
+    ) -> Result<Vec<MessageRow>, DbError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let result = async {
+            let owned: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ? AND user_id = ?)")
+                    .bind(conv_id)
+                    .bind(user_id)
+                    .fetch_one(&mut *connection)
+                    .await?;
+            if !owned {
+                return Err(DbError::NotFound(format!(
+                    "Conversation '{conv_id}' not found for user"
+                )));
+            }
+            let (message_count, content_bytes): (i64, i64) = sqlx::query_as(
+                "SELECT COUNT(*),COALESCE(SUM(length(CAST(content AS BLOB))),0)
+                 FROM messages WHERE conversation_id = ? AND turn_id = ?",
+            )
+            .bind(conv_id)
+            .bind(turn_id)
+            .fetch_one(&mut *connection)
+            .await?;
+            if message_count > MAX_EXACT_TURN_MESSAGES || content_bytes > MAX_EXACT_TURN_BYTES {
+                return Err(DbError::Conflict(
+                    "Exact turn exceeds bounded Memory evidence limits".into(),
+                ));
+            }
+            Ok(sqlx::query_as::<_, MessageRow>(
+                "SELECT * FROM messages WHERE conversation_id = ? AND turn_id = ? ORDER BY created_at, id",
+            )
+            .bind(conv_id)
+            .bind(turn_id)
+            .fetch_all(&mut *connection)
+            .await?)
+        }
+        .await;
+        match result {
+            Ok(messages) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(messages)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
     }
 
     async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError> {
@@ -1099,6 +1233,7 @@ mod tests {
         MessageRow {
             id: aionui_common::generate_prefixed_id("msg"),
             conversation_id: conv_id.to_string(),
+            turn_id: None,
             msg_id: Some("client_msg_1".to_string()),
             r#type: "text".to_string(),
             content: r#"{"content":"Hello world"}"#.to_string(),

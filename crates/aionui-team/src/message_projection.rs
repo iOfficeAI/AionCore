@@ -297,6 +297,7 @@ where
         Ok(MessageRow {
             id: msg_id.to_owned(),
             conversation_id: request.conversation_id.clone(),
+            turn_id: None,
             msg_id: Some(msg_id.to_owned()),
             r#type: TEXT_MESSAGE_TYPE.into(),
             content: serde_json::to_string(&content)?,

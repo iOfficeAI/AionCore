@@ -411,6 +411,7 @@ dependencies = [
  "aionui-extension",
  "aionui-file",
  "aionui-mcp",
+ "aionui-memory",
  "aionui-office",
  "aionui-process",
  "aionui-project",
@@ -632,6 +633,7 @@ dependencies = [
  "fs2",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",
@@ -724,6 +726,28 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "aionui-memory"
+version = "0.1.53"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "async-trait",
+ "axum",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]

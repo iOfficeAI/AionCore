@@ -33,6 +33,14 @@ pub struct ProviderHealthCheckService {
     data_dir: PathBuf,
 }
 
+#[async_trait::async_trait]
+pub trait ProviderHealthChecker: Send + Sync {
+    async fn health_check(
+        &self,
+        request: ProviderHealthCheckRequest,
+    ) -> Result<ProviderHealthCheckResponse, AgentError>;
+}
+
 impl ProviderHealthCheckService {
     pub fn new(provider_repo: Arc<dyn IProviderRepository>, encryption_key: [u8; 32], data_dir: PathBuf) -> Self {
         Self {
@@ -105,6 +113,16 @@ impl ProviderHealthCheckService {
             runtime_env: Vec::new(),
             prompt_dump_dir: None,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl ProviderHealthChecker for ProviderHealthCheckService {
+    async fn health_check(
+        &self,
+        request: ProviderHealthCheckRequest,
+    ) -> Result<ProviderHealthCheckResponse, AgentError> {
+        ProviderHealthCheckService::health_check(self, request).await
     }
 }
 

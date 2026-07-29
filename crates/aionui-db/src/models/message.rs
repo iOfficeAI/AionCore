@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 pub struct MessageRow {
     pub id: String,
     pub conversation_id: String,
+    /// Canonical conversation turn identifier. Legacy and internal rows may be unlinked.
+    pub turn_id: Option<String>,
     /// Source message ID for streaming message merge identification.
     pub msg_id: Option<String>,
     /// Message type string (e.g. "text", "tips", "tool_call").

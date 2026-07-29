@@ -40,6 +40,15 @@ pub enum RuntimeLifecycleState {
     ShuttingDown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TurnReleaseOutcome {
+    pub released: bool,
+    pub lifecycle: RuntimeLifecycleState,
+    pub was_deleting: bool,
+    pub was_cancelling: bool,
+    pub was_shutting_down: bool,
+}
+
 impl ConversationRuntimeStateService {
     pub fn try_claim_turn(
         self: &Arc<Self>,
@@ -285,7 +294,7 @@ impl ConversationRuntimeStateService {
         }
     }
 
-    fn release(&self, conversation_id: &str, turn_id: &str) -> bool {
+    fn release(&self, conversation_id: &str, turn_id: &str) -> TurnReleaseOutcome {
         match self.state.lock() {
             Ok(mut state) => {
                 let removed = match state.active_turns.get(conversation_id) {
@@ -306,27 +315,57 @@ impl ConversationRuntimeStateService {
                 };
 
                 if !removed {
-                    return false;
+                    return TurnReleaseOutcome {
+                        released: false,
+                        lifecycle: RuntimeLifecycleState::Active,
+                        was_deleting: false,
+                        was_cancelling: false,
+                        was_shutting_down: false,
+                    };
                 }
 
-                let was_deleting = state.deleting_conversations.remove(conversation_id);
+                let was_deleting = state.deleting_conversations.contains(conversation_id);
+                let was_cancelling = state.cancelling_conversations.contains(conversation_id);
+                let was_shutting_down = state.shutting_down;
+                let lifecycle = if was_shutting_down {
+                    RuntimeLifecycleState::ShuttingDown
+                } else if was_deleting {
+                    RuntimeLifecycleState::Deleting
+                } else if was_cancelling {
+                    RuntimeLifecycleState::Cancelling
+                } else {
+                    RuntimeLifecycleState::Active
+                };
+                state.deleting_conversations.remove(conversation_id);
                 state.cancelling_conversations.remove(conversation_id);
                 info!(
                     conversation_id,
                     turn_id,
-                    deleting = was_deleting,
+                    ?lifecycle,
                     "conversation runtime turn claim released"
                 );
                 drop(state);
                 self.release_notify.notify_waiters();
-                was_deleting
+                TurnReleaseOutcome {
+                    released: true,
+                    lifecycle,
+                    was_deleting,
+                    was_cancelling,
+                    was_shutting_down,
+                }
             }
             Err(_) => {
                 warn!(
                     conversation_id,
                     turn_id, "conversation runtime state lock poisoned while releasing turn"
                 );
-                false
+                TurnReleaseOutcome {
+                    released: false,
+                    lifecycle: RuntimeLifecycleState::ShuttingDown,
+                    was_deleting: false,
+                    was_cancelling: false,
+                    was_shutting_down: true,
+                }
             }
         }
     }
@@ -338,34 +377,61 @@ impl TurnClaim {
     }
 
     pub fn release(&mut self) -> bool {
-        self.release_inner()
+        let outcome = self.release_inner();
+        outcome.released && outcome.was_deleting
     }
 
     pub fn release_for_turn(&mut self, turn_id: &str) -> bool {
         if self.turn_id != turn_id {
             return false;
         }
+        let outcome = self.release_inner();
+        outcome.released && outcome.was_deleting
+    }
+
+    pub(crate) fn release_for_turn_with_lifecycle(&mut self, turn_id: &str) -> TurnReleaseOutcome {
+        if self.turn_id != turn_id {
+            return TurnReleaseOutcome {
+                released: false,
+                lifecycle: RuntimeLifecycleState::Active,
+                was_deleting: false,
+                was_cancelling: false,
+                was_shutting_down: false,
+            };
+        }
         self.release_inner()
     }
 
-    fn release_inner(&mut self) -> bool {
+    fn release_inner(&mut self) -> TurnReleaseOutcome {
         if self.released {
-            return false;
+            return TurnReleaseOutcome {
+                released: false,
+                lifecycle: RuntimeLifecycleState::Active,
+                was_deleting: false,
+                was_cancelling: false,
+                was_shutting_down: false,
+            };
         }
 
-        let was_deleting = self
+        let outcome = self
             .state
             .upgrade()
             .map(|state| state.release(&self.conversation_id, &self.turn_id))
-            .unwrap_or(false);
+            .unwrap_or(TurnReleaseOutcome {
+                released: false,
+                lifecycle: RuntimeLifecycleState::ShuttingDown,
+                was_deleting: false,
+                was_cancelling: false,
+                was_shutting_down: true,
+            });
         self.released = true;
-        was_deleting
+        outcome
     }
 }
 
 impl Drop for TurnClaim {
     fn drop(&mut self) {
-        self.release_inner();
+        let _ = self.release_inner();
     }
 }
 
@@ -528,6 +594,42 @@ mod tests {
         assert!(!claim.release());
 
         assert!(!state.is_cancelling("conv-1"));
+    }
+
+    #[test]
+    fn release_reports_the_canonical_pre_release_lifecycle() {
+        for expected in [
+            RuntimeLifecycleState::Active,
+            RuntimeLifecycleState::Cancelling,
+            RuntimeLifecycleState::Deleting,
+            RuntimeLifecycleState::ShuttingDown,
+        ] {
+            let state = Arc::new(ConversationRuntimeStateService::default());
+            let mut claim = state
+                .try_claim_turn("conv-1", "turn-1")
+                .expect("claim should be created");
+            match expected {
+                RuntimeLifecycleState::Active => {}
+                RuntimeLifecycleState::Cancelling => state.mark_cancelling("conv-1"),
+                RuntimeLifecycleState::Deleting => {
+                    state.mark_deleting("conv-1");
+                }
+                RuntimeLifecycleState::ShuttingDown => {
+                    state.mark_shutting_down();
+                }
+            }
+
+            let outcome = claim.release_for_turn_with_lifecycle("turn-1");
+
+            assert!(outcome.released);
+            assert_eq!(outcome.lifecycle, expected);
+            assert_eq!(outcome.was_deleting, expected == RuntimeLifecycleState::Deleting);
+            assert_eq!(outcome.was_cancelling, expected == RuntimeLifecycleState::Cancelling);
+            assert_eq!(
+                outcome.was_shutting_down,
+                expected == RuntimeLifecycleState::ShuttingDown
+            );
+        }
     }
 
     #[test]

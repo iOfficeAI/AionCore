@@ -20,6 +20,12 @@ use aionui_db::{
 };
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
+use aionui_system::SettingsService;
+
+use crate::router::memory_adapters::{
+    ConversationMemoryAdapter, MemoryConversationDeleteAdapter, SettingsReadinessAdapter,
+    TrustedRetrievalContextAdapter,
+};
 
 pub struct AppServices {
     pub database: Database,
@@ -34,6 +40,9 @@ pub struct AppServices {
     pub runtime_token_service: Arc<RuntimeTokenService>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    pub memory_service: Arc<aionui_memory::MemoryService>,
+    pub settings_service: SettingsService,
+    memory_delete_hook: Arc<dyn OnConversationDelete>,
     /// Project-bind service (project-bind side branch). Shared by conversation
     /// and team wiring to bind/backfill project/folder rows. Cheap to clone.
     pub project_service: ProjectService,
@@ -86,11 +95,14 @@ impl AppServices {
             conversation_runtime_state: self.conversation_runtime_state.clone(),
             conversation_repo: self.conversation_repo.clone(),
             task_manager_delete_hook: self.task_manager_delete_hook.clone(),
+            memory_delete_hook: self.memory_delete_hook.clone(),
             runtime_helper_bin: self.runtime_helper_bin.clone(),
             runtime_base_url: self.runtime_base_url.clone(),
             runtime_token_service: self.runtime_token_service.clone(),
             project_service: self.project_service.clone(),
         });
+        self.conversation_service
+            .with_memory_port(Arc::new(ConversationMemoryAdapter::new(self.memory_service.clone())));
         self
     }
 
@@ -127,7 +139,8 @@ impl AppServices {
 
         let encryption_key = derive_encryption_key(&secret);
 
-        let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
+        let provider_repo: Arc<dyn aionui_db::IProviderRepository> =
+            Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
         // User-configured MCP servers — injected into ACP `session/new`
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
@@ -151,6 +164,29 @@ impl AppServices {
 
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
+        let settings_service = SettingsService::new(Arc::new(aionui_db::SqliteSettingsRepository::new(
+            database.pool().clone(),
+        )))
+        .with_provider_repo(provider_repo.clone());
+        let memory_service = Arc::new(
+            aionui_memory::MemoryService::with_job_dependencies(
+                Arc::new(aionui_db::SqliteMemoryRepository::new(database.pool().clone())),
+                conversation_repo.clone(),
+                Arc::new(SettingsReadinessAdapter::new(settings_service.clone())),
+            )
+            .with_retrieval_context(Arc::new(TrustedRetrievalContextAdapter::new(
+                conversation_repo.clone(),
+                provider_repo.clone(),
+            ))),
+        );
+        memory_service
+            .recover_expired_jobs()
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to recover expired Memory jobs: {error}"))?;
+        let memory_delete_hook: Arc<dyn OnConversationDelete> = Arc::new(MemoryConversationDeleteAdapter::new(
+            memory_service.clone(),
+            conversation_repo.clone(),
+        ));
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
 
         // Project-bind service (side branch). temp_root mirrors the existing
@@ -230,11 +266,13 @@ impl AppServices {
             conversation_runtime_state: conversation_runtime_state.clone(),
             conversation_repo: conversation_repo.clone(),
             task_manager_delete_hook: Some(task_manager_delete_hook.clone()),
+            memory_delete_hook: memory_delete_hook.clone(),
             runtime_helper_bin: runtime_helper_bin.clone(),
             runtime_base_url: runtime_base_url.clone(),
             runtime_token_service: runtime_token_service.clone(),
             project_service: project_service.clone(),
         });
+        conversation_service.with_memory_port(Arc::new(ConversationMemoryAdapter::new(memory_service.clone())));
 
         Ok(Self {
             database,
@@ -249,6 +287,9 @@ impl AppServices {
             runtime_token_service,
             conversation_runtime_state,
             conversation_service,
+            memory_service,
+            settings_service,
+            memory_delete_hook,
             project_service,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
@@ -278,6 +319,7 @@ struct ConversationServiceDeps<'a> {
     conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     conversation_repo: Arc<dyn IConversationRepository>,
     task_manager_delete_hook: Option<Arc<dyn OnConversationDelete>>,
+    memory_delete_hook: Arc<dyn OnConversationDelete>,
     runtime_helper_bin: String,
     runtime_base_url: String,
     runtime_token_service: Arc<RuntimeTokenService>,
@@ -314,6 +356,7 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     if let Some(hook) = deps.task_manager_delete_hook {
         service.with_delete_hook(hook);
     }
+    service.with_delete_hook(deps.memory_delete_hook);
     service.with_project_service(Arc::new(deps.project_service));
     service
 }

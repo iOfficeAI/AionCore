@@ -13,5 +13,15 @@ pub struct SystemSettings {
     pub cron_notification_enabled: bool,
     pub command_queue_enabled: bool,
     pub save_upload_to_workspace: bool,
+    pub app_operations_model_mode: String,
+    pub app_operations_provider_id: Option<String>,
+    pub app_operations_model_id: Option<String>,
     pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct AppOperationsModelSettingRow {
+    pub mode: String,
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
 }

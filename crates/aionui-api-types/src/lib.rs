@@ -18,6 +18,7 @@ mod extension;
 mod file;
 mod lifecycle;
 mod mcp;
+mod memory;
 mod office;
 mod provider;
 mod remote_agent;
@@ -115,6 +116,20 @@ pub use mcp::{
     McpToolResponse, McpTransport, OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse, OAuthLogoutRequest,
     OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
+pub use memory::{
+    ClaimMemoryJobRequest, ClaimMemoryJobResponse, CompleteMemoryJobRequest, ConversationMemoryPolicy,
+    CreateMemoryRetrievalRequest, DeleteMemoryEntryResponse, ExistingMemoryEntryInput, ListMemoryChangeSetsQuery,
+    ListMemoryEntriesQuery, MemoryAppOperationsReadiness, MemoryCandidateMutation, MemoryChangeSetListResponse,
+    MemoryChangeSetResponse, MemoryEntryKind, MemoryEntryListResponse, MemoryEntryResponse, MemoryEntrySourceResponse,
+    MemoryEntryState, MemoryJobEvidenceResponse, MemoryJobFailureCode, MemoryJobHealthSummary, MemoryJobResponse,
+    MemoryJobState, MemoryRetrievalEntrySummary, MemoryRetrievalPreview, MemorySettings, MemorySourceMessageInput,
+    MemorySourceMessageRole, MemorySourceTurnInput, MemoryStatus, MemorySummary, MemoryTaskResultProvenance,
+    MemoryUpdateConversationInput, MemoryUpdateInput, MemoryUpdateOutput, NormalizedMemoryJobFailure,
+    RecordMemoryJobFailureRequest, RecordMemoryJobFailureResponse, ReleaseMemoryJobLeaseRequest,
+    ReleaseMemoryJobLeaseResponse, RenewMemoryJobLeaseRequest, RenewMemoryJobLeaseResponse,
+    ResolveMemoryEntryConflictRequest, ResolveMemoryEntryConflictResponse, RetryMemoryJobResponse,
+    UpdateConversationMemoryPolicyRequest, UpdateMemoryEntryRequest, UpdateMemorySettingsRequest,
+};
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,
     ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, GetSnapshotContentRequest, ListSnapshotsRequest, PptJsonData,
@@ -152,8 +167,10 @@ pub use skill::{
     WriteAssistantRuleRequest,
 };
 pub use system::{
-    ClientPreferencesResponse, FeedbackDiagnosticsContextResponse, FeedbackDiagnosticsPrivacyResponse,
-    FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse, SystemSettingsResponse,
+    AppOperationsModelHealth, AppOperationsModelReasonCode, AppOperationsModelRef, AppOperationsModelResponse,
+    AppOperationsModelSetting, ClientPreferencesResponse, FeedbackDiagnosticsContextResponse,
+    FeedbackDiagnosticsPrivacyResponse, FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery,
+    FeedbackDiagnosticsResponse, SystemSettingsResponse, UpdateAppOperationsModelRequest,
     UpdateClientPreferencesRequest, UpdateSettingsRequest,
 };
 pub use team::{

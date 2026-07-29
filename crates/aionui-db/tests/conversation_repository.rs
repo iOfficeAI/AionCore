@@ -38,6 +38,7 @@ fn make_message(conv_id: &str, content: &str) -> MessageRow {
     MessageRow {
         id: aionui_common::generate_prefixed_id("msg"),
         conversation_id: conv_id.to_string(),
+        turn_id: None,
         msg_id: Some(aionui_common::generate_prefixed_id("cmsg")),
         r#type: "text".to_string(),
         content: format!(r#"{{"content":"{content}"}}"#),
@@ -670,6 +671,7 @@ async fn anchor_rejects_legacy_artifact_rows() {
     repo.insert_message(&MessageRow {
         id: "legacy-cron".into(),
         conversation_id: conv.id.clone(),
+        turn_id: None,
         msg_id: None,
         r#type: "cron_trigger".into(),
         content: "{}".into(),
@@ -1026,6 +1028,7 @@ async fn get_messages_excludes_legacy_cron_and_skill_suggest_rows() {
         repo.insert_message(&MessageRow {
             id: id.into(),
             conversation_id: conv.id.clone(),
+            turn_id: None,
             msg_id: None,
             r#type: ty.into(),
             content: "{}".into(),
@@ -1061,6 +1064,7 @@ async fn list_legacy_cron_trigger_messages_returns_only_trigger_rows() {
     repo.insert_message(&MessageRow {
         id: aionui_common::generate_prefixed_id("msg"),
         conversation_id: conv.id.clone(),
+        turn_id: None,
         msg_id: Some("legacy-trigger".into()),
         r#type: "cron_trigger".into(),
         content: r#"{"cron_job_id":"cron_1","cron_job_name":"Daily Report"}"#.into(),

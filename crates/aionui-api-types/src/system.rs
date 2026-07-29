@@ -65,6 +65,54 @@ pub type ClientPreferencesResponse = HashMap<String, Value>;
 /// the key should be deleted. Non-null values are persisted as-is.
 pub type UpdateClientPreferencesRequest = HashMap<String, Value>;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum AppOperationsModelSetting {
+    Auto,
+    Fixed { provider_id: String, model_id: String },
+}
+
+pub type UpdateAppOperationsModelRequest = AppOperationsModelSetting;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppOperationsModelRef {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppOperationsModelHealth {
+    Ready,
+    Checking,
+    SetupRequired,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppOperationsModelReasonCode {
+    NoEligibleModel,
+    ProviderMissing,
+    ProviderDisabled,
+    ModelMissing,
+    ModelDisabled,
+    AuthRequired,
+    HealthCheckFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppOperationsModelResponse {
+    pub setting: AppOperationsModelSetting,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<AppOperationsModelRef>,
+    pub health: AppOperationsModelHealth,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<AppOperationsModelReasonCode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<i64>,
+}
+
 /// Query parameters for `GET /api/system/diagnostics/feedback-report`.
 ///
 /// The UI sends only routing and explicit context. aionCore owns profile
@@ -264,5 +312,40 @@ mod tests {
         let req: UpdateClientPreferencesRequest = serde_json::from_value(raw).unwrap();
         assert!(req["theme"].is_null());
         assert_eq!(req["pet.size"], 360);
+    }
+
+    #[test]
+    fn app_operations_fixed_request_uses_tagged_snake_case_shape() {
+        let request: UpdateAppOperationsModelRequest = serde_json::from_value(json!({
+            "mode": "fixed",
+            "provider_id": "provider-1",
+            "model_id": "model-1"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request,
+            UpdateAppOperationsModelRequest::Fixed {
+                provider_id: "provider-1".into(),
+                model_id: "model-1".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn app_operations_response_omits_absent_resolution() {
+        let response = AppOperationsModelResponse {
+            setting: AppOperationsModelSetting::Auto,
+            resolved_model: None,
+            health: AppOperationsModelHealth::SetupRequired,
+            reason_code: Some(AppOperationsModelReasonCode::NoEligibleModel),
+            checked_at: None,
+        };
+        let value = serde_json::to_value(response).unwrap();
+
+        assert_eq!(value["setting"], json!({ "mode": "auto" }));
+        assert_eq!(value["health"], "setup_required");
+        assert!(value.get("resolved_model").is_none());
+        assert!(value.get("checked_at").is_none());
     }
 }

@@ -99,6 +99,7 @@ mod tests {
         let row = MessageRow {
             id: "msg-1".into(),
             conversation_id: "conv-1".into(),
+            turn_id: None,
             msg_id: Some("msg-1".into()),
             r#type: "text".into(),
             content: serde_json::json!({ "content": "hello" }).to_string(),
@@ -119,6 +120,7 @@ mod tests {
         let row = MessageRow {
             id: "msg-1".into(),
             conversation_id: "conv-1".into(),
+            turn_id: None,
             msg_id: Some("msg-1".into()),
             r#type: "text".into(),
             content: serde_json::json!({ "content": "" }).to_string(),

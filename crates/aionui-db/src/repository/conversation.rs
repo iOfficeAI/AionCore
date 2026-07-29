@@ -38,6 +38,68 @@ pub trait IConversationRepository: Send + Sync {
         filters: &ConversationFilters,
     ) -> Result<PaginatedResult<ConversationRow>, DbError>;
 
+    /// Lists one stable, owner-scoped page for the one-time legacy Memory import.
+    async fn list_for_memory_import(
+        &self,
+        user_id: &str,
+        after: Option<&LegacyConversationCursor>,
+        boundary: &LegacyConversationImportBoundary,
+        limit: u32,
+    ) -> Result<LegacyConversationImportPage, DbError> {
+        let rows = self
+            .list_paginated(
+                user_id,
+                &ConversationFilters {
+                    limit: limit.saturating_mul(2).max(1),
+                    ..ConversationFilters::default()
+                },
+            )
+            .await?
+            .items;
+        let mut rows = rows
+            .into_iter()
+            .filter(|row| {
+                (row.updated_at, row.id.as_str()) <= (boundary.upper.updated_at, boundary.upper.id.as_str())
+                    && after
+                        .is_none_or(|after| (row.updated_at, row.id.as_str()) > (after.updated_at, after.id.as_str()))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| (left.updated_at, &left.id).cmp(&(right.updated_at, &right.id)));
+        rows.truncate(limit as usize);
+        let next_after = rows.last().map(|row| LegacyConversationCursor {
+            updated_at: row.updated_at,
+            id: row.id.clone(),
+            sequence: None,
+        });
+        Ok(LegacyConversationImportPage { rows, next_after })
+    }
+
+    /// Returns the fixed upper watermark for a new legacy Memory import.
+    async fn memory_import_upper_bound(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<LegacyConversationImportBoundary>, DbError> {
+        Ok(self
+            .list_paginated(
+                user_id,
+                &ConversationFilters {
+                    limit: 1,
+                    ..ConversationFilters::default()
+                },
+            )
+            .await?
+            .items
+            .first()
+            .map(|row| LegacyConversationImportBoundary {
+                upper: LegacyConversationCursor {
+                    updated_at: row.updated_at,
+                    id: row.id.clone(),
+                    sequence: None,
+                },
+                max_sequence: i64::MAX,
+            }))
+    }
+
     // ── Extended queries ────────────────────────────────────────────
 
     /// Finds a conversation by source, channel chat ID, and agent type.
@@ -86,6 +148,16 @@ pub trait IConversationRepository: Send + Sync {
     /// Returns a single message scoped to a conversation.
     async fn get_message(&self, _conv_id: &str, _message_id: &str) -> Result<Option<MessageRow>, DbError> {
         Ok(None)
+    }
+
+    /// Returns messages linked to one exact durable turn after verifying user ownership.
+    async fn list_messages_by_turn(
+        &self,
+        _user_id: &str,
+        _conv_id: &str,
+        _turn_id: &str,
+    ) -> Result<Vec<MessageRow>, DbError> {
+        Ok(Vec::new())
     }
 
     /// Inserts a new message row.
@@ -196,6 +268,28 @@ pub trait IConversationRepository: Send + Sync {
 pub struct MessagePageCursor {
     pub created_at: TimestampMs,
     pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyConversationCursor {
+    pub updated_at: TimestampMs,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LegacyConversationImportPage {
+    pub rows: Vec<ConversationRow>,
+    pub next_after: Option<LegacyConversationCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyConversationImportBoundary {
+    pub upper: LegacyConversationCursor,
+    pub max_sequence: i64,
 }
 
 impl From<&MessageRow> for MessagePageCursor {

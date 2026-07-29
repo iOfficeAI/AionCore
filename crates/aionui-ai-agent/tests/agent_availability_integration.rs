@@ -1,12 +1,17 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use aionui_ai_agent::{AgentRegistry, AgentService};
-use aionui_api_types::{AgentManagementStatus, AgentSnapshotCheckKind, AgentSnapshotCheckStatus};
+use aionui_ai_agent::{AgentError, AgentRegistry, AgentService, ProviderHealthChecker};
+use aionui_api_types::{
+    AgentManagementStatus, AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AppOperationsModelHealth, HealthStatus,
+    ProviderHealthCheckRequest, ProviderHealthCheckResponse,
+};
 use aionui_db::{
-    IAgentMetadataRepository, IProviderRepository, SqliteAgentMetadataRepository, SqliteProviderRepository,
-    UpdateAgentAvailabilitySnapshotParams, UpsertAgentMetadataParams, init_database_memory,
+    CreateProviderParams, IAgentMetadataRepository, IProviderRepository, SqliteAgentMetadataRepository,
+    SqliteProviderRepository, SqliteSettingsRepository, UpdateAgentAvailabilitySnapshotParams,
+    UpsertAgentMetadataParams, init_database_memory,
 };
 use aionui_realtime::EventBroadcaster;
+use aionui_system::SettingsService;
 
 struct NoopBroadcaster;
 
@@ -48,12 +53,103 @@ fn custom_params<'a>(
     }
 }
 
-fn agent_service(
+async fn agent_service(
     registry: Arc<AgentRegistry>,
     provider_repo: Arc<dyn IProviderRepository>,
     data_dir: std::path::PathBuf,
 ) -> Arc<AgentService> {
-    AgentService::new(registry, Arc::new(NoopBroadcaster), provider_repo, [0; 32], data_dir)
+    let db = init_database_memory().await.unwrap();
+    let settings = SettingsService::new(Arc::new(SqliteSettingsRepository::new(db.pool().clone())))
+        .with_provider_repo(provider_repo.clone());
+    std::mem::forget(db);
+    AgentService::new(
+        registry,
+        Arc::new(NoopBroadcaster),
+        provider_repo,
+        [0; 32],
+        data_dir,
+        settings,
+    )
+}
+
+#[derive(Default)]
+struct RecordingProviderHealthChecker {
+    requests: Mutex<Vec<ProviderHealthCheckRequest>>,
+}
+
+#[async_trait::async_trait]
+impl ProviderHealthChecker for RecordingProviderHealthChecker {
+    async fn health_check(
+        &self,
+        request: ProviderHealthCheckRequest,
+    ) -> Result<ProviderHealthCheckResponse, AgentError> {
+        self.requests.lock().unwrap().push(request.clone());
+        Ok(ProviderHealthCheckResponse {
+            provider_id: request.provider_id,
+            platform: "openai".into(),
+            model: request.model,
+            status: HealthStatus::Healthy,
+            elapsed_ms: 37,
+            message: None,
+            error_kind: None,
+            http_status: None,
+            timeout_stage: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn app_operations_health_check_probes_resolved_model_and_returns_ready() {
+    let db = init_database_memory().await.unwrap();
+    let metadata_repo: Arc<dyn IAgentMetadataRepository> =
+        Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let provider_repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+    provider_repo
+        .create(CreateProviderParams {
+            id: Some("operations-provider"),
+            platform: "openai",
+            name: "Operations Provider",
+            base_url: "https://example.invalid/v1",
+            api_key_encrypted: "encrypted-test-value",
+            models: r#"["operations-model"]"#,
+            enabled: true,
+            capabilities: r#"[{"type":"text"}]"#,
+            context_limit: None,
+            model_protocols: None,
+            model_enabled: None,
+            model_health: None,
+            model_settings: "{}",
+            bedrock_config: None,
+            is_full_url: false,
+        })
+        .await
+        .unwrap();
+    let settings = SettingsService::new(Arc::new(SqliteSettingsRepository::new(db.pool().clone())))
+        .with_provider_repo(provider_repo.clone());
+    let registry = AgentRegistry::new(metadata_repo);
+    registry.hydrate().await.unwrap();
+    let checker = Arc::new(RecordingProviderHealthChecker::default());
+    let service = AgentService::new(
+        registry,
+        Arc::new(NoopBroadcaster),
+        provider_repo,
+        [0; 32],
+        tempfile::tempdir().unwrap().path().to_path_buf(),
+        settings,
+    )
+    .with_provider_health_checker(checker.clone());
+
+    let response = service.check_app_operations_model().await.unwrap();
+
+    assert_eq!(response.health, AppOperationsModelHealth::Ready);
+    assert!(response.checked_at.is_some());
+    assert_eq!(
+        checker.requests.lock().unwrap().as_slice(),
+        [ProviderHealthCheckRequest {
+            provider_id: "operations-provider".into(),
+            model: "operations-model".into(),
+        }]
+    );
 }
 
 #[tokio::test]
@@ -280,7 +376,7 @@ async fn management_list_keeps_hydrated_installation_without_reprobing_path() {
 
     std::fs::remove_file(&command_path).unwrap();
 
-    let service = agent_service(registry, provider_repo, temp.path().to_path_buf());
+    let service = agent_service(registry, provider_repo, temp.path().to_path_buf()).await;
     let rows = service.list_management_agents().await.unwrap();
     let cached = rows.iter().find(|row| row.id == "agent-cached").unwrap();
 
@@ -320,7 +416,7 @@ async fn manual_health_check_does_not_refresh_unrelated_agents() {
     registry.hydrate().await.unwrap();
     std::fs::remove_file(&unrelated_path).unwrap();
 
-    let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf());
+    let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf()).await;
     service.health_check_agent_by_id("agent-target-missing").await.unwrap();
 
     let rows = registry.list_management_rows().await;
@@ -365,7 +461,7 @@ async fn custom_enabled_toggle_does_not_refresh_unrelated_agents() {
     registry.hydrate().await.unwrap();
     std::fs::remove_file(&unrelated_path).unwrap();
 
-    let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf());
+    let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf()).await;
     service.set_agent_enabled("agent-target-toggle", false).await.unwrap();
 
     let rows = registry.list_management_rows().await;
@@ -410,7 +506,7 @@ async fn custom_delete_does_not_refresh_unrelated_agents() {
     registry.hydrate().await.unwrap();
     std::fs::remove_file(&unrelated_path).unwrap();
 
-    let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf());
+    let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf()).await;
     service.delete_custom_agent("agent-target-delete").await.unwrap();
 
     let rows = registry.list_management_rows().await;

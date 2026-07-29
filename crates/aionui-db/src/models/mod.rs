@@ -7,6 +7,7 @@ mod conversation;
 mod conversation_artifact;
 mod cron_job;
 mod mcp_server;
+mod memory;
 mod message;
 mod oauth_token;
 mod project;
@@ -32,12 +33,18 @@ pub use conversation::{ConversationAssistantSnapshotRow, ConversationRow, Upsert
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
 pub use mcp_server::McpServerRow;
+pub(crate) use memory::MemoryEntryDbRow;
+pub use memory::{
+    ConversationMemoryPolicyRow, ConversationMemoryRow, EffectiveMemoryPolicyRow, MemoryChangeSetRow, MemoryEntryRow,
+    MemoryImportStateRow, MemoryJobHealthRow, MemoryJobRow, MemoryJobTurnRow, MemoryRetrievalRow, MemorySettingsRow,
+    MemorySourceRow,
+};
 pub use message::MessageRow;
 pub use oauth_token::OAuthTokenRow;
 pub use project::{FolderRow, ProjectExplorerRow, ProjectKind, ProjectRow, Role};
 pub use provider::Provider;
 pub use remote_agent::RemoteAgentRow;
 pub use skill::{SkillImportRecordRow, SkillRow};
-pub use system_settings::SystemSettings;
+pub use system_settings::{AppOperationsModelSettingRow, SystemSettings};
 pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};
 pub use user::User;

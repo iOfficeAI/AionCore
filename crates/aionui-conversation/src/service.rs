@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
@@ -10,10 +10,13 @@ use aionui_ai_agent::{
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
 };
 
+use crate::memory_port::{
+    CompletedTurnMemoryInput, ConversationMemoryPort, MemoryTurnOutcome, NoopConversationMemoryPort,
+};
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
-use crate::runtime_completion::RuntimeCompletionPublisher;
+use crate::runtime_completion::{RuntimeCompletionOutcome, RuntimeCompletionPublisher};
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
-use crate::runtime_state::ConversationRuntimeStateService;
+use crate::runtime_state::{ConversationRuntimeStateService, TurnClaim};
 use aionui_api_types::{
     ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
     ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
@@ -59,6 +62,7 @@ use std::sync::RwLock;
 
 pub(crate) const MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN: usize = 4;
 const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const MEMORY_COMPLETION_CALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
@@ -319,6 +323,8 @@ pub struct ConversationService {
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
+    memory_port: Arc<RwLock<Arc<dyn ConversationMemoryPort>>>,
+    completion_gates: Arc<std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
     /// Project-bind side branch (optional). `None` → binding is a no-op, so
     /// conversation create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
@@ -331,6 +337,29 @@ pub struct ConversationService {
     conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
+}
+
+type CompletionGateRegistry = Arc<std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>;
+
+struct CompletionGateLease {
+    registry: CompletionGateRegistry,
+    conversation_id: String,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for CompletionGateLease {
+    fn drop(&mut self) {
+        let mut gates = self.registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let same_gate = gates
+            .get(&self.conversation_id)
+            .is_some_and(|stored| stored.ptr_eq(&Arc::downgrade(&self.gate)));
+        // Drop is synchronous and runs for normal return, cancellation, and
+        // unwind. Existing waiters each own another strong Arc, so the mapped
+        // identity remains until the final lease disappears.
+        if same_gate && Arc::strong_count(&self.gate) == 1 {
+            gates.remove(&self.conversation_id);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -395,6 +424,8 @@ impl ConversationService {
             assistant_preference_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
+            memory_port: Arc::new(RwLock::new(Arc::new(NoopConversationMemoryPort))),
+            completion_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             project_service: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
@@ -510,6 +541,12 @@ impl ConversationService {
         }
     }
 
+    pub fn with_memory_port(&self, port: Arc<dyn ConversationMemoryPort>) {
+        if let Ok(mut guard) = self.memory_port.write() {
+            *guard = port;
+        }
+    }
+
     /// Register a hook to be notified when a conversation is deleted.
     ///
     /// Hooks are dispatched sequentially in registration order before
@@ -598,6 +635,13 @@ impl ConversationService {
             .and_then(|guard| guard.as_ref().cloned())
     }
 
+    pub(crate) fn memory_port(&self) -> Arc<dyn ConversationMemoryPort> {
+        self.memory_port
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|_| Arc::new(NoopConversationMemoryPort))
+    }
+
     pub(crate) fn runtime_persistence(&self) -> RuntimePersistenceCoordinator {
         RuntimePersistenceCoordinator::new(self.runtime_state())
     }
@@ -646,22 +690,112 @@ impl ConversationService {
     }
 
     pub async fn complete_turn(&self, conversation_id: &str, turn_id: &str) {
-        let runtime = self.runtime_summary_for(conversation_id).await;
-        self.completion_publisher()
-            .publish(conversation_id, turn_id, Some(runtime))
+        let lease = self.completion_gate(conversation_id);
+        let _guard = lease.gate.lock().await;
+        self.complete_turn_with_memory_unsequenced(conversation_id, turn_id, ConversationTurnStatus::Completed, true)
             .await;
     }
 
-    pub(crate) async fn complete_released_turn(&self, conversation_id: &str, turn_id: &str, was_deleting: bool) {
-        if was_deleting {
+    fn completion_gate(&self, conversation_id: &str) -> CompletionGateLease {
+        let mut gates = self
+            .completion_gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        gates.retain(|_, stored| stored.strong_count() > 0);
+        let gate = gates.get(conversation_id).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let gate = Arc::new(tokio::sync::Mutex::new(()));
+            gates.insert(conversation_id.to_owned(), Arc::downgrade(&gate));
+            gate
+        });
+        CompletionGateLease {
+            registry: Arc::clone(&self.completion_gates),
+            conversation_id: conversation_id.to_owned(),
+            gate,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completion_gate_count(&self) -> usize {
+        self.completion_gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    async fn complete_turn_with_memory_unsequenced(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        status: ConversationTurnStatus,
+        memory_eligible: bool,
+    ) {
+        let runtime = self.runtime_summary_for(conversation_id).await;
+        let outcome = self
+            .completion_publisher()
+            .publish(conversation_id, turn_id, Some(runtime))
+            .await;
+        let RuntimeCompletionOutcome::Committed { user_id } = outcome else {
+            return;
+        };
+        if !memory_eligible {
+            return;
+        }
+        let outcome = match status {
+            ConversationTurnStatus::Completed => MemoryTurnOutcome::Completed,
+            ConversationTurnStatus::Failed => MemoryTurnOutcome::Failed,
+        };
+        let memory_port = self.memory_port();
+        let callback = memory_port.on_turn_completed(CompletedTurnMemoryInput {
+            user_id,
+            conversation_id: conversation_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            outcome,
+        });
+        match tokio::time::timeout(MEMORY_COMPLETION_CALLBACK_TIMEOUT, callback).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(conversation_id, turn_id, error = %error, "Memory completion callback failed");
+            }
+            Err(_) => {
+                warn!(
+                    conversation_id,
+                    turn_id,
+                    timeout_ms = MEMORY_COMPLETION_CALLBACK_TIMEOUT.as_millis() as u64,
+                    "Memory completion callback timed out"
+                );
+            }
+        }
+    }
+
+    pub(crate) async fn finish_claimed_turn(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        turn_claim: &mut TurnClaim,
+        status: ConversationTurnStatus,
+        mut memory_eligible: bool,
+    ) {
+        // Acquire before releasing the runtime claim. A following turn may start
+        // as soon as the claim is released, but cannot publish completion or
+        // enqueue Memory capture ahead of this turn.
+        let lease = self.completion_gate(conversation_id);
+        let _guard = lease.gate.lock().await;
+        let release = turn_claim.release_for_turn_with_lifecycle(turn_id);
+        if !release.released {
+            return;
+        }
+        if release.was_deleting {
             debug!(
                 conversation_id,
                 turn_id, "Skipping turn completion because conversation was deleting at claim release"
             );
             return;
         }
-
-        self.complete_turn(conversation_id, turn_id).await;
+        if release.was_cancelling || release.was_shutting_down {
+            memory_eligible = false;
+        }
+        self.complete_turn_with_memory_unsequenced(conversation_id, turn_id, status, memory_eligible)
+            .await;
     }
 }
 
@@ -2206,6 +2340,11 @@ impl ConversationService {
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
+        self.memory_port()
+            .on_conversation_reset(user_id, id)
+            .await
+            .map_err(|_| ConversationError::internal("Failed to reset conversation Memory"))?;
+
         // Delete all messages
         self.conversation_repo.delete_messages_by_conversation(id).await?;
         self.conversation_repo.delete_artifacts_by_conversation(id).await?;
@@ -2683,6 +2822,7 @@ impl ConversationService {
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
+        let memory_eligible = !req.hidden;
 
         // Store user message. `msg_id` is server-generated so the WebSocket
         // stream, DB row, and client-side message index all agree on the same
@@ -2692,6 +2832,7 @@ impl ConversationService {
         let user_msg = aionui_db::models::MessageRow {
             id: user_msg_id.clone(),
             conversation_id: conversation_id.to_owned(),
+            turn_id: Some(turn_id.clone()),
             msg_id: Some(user_msg_id.clone()),
             r#type: "text".into(),
             content: serde_json::json!({ "content": req.content }).to_string(),
@@ -2705,9 +2846,14 @@ impl ConversationService {
             .allows(conversation_id, RuntimeWriteKind::UserMessage)
         {
             let mut turn_claim = turn_claim;
-            let was_deleting = turn_claim.release();
-            self.complete_released_turn(conversation_id, &turn_id, was_deleting)
-                .await;
+            self.finish_claimed_turn(
+                conversation_id,
+                &turn_id,
+                &mut turn_claim,
+                ConversationTurnStatus::Failed,
+                false,
+            )
+            .await;
             return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
         }
         if let Err(e) = self.conversation_repo.insert_message(&user_msg).await {
@@ -2749,9 +2895,14 @@ impl ConversationService {
                 )
                 .await;
                 let mut turn_claim = turn_claim;
-                let was_deleting = turn_claim.release();
-                self.complete_released_turn(conversation_id, &turn_id, was_deleting)
-                    .await;
+                self.finish_claimed_turn(
+                    conversation_id,
+                    &turn_id,
+                    &mut turn_claim,
+                    ConversationTurnStatus::Failed,
+                    memory_eligible,
+                )
+                .await;
                 return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
             }
         };
@@ -2769,6 +2920,8 @@ impl ConversationService {
             stored_workspace,
             turn_id: turn_id.clone(),
             turn_claim,
+            memory_eligible,
+            persisted_turn_id: Some(turn_id.clone()),
         });
 
         info!(
@@ -2815,6 +2968,7 @@ impl ConversationService {
             let user_msg = aionui_db::models::MessageRow {
                 id: user_msg_id.clone(),
                 conversation_id: request.conversation_id.clone(),
+                turn_id: None,
                 msg_id: Some(user_msg_id),
                 r#type: "text".into(),
                 content: serde_json::json!({ "content": request.content }).to_string(),
@@ -2834,9 +2988,14 @@ impl ConversationService {
                     "Failed to insert agent turn user message"
                 );
                 let mut turn_claim = turn_claim;
-                let was_deleting = turn_claim.release();
-                self.complete_released_turn(&request.conversation_id, &turn_id, was_deleting)
-                    .await;
+                self.finish_claimed_turn(
+                    &request.conversation_id,
+                    &turn_id,
+                    &mut turn_claim,
+                    ConversationTurnStatus::Failed,
+                    false,
+                )
+                .await;
                 return Err(e.into());
             }
         }
@@ -2853,17 +3012,23 @@ impl ConversationService {
             Err(err) => {
                 let top_level_code = err.error_code();
                 let send_error = AgentSendError::from_agent_error(err.to_agent_error());
-                self.persist_and_broadcast_send_failure_tip(
+                self.persist_and_broadcast_send_failure_tip_with_turn_id(
                     &request.conversation_id,
                     &turn_id,
+                    None,
                     &send_error,
                     Some(top_level_code),
                 )
                 .await;
                 let mut turn_claim = turn_claim;
-                let was_deleting = turn_claim.release();
-                self.complete_released_turn(&request.conversation_id, &turn_id, was_deleting)
-                    .await;
+                self.finish_claimed_turn(
+                    &request.conversation_id,
+                    &turn_id,
+                    &mut turn_claim,
+                    ConversationTurnStatus::Failed,
+                    false,
+                )
+                .await;
                 return Ok(ConversationAgentTurnOutcome {
                     conversation_id: request.conversation_id.clone(),
                     turn_id,
@@ -2887,12 +3052,16 @@ impl ConversationService {
                     files: request.files,
                     inject_skills: request.inject_skills,
                     hidden: request.user_message_hidden,
+                    memory_retrieval_id: None,
+                    excluded_memory_ids: vec![],
                 },
                 required_runtime_mode: request.required_runtime_mode,
                 build_options: build_opts,
                 stored_workspace,
                 turn_id: turn_id.clone(),
                 turn_claim,
+                memory_eligible: false,
+                persisted_turn_id: None,
             })
             .await;
 
@@ -2933,8 +3102,26 @@ impl ConversationService {
         err: &AgentSendError,
         top_level_code: Option<&'static str>,
     ) {
+        self.persist_and_broadcast_send_failure_tip_with_turn_id(
+            conversation_id,
+            turn_id,
+            Some(turn_id),
+            err,
+            top_level_code,
+        )
+        .await;
+    }
+
+    pub(crate) async fn persist_and_broadcast_send_failure_tip_with_turn_id(
+        &self,
+        conversation_id: &str,
+        runtime_turn_id: &str,
+        persisted_turn_id: Option<&str>,
+        err: &AgentSendError,
+        top_level_code: Option<&'static str>,
+    ) {
         let Some(row) = self
-            .persist_send_failure_tip(conversation_id, err, top_level_code)
+            .persist_send_failure_tip_with_turn_id(conversation_id, persisted_turn_id, err, top_level_code)
             .await
         else {
             return;
@@ -2948,7 +3135,7 @@ impl ConversationService {
             serde_json::json!({
                 "conversation_id": row.conversation_id,
                 "msg_id": msg_id,
-                "turn_id": turn_id,
+                "turn_id": runtime_turn_id,
                 "type": row.r#type,
                 "data": content_value,
                 "position": row.position,

@@ -16,6 +16,12 @@ pub struct RuntimeCompletionPublisher {
     persistence: RuntimePersistenceCoordinator,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeCompletionOutcome {
+    Committed { user_id: String },
+    Skipped,
+}
+
 impl RuntimeCompletionPublisher {
     pub fn new(
         repo: Arc<dyn IConversationRepository>,
@@ -30,7 +36,12 @@ impl RuntimeCompletionPublisher {
     }
 
     #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id, turn_id = %turn_id))]
-    pub async fn publish(&self, conversation_id: &str, turn_id: &str, runtime: Option<ConversationRuntimeSummary>) {
+    pub async fn publish(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        runtime: Option<ConversationRuntimeSummary>,
+    ) -> RuntimeCompletionOutcome {
         if !self
             .persistence
             .allows(conversation_id, RuntimeWriteKind::ConversationFinished)
@@ -39,17 +50,17 @@ impl RuntimeCompletionPublisher {
                 conversation_id,
                 turn_id, "turn completion skipped by runtime persistence policy"
             );
-            return;
+            return RuntimeCompletionOutcome::Skipped;
         }
 
-        match self.repo.get(conversation_id).await {
-            Ok(Some(_)) => {}
+        let conversation = match self.repo.get(conversation_id).await {
+            Ok(Some(conversation)) => conversation,
             Ok(None) => {
                 debug!(
                     conversation_id,
                     turn_id, "turn completion skipped because conversation row is missing"
                 );
-                return;
+                return RuntimeCompletionOutcome::Skipped;
             }
             Err(error) => {
                 error!(
@@ -58,9 +69,9 @@ impl RuntimeCompletionPublisher {
                     error = %ErrorChain(&error),
                     "turn completion skipped because conversation row lookup failed"
                 );
-                return;
+                return RuntimeCompletionOutcome::Skipped;
             }
-        }
+        };
 
         let update = ConversationRowUpdate {
             status: Some("finished".to_owned()),
@@ -74,7 +85,7 @@ impl RuntimeCompletionPublisher {
                 error = %ErrorChain(&error),
                 "Failed to update conversation status"
             );
-            return;
+            return RuntimeCompletionOutcome::Skipped;
         }
 
         let payload = json!({
@@ -89,5 +100,8 @@ impl RuntimeCompletionPublisher {
             .broadcast(WebSocketMessage::new("turn.completed", payload));
 
         debug!(conversation_id, turn_id, status = "finished", "Turn completed");
+        RuntimeCompletionOutcome::Committed {
+            user_id: conversation.user_id,
+        }
     }
 }
