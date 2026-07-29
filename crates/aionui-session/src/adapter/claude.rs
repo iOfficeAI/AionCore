@@ -717,19 +717,16 @@ impl ClaudeAdapter {
                     .and_then(|r| r.get("tool_name"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                // Carry the raw `input` ONLY for AskUserQuestion — its
-                // `{questions:[…]}` is question CONTENT meant for the user, so the
-                // frontend can render a real question card. For every other tool the
-                // `input` is a command body / file contents (TIO-13 sensitive) and is
-                // deliberately dropped here — the generic allow/deny card needs no
-                // payload. `tool_name` itself is non-sensitive (a tool label) and is
-                // always carried so the conversation layer can tell AskUserQuestion
-                // apart from an ordinary approval.
-                let input = if tool_name.as_deref() == Some("AskUserQuestion") {
-                    request.and_then(|r| r.get("input")).cloned()
-                } else {
-                    None
-                };
+                // Carry the raw `input` for EVERY tool. The permission card must show
+                // the user WHAT they are approving (a Bash `command`, a Write target)
+                // — with only `tool_name` the card reads "命令: Bash" and the user
+                // approves blind (AionUi issue #3779). This is display-to-the-approver,
+                // not logging: TIO-13 ("never log tool input at info") still holds, and
+                // the SAME `input` already reaches the frontend via the assistant
+                // tool_use block (ToolBegin carries it), so the card adds no new
+                // exposure. For AskUserQuestion the `{questions:[…]}` payload
+                // additionally drives the real question card.
+                let input = request.and_then(|r| r.get("input")).cloned();
                 vec![SessionEvent::Permission {
                     request_id: request_id.to_string(),
                     // 007 §9.17: claude can_use_tool is a TOOL approval (not auth).
@@ -1890,11 +1887,13 @@ mod tests {
         }
     }
 
-    /// An ORDINARY tool permission (Bash) carries `tool_name` but NOT `input` — the
-    /// command body is TIO-13 sensitive and is deliberately dropped (the generic
-    /// allow/deny card needs no payload). Distinguishes it from AskUserQuestion.
+    /// An ORDINARY tool permission (Bash) carries `tool_name` AND `input` — the
+    /// permission card must show the approver what command they are approving
+    /// (AionUi issue #3779: with input dropped the card read "命令: Bash" and the
+    /// user approved blind). Display-to-the-approver is not logging, so TIO-13
+    /// (never log tool input at info) is unaffected.
     #[test]
-    fn ordinary_tool_permission_drops_input_keeps_tool_name() {
+    fn ordinary_tool_permission_carries_input_and_tool_name() {
         let frame = serde_json::json!({
             "type": "control_request",
             "request_id": "req-b1",
@@ -1909,9 +1908,10 @@ mod tests {
         match events.as_slice() {
             [SessionEvent::Permission { tool_name, input, .. }] => {
                 assert_eq!(tool_name.as_deref(), Some("Bash"));
-                assert!(
-                    input.is_none(),
-                    "ordinary tool input (command body) is NOT projected (TIO-13)"
+                let input = input.as_ref().expect("ordinary tool input is projected for the card");
+                assert_eq!(
+                    input["command"], "rm -rf /",
+                    "the command body reaches the permission card so the user reviews it"
                 );
             }
             other => panic!("expected one Permission, got {other:?}"),
