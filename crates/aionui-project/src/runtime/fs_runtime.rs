@@ -14,6 +14,7 @@ use super::error::FsError;
 use super::local_provider::LocalFsProvider;
 use super::local_watcher::LocalWatcher;
 use super::provider::IFsProvider;
+use super::search::IFsSearchProvider;
 use super::watcher::{RawEvent, Watcher};
 
 /// How a provider's `read_dir`/`stat` IO is executed on the shard worker.
@@ -31,11 +32,18 @@ pub trait IFsRuntime: Send + Sync {
     fn provider(&self) -> &dyn IFsProvider;
     fn watcher(&self) -> &dyn Watcher;
     fn io_dispatch(&self) -> IoDispatch;
+
+    /// The filename-search capability, when this scheme supports it. Returned as
+    /// an owned `Arc` so the search orchestration can move it into a spawned
+    /// coordinator task. `None` = scheme does not support search.
+    fn search_provider(&self) -> Option<Arc<dyn IFsSearchProvider>>;
 }
 
 /// `file:` runtime: local provider + non-recursive local watcher, `Inline` IO.
 pub struct LocalFsRuntime {
-    provider: LocalFsProvider,
+    /// `Arc`-wrapped so it can serve both the borrowed `provider()` view and an
+    /// owned `search_provider()` handle without a second construction.
+    provider: Arc<LocalFsProvider>,
     watcher: LocalWatcher,
 }
 
@@ -46,7 +54,7 @@ impl LocalFsRuntime {
         let (watcher, rx) = LocalWatcher::new()?;
         Ok((
             Self {
-                provider: LocalFsProvider::new(),
+                provider: Arc::new(LocalFsProvider::new()),
                 watcher,
             },
             rx,
@@ -56,7 +64,7 @@ impl LocalFsRuntime {
 
 impl IFsRuntime for LocalFsRuntime {
     fn provider(&self) -> &dyn IFsProvider {
-        &self.provider
+        self.provider.as_ref()
     }
 
     fn watcher(&self) -> &dyn Watcher {
@@ -65,6 +73,10 @@ impl IFsRuntime for LocalFsRuntime {
 
     fn io_dispatch(&self) -> IoDispatch {
         IoDispatch::Inline
+    }
+
+    fn search_provider(&self) -> Option<Arc<dyn IFsSearchProvider>> {
+        Some(Arc::clone(&self.provider) as Arc<dyn IFsSearchProvider>)
     }
 }
 

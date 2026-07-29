@@ -195,6 +195,60 @@ fn notification_frame_has_no_id() {
     assert!(v.get("id").is_none());
 }
 
+// ── filename search params / builders ─────────────────────────────────────
+
+#[test]
+fn search_params_parse_roots_query_and_default_limit() {
+    let v = json!({"roots":[{"pe_id":"pe1","relative_path":""}],"query":"button","limit":200});
+    let p: SearchParams = serde_json::from_value(v).unwrap();
+    assert_eq!(p.roots.len(), 1);
+    assert_eq!(p.query, "button");
+    assert_eq!(p.limit, Some(200));
+
+    // limit is optional (server picks a default when omitted).
+    let p2: SearchParams = serde_json::from_value(json!({"roots":[],"query":""})).unwrap();
+    assert_eq!(p2.limit, None);
+}
+
+#[test]
+fn search_cancel_params_echo_search_id_value() {
+    let p: SearchCancelParams = serde_json::from_value(json!({"search_id":8})).unwrap();
+    assert_eq!(p.search_id, json!(8));
+}
+
+#[test]
+fn search_hit_serializes_project_identity() {
+    let hit = SearchHit {
+        pe_id: "pe1".to_owned(),
+        relative_path: "src/components/Button.tsx".to_owned(),
+        name: "Button.tsx".to_owned(),
+    };
+    let v = serde_json::to_value(&hit).unwrap();
+    assert_eq!(
+        v,
+        json!({"pe_id":"pe1","relative_path":"src/components/Button.tsx","name":"Button.tsx"})
+    );
+}
+
+#[test]
+fn search_match_params_batches_hits_under_search_id() {
+    let hits = vec![SearchHit {
+        pe_id: "pe2".to_owned(),
+        relative_path: "widgets/iconButton.ts".to_owned(),
+        name: "iconButton.ts".to_owned(),
+    }];
+    let v = search_match_params(&json!(7), &hits);
+    assert_eq!(v["search_id"], 7);
+    assert_eq!(v["matches"][0]["pe_id"], "pe2");
+    assert_eq!(v["matches"][0]["name"], "iconButton.ts");
+}
+
+#[test]
+fn search_result_carries_limit_reached_and_total() {
+    assert_eq!(search_result(false, 2), json!({"limit_reached":false,"total":2}));
+    assert_eq!(search_result(true, 200), json!({"limit_reached":true,"total":200}));
+}
+
 // ── error mapping ─────────────────────────────────────────────────────────
 
 #[test]

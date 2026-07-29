@@ -2,14 +2,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aionui_db::{Database, IProjectStore, SqliteProjectStore, init_database_memory};
+use async_trait::async_trait;
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::ProjectService;
 use crate::canonical::to_file_uri;
 use crate::monitor::{FsInbound, FsMonitorActor, FsWirePush};
-use crate::runtime::{EntryFact, Kind, RawEvent, ShardOutput, Snapshot, Subscriber};
+use crate::runtime::{
+    Budget, CancellationToken, EntryFact, FsError, IFsRuntime, IFsSearchProvider, Kind, LocalFsRuntime, MatchMode,
+    NameMatcher, RawEvent, SearchSink, ShardOutput, Snapshot, Subscriber,
+};
+
+use super::super::search::{ActiveSearch, SearchDone, SearchJob, SearchRoot, run_search};
 
 // ── recording push port ────────────────────────────────────────────────────
 
@@ -638,4 +645,304 @@ async fn disconnect_drops_session_subscriptions() {
 
     drop(tx);
     let _ = handle.await;
+}
+
+// ══ filename search — actor state machine (deterministic helpers) ═════════════
+
+fn active(id: i64) -> (ActiveSearch, CancellationToken) {
+    let cancel = CancellationToken::new();
+    (
+        ActiveSearch {
+            search_id: json!(id),
+            cancel: cancel.clone(),
+        },
+        cancel,
+    )
+}
+
+#[tokio::test]
+async fn register_search_supersedes_and_cancels_previous() {
+    let (mut actor, _rx, _push, _pe, _dir, _db) = setup().await;
+    let (first, first_cancel) = active(1);
+    let (second, _second_cancel) = active(2);
+
+    actor.register_search("1", first);
+    actor.register_search("1", second);
+
+    // Superseded search's token is cancelled; the current entry is the new id.
+    assert!(first_cancel.is_cancelled());
+    assert_eq!(actor.active_searches.get("1").unwrap().search_id, json!(2));
+}
+
+#[tokio::test]
+async fn cancel_search_only_when_id_matches() {
+    let (mut actor, _rx, _push, _pe, _dir, _db) = setup().await;
+    let (search, cancel) = active(7);
+    actor.register_search("1", search);
+
+    // Non-matching id → no cancel, entry stays.
+    assert!(!actor.cancel_search("1", &json!(8)));
+    assert!(!cancel.is_cancelled());
+    assert!(actor.active_searches.contains_key("1"));
+
+    // Matching id → cancelled + removed.
+    assert!(actor.cancel_search("1", &json!(7)));
+    assert!(cancel.is_cancelled());
+    assert!(!actor.active_searches.contains_key("1"));
+}
+
+#[tokio::test]
+async fn disconnect_cascades_cancel_to_running_search() {
+    let (mut actor, _rx, _push, _pe, _dir, _db) = setup().await;
+    let (search, cancel) = active(1);
+    actor.register_search("1", search);
+
+    actor.drop_session_search("1");
+
+    assert!(cancel.is_cancelled());
+    assert!(!actor.active_searches.contains_key("1"));
+}
+
+#[tokio::test]
+async fn on_search_done_clears_only_the_current_search() {
+    let (mut actor, _rx, _push, _pe, _dir, _db) = setup().await;
+    let (search, _c) = active(7);
+    actor.register_search("1", search);
+
+    // Completion of the current search clears its entry.
+    actor.on_search_done(SearchDone {
+        session: "1".to_owned(),
+        search_id: json!(7),
+    });
+    assert!(!actor.active_searches.contains_key("1"));
+
+    // A stale done (id 7) arriving after a superseding search (id 8) must NOT
+    // clobber the newer entry.
+    let (newer, _c2) = active(8);
+    actor.register_search("1", newer);
+    actor.on_search_done(SearchDone {
+        session: "1".to_owned(),
+        search_id: json!(7),
+    });
+    assert_eq!(
+        actor.active_searches.get("1").unwrap().search_id,
+        json!(8),
+        "stale done must not clobber the superseding search"
+    );
+}
+
+// ══ filename search — end-to-end through the real event loop ══════════════════
+
+/// A `fs/searchMatch` hit for `session` naming `file` with `pe_id`.
+fn has_search_hit(frames: &[(String, Value)], session: &str, pe_id: &str, name: &str) -> bool {
+    frames.iter().any(|(s, f)| {
+        s == session
+            && f["method"] == "fs/searchMatch"
+            && f["params"]["matches"]
+                .as_array()
+                .map(|ms| ms.iter().any(|m| m["pe_id"] == pe_id && m["name"] == name))
+                .unwrap_or(false)
+    })
+}
+
+/// The terminal `fs/search` response (a `result` for `id`) delivered to `session`.
+fn search_terminal(frames: &[(String, Value)], session: &str, id: i64) -> Option<Value> {
+    frames
+        .iter()
+        .find(|(s, f)| s == session && f["id"] == id && f.get("result").is_some())
+        .map(|(_, f)| f["result"].clone())
+}
+
+#[tokio::test]
+async fn search_streams_matches_and_terminal_through_loop() {
+    let (actor, raw_rx, push, pe, dir, _db) = setup().await;
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src").join("Button.tsx"), b"x").unwrap();
+    std::fs::write(dir.path().join("Widget.tsx"), b"x").unwrap();
+
+    let (tx, rx) = unbounded_channel();
+    let handle = tokio::spawn(actor.run(rx, raw_rx));
+
+    tx.send(FsInbound::Frame {
+        session: "1".to_owned(),
+        user_id: "system_default_user".to_owned(),
+        frame: request(7, "fs/search", json!({"roots":[dir_ref(&pe, "")],"query":"button"})),
+    })
+    .unwrap();
+
+    // Terminal arrives (search is spawned off the loop, then streams + finishes).
+    let got_terminal = wait_until(&push, Duration::from_secs(5), |f| search_terminal(f, "1", 7).is_some()).await;
+    assert!(got_terminal, "search must send a terminal response");
+
+    let frames = push.frames();
+    // The matching file streamed with the root's pe_id stamped; the non-match did not.
+    assert!(has_search_hit(&frames, "1", &pe, "Button.tsx"));
+    assert!(!has_search_hit(&frames, "1", &pe, "Widget.tsx"));
+    let result = search_terminal(&frames, "1", 7).unwrap();
+    assert_eq!(result["limit_reached"], false);
+    assert_eq!(result["total"], 1);
+
+    drop(tx);
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn search_unknown_pe_is_out_of_scope() {
+    // Resolve failure replies synchronously (before any coordinator spawn).
+    let (mut actor, _rx, push, _pe, _dir, _db) = setup().await;
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(8, "fs/search", json!({"roots":[dir_ref("pe-nope", "")],"query":"x"})),
+        )
+        .await;
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["id"], 8);
+    assert_eq!(reply["error"]["code"], -32000);
+    assert_eq!(reply["error"]["message"], "out_of_scope");
+    assert_eq!(reply["error"]["data"]["pe_id"], "pe-nope");
+}
+
+/// A search provider that parks in `search_names` until released, so a test can
+/// hold a search provably in-flight. `entered` fires when the walk begins;
+/// `release` unblocks it.
+struct BarrierSearchProvider {
+    entered: Notify,
+    release: Notify,
+}
+
+#[async_trait]
+impl IFsSearchProvider for BarrierSearchProvider {
+    async fn search_names(
+        &self,
+        _root_uri: &str,
+        _matcher: &NameMatcher,
+        sink: &Arc<dyn SearchSink>,
+        budget: &Budget,
+        _cancel: &CancellationToken,
+    ) -> Result<(), FsError> {
+        self.entered.notify_one(); // tell the test the search is in-flight
+        self.release.notified().await; // park until released
+        if budget.try_take() {
+            sink.emit("hit.txt".to_owned(), "hit.txt".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn search_running_keeps_event_loop_responsive() {
+    // Inject a barrier provider so the search is provably parked in-flight when
+    // the initialize arrives — proving the loop is not blocked by a running walk.
+    let (mut actor, raw_rx, push, pe, _dir, _db) = setup().await;
+    let barrier = Arc::new(BarrierSearchProvider {
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    actor.set_search_provider_override(Arc::clone(&barrier) as Arc<dyn IFsSearchProvider>);
+    let (tx, rx) = unbounded_channel();
+    let handle = tokio::spawn(actor.run(rx, raw_rx));
+
+    // Kick off the search; it will park inside the barrier provider.
+    tx.send(FsInbound::Frame {
+        session: "1".to_owned(),
+        user_id: "system_default_user".to_owned(),
+        frame: request(7, "fs/search", json!({"roots":[dir_ref(&pe, "")],"query":""})),
+    })
+    .unwrap();
+    // Wait until the walk has actually started (search is in-flight).
+    tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified())
+        .await
+        .expect("search must enter the provider (be in-flight)");
+
+    // With the search parked, send an initialize on the same connection.
+    tx.send(FsInbound::Frame {
+        session: "1".to_owned(),
+        user_id: "system_default_user".to_owned(),
+        frame: request(99, "initialize", json!({"protocol_version": 1})),
+    })
+    .unwrap();
+
+    // The initialize is answered while the search is still parked in-flight.
+    let responsive = wait_until(&push, Duration::from_secs(2), |f| {
+        f.iter()
+            .any(|(s, m)| s == "1" && m["id"] == 99 && m["result"]["protocol_version"] == 1)
+    })
+    .await;
+    assert!(responsive, "event loop must stay responsive during a running search");
+    // Prove the search had NOT completed when initialize was served (still parked).
+    assert!(
+        search_terminal(&push.frames(), "1", 7).is_none(),
+        "search must still be in-flight (no terminal) when initialize was answered"
+    );
+
+    // Release the barrier → the search finishes and its terminal lands.
+    barrier.release.notify_one();
+    assert!(
+        wait_until(&push, Duration::from_secs(3), |f| search_terminal(f, "1", 7).is_some()).await,
+        "search terminal must arrive once released"
+    );
+
+    drop(tx);
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn completion_signals_done_actor_clears_and_later_cancel_is_noop() {
+    // End-to-end of the clear-on-done path: a real `run_search` completing sends a
+    // SearchDone; the actor clears its active-search entry; a later same-id
+    // fs/searchCancel is then a no-op (the completed search is not "in-flight").
+    let (mut actor, _rx, _push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+    // Register the search exactly as dispatch would.
+    let cancel = CancellationToken::new();
+    actor.register_search(
+        "1",
+        ActiveSearch {
+            search_id: json!(5),
+            cancel,
+        },
+    );
+
+    // Drive a real walk (real LocalFsProvider) over the workspace root to natural
+    // completion, capturing the done signal it emits.
+    let (runtime, _watch_rx) = LocalFsRuntime::new().unwrap();
+    let provider = runtime.search_provider().expect("file scheme supports search");
+    let sink_push: Arc<dyn FsWirePush> = Arc::new(RecordingPush::default());
+    let (done_tx, mut done_rx) = unbounded_channel();
+    run_search(
+        provider,
+        sink_push,
+        SearchJob {
+            session: "1".to_owned(),
+            search_id: json!(5),
+            roots: vec![SearchRoot {
+                root_uri: to_file_uri(dir.path()).unwrap(),
+                pe_id: pe.clone(),
+            }],
+            matcher: NameMatcher::new("", MatchMode::Substring),
+            budget: Budget::new(100),
+            cancel: CancellationToken::new(),
+        },
+        done_tx,
+    )
+    .await;
+
+    // Natural completion emitted a done for this session + id.
+    let done = done_rx.try_recv().expect("done signal on natural completion");
+    assert_eq!(done.session, "1");
+    assert_eq!(done.search_id, json!(5));
+
+    // Actor clears the entry; a later same-id cancel finds nothing in-flight.
+    actor.on_search_done(done);
+    assert!(
+        !actor.active_searches.contains_key("1"),
+        "completed search entry cleared"
+    );
+    assert!(
+        !actor.cancel_search("1", &json!(5)),
+        "a completed search must not be treated as in-flight by fs/searchCancel"
+    );
 }

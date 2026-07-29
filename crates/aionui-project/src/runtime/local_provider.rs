@@ -10,14 +10,21 @@
 //! stage. This provider currently performs no realpath containment.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use ignore::WalkBuilder;
 
 use crate::canonical;
 
 use super::error::FsError;
 use super::provider::{EntryFact, IFsProvider, Kind};
+use super::search::{Budget, CancellationToken, IFsSearchProvider, NameMatcher, SearchSink};
+
+/// How often, in walked entries, the blocking walk re-checks the cancel token
+/// (checking every entry would be needless overhead on a large tree).
+const CANCEL_CHECK_STRIDE: usize = 128;
 
 /// Local-disk provider for the `file:` scheme.
 #[derive(Debug, Default, Clone)]
@@ -201,6 +208,98 @@ impl IFsProvider for LocalFsProvider {
                 .map_err(|e| map_io(from, &e))
         }
     }
+}
+
+#[async_trait]
+impl IFsSearchProvider for LocalFsProvider {
+    async fn search_names(
+        &self,
+        root_uri: &str,
+        matcher: &NameMatcher,
+        sink: &Arc<dyn SearchSink>,
+        budget: &Budget,
+        cancel: &CancellationToken,
+    ) -> Result<(), FsError> {
+        let root = path_of(root_uri)?;
+        // The `ignore` walk is synchronous and CPU/IO-bound; run it off the async
+        // worker so it never blocks the actor's event loop. Shared budget/cancel
+        // are cheap Arc handles moved into the blocking task.
+        let (matcher, sink, budget, cancel) = (matcher.clone(), Arc::clone(sink), budget.clone(), cancel.clone());
+        tokio::task::spawn_blocking(move || walk_names(&root, &matcher, &sink, &budget, &cancel))
+            .await
+            .map_err(|e| FsError::Io {
+                uri: root_uri.to_owned(),
+                message: format!("search walk task join failed: {e}"),
+            })
+    }
+}
+
+/// The blocking `ignore` tree walk backing [`LocalFsProvider::search_names`].
+/// Honors `.gitignore` / git excludes (same walker ripgrep uses); emits only
+/// files whose name matches, stopping on budget exhaustion or cancellation.
+fn walk_names(
+    root: &Path,
+    matcher: &NameMatcher,
+    sink: &Arc<dyn SearchSink>,
+    budget: &Budget,
+    cancel: &CancellationToken,
+) {
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        .require_git(false)
+        .build();
+
+    for (seen, entry) in walker.enumerate() {
+        // Periodic cancel check so a large no-hit subtree still bails promptly.
+        if seen.is_multiple_of(CANCEL_CHECK_STRIDE) && cancel.is_cancelled() {
+            return;
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            // Unreadable entry (permissions, race) — skip, safely handled.
+            Err(err) => {
+                tracing::debug!(error = %err, "fs search: skipping unreadable entry");
+                continue;
+            }
+        };
+        // Filename search returns files only (SearchHit is files-only); the root
+        // dir itself and every subdirectory are traversed but never emitted.
+        if entry.file_type().is_none_or(|ft| ft.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if !matcher.matches(&name) {
+            continue;
+        }
+        if cancel.is_cancelled() {
+            return;
+        }
+        // Reserve a hit slot from the shared global budget; failure = cap reached
+        // (budget records `limit_reached`) → stop this root's walk.
+        if !budget.try_take() {
+            return;
+        }
+        sink.emit(rel_path(root, path), name);
+    }
+}
+
+/// Root-relative path, forward-slash normalized, no leading slash (wire form).
+fn rel_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(seg) => Some(seg.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]
