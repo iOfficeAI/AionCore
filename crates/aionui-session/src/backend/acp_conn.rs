@@ -3489,7 +3489,11 @@ mod tests {
         .expect("Permission surfaced");
         // AionUi issue #3779: the card must show what is being approved — the
         // toolCall's title and rawInput ride on the Permission event.
-        assert_eq!(perm_tool_name.as_deref(), Some("Bash"), "toolCall.title rides as tool_name");
+        assert_eq!(
+            perm_tool_name.as_deref(),
+            Some("Bash"),
+            "toolCall.title rides as tool_name"
+        );
         let perm_input = perm_input.expect("toolCall.rawInput rides as input");
         assert_eq!(perm_input["command"], "rm -rf /", "rawInput reaches the card verbatim");
 
