@@ -108,6 +108,30 @@ impl ITeamRepository for MockTeamRepo {
         Ok(msgs)
     }
 
+    async fn list_messages_by_team(&self, team_id: &str, limit: i64) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let state = self.state.lock().unwrap();
+        let mut msgs: Vec<MailboxMessageRow> = state
+            .messages
+            .iter()
+            .filter(|m| m.team_id == team_id)
+            .cloned()
+            .collect();
+        // DESC by created_at, id as a stable secondary key.
+        msgs.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        msgs.truncate(limit.max(0) as usize);
+        Ok(msgs)
+    }
+
+    async fn list_messages_by_ids(&self, ids: &[String]) -> Result<Vec<MailboxMessageRow>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let state = self.state.lock().unwrap();
+        let mut msgs: Vec<MailboxMessageRow> = state.messages.iter().filter(|m| ids.contains(&m.id)).cloned().collect();
+        msgs.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        Ok(msgs)
+    }
+
     async fn delete_mailbox_by_team(&self, team_id: &str) -> Result<(), DbError> {
         self.state.lock().unwrap().messages.retain(|m| m.team_id != team_id);
         Ok(())
@@ -481,6 +505,21 @@ pub(crate) mod workspace_harness {
             _team_id: &str,
             _to_agent_id: &str,
             _limit: Option<i64>,
+        ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+            Ok(vec![])
+        }
+
+        async fn list_messages_by_team(
+            &self,
+            _team_id: &str,
+            _limit: i64,
+        ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+            Ok(vec![])
+        }
+
+        async fn list_messages_by_ids(
+            &self,
+            _ids: &[String],
         ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
             Ok(vec![])
         }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, State};
+use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 
@@ -12,15 +12,15 @@ use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
     GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
-    SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
-    TeamRunStateResponse,
+    SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse, TeamMailboxMessageResponse,
+    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_db::DbError;
 
 use crate::error::{TeamError, classify_public_error};
-use crate::service::TeamSessionService;
+use crate::service::{DEFAULT_ACTIVITY_LIMIT, TeamSessionService};
 
 #[derive(Clone)]
 pub struct TeamRouterState {
@@ -92,6 +92,8 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams", post(create_team).get(list_teams))
         .route("/api/teams/{id}", get(get_team).delete(remove_team))
         .route("/api/teams/{id}/run-state", get(get_run_state))
+        .route("/api/teams/{id}/mailbox", get(list_mailbox))
+        .route("/api/teams/{id}/tasks", get(list_tasks))
         .route("/api/teams/{id}/name", axum::routing::patch(rename_team))
         .route("/api/teams/{id}/agents", post(add_agent))
         .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
@@ -164,6 +166,36 @@ async fn remove_team(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     state.service.remove_team(&user.id, &id).await?;
     Ok(Json(ApiResponse::success()))
+}
+
+/// Query parameters for the read-only team activity endpoints. `limit` is
+/// optional (defaults to `DEFAULT_ACTIVITY_LIMIT`) and clamped in the service.
+#[derive(serde::Deserialize)]
+struct ActivityQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+async fn list_mailbox(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Query(query): Query<ActivityQuery>,
+) -> Result<Json<ApiResponse<Vec<TeamMailboxMessageResponse>>>, ApiError> {
+    let limit = query.limit.unwrap_or(DEFAULT_ACTIVITY_LIMIT);
+    let messages = state.service.list_team_mailbox(&user.id, &id, limit).await?;
+    Ok(Json(ApiResponse::ok(messages)))
+}
+
+async fn list_tasks(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Query(query): Query<ActivityQuery>,
+) -> Result<Json<ApiResponse<Vec<TeamTaskResponse>>>, ApiError> {
+    let limit = query.limit.unwrap_or(DEFAULT_ACTIVITY_LIMIT);
+    let tasks = state.service.list_team_tasks(&user.id, &id, limit).await?;
+    Ok(Json(ApiResponse::ok(tasks)))
 }
 
 async fn rename_team(

@@ -9,9 +9,9 @@ use std::sync::{Arc, RwLock, Weak};
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus,
-    TeamSessionStatusPayload, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
-    TeamToolTransport, WebSocketMessage,
+    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding,
+    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
+    TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -24,6 +24,7 @@ use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
+use crate::activity_mapping::{mailbox_row_to_response, task_to_response};
 use crate::error::TeamError;
 use crate::event_loop::{AgentLoopContext, EventLoopRegistrationError};
 use crate::events::{
@@ -44,9 +45,14 @@ use crate::runtime_tools::{
 };
 use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
 use crate::team_run::TeamRunManager;
-use crate::types::{Team, TeamAgent, TeammateRole};
+use crate::types::{Team, TeamAgent, TeamTask, TeammateRole};
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
+
+/// Default number of activity items returned when the client omits `limit`.
+pub const DEFAULT_ACTIVITY_LIMIT: i64 = 500;
+/// Hard upper bound for the activity `limit` query parameter.
+pub const MAX_ACTIVITY_LIMIT: i64 = 1000;
 
 pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &str) {
     if !workspace.trim().is_empty() {
@@ -280,6 +286,45 @@ impl TeamSessionService {
             )));
         }
         Ok(Team::from_row(&row)?)
+    }
+
+    /// Returns the most recent team-wide mailbox messages (all recipients),
+    /// newest first, for the read-only activity view. `limit` is clamped to
+    /// `[1, MAX_ACTIVITY_LIMIT]`. Ownership is enforced first (404 when the
+    /// team is absent, Forbidden when owned by another user).
+    pub async fn list_team_mailbox(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TeamMailboxMessageResponse>, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let clamped = limit.clamp(1, MAX_ACTIVITY_LIMIT);
+        let rows = self.repo.list_messages_by_team(team_id, clamped).await?;
+        let responses: Vec<TeamMailboxMessageResponse> = rows.iter().map(mailbox_row_to_response).collect();
+        info!(kind = "team", team_id, count = responses.len(), "team mailbox listed");
+        Ok(responses)
+    }
+
+    /// Returns the team's tasks, newest first (`created_at` DESC, `id` as a
+    /// stable secondary key), truncated to a clamped `limit`, for the
+    /// read-only activity view. Reuses the existing ASC `list_tasks` and sorts
+    /// in the service. Ownership is enforced first.
+    pub async fn list_team_tasks(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TeamTaskResponse>, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let clamped = limit.clamp(1, MAX_ACTIVITY_LIMIT);
+        let rows = self.repo.list_tasks(team_id).await?;
+        let mut tasks: Vec<TeamTask> = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
+        tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        tasks.truncate(clamped as usize);
+        let responses: Vec<TeamTaskResponse> = tasks.iter().map(task_to_response).collect();
+        info!(kind = "team", team_id, count = responses.len(), "team tasks listed");
+        Ok(responses)
     }
 
     pub async fn renew_active_lease(

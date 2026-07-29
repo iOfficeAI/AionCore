@@ -390,6 +390,79 @@ async fn delete_mailbox_by_team() {
     assert_eq!(h2.len(), 1);
 }
 
+#[tokio::test]
+async fn list_messages_by_team_orders_desc_and_clamps_limit() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+
+    // Distinct created_at so DESC ordering is deterministic.
+    for i in 1..=5 {
+        let mut msg = make_mailbox_msg(&format!("m{i}"), "t1", &format!("a{i}"), "lead", "message");
+        msg.created_at = i as i64 * 1000;
+        repo.write_message(&msg).await.unwrap();
+    }
+
+    // limit smaller than total keeps the newest ones, newest first.
+    let latest = repo.list_messages_by_team("t1", 3).await.unwrap();
+    assert_eq!(latest.len(), 3);
+    assert_eq!(latest[0].id, "m5");
+    assert_eq!(latest[1].id, "m4");
+    assert_eq!(latest[2].id, "m3");
+
+    // limit above total returns everything (whole team, not a single mailbox).
+    let all = repo.list_messages_by_team("t1", 1000).await.unwrap();
+    assert_eq!(all.len(), 5);
+    assert_eq!(all.first().unwrap().id, "m5");
+}
+
+#[tokio::test]
+async fn list_messages_by_team_limit_one() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    for i in 1..=3 {
+        let mut msg = make_mailbox_msg(&format!("m{i}"), "t1", "a1", "lead", "message");
+        msg.created_at = i as i64 * 1000;
+        repo.write_message(&msg).await.unwrap();
+    }
+
+    let one = repo.list_messages_by_team("t1", 1).await.unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].id, "m3");
+}
+
+#[tokio::test]
+async fn list_messages_by_team_empty() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+
+    let msgs = repo.list_messages_by_team("t1", 500).await.unwrap();
+    assert!(msgs.is_empty());
+}
+
+#[tokio::test]
+async fn list_messages_by_ids_hits_empty_and_partial() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    for i in 1..=3 {
+        let mut msg = make_mailbox_msg(&format!("m{i}"), "t1", "a1", "lead", "message");
+        msg.created_at = i as i64 * 1000;
+        repo.write_message(&msg).await.unwrap();
+    }
+
+    // Empty ids -> empty result without touching the DB.
+    let none = repo.list_messages_by_ids(&[]).await.unwrap();
+    assert!(none.is_empty());
+
+    // Mix of existing and missing ids returns only the hits, newest first.
+    let hits = repo
+        .list_messages_by_ids(&["m1".to_string(), "m3".to_string(), "missing".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].id, "m3");
+    assert_eq!(hits[1].id, "m1");
+}
+
 // ── Task Board Tests ─────────────────────────────────────────────────
 
 #[tokio::test]

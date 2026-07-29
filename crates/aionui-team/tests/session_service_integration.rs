@@ -805,6 +805,16 @@ impl ITeamRepository for FullMockTeamRepo {
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
         self.inner.get_history(team_id, to_agent_id, limit).await
     }
+    async fn list_messages_by_team(
+        &self,
+        team_id: &str,
+        limit: i64,
+    ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+        self.inner.list_messages_by_team(team_id, limit).await
+    }
+    async fn list_messages_by_ids(&self, ids: &[String]) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+        self.inner.list_messages_by_ids(ids).await
+    }
     async fn delete_mailbox_by_team(&self, team_id: &str) -> Result<(), DbError> {
         self.inner.delete_mailbox_by_team(team_id).await
     }
@@ -6929,4 +6939,162 @@ async fn agent_triggered_attach_failure_notifies_leader() {
     })
     .await
     .expect("an agent-triggered attach failure must notify the leader (notify_leader_on_failure=true)");
+}
+
+// ===========================================================================
+// Test: Team activity read endpoints (mailbox & tasks)
+// ===========================================================================
+
+fn activity_team_row(id: &str, user_id: &str) -> aionui_db::models::TeamRow {
+    aionui_db::models::TeamRow {
+        id: id.into(),
+        user_id: user_id.into(),
+        name: "Activity Team".into(),
+        workspace: String::new(),
+        workspace_mode: "shared".into(),
+        agents: "[]".into(),
+        lead_agent_id: None,
+        session_mode: None,
+        agents_version: "1.0.1".into(),
+        created_at: aionui_common::now_ms(),
+        updated_at: aionui_common::now_ms(),
+        project_id: None,
+        folder_id: None,
+    }
+}
+
+fn activity_message_row(id: &str, team_id: &str, created_at: i64) -> aionui_db::models::MailboxMessageRow {
+    aionui_db::models::MailboxMessageRow {
+        id: id.into(),
+        team_id: team_id.into(),
+        to_agent_id: "a1".into(),
+        from_agent_id: "lead".into(),
+        msg_type: "message".into(),
+        content: format!("content-{id}"),
+        summary: None,
+        files: None,
+        read: false,
+        created_at,
+    }
+}
+
+fn activity_task_row(id: &str, team_id: &str, created_at: i64) -> aionui_db::models::TeamTaskRow {
+    aionui_db::models::TeamTaskRow {
+        id: id.into(),
+        team_id: team_id.into(),
+        subject: format!("subject-{id}"),
+        description: None,
+        status: "pending".into(),
+        owner: Some("a1".into()),
+        blocked_by: "[]".into(),
+        blocks: "[]".into(),
+        metadata: Some(r#"{"secret":"xxx"}"#.into()),
+        created_at,
+        updated_at: created_at,
+    }
+}
+
+#[tokio::test]
+async fn list_team_mailbox_happy_path_orders_desc() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.create_team(&activity_team_row("t1", "user1")).await.unwrap();
+    for i in 1..=3 {
+        team_repo
+            .write_message(&activity_message_row(&format!("m{i}"), "t1", i as i64 * 1000))
+            .await
+            .unwrap();
+    }
+
+    let messages = svc.list_team_mailbox("user1", "t1", 500).await.unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].id, "m3");
+    assert_eq!(messages[2].id, "m1");
+    // Response envelope-friendly DTO fields present, files normalized to a list.
+    assert!(messages[0].files.is_empty());
+}
+
+#[tokio::test]
+async fn list_team_mailbox_clamps_over_limit() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.create_team(&activity_team_row("t1", "user1")).await.unwrap();
+    for i in 1..=5 {
+        team_repo
+            .write_message(&activity_message_row(&format!("m{i}"), "t1", i as i64 * 1000))
+            .await
+            .unwrap();
+    }
+
+    // Over-limit is clamped to MAX (1000); still returns all 5.
+    let messages = svc.list_team_mailbox("user1", "t1", 99_999).await.unwrap();
+    assert_eq!(messages.len(), 5);
+}
+
+#[tokio::test]
+async fn list_team_tasks_happy_path_desc_and_truncates_without_metadata() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.create_team(&activity_team_row("t1", "user1")).await.unwrap();
+    for i in 1..=4 {
+        team_repo
+            .create_task(&activity_task_row(&format!("tk{i}"), "t1", i as i64 * 1000))
+            .await
+            .unwrap();
+    }
+
+    let tasks = svc.list_team_tasks("user1", "t1", 2).await.unwrap();
+    // DESC by created_at, truncated to 2.
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(tasks[0].id, "tk4");
+    assert_eq!(tasks[1].id, "tk3");
+    // Metadata is never exposed on the response DTO (compile-time guarantee:
+    // the field does not exist), and serialized JSON must not contain it.
+    let json = serde_json::to_value(&tasks[0]).unwrap();
+    assert!(json.get("metadata").is_none());
+    assert!(!serde_json::to_string(&tasks).unwrap().contains("secret"));
+}
+
+#[tokio::test]
+async fn list_team_mailbox_missing_team_returns_not_found() {
+    let (svc, _team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let err = svc.list_team_mailbox("user1", "missing", 500).await.unwrap_err();
+    assert!(matches!(err, TeamError::TeamNotFound(_)));
+}
+
+#[tokio::test]
+async fn list_team_tasks_missing_team_returns_not_found() {
+    let (svc, _team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let err = svc.list_team_tasks("user1", "missing", 500).await.unwrap_err();
+    assert!(matches!(err, TeamError::TeamNotFound(_)));
+}
+
+#[tokio::test]
+async fn list_team_activity_rejects_other_user() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.create_team(&activity_team_row("t1", "user1")).await.unwrap();
+    team_repo
+        .write_message(&activity_message_row("m1", "t1", 1000))
+        .await
+        .unwrap();
+
+    let mailbox_err = svc.list_team_mailbox("intruder", "t1", 500).await.unwrap_err();
+    assert!(matches!(mailbox_err, TeamError::Forbidden(_)));
+    let tasks_err = svc.list_team_tasks("intruder", "t1", 500).await.unwrap_err();
+    assert!(matches!(tasks_err, TeamError::Forbidden(_)));
 }

@@ -1,16 +1,23 @@
 use std::sync::Arc;
 
+use aionui_api_types::TeamTaskChange;
 use aionui_common::{generate_id, now_ms};
 use aionui_db::ITeamRepository;
 use aionui_db::UpdateTaskParams;
 use aionui_db::models::TeamTaskRow;
 use tracing::debug;
 
+use crate::activity_mapping::task_to_response;
 use crate::error::TeamError;
+use crate::events::TeamEventEmitter;
 use crate::types::{TaskStatus, TeamTask};
 
 pub struct TaskBoard {
     repo: Arc<dyn ITeamRepository>,
+    /// Optional real-time emitter. When present, task create/update broadcast
+    /// `team.taskChanged`. Absent in unit tests that use [`TaskBoard::new`]
+    /// directly.
+    events: Option<Arc<TeamEventEmitter>>,
 }
 
 /// Optional fields for task update.
@@ -25,7 +32,13 @@ pub struct TaskUpdate {
 
 impl TaskBoard {
     pub fn new(repo: Arc<dyn ITeamRepository>) -> Self {
-        Self { repo }
+        Self { repo, events: None }
+    }
+
+    /// Attaches a real-time event emitter for `team.taskChanged` broadcasts.
+    pub fn with_events(mut self, events: Arc<TeamEventEmitter>) -> Self {
+        self.events = Some(events);
+        self
     }
 
     pub async fn create_task(
@@ -69,7 +82,11 @@ impl TaskBoard {
 
         debug!(team_id, task_id = %task_id, subject, "task created");
 
-        TeamTask::from_row(&row).map_err(TeamError::Json)
+        let task = TeamTask::from_row(&row).map_err(TeamError::Json)?;
+        if let Some(events) = &self.events {
+            events.broadcast_task_changed(task_to_response(&task), TeamTaskChange::Created);
+        }
+        Ok(task)
     }
 
     pub async fn update_task(&self, team_id: &str, task_id: &str, update: &TaskUpdate) -> Result<TeamTask, TeamError> {
@@ -101,7 +118,13 @@ impl TaskBoard {
 
         debug!(team_id, task_id, "task updated");
 
-        TeamTask::from_row(&updated).map_err(TeamError::Json)
+        let task = TeamTask::from_row(&updated).map_err(TeamError::Json)?;
+        // Deletion is modeled as an update to `status=deleted`, not a separate
+        // removed event; the frontend filters/removes by status.
+        if let Some(events) = &self.events {
+            events.broadcast_task_changed(task_to_response(&task), TeamTaskChange::Updated);
+        }
+        Ok(task)
     }
 
     pub async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTask>, TeamError> {
@@ -130,6 +153,104 @@ impl TaskBoard {
 mod tests {
     use super::*;
     use crate::test_utils::MockTeamRepo;
+    use aionui_api_types::{TeamTaskChangedPayload, WebSocketMessage};
+    use aionui_realtime::EventBroadcaster;
+
+    struct RecordingBroadcaster {
+        events: std::sync::Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
+    }
+
+    impl RecordingBroadcaster {
+        fn new() -> Self {
+            Self {
+                events: std::sync::Mutex::new(vec![]),
+            }
+        }
+
+        fn events(&self) -> Vec<WebSocketMessage<serde_json::Value>> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl EventBroadcaster for RecordingBroadcaster {
+        fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    fn board_with_events(repo: Arc<MockTeamRepo>) -> (TaskBoard, Arc<RecordingBroadcaster>) {
+        let bc = Arc::new(RecordingBroadcaster::new());
+        let emitter = Arc::new(TeamEventEmitter::new("t1".into(), bc.clone()));
+        (TaskBoard::new(repo).with_events(emitter), bc)
+    }
+
+    fn task_changes(bc: &RecordingBroadcaster) -> Vec<TeamTaskChangedPayload> {
+        bc.events()
+            .into_iter()
+            .filter(|e| e.name == "team.taskChanged")
+            .map(|e| serde_json::from_value(e.data).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn create_task_broadcasts_created() {
+        let repo = Arc::new(MockTeamRepo::new());
+        let (board, bc) = board_with_events(repo);
+
+        let task = board.create_task("t1", "Build", None, None, &[]).await.unwrap();
+
+        let changes = task_changes(&bc);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change, TeamTaskChange::Created);
+        assert_eq!(changes[0].task.id, task.id);
+        assert_eq!(changes[0].task.status, "pending");
+    }
+
+    #[tokio::test]
+    async fn update_task_broadcasts_updated_including_deleted() {
+        let repo = Arc::new(MockTeamRepo::new());
+        let (board, bc) = board_with_events(repo);
+
+        let task = board.create_task("t1", "Build", None, None, &[]).await.unwrap();
+        board
+            .update_task(
+                "t1",
+                &task.id,
+                &TaskUpdate {
+                    status: Some(TaskStatus::Deleted),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let updated: Vec<_> = task_changes(&bc)
+            .into_iter()
+            .filter(|c| c.change == TeamTaskChange::Updated)
+            .collect();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].task.id, task.id);
+        assert_eq!(updated[0].task.status, "deleted");
+    }
+
+    #[tokio::test]
+    async fn no_emitter_does_not_panic_and_emits_nothing() {
+        let repo = Arc::new(MockTeamRepo::new());
+        let board = TaskBoard::new(repo);
+        let task = board.create_task("t1", "Build", None, None, &[]).await.unwrap();
+        board
+            .update_task(
+                "t1",
+                &task.id,
+                &TaskUpdate {
+                    status: Some(TaskStatus::Completed),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // No broadcaster attached: nothing to assert beyond not panicking.
+    }
 
     // -- Helper ---------------------------------------------------------------
 

@@ -174,13 +174,13 @@ impl TeamSession {
         service: Weak<TeamSessionService>,
         prompt_dump: TeamPromptDumpConfig,
     ) -> Result<Self, TeamError> {
-        let mailbox = Arc::new(Mailbox::new(repo.clone()));
-        let task_board = Arc::new(TaskBoard::new(repo));
+        // Single emitter shared by mailbox, task board, and the run manager so
+        // all team events reuse the same team-scoped subscription/delivery.
+        let emitter = Arc::new(TeamEventEmitter::new(team.id.clone(), broadcaster.clone()));
+        let mailbox = Arc::new(Mailbox::new(repo.clone()).with_events(emitter.clone()));
+        let task_board = Arc::new(TaskBoard::new(repo).with_events(emitter.clone()));
         let member_runtimes = Arc::new(MemberRuntimeRegistry::new(generate_id()));
-        let team_run_manager = Arc::new(TeamRunManager::new(
-            team.id.clone(),
-            Arc::new(TeamEventEmitter::new(team.id.clone(), broadcaster.clone())),
-        ));
+        let team_run_manager = Arc::new(TeamRunManager::new(team.id.clone(), emitter.clone()));
         let work_coordinator = Arc::new(SlotWorkCoordinator::new(
             team.id.clone(),
             member_runtimes.generation().to_owned(),

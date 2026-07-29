@@ -268,6 +268,48 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(rows)
     }
 
+    async fn list_messages_by_team(&self, team_id: &str, limit: i64) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let rows = sqlx::query_as::<_, MailboxMessageRow>(
+            "SELECT id, team_id, to_agent_id, from_agent_id, \
+                    type, content, summary, files, read, created_at \
+             FROM mailbox \
+             WHERE team_id = ? \
+             ORDER BY created_at DESC \
+             LIMIT ?",
+        )
+        .bind(team_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn list_messages_by_ids(&self, ids: &[String]) -> Result<Vec<MailboxMessageRow>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // SQLite placeholder limit is 999; batch in the same way as
+        // `mark_read_batch` and merge the chunks.
+        let mut out = Vec::new();
+        for chunk in ids.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT id, team_id, to_agent_id, from_agent_id, \
+                        type, content, summary, files, read, created_at \
+                 FROM mailbox \
+                 WHERE id IN ({placeholders}) \
+                 ORDER BY created_at DESC"
+            );
+            let mut query = sqlx::query_as::<_, MailboxMessageRow>(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            out.extend(rows);
+        }
+        Ok(out)
+    }
+
     async fn delete_mailbox_by_team(&self, team_id: &str) -> Result<(), DbError> {
         sqlx::query("DELETE FROM mailbox WHERE team_id = ?")
             .bind(team_id)

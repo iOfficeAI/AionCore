@@ -1,6 +1,7 @@
 #![warn(clippy::disallowed_types)]
 
 //! Multi-agent team sessions with role-based prompts, task board, mailbox, and scheduling.
+pub mod activity_mapping;
 pub mod capability;
 pub mod crash_detection;
 pub mod error;
