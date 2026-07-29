@@ -7,20 +7,24 @@ use crate::protocol::events::{
 };
 
 pub struct BackendOutputSink {
+    conversation_id: String,
     event_tx: broadcast::Sender<AgentStreamEvent>,
 }
 
 impl BackendOutputSink {
-    pub fn new(event_tx: broadcast::Sender<AgentStreamEvent>) -> Self {
-        Self { event_tx }
+    pub fn new(conversation_id: String, event_tx: broadcast::Sender<AgentStreamEvent>) -> Self {
+        Self {
+            conversation_id,
+            event_tx,
+        }
     }
 
-    fn internal_call_id(tool_use_id: &str) -> Option<String> {
+    fn internal_call_id(&self, tool_use_id: &str) -> Option<String> {
         let id = tool_use_id.trim();
         if id.is_empty() {
             None
         } else {
-            Some(format!("aionrs-{id}"))
+            Some(format!("aionrs-{}-{id}", self.conversation_id))
         }
     }
 }
@@ -42,7 +46,7 @@ impl OutputSink for BackendOutputSink {
     }
 
     fn emit_tool_call(&self, tool_use_id: &str, name: &str, input: &str) {
-        let Some(call_id) = Self::internal_call_id(tool_use_id) else {
+        let Some(call_id) = self.internal_call_id(tool_use_id) else {
             tracing::error!(tool = name, "Cannot emit tool_call with empty tool_use_id");
             return;
         };
@@ -80,7 +84,7 @@ impl OutputSink for BackendOutputSink {
     }
 
     fn emit_tool_result(&self, tool_use_id: &str, name: &str, is_error: bool, content: &str) {
-        let Some(call_id) = Self::internal_call_id(tool_use_id) else {
+        let Some(call_id) = self.internal_call_id(tool_use_id) else {
             tracing::error!(tool = name, "Cannot emit tool_result with empty tool_use_id");
             return;
         };
@@ -158,9 +162,11 @@ impl OutputSink for BackendOutputSink {
 mod tests {
     use super::*;
 
+    const CONVERSATION_ID: &str = "conv-test";
+
     fn make_sink() -> (BackendOutputSink, broadcast::Receiver<AgentStreamEvent>) {
         let (tx, rx) = broadcast::channel(16);
-        (BackendOutputSink::new(tx), rx)
+        (BackendOutputSink::new(CONVERSATION_ID.to_string(), tx), rx)
     }
 
     #[test]
@@ -260,12 +266,36 @@ mod tests {
             }
         }
 
-        assert_eq!(call_ids[0].0, "aionrs-call_a");
-        assert_eq!(call_ids[1].0, "aionrs-call_b");
-        assert_eq!(call_ids[2].0, "aionrs-call_a");
-        assert_eq!(call_ids[3].0, "aionrs-call_b");
+        assert_eq!(call_ids[0].0, "aionrs-conv-test-call_a");
+        assert_eq!(call_ids[1].0, "aionrs-conv-test-call_b");
+        assert_eq!(call_ids[2].0, "aionrs-conv-test-call_a");
+        assert_eq!(call_ids[3].0, "aionrs-conv-test-call_b");
         assert_eq!(call_ids[2].1, ToolCallStatus::Completed);
         assert_eq!(call_ids[3].1, ToolCallStatus::Completed);
+    }
+
+    #[test]
+    fn identical_tool_use_ids_are_namespaced_by_conversation() {
+        let (first_tx, mut first_rx) = broadcast::channel(1);
+        let (second_tx, mut second_rx) = broadcast::channel(1);
+        let first = BackendOutputSink::new("conv-a".to_string(), first_tx);
+        let second = BackendOutputSink::new("conv-b".to_string(), second_tx);
+
+        first.emit_tool_call("Glob_0", "Glob", r#"{"pattern":"*.rs"}"#);
+        second.emit_tool_call("Glob_0", "Glob", r#"{"pattern":"*.rs"}"#);
+
+        let first_id = match first_rx.try_recv().unwrap() {
+            AgentStreamEvent::ToolCall(data) => data.call_id,
+            other => panic!("Expected ToolCall, got {other:?}"),
+        };
+        let second_id = match second_rx.try_recv().unwrap() {
+            AgentStreamEvent::ToolCall(data) => data.call_id,
+            other => panic!("Expected ToolCall, got {other:?}"),
+        };
+
+        assert_eq!(first_id, "aionrs-conv-a-Glob_0");
+        assert_eq!(second_id, "aionrs-conv-b-Glob_0");
+        assert_ne!(first_id, second_id);
     }
 
     #[test]
@@ -370,7 +400,7 @@ mod tests {
     #[test]
     fn no_panic_when_no_receivers() {
         let (tx, _) = broadcast::channel(16);
-        let sink = BackendOutputSink::new(tx);
+        let sink = BackendOutputSink::new(CONVERSATION_ID.to_string(), tx);
         sink.emit_text_delta("hello", "msg-1");
         sink.emit_thinking("thought", "msg-1");
         sink.emit_tool_call("call_read_1", "Read", "{}");

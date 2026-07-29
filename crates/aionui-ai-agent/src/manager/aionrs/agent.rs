@@ -142,7 +142,8 @@ impl AionrsAgentManager {
         resume_session: Option<Session>,
     ) -> Result<Self, AgentError> {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
-        let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
+        let sink: Arc<dyn OutputSink> =
+            Arc::new(BackendOutputSink::new(conversation_id.clone(), runtime.event_sender()));
         let runtime_env = config_extra.runtime_env.clone();
         let image_input_override = config_extra.compat_overrides.image_input;
         let image_input_capability = image_input_override.unwrap_or_else(|| {
