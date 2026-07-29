@@ -1631,7 +1631,7 @@ mod tests {
         assert_eq!(pi.agent_source_info.binary_name.as_deref(), Some("pi"));
         assert_eq!(pi.agent_source_info.bridge_binary.as_deref(), Some("npx"));
         assert_eq!(pi.native_skills_dirs.as_deref(), Some(&[".pi/skills".to_owned()][..]));
-        assert!(!pi.team_capable);
+        assert!(pi.team_capable);
         assert_eq!(pi.yolo_id, None);
         assert_eq!(
             pi.handshake
