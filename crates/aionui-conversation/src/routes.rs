@@ -9,10 +9,11 @@ use axum::routing::{get, patch, post};
 use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery,
-    MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
-    SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse,
+    ConversationProjectListResponse, ConversationResponse, CreateConversationRequest,
+    EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -108,6 +109,7 @@ impl From<ConversationError> for ApiError {
 pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
         .route("/api/conversations", post(create).get(list))
+        .route("/api/conversation-projects", get(list_projects))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/associated", get(associated))
@@ -138,6 +140,14 @@ async fn create(
     let Json(req) = body.map_err(ApiError::from)?;
     let conversation = state.service.create(&user.id, req).await.map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
+}
+
+async fn list_projects(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<ConversationProjectListResponse>>, ApiError> {
+    let result = state.service.list_projects(&user.id).await.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
 }
 
 async fn list(
