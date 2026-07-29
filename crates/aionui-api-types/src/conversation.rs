@@ -62,6 +62,10 @@ pub struct CreateConversationRequest {
     pub assistant: Option<AssistantConversationRequest>,
     pub source: Option<ConversationSource>,
     pub channel_chat_id: Option<String>,
+    /// Existing backend session to resume when materializing an externally
+    /// discovered ACP conversation. Ordinary new conversations leave this unset.
+    #[serde(default)]
+    pub resume_session_id: Option<String>,
     pub extra: serde_json::Value,
 }
 
@@ -339,6 +343,7 @@ mod tests {
             },
             "source": "aionui",
             "channel_chat_id": "user:123",
+            "resume_session_id": "thread-existing",
             "extra": { "workspace": "/project" }
         });
         let req: CreateConversationRequest = serde_json::from_value(raw).unwrap();
@@ -362,6 +367,7 @@ mod tests {
         );
         assert_eq!(req.source, Some(ConversationSource::Aionui));
         assert_eq!(req.channel_chat_id.as_deref(), Some("user:123"));
+        assert_eq!(req.resume_session_id.as_deref(), Some("thread-existing"));
         assert_eq!(req.extra["workspace"], "/project");
     }
 
@@ -378,6 +384,7 @@ mod tests {
         assert!(req.assistant.is_none());
         assert!(req.source.is_none());
         assert!(req.channel_chat_id.is_none());
+        assert!(req.resume_session_id.is_none());
     }
 
     #[test]

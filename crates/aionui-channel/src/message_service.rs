@@ -177,6 +177,7 @@ impl ChannelMessageService {
             }),
             source: Some(source),
             channel_chat_id: session.chat_id.clone(),
+            resume_session_id: None,
             extra,
         };
 

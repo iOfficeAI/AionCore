@@ -392,6 +392,7 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
                     }),
                     source: None,
                     channel_chat_id: None,
+                    resume_session_id: None,
                     extra: request.extra,
                 },
             )

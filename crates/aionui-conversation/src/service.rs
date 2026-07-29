@@ -744,6 +744,15 @@ impl ConversationService {
         let id = generate_short_id();
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
+        let resume_session_id = match req.resume_session_id.as_deref() {
+            Some(value) if value.trim().is_empty() => {
+                return Err(ConversationError::BadRequest {
+                    reason: "resume_session_id must not be empty".into(),
+                });
+            }
+            Some(value) => Some(value.trim().to_owned()),
+            None => None,
+        };
 
         let mut extra = req.extra;
 
@@ -773,6 +782,12 @@ impl ConversationService {
         };
         let explicit_type = req.r#type;
         let effective_type = resolve_create_agent_type(explicit_type, assistant_snapshot.as_ref())?;
+
+        if resume_session_id.is_some() && effective_type != AgentType::Acp {
+            return Err(ConversationError::BadRequest {
+                reason: "resume_session_id is only accepted for ACP conversations".into(),
+            });
+        }
 
         if !effective_type.supports_new_conversation() {
             info!(
@@ -1220,6 +1235,19 @@ impl ConversationService {
         if effective_type == AgentType::Acp {
             self.create_acp_session_row(&id, &extra, assistant_snapshot.as_ref())
                 .await?;
+            if let Some(session_id) = resume_session_id.as_deref() {
+                let updated = self
+                    .acp_session_repo
+                    .update_session_id(&id, session_id)
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("Failed to bind resumed ACP session: {e}")))?;
+                if !updated {
+                    return Err(ConversationError::internal(
+                        "Failed to bind resumed ACP session: acp_session row was not found",
+                    ));
+                }
+                info!("Bound conversation to an existing ACP session");
+            }
         }
 
         if let Some(snapshot) = assistant_snapshot.as_ref() {

@@ -908,6 +908,10 @@ impl StubAcpSessionRepo {
         self.runtime_state_saves.lock().unwrap().clone()
     }
 
+    fn session_id(&self) -> Option<String> {
+        self.session_id.lock().unwrap().clone()
+    }
+
     fn row_for(&self, conversation_id: &str) -> AcpSessionRow {
         AcpSessionRow {
             conversation_id: conversation_id.to_owned(),
@@ -2419,6 +2423,47 @@ async fn clone_without_source_creates_new() {
     let events = broadcaster.take_events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].data["action"], "created");
+}
+
+#[tokio::test]
+async fn create_binds_an_explicit_acp_resume_session_before_returning() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::default());
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_repo.clone(),
+    );
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "Canonical task",
+        "resume_session_id": "thread-existing",
+        "extra": {
+            "workspace": workspace,
+            "backend": "codex"
+        }
+    }))
+    .unwrap();
+
+    let response = svc.create("user_1", req).await.unwrap();
+
+    assert_eq!(response.name, "Canonical task");
+    assert_eq!(acp_repo.session_id().as_deref(), Some("thread-existing"));
+}
+
+#[tokio::test]
+async fn create_rejects_resume_session_for_non_acp_conversation() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "aionrs",
+        "resume_session_id": "thread-existing",
+        "extra": { "workspace": workspace }
+    }))
+    .unwrap();
+
+    let error = svc.create("user_1", req).await.unwrap_err();
+
+    assert!(matches!(error, ConversationError::BadRequest { reason } if reason.contains("only accepted for ACP")));
 }
 
 // ── Reset tests ───────────────────────────────────────────────────
