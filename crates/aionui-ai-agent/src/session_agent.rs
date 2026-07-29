@@ -1190,6 +1190,33 @@ fn spec_mode_model(
     (spec, mode, model)
 }
 
+/// Feature 015 F2: settings-derived spawn-mode fallback, claude-only. Applies
+/// ONLY when the `spec_mode_model` precedence chain resolved nothing (no
+/// interactive switch persisted, no create-time seed) — an explicit choice is
+/// never overridden. `resolve` is lazy (file IO happens only on the fallback
+/// path) and injected so the wiring is unit-testable without touching the real
+/// machine's claude settings. Its output is always a valid `--permission-mode`
+/// wire value by construction (`claude_settings` normalizes via the adapter's
+/// alias table), so no re-normalization here.
+fn apply_claude_mode_fallback(
+    backend_label: &str,
+    conversation_id: &str,
+    mode: Option<String>,
+    resolve: impl FnOnce() -> aionui_session::claude_settings::ResolvedDefaultMode,
+) -> Option<String> {
+    if backend_label != "claude" || mode.is_some() {
+        return mode;
+    }
+    let resolved = resolve();
+    tracing::info!(
+        conv_id = %conversation_id,
+        mode = %resolved.mode,
+        source = ?resolved.source,
+        "claude: no persisted/create-time mode; spawn mode seeded from claude settings defaultMode"
+    );
+    Some(resolved.mode)
+}
+
 /// Build a claude/codex `SessionAgentTask` (the session-model port's `IAgentTask`)
 /// from a resolved ACP build request, or `Ok(None)` for a non-session backend.
 ///
@@ -1233,6 +1260,22 @@ pub async fn build_session_instance(
     // snapshot-wins precedence). Extracted so it is unit-testable in isolation, the
     // exact sibling of clean-slate's `spec_and_config`.
     let (spec, mode, model) = spec_mode_model(&conversation_id, backend_session_id, config, session_snapshot, metadata);
+
+    // Feature 015 F2 (ELECTRON-3R4): a claude conversation with NO persisted or
+    // create-time mode selection used to harden into the fail-closed
+    // `--permission-mode default`, silently overriding the user's machine-level
+    // claude-settings `permissions.defaultMode` — a regression against the legacy
+    // ACP adapter, which resolved that setting per session. Restore it as the LAST
+    // step of the precedence chain (snapshot > config > settings), still passed as
+    // an explicit flag downstream (fail-closed: an absent/unparsable settings chain
+    // resolves to "default", byte-identical to the previous hard-code). No bespoke
+    // persist or UI write is needed: open_session seeds `caps.current_mode` from
+    // `config.mode` (picker truth from the first `runtime/ensure`), and claude
+    // echoes the flag on `system/init` → `sniff_mode` → `ConfigChanged{mode}` →
+    // the event pump's `save_runtime_state` lands it in `current_mode_id`.
+    let mode = apply_claude_mode_fallback(backend_label, &conversation_id, mode, || {
+        aionui_session::claude_settings::resolve_claude_default_mode(Some(std::path::Path::new(&workspace)))
+    });
 
     // GAP #3 — MCP init surface: resolve user-configured servers to the neutral
     // spec (clean-slate resolve_session_init), fold in the inline snapshot, then
@@ -2991,6 +3034,34 @@ mod build_mapping_tests {
         };
         let (_s, mode, _m) = spec_mode_model("c", None, &plan_cfg, None, &test_metadata(Some("claude"), None));
         assert_eq!(mode.as_deref(), Some("plan"), "non-alias mode unchanged");
+    }
+
+    // Feature 015 F2 (T6 wiring axis): the settings fallback fires ONLY for
+    // claude AND only when the snapshot/config precedence chain resolved nothing.
+    // An explicit choice must never be overridden, and no settings IO may happen
+    // off the fallback path (the resolver closure panics if invoked).
+    #[test]
+    fn claude_mode_fallback_applies_only_when_unset() {
+        use aionui_session::claude_settings::{DefaultModeSource, ResolvedDefaultMode};
+
+        // claude + no mode → resolver consulted, its value adopted.
+        let mode = apply_claude_mode_fallback("claude", "conv_1", None, || ResolvedDefaultMode {
+            mode: "bypassPermissions".into(),
+            source: DefaultModeSource::User,
+        });
+        assert_eq!(mode.as_deref(), Some("bypassPermissions"));
+
+        // claude + explicit mode → untouched, resolver never invoked.
+        let mode = apply_claude_mode_fallback("claude", "conv_1", Some("plan".into()), || {
+            panic!("resolver must not run when a mode is already resolved")
+        });
+        assert_eq!(mode.as_deref(), Some("plan"));
+
+        // non-claude backend → untouched (None stays None), resolver never invoked.
+        let mode = apply_claude_mode_fallback("codex", "conv_1", None, || {
+            panic!("resolver must not run for a non-claude backend")
+        });
+        assert_eq!(mode, None);
     }
 
     /// G5: a discovered catalog projects mode/model as ACP `configOptions[]` + slash

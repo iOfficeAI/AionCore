@@ -150,15 +150,22 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
         args.push("--strict-mcp-config".to_string());
     }
 
-    // SECURITY (fail-CLOSED): ALWAYS pass --permission-mode. Omitting it makes claude
-    // headless default to `bypassPermissions` — LIVE-PROBED: `system/init` reports
-    // `permissionMode: bypassPermissions` and Write/Bash auto-run with NO `can_use_tool`
-    // prompt. config.mode is `None` for an ordinary claude session (the create path
-    // does not seed it; an interactive switch is in-band + persisted to extra, read
-    // back into config.mode on the next spawn), so gating the flag on `Some` silently
-    // downgraded every default session to the most-permissive mode. Default to
-    // "default" (standard prompts) so a session with no explicit choice is gated, not
-    // bypassed. `default`/`acceptEdits`/`bypassPermissions`/`plan`/`dontAsk`/`auto` are
+    // SECURITY (fail-CLOSED): ALWAYS pass --permission-mode, so the spawn mode is
+    // deterministic and UI-visible. Omitting the flag makes the CLI resolve its own
+    // settings hierarchy `permissions.defaultMode` (managed > local project >
+    // project > user; fallback "default") — LIVE-PROBED 2.1.220: a clean
+    // `CLAUDE_CONFIG_DIR` inits `permissionMode: default`, while a user
+    // settings.json carrying `defaultMode: bypassPermissions` inits bypass. (An
+    // earlier revision of this comment claimed omission hard-defaults to
+    // `bypassPermissions`; that probe read a dev machine whose settings.json set
+    // exactly that — the CLI was honoring settings, not defaulting open.)
+    // config.mode arrives here already resolved by `build_session_instance`:
+    // persisted switch > create-time seed > the SAME settings hierarchy
+    // (`claude_settings::resolve_claude_default_mode`, feature 015 F2) — so an
+    // explicit flag no longer overrides the user's configured default; it ECHOES
+    // it. A still-empty mode (non-session callers, tests) falls back to "default"
+    // (standard prompts): gated, not bypassed.
+    // `default`/`acceptEdits`/`bypassPermissions`/`plan`/`dontAsk`/`auto` are
     // claude's exact accepted wire values — the whitelist is a SUPERSET of the advertised
     // picker (which omits `auto`; see `claude_permission_modes`) so a resumed session that
     // carries `auto` is not downgraded/crashed.
@@ -172,23 +179,7 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
     // "default" (a WARN records the drop) rather than crashing the process. Mirrors
     // the ACP path's `clear_invalid_desired_mode` (drop-if-not-in-catalog) — a
     // protection the port had wired but never called.
-    let mode = config
-        .mode
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter(|m| {
-            let ok = crate::adapter::is_valid_claude_permission_mode(m);
-            if !ok {
-                tracing::warn!(
-                    requested_mode = %m,
-                    "claude: ignoring unrecognized --permission-mode (would crash spawn); \
-                     falling back to \"default\""
-                );
-            }
-            ok
-        })
-        .unwrap_or("default");
+    let mode = effective_permission_mode(config.mode.as_deref());
     args.push("--permission-mode".to_string());
     args.push(mode.to_string());
 
@@ -233,6 +224,60 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
         args.push(model.to_string());
     }
 
+    args
+}
+
+/// The exact value `build_claude_init_args` puts on `--permission-mode`:
+/// `config.mode` when non-empty AND spawn-safe per the whitelist, else the
+/// fail-closed "default". Also consumed by `spawn` as the reference value for
+/// the S5 drift tripwire (claude's `system/init` echo is compared against it),
+/// so the flag and the tripwire can never disagree.
+fn effective_permission_mode(requested: Option<&str>) -> &str {
+    requested
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|m| {
+            let ok = crate::adapter::is_valid_claude_permission_mode(m);
+            if !ok {
+                tracing::warn!(
+                    requested_mode = %m,
+                    "claude: ignoring unrecognized --permission-mode (would crash spawn); \
+                     falling back to \"default\""
+                );
+            }
+            ok
+        })
+        .unwrap_or("default")
+}
+
+/// Append `--add-dir` grants for the HTTP-upload staging dirs. Pasted images /
+/// uploaded attachments land in `<tmp>/aionui/<conversation_id>` (home-page
+/// uploads in `<tmp>/aionui/general`) — both OUTSIDE the workspace cwd, so under
+/// the fail-closed `--permission-mode default` the model's Read of an attachment
+/// raises a `can_use_tool` permission prompt (denied → "the pasted image displays
+/// but is never recognized", ELECTRON-3R4). Scoping the grant to exactly these
+/// two dirs keeps the fail-closed posture for everything else. Both dirs are
+/// created up-front (idempotent); a create failure is WARN-only — an unwritable
+/// temp dir already breaks uploads themselves, the spawn must not die with it
+/// (claude tolerates a missing `--add-dir` target — live-probed 2.1.220).
+///
+/// Appended to the init args so ALL spawn paths inherit the grant: Fresh,
+/// Resume, and the wake-recipe respawn (which carries `spawn_args` verbatim).
+async fn with_upload_add_dirs(mut args: Vec<String>, conversation_id: &str) -> Vec<String> {
+    for dir in [
+        aionui_common::paths::uploads_dir(Some(conversation_id)),
+        aionui_common::paths::uploads_dir(None),
+    ] {
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "upload staging dir create failed; passing --add-dir anyway"
+            );
+        }
+        args.push("--add-dir".to_string());
+        args.push(dir.to_string_lossy().into_owned());
+    }
     args
 }
 
@@ -294,6 +339,11 @@ impl BackendConnection for ClaudeConnection {
         // by position. The SAME args are threaded into the wake recipe so a
         // crash/idle-reap respawn re-applies them (R16 continuity).
         let init_args = build_claude_init_args(&config);
+        // ELECTRON-3R4: grant read access to the upload staging dirs (out-of-cwd
+        // temp) so attachment Reads don't dead-end on a permission prompt. See
+        // `with_upload_add_dirs`. logical_id == the conversation id (the upload
+        // dir key) on both Fresh and Resume.
+        let init_args = with_upload_add_dirs(init_args, &logical_id).await;
         let spawn_args = prepend_args(&init_args, &config.extra_args);
 
         // Spawn the persistent process via the legacy adapter (reuses the exact
@@ -524,6 +574,12 @@ struct ClaudeReaderState {
     /// `sniff_set_config_reject` can surface a rejection as a `Notice{Warning}`
     /// (shared Arc with `ClaudeSessionBackend.pending_set_config`).
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// S5 (feature 015): the exact `--permission-mode` value this session was
+    /// spawned with (`effective_permission_mode`). `sniff_mode` compares the FIRST
+    /// observed `permissionMode` (claude's init echo) against it and WARNs on a
+    /// mismatch — the tripwire for a silently overridden flag (managed policy,
+    /// root bypass-refusal, CLI behavior change). Behavior otherwise unchanged.
+    requested_mode: String,
 }
 
 /// Spawn a claude stdout reader over `stdout`/`io` using the shared state. Used
@@ -549,6 +605,7 @@ fn start_claude_reader(
             state.turn_in_flight,
             state.current_mode_override,
             state.pending_set_config,
+            state.requested_mode,
         )
         .await;
     })
@@ -607,6 +664,10 @@ impl ClaudeSessionBackend {
             turn_in_flight: turn_in_flight.clone(),
             current_mode_override: current_mode_override.clone(),
             pending_set_config: pending_set_config.clone(),
+            // S5: the same value `build_claude_init_args` put on the flag. A
+            // post-wake reader reuses it — harmless, since the drift check only
+            // fires on the first-ever observation (override is Some by then).
+            requested_mode: effective_permission_mode(config.mode.as_deref()).to_string(),
         };
         let reader = start_claude_reader(&reader_state, stdout, io.clone());
 
@@ -1083,6 +1144,7 @@ async fn reader_task(
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
     current_mode_override: Arc<std::sync::Mutex<Option<String>>>,
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    requested_mode: String,
 ) {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
@@ -1160,7 +1222,14 @@ async fn reader_task(
                 // exits plan mode on its own → emits ONLY system/status). It replaces the
                 // old optimistic dispatch emit (de-optimistic'd). normal→default normalized;
                 // dedups so a repeated init/status echo of the same mode is silent.
-                sniff_mode(v, &current_mode_override, &event_tx, &session_id, cur_gen);
+                sniff_mode(
+                    v,
+                    &current_mode_override,
+                    &event_tx,
+                    &session_id,
+                    cur_gen,
+                    &requested_mode,
+                );
                 // The ONE case system/status can't cover: a REJECTED set_permission_mode
                 // (claude refused → no status, only a control_response error). Clears the
                 // stale override + surfaces mode_switch_rejected.
@@ -1638,6 +1707,7 @@ fn sniff_mode(
     event_tx: &broadcast::Sender<SessionEnvelope>,
     session_id: &str,
     turn_gen: u64,
+    requested_mode: &str,
 ) {
     use serde_json::Value;
     if frame.get("type").and_then(Value::as_str) != Some("system") {
@@ -1653,6 +1723,20 @@ fn sniff_mode(
         let mut cur = current_mode_override.lock().unwrap_or_else(|e| e.into_inner());
         if cur.as_deref() == Some(mode) {
             return;
+        }
+        // S5 drift tripwire (feature 015): the FIRST observation is claude's init
+        // echo of the spawn's `--permission-mode` flag; a mismatch means the flag
+        // was overridden out-of-band (managed settings policy, root refusing
+        // bypass, a CLI behavior change). Later transitions are legitimate in-band
+        // switches, never compared. WARN-only — the observed value stays
+        // authoritative either way.
+        if cur.is_none() && mode != requested_mode {
+            tracing::warn!(
+                conversation_id = %session_id,
+                requested = %requested_mode,
+                effective = %mode,
+                "claude: initial permissionMode differs from the spawn-requested --permission-mode"
+            );
         }
         *cur = Some(mode.to_string());
     }
@@ -5010,6 +5094,76 @@ mod tests {
         assert_eq!(tok.map(|e| e.value.as_str()), Some("tok-123"));
     }
 
+    /// ELECTRON-3R4 (feature 015 S1/T1): every claude spawn grants `--add-dir` for
+    /// the two upload staging dirs — `<tmp>/aionui/<conversation_id>` (in-conversation
+    /// uploads) and `<tmp>/aionui/general` (home-page uploads) — in that fixed order,
+    /// and creates both dirs up-front so the grant never points at a missing path.
+    #[tokio::test]
+    async fn open_session_grants_add_dir_for_upload_dirs() {
+        use crate::testing::FakeSpawner;
+        let spawner = Arc::new(FakeSpawner::new());
+        let conn = ClaudeConnection::new(spawner.clone());
+        let sid = "33333333-3333-4333-8333-333333333333";
+        let _ = conn
+            .open_session(SessionSpec::Fresh { session_id: sid.into() }, SessionConfig::default())
+            .await;
+        let spec = spawner.last_command().await.expect("a spawn was recorded");
+        let conv_dir = aionui_common::paths::uploads_dir(Some(sid));
+        let general_dir = aionui_common::paths::uploads_dir(None);
+        let pairs: Vec<&str> = spec
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--add-dir")
+            .map(|(i, _)| spec.args[i + 1].as_str())
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                conv_dir.to_string_lossy().as_ref(),
+                general_dir.to_string_lossy().as_ref()
+            ],
+            "exactly two --add-dir grants, conversation dir first, got args {:?}",
+            spec.args
+        );
+        assert!(conv_dir.is_dir(), "conversation upload dir created before spawn");
+        assert!(general_dir.is_dir(), "general upload dir created before spawn");
+    }
+
+    /// ELECTRON-3R4 (feature 015 S1): the Resume spawn path carries the same
+    /// `--add-dir` grants — the upload-dir key is the LOGICAL conversation id,
+    /// not the claude backend session id being resumed.
+    #[tokio::test]
+    async fn open_session_resume_grants_same_add_dirs() {
+        use crate::testing::FakeSpawner;
+        let spawner = Arc::new(FakeSpawner::new());
+        let conn = ClaudeConnection::new(spawner.clone());
+        let sid = "44444444-4444-4444-8444-444444444444";
+        let _ = conn
+            .open_session(
+                SessionSpec::Resume {
+                    session_id: sid.into(),
+                    backend_session_id: Some("55555555-5555-4555-8555-555555555555".into()),
+                },
+                SessionConfig::default(),
+            )
+            .await;
+        let spec = spawner.last_command().await.expect("a spawn was recorded");
+        assert!(
+            spec.args.iter().any(|a| a == "--resume"),
+            "resume spec routes --resume, got {:?}",
+            spec.args
+        );
+        let conv_dir = aionui_common::paths::uploads_dir(Some(sid));
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|w| w[0] == "--add-dir" && w[1] == conv_dir.to_string_lossy()),
+            "resume spawn grants the conversation upload dir (keyed by LOGICAL id), got {:?}",
+            spec.args
+        );
+    }
+
     /// #103 parity: an empty `spawn_env` (no cc-switch config, or a non-claude backend
     /// the app never fills) yields an empty `CommandSpec.env` — byte-identical to the
     /// pre-#103 spawn (inherit the parent env only).
@@ -5206,6 +5360,141 @@ mod tests {
             modes,
             vec!["plan".to_string(), "bypassPermissions".to_string()],
             "two distinct modes emit (incl the autonomous plan→bypass exit); the repeat is deduped"
+        );
+    }
+
+    /// S5 drift tripwire (feature 015 / T7): the FIRST observed `permissionMode`
+    /// is claude's init echo of the spawn's `--permission-mode`; a mismatch WARNs
+    /// (flag silently overridden — managed policy, root bypass-refusal, CLI
+    /// change), a match stays silent, and a LATER change (in-band switch) never
+    /// re-fires. Behavior (override adoption + ConfigChanged) is unchanged either
+    /// way. `build_with_io` spawns with a default config → requested = "default".
+    #[tokio::test]
+    async fn sniff_mode_warns_when_first_observed_mode_differs_from_requested() {
+        #[derive(Clone, Default)]
+        struct VecWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for VecWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = VecWriter::default();
+        let sink = captured.clone();
+        // Thread-local default: the reader task runs on this same thread under the
+        // current-thread test runtime, so its WARN lands in this subscriber.
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(move || sink.clone())
+                .with_max_level(tracing::Level::WARN)
+                .finish(),
+        );
+        let drift_msg = "initial permissionMode differs from the spawn-requested";
+
+        // Frame 1: first observation bypassPermissions ≠ requested "default" → WARN.
+        // Frame 2: a later in-band-style change ("plan") must NOT re-fire the tripwire.
+        let frames = concat!(
+            r#"{"type":"system","subtype":"init","permissionMode":"bypassPermissions","session_id":"s"}"#,
+            "\n",
+            r#"{"type":"system","subtype":"status","permissionMode":"plan","session_id":"s"}"#,
+            "\n",
+        );
+        let backend =
+            ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(frames.as_bytes().to_vec())))
+                .await;
+        let mut events = backend.events();
+        let mut modes: Vec<String> = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(600), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::ConfigChanged { mode: Some(m), .. } = env.event {
+                    modes.push(m);
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            modes,
+            vec!["bypassPermissions".to_string(), "plan".to_string()],
+            "drift changes nothing about adoption/emission"
+        );
+        let logs = String::from_utf8_lossy(&captured.0.lock().unwrap()).to_string();
+        assert_eq!(
+            logs.matches(drift_msg).count(),
+            1,
+            "exactly one drift WARN (first observation only, later switches exempt): {logs}"
+        );
+        assert!(
+            logs.contains("bypassPermissions") && logs.contains("default"),
+            "WARN carries requested + effective: {logs}"
+        );
+
+        // Control: first observation MATCHING the requested mode ("normal" is
+        // claude's alias for "default") → no WARN at all.
+        let captured = VecWriter::default();
+        let sink = captured.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(move || sink.clone())
+                .with_max_level(tracing::Level::WARN)
+                .finish(),
+        );
+        let frame = r#"{"type":"system","subtype":"init","permissionMode":"normal","session_id":"s"}"#;
+        let backend = ClaudeSessionBackend::build_with_io(
+            "s",
+            Box::new(FakeAgentIo::never_exits(format!("{frame}\n").into_bytes())),
+        )
+        .await;
+        let mut events = backend.events();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(600), async {
+            while let Some(env) = events.next().await {
+                if matches!(env.event, SessionEvent::ConfigChanged { .. }) {
+                    return;
+                }
+            }
+        })
+        .await;
+        let logs = String::from_utf8_lossy(&captured.0.lock().unwrap()).to_string();
+        assert!(
+            !logs.contains(drift_msg),
+            "matching init echo must not trip the drift WARN: {logs}"
+        );
+    }
+
+    /// Feature 015 F2 (T5 link): the mode `build_session_instance` resolved into
+    /// `config.mode` (persisted switch > create seed > claude-settings fallback)
+    /// becomes `capabilities().current_mode` AT OPEN — before any wire frame — so
+    /// the first `runtime/ensure` → `get_config_options` already serves the
+    /// settings-seeded value (no "default, then flips after the first message"
+    /// picker flicker).
+    #[tokio::test]
+    async fn open_seeds_current_mode_from_config_before_any_wire_frame() {
+        let wake = ClaudeWakeRecipe {
+            spawner: Arc::new(crate::testing::FakeSpawner::new()),
+            claude_session_id: "s".into(),
+            cwd: None,
+            extra_args: Vec::new(),
+            env: Vec::new(),
+            cli_program: None,
+        };
+        let config = SessionConfig {
+            mode: Some("bypassPermissions".into()),
+            ..Default::default()
+        };
+        let backend = ClaudeSessionBackend::spawn(
+            "s".to_string(),
+            ClaudeAdapter::new(),
+            Box::new(FakeAgentIo::never_exits(Vec::new())),
+            config,
+            wake,
+        )
+        .await;
+        assert_eq!(
+            backend.capabilities().current_mode.as_deref(),
+            Some("bypassPermissions"),
+            "config.mode must seed the picker's current_mode synchronously at open"
         );
     }
 

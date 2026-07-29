@@ -41,3 +41,6 @@ proptest.workspace = true
 # constructing a production RealSpawner without touching the real data dir.
 # Workspace-pinned; dev-only (never shipped). (uuid is a normal dep above.)
 tempfile.workspace = true
+# S5 drift-WARN test (feature 015): capture tracing output to assert the WARN
+# fires; the tripwire has no other observable effect by design.
+tracing-subscriber.workspace = true

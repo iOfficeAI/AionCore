@@ -35,6 +35,7 @@
 mod adapter;
 mod backend;
 mod capability;
+pub mod claude_settings;
 mod error;
 mod event;
 mod reducer;
