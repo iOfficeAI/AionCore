@@ -98,6 +98,9 @@ impl ChannelOrchestrator {
                 Ok(MessageResult::AlreadyProcessing) => {
                     info!(chat_id = %chat_id, "message ignored: already processing");
                 }
+                Ok(MessageResult::Ignored) => {
+                    // Reason already logged in handle_incoming_message.
+                }
                 Err(e) => {
                     error!(error = %e, "failed to handle incoming message");
                 }

@@ -186,6 +186,20 @@ impl PairingService {
         Ok(user.map(|u| u.id))
     }
 
+    /// Resolve a platform user to `(internal_id, authorized_at)` if authorized.
+    ///
+    /// `authorized_at` lets callers drop messages that predate authorization
+    /// (e.g. the pairing-trigger message redelivered by the platform) instead
+    /// of replaying them as chat messages.
+    pub async fn get_authorized_user(
+        &self,
+        platform_user_id: &str,
+        platform_type: &str,
+    ) -> Result<Option<(String, TimestampMs)>, ChannelError> {
+        let user = self.repo.get_user_by_platform(platform_user_id, platform_type).await?;
+        Ok(user.map(|u| (u.id, u.authorized_at)))
+    }
+
     /// Starts a background task that periodically cleans up expired
     /// pairing codes. Returns a `JoinHandle` that can be used to cancel
     /// the task on shutdown.
