@@ -3,12 +3,17 @@
 //! error-code mapping. Uses a real in-memory DB store + a fresh tempdir
 //! workspace, exercised through the axum router via `oneshot`.
 
+// `ApiError` is the type under test in the wire-mapping cases below.
+#![allow(clippy::disallowed_types)]
+
 use std::sync::Arc;
 
+use aionui_common::ApiError;
 use aionui_db::{Database, IProjectStore, SqliteProjectStore, init_database_memory};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::response::IntoResponse;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -17,6 +22,7 @@ use tower::ServiceExt;
 use super::{ProjectRouterState, project_routes};
 use crate::ProjectService;
 use crate::canonical::to_file_uri;
+use crate::types::ProjectError;
 
 /// Build a router over an in-memory-DB `ProjectService` with a fresh tempdir
 /// registered as the standard (workspace) project. Returns the project_id, the
@@ -59,6 +65,41 @@ async fn send(router: &Router, method: &str, uri: &str, body: Option<Value>) -> 
 
 fn folders_url(project_id: &str) -> String {
     format!("/api/projects/{project_id}/folders")
+}
+
+/// Render the `From<ProjectError> for ApiError` wire mapping to `(status,
+/// body)`. These errors are produced by `resolve_chat_message` (called from
+/// conversation/team), not by any route in this crate's router, so the mapping
+/// arc — HTTP status + stable `code` string the frontend branches on — must be
+/// asserted directly rather than through a request.
+async fn map_error(err: ProjectError) -> (StatusCode, Value) {
+    let response = ApiError::from(err).into_response();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    (status, body)
+}
+
+#[tokio::test]
+async fn local_path_not_readable_maps_to_400_with_stable_code() {
+    let (status, body) = map_error(ProjectError::LocalPathNotReadable {
+        path: "/host/file".into(),
+    })
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "local_path_not_readable");
+    assert_eq!(body["success"], false);
+}
+
+#[tokio::test]
+async fn upload_path_outside_root_maps_to_400_with_stable_code() {
+    let (status, body) = map_error(ProjectError::UploadPathOutsideRoot {
+        path: "/outside/root".into(),
+    })
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "upload_path_outside_root");
+    assert_eq!(body["success"], false);
 }
 
 #[tokio::test]

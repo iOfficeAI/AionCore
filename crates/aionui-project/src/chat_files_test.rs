@@ -135,6 +135,44 @@ async fn local_readable_file_resolves_and_inlines_marker() {
     assert_eq!(out.content, format!("see this\n\n{AIONUI_FILES_MARKER}\n{abs}"));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn local_canonicalizes_symlink_to_target_path() {
+    let (service, _pe, _dir, upload_root) = setup().await;
+    // A symlink whose name differs from its target, so we can prove the
+    // resolved path is the *target* (canonicalized), not the link we were given.
+    let d = tempfile::tempdir().unwrap();
+    let target = d.path().join("real_target.txt");
+    std::fs::write(&target, b"hi").unwrap();
+    let link = d.path().join("link_name.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let link_path = link.to_string_lossy().into_owned();
+
+    let out = service
+        .resolve_chat_message(
+            "x",
+            &[ChatFileRef::Local {
+                path: link_path.clone(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.files.len(), 1);
+    let resolved = &out.files[0];
+    // `canonicalize` collapses the symlink to the target's real path — this is
+    // the behavior a `PathBuf::from(path)` mutation would break.
+    let expected = std::fs::canonicalize(&target).unwrap().to_string_lossy().into_owned();
+    assert_eq!(resolved, &expected, "expected canonicalized target, got {resolved}");
+    assert!(
+        resolved.ends_with("real_target.txt"),
+        "should be target name, not link name"
+    );
+    assert_ne!(resolved, &link_path, "must not echo back the raw symlink path");
+    assert_eq!(out.content, format!("x\n\n{AIONUI_FILES_MARKER}\n{resolved}"));
+}
+
 #[tokio::test]
 async fn local_nonexistent_is_rejected() {
     let (service, _pe, _dir, upload_root) = setup().await;
