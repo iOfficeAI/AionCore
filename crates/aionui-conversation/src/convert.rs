@@ -74,6 +74,7 @@ pub fn row_to_response_with_extra(
         pinned_at: row.pinned_at,
         channel_chat_id: row.channel_chat_id,
         assistant: None,
+        project_id: row.project_id,
         created_at: row.created_at,
         modified_at: row.updated_at,
         extra,
@@ -366,6 +367,22 @@ mod tests {
         let resp = row_to_response(row, Path::new("/tmp/data")).unwrap();
         assert!(resp.source.is_none());
         assert!(resp.model.is_none());
+    }
+
+    #[test]
+    fn row_to_response_carries_project_id() {
+        let row = ConversationRow {
+            project_id: Some("prj_abc".into()),
+            ..make_row("acp", "pending", None, None, "{}")
+        };
+        let resp = row_to_response(row, Path::new("/tmp/data")).unwrap();
+        assert_eq!(resp.project_id.as_deref(), Some("prj_abc"));
+    }
+
+    #[test]
+    fn row_to_response_project_id_none_when_unbound() {
+        let resp = row_to_response(make_row("acp", "pending", None, None, "{}"), Path::new("/tmp/data")).unwrap();
+        assert_eq!(resp.project_id, None);
     }
 
     #[test]

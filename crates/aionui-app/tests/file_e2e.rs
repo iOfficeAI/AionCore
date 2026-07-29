@@ -487,13 +487,24 @@ async fn copy_files_to_workspace() {
     std::fs::write(src_dir.path().join("source.txt"), "content").unwrap();
 
     let ws_dir = tempfile::tempdir().unwrap();
+    // The copy destination is now pe-addressed: register ws_dir as a project so
+    // it has a pe_id the backend resolves to the absolute directory.
+    let created = services
+        .project_service
+        .create_standard(
+            "system_default_user",
+            aionui_project::canonical::to_file_uri(ws_dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let pe_id = created.project_explorer.pe_id;
 
     let req = json_with_token(
         "POST",
         "/api/fs/copy",
         json!({
             "file_paths": [src_dir.path().join("source.txt").to_str().unwrap()],
-            "workspace": ws_dir.path().to_str().unwrap()
+            "target": { "pe_id": pe_id, "relative_path": "" }
         }),
         &token,
         &csrf,
@@ -518,12 +529,23 @@ async fn copy_files_to_workspace_accepts_non_sandbox_source_and_target_roots() {
     let source_file = source_root.path().join("nested").join("source.txt");
     std::fs::write(&source_file, "copy me").unwrap();
 
+    // pe-addressed destination (the workspace dir need not be under file roots).
+    let created = services
+        .project_service
+        .create_standard(
+            "system_default_user",
+            aionui_project::canonical::to_file_uri(workspace.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let pe_id = created.project_explorer.pe_id;
+
     let req = json_with_token(
         "POST",
         "/api/fs/copy",
         json!({
             "file_paths": [source_file.to_str().unwrap()],
-            "workspace": workspace.path().to_str().unwrap(),
+            "target": { "pe_id": pe_id, "relative_path": "" },
             "source_root": source_root.path().to_str().unwrap()
         }),
         &token,

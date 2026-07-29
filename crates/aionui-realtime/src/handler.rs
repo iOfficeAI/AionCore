@@ -93,11 +93,13 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
     let (ws_sender, ws_receiver) = socket.split();
 
     let send_handle = tokio::spawn(send_loop(conn_id, rx, ws_sender));
-    recv_loop(conn_id, ws_receiver, &state).await;
+    recv_loop(conn_id, &user_id, ws_receiver, &state).await;
 
     // Recv loop exited — client disconnected or errored.
     send_handle.abort();
     state.manager.remove_client(conn_id);
+    // Let stateful routers release per-connection state (e.g. fs subscriptions).
+    state.router.on_disconnect(conn_id);
     info!(%conn_id, user_id = %user_id, "websocket connection closed");
 }
 
@@ -156,6 +158,7 @@ async fn send_loop(
 /// Reads messages from the WebSocket stream, parses JSON, routes.
 async fn recv_loop(
     conn_id: ConnectionId,
+    user_id: &str,
     mut receiver: futures_util::stream::SplitStream<WebSocket>,
     state: &WsHandlerState,
 ) {
@@ -170,7 +173,7 @@ async fn recv_loop(
 
         match msg {
             Message::Text(text) => {
-                handle_text_message(conn_id, &text, state);
+                handle_text_message(conn_id, user_id, &text, state);
             }
             Message::Close(_) => {
                 debug!(%conn_id, "received close frame");
@@ -184,7 +187,7 @@ async fn recv_loop(
 }
 
 /// Process a text message: parse JSON, dispatch to built-in or router.
-fn handle_text_message(conn_id: ConnectionId, text: &str, state: &WsHandlerState) {
+fn handle_text_message(conn_id: ConnectionId, user_id: &str, text: &str, state: &WsHandlerState) {
     let parsed: Result<WebSocketMessage<Value>, _> = serde_json::from_str(text);
 
     let msg = match parsed {
@@ -208,7 +211,7 @@ fn handle_text_message(conn_id: ConnectionId, text: &str, state: &WsHandlerState
             handle_subscribe_show_open(state, conn_id, msg.data);
         }
         name => {
-            if !state.router.route(conn_id, name, msg.data) {
+            if !state.router.route(conn_id, user_id, name, msg.data) {
                 send_realtime_error(state, conn_id, RealtimeError::UnsupportedMessage);
             }
         }
@@ -433,7 +436,7 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        handle_text_message(conn_id, r#"{"name":"pong","data":{}}"#, &state);
+        handle_text_message(conn_id, "user-1", r#"{"name":"pong","data":{}}"#, &state);
         // No panic = success (update_last_ping was called)
     }
 
@@ -444,7 +447,7 @@ mod tests {
         let conn_id = manager.add_client("tok".into(), tx);
         let state = test_state(manager);
 
-        handle_text_message(conn_id, "not json", &state);
+        handle_text_message(conn_id, "user-1", "not json", &state);
 
         let msg = rx.try_recv().unwrap();
         match msg {
@@ -462,7 +465,7 @@ mod tests {
         let conn_id = manager.add_client("tok".into(), tx);
         let state = test_state(manager);
 
-        handle_text_message(conn_id, r#"{"foo":"bar"}"#, &state);
+        handle_text_message(conn_id, "user-1", r#"{"foo":"bar"}"#, &state);
 
         let msg = rx.try_recv().unwrap();
         match msg {
@@ -480,7 +483,7 @@ mod tests {
         let conn_id = manager.add_client("tok".into(), tx);
         let state = test_state(manager);
 
-        handle_text_message(conn_id, r#"{"name":"","data":{}}"#, &state);
+        handle_text_message(conn_id, "user-1", r#"{"name":"","data":{}}"#, &state);
 
         let msg = rx.try_recv().unwrap();
         match msg {
@@ -499,7 +502,7 @@ mod tests {
             called: AtomicBool,
         }
         impl MessageRouter for TestRouter {
-            fn route(&self, _conn_id: ConnectionId, _name: &str, _data: Value) -> bool {
+            fn route(&self, _conn_id: ConnectionId, _user_id: &str, _name: &str, _data: Value) -> bool {
                 self.called.store(true, Ordering::Relaxed);
                 true
             }
@@ -522,6 +525,7 @@ mod tests {
 
         handle_text_message(
             conn_id,
+            "user-1",
             r#"{"name":"conversation.send-message","data":{"text":"hi"}}"#,
             &state,
         );
@@ -538,6 +542,7 @@ mod tests {
 
         handle_text_message(
             conn_id,
+            "user-1",
             r#"{"name":"conversation.send-message","data":{"text":"hi"}}"#,
             &state,
         );

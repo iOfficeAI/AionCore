@@ -215,6 +215,44 @@ impl WebSocketManager {
         self.send_raw_to(conn_id, WsOutbound::Text(text));
     }
 
+    /// Strict scoped delivery for **ordered** streams: on backpressure the
+    /// connection is dropped rather than the frame.
+    ///
+    /// For a feed whose consumer applies frames in arrival order with no
+    /// gap/version detection (the fs monitor protocol), silently dropping one
+    /// frame on a full channel desyncs the client with no way to notice or
+    /// recover. So a `Full` (or `Closed`) channel removes the client instead —
+    /// the connection tears down and the client reconnects and re-declares its
+    /// subscriptions, restoring consistency. Unlike [`Self::send_to`], which
+    /// keeps the connection alive and logs the drop (fine for the fire-and-forget
+    /// broadcast path, not for an ordered stream).
+    pub fn send_to_or_disconnect(&self, conn_id: ConnectionId, msg: WebSocketMessage<serde_json::Value>) {
+        let text = match serde_json::to_string(&msg) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(%conn_id, error = %e, "failed to serialize ordered unicast message");
+                return;
+            }
+        };
+
+        // Determine the outcome without holding the map guard across removal.
+        let drop_connection = match self.connections.get(&conn_id) {
+            Some(client) => matches!(
+                client.tx.try_send(WsOutbound::Text(text)),
+                Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_))
+            ),
+            None => false,
+        };
+        if drop_connection {
+            warn!(
+                %conn_id,
+                code = RealtimeError::Backpressure.code(),
+                "ordered stream backpressure, closing connection to force resync"
+            );
+            self.remove_client(conn_id);
+        }
+    }
+
     /// Send a raw outbound message to a specific connection.
     ///
     /// Used for non-`WebSocketMessage` payloads (e.g. error responses). A full
@@ -605,6 +643,48 @@ mod tests {
         drop(rx);
 
         mgr.send_to(id, WebSocketMessage::new("test", json!(null)));
+        assert_eq!(mgr.client_count(), 0);
+    }
+
+    #[test]
+    fn send_to_or_disconnect_delivers_when_capacity_available() {
+        let mgr = WebSocketManager::new();
+        let (tx, mut rx) = new_client_tx();
+        let id = mgr.add_client("tok".into(), tx);
+
+        mgr.send_to_or_disconnect(id, WebSocketMessage::new("fs", json!({"ok": true})));
+
+        assert!(rx.try_recv().is_ok(), "frame delivered");
+        assert_eq!(mgr.client_count(), 1, "connection kept when it fits");
+    }
+
+    #[test]
+    fn send_to_or_disconnect_closes_connection_on_full() {
+        let mgr = WebSocketManager::new();
+        // Capacity 1 so the second send saturates the channel.
+        let (tx, _rx) = mpsc::channel(1);
+        let id = mgr.add_client("tok".into(), tx);
+
+        mgr.send_to_or_disconnect(id, WebSocketMessage::new("fs", json!({})));
+        assert_eq!(mgr.client_count(), 1, "first send fills the buffer, connection alive");
+
+        // Second send hits a full channel → backpressure close (no silent drop).
+        mgr.send_to_or_disconnect(id, WebSocketMessage::new("fs", json!({})));
+        assert_eq!(
+            mgr.client_count(),
+            0,
+            "ordered-stream backpressure closes the connection"
+        );
+    }
+
+    #[test]
+    fn send_to_or_disconnect_removes_on_closed() {
+        let mgr = WebSocketManager::new();
+        let (tx, rx) = new_client_tx();
+        let id = mgr.add_client("tok".into(), tx);
+        drop(rx);
+
+        mgr.send_to_or_disconnect(id, WebSocketMessage::new("fs", json!({})));
         assert_eq!(mgr.client_count(), 0);
     }
 
