@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.54](https://github.com/iOfficeAI/AionCore/compare/v0.1.53...v0.1.54) (2026-07-29)
+
+
+### Features
+
+* multi-account user scope isolation ([#669](https://github.com/iOfficeAI/AionCore/issues/669)) ([7f8ed6c](https://github.com/iOfficeAI/AionCore/commit/7f8ed6c5d5a899984e23b1ae130640bdeaffd6dc))
+* **project:** Project Explorer backend (runtime, WS monitor, HTTP) ([#701](https://github.com/iOfficeAI/AionCore/issues/701)) ([0a79100](https://github.com/iOfficeAI/AionCore/commit/0a791002b0b43f0ac883a4b58b76336830041da0))
+* **scripts:** carry aionrs changelog into the bump PR ([#703](https://github.com/iOfficeAI/AionCore/issues/703)) ([f34cfb6](https://github.com/iOfficeAI/AionCore/commit/f34cfb61ba58266dfe8100cebc678925c9d67806))
+
+
+### Code Refactoring
+
+* **acp:** upgrade agent-client-protocol SDK 0.11.1 -&gt; 2.0.0 ([#708](https://github.com/iOfficeAI/AionCore/issues/708)) ([9e185f0](https://github.com/iOfficeAI/AionCore/commit/9e185f0b196e6945b4d716553968150cb162c7ba))
+
 ## [0.1.53](https://github.com/iOfficeAI/AionCore/compare/v0.1.52...v0.1.53) (2026-07-28)
 
 
