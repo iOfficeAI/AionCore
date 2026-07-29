@@ -113,6 +113,55 @@ async fn upload_under_root_is_accepted() {
 }
 
 #[tokio::test]
+async fn local_readable_file_resolves_and_inlines_marker() {
+    let (service, _pe, _dir, upload_root) = setup().await;
+    // A file anywhere on disk (outside the managed upload root) — `local` has no
+    // managed-directory restriction, only existence + is-file.
+    let outside = tempfile::tempdir().unwrap();
+    let f = outside.path().join("host.txt");
+    std::fs::write(&f, b"hi").unwrap();
+    let path = f.to_string_lossy().into_owned();
+
+    let out = service
+        .resolve_chat_message("see this", &[ChatFileRef::Local { path }], upload_root.path())
+        .await
+        .unwrap();
+
+    assert_eq!(out.files.len(), 1);
+    let abs = &out.files[0];
+    // Resolved to the canonicalized absolute path (symlinks/`..` collapsed).
+    assert!(std::path::Path::new(abs).is_file());
+    assert!(abs.ends_with("host.txt"));
+    assert_eq!(out.content, format!("see this\n\n{AIONUI_FILES_MARKER}\n{abs}"));
+}
+
+#[tokio::test]
+async fn local_nonexistent_is_rejected() {
+    let (service, _pe, _dir, upload_root) = setup().await;
+    let missing = upload_root.path().join("nope.txt").to_string_lossy().into_owned();
+
+    let err = service
+        .resolve_chat_message("x", &[ChatFileRef::Local { path: missing }], upload_root.path())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ProjectError::LocalPathNotReadable { .. }), "got {err:?}");
+}
+
+#[tokio::test]
+async fn local_directory_is_rejected() {
+    let (service, _pe, _dir, upload_root) = setup().await;
+    // A real directory is not a regular file → rejected.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().to_string_lossy().into_owned();
+
+    let err = service
+        .resolve_chat_message("x", &[ChatFileRef::Local { path }], upload_root.path())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ProjectError::LocalPathNotReadable { .. }), "got {err:?}");
+}
+
+#[tokio::test]
 async fn upload_outside_root_is_rejected() {
     let (service, _pe, _dir, upload_root) = setup().await;
     // A real file, but outside the managed upload dir.

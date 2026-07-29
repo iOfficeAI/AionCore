@@ -190,6 +190,11 @@ impl From<ProjectError> for ApiError {
                 "chat_file_missing",
                 Some(json!({ "path": path })),
             ),
+            ProjectError::LocalPathNotReadable { path } => (
+                StatusCode::BAD_REQUEST,
+                "local_path_not_readable",
+                Some(json!({ "path": path })),
+            ),
             ProjectError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", None),
         };
         // Never leak internal DB detail to clients (Security: no internal leakage).

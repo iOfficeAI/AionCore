@@ -179,6 +179,9 @@ pub enum ProjectError {
     #[error("attached file does not exist: {path}")]
     ChatFileMissing { path: String },
 
+    #[error("local file path is not a readable file: {path}")]
+    LocalPathNotReadable { path: String },
+
     #[error(transparent)]
     Database(#[from] DbError),
 }
@@ -205,6 +208,7 @@ impl ProjectError {
             ProjectError::UnsupportedResourceScheme { .. } => "unsupported_resource_scheme",
             ProjectError::UploadPathOutsideRoot { .. } => "upload_path_outside_root",
             ProjectError::ChatFileMissing { .. } => "chat_file_missing",
+            ProjectError::LocalPathNotReadable { .. } => "local_path_not_readable",
             ProjectError::Database(_) => "internal_db_error",
         }
     }

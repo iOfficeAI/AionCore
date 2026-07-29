@@ -32,7 +32,7 @@ pub struct ResolvedChatMessage {
 impl ProjectService {
     /// Resolve a message's `files` to absolute paths and return the inlined
     /// content. Atomic: any bad reference (unknown pe, escape, missing file,
-    /// out-of-root upload) fails the whole message.
+    /// out-of-root upload, unreadable local path) fails the whole message.
     ///
     /// `upload_root` is the managed upload directory (`temp_dir()/aionui`);
     /// `Upload` paths must live under it.
@@ -72,6 +72,19 @@ impl ProjectService {
                         return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
                     }
                     paths.push(path.clone());
+                }
+                ChatFileRef::Local { path } => {
+                    // A path the user explicitly picked in the host-file browser,
+                    // which already exposes the whole filesystem. No managed-root
+                    // restriction (that is the upload channel's D2 invariant only);
+                    // just canonicalize (collapsing `..`/symlinks) and require an
+                    // existing regular file.
+                    let canonical = std::fs::canonicalize(path)
+                        .map_err(|_| ProjectError::LocalPathNotReadable { path: path.clone() })?;
+                    if !canonical.is_file() {
+                        return Err(ProjectError::LocalPathNotReadable { path: path.clone() });
+                    }
+                    paths.push(canonical.to_string_lossy().into_owned());
                 }
             }
         }

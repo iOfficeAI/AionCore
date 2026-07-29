@@ -805,7 +805,8 @@ mod tests {
             "content": "Review this code",
             "files": [
                 { "kind": "project", "pe_id": "pe1", "relative_path": "src/a.rs" },
-                { "kind": "upload", "path": "/tmp/a.rs" }
+                { "kind": "upload", "path": "/tmp/a.rs" },
+                { "kind": "local", "path": "/Users/me/notes.txt" }
             ],
             "inject_skills": ["security-review"],
             "hidden": true
@@ -821,6 +822,9 @@ mod tests {
                 },
                 ChatFileRef::Upload {
                     path: "/tmp/a.rs".into()
+                },
+                ChatFileRef::Local {
+                    path: "/Users/me/notes.txt".into()
                 },
             ]
         );
