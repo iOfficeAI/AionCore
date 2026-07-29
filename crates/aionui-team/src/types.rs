@@ -152,6 +152,11 @@ pub struct Team {
     pub lead_agent_id: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    /// Currently active working session id (migration 030). `None` only on
+    /// legacy rows written before multi-session support; the service layer
+    /// resolves it to the team's primary session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_session_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +288,7 @@ impl Team {
             lead_agent_id: row.lead_agent_id.clone(),
             created_at: row.created_at,
             updated_at: row.updated_at,
+            active_session_id: row.active_session_id.clone(),
         })
     }
 
@@ -295,6 +301,7 @@ impl Team {
             leader_assistant_id: self.lead_agent_id.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
+            active_session_id: self.active_session_id.clone(),
         }
     }
 }
@@ -645,6 +652,7 @@ mod tests {
             updated_at: 2000,
             project_id: None,
             folder_id: None,
+            active_session_id: None,
         };
         let team = Team::from_row(&row).unwrap();
         assert_eq!(team.id, "t1");
@@ -674,6 +682,7 @@ mod tests {
             lead_agent_id: Some("s1".into()),
             created_at: 1000,
             updated_at: 2000,
+            active_session_id: None,
         };
         let resp = team.to_response();
         assert_eq!(resp.id, "t1");
@@ -701,6 +710,7 @@ mod tests {
             updated_at: 0,
             project_id: None,
             folder_id: None,
+            active_session_id: None,
         };
         assert!(Team::from_row(&row).is_err());
     }
@@ -741,6 +751,7 @@ mod tests {
             files: None,
             read: false,
             created_at: 1000,
+                    session_id: None,
         };
         let msg = MailboxMessage::from_row(&row).unwrap();
         assert_eq!(msg.msg_type, MailboxMessageType::Message);
@@ -760,6 +771,7 @@ mod tests {
             files: None,
             read: false,
             created_at: 2000,
+                    session_id: None,
         };
         let msg = MailboxMessage::from_row(&row).unwrap();
         assert_eq!(msg.msg_type, MailboxMessageType::IdleNotification);
@@ -779,6 +791,7 @@ mod tests {
             files: None,
             read: false,
             created_at: 0,
+                    session_id: None,
         };
         assert!(MailboxMessage::from_row(&row).is_none());
     }
@@ -819,6 +832,7 @@ mod tests {
             metadata: Some(r#"{"priority":"high"}"#.into()),
             created_at: 1000,
             updated_at: 2000,
+                    session_id: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::InProgress);
@@ -841,6 +855,7 @@ mod tests {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+                    session_id: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
@@ -863,6 +878,7 @@ mod tests {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+                    session_id: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
@@ -882,6 +898,7 @@ mod tests {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+                    session_id: None,
         };
         assert!(TeamTask::from_row(&row).is_err());
     }

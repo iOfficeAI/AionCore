@@ -703,10 +703,12 @@ async fn setup_session_with_turn_recorder_inner(
         lead_agent_id: Some("lead-1".into()),
         created_at: 1000,
         updated_at: 1000,
+        active_session_id: None,
     };
 
     let session = TeamSession::start(
         team,
+        "s1".to_owned(),
         repo_dyn,
         broadcaster,
         backend_path(),
@@ -761,10 +763,12 @@ async fn setup_session_with_runtime_ports(
         lead_agent_id: Some("lead-1".into()),
         created_at: 1000,
         updated_at: 1000,
+        active_session_id: None,
     };
 
     let session = TeamSession::start(
         team,
+        "s1".to_owned(),
         repo_dyn,
         broadcaster_dyn,
         backend_path(),
@@ -1093,6 +1097,7 @@ async fn s3c_finish_triggers_lead_wake_with_idle_notification() {
         .mailbox()
         .write(
             "e2e-team",
+            "s1",
             "worker-1",
             "lead-1",
             aionui_team::MailboxMessageType::Message,
@@ -1109,7 +1114,7 @@ async fn s3c_finish_triggers_lead_wake_with_idle_notification() {
         .set_status("worker-1", aionui_team::TeammateStatus::Working)
         .await
         .unwrap();
-    let _ = session.mailbox().read_unread("e2e-team", "worker-1").await;
+    let _ = session.mailbox().read_unread("e2e-team", "s1", "worker-1").await;
 
     // Worker finishes → IdleNotification → lead returned
     let wake_target = session.on_agent_finish("conv-worker", false).await.unwrap();
@@ -1205,6 +1210,7 @@ async fn s4_dynamic_agent_added_then_finish_propagates() {
         .mailbox()
         .write(
             "e2e-team",
+            "s1",
             "helper-1",
             "lead-1",
             aionui_team::MailboxMessageType::Message,
@@ -1535,6 +1541,7 @@ async fn turn_completion_reconciles_without_another_notify() {
         .mailbox()
         .write(
             "e2e-team",
+            "s1",
             "lead-1",
             "worker-1",
             aionui_team::MailboxMessageType::Message,
@@ -1653,7 +1660,7 @@ async fn one_notify_drains_five_intents_after_busy_turn() {
     assert!(
         session
             .mailbox()
-            .peek_unread("e2e-team", "lead-1")
+            .peek_unread("e2e-team", "s1", "lead-1")
             .await
             .unwrap()
             .is_empty()
@@ -1711,7 +1718,7 @@ async fn nonretryable_start_failure_is_terminal_and_not_recovered() {
     assert!(
         session
             .mailbox()
-            .peek_unread("e2e-team", "lead-1")
+            .peek_unread("e2e-team", "s1", "lead-1")
             .await
             .unwrap()
             .is_empty()
@@ -1754,7 +1761,7 @@ async fn retryable_start_requeues_without_marking_mailbox_read() {
         "run should remain active for a state-driven retry"
     );
     assert_eq!(
-        session.mailbox().peek_unread("e2e-team", "lead-1").await.unwrap().len(),
+        session.mailbox().peek_unread("e2e-team", "s1", "lead-1").await.unwrap().len(),
         1
     );
 

@@ -15,6 +15,7 @@ pub struct TeamConversationBindingLookup {
     pub team_id: Option<String>,
     pub slot_id: Option<String>,
     pub role: Option<String>,
+    pub session_id: Option<String>,
 }
 
 #[async_trait]

@@ -517,6 +517,12 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
                 .and_then(serde_json::Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned),
+            session_id: extra
+                .get("sessionId")
+                .or_else(|| extra.get("session_id"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
         }))
     }
 }

@@ -64,6 +64,7 @@ impl TeammateManager {
             self.mailbox
                 .write(
                     &self.team_id,
+                    &self.session_id,
                     &lead_slot_id,
                     slot_id,
                     MailboxMessageType::IdleNotification,

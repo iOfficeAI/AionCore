@@ -101,6 +101,7 @@ async fn setup_team_with_lead() -> SmokeEnv {
     ];
     let scheduler = Arc::new(TeammateManager::new(
         team_id.clone(),
+        "s1".to_owned(),
         &agents,
         mailbox.clone(),
         task_board.clone(),
@@ -309,7 +310,7 @@ async fn smoke_mcp_tool_execution_not_noop() {
         !is_error_response(&task_resp),
         "team_task_create returned error: {task_resp}"
     );
-    let tasks = env.task_board.list_tasks(&env.team_id).await.unwrap();
+    let tasks = env.task_board.list_tasks(&env.team_id, "s1").await.unwrap();
     assert!(
         tasks.iter().any(|t| t.subject == "Smoke test subject"),
         "team_task_create did not persist task, got {tasks:?}"

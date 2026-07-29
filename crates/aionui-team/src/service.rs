@@ -9,12 +9,12 @@ use std::sync::{Arc, RwLock, Weak};
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus,
-    TeamSessionStatusPayload, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
-    TeamToolTransport, WebSocketMessage,
+    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionAgentResponse, TeamSessionBinding,
+    TeamSessionPhase, TeamSessionResponse, TeamSessionStatus, TeamSessionStatusPayload, TeamToolCall,
+    TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
-use aionui_db::models::TeamRow;
+use aionui_db::models::{TeamRow, TeamSessionRow};
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
     ITeamRepository, UpdateTeamParams,
@@ -269,6 +269,13 @@ impl TeamSessionService {
     }
 
     async fn load_owned_team(&self, user_id: &str, team_id: &str) -> Result<Team, TeamError> {
+        let row = self.load_owned_team_row(user_id, team_id).await?;
+        Ok(Team::from_row(&row)?)
+    }
+
+    /// Like [`load_owned_team`] but returns the raw DB row (needed by callers
+    /// that read `active_session_id` / `session_mode` directly).
+    async fn load_owned_team_row(&self, user_id: &str, team_id: &str) -> Result<TeamRow, TeamError> {
         let row = self
             .repo
             .get_team(team_id)
@@ -279,7 +286,7 @@ impl TeamSessionService {
                 "team {team_id} is not owned by current user"
             )));
         }
-        Ok(Team::from_row(&row)?)
+        Ok(row)
     }
 
     pub async fn renew_active_lease(
@@ -370,9 +377,21 @@ impl TeamSessionService {
         let team_id = generate_id();
         let now = now_ms();
 
+        // Provision the team's primary working session id FIRST (migration
+        // 030) so each freshly-minted conversation carries it in its `extra`
+        // and is bound to it. The session row is persisted after the
+        // conversations exist (below).
+        let primary_session_id = generate_id();
+
         let provisioned = self
             .provisioner()
-            .provision_initial_agents(user_id, &team_id, &req.agents, shared_workspace.as_deref())
+            .provision_initial_agents(
+                user_id,
+                &team_id,
+                &primary_session_id,
+                &req.agents,
+                shared_workspace.as_deref(),
+            )
             .await?;
         let agents = provisioned.agents;
         let lead_agent_id = provisioned.lead_agent_id;
@@ -381,6 +400,33 @@ impl TeamSessionService {
 
         // Project-bind side branch (best-effort; never affects team creation).
         let (project_id, folder_id) = self.resolve_binding_best_effort(&team_workspace).await;
+
+        // Persist the primary session row and bind each roster slot's
+        // conversation to it. Every team owns at least one session; the
+        // primary is the default active session and the fallback target for
+        // session_id-less callers.
+        self.repo
+            .create_team_session(&TeamSessionRow {
+                id: primary_session_id.clone(),
+                team_id: team_id.clone(),
+                name: "Main".to_owned(),
+                is_primary: true,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        for agent in &agents {
+            self.repo
+                .bind_session_conversation(&aionui_db::models::TeamSessionAgentRow {
+                    id: 0,
+                    session_id: primary_session_id.clone(),
+                    team_id: team_id.clone(),
+                    slot_id: agent.slot_id.clone(),
+                    conversation_id: agent.conversation_id.clone(),
+                    created_at: now,
+                })
+                .await?;
+        }
 
         let row = TeamRow {
             id: team_id.clone(),
@@ -396,6 +442,7 @@ impl TeamSessionService {
             updated_at: now,
             project_id,
             folder_id,
+            active_session_id: Some(primary_session_id.clone()),
         };
         self.repo.create_team(&row).await?;
 
@@ -407,6 +454,7 @@ impl TeamSessionService {
             lead_agent_id,
             created_at: now,
             updated_at: now,
+            active_session_id: Some(primary_session_id.clone()),
         };
 
         info!(
@@ -858,6 +906,13 @@ impl TeamSessionService {
         let team = Team::from_row(&row)?;
         let agents_snapshot: Vec<TeamAgent> = team.agents.clone();
 
+        // Resolve the active working session for this team. Pre-feature teams
+        // have a single (primary) session backfilled by migration 030; the
+        // active pointer is read first, falling back to the team's primary
+        // session row, and finally lazily provisioning one if neither exists
+        // (defensive — migration 030 backfills every team, so this is rare).
+        let session_id = self.resolve_active_session_id(team_id, &row).await?;
+
         if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
             let work = self
                 .reserve_member_runtime_reconciliation(&session, &agents_snapshot)
@@ -902,6 +957,7 @@ impl TeamSessionService {
 
         let session = match TeamSession::start_with_prompt_dump(
             team,
+            session_id,
             self.repo.clone(),
             self.broadcaster.clone(),
             self.backend_binary_path.clone(),
@@ -1614,6 +1670,7 @@ impl TeamSessionService {
             team_id: team_id.clone(),
             slot_id: binding_lookup.slot_id,
             role: binding_lookup.role,
+            session_id: binding_lookup.session_id,
             runtime_seed: Default::default(),
             mcp: None,
         };
@@ -1676,6 +1733,73 @@ impl TeamSessionService {
         self.load_owned_team(user_id, team_id).await?;
         self.stop_session_unchecked(team_id);
         Ok(())
+    }
+
+    /// Resolve the active working-session id for a team.
+    ///
+    /// Order: (1) the team's persisted `active_session_id` pointer, (2) the
+    /// team's primary session row (migration 030 backfills one for every
+    /// pre-existing team), (3) lazily create a primary session row if neither
+    /// exists (defensive — should not happen post-migration, but keeps startup
+    /// robust). The pointer is also persisted so subsequent calls skip the
+    /// lookup.
+    async fn resolve_active_session_id(&self, team_id: &str, row: &TeamRow) -> Result<String, TeamError> {
+        if let Some(id) = row.active_session_id.as_deref()
+            && self.repo.get_team_session(id).await?.is_some()
+        {
+            return Ok(id.to_owned());
+        }
+
+        let sessions = self.repo.list_team_sessions(team_id).await?;
+        if let Some(primary) = sessions.iter().find(|s| s.is_primary) {
+            let id = primary.id.clone();
+            self.persist_active_session_id(team_id, &id).await;
+            return Ok(id);
+        }
+        if let Some(first) = sessions.first() {
+            let id = first.id.clone();
+            self.persist_active_session_id(team_id, &id).await;
+            return Ok(id);
+        }
+
+        // No session row at all: provision a primary one. This mirrors what
+        // migration 030 does for pre-existing teams and what team creation
+        // (post-this-feature) will do explicitly.
+        let now = now_ms();
+        let id = format!("primary_{team_id}");
+        self.repo
+            .create_team_session(&TeamSessionRow {
+                id: id.clone(),
+                team_id: team_id.to_owned(),
+                name: "Main".to_owned(),
+                is_primary: true,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        self.persist_active_session_id(team_id, &id).await;
+        Ok(id)
+    }
+
+    async fn persist_active_session_id(&self, team_id: &str, session_id: &str) {
+        if let Err(error) = self
+            .repo
+            .update_team(
+                team_id,
+                &UpdateTeamParams {
+                    active_session_id: Some(session_id.to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            warn!(
+                team_id,
+                session_id,
+                %error,
+                "failed to persist team active_session_id (non-fatal)"
+            );
+        }
     }
 
     fn stop_session_unchecked(&self, team_id: &str) {
@@ -1950,6 +2074,265 @@ impl TeamSessionService {
             }
         }
 
+        Ok(())
+    }
+
+    // ── Team working sessions (migration 030) ──────────────────────────────
+
+    /// List all working sessions for a team. The primary session is ordered
+    /// first by the repository. Per-slot conversation bindings are NOT
+    /// populated here (use [`get_team_session`] for a single session with
+    /// bindings); the list endpoint favours brevity.
+    pub async fn list_team_sessions(
+        &self,
+        user_id: &str,
+        team_id: &str,
+    ) -> Result<Vec<TeamSessionResponse>, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let rows = self.repo.list_team_sessions(team_id).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| TeamSessionResponse {
+                id: row.id,
+                team_id: row.team_id,
+                name: row.name,
+                is_primary: row.is_primary,
+                agents: Vec::new(),
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            })
+            .collect())
+    }
+
+    /// Create a new working session under an existing team. Each roster slot
+    /// gets a freshly-minted conversation bound to the new session; the team
+    /// roster/config itself is unchanged. The new session does NOT become
+    /// active automatically — the client calls [`set_active_session`] to
+    /// switch to it.
+    pub async fn create_team_session(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        name: Option<&str>,
+    ) -> Result<TeamSessionResponse, TeamError> {
+        let row = self.load_owned_team_row(user_id, team_id).await?;
+        let team = Team::from_row(&row)?;
+
+        // Default name: "Session N" where N = current count + 1.
+        let existing = self.repo.list_team_sessions(team_id).await?;
+        let name = name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Session {}", existing.len() + 1));
+        if existing.iter().any(|s| s.name == name) {
+            return Err(TeamError::InvalidRequest(format!(
+                "session name already exists in this team: {name}"
+            )));
+        }
+
+        let now = now_ms();
+        let session_id = generate_id();
+        self.repo
+            .create_team_session(&TeamSessionRow {
+                id: session_id.clone(),
+                team_id: team_id.to_owned(),
+                name: name.clone(),
+                is_primary: false,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+
+        // Mint a fresh conversation for every roster slot, bound to this
+        // session. Reuses the same provisioning path as initial agents so
+        // each conversation carries the right `extra` (teamId/sessionId/
+        // slot_id/role/backend/session_mode).
+        let provisioner = self.provisioner();
+        let mut bindings = Vec::with_capacity(team.agents.len());
+        for agent in &team.agents {
+            let conversation = provisioner
+                .provision_session_agent_conversation(
+                    user_id,
+                    team_id,
+                    &session_id,
+                    agent,
+                    row.session_mode.as_deref(),
+                )
+                .await?;
+            self.repo
+                .bind_session_conversation(&aionui_db::models::TeamSessionAgentRow {
+                    id: 0,
+                    session_id: session_id.clone(),
+                    team_id: team_id.to_owned(),
+                    slot_id: agent.slot_id.clone(),
+                    conversation_id: conversation.conversation_id.clone(),
+                    created_at: now,
+                })
+                .await?;
+            bindings.push(TeamSessionAgentResponse {
+                slot_id: agent.slot_id.clone(),
+                conversation_id: conversation.conversation_id,
+            });
+        }
+
+        info!(team_id, session_id = %session_id, name = %name, "team session created");
+
+        Ok(TeamSessionResponse {
+            id: session_id,
+            team_id: team_id.to_owned(),
+            name,
+            is_primary: false,
+            agents: bindings,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    /// Get a single session with its per-slot conversation bindings.
+    pub async fn get_team_session(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        session_id: &str,
+    ) -> Result<TeamSessionResponse, TeamError> {
+        let row = self.load_owned_team_row(user_id, team_id).await?;
+        let session = self
+            .repo
+            .get_team_session(session_id)
+            .await?
+            .ok_or_else(|| TeamError::SessionNotFound(session_id.to_owned()))?;
+        if session.team_id != team_id {
+            return Err(TeamError::SessionNotFound(session_id.to_owned()));
+        }
+        let bindings = self
+            .repo
+            .list_session_agents(session_id)
+            .await?
+            .into_iter()
+            .map(|b| TeamSessionAgentResponse {
+                slot_id: b.slot_id,
+                conversation_id: b.conversation_id,
+            })
+            .collect();
+        // Touch row to silence unused-var lint while documenting the ownership
+        // check already performed above.
+        let _ = &row;
+        Ok(TeamSessionResponse {
+            id: session.id,
+            team_id: session.team_id,
+            name: session.name,
+            is_primary: session.is_primary,
+            agents: bindings,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+        })
+    }
+
+    /// Rename a session. The primary session can be renamed too (its
+    /// `is_primary` flag is what makes it the default, not its name).
+    pub async fn rename_team_session(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        session_id: &str,
+        name: &str,
+    ) -> Result<(), TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(TeamError::InvalidRequest("session name cannot be empty".into()));
+        }
+        // Enforce per-team name uniqueness.
+        let existing = self.repo.list_team_sessions(team_id).await?;
+        if existing
+            .iter()
+            .any(|s| s.id != session_id && s.name == name)
+        {
+            return Err(TeamError::InvalidRequest(format!(
+                "session name already exists in this team: {name}"
+            )));
+        }
+        self.repo
+            .update_team_session(
+                session_id,
+                &aionui_db::UpdateTeamSessionParams {
+                    name: Some(name.to_owned()),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Delete a session. The primary session cannot be deleted. Deleting a
+    /// session removes its per-slot conversation bindings and its mailbox/
+    /// task rows; the underlying conversations are left in place (the user
+    /// may still reach them via the team's other sessions or history).
+    pub async fn delete_team_session(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        session_id: &str,
+    ) -> Result<(), TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let session = self
+            .repo
+            .get_team_session(session_id)
+            .await?
+            .ok_or_else(|| TeamError::SessionNotFound(session_id.to_owned()))?;
+        if session.team_id != team_id {
+            return Err(TeamError::SessionNotFound(session_id.to_owned()));
+        }
+        if session.is_primary {
+            return Err(TeamError::InvalidRequest(
+                "the primary session cannot be deleted".into(),
+            ));
+        }
+        // If the deleted session is the active one, repoint active to primary.
+        let team_row = self.repo.get_team(team_id).await?.ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+        if team_row.active_session_id.as_deref() == Some(session_id)
+            && let Some(primary) = self
+                .repo
+                .list_team_sessions(team_id)
+                .await?
+                .into_iter()
+                .find(|s| s.is_primary)
+        {
+            self.persist_active_session_id(team_id, &primary.id).await;
+        }
+        // Stop the in-memory session if it is currently running for this id.
+        self.stop_session_unchecked(team_id);
+        self.repo.delete_mailbox_by_session(team_id, session_id).await?;
+        self.repo.delete_tasks_by_session(team_id, session_id).await?;
+        self.repo.delete_session_agents_by_session(session_id).await?;
+        self.repo.delete_team_session(session_id).await?;
+        info!(team_id, session_id, "team session deleted");
+        Ok(())
+    }
+
+    /// Set the team's active working session pointer. Subsequent
+    /// `ensure_session` / `send_message` calls without an explicit session
+    /// target operate on this session.
+    pub async fn set_active_session(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        session_id: &str,
+    ) -> Result<(), TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let session = self
+            .repo
+            .get_team_session(session_id)
+            .await?
+            .ok_or_else(|| TeamError::SessionNotFound(session_id.to_owned()))?;
+        if session.team_id != team_id {
+            return Err(TeamError::SessionNotFound(session_id.to_owned()));
+        }
+        // Stop any currently-running in-memory session for this team so the
+        // next ensure rebuilds it against the new active session id.
+        self.stop_session_unchecked(team_id);
+        self.persist_active_session_id(team_id, session_id).await;
+        info!(team_id, session_id, "team active session set");
         Ok(())
     }
 

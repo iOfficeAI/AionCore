@@ -33,14 +33,15 @@ pub(crate) struct InitialProvisioningResult {
     pub team_workspace: String,
 }
 
-struct ProvisionedConversation {
-    conversation_id: String,
-    workspace: Option<String>,
+pub(crate) struct ProvisionedConversation {
+    pub(crate) conversation_id: String,
+    pub(crate) workspace: Option<String>,
 }
 
 struct NewAgentProvisioning {
     user_id: String,
     team_id: String,
+    session_id: String,
     slot_id: String,
     name: String,
     role: TeammateRole,
@@ -151,6 +152,7 @@ impl TeamAgentProvisioner {
         &self,
         user_id: &str,
         team_id: &str,
+        session_id: &str,
         inputs: &[TeamAgentInput],
         shared_workspace: Option<&str>,
     ) -> Result<InitialProvisioningResult, TeamError> {
@@ -184,6 +186,7 @@ impl TeamAgentProvisioner {
             .create_team_conversation_for_agent(
                 user_id,
                 team_id,
+                session_id,
                 &leader_slot_id,
                 leader_role,
                 &leader_input.name,
@@ -235,6 +238,7 @@ impl TeamAgentProvisioner {
                 .create_team_conversation_for_agent(
                     user_id,
                     team_id,
+                    session_id,
                     &slot_id,
                     *role,
                     &input.name,
@@ -296,10 +300,16 @@ impl TeamAgentProvisioner {
         let backend = self
             .resolve_requested_backend(req.backend.as_deref(), assistant_id.as_deref())
             .await?;
+        // New roster agents join the team's currently active session.
+        let session_id = row
+            .active_session_id
+            .clone()
+            .ok_or_else(|| TeamError::InvalidRequest("team has no active session".into()))?;
         let agent = self
             .provision_new_agent(NewAgentProvisioning {
                 user_id: user_id.to_owned(),
                 team_id: team.id.clone(),
+                session_id,
                 slot_id: generate_id(),
                 name: req.name,
                 role,
@@ -312,7 +322,29 @@ impl TeamAgentProvisioner {
             .await?;
         team.agents.push(agent.clone());
         self.persist_agents(&team.id, &team.agents).await?;
+        // Bind the new agent's conversation into the active session.
+        self.bind_agent_to_active_session(row, &agent).await?;
         Ok(agent)
+    }
+
+    /// Persist a `(session, slot) -> conversation` binding for a freshly added
+    /// agent, mirroring what `create_team` does for the initial roster.
+    async fn bind_agent_to_active_session(&self, row: &TeamRow, agent: &TeamAgent) -> Result<(), TeamError> {
+        let session_id = row
+            .active_session_id
+            .as_deref()
+            .ok_or_else(|| TeamError::InvalidRequest("team has no active session".into()))?;
+        self.repo
+            .bind_session_conversation(&aionui_db::models::TeamSessionAgentRow {
+                id: 0,
+                session_id: session_id.to_owned(),
+                team_id: row.id.clone(),
+                slot_id: agent.slot_id.clone(),
+                conversation_id: agent.conversation_id.clone(),
+                created_at: aionui_common::now_ms(),
+            })
+            .await?;
+        Ok(())
     }
 
     async fn resolve_requested_backend(
@@ -348,10 +380,16 @@ impl TeamAgentProvisioner {
             .ok_or_else(|| TeamError::TeamNotFound(req.team_id.clone()))?;
         let mut team = Team::from_row(&row)?;
         let workspace = self.workspace_resolver().resolve_for_new_agent(&row, &team).await?;
+        // Spawned agents join the team's currently active session.
+        let session_id = row
+            .active_session_id
+            .clone()
+            .ok_or_else(|| TeamError::InvalidRequest("team has no active session".into()))?;
         let agent = self
             .provision_new_agent(NewAgentProvisioning {
                 user_id: req.user_id,
                 team_id: req.team_id.clone(),
+                session_id,
                 slot_id: req.slot_id,
                 name: req.name,
                 role: TeammateRole::Teammate,
@@ -364,6 +402,7 @@ impl TeamAgentProvisioner {
             .await?;
         team.agents.push(agent.clone());
         self.persist_agents(&req.team_id, &team.agents).await?;
+        self.bind_agent_to_active_session(&row, &agent).await?;
         Ok(agent)
     }
 
@@ -496,11 +535,42 @@ impl TeamAgentProvisioner {
         Ok(())
     }
 
+    /// Mint a fresh conversation for an EXISTING roster agent under a NEW
+    /// working session. Used by `create_team_session` to give every slot its
+    /// own conversation per session. Unlike `provision_new_agent`, this does
+    /// not create a new roster entry — the roster `TeamAgent` is the input,
+    /// and only a new conversation (carrying the session id in its `extra`)
+    /// is produced.
+    pub(crate) async fn provision_session_agent_conversation(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        session_id: &str,
+        agent: &TeamAgent,
+        session_mode: Option<&str>,
+    ) -> Result<ProvisionedConversation, TeamError> {
+        self.create_team_conversation_for_agent(
+            user_id,
+            team_id,
+            session_id,
+            &agent.slot_id,
+            agent.role,
+            &agent.name,
+            &agent.backend,
+            &agent.model,
+            agent.assistant_id.as_deref(),
+            None,
+            session_mode,
+        )
+        .await
+    }
+
     async fn provision_new_agent(&self, input: NewAgentProvisioning) -> Result<TeamAgent, TeamError> {
         let conversation = self
             .create_team_conversation_for_agent(
                 &input.user_id,
                 &input.team_id,
+                &input.session_id,
                 &input.slot_id,
                 input.role,
                 &input.name,
@@ -530,6 +600,7 @@ impl TeamAgentProvisioner {
         &self,
         user_id: &str,
         team_id: &str,
+        session_id: &str,
         slot_id: &str,
         role: TeammateRole,
         name: &str,
@@ -547,6 +618,7 @@ impl TeamAgentProvisioner {
         };
         let extra = self.build_team_extra(
             team_id,
+            session_id,
             slot_id,
             role,
             backend,
@@ -649,6 +721,7 @@ impl TeamAgentProvisioner {
     fn build_team_extra(
         &self,
         team_id: &str,
+        session_id: &str,
         slot_id: &str,
         role: TeammateRole,
         backend: &str,
@@ -666,6 +739,7 @@ impl TeamAgentProvisioner {
             .unwrap_or_else(|| session_mode_for_backend(backend, agent_type, acp_metadata));
         let mut extra = serde_json::json!({
             "teamId": team_id,
+            "sessionId": session_id,
             "slot_id": slot_id,
             "role": role.to_string(),
             "backend": backend,

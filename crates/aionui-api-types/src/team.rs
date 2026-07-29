@@ -171,6 +171,11 @@ pub struct TeamSessionBinding {
     pub slot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Working session id (migration 030). Absent on conversations written
+    /// before multi-session support; the service treats absence as the team's
+    /// primary session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     #[serde(default)]
     pub runtime_seed: TeamRuntimeSeed,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -199,6 +204,7 @@ impl TeamSessionBinding {
             team_id,
             slot_id: extra_string_field(extra, "slot_id"),
             role: extra_string_field(extra, "role"),
+            session_id: extra_string_field(extra, "sessionId").or_else(|| extra_string_field(extra, "session_id")),
             runtime_seed: TeamRuntimeSeed {
                 backend: extra_string_field(extra, "backend"),
                 session_mode: extra_string_field(extra, "session_mode"),
@@ -468,6 +474,11 @@ pub struct TeamResponse {
     pub leader_assistant_id: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    /// Currently active working session id (migration 030). Absent for
+    /// legacy responses that predate multi-session support; the client
+    /// treats absence as "the team's single/primary session".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_session_id: Option<String>,
 }
 
 /// Type alias for team list responses.
@@ -593,6 +604,59 @@ pub struct TeammateMessagePayload {
     pub content: String,
     pub from_slot_id: String,
     pub from_name: String,
+}
+
+// ---------------------------------------------------------------------------
+// Team working sessions (migration 030)
+// ---------------------------------------------------------------------------
+
+/// A single per-slot conversation binding within a session response.
+///
+/// Maps each roster `slot_id` to the concrete `conversation_id` minted for
+/// this session. The primary session mirrors the ids already in the team
+/// roster; secondary sessions carry fresh ids.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamSessionAgentResponse {
+    pub slot_id: String,
+    pub conversation_id: String,
+}
+
+/// A working session owned by a team.
+///
+/// Each session has its own per-slot conversations, mailbox messages, and
+/// task board, isolated by `session_id`. The team roster and `session_mode`
+/// stay shared at the team level. `is_primary` marks the auto-created default
+/// session that every team owns and that cannot be deleted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamSessionResponse {
+    pub id: String,
+    pub team_id: String,
+    pub name: String,
+    pub is_primary: bool,
+    /// Per-slot conversation bindings for this session. Populated by the
+    /// `GET /api/teams/{id}/sessions/{sid}` and
+    /// `POST /api/teams/{id}/sessions` endpoints; the list endpoint may omit
+    /// it for brevity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<TeamSessionAgentResponse>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+/// Request body for `POST /api/teams/{id}/sessions` (create a new session).
+///
+/// `name` defaults to a localized "Session N" chosen by the client; the
+/// server rejects a name that duplicates an existing session in the team.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateTeamSessionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Request body for `PATCH /api/teams/{id}/sessions/{sid}` (rename a session).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameTeamSessionRequest {
+    pub name: String,
 }
 
 // ---------------------------------------------------------------------------

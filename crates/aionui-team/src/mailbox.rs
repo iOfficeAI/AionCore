@@ -17,16 +17,18 @@ impl Mailbox {
         Self { repo }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn write(
         &self,
         team_id: &str,
+        session_id: &str,
         to_agent_id: &str,
         from_agent_id: &str,
         msg_type: MailboxMessageType,
         content: &str,
         summary: Option<&str>,
     ) -> Result<MailboxMessage, TeamError> {
-        self.write_with_files(team_id, to_agent_id, from_agent_id, msg_type, content, summary, None)
+        self.write_with_files(team_id, session_id, to_agent_id, from_agent_id, msg_type, content, summary, None)
             .await
     }
 
@@ -34,6 +36,7 @@ impl Mailbox {
     pub async fn write_with_files(
         &self,
         team_id: &str,
+        session_id: &str,
         to_agent_id: &str,
         from_agent_id: &str,
         msg_type: MailboxMessageType,
@@ -55,12 +58,14 @@ impl Mailbox {
             files: files_json,
             read: false,
             created_at: now_ms(),
+            session_id: Some(session_id.to_owned()),
         };
 
         self.repo.write_message(&row).await?;
 
         debug!(
             team_id,
+            session_id,
             to = to_agent_id,
             from = from_agent_id,
             msg_type = %msg_type,
@@ -71,10 +76,15 @@ impl Mailbox {
             .ok_or_else(|| TeamError::InvalidRequest(format!("invalid message type: {msg_type}")))
     }
 
-    pub async fn read_unread(&self, team_id: &str, agent_id: &str) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self.repo.read_unread_and_mark(team_id, agent_id).await?;
+    pub async fn read_unread(
+        &self,
+        team_id: &str,
+        session_id: &str,
+        agent_id: &str,
+    ) -> Result<Vec<MailboxMessage>, TeamError> {
+        let rows = self.repo.read_unread_and_mark(team_id, session_id, agent_id).await?;
 
-        debug!(team_id, agent_id, count = rows.len(), "mailbox unread messages read");
+        debug!(team_id, session_id, agent_id, count = rows.len(), "mailbox unread messages read");
 
         let messages = rows.iter().filter_map(MailboxMessage::from_row).collect();
         Ok(messages)
@@ -82,9 +92,14 @@ impl Mailbox {
 
     /// Reads all unread messages without marking them as read.
     /// Used by the drain_mailbox pattern: peek → prompt → mark_read on success.
-    pub async fn peek_unread(&self, team_id: &str, agent_id: &str) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self.repo.peek_unread(team_id, agent_id).await?;
-        debug!(team_id, agent_id, count = rows.len(), "mailbox peek_unread");
+    pub async fn peek_unread(
+        &self,
+        team_id: &str,
+        session_id: &str,
+        agent_id: &str,
+    ) -> Result<Vec<MailboxMessage>, TeamError> {
+        let rows = self.repo.peek_unread(team_id, session_id, agent_id).await?;
+        debug!(team_id, session_id, agent_id, count = rows.len(), "mailbox peek_unread");
         let messages = rows.iter().filter_map(MailboxMessage::from_row).collect();
         Ok(messages)
     }
@@ -100,11 +115,12 @@ impl Mailbox {
     pub async fn mark_all_unread_for_agents_read(
         &self,
         team_id: &str,
+        session_id: &str,
         agent_ids: &[String],
     ) -> Result<usize, TeamError> {
         let mut ids = Vec::new();
         for agent_id in agent_ids {
-            let unread = self.peek_unread(team_id, agent_id).await?;
+            let unread = self.peek_unread(team_id, session_id, agent_id).await?;
             ids.extend(unread.into_iter().map(|message| message.id));
         }
         let count = ids.len();
@@ -117,22 +133,29 @@ impl Mailbox {
     pub async fn get_history(
         &self,
         team_id: &str,
+        session_id: &str,
         agent_id: &str,
         limit: Option<i64>,
     ) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self.repo.get_history(team_id, agent_id, limit).await?;
+        let rows = self.repo.get_history(team_id, session_id, agent_id, limit).await?;
         let messages = rows.iter().filter_map(MailboxMessage::from_row).collect();
         Ok(messages)
     }
 
-    pub async fn has_unread(&self, team_id: &str, agent_id: &str) -> Result<bool, TeamError> {
-        let rows = self.repo.get_history(team_id, agent_id, None).await?;
+    pub async fn has_unread(&self, team_id: &str, session_id: &str, agent_id: &str) -> Result<bool, TeamError> {
+        let rows = self.repo.get_history(team_id, session_id, agent_id, None).await?;
         Ok(rows.iter().any(|r| !r.read))
     }
 
     pub async fn delete_by_team(&self, team_id: &str) -> Result<(), TeamError> {
         self.repo.delete_mailbox_by_team(team_id).await?;
         debug!(team_id, "mailbox messages deleted for team");
+        Ok(())
+    }
+
+    pub async fn delete_by_session(&self, team_id: &str, session_id: &str) -> Result<(), TeamError> {
+        self.repo.delete_mailbox_by_session(team_id, session_id).await?;
+        debug!(team_id, session_id, "mailbox messages deleted for session");
         Ok(())
     }
 }
@@ -150,20 +173,20 @@ mod tests {
         let mailbox = Mailbox::new(repo);
 
         mailbox
-            .write("t1", "a1", "user", MailboxMessageType::Message, "hi", None)
+            .write("t1", "s1", "a1", "user", MailboxMessageType::Message, "hi", None)
             .await
             .unwrap();
         mailbox
-            .write("t1", "a1", "a2", MailboxMessageType::Message, "hello", None)
+            .write("t1", "s1", "a1", "a2", MailboxMessageType::Message, "hello", None)
             .await
             .unwrap();
 
-        let unread = mailbox.read_unread("t1", "a1").await.unwrap();
+        let unread = mailbox.read_unread("t1", "s1", "a1").await.unwrap();
         assert_eq!(unread.len(), 2);
         assert_eq!(unread[0].content, "hi");
         assert_eq!(unread[1].content, "hello");
 
-        let unread_again = mailbox.read_unread("t1", "a1").await.unwrap();
+        let unread_again = mailbox.read_unread("t1", "s1", "a1").await.unwrap();
         assert!(unread_again.is_empty());
     }
 
@@ -175,6 +198,7 @@ mod tests {
         let msg = mailbox
             .write(
                 "t1",
+                "s1",
                 "lead",
                 "a1",
                 MailboxMessageType::IdleNotification,
@@ -194,17 +218,17 @@ mod tests {
         let mailbox = Mailbox::new(repo);
 
         mailbox
-            .write("t1", "a1", "user", MailboxMessageType::Message, "m1", None)
+            .write("t1", "s1", "a1", "user", MailboxMessageType::Message, "m1", None)
             .await
             .unwrap();
         mailbox
-            .write("t1", "a1", "user", MailboxMessageType::Message, "m2", None)
+            .write("t1", "s1", "a1", "user", MailboxMessageType::Message, "m2", None)
             .await
             .unwrap();
 
-        mailbox.read_unread("t1", "a1").await.unwrap();
+        mailbox.read_unread("t1", "s1", "a1").await.unwrap();
 
-        let history = mailbox.get_history("t1", "a1", None).await.unwrap();
+        let history = mailbox.get_history("t1", "s1", "a1", None).await.unwrap();
         assert_eq!(history.len(), 2);
     }
 
@@ -217,6 +241,7 @@ mod tests {
             mailbox
                 .write(
                     "t1",
+                    "s1",
                     "a1",
                     "user",
                     MailboxMessageType::Message,
@@ -227,7 +252,7 @@ mod tests {
                 .unwrap();
         }
 
-        let history = mailbox.get_history("t1", "a1", Some(3)).await.unwrap();
+        let history = mailbox.get_history("t1", "s1", "a1", Some(3)).await.unwrap();
         assert_eq!(history.len(), 3);
     }
 
@@ -237,20 +262,20 @@ mod tests {
         let mailbox = Mailbox::new(repo);
 
         mailbox
-            .write("t1", "a1", "user", MailboxMessageType::Message, "x", None)
+            .write("t1", "s1", "a1", "user", MailboxMessageType::Message, "x", None)
             .await
             .unwrap();
         mailbox
-            .write("t2", "a1", "user", MailboxMessageType::Message, "y", None)
+            .write("t2", "s1", "a1", "user", MailboxMessageType::Message, "y", None)
             .await
             .unwrap();
 
         mailbox.delete_by_team("t1").await.unwrap();
 
-        let h1 = mailbox.get_history("t1", "a1", None).await.unwrap();
+        let h1 = mailbox.get_history("t1", "s1", "a1", None).await.unwrap();
         assert!(h1.is_empty());
 
-        let h2 = mailbox.get_history("t2", "a1", None).await.unwrap();
+        let h2 = mailbox.get_history("t2", "s1", "a1", None).await.unwrap();
         assert_eq!(h2.len(), 1);
     }
 
@@ -259,7 +284,7 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let mailbox = Mailbox::new(repo);
 
-        let unread = mailbox.read_unread("t1", "a1").await.unwrap();
+        let unread = mailbox.read_unread("t1", "s1", "a1").await.unwrap();
         assert!(unread.is_empty());
     }
 
@@ -269,19 +294,19 @@ mod tests {
         let mailbox = Mailbox::new(repo);
 
         mailbox
-            .write("t1", "a1", "user", MailboxMessageType::Message, "for-a1", None)
+            .write("t1", "s1", "a1", "user", MailboxMessageType::Message, "for-a1", None)
             .await
             .unwrap();
         mailbox
-            .write("t1", "a2", "user", MailboxMessageType::Message, "for-a2", None)
+            .write("t1", "s1", "a2", "user", MailboxMessageType::Message, "for-a2", None)
             .await
             .unwrap();
 
-        let unread_a1 = mailbox.read_unread("t1", "a1").await.unwrap();
+        let unread_a1 = mailbox.read_unread("t1", "s1", "a1").await.unwrap();
         assert_eq!(unread_a1.len(), 1);
         assert_eq!(unread_a1[0].content, "for-a1");
 
-        let unread_a2 = mailbox.read_unread("t1", "a2").await.unwrap();
+        let unread_a2 = mailbox.read_unread("t1", "s1", "a2").await.unwrap();
         assert_eq!(unread_a2.len(), 1);
         assert_eq!(unread_a2[0].content, "for-a2");
     }

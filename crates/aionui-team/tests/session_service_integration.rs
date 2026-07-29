@@ -649,6 +649,11 @@ impl TeamConversationLookupPort for FakeConversationPorts {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
             role: extra.get("role").and_then(serde_json::Value::as_str).map(str::to_owned),
+            session_id: extra
+                .get("sessionId")
+                .or_else(|| extra.get("session_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
         }))
     }
 }
@@ -783,16 +788,18 @@ impl ITeamRepository for FullMockTeamRepo {
     async fn read_unread_and_mark(
         &self,
         team_id: &str,
+        session_id: &str,
         to_agent_id: &str,
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-        self.inner.read_unread_and_mark(team_id, to_agent_id).await
+        self.inner.read_unread_and_mark(team_id, session_id, to_agent_id).await
     }
     async fn peek_unread(
         &self,
         team_id: &str,
+        session_id: &str,
         to_agent_id: &str,
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-        self.inner.peek_unread(team_id, to_agent_id).await
+        self.inner.peek_unread(team_id, session_id, to_agent_id).await
     }
     async fn mark_read_batch(&self, ids: &[String]) -> Result<(), DbError> {
         self.inner.mark_read_batch(ids).await
@@ -800,13 +807,17 @@ impl ITeamRepository for FullMockTeamRepo {
     async fn get_history(
         &self,
         team_id: &str,
+        session_id: &str,
         to_agent_id: &str,
         limit: Option<i64>,
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-        self.inner.get_history(team_id, to_agent_id, limit).await
+        self.inner.get_history(team_id, session_id, to_agent_id, limit).await
     }
     async fn delete_mailbox_by_team(&self, team_id: &str) -> Result<(), DbError> {
         self.inner.delete_mailbox_by_team(team_id).await
+    }
+    async fn delete_mailbox_by_session(&self, team_id: &str, session_id: &str) -> Result<(), DbError> {
+        self.inner.delete_mailbox_by_session(team_id, session_id).await
     }
 
     async fn create_task(&self, row: &aionui_db::models::TeamTaskRow) -> Result<(), DbError> {
@@ -815,15 +826,16 @@ impl ITeamRepository for FullMockTeamRepo {
     async fn find_task_by_id(
         &self,
         team_id: &str,
+        session_id: &str,
         task_id: &str,
     ) -> Result<Option<aionui_db::models::TeamTaskRow>, DbError> {
-        self.inner.find_task_by_id(team_id, task_id).await
+        self.inner.find_task_by_id(team_id, session_id, task_id).await
     }
     async fn update_task(&self, task_id: &str, params: &aionui_db::UpdateTaskParams) -> Result<(), DbError> {
         self.inner.update_task(task_id, params).await
     }
-    async fn list_tasks(&self, team_id: &str) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
-        self.inner.list_tasks(team_id).await
+    async fn list_tasks(&self, team_id: &str, session_id: &str) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
+        self.inner.list_tasks(team_id, session_id).await
     }
     async fn append_to_blocks(&self, task_id: &str, blocked_task_id: &str) -> Result<(), DbError> {
         self.inner.append_to_blocks(task_id, blocked_task_id).await
@@ -833,6 +845,77 @@ impl ITeamRepository for FullMockTeamRepo {
     }
     async fn delete_tasks_by_team(&self, team_id: &str) -> Result<(), DbError> {
         self.inner.delete_tasks_by_team(team_id).await
+    }
+    async fn delete_tasks_by_session(&self, team_id: &str, session_id: &str) -> Result<(), DbError> {
+        self.inner.delete_tasks_by_session(team_id, session_id).await
+    }
+
+    // ── Team Sessions (migration 030) — in-memory stubs ───────────────
+
+    async fn create_team_session(
+        &self,
+        _row: &aionui_db::models::TeamSessionRow,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn list_team_sessions(
+        &self,
+        _team_id: &str,
+    ) -> Result<Vec<aionui_db::models::TeamSessionRow>, DbError> {
+        Ok(vec![])
+    }
+
+    async fn get_team_session(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<aionui_db::models::TeamSessionRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn update_team_session(
+        &self,
+        _session_id: &str,
+        _params: &aionui_db::UpdateTeamSessionParams,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn delete_team_session(&self, _session_id: &str) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn delete_team_sessions_by_team(&self, _team_id: &str) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn bind_session_conversation(
+        &self,
+        _row: &aionui_db::models::TeamSessionAgentRow,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn list_session_agents(
+        &self,
+        _session_id: &str,
+    ) -> Result<Vec<aionui_db::models::TeamSessionAgentRow>, DbError> {
+        Ok(vec![])
+    }
+
+    async fn list_session_agents_by_team(
+        &self,
+        _team_id: &str,
+    ) -> Result<Vec<aionui_db::models::TeamSessionAgentRow>, DbError> {
+        Ok(vec![])
+    }
+
+    async fn delete_session_agents_by_session(&self, _session_id: &str) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn delete_session_agents_by_team(&self, _team_id: &str) -> Result<(), DbError> {
+        Ok(())
     }
 }
 
@@ -1678,6 +1761,7 @@ async fn recovery_creates_system_run_intents_without_restoring_old_memory_run() 
             files: None,
             read: false,
             created_at: aionui_common::now_ms(),
+            session_id: None,
         })
         .await
         .expect("seed orphan mailbox");
@@ -1799,6 +1883,7 @@ async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
             files: None,
             read: false,
             created_at: aionui_common::now_ms(),
+            session_id: None,
         })
         .await
         .expect("seed self mailbox");
@@ -2155,6 +2240,7 @@ async fn renew_active_lease_allows_empty_team_without_unrelated_lease() {
             updated_at: aionui_common::now_ms(),
             project_id: None,
             folder_id: None,
+            active_session_id: None,
         })
         .await
         .expect("insert empty team");
@@ -3863,7 +3949,17 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
     );
 
     let lead_slot_id = created.leader_assistant_id.as_deref().expect("leader slot");
-    let leader_messages = team_repo.get_history(&created.id, lead_slot_id, None).await.unwrap();
+    let active_session_id = team_repo
+        .get_team(&created.id)
+        .await
+        .expect("team exists")
+        .expect("team row")
+        .active_session_id
+        .expect("team has an active session");
+    let leader_messages = team_repo
+        .get_history(&created.id, &active_session_id, lead_slot_id, None)
+        .await
+        .unwrap();
     assert!(
         !leader_messages
             .iter()
@@ -6834,7 +6930,17 @@ async fn lazy_attach_failure_preserves_unread_and_skips_leader_on_human_delivery
 
     // Preserve-unread (spec 5.4b): the delivered message must remain unread so a
     // retry re-drains it via reconcile_mailbox.
-    let worker_unread = team_repo.peek_unread(&created.id, &worker.slot_id).await.unwrap();
+    let active_session_id = team_repo
+        .get_team(&created.id)
+        .await
+        .expect("team exists")
+        .expect("team row")
+        .active_session_id
+        .expect("team has an active session");
+    let worker_unread = team_repo
+        .peek_unread(&created.id, &active_session_id, &worker.slot_id)
+        .await
+        .unwrap();
     assert!(
         worker_unread.iter().any(|message| message.content == "please do X"),
         "a failed lazy attach must not mark the pending delivery read"
@@ -6842,7 +6948,10 @@ async fn lazy_attach_failure_preserves_unread_and_skips_leader_on_human_delivery
 
     // Human-direct failure must NOT wake the leader (spec 5.4c): the failure is
     // surfaced inline to the user instead.
-    let lead_unread = team_repo.peek_unread(&created.id, &lead.slot_id).await.unwrap();
+    let lead_unread = team_repo
+        .peek_unread(&created.id, &active_session_id, &lead.slot_id)
+        .await
+        .unwrap();
     assert!(
         !lead_unread
             .iter()
@@ -6898,6 +7007,13 @@ async fn agent_triggered_attach_failure_notifies_leader() {
         .unwrap();
     let lead_slot_id = created.leader_assistant_id.clone().expect("leader slot");
     svc.ensure_session("user1", &created.id).await.unwrap();
+    let active_session_id = team_repo
+        .get_team(&created.id)
+        .await
+        .expect("team exists")
+        .expect("team row")
+        .active_session_id
+        .expect("team has an active session");
 
     // Arm the failure, then have the leader spawn a teammate whose attach fails.
     fail_next.store(true, Ordering::SeqCst);
@@ -6918,7 +7034,10 @@ async fn agent_triggered_attach_failure_notifies_leader() {
     // re-delegate.
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            let leader_messages = team_repo.get_history(&created.id, &lead_slot_id, None).await.unwrap();
+            let leader_messages = team_repo
+                .get_history(&created.id, &active_session_id, &lead_slot_id, None)
+                .await
+                .unwrap();
             if leader_messages.iter().any(|message| {
                 message.from_agent_id == spawned.slot_id && message.content.contains("failed to start its runtime")
             }) {

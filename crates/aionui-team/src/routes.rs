@@ -11,9 +11,9 @@ use axum::routing::{get, post};
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
-    SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
-    TeamRunStateResponse,
+    CreateTeamSessionRequest, GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
+    RenameTeamSessionRequest, SendAgentMessageRequest, SendTeamMessageRequest, SetModeRequest, TeamAgentResponse,
+    TeamListResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -118,8 +118,22 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams/{id}/session", post(ensure_session).delete(stop_session))
         .route("/api/teams/{id}/active-lease", post(active_lease))
         .route("/api/teams/{id}/session-mode", post(set_session_mode))
+        // Working sessions (migration 030). Plural /sessions CRUD is
+        // additive; the singular /session routes above keep working as the
+        // "active session" shorthand for pre-multi-session clients.
+        .route(
+            "/api/teams/{id}/sessions",
+            get(list_team_sessions).post(create_team_session),
+        )
+        .route(
+            "/api/teams/{id}/sessions/{session_id}",
+            axum::routing::get(get_team_session)
+                .patch(rename_team_session)
+                .delete(delete_team_session),
+        )
+        .route("/api/teams/{id}/sessions/{session_id}/active", post(set_active_session))
         .with_state(state)
-}
+    }
 
 async fn create_team(
     State(state): State<TeamRouterState>,
@@ -375,6 +389,78 @@ async fn stop_session(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     state.service.stop_session(&user.id, &id).await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+// ── Working sessions (migration 030) ─────────────────────────────────────
+
+async fn list_team_sessions(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<TeamSessionResponse>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.list_team_sessions(&user.id, &id).await?,
+    )))
+}
+
+async fn create_team_session(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<CreateTeamSessionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TeamSessionResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.create_team_session(&user.id, &id, req.name.as_deref()).await?,
+    )))
+}
+
+async fn get_team_session(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, session_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<TeamSessionResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.get_team_session(&user.id, &id, &session_id).await?,
+    )))
+}
+
+async fn rename_team_session(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, session_id)): Path<(String, String)>,
+    body: Result<Json<RenameTeamSessionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .service
+        .rename_team_session(&user.id, &id, &session_id, &req.name)
+        .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn delete_team_session(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, session_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .delete_team_session(&user.id, &id, &session_id)
+        .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn set_active_session(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, session_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .set_active_session(&user.id, &id, &session_id)
+        .await?;
     Ok(Json(ApiResponse::success()))
 }
 

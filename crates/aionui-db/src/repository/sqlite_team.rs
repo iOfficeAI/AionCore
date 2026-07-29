@@ -2,7 +2,7 @@ use aionui_common::now_ms;
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use crate::models::{MailboxMessageRow, TeamRow, TeamSessionAgentRow, TeamSessionRow, TeamTaskRow};
 use crate::repository::team::{ITeamRepository, UpdateTaskParams, UpdateTeamParams};
 
 /// SQLite-backed implementation of [`ITeamRepository`].
@@ -23,8 +23,8 @@ impl ITeamRepository for SqliteTeamRepository {
 
     async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, created_at, updated_at, project_id, folder_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, created_at, updated_at, project_id, folder_id, active_session_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.user_id)
@@ -39,6 +39,7 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(row.updated_at)
         .bind(&row.project_id)
         .bind(&row.folder_id)
+        .bind(&row.active_session_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -90,6 +91,9 @@ impl ITeamRepository for SqliteTeamRepository {
         if params.folder_id.is_some() {
             set_clauses.push("folder_id = ?");
         }
+        if params.active_session_id.is_some() {
+            set_clauses.push("active_session_id = ?");
+        }
 
         if set_clauses.is_empty() {
             return Ok(());
@@ -120,6 +124,9 @@ impl ITeamRepository for SqliteTeamRepository {
         if let Some(ref folder_id) = params.folder_id {
             query = query.bind(folder_id);
         }
+        if let Some(ref active_session_id) = params.active_session_id {
+            query = query.bind(active_session_id);
+        }
         query = query.bind(now_ms());
         query = query.bind(team_id);
 
@@ -146,8 +153,8 @@ impl ITeamRepository for SqliteTeamRepository {
     async fn write_message(&self, row: &MailboxMessageRow) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO mailbox \
-                (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at, session_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.team_id)
@@ -159,12 +166,18 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(&row.files)
         .bind(row.read)
         .bind(row.created_at)
+        .bind(&row.session_id)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    async fn read_unread_and_mark(&self, team_id: &str, to_agent_id: &str) -> Result<Vec<MailboxMessageRow>, DbError> {
+    async fn read_unread_and_mark(
+        &self,
+        team_id: &str,
+        session_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
         // Use BEGIN IMMEDIATE for atomicity: prevents concurrent readers
         // from seeing the same unread messages.
         let mut tx = self.pool.begin().await?;
@@ -175,12 +188,13 @@ impl ITeamRepository for SqliteTeamRepository {
 
         let rows = sqlx::query_as::<_, MailboxMessageRow>(
             "SELECT id, team_id, to_agent_id, from_agent_id, \
-                    type, content, summary, files, read, created_at \
+                    type, content, summary, files, read, created_at, session_id \
              FROM mailbox \
-             WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
+             WHERE team_id = ? AND session_id = ? AND to_agent_id = ? AND read = 0 \
              ORDER BY created_at ASC",
         )
         .bind(team_id)
+        .bind(session_id)
         .bind(to_agent_id)
         .fetch_all(&mut *tx)
         .await?;
@@ -188,9 +202,10 @@ impl ITeamRepository for SqliteTeamRepository {
         if !rows.is_empty() {
             sqlx::query(
                 "UPDATE mailbox SET read = 1 \
-                 WHERE team_id = ? AND to_agent_id = ? AND read = 0",
+                 WHERE team_id = ? AND session_id = ? AND to_agent_id = ? AND read = 0",
             )
             .bind(team_id)
+            .bind(session_id)
             .bind(to_agent_id)
             .execute(&mut *tx)
             .await?;
@@ -200,15 +215,21 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(rows)
     }
 
-    async fn peek_unread(&self, team_id: &str, to_agent_id: &str) -> Result<Vec<MailboxMessageRow>, DbError> {
+    async fn peek_unread(
+        &self,
+        team_id: &str,
+        session_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let rows = sqlx::query_as::<_, MailboxMessageRow>(
             "SELECT id, team_id, to_agent_id, from_agent_id, \
-                    type, content, summary, files, read, created_at \
+                    type, content, summary, files, read, created_at, session_id \
              FROM mailbox \
-             WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
+             WHERE team_id = ? AND session_id = ? AND to_agent_id = ? AND read = 0 \
              ORDER BY created_at ASC",
         )
         .bind(team_id)
+        .bind(session_id)
         .bind(to_agent_id)
         .fetch_all(&self.pool)
         .await?;
@@ -235,19 +256,21 @@ impl ITeamRepository for SqliteTeamRepository {
     async fn get_history(
         &self,
         team_id: &str,
+        session_id: &str,
         to_agent_id: &str,
         limit: Option<i64>,
     ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let rows = if let Some(limit) = limit {
             sqlx::query_as::<_, MailboxMessageRow>(
                 "SELECT id, team_id, to_agent_id, from_agent_id, \
-                        type, content, summary, files, read, created_at \
+                        type, content, summary, files, read, created_at, session_id \
                  FROM mailbox \
-                 WHERE team_id = ? AND to_agent_id = ? \
+                 WHERE team_id = ? AND session_id = ? AND to_agent_id = ? \
                  ORDER BY created_at ASC \
                  LIMIT ?",
             )
             .bind(team_id)
+            .bind(session_id)
             .bind(to_agent_id)
             .bind(limit)
             .fetch_all(&self.pool)
@@ -255,12 +278,13 @@ impl ITeamRepository for SqliteTeamRepository {
         } else {
             sqlx::query_as::<_, MailboxMessageRow>(
                 "SELECT id, team_id, to_agent_id, from_agent_id, \
-                        type, content, summary, files, read, created_at \
+                        type, content, summary, files, read, created_at, session_id \
                  FROM mailbox \
-                 WHERE team_id = ? AND to_agent_id = ? \
+                 WHERE team_id = ? AND session_id = ? AND to_agent_id = ? \
                  ORDER BY created_at ASC",
             )
             .bind(team_id)
+            .bind(session_id)
             .bind(to_agent_id)
             .fetch_all(&self.pool)
             .await?
@@ -276,14 +300,23 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(())
     }
 
+    async fn delete_mailbox_by_session(&self, team_id: &str, session_id: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM mailbox WHERE team_id = ? AND session_id = ?")
+            .bind(team_id)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     // ── Tasks ────────────────────────────────────────────────────────
 
     async fn create_task(&self, row: &TeamTaskRow) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO team_tasks \
                 (id, team_id, subject, description, status, owner, \
-                 blocked_by, blocks, metadata, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 blocked_by, blocks, metadata, created_at, updated_at, session_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.team_id)
@@ -296,17 +329,25 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(&row.metadata)
         .bind(row.created_at)
         .bind(row.updated_at)
+        .bind(&row.session_id)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    async fn find_task_by_id(&self, team_id: &str, task_id: &str) -> Result<Option<TeamTaskRow>, DbError> {
-        let row = sqlx::query_as::<_, TeamTaskRow>("SELECT * FROM team_tasks WHERE team_id = ? AND id = ?")
-            .bind(team_id)
-            .bind(task_id)
-            .fetch_optional(&self.pool)
-            .await?;
+    async fn find_task_by_id(
+        &self,
+        team_id: &str,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TeamTaskRow>, DbError> {
+        let row =
+            sqlx::query_as::<_, TeamTaskRow>("SELECT * FROM team_tasks WHERE team_id = ? AND session_id = ? AND id = ?")
+                .bind(team_id)
+                .bind(session_id)
+                .bind(task_id)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row)
     }
 
@@ -361,12 +402,14 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(())
     }
 
-    async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
-        let rows =
-            sqlx::query_as::<_, TeamTaskRow>("SELECT * FROM team_tasks WHERE team_id = ? ORDER BY created_at ASC")
-                .bind(team_id)
-                .fetch_all(&self.pool)
-                .await?;
+    async fn list_tasks(&self, team_id: &str, session_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
+        let rows = sqlx::query_as::<_, TeamTaskRow>(
+            "SELECT * FROM team_tasks WHERE team_id = ? AND session_id = ? ORDER BY created_at ASC",
+        )
+        .bind(team_id)
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 
@@ -424,6 +467,165 @@ impl ITeamRepository for SqliteTeamRepository {
 
     async fn delete_tasks_by_team(&self, team_id: &str) -> Result<(), DbError> {
         sqlx::query("DELETE FROM team_tasks WHERE team_id = ?")
+            .bind(team_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_tasks_by_session(&self, team_id: &str, session_id: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM team_tasks WHERE team_id = ? AND session_id = ?")
+            .bind(team_id)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ── Team Sessions (migration 030) ──────────────────────────────────
+
+    async fn create_team_session(&self, row: &TeamSessionRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO team_sessions (id, team_id, name, is_primary, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.team_id)
+        .bind(&row.name)
+        .bind(row.is_primary)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_team_sessions(&self, team_id: &str) -> Result<Vec<TeamSessionRow>, DbError> {
+        // Primary first (is_primary DESC), then by creation time — stable,
+        // predictable ordering for UI lists.
+        let rows = sqlx::query_as::<_, TeamSessionRow>(
+            "SELECT id, team_id, name, is_primary, created_at, updated_at \
+             FROM team_sessions \
+             WHERE team_id = ? \
+             ORDER BY is_primary DESC, created_at ASC",
+        )
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn get_team_session(&self, session_id: &str) -> Result<Option<TeamSessionRow>, DbError> {
+        let row = sqlx::query_as::<_, TeamSessionRow>(
+            "SELECT id, team_id, name, is_primary, created_at, updated_at FROM team_sessions WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn update_team_session(
+        &self,
+        session_id: &str,
+        params: &crate::repository::team::UpdateTeamSessionParams,
+    ) -> Result<(), DbError> {
+        let mut set_clauses = Vec::new();
+        if params.name.is_some() {
+            set_clauses.push("name = ?");
+        }
+
+        if set_clauses.is_empty() {
+            return Ok(());
+        }
+
+        set_clauses.push("updated_at = ?");
+        let sql = format!("UPDATE team_sessions SET {} WHERE id = ?", set_clauses.join(", "));
+
+        let mut query = sqlx::query(&sql);
+        if let Some(ref name) = params.name {
+            query = query.bind(name);
+        }
+        query = query.bind(now_ms());
+        query = query.bind(session_id);
+
+        let result = query.execute(&self.pool).await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("team_session {session_id}")));
+        }
+        Ok(())
+    }
+
+    async fn delete_team_session(&self, session_id: &str) -> Result<(), DbError> {
+        let result = sqlx::query("DELETE FROM team_sessions WHERE id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("team_session {session_id}")));
+        }
+        Ok(())
+    }
+
+    async fn delete_team_sessions_by_team(&self, team_id: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM team_sessions WHERE team_id = ?")
+            .bind(team_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ── Team Session Agents (migration 030) ────────────────────────────
+
+    async fn bind_session_conversation(&self, row: &TeamSessionAgentRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO team_session_agents (session_id, team_id, slot_id, conversation_id, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&row.session_id)
+        .bind(&row.team_id)
+        .bind(&row.slot_id)
+        .bind(&row.conversation_id)
+        .bind(row.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_session_agents(&self, session_id: &str) -> Result<Vec<TeamSessionAgentRow>, DbError> {
+        let rows = sqlx::query_as::<_, TeamSessionAgentRow>(
+            "SELECT id, session_id, team_id, slot_id, conversation_id, created_at \
+             FROM team_session_agents \
+             WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn list_session_agents_by_team(&self, team_id: &str) -> Result<Vec<TeamSessionAgentRow>, DbError> {
+        let rows = sqlx::query_as::<_, TeamSessionAgentRow>(
+            "SELECT id, session_id, team_id, slot_id, conversation_id, created_at \
+             FROM team_session_agents \
+             WHERE team_id = ?",
+        )
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn delete_session_agents_by_session(&self, session_id: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM team_session_agents WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_session_agents_by_team(&self, team_id: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM team_session_agents WHERE team_id = ?")
             .bind(team_id)
             .execute(&self.pool)
             .await?;
