@@ -172,24 +172,55 @@ pub(crate) async fn repair_user_scope_preconditions(conn: &mut sqlx::SqliteConne
         return Ok(());
     }
 
+    // Pre-repair preflight: record which named invariants are violated (check
+    // name + offending-row count only, never row content) so the field-observed
+    // dirty-data distribution is captured before we touch anything.
     let violations = evaluate_user_scope_guards(conn).await?;
     if violations.is_empty() {
         info!(
             migration = USER_SCOPE_MIGRATION_VERSION,
             "user_scope pre-migration preflight: no invariant violations detected"
         );
+        // Nothing to repair; the repair statements are strict no-ops here. Skip
+        // the post-repair re-check to avoid emitting a redundant log line.
+        apply_user_scope_repairs(conn).await?;
+        return Ok(());
+    }
+    for v in &violations {
+        warn!(
+            migration = USER_SCOPE_MIGRATION_VERSION,
+            check = v.check,
+            count = v.count,
+            "user_scope pre-migration preflight detected an invariant violation"
+        );
+    }
+
+    apply_user_scope_repairs(conn).await?;
+
+    // Post-repair re-check: re-evaluate the same invariants so a subsequent 030
+    // failure can be attributed to a specific STILL-violated guard (the
+    // diagnostic-only B-class cross-scope owner, or a form the repair did not
+    // fully cover) instead of 030's generic `CHECK constraint failed: ok = 1`.
+    // This closes the "repaired vs. never-covered" ambiguity the pre-check alone
+    // cannot resolve: a residual named here is exactly what will trip 030 next.
+    // Reuses the same COUNT queries; runs once, on the gated upgrade only. Check
+    // names + counts only (production logging rule; no user row content).
+    let residual = evaluate_user_scope_guards(conn).await?;
+    if residual.is_empty() {
+        info!(
+            migration = USER_SCOPE_MIGRATION_VERSION,
+            "user_scope pre-migration repair: all detected invariant violations cleared"
+        );
     } else {
-        for v in &violations {
+        for v in &residual {
             warn!(
                 migration = USER_SCOPE_MIGRATION_VERSION,
                 check = v.check,
                 count = v.count,
-                "user_scope pre-migration preflight detected an invariant violation"
+                "user_scope invariant still violated after repair; migration 030 may fail"
             );
         }
     }
-
-    apply_user_scope_repairs(conn).await?;
     Ok(())
 }
 
@@ -569,6 +600,54 @@ mod tests {
         assert_eq!(
             id, 1,
             "lone settings row promoted to id=1 so 030 WHERE id=1 copy preserves it"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_repair_recheck_reports_residual_after_clearing_repaired_guards() {
+        // The post-repair re-check re-evaluates the same guards after repair so a
+        // residual (e.g. diagnostic-only B-class) stays attributable while a
+        // repaired A-class guard reads clean. This asserts that exact sequence —
+        // the logic the "still violated after repair" warn / "all cleared" info
+        // lines report — without needing a log-capture harness.
+        let mut c = conn().await;
+        create_min_v29_aggregate_tables(&mut c).await;
+        // A-class orphan (repaired) + B-class cross-scope session (diagnostic-only).
+        sqlx::query("INSERT INTO messages (id, conversation_id) VALUES ('m_orphan','missing')")
+            .execute(&mut c)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversations (id, user_id) VALUES ('c_other','user-abc')")
+            .execute(&mut c)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO assistant_sessions (id, user_id, conversation_id) VALUES ('s_x','u1','c_other')")
+            .execute(&mut c)
+            .await
+            .unwrap();
+
+        let pre = evaluate_user_scope_guards(&mut c).await.unwrap();
+        assert!(
+            pre.iter().any(|v| v.check == "messages_orphaned_conversation"),
+            "A-class orphan must be detected pre-repair, got {pre:?}"
+        );
+        assert!(
+            pre.iter().any(|v| v.check == "assistant_sessions_cross_scope_owner"),
+            "B-class must be detected pre-repair, got {pre:?}"
+        );
+
+        apply_user_scope_repairs(&mut c).await.unwrap();
+
+        let residual = evaluate_user_scope_guards(&mut c).await.unwrap();
+        assert!(
+            !residual.iter().any(|v| v.check == "messages_orphaned_conversation"),
+            "repaired A-class orphan must NOT appear in the post-repair residual, got {residual:?}"
+        );
+        assert!(
+            residual
+                .iter()
+                .any(|v| v.check == "assistant_sessions_cross_scope_owner" && v.count == 1),
+            "diagnostic-only B-class must remain a named residual after repair, got {residual:?}"
         );
     }
 
