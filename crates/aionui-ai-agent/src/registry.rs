@@ -1353,6 +1353,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grok_build_builtin_is_team_capable() {
+        let reg = registry().await;
+        let grok = reg.find_builtin_by_backend("grok").await.unwrap();
+
+        assert_eq!(grok.command.as_deref(), Some("npx"));
+        assert_eq!(grok.args, ["-y", "@xai-official/grok", "agent", "stdio"]);
+        assert_eq!(grok.agent_source_info.binary_name.as_deref(), Some("grok"));
+        assert_eq!(grok.agent_source_info.bridge_binary.as_deref(), Some("npx"));
+        // Migration 032 clears the hard team disable and sets supports_team so
+        // agent.team_capable → assistant.team_selectable can become true.
+        assert!(grok.behavior_policy.supports_team);
+        assert_eq!(grok.behavior_policy.team_capable_override, None);
+        assert!(grok.team_capable, "Grok Build must be team_capable for Team picker");
+    }
+
+    #[tokio::test]
     async fn every_builtin_npx_agent_has_a_release_lock() {
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;

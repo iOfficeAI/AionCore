@@ -66,6 +66,16 @@ async fn verified_registry_npx_agents_use_stable_packages_and_conservative_team_
         assert_eq!(source["binary_name"], binary_name, "{backend} binary_name");
         assert_eq!(source["bridge_binary"], "npx", "{backend} bridge_binary");
         let policy: serde_json::Value = serde_json::from_str(row.behavior_policy.as_deref().unwrap()).unwrap();
-        assert_eq!(policy["team_capable_override"], false, "{backend} team policy");
+        if backend == "grok" {
+            // Migration 032 enables Grok Build for Team; other registry agents
+            // remain on the conservative hard-disable policy from 025.
+            assert_eq!(policy["supports_team"], true, "{backend} team policy");
+            assert!(
+                policy.get("team_capable_override").is_none() || policy["team_capable_override"].is_null(),
+                "{backend} must not hard-disable team: {policy}"
+            );
+        } else {
+            assert_eq!(policy["team_capable_override"], false, "{backend} team policy");
+        }
     }
 }
