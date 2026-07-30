@@ -530,6 +530,39 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(rows)
     }
 
+    async fn list_tasks_paged(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        limit: i64,
+    ) -> Result<Vec<TeamTaskRow>, DbError> {
+        let (cmp, order) = match direction {
+            PageDirection::Desc => ("<", "DESC"),
+            PageDirection::Asc => (">", "ASC"),
+        };
+        let cursor_clause = if cursor.is_some() {
+            format!("AND (created_at {cmp} ? OR (created_at = ? AND id {cmp} ?)) ")
+        } else {
+            String::new()
+        };
+        let sql = format!(
+            "SELECT * FROM team_tasks \
+             WHERE team_id = ? \
+               AND EXISTS (SELECT 1 FROM teams t WHERE t.id = team_tasks.team_id AND t.user_id = ?) \
+               {cursor_clause}\
+             ORDER BY created_at {order}, id {order} \
+             LIMIT ?"
+        );
+        let mut q = sqlx::query_as::<_, TeamTaskRow>(&sql).bind(team_id).bind(user_id);
+        if let Some(c) = &cursor {
+            q = q.bind(c.created_at).bind(c.created_at).bind(&c.id);
+        }
+        let rows = q.bind(limit).fetch_all(&self.pool).await?;
+        Ok(rows)
+    }
+
     async fn append_to_blocks(
         &self,
         user_id: &str,

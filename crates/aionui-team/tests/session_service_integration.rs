@@ -898,6 +898,16 @@ impl ITeamRepository for FullMockTeamRepo {
     async fn list_tasks(&self, user_id: &str, team_id: &str) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
         self.inner.list_tasks(user_id, team_id).await
     }
+    async fn list_tasks_paged(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        limit: i64,
+    ) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
+        self.inner.list_tasks_paged(user_id, team_id, cursor, direction, limit).await
+    }
     async fn append_to_blocks(
         &self,
         user_id: &str,

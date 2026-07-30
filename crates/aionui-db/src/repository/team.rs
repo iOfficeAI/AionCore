@@ -158,6 +158,17 @@ pub trait ITeamRepository: Send + Sync {
     /// Returns all tasks for a team, ordered by `created_at` ascending.
     async fn list_tasks(&self, user_id: &str, team_id: &str) -> Result<Vec<TeamTaskRow>, DbError>;
 
+    /// Keyset-paginated team tasks for the activity feed (user-scoped). Up to
+    /// `limit` rows strictly beyond `cursor` in `direction` order.
+    async fn list_tasks_paged(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        limit: i64,
+    ) -> Result<Vec<TeamTaskRow>, DbError>;
+
     /// Appends `blocked_task_id` to the `blocks` JSON array of `task_id`.
     /// This is a transactional JSON array append operation.
     async fn append_to_blocks(

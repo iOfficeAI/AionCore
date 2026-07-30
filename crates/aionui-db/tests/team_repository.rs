@@ -1092,3 +1092,48 @@ async fn paged_messages_asc_walks_newer_from_oldest() {
         .unwrap();
     assert_eq!(page2.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["m3"]);
 }
+
+// ── Activity feed keyset pagination (tasks) ──────────────────────────
+
+#[tokio::test]
+async fn paged_tasks_desc_and_cursor() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    for (id, ts) in [("k1", 1000), ("k2", 2000), ("k3", 3000)] {
+        let mut task = make_task(id, "t1", "subject");
+        task.created_at = ts;
+        repo.create_task(DEFAULT_USER_ID, &task).await.unwrap();
+    }
+    let page1 = repo
+        .list_tasks_paged(DEFAULT_USER_ID, "t1", None, PageDirection::Desc, 2)
+        .await
+        .unwrap();
+    assert_eq!(page1.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["k3", "k2"]);
+
+    let cursor = ActivityCursor {
+        created_at: 2000,
+        id: "k2".into(),
+    };
+    let page2 = repo
+        .list_tasks_paged(DEFAULT_USER_ID, "t1", Some(cursor), PageDirection::Desc, 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["k1"]);
+}
+
+#[tokio::test]
+async fn paged_tasks_rejects_cross_user() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team_for_user("t1", "user-a", "Team A"))
+        .await
+        .unwrap();
+    let mut task = make_task("k1", "t1", "subject");
+    task.created_at = 1000;
+    repo.create_task("user-a", &task).await.unwrap();
+    // Another user cannot see it.
+    let rows = repo
+        .list_tasks_paged("user-b", "t1", None, PageDirection::Desc, 10)
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+}

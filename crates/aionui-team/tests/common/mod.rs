@@ -224,6 +224,32 @@ impl ITeamRepository for MockTeamRepo {
         Ok(tasks)
     }
 
+    async fn list_tasks_paged(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        limit: i64,
+    ) -> Result<Vec<TeamTaskRow>, DbError> {
+        let state = self.state.lock().unwrap();
+        let mut tasks: Vec<TeamTaskRow> = state.tasks.iter().filter(|t| t.team_id == team_id).cloned().collect();
+        match direction {
+            PageDirection::Desc => {
+                tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)))
+            }
+            PageDirection::Asc => tasks.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id))),
+        }
+        if let Some(c) = cursor {
+            tasks.retain(|t| match direction {
+                PageDirection::Desc => (t.created_at, t.id.as_str()) < (c.created_at, c.id.as_str()),
+                PageDirection::Asc => (t.created_at, t.id.as_str()) > (c.created_at, c.id.as_str()),
+            });
+        }
+        tasks.truncate(limit.max(0) as usize);
+        Ok(tasks)
+    }
+
     async fn append_to_blocks(
         &self,
         _user_id: &str,
