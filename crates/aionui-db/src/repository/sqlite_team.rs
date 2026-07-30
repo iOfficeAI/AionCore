@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
-use crate::repository::team::{ITeamRepository, UpdateTaskParams, UpdateTeamParams};
+use crate::repository::team::{ActivityCursor, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 
 /// SQLite-backed implementation of [`ITeamRepository`].
 #[derive(Clone, Debug)]
@@ -328,6 +328,38 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
+        Ok(rows)
+    }
+
+    async fn list_messages_by_team_paged(
+        &self,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        limit: i64,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let (cmp, order) = match direction {
+            PageDirection::Desc => ("<", "DESC"),
+            PageDirection::Asc => (">", "ASC"),
+        };
+        let cursor_clause = if cursor.is_some() {
+            format!("AND (created_at {cmp} ? OR (created_at = ? AND id {cmp} ?)) ")
+        } else {
+            String::new()
+        };
+        let sql = format!(
+            "SELECT id, team_id, to_agent_id, from_agent_id, \
+                    type, content, summary, files, read, created_at \
+             FROM mailbox \
+             WHERE team_id = ? {cursor_clause}\
+             ORDER BY created_at {order}, id {order} \
+             LIMIT ?"
+        );
+        let mut q = sqlx::query_as::<_, MailboxMessageRow>(&sql).bind(team_id);
+        if let Some(c) = &cursor {
+            q = q.bind(c.created_at).bind(c.created_at).bind(&c.id);
+        }
+        let rows = q.bind(limit).fetch_all(&self.pool).await?;
         Ok(rows)
     }
 

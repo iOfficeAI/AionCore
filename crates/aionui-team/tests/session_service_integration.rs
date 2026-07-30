@@ -22,9 +22,10 @@ use aionui_db::models::{
     UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
 };
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IAssistantDefinitionRepository,
-    IAssistantOverlayRepository, IConversationRepository, IProviderRepository, ITeamRepository, MessagePageParams,
-    MessagePageResult, MessageRowUpdate, MessageSearchRow, resolve_agent_binding_from_rows,
+    ActivityCursor, ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository,
+    IAssistantDefinitionRepository, IAssistantOverlayRepository, IConversationRepository, IProviderRepository,
+    ITeamRepository, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, PageDirection,
+    resolve_agent_binding_from_rows,
 };
 use aionui_realtime::EventBroadcaster;
 
@@ -857,6 +858,15 @@ impl ITeamRepository for FullMockTeamRepo {
         limit: i64,
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
         self.inner.list_messages_by_team(team_id, limit).await
+    }
+    async fn list_messages_by_team_paged(
+        &self,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        limit: i64,
+    ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+        self.inner.list_messages_by_team_paged(team_id, cursor, direction, limit).await
     }
     async fn list_messages_by_ids(&self, ids: &[String]) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
         self.inner.list_messages_by_ids(ids).await

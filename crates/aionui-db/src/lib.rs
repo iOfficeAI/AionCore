@@ -46,6 +46,7 @@ pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentPar
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams};
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{
+    ActivityCursor, PageDirection,
     CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile, FeedbackDiagnosticsProfileResult,
     FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IAcpSessionRepository, IAgentMetadataRepository,
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,

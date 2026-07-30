@@ -1,6 +1,6 @@
 use aionui_common::now_ms;
 use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
-use aionui_db::{DbError, ITeamRepository, UpdateTaskParams, UpdateTeamParams};
+use aionui_db::{ActivityCursor, DbError, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -150,6 +150,32 @@ impl ITeamRepository for MockTeamRepo {
         Ok(msgs)
     }
 
+    async fn list_messages_by_team_paged(
+        &self,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        limit: i64,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let state = self.state.lock().unwrap();
+        let mut msgs: Vec<MailboxMessageRow> =
+            state.messages.iter().filter(|m| m.team_id == team_id).cloned().collect();
+        match direction {
+            PageDirection::Desc => {
+                msgs.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)))
+            }
+            PageDirection::Asc => msgs.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id))),
+        }
+        if let Some(c) = cursor {
+            msgs.retain(|m| match direction {
+                PageDirection::Desc => (m.created_at, m.id.as_str()) < (c.created_at, c.id.as_str()),
+                PageDirection::Asc => (m.created_at, m.id.as_str()) > (c.created_at, c.id.as_str()),
+            });
+        }
+        msgs.truncate(limit.max(0) as usize);
+        Ok(msgs)
+    }
+
     async fn list_messages_by_ids(&self, ids: &[String]) -> Result<Vec<MailboxMessageRow>, DbError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -287,9 +313,10 @@ pub(crate) mod workspace_harness {
         UpsertAssistantOverlayParams,
     };
     use aionui_db::{
-        ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IAssistantDefinitionRepository,
-        IAssistantOverlayRepository, IConversationRepository, IProviderRepository, ITeamRepository, MessagePageParams,
-        MessagePageResult, MessageRowUpdate, MessageSearchRow, UpdateTeamParams,
+        ActivityCursor, ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository,
+        IAssistantDefinitionRepository, IAssistantOverlayRepository, IConversationRepository, IProviderRepository,
+        ITeamRepository, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, PageDirection,
+        UpdateTeamParams,
     };
     use aionui_realtime::EventBroadcaster;
     use async_trait::async_trait;
@@ -610,6 +637,16 @@ pub(crate) mod workspace_harness {
         async fn list_messages_by_team(
             &self,
             _team_id: &str,
+            _limit: i64,
+        ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+            Ok(vec![])
+        }
+
+        async fn list_messages_by_team_paged(
+            &self,
+            _team_id: &str,
+            _cursor: Option<ActivityCursor>,
+            _direction: PageDirection,
             _limit: i64,
         ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
             Ok(vec![])

@@ -14,7 +14,8 @@ use std::sync::Arc;
 use aionui_common::now_ms;
 use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
 use aionui_db::{
-    DbError, ITeamRepository, SqliteTeamRepository, UpdateTaskParams, UpdateTeamParams, init_database_memory,
+    ActivityCursor, DbError, ITeamRepository, PageDirection, SqliteTeamRepository, UpdateTaskParams, UpdateTeamParams,
+    init_database_memory,
 };
 
 const DEFAULT_USER_ID: &str = "system_default_user";
@@ -1032,4 +1033,62 @@ async fn task_blocked_by_blocks_bidirectional_consistency() {
         b_blocked_by.contains(&"tkA".to_string()),
         "B.blockedBy should contain A"
     );
+}
+
+// ── Activity feed keyset pagination (messages) ───────────────────────
+
+#[tokio::test]
+async fn paged_messages_desc_walks_older_with_stable_tiebreak() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    // 5 messages, incl. a pair sharing created_at to verify the id tiebreak.
+    for (id, ts) in [("m1", 1000), ("m2", 2000), ("m3", 3000), ("m4", 3000), ("m5", 4000)] {
+        let mut msg = make_mailbox_msg(id, "t1", "a1", "lead", "message");
+        msg.created_at = ts;
+        repo.write_message(DEFAULT_USER_ID, &msg).await.unwrap();
+    }
+
+    // First page desc, limit 2 -> newest two: m5(4000), m4(3000,id"m4").
+    let page1 = repo
+        .list_messages_by_team_paged("t1", None, PageDirection::Desc, 2)
+        .await
+        .unwrap();
+    assert_eq!(page1.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["m5", "m4"]);
+
+    // Next-page cursor = m4(3000,"m4"); same created_at m3 is caught via id<"m4".
+    let cursor = ActivityCursor {
+        created_at: 3000,
+        id: "m4".into(),
+    };
+    let page2 = repo
+        .list_messages_by_team_paged("t1", Some(cursor), PageDirection::Desc, 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["m3", "m2"]);
+}
+
+#[tokio::test]
+async fn paged_messages_asc_walks_newer_from_oldest() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    for (id, ts) in [("m1", 1000), ("m2", 2000), ("m3", 3000)] {
+        let mut msg = make_mailbox_msg(id, "t1", "a1", "lead", "message");
+        msg.created_at = ts;
+        repo.write_message(DEFAULT_USER_ID, &msg).await.unwrap();
+    }
+    let page1 = repo
+        .list_messages_by_team_paged("t1", None, PageDirection::Asc, 2)
+        .await
+        .unwrap();
+    assert_eq!(page1.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["m1", "m2"]);
+
+    let cursor = ActivityCursor {
+        created_at: 2000,
+        id: "m2".into(),
+    };
+    let page2 = repo
+        .list_messages_by_team_paged("t1", Some(cursor), PageDirection::Asc, 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["m3"]);
 }

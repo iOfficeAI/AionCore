@@ -1,6 +1,24 @@
 use crate::error::DbError;
 use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
 
+/// Sort/paging direction for the activity feed cursor queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageDirection {
+    /// Newest first; `load more` walks toward older rows.
+    Desc,
+    /// Oldest first; `load more` walks toward newer rows.
+    Asc,
+}
+
+/// Keyset-pagination cursor. Rows strictly beyond `(created_at, id)` in the
+/// requested direction are returned. `id` is compared lexicographically to
+/// match the `ORDER BY ... id` tiebreak.
+#[derive(Debug, Clone)]
+pub struct ActivityCursor {
+    pub created_at: i64,
+    pub id: String,
+}
+
 /// Parameters for updating a team record.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateTeamParams {
@@ -94,6 +112,17 @@ pub trait ITeamRepository: Send + Sync {
     /// `created_at` descending and capped at `limit`. Backs the read-only
     /// team activity view (all recipients, not a single mailbox).
     async fn list_messages_by_team(&self, team_id: &str, limit: i64) -> Result<Vec<MailboxMessageRow>, DbError>;
+
+    /// Keyset-paginated team-wide messages for the activity feed. Returns up to
+    /// `limit` rows strictly beyond `cursor` in `direction` order (no cursor =
+    /// first page). Ordered `(created_at, id)` per direction.
+    async fn list_messages_by_team_paged(
+        &self,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        limit: i64,
+    ) -> Result<Vec<MailboxMessageRow>, DbError>;
 
     /// Returns the message rows with the given ids, ordered by `created_at`
     /// descending. Used to build full payloads after a batch read-mark.
