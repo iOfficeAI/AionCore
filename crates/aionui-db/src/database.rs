@@ -363,6 +363,16 @@ async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitErro
         .await
         .map_err(|e| DatabaseInitError::new("database.migration", DbError::Query(e)))?;
 
+    // Idempotent pre-migration repair for migration 030 (`user_scope`): normalize
+    // benign historical inconsistencies so 030's fail-hard CHECK(ok=1) assertions
+    // do not abort startup (Sentry ELECTRON-31Z / ELECTRON-31X). No-op unless the
+    // gate (max applied version == 29) holds. Runs on the migrator's own
+    // connection, inside the caller's cross-process startup lock, with
+    // foreign_keys already OFF.
+    crate::migrate_repair::repair_user_scope_preconditions(&mut conn)
+        .await
+        .map_err(|e| DatabaseInitError::new("database.migration", e))?;
+
     let result = run_migrations_with_retry(&mut conn)
         .await
         .map_err(|e| DatabaseInitError::new("database.migration", e));
