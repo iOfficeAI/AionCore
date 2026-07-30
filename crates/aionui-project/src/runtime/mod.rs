@@ -14,6 +14,7 @@ mod fs_runtime;
 mod local_provider;
 mod local_watcher;
 mod provider;
+mod search;
 mod subscription;
 mod tree_model;
 mod watcher;
@@ -22,6 +23,7 @@ pub use actor::{Command, Debouncer, Shard, ShardOutput, raw_to_command};
 pub use error::FsError;
 pub use fs_runtime::{FsRuntimeRegistry, IFsRuntime, IoDispatch, LocalFsRuntime};
 pub use provider::{EntryFact, IFsProvider, Kind};
+pub use search::{Budget, CancellationToken, IFsSearchProvider, MatchMode, NameMatcher, SearchSink};
 // Note: the concrete `file:` impls `LocalFsProvider` / `LocalWatcher` are
 // `pub(crate)` (internal) — external callers build via `LocalFsRuntime` and see
 // only the trait objects it returns, so they are not re-exported here.

@@ -6,6 +6,7 @@ mod database;
 mod error;
 mod instance_lock;
 mod legacy_handoff;
+mod migrate_repair;
 pub mod models;
 mod repository;
 

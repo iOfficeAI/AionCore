@@ -119,6 +119,26 @@ impl AppServices {
 
         let (secret, is_new) = resolve_jwt_secret(env_secret.as_deref(), db_secret);
 
+        // Defense-in-depth for the encryption key: generating a NEW secret is
+        // only legitimate on a genuinely fresh install. If the read path
+        // claimed "no system user" while the row actually exists (as happened
+        // when a stale post-migration connection mis-decoded the users table,
+        // ELECTRON-3T0), deriving a fresh key would silently break decryption
+        // of every stored credential. Verify absence with an independent
+        // query and fail startup instead of corrupting.
+        if is_new
+            && system_user.is_none()
+            && user_repo
+                .find_by_id("system_default_user")
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to verify system user absence: {e}"))?
+                .is_some()
+        {
+            anyhow::bail!(
+                "system user row exists but could not be read; refusing to generate a new                  JWT secret (would break decryption of stored credentials)"
+            );
+        }
+
         // Persist newly generated secret to database
         if is_new && let Some(user) = &system_user {
             user_repo

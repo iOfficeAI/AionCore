@@ -9,6 +9,7 @@ use crate::canonical::{self, Canonical};
 use crate::runtime::error::FsError;
 use crate::runtime::fs_runtime::{FsRuntimeRegistry, IFsRuntime, IoDispatch};
 use crate::runtime::provider::{EntryFact, IFsProvider, Kind};
+use crate::runtime::search::IFsSearchProvider;
 use crate::runtime::watcher::{WatchHandle, Watcher};
 
 use super::{Change, Hint, TreeModel, diff};
@@ -338,6 +339,10 @@ impl IFsRuntime for FakeRuntime {
     }
     fn io_dispatch(&self) -> IoDispatch {
         IoDispatch::Inline
+    }
+    fn search_provider(&self) -> Option<Arc<dyn IFsSearchProvider>> {
+        // The tree model never uses search; this fake need not provide it.
+        None
     }
 }
 

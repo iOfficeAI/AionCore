@@ -323,3 +323,96 @@ async fn adoption_window_closes_with_second_external_user() {
 
     db.close().await;
 }
+
+#[tokio::test]
+async fn adoption_fires_once_then_new_local_data_stays_local() {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool();
+    let repo = SqliteUserRepository::new(pool.clone());
+
+    // Pre-upgrade local data.
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at)
+         VALUES ('conv-old', 'system_default_user', 'Old', 'acp', '{}', 'pending', 1, 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let user = repo
+        .ensure_external_user(UserType::Aionpro, "ext-once", ExternalUserProjection::default())
+        .await
+        .unwrap();
+
+    // First login: sweeps the old data and stamps the one-shot marker.
+    assert!(repo.adopt_system_default_data(&user.id).await.unwrap() >= 1);
+    let adopted_by: Option<String> =
+        sqlx::query_scalar("SELECT adopted_by FROM users WHERE id = 'system_default_user'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(adopted_by.as_deref(), Some(user.id.as_str()), "marker must be stamped");
+    assert!(repo.is_default_data_adopter(&user.id).await.unwrap());
+
+    // AionUi keeps working locally: NEW data lands on the default user.
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at)
+         VALUES ('conv-new', 'system_default_user', 'New', 'acp', '{}', 'pending', 2, 2)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Later logins must NOT re-sweep it — the marker closes the window even
+    // though the account is still the machine's sole external user.
+    assert_eq!(repo.adopt_system_default_data(&user.id).await.unwrap(), 0);
+    let owner: String = sqlx::query_scalar("SELECT user_id FROM conversations WHERE id = 'conv-new'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(owner, "system_default_user", "post-adoption local data must stay local");
+
+    db.close().await;
+}
+
+#[tokio::test]
+async fn empty_first_sweep_still_consumes_the_adoption_opportunity() {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool();
+    let repo = SqliteUserRepository::new(pool.clone());
+
+    // Fresh machine: nothing to adopt on first login.
+    let user = repo
+        .ensure_external_user(UserType::Aionpro, "ext-fresh", ExternalUserProjection::default())
+        .await
+        .unwrap();
+    assert_eq!(repo.adopt_system_default_data(&user.id).await.unwrap(), 0);
+    assert!(
+        repo.is_default_data_adopter(&user.id).await.unwrap(),
+        "a zero-row sweep still stamps the marker"
+    );
+
+    // Local data created afterwards stays local forever.
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at)
+         VALUES ('conv-later', 'system_default_user', 'Later', 'acp', '{}', 'pending', 3, 3)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_eq!(repo.adopt_system_default_data(&user.id).await.unwrap(), 0);
+    let owner: String = sqlx::query_scalar("SELECT user_id FROM conversations WHERE id = 'conv-later'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(owner, "system_default_user");
+
+    // The marker is account-specific: nobody else counts as the adopter.
+    let other = repo
+        .ensure_external_user(UserType::Aionpro, "ext-other", ExternalUserProjection::default())
+        .await
+        .unwrap();
+    assert!(!repo.is_default_data_adopter(&other.id).await.unwrap());
+
+    db.close().await;
+}

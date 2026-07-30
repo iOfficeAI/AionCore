@@ -17,13 +17,14 @@ use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
 
 use crate::canonical;
-use crate::runtime::{Command, ShardOutput, Subscriber};
+use crate::runtime::{Budget, CancellationToken, Command, MatchMode, NameMatcher, ShardOutput, Subscriber};
 use crate::types::{FileOp, ReferenceInput, ResolvedResource};
 
 use super::actor::FsMonitorActor;
+use super::search::{self, ActiveSearch, SearchRoot};
 use super::wire::{
-    self, Encoding, InitializeParams, MkdirParams, ReadParams, RemoveParams, RenameParams, ResourceRef,
-    SubscribeParams, UnsubscribeParams, WriteParams,
+    self, Encoding, InitializeParams, MkdirParams, ReadParams, RemoveParams, RenameParams, ResolveParams, ResourceRef,
+    SearchCancelParams, SearchParams, SubscribeParams, UnsubscribeParams, WriteParams,
 };
 
 impl FsMonitorActor {
@@ -49,10 +50,15 @@ impl FsMonitorActor {
             "fs/subscribe" => self.handle_subscribe(session, user_id, id, params).await,
             "fs/unsubscribe" => self.handle_unsubscribe(session, user_id, params).await,
             "fs/read" => self.handle_read(session, user_id, id, params).await,
+            // PATCH(ELECTRON-3SZ): remove with `handle_resolve` when preview no
+            // longer needs absolute paths (see handler doc).
+            "fs/resolve" => self.handle_resolve(session, user_id, id, params).await,
             "fs/write" => self.handle_write(session, user_id, id, params).await,
             "fs/mkdir" => self.handle_mkdir(session, user_id, id, params).await,
             "fs/remove" => self.handle_remove(session, user_id, id, params).await,
             "fs/rename" => self.handle_rename(session, user_id, id, params).await,
+            "fs/search" => self.handle_search(session, user_id, id, params).await,
+            "fs/searchCancel" => self.handle_search_cancel(session, params),
             other => {
                 tracing::warn!(session, method = %other, "fs dispatch: unknown method");
                 self.push(
@@ -229,6 +235,84 @@ impl FsMonitorActor {
         }
     }
 
+    /// PATCH(ELECTRON-3SZ): resolve `{pe_id, relative_path}` to the underlying
+    /// absolute path + the pe root's absolute path.
+    ///
+    /// This deliberately violates the pe_id identity boundary — the backend is
+    /// not supposed to expose absolute paths and the frontend is not supposed to
+    /// know them. It exists only as an emergency line fix so preview's office
+    /// (officecli watch needs an on-disk `file_path` + sandbox `workspace`) and
+    /// pdf (`file://` webview) viewers can render again after the project-scoped
+    /// Explorer stopped passing `file_path`. REMOVE this handler, its
+    /// `wire::ResolveParams` (and the `ResolveParams` name in this file's
+    /// `use super::wire::{…}` import), and the `fs/resolve` dispatch arm once
+    /// preview is redesigned to consume content over the wire.
+    ///
+    /// Reuses the same identity + realpath containment guard as the other file
+    /// commands (`FileOp::Read`); resolution is lexical (no read IO).
+    ///
+    /// `absolute_path` is `resolved.absolute_path` — the exact same `absolute`
+    /// PathBuf `fs/read` derives its `resource_uri` from (`containment.rs`:
+    /// `absolute` is computed once, then turned into both the read URI and this
+    /// string). So on any machine where `fs/read` opens the file, this path opens
+    /// it too — resolve introduces no new open-failure surface over read. (The
+    /// dedupe-key case-folding of the root — `canonical::IGNORE_PATH_CASING`,
+    /// macOS/Windows only, filename segment never folded — is shared with read,
+    /// so a case-sensitive-volume mismatch is a pre-existing whole-`fs/*` concern
+    /// tracked separately, NOT something this patch introduces.)
+    /// `workspace_root` is the pe root's absolute path (officecli sandbox needs it).
+    async fn handle_resolve(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
+        let Ok(p) = serde_json::from_value::<ResolveParams>(params) else {
+            self.push(session, invalid_params(id));
+            return;
+        };
+        let resolved = match self.resolve_guarded(user_id, &p.file, FileOp::Read).await {
+            Ok(r) => r,
+            Err((code, message)) => {
+                self.push(session, wire::error(id, code, message, ref_data(&p.file)));
+                return;
+            }
+        };
+        // Non-file schemes carry no absolute path; treat as provider-unavailable.
+        // Unreachable with the current file-only provider (resolve_reference
+        // rejects non-file at canonicalize → unsupported_resource_scheme before
+        // here); kept as a defensive fail-closed.
+        let Some(absolute_path) = resolved.absolute_path.clone() else {
+            self.push(
+                session,
+                wire::error(
+                    id,
+                    wire::CODE_PROVIDER_UNAVAILABLE,
+                    "provider_unavailable",
+                    ref_data(&p.file),
+                ),
+            );
+            return;
+        };
+        let Ok(workspace_root) = canonical::uri_to_path(&resolved.root_resource_canonical) else {
+            self.push(
+                session,
+                wire::error(
+                    id,
+                    wire::CODE_PROVIDER_UNAVAILABLE,
+                    "provider_unavailable",
+                    ref_data(&p.file),
+                ),
+            );
+            return;
+        };
+        let workspace_root = workspace_root.to_string_lossy().into_owned();
+        // Log identity only — never the resolved absolute paths (sensitive).
+        tracing::info!(session, op = "resolve", pe_id = %p.file.pe_id, rel = %p.file.relative_path, "fs command ok");
+        self.push(
+            session,
+            wire::success(
+                id,
+                json!({ "absolute_path": absolute_path, "workspace_root": workspace_root }),
+            ),
+        );
+    }
+
     async fn handle_write(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
         let Ok(p) = serde_json::from_value::<WriteParams>(params) else {
             self.push(session, invalid_params(id));
@@ -313,6 +397,98 @@ impl FsMonitorActor {
             .rename(&from.resource_uri, &to.resource_uri)
             .await;
         self.reply_unit(session, id, "rename", &p.from, outcome);
+    }
+
+    // ── filename search ───────────────────────────────────────────────────
+
+    /// `fs/search` (request): resolve every root atomically, then hand off to a
+    /// spawned coordinator that walks all roots concurrently and streams
+    /// `fs/searchMatch` batches + a terminal response. Superseding a prior
+    /// in-flight search on this connection is done inside `register_search`.
+    async fn handle_search(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
+        // A search is a request: without an id there is no `search_id` to key
+        // matches/terminal on, so a search-shaped notification is ignored.
+        let Some(search_id) = id else {
+            tracing::warn!(session, "fs/search missing id (not a request); ignoring");
+            return;
+        };
+        let Ok(p) = serde_json::from_value::<SearchParams>(params) else {
+            self.push(session, invalid_params(Some(search_id)));
+            return;
+        };
+
+        // Atomic resolve: each root via resolve_reference(Browse); any failure →
+        // whole request errors, no partial search started (mirrors subscribe).
+        let mut roots: Vec<SearchRoot> = Vec::with_capacity(p.roots.len());
+        for root in &p.roots {
+            match self.resolve(user_id, root, FileOp::Browse).await {
+                Ok(resolved) => roots.push(SearchRoot {
+                    root_uri: resolved.resource_uri,
+                    pe_id: root.pe_id.clone(),
+                }),
+                Err((code, message)) => {
+                    tracing::warn!(session, code = message, pe_id = %root.pe_id, "fs search rejected");
+                    self.push(session, wire::error(Some(search_id), code, message, ref_data(root)));
+                    return;
+                }
+            }
+        }
+
+        let Some(provider) = self.search_provider() else {
+            self.push(
+                session,
+                wire::error(
+                    Some(search_id),
+                    wire::CODE_PROVIDER_UNAVAILABLE,
+                    "provider_unavailable",
+                    Value::Null,
+                ),
+            );
+            return;
+        };
+
+        let matcher = NameMatcher::new(&p.query, MatchMode::Substring);
+        let budget = Budget::new(p.limit.unwrap_or(search::DEFAULT_SEARCH_LIMIT));
+        let cancel = CancellationToken::new();
+        // Supersede any prior in-flight search on this connection (cancels it).
+        self.register_search(
+            session,
+            ActiveSearch {
+                search_id: search_id.clone(),
+                cancel: cancel.clone(),
+            },
+        );
+        // Lifecycle boundary — low volume; root count only (no query/paths).
+        tracing::info!(session, roots = roots.len(), "fs search start");
+
+        // Spawn the coordinator so the walks never block the actor event loop —
+        // it must stay responsive to fs/searchCancel and superseding searches.
+        let push = self.push_handle();
+        let done = self.search_done_handle();
+        tokio::spawn(search::run_search(
+            provider,
+            push,
+            search::SearchJob {
+                session: session.to_owned(),
+                search_id,
+                roots,
+                matcher,
+                budget,
+                cancel,
+            },
+            done,
+        ));
+    }
+
+    /// `fs/searchCancel` (notification): cancel the in-flight search iff its
+    /// `search_id` matches. Fire-and-forget; the coordinator then sends no
+    /// terminal frame (the client discards the cancelled search's matches).
+    fn handle_search_cancel(&mut self, session: &str, params: Value) {
+        let Ok(p) = serde_json::from_value::<SearchCancelParams>(params) else {
+            return;
+        };
+        let cancelled = self.cancel_search(session, &p.search_id);
+        tracing::info!(session, cancelled, "fs search cancel");
     }
 
     // ── helpers ───────────────────────────────────────────────────────────

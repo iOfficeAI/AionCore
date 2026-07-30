@@ -220,22 +220,22 @@ pub enum SessionEvent {
         /// ⚠️ TIO-13: may carry a tool title — never log at info level.
         #[serde(default)]
         metadata: Option<serde_json::Value>,
-        /// AskUserQuestion projection: the raised tool's name, so the conversation
-        /// layer can recognize an `AskUserQuestion` permission and render it as a
-        /// question card (not a generic allow/deny). `None` for every other path
-        /// (ordinary tool approvals, ACP MCP, auth). The reducer NEVER reads it
-        /// (ref-counts on request_id only — §R9). `#[serde(default)]` so older
-        /// persisted frames deserialize as `None`.
+        /// The raised tool's name (claude-direct: every `can_use_tool`), used as
+        /// the permission card's title and to recognize an `AskUserQuestion`
+        /// permission (rendered as a question card, not a generic allow/deny).
+        /// `None` for paths that name no tool (ACP MCP, auth). The reducer NEVER
+        /// reads it (ref-counts on request_id only — §R9). `#[serde(default)]` so
+        /// older persisted frames deserialize as `None`.
         #[serde(default)]
         tool_name: Option<String>,
-        /// AskUserQuestion projection: the raised tool's raw `input`
-        /// (`{questions:[{question, header, options:[{label,description}], multiSelect}]}`).
-        /// This is QUESTION CONTENT meant to be shown to the user — NOT a sensitive
-        /// tool body, so TIO-13's redaction does not apply (`detail` still stays
-        /// `None` for ordinary tools). Carried so the question text/options reach the
-        /// frontend, which cannot synthesize text that exists on no transport. `None`
-        /// for non-AskUserQuestion paths. Reducer no-op. `#[serde(default)]` for
-        /// back-compat.
+        /// The raised tool's raw `input`, shown on the permission card so the
+        /// approver can review WHAT they are approving (a Bash `command`, an
+        /// AskUserQuestion `{questions:[…]}` — AionUi issue #3779: without it the
+        /// card showed only the tool name and the user approved blind). This is
+        /// display-to-the-approver, NOT logging — TIO-13 (never log tool input at
+        /// info) still applies to log output. `None` for paths that carry no tool
+        /// input (auth, codex approvals until their params are probed). Reducer
+        /// no-op. `#[serde(default)]` for back-compat.
         #[serde(default)]
         input: Option<serde_json::Value>,
     },

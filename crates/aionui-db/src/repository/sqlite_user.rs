@@ -209,6 +209,19 @@ impl IUserRepository for SqliteUserRepository {
         if is_owner != 1 {
             return Ok(0);
         }
+        // One-shot marker: adoption happens exactly once, on the first
+        // external account's first login. Eligibility alone used to be
+        // re-evaluated on every provision call, which kept re-sweeping data
+        // the local default user accumulated AFTER the first adoption (new
+        // AionUi conversations were repeatedly re-owned). A stamped marker
+        // closes the window permanently regardless of later data.
+        let already_adopted: Option<Option<String>> =
+            sqlx::query_scalar("SELECT adopted_by FROM users WHERE id = 'system_default_user'")
+                .fetch_optional(&mut *tx)
+                .await?;
+        if matches!(already_adopted, Some(Some(_))) {
+            return Ok(0);
+        }
 
         // Discover ownership tables from the live schema rather than a
         // hand-maintained list, so user-scoped tables added by future
@@ -247,24 +260,32 @@ impl IUserRepository for SqliteUserRepository {
             }
         }
 
+        // Stamp the one-shot marker in the same transaction: even a zero-row
+        // sweep (fresh machine with no local data) consumes the adoption
+        // opportunity — from now on local-mode data stays local.
+        sqlx::query(
+            "UPDATE users SET adopted_by = ?, adopted_at = ? \
+             WHERE id = 'system_default_user' AND adopted_by IS NULL",
+        )
+        .bind(owner_id)
+        .bind(aionui_common::now_ms())
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         Ok(moved)
     }
 
-    async fn is_sole_external_user(&self, owner_id: &str) -> Result<bool, DbError> {
-        // Mirrors the adoption-window precondition in `adopt_system_default_data`:
-        // exactly one external user, and it is the caller.
-        let (external_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE user_type != 'local'")
-            .fetch_one(&self.pool)
-            .await?;
-        if external_count != 1 {
-            return Ok(false);
-        }
-        let (is_owner,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ? AND user_type != 'local'")
-            .bind(owner_id)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(is_owner == 1)
+    async fn is_default_data_adopter(&self, owner_id: &str) -> Result<bool, DbError> {
+        // The one-shot marker stamped by `adopt_system_default_data` is the
+        // single source of truth for "who adopted": only that account may
+        // re-run the on-disk file move.
+        let (matches,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = 'system_default_user' AND adopted_by = ?")
+                .bind(owner_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(matches == 1)
     }
 
     async fn find_by_id(&self, id: &str) -> Result<Option<User>, DbError> {

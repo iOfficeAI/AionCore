@@ -129,6 +129,7 @@ mod tests {
             "kilo",
             "mimo-code",
             "nova",
+            "omp",
             "sigit",
             "amp-acp",
             "cortex-code",

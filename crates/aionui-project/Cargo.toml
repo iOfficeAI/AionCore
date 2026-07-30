@@ -20,6 +20,9 @@ tracing.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 notify.workspace = true
+# Filename search: in-process tree walk honoring .gitignore/excludes (same walker
+# ripgrep is built on) — no ripgrep subprocess, since filename search reads no content.
+ignore.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
