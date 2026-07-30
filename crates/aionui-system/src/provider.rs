@@ -128,7 +128,24 @@ impl ProviderService {
     /// frontend can migrate its local store to the backend without losing
     /// the key on re-read. Storage remains encrypted at rest.
     fn row_to_response(&self, row: Provider) -> Result<ProviderResponse, SystemError> {
-        let api_key = decrypt_string(&row.api_key_encrypted, &self.encryption_key)?;
+        // Lenient on decryption: a credential encrypted under a rotated/lost
+        // key (e.g. one saved during the ELECTRON-3T0 broken session, whose
+        // in-memory-only key is gone forever) must not take the whole
+        // provider list down. Surface the row with an empty api_key so the
+        // user can see it and re-enter the key; log at warn for production
+        // diagnosability.
+        let api_key = match decrypt_string(&row.api_key_encrypted, &self.encryption_key) {
+            Ok(key) => key,
+            Err(error) => {
+                tracing::warn!(
+                    provider_id = %row.id,
+                    provider_name = %row.name,
+                    %error,
+                    "provider api_key failed to decrypt; returning empty key so the row stays visible for re-entry"
+                );
+                String::new()
+            }
+        };
 
         let models: Vec<String> = serde_json::from_str(&row.models)
             .map_err(|e| SystemError::Internal(format!("Failed to parse models JSON: {e}")))?;
@@ -681,5 +698,91 @@ mod tests {
         let svc = setup().await;
         let err = svc.delete(TEST_USER_ID, "no_such_id").await.unwrap_err();
         assert!(matches!(err, SystemError::NotFound(_)));
+    }
+}
+
+#[cfg(test)]
+mod undecryptable_row_tests {
+    use super::*;
+    use aionui_db::{SqliteProviderRepository, init_database_memory};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const KEY: [u8; 32] = [7u8; 32];
+    const USER: &str = "system_default_user";
+
+    /// ELECTRON-3T0 scenario 2: a credential encrypted under a lost key (the
+    /// broken session's in-memory-only key) must not take the whole provider
+    /// list down. The row stays visible with an empty api_key so the user can
+    /// re-enter it; healthy rows keep decrypting.
+    #[tokio::test]
+    async fn undecryptable_api_key_degrades_to_empty_instead_of_failing_the_list() {
+        let db = init_database_memory().await.unwrap();
+        let pool = db.pool().clone();
+        let repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
+        std::mem::forget(db);
+        let svc = ProviderService::new(repo, KEY);
+
+        let good = svc
+            .create(
+                USER,
+                CreateProviderRequest {
+                    id: Some("prov-good".into()),
+                    platform: "custom".into(),
+                    name: "Good".into(),
+                    base_url: "http://localhost:1".into(),
+                    api_key: "sk-good".into(),
+                    models: vec![],
+                    enabled: true,
+                    capabilities: vec![],
+                    context_limit: None,
+                    model_protocols: None,
+                    model_enabled: None,
+                    model_health: None,
+                    model_settings: HashMap::new(),
+                    bedrock_config: None,
+                    is_full_url: false,
+                },
+            )
+            .await
+            .unwrap();
+        let bad = svc
+            .create(
+                USER,
+                CreateProviderRequest {
+                    id: Some("prov-bad".into()),
+                    platform: "custom".into(),
+                    name: "Bad".into(),
+                    base_url: "http://localhost:2".into(),
+                    api_key: "sk-bad".into(),
+                    models: vec![],
+                    enabled: true,
+                    capabilities: vec![],
+                    context_limit: None,
+                    model_protocols: None,
+                    model_enabled: None,
+                    model_health: None,
+                    model_settings: HashMap::new(),
+                    bedrock_config: None,
+                    is_full_url: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Corrupt the bad row's ciphertext as if it were written under a key
+        // that no longer exists.
+        sqlx::query("UPDATE providers SET api_key_encrypted = 'AAAAgarbage-not-decryptable' WHERE id = ?")
+            .bind(&bad.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let list = svc.list(USER).await.expect("one bad row must not fail the list");
+        assert_eq!(list.len(), 2);
+        let good_row = list.iter().find(|p| p.id == good.id).unwrap();
+        let bad_row = list.iter().find(|p| p.id == bad.id).unwrap();
+        assert_eq!(good_row.api_key, "sk-good", "healthy rows keep decrypting");
+        assert_eq!(bad_row.api_key, "", "undecryptable row degrades to an empty key");
     }
 }
