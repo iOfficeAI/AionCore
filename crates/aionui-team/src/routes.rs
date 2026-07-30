@@ -12,15 +12,15 @@ use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
     GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
-    SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse, TeamMailboxMessageResponse,
-    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
+    SendTeamMessageRequest, SetModeRequest, TeamActivityPageResponse, TeamAgentResponse, TeamListResponse,
+    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
-use aionui_db::DbError;
+use aionui_db::{ActivityCursor, DbError, PageDirection};
 
 use crate::error::{TeamError, classify_public_error};
-use crate::service::{DEFAULT_ACTIVITY_LIMIT, TeamSessionService};
+use crate::service::{ActivityKind, DEFAULT_ACTIVITY_LIMIT, TeamSessionService};
 
 #[derive(Clone)]
 pub struct TeamRouterState {
@@ -94,6 +94,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams/{id}/run-state", get(get_run_state))
         .route("/api/teams/{id}/mailbox", get(list_mailbox))
         .route("/api/teams/{id}/tasks", get(list_tasks))
+        .route("/api/teams/{id}/activity", get(list_activity))
         .route("/api/teams/{id}/name", axum::routing::patch(rename_team))
         .route("/api/teams/{id}/agents", post(add_agent))
         .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
@@ -196,6 +197,62 @@ async fn list_tasks(
     let limit = query.limit.unwrap_or(DEFAULT_ACTIVITY_LIMIT);
     let tasks = state.service.list_team_tasks(&user.id, &id, limit).await?;
     Ok(Json(ApiResponse::ok(tasks)))
+}
+
+/// Query parameters for the unified activity feed. `direction`/`kind` fall back
+/// to their defaults on absent or unrecognized values; `cursor_ts`/`cursor_id`
+/// only take effect together (either alone is ignored, treated as first page).
+#[derive(serde::Deserialize)]
+struct ActivityFeedQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    cursor_ts: Option<i64>,
+    #[serde(default)]
+    cursor_id: Option<String>,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+fn parse_direction(s: Option<&str>) -> PageDirection {
+    match s {
+        Some("asc") => PageDirection::Asc,
+        _ => PageDirection::Desc,
+    }
+}
+
+fn parse_kind(s: Option<&str>) -> ActivityKind {
+    match s {
+        Some("message") => ActivityKind::Message,
+        Some("task") => ActivityKind::Task,
+        _ => ActivityKind::All,
+    }
+}
+
+fn build_cursor(ts: Option<i64>, id: Option<String>) -> Option<ActivityCursor> {
+    match (ts, id) {
+        (Some(created_at), Some(id)) => Some(ActivityCursor { created_at, id }),
+        _ => None,
+    }
+}
+
+async fn list_activity(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Query(query): Query<ActivityFeedQuery>,
+) -> Result<Json<ApiResponse<TeamActivityPageResponse>>, ApiError> {
+    let limit = query.limit.unwrap_or(DEFAULT_ACTIVITY_LIMIT);
+    let direction = parse_direction(query.direction.as_deref());
+    let kind = parse_kind(query.kind.as_deref());
+    let cursor = build_cursor(query.cursor_ts, query.cursor_id.clone());
+    let page = state
+        .service
+        .list_team_activity(&user.id, &id, cursor, direction, kind, limit)
+        .await?;
+    Ok(Json(ApiResponse::ok(page)))
 }
 
 async fn rename_team(
@@ -419,6 +476,20 @@ mod tests {
     fn team_router_state_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<TeamRouterState>();
+    }
+
+    #[test]
+    fn parse_activity_query_maps_direction_and_kind_with_fallback() {
+        assert_eq!(parse_direction(Some("asc")), PageDirection::Asc);
+        assert_eq!(parse_direction(Some("weird")), PageDirection::Desc); // fallback
+        assert_eq!(parse_direction(None), PageDirection::Desc);
+        assert!(matches!(parse_kind(Some("task")), ActivityKind::Task));
+        assert!(matches!(parse_kind(Some("message")), ActivityKind::Message));
+        assert!(matches!(parse_kind(Some("nope")), ActivityKind::All)); // fallback
+        // Cursor is only valid when both parts are present.
+        assert!(build_cursor(Some(1000), Some("x".into())).is_some());
+        assert!(build_cursor(Some(1000), None).is_none());
+        assert!(build_cursor(None, Some("x".into())).is_none());
     }
 
     #[test]
