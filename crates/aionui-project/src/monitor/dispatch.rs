@@ -23,7 +23,7 @@ use crate::types::{FileOp, ReferenceInput, ResolvedResource};
 use super::actor::FsMonitorActor;
 use super::search::{self, ActiveSearch, SearchRoot};
 use super::wire::{
-    self, Encoding, InitializeParams, MkdirParams, ReadParams, RemoveParams, RenameParams, ResourceRef,
+    self, Encoding, InitializeParams, MkdirParams, ReadParams, RemoveParams, RenameParams, ResolveParams, ResourceRef,
     SearchCancelParams, SearchParams, SubscribeParams, UnsubscribeParams, WriteParams,
 };
 
@@ -50,6 +50,9 @@ impl FsMonitorActor {
             "fs/subscribe" => self.handle_subscribe(session, user_id, id, params).await,
             "fs/unsubscribe" => self.handle_unsubscribe(session, user_id, params).await,
             "fs/read" => self.handle_read(session, user_id, id, params).await,
+            // PATCH(ELECTRON-3SZ): remove with `handle_resolve` when preview no
+            // longer needs absolute paths (see handler doc).
+            "fs/resolve" => self.handle_resolve(session, user_id, id, params).await,
             "fs/write" => self.handle_write(session, user_id, id, params).await,
             "fs/mkdir" => self.handle_mkdir(session, user_id, id, params).await,
             "fs/remove" => self.handle_remove(session, user_id, id, params).await,
@@ -230,6 +233,84 @@ impl FsMonitorActor {
                 self.push(session, wire::error(id, code, message, ref_data(&p.file)));
             }
         }
+    }
+
+    /// PATCH(ELECTRON-3SZ): resolve `{pe_id, relative_path}` to the underlying
+    /// absolute path + the pe root's absolute path.
+    ///
+    /// This deliberately violates the pe_id identity boundary — the backend is
+    /// not supposed to expose absolute paths and the frontend is not supposed to
+    /// know them. It exists only as an emergency line fix so preview's office
+    /// (officecli watch needs an on-disk `file_path` + sandbox `workspace`) and
+    /// pdf (`file://` webview) viewers can render again after the project-scoped
+    /// Explorer stopped passing `file_path`. REMOVE this handler, its
+    /// `wire::ResolveParams` (and the `ResolveParams` name in this file's
+    /// `use super::wire::{…}` import), and the `fs/resolve` dispatch arm once
+    /// preview is redesigned to consume content over the wire.
+    ///
+    /// Reuses the same identity + realpath containment guard as the other file
+    /// commands (`FileOp::Read`); resolution is lexical (no read IO).
+    ///
+    /// `absolute_path` is `resolved.absolute_path` — the exact same `absolute`
+    /// PathBuf `fs/read` derives its `resource_uri` from (`containment.rs`:
+    /// `absolute` is computed once, then turned into both the read URI and this
+    /// string). So on any machine where `fs/read` opens the file, this path opens
+    /// it too — resolve introduces no new open-failure surface over read. (The
+    /// dedupe-key case-folding of the root — `canonical::IGNORE_PATH_CASING`,
+    /// macOS/Windows only, filename segment never folded — is shared with read,
+    /// so a case-sensitive-volume mismatch is a pre-existing whole-`fs/*` concern
+    /// tracked separately, NOT something this patch introduces.)
+    /// `workspace_root` is the pe root's absolute path (officecli sandbox needs it).
+    async fn handle_resolve(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
+        let Ok(p) = serde_json::from_value::<ResolveParams>(params) else {
+            self.push(session, invalid_params(id));
+            return;
+        };
+        let resolved = match self.resolve_guarded(user_id, &p.file, FileOp::Read).await {
+            Ok(r) => r,
+            Err((code, message)) => {
+                self.push(session, wire::error(id, code, message, ref_data(&p.file)));
+                return;
+            }
+        };
+        // Non-file schemes carry no absolute path; treat as provider-unavailable.
+        // Unreachable with the current file-only provider (resolve_reference
+        // rejects non-file at canonicalize → unsupported_resource_scheme before
+        // here); kept as a defensive fail-closed.
+        let Some(absolute_path) = resolved.absolute_path.clone() else {
+            self.push(
+                session,
+                wire::error(
+                    id,
+                    wire::CODE_PROVIDER_UNAVAILABLE,
+                    "provider_unavailable",
+                    ref_data(&p.file),
+                ),
+            );
+            return;
+        };
+        let Ok(workspace_root) = canonical::uri_to_path(&resolved.root_resource_canonical) else {
+            self.push(
+                session,
+                wire::error(
+                    id,
+                    wire::CODE_PROVIDER_UNAVAILABLE,
+                    "provider_unavailable",
+                    ref_data(&p.file),
+                ),
+            );
+            return;
+        };
+        let workspace_root = workspace_root.to_string_lossy().into_owned();
+        // Log identity only — never the resolved absolute paths (sensitive).
+        tracing::info!(session, op = "resolve", pe_id = %p.file.pe_id, rel = %p.file.relative_path, "fs command ok");
+        self.push(
+            session,
+            wire::success(
+                id,
+                json!({ "absolute_path": absolute_path, "workspace_root": workspace_root }),
+            ),
+        );
     }
 
     async fn handle_write(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {

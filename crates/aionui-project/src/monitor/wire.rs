@@ -92,6 +92,16 @@ pub struct ReadParams {
     pub encoding: Option<Encoding>,
 }
 
+// PATCH(ELECTRON-3SZ): `fs/resolve` params. Violates the pe_id identity boundary
+// (the backend must not expose absolute paths, the frontend must not know them).
+// Added only as an emergency line fix so preview's office/pdf viewers can obtain
+// an absolute `file_path`. REMOVE together with `handle_resolve` once preview is
+// redesigned to consume content over the wire.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveParams {
+    pub file: ResourceRef,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WriteParams {
     pub file: ResourceRef,
