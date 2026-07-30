@@ -1,4 +1,4 @@
--- Migration 028: Add origin_conversation_id to teams for ad-hoc teams from conversations
+-- Migration 029: Add origin_conversation_id to teams for ad-hoc teams from conversations
 
 ALTER TABLE teams ADD COLUMN origin_conversation_id TEXT;
 

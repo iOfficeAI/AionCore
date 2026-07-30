@@ -86,6 +86,7 @@ async fn insert_team(services: &aionui_app::AppServices, user_id: &str, team_id:
         lead_agent_id: agents.first().map(|agent| agent.slot_id.clone()),
         session_mode: None,
         agents_version: "1.0.1".to_owned(),
+        origin_conversation_id: None,
         created_at: now_ms(),
         updated_at: now_ms(),
     })
