@@ -16,16 +16,17 @@ impl CronEventEmitter {
         Self { broadcaster }
     }
 
-    pub fn emit_job_created(&self, job: &CronJobResponse) {
-        self.broadcast("cron.job-created", job);
+    pub fn emit_job_created(&self, user_id: &str, job: &CronJobResponse) {
+        self.broadcast(user_id, "cron.job-created", job);
     }
 
-    pub fn emit_job_updated(&self, job: &CronJobResponse) {
-        self.broadcast("cron.job-updated", job);
+    pub fn emit_job_updated(&self, user_id: &str, job: &CronJobResponse) {
+        self.broadcast(user_id, "cron.job-updated", job);
     }
 
-    pub fn emit_job_removed(&self, job_id: &str) {
+    pub fn emit_job_removed(&self, user_id: &str, job_id: &str) {
         self.broadcast(
+            user_id,
             "cron.job-removed",
             &CronJobRemovedPayload {
                 job_id: job_id.to_owned(),
@@ -33,8 +34,9 @@ impl CronEventEmitter {
         );
     }
 
-    pub fn emit_job_executed(&self, job_id: &str, status: &str, err: Option<&str>) {
+    pub fn emit_job_executed(&self, user_id: &str, job_id: &str, status: &str, err: Option<&str>) {
         self.broadcast(
+            user_id,
             "cron.job-executed",
             &CronJobExecutedEvent {
                 job_id: job_id.to_owned(),
@@ -44,8 +46,9 @@ impl CronEventEmitter {
         );
     }
 
-    pub fn emit_conversation_tips(&self, conversation_id: &str, content: &str, tip_type: &str) {
+    pub fn emit_conversation_tips(&self, user_id: &str, conversation_id: &str, content: &str, tip_type: &str) {
         let payload = json!({
+            "user_id": user_id,
             "conversation_id": conversation_id,
             "msg_id": ConversationService::mint_msg_id(),
             "type": "tips",
@@ -59,14 +62,15 @@ impl CronEventEmitter {
             .broadcast(WebSocketMessage::new("message.stream", payload));
     }
 
-    fn broadcast<T: serde::Serialize>(&self, event_name: &str, payload: &T) {
-        let value = match serde_json::to_value(payload) {
+    fn broadcast<T: serde::Serialize>(&self, user_id: &str, event_name: &str, payload: &T) {
+        let mut value = match serde_json::to_value(payload) {
             Ok(v) => v,
             Err(e) => {
                 error!(event_name, error = %e, "Failed to serialize event payload");
                 return;
             }
         };
+        value["user_id"] = serde_json::Value::String(user_id.to_owned());
         self.broadcaster.broadcast(WebSocketMessage::new(event_name, value));
     }
 }
@@ -147,11 +151,12 @@ mod tests {
     fn job_created_event_shape() {
         let (emitter, bc) = make_emitter();
         let resp = sample_response();
-        emitter.emit_job_created(&resp);
+        emitter.emit_job_created("user-1", &resp);
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "cron.job-created");
+        assert_eq!(events[0].data["user_id"], "user-1");
 
         let parsed: CronJobResponse = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(parsed.id, "cron_123");
@@ -162,11 +167,12 @@ mod tests {
     fn job_updated_event_shape() {
         let (emitter, bc) = make_emitter();
         let resp = sample_response();
-        emitter.emit_job_updated(&resp);
+        emitter.emit_job_updated("user-1", &resp);
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "cron.job-updated");
+        assert_eq!(events[0].data["user_id"], "user-1");
 
         let parsed: CronJobResponse = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(parsed.id, "cron_123");
@@ -175,11 +181,12 @@ mod tests {
     #[test]
     fn job_removed_event_shape() {
         let (emitter, bc) = make_emitter();
-        emitter.emit_job_removed("cron_456");
+        emitter.emit_job_removed("user-1", "cron_456");
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "cron.job-removed");
+        assert_eq!(events[0].data["user_id"], "user-1");
 
         let parsed: CronJobRemovedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(parsed.job_id, "cron_456");
@@ -188,11 +195,12 @@ mod tests {
     #[test]
     fn job_executed_success_event() {
         let (emitter, bc) = make_emitter();
-        emitter.emit_job_executed("cron_789", "ok", None);
+        emitter.emit_job_executed("user-1", "cron_789", "ok", None);
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "cron.job-executed");
+        assert_eq!(events[0].data["user_id"], "user-1");
 
         let parsed: CronJobExecutedEvent = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(parsed.job_id, "cron_789");
@@ -203,7 +211,7 @@ mod tests {
     #[test]
     fn job_executed_error_event() {
         let (emitter, bc) = make_emitter();
-        emitter.emit_job_executed("cron_789", "error", Some("timeout"));
+        emitter.emit_job_executed("user-1", "cron_789", "error", Some("timeout"));
 
         let events = bc.events();
         assert_eq!(events.len(), 1);
@@ -216,7 +224,7 @@ mod tests {
     #[test]
     fn job_executed_skipped_event() {
         let (emitter, bc) = make_emitter();
-        emitter.emit_job_executed("cron_789", "skipped", None);
+        emitter.emit_job_executed("user-1", "cron_789", "skipped", None);
 
         let events = bc.events();
         let parsed: CronJobExecutedEvent = serde_json::from_value(events[0].data.clone()).unwrap();
@@ -227,10 +235,10 @@ mod tests {
     fn multiple_events_accumulate() {
         let (emitter, bc) = make_emitter();
         let resp = sample_response();
-        emitter.emit_job_created(&resp);
-        emitter.emit_job_updated(&resp);
-        emitter.emit_job_removed("cron_123");
-        emitter.emit_job_executed("cron_123", "ok", None);
+        emitter.emit_job_created("user-1", &resp);
+        emitter.emit_job_updated("user-1", &resp);
+        emitter.emit_job_removed("user-1", "cron_123");
+        emitter.emit_job_executed("user-1", "cron_123", "ok", None);
 
         let events = bc.events();
         assert_eq!(events.len(), 4);

@@ -29,16 +29,16 @@ impl RemoteAgentService {
     }
 
     /// List all remote agents (auth_token omitted).
-    pub async fn list(&self) -> Result<Vec<RemoteAgentListItem>, AgentError> {
-        let rows = self.repo.list().await.map_err(db_err)?;
+    pub async fn list(&self, user_id: &str) -> Result<Vec<RemoteAgentListItem>, AgentError> {
+        let rows = self.repo.list(user_id).await.map_err(db_err)?;
         rows.into_iter().map(|r| self.row_to_list_item(r)).collect()
     }
 
     /// Get a single remote agent by ID (auth_token masked).
-    pub async fn get(&self, id: &str) -> Result<RemoteAgentResponse, AgentError> {
+    pub async fn get(&self, user_id: &str, id: &str) -> Result<RemoteAgentResponse, AgentError> {
         let row = self
             .repo
-            .find_by_id(id)
+            .find_by_id(user_id, id)
             .await
             .map_err(db_err)?
             .ok_or_else(|| AgentError::not_found(format!("Remote agent '{id}' not found")))?;
@@ -46,7 +46,11 @@ impl RemoteAgentService {
     }
 
     /// Create a new remote agent. OpenClaw protocol auto-generates Ed25519 keys.
-    pub async fn create(&self, req: CreateRemoteAgentRequest) -> Result<RemoteAgentResponse, AgentError> {
+    pub async fn create(
+        &self,
+        user_id: &str,
+        req: CreateRemoteAgentRequest,
+    ) -> Result<RemoteAgentResponse, AgentError> {
         validate_create_request(&req)?;
 
         let encrypted_token = req
@@ -65,6 +69,7 @@ impl RemoteAgentService {
         let row = self
             .repo
             .create(aionui_db::CreateRemoteAgentParams {
+                user_id,
                 name: &req.name,
                 protocol: &enum_to_str(&req.protocol),
                 url: &req.url,
@@ -85,7 +90,12 @@ impl RemoteAgentService {
     }
 
     /// Update an existing remote agent.
-    pub async fn update(&self, id: &str, req: UpdateRemoteAgentRequest) -> Result<RemoteAgentResponse, AgentError> {
+    pub async fn update(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: UpdateRemoteAgentRequest,
+    ) -> Result<RemoteAgentResponse, AgentError> {
         let encrypted_token = match &req.auth_token {
             Some(Some(t)) => Some(Some(
                 encrypt_string(t, &self.encryption_key).map_err(|e| AgentError::internal(e.to_string()))?,
@@ -108,7 +118,7 @@ impl RemoteAgentService {
             description: req.description.as_ref().map(|o| o.as_deref()),
         };
 
-        let row = self.repo.update(id, params).await.map_err(|e| match e {
+        let row = self.repo.update(user_id, id, params).await.map_err(|e| match e {
             aionui_db::DbError::NotFound(msg) => AgentError::not_found(msg),
             other => AgentError::internal(other.to_string()),
         })?;
@@ -117,8 +127,8 @@ impl RemoteAgentService {
     }
 
     /// Delete a remote agent.
-    pub async fn delete(&self, id: &str) -> Result<(), AgentError> {
-        self.repo.delete(id).await.map_err(|e| match e {
+    pub async fn delete(&self, user_id: &str, id: &str) -> Result<(), AgentError> {
+        self.repo.delete(user_id, id).await.map_err(|e| match e {
             aionui_db::DbError::NotFound(msg) => AgentError::not_found(msg),
             other => AgentError::internal(other.to_string()),
         })
@@ -148,10 +158,10 @@ impl RemoteAgentService {
     }
 
     /// OpenClaw device handshake (15s timeout).
-    pub async fn handshake(&self, id: &str) -> Result<HandshakeResponse, AgentError> {
+    pub async fn handshake(&self, user_id: &str, id: &str) -> Result<HandshakeResponse, AgentError> {
         let row = self
             .repo
-            .find_by_id(id)
+            .find_by_id(user_id, id)
             .await
             .map_err(db_err)?
             .ok_or_else(|| AgentError::not_found(format!("Remote agent '{id}' not found")))?;
@@ -180,17 +190,17 @@ impl RemoteAgentService {
         match connect_result {
             Ok(Ok(_)) => {
                 let now = aionui_common::now_ms();
-                let _ = self.repo.update_status(id, "connected", Some(now)).await;
+                let _ = self.repo.update_status(user_id, id, "connected", Some(now)).await;
                 Ok(HandshakeResponse {
                     status: "ok".to_string(),
                 })
             }
             Ok(Err(e)) => {
-                let _ = self.repo.update_status(id, "error", None).await;
+                let _ = self.repo.update_status(user_id, id, "error", None).await;
                 Err(e)
             }
             Err(_) => {
-                let _ = self.repo.update_status(id, "error", None).await;
+                let _ = self.repo.update_status(user_id, id, "error", None).await;
                 Err(AgentError::timeout("Handshake timed out after 15 seconds"))
             }
         }

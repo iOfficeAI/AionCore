@@ -28,7 +28,6 @@ use crate::types::{CronJob, ExecutionMode};
 
 pub const RETRY_INTERVAL_MS: u64 = 30_000;
 pub const MAX_RETRIES_DEFAULT: i64 = 3;
-const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionResult {
@@ -50,6 +49,7 @@ pub(crate) enum PreparedRunNow {
 }
 
 struct SkillSuggestContext {
+    user_id: String,
     conversation_id: String,
     job_id: String,
     workspace: String,
@@ -212,7 +212,7 @@ impl JobExecutor {
     pub async fn conversation_exists(&self, conversation_id: &str) -> Result<bool, CronError> {
         let row = self
             .conversation_repo
-            .get(conversation_id)
+            .owner_user_id(conversation_id)
             .await
             .map_err(CronError::Database)?;
         Ok(row.is_some())
@@ -226,17 +226,37 @@ impl JobExecutor {
         &self,
         conversation_id: &str,
     ) -> Result<Option<aionui_db::models::ConversationRow>, CronError> {
+        let Some(user_id) = self
+            .conversation_repo
+            .owner_user_id(conversation_id)
+            .await
+            .map_err(CronError::Database)?
+        else {
+            return Ok(None);
+        };
         self.conversation_repo
-            .get(conversation_id)
+            .get(&user_id, conversation_id)
+            .await
+            .map_err(CronError::Database)
+    }
+
+    pub async fn get_conversation_row_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<aionui_db::models::ConversationRow>, CronError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
             .await
             .map_err(CronError::Database)
     }
 
     pub async fn auto_workspace_to_delete_for_conversation(
         &self,
+        user_id: &str,
         conversation_id: &str,
     ) -> Result<Option<PathBuf>, CronError> {
-        let Some(row) = self.get_conversation_row(conversation_id).await? else {
+        let Some(row) = self.get_conversation_row_for_user(user_id, conversation_id).await? else {
             return Ok(None);
         };
         Ok(self
@@ -248,8 +268,16 @@ impl JobExecutor {
         &self,
         conversation_id: &str,
     ) -> Result<Option<aionui_db::models::ConversationAssistantSnapshotRow>, CronError> {
+        let Some(user_id) = self
+            .conversation_repo
+            .owner_user_id(conversation_id)
+            .await
+            .map_err(CronError::Database)?
+        else {
+            return Ok(None);
+        };
         self.conversation_repo
-            .get_assistant_snapshot(conversation_id)
+            .get_assistant_snapshot(&user_id, conversation_id)
             .await
             .map_err(CronError::Database)
     }
@@ -298,8 +326,9 @@ impl JobExecutor {
             created_at: aionui_common::now_ms(),
         };
 
+        let user_id = self.resolve_target_conversation_user_id(conversation_id).await?;
         self.conversation_repo
-            .insert_message(&row)
+            .insert_message(&user_id, &row)
             .await
             .map_err(CronError::Database)
     }
@@ -348,14 +377,14 @@ impl JobExecutor {
                 ..Default::default()
             };
             self.conversation_repo
-                .update(conversation_id, &update)
+                .update(&row.user_id, conversation_id, &update)
                 .await
                 .map_err(CronError::Database)?;
         }
 
         if is_acp_conversation && let Some(mode) = session_mode {
             self.conversation_service
-                .save_acp_runtime_mode(conversation_id, mode)
+                .save_acp_runtime_mode(&row.user_id, conversation_id, mode)
                 .await?;
         }
 
@@ -395,7 +424,7 @@ impl JobExecutor {
             ..Default::default()
         };
         self.conversation_repo
-            .update(conversation_id, &update)
+            .update(&row.user_id, conversation_id, &update)
             .await
             .map_err(CronError::Database)
     }
@@ -428,7 +457,7 @@ impl JobExecutor {
             };
             return self
                 .conversation_repo
-                .update(conversation_id, &update)
+                .update(&row.user_id, conversation_id, &update)
                 .await
                 .map_err(CronError::Database);
         };
@@ -454,7 +483,7 @@ impl JobExecutor {
             ..Default::default()
         };
         self.conversation_repo
-            .update(conversation_id, &update)
+            .update(&row.user_id, conversation_id, &update)
             .await
             .map_err(CronError::Database)
     }
@@ -508,7 +537,12 @@ impl JobExecutor {
                         .create_new_conversation(job, saved_skill, ConversationPurpose::ExistingReplacement)
                         .await;
                 }
-                if !self.conversation_exists(conversation_id).await? {
+                let Some(owner_user_id) = self
+                    .conversation_repo
+                    .owner_user_id(conversation_id)
+                    .await
+                    .map_err(CronError::Database)?
+                else {
                     warn!(
                         job_id = %job.id,
                         conversation_id,
@@ -517,6 +551,19 @@ impl JobExecutor {
                     return self
                         .create_new_conversation(job, saved_skill, ConversationPurpose::ExistingReplacement)
                         .await;
+                };
+                if !job.user_id.trim().is_empty() && owner_user_id != job.user_id {
+                    warn!(
+                        job_id = %job.id,
+                        job_user_id = %job.user_id,
+                        conversation_id,
+                        conversation_user_id = %owner_user_id,
+                        "Cron existing-mode conversation owner mismatch; refusing to dispatch"
+                    );
+                    return Err(CronError::Scheduler(format!(
+                        "cron job {} targets conversation {} owned by another user",
+                        job.id, conversation_id
+                    )));
                 }
                 Ok(job.conversation_id.clone())
             }
@@ -542,7 +589,7 @@ impl JobExecutor {
         saved_skill: Option<&SavedSkillContext>,
         purpose: ConversationPurpose,
     ) -> Result<String, CronError> {
-        let agent_type = parse_agent_type(&self.agent_registry, &job.agent_type).await?;
+        let agent_type = parse_agent_type(&self.agent_registry, &job.user_id, &job.agent_type).await?;
         let model = resolve_model(job);
         let user_id = self.resolve_conversation_owner_user_id(job).await?;
 
@@ -594,14 +641,32 @@ impl JobExecutor {
     }
 
     async fn resolve_conversation_owner_user_id(&self, job: &CronJob) -> Result<String, CronError> {
-        if !job.conversation_id.trim().is_empty()
-            && let Some(row) = self.get_conversation_row(&job.conversation_id).await?
-            && !row.user_id.trim().is_empty()
-        {
-            return Ok(row.user_id);
+        if !job.user_id.trim().is_empty() {
+            return Ok(job.user_id.clone());
         }
 
-        Ok(SYSTEM_DEFAULT_USER_ID.to_owned())
+        if job.conversation_id.trim().is_empty() {
+            return Err(CronError::Scheduler(format!(
+                "cron job {} has no conversation owner",
+                job.id
+            )));
+        }
+
+        if !job.conversation_id.trim().is_empty()
+            && let Some(user_id) = self
+                .conversation_repo
+                .owner_user_id(&job.conversation_id)
+                .await
+                .map_err(CronError::Database)?
+            && !user_id.trim().is_empty()
+        {
+            return Ok(user_id);
+        }
+
+        Err(CronError::Scheduler(format!(
+            "cron job {} conversation {} has no resolvable owner",
+            job.id, job.conversation_id
+        )))
     }
 
     async fn execute_inner_with_busy_retry(
@@ -653,18 +718,20 @@ impl JobExecutor {
 
         let on_started = {
             let job = job.clone();
+            let user_id = user_id.clone();
             let conversation_repo = Arc::clone(&self.conversation_repo);
             let broadcaster = Arc::clone(&self.broadcaster);
             Some(Arc::new(move |started: ConversationAgentTurnStarted| {
                 let job = job.clone();
+                let user_id = user_id.clone();
                 let conversation_repo = Arc::clone(&conversation_repo);
                 let broadcaster = Arc::clone(&broadcaster);
                 let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = Box::pin(async move {
                     let created_at = now_ms();
                     let row = build_cron_trigger_artifact(&started.conversation_id, &job, created_at);
-                    match conversation_repo.upsert_artifact(&row).await {
+                    match conversation_repo.upsert_artifact(&user_id, &row).await {
                         Ok(row) => {
-                            if let Err(e) = broadcast_artifact(&broadcaster, &row) {
+                            if let Err(e) = broadcast_artifact(&broadcaster, &user_id, &row) {
                                 warn!(
                                     job_id = %job.id,
                                     conversation_id = %started.conversation_id,
@@ -688,7 +755,7 @@ impl JobExecutor {
         };
 
         let turn_req = ConversationAgentTurnRequest {
-            user_id,
+            user_id: user_id.clone(),
             conversation_id: conversation_id.to_owned(),
             content: prompt,
             files: vec![],
@@ -703,7 +770,9 @@ impl JobExecutor {
             Ok(outcome) => {
                 if outcome.status == ConversationAgentTurnStatus::Failed {
                     return ExecutionResult::Error {
-                        message: self.conversation_turn_failed_message(conversation_id, outcome).await,
+                        message: self
+                            .conversation_turn_failed_message(&user_id, conversation_id, outcome)
+                            .await,
                     };
                 }
                 if saved_skill.is_none() && matches!(job.execution_mode, ExecutionMode::NewConversation) {
@@ -720,6 +789,7 @@ impl JobExecutor {
                             String::new()
                         });
                     self.schedule_skill_suggest_check(SkillSuggestContext {
+                        user_id: user_id.clone(),
                         conversation_id: conversation_id.to_owned(),
                         job_id: job.id.clone(),
                         workspace,
@@ -757,6 +827,7 @@ impl JobExecutor {
 
     async fn conversation_turn_failed_message(
         &self,
+        user_id: &str,
         conversation_id: &str,
         outcome: ConversationAgentTurnOutcome,
     ) -> String {
@@ -771,7 +842,7 @@ impl JobExecutor {
 
         match self
             .conversation_service
-            .latest_conversation_error_message(conversation_id)
+            .latest_conversation_error_message(user_id, conversation_id)
             .await
         {
             Ok(Some(message)) => message,
@@ -802,21 +873,23 @@ impl JobExecutor {
         };
 
         if row.user_id.trim().is_empty() {
-            return Ok(SYSTEM_DEFAULT_USER_ID.to_owned());
+            return Err(CronError::Scheduler(format!(
+                "conversation {conversation_id} has no owner"
+            )));
         }
 
         Ok(row.user_id)
     }
 
-    pub async fn mark_skill_suggest_artifacts_saved(&self, job_id: &str) -> Result<(), CronError> {
+    pub async fn mark_skill_suggest_artifacts_saved(&self, user_id: &str, job_id: &str) -> Result<(), CronError> {
         let rows = self
             .conversation_repo
-            .mark_skill_suggest_artifacts_saved(job_id, now_ms())
+            .mark_skill_suggest_artifacts_saved(user_id, job_id, now_ms())
             .await
             .map_err(CronError::Database)?;
 
         for row in rows {
-            broadcast_artifact(&self.broadcaster, &row)?;
+            broadcast_artifact(&self.broadcaster, user_id, &row)?;
         }
 
         Ok(())
@@ -849,7 +922,7 @@ impl JobExecutor {
 
     fn schedule_skill_suggest_check(&self, ctx: SkillSuggestContext) {
         self.skill_suggest_detector
-            .schedule_check(ctx.conversation_id, ctx.job_id, ctx.workspace);
+            .schedule_check(ctx.user_id, ctx.conversation_id, ctx.job_id, ctx.workspace);
     }
 
     async fn prepare_saved_skill(&self, job: &CronJob) -> Result<Option<SavedSkillContext>, CronError> {
@@ -907,7 +980,10 @@ impl JobExecutor {
     async fn load_conversation_skill_names(&self, conversation_id: &str) -> Result<Vec<String>, CronError> {
         let Some(row) = self
             .conversation_repo
-            .get(conversation_id)
+            .get(
+                &self.resolve_target_conversation_user_id(conversation_id).await?,
+                conversation_id,
+            )
             .await
             .map_err(CronError::Database)?
         else {
@@ -941,7 +1017,11 @@ impl JobExecutor {
 /// 2. ACP vendor lookup via the registry — any builtin ACP row's
 ///    `backend` aliases to [`AgentType::Acp`].
 /// 3. Fallback to [`AgentType::Acp`] to preserve the prior default.
-async fn parse_agent_type(registry: &AgentRegistry, agent_type_str: &str) -> Result<AgentType, CronError> {
+async fn parse_agent_type(
+    registry: &AgentRegistry,
+    user_id: &str,
+    agent_type_str: &str,
+) -> Result<AgentType, CronError> {
     if let Ok(agent_type) = serde_json::from_value::<AgentType>(serde_json::Value::String(agent_type_str.to_owned())) {
         if agent_type.is_deprecated_runtime() {
             return Err(CronError::InvalidAgentConfig(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
@@ -949,7 +1029,11 @@ async fn parse_agent_type(registry: &AgentRegistry, agent_type_str: &str) -> Res
         return Ok(agent_type);
     }
 
-    if registry.find_builtin_by_backend(agent_type_str).await.is_some() {
+    if registry
+        .find_builtin_by_backend_for_user(user_id, agent_type_str)
+        .await
+        .is_some()
+    {
         return Ok(AgentType::Acp);
     }
 
@@ -984,7 +1068,10 @@ async fn inject_agent_identity(
         return;
     }
 
-    if let Some(meta) = registry.find_builtin_by_backend(lookup_label).await {
+    if let Some(meta) = registry
+        .find_builtin_by_backend_for_user(&job.user_id, lookup_label)
+        .await
+    {
         extra.insert("agent_id".to_owned(), serde_json::Value::String(meta.id.clone()));
         if let Some(backend) = meta.backend {
             extra.insert("backend".to_owned(), serde_json::Value::String(backend));
@@ -1240,6 +1327,7 @@ mod tests {
     fn sample_job() -> CronJob {
         CronJob {
             id: "cron_test1".into(),
+            user_id: "user1".into(),
             name: "Test Job".into(),
             enabled: true,
             schedule: CronSchedule::Every {
@@ -1404,6 +1492,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_scheduled_rejects_cross_user_existing_conversation() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let task_manager = Arc::new(RecordingTaskManager::new(AgentInstance::Mock(agent.clone())));
+        let repo = Arc::new(MissingWorkspaceConversationRepo::new(
+            "conv_1",
+            serde_json::json!({
+                "workspace": ensure_named_workspace_path("aionui-cron-cross-user-conversation-workspace")
+            }),
+        ));
+        let executor = make_executor_with_task_manager_and_repo(task_manager, repo);
+        let result = executor.prepare_scheduled(&sample_job()).await.unwrap_err();
+
+        match result {
+            ExecutionResult::Error { message } => {
+                assert!(message.contains("owned by another user"), "unexpected error: {message}");
+            }
+            other => panic!("expected owner mismatch error, got {other:?}"),
+        }
+        assert_eq!(agent.send_calls(), 0, "owner mismatch must not dispatch");
+    }
+
+    #[tokio::test]
     async fn prepare_run_now_returns_active_conversation_when_runtime_state_is_already_claimed() {
         let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
         let executor = make_executor_with_agent(AgentInstance::Mock(agent));
@@ -1508,15 +1618,21 @@ mod tests {
     #[tokio::test]
     async fn parse_agent_type_known_types() {
         let registry = hydrated_registry().await;
-        assert_eq!(parse_agent_type(&registry, "acp").await.unwrap(), AgentType::Acp);
-        assert_eq!(parse_agent_type(&registry, "aionrs").await.unwrap(), AgentType::Aionrs);
+        assert_eq!(
+            parse_agent_type(&registry, "user1", "acp").await.unwrap(),
+            AgentType::Acp
+        );
+        assert_eq!(
+            parse_agent_type(&registry, "user1", "aionrs").await.unwrap(),
+            AgentType::Aionrs
+        );
     }
 
     #[tokio::test]
     async fn parse_agent_type_rejects_deprecated_runtime_types() {
         let registry = hydrated_registry().await;
         for agent_type in ["openclaw-gateway", "nanobot", "remote", "gemini", "codex"] {
-            let err = parse_agent_type(&registry, agent_type).await.unwrap_err();
+            let err = parse_agent_type(&registry, "user1", agent_type).await.unwrap_err();
             assert!(matches!(err, CronError::InvalidAgentConfig(_)));
             assert!(
                 err.to_string()
@@ -1529,15 +1645,21 @@ mod tests {
     #[tokio::test]
     async fn parse_agent_type_acp_backend_aliases_to_acp() {
         let registry = hydrated_registry().await;
-        assert_eq!(parse_agent_type(&registry, "claude").await.unwrap(), AgentType::Acp);
-        assert_eq!(parse_agent_type(&registry, "qwen").await.unwrap(), AgentType::Acp);
+        assert_eq!(
+            parse_agent_type(&registry, "user1", "claude").await.unwrap(),
+            AgentType::Acp
+        );
+        assert_eq!(
+            parse_agent_type(&registry, "user1", "qwen").await.unwrap(),
+            AgentType::Acp
+        );
     }
 
     #[tokio::test]
     async fn parse_agent_type_unknown_defaults_to_acp() {
         let registry = hydrated_registry().await;
         assert_eq!(
-            parse_agent_type(&registry, "unknown_type").await.unwrap(),
+            parse_agent_type(&registry, "user1", "unknown_type").await.unwrap(),
             AgentType::Acp
         );
     }
@@ -2360,16 +2482,28 @@ mod tests {
 
         #[async_trait::async_trait]
         impl IConversationRepository for StubConvRepo {
-            async fn get(&self, _id: &str) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+            async fn get(
+                &self,
+                _user_id: &str,
+                _id: &str,
+            ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+                Ok(None)
+            }
+            async fn owner_user_id(&self, _id: &str) -> Result<Option<String>, aionui_db::DbError> {
                 Ok(None)
             }
             async fn create(&self, _row: &aionui_db::models::ConversationRow) -> Result<(), aionui_db::DbError> {
                 Ok(())
             }
-            async fn update(&self, _id: &str, _updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
+            async fn update(
+                &self,
+                _user_id: &str,
+                _id: &str,
+                _updates: &ConversationRowUpdate,
+            ) -> Result<(), aionui_db::DbError> {
                 Ok(())
             }
-            async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+            async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
                 Ok(())
             }
             async fn list_paginated(
@@ -2408,6 +2542,7 @@ mod tests {
             }
             async fn list_messages_page(
                 &self,
+                _user_id: &str,
                 _conv_id: &str,
                 _params: &MessagePageParams,
             ) -> Result<MessagePageResult, aionui_db::DbError> {
@@ -2417,17 +2552,32 @@ mod tests {
                     has_more_after: false,
                 })
             }
-            async fn insert_message(&self, _message: &aionui_db::models::MessageRow) -> Result<(), aionui_db::DbError> {
+            async fn insert_message(
+                &self,
+                _user_id: &str,
+                _message: &aionui_db::models::MessageRow,
+            ) -> Result<(), aionui_db::DbError> {
                 Ok(())
             }
-            async fn update_message(&self, _id: &str, _updates: &MessageRowUpdate) -> Result<(), aionui_db::DbError> {
+            async fn update_message(
+                &self,
+                _user_id: &str,
+                _conversation_id: &str,
+                _id: &str,
+                _updates: &MessageRowUpdate,
+            ) -> Result<(), aionui_db::DbError> {
                 Ok(())
             }
-            async fn delete_messages_by_conversation(&self, _conv_id: &str) -> Result<(), aionui_db::DbError> {
+            async fn delete_messages_by_conversation(
+                &self,
+                _user_id: &str,
+                _conv_id: &str,
+            ) -> Result<(), aionui_db::DbError> {
                 Ok(())
             }
             async fn get_message_by_msg_id(
                 &self,
+                _user_id: &str,
                 _conv_id: &str,
                 _msg_id: &str,
                 _msg_type: &str,
@@ -2797,10 +2947,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IConversationRepository for ExistingConversationRepo {
-        async fn get(&self, id: &str) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+        async fn get(
+            &self,
+            _user_id: &str,
+            id: &str,
+        ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
             Ok(Some(aionui_db::models::ConversationRow {
                 id: id.to_owned(),
-                user_id: "cron".into(),
+                user_id: "user1".into(),
                 name: "Cron Conversation".into(),
                 r#type: "acp".into(),
                 extra: serde_json::json!({
@@ -2820,15 +2974,24 @@ mod tests {
             }))
         }
 
+        async fn owner_user_id(&self, _id: &str) -> Result<Option<String>, aionui_db::DbError> {
+            Ok(Some("user1".into()))
+        }
+
         async fn create(&self, _row: &aionui_db::models::ConversationRow) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn update(&self, _id: &str, _updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _updates: &ConversationRowUpdate,
+        ) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
@@ -2872,6 +3035,7 @@ mod tests {
 
         async fn list_messages_page(
             &self,
+            _user_id: &str,
             _conv_id: &str,
             _params: &MessagePageParams,
         ) -> Result<MessagePageResult, aionui_db::DbError> {
@@ -2882,20 +3046,35 @@ mod tests {
             })
         }
 
-        async fn insert_message(&self, _message: &aionui_db::models::MessageRow) -> Result<(), aionui_db::DbError> {
+        async fn insert_message(
+            &self,
+            _user_id: &str,
+            _message: &aionui_db::models::MessageRow,
+        ) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn update_message(&self, _id: &str, _updates: &MessageRowUpdate) -> Result<(), aionui_db::DbError> {
+        async fn update_message(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _id: &str,
+            _updates: &MessageRowUpdate,
+        ) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn delete_messages_by_conversation(&self, _conv_id: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete_messages_by_conversation(
+            &self,
+            _user_id: &str,
+            _conv_id: &str,
+        ) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
         async fn get_message_by_msg_id(
             &self,
+            _user_id: &str,
             _conv_id: &str,
             _msg_id: &str,
             _msg_type: &str,
@@ -3005,20 +3184,33 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IConversationRepository for MissingWorkspaceConversationRepo {
-        async fn get(&self, _id: &str) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+        async fn get(
+            &self,
+            _user_id: &str,
+            _id: &str,
+        ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
             Ok(Some(self.row.clone()))
+        }
+
+        async fn owner_user_id(&self, _id: &str) -> Result<Option<String>, aionui_db::DbError> {
+            Ok(Some(self.row.user_id.clone()))
         }
 
         async fn create(&self, _row: &aionui_db::models::ConversationRow) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn update(&self, _id: &str, updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            updates: &ConversationRowUpdate,
+        ) -> Result<(), aionui_db::DbError> {
             self.updates.lock().unwrap().push(updates.clone());
             Ok(())
         }
 
-        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
@@ -3062,6 +3254,7 @@ mod tests {
 
         async fn list_messages_page(
             &self,
+            _user_id: &str,
             _conv_id: &str,
             _params: &MessagePageParams,
         ) -> Result<MessagePageResult, aionui_db::DbError> {
@@ -3072,7 +3265,11 @@ mod tests {
             })
         }
 
-        async fn insert_message(&self, message: &aionui_db::models::MessageRow) -> Result<(), aionui_db::DbError> {
+        async fn insert_message(
+            &self,
+            _user_id: &str,
+            message: &aionui_db::models::MessageRow,
+        ) -> Result<(), aionui_db::DbError> {
             self.operations.lock().unwrap().push(format!(
                 "insert_message:{}:{}",
                 message.position.as_deref().unwrap_or("none"),
@@ -3082,16 +3279,27 @@ mod tests {
             Ok(())
         }
 
-        async fn update_message(&self, _id: &str, _updates: &MessageRowUpdate) -> Result<(), aionui_db::DbError> {
+        async fn update_message(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _id: &str,
+            _updates: &MessageRowUpdate,
+        ) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn delete_messages_by_conversation(&self, _conv_id: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete_messages_by_conversation(
+            &self,
+            _user_id: &str,
+            _conv_id: &str,
+        ) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
         async fn get_message_by_msg_id(
             &self,
+            _user_id: &str,
             _conv_id: &str,
             _msg_id: &str,
             _msg_type: &str,
@@ -3115,6 +3323,7 @@ mod tests {
 
         async fn upsert_artifact(
             &self,
+            _user_id: &str,
             artifact: &ConversationArtifactRow,
         ) -> Result<ConversationArtifactRow, aionui_db::DbError> {
             self.operations
@@ -3206,8 +3415,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl aionui_db::IAcpSessionRepository for StubAcpSessionRepo {
-        async fn get(
+        async fn get_for_user(
             &self,
+            _user_id: &str,
             _conversation_id: &str,
         ) -> Result<Option<aionui_db::models::AcpSessionRow>, aionui_db::DbError> {
             Ok(None)
@@ -3218,27 +3428,34 @@ mod tests {
         ) -> Result<aionui_db::models::AcpSessionRow, aionui_db::DbError> {
             Err(aionui_db::DbError::Init("stub".into()))
         }
-        async fn update_session_id(
+        async fn update_session_id_for_user(
             &self,
+            _user_id: &str,
             _conversation_id: &str,
             _session_id: &str,
         ) -> Result<bool, aionui_db::DbError> {
             Ok(false)
         }
-        async fn clear_session_id(&self, _conversation_id: &str) -> Result<bool, aionui_db::DbError> {
-            Ok(false)
-        }
-        async fn delete(&self, _conversation_id: &str) -> Result<bool, aionui_db::DbError> {
-            Ok(false)
-        }
-        async fn load_runtime_state(
+        async fn clear_session_id_for_user(
             &self,
+            _user_id: &str,
+            _conversation_id: &str,
+        ) -> Result<bool, aionui_db::DbError> {
+            Ok(false)
+        }
+        async fn delete_for_user(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, aionui_db::DbError> {
+            Ok(false)
+        }
+        async fn load_runtime_state_for_user(
+            &self,
+            _user_id: &str,
             _conversation_id: &str,
         ) -> Result<Option<aionui_db::PersistedSessionState>, aionui_db::DbError> {
             Ok(None)
         }
-        async fn save_runtime_state(
+        async fn save_runtime_state_for_user(
             &self,
+            _user_id: &str,
             _conversation_id: &str,
             _params: &aionui_db::SaveRuntimeStateParams<'_>,
         ) -> Result<bool, aionui_db::DbError> {
@@ -3253,8 +3470,21 @@ mod tests {
         async fn list_all(&self) -> Result<Vec<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
             Ok(Vec::new())
         }
+        async fn list_all_for_user(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
+            self.list_all().await
+        }
         async fn get(&self, _id: &str) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
             Ok(None)
+        }
+        async fn get_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+        ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
+            self.get(id).await
         }
         async fn find_by_source_and_name(
             &self,
@@ -3263,17 +3493,39 @@ mod tests {
         ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
             Ok(None)
         }
+        async fn find_by_source_and_name_for_user(
+            &self,
+            _user_id: &str,
+            agent_source: &str,
+            name: &str,
+        ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
+            self.find_by_source_and_name(agent_source, name).await
+        }
         async fn find_builtin_by_backend(
             &self,
             _backend: &str,
         ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
             Ok(None)
         }
+        async fn find_builtin_by_backend_for_user(
+            &self,
+            _user_id: &str,
+            backend: &str,
+        ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
+            self.find_builtin_by_backend(backend).await
+        }
         async fn upsert(
             &self,
             _params: &aionui_db::models::UpsertAgentMetadataParams<'_>,
         ) -> Result<aionui_db::models::AgentMetadataRow, aionui_db::DbError> {
             Err(aionui_db::DbError::Init("stub".into()))
+        }
+        async fn upsert_for_user(
+            &self,
+            _user_id: &str,
+            params: &aionui_db::models::UpsertAgentMetadataParams<'_>,
+        ) -> Result<aionui_db::models::AgentMetadataRow, aionui_db::DbError> {
+            self.upsert(params).await
         }
         async fn apply_handshake(
             &self,
@@ -3282,12 +3534,28 @@ mod tests {
         ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
             Ok(None)
         }
+        async fn apply_handshake_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+            params: &aionui_db::models::UpdateAgentHandshakeParams<'_>,
+        ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
+            self.apply_handshake(id, params).await
+        }
         async fn update_availability_snapshot(
             &self,
             _id: &str,
             _params: &aionui_db::models::UpdateAgentAvailabilitySnapshotParams<'_>,
         ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
             Ok(None)
+        }
+        async fn update_availability_snapshot_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+            params: &aionui_db::models::UpdateAgentAvailabilitySnapshotParams<'_>,
+        ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
+            self.update_availability_snapshot(id, params).await
         }
         async fn update_agent_overrides(
             &self,
@@ -3297,11 +3565,31 @@ mod tests {
         ) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
+        async fn update_agent_overrides_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+            command_override: Option<&str>,
+            env_override: Option<&str>,
+        ) -> Result<(), aionui_db::DbError> {
+            self.update_agent_overrides(id, command_override, env_override).await
+        }
         async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, aionui_db::DbError> {
             Ok(false)
         }
+        async fn set_enabled_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+            enabled: bool,
+        ) -> Result<bool, aionui_db::DbError> {
+            self.set_enabled(id, enabled).await
+        }
         async fn delete(&self, _id: &str) -> Result<bool, aionui_db::DbError> {
             Ok(false)
+        }
+        async fn delete_for_user(&self, _user_id: &str, id: &str) -> Result<bool, aionui_db::DbError> {
+            self.delete(id).await
         }
     }
 }

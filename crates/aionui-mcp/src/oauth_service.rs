@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,8 +70,8 @@ struct PendingLogin {
 pub struct McpOAuthService {
     token_repo: Arc<dyn IOAuthTokenRepository>,
     http_client: reqwest::Client,
-    /// Mutex protecting the pending login state (only one login at a time).
-    pending: Arc<Mutex<Option<PendingLogin>>>,
+    /// Mutex protecting pending login state by (user_id, oauth_state).
+    pending: Arc<Mutex<HashMap<(String, String), PendingLogin>>>,
 }
 
 impl McpOAuthService {
@@ -78,7 +79,7 @@ impl McpOAuthService {
         Self {
             token_repo,
             http_client,
-            pending: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -87,8 +88,8 @@ impl McpOAuthService {
     // -----------------------------------------------------------------------
 
     /// Check whether the given server URL has a valid (non-expired) OAuth token.
-    pub async fn check_oauth_status(&self, server_url: &str) -> Result<OAuthStatusResponse, McpError> {
-        let authenticated = self.has_valid_token(server_url).await?;
+    pub async fn check_oauth_status(&self, user_id: &str, server_url: &str) -> Result<OAuthStatusResponse, McpError> {
+        let authenticated = self.has_valid_token(user_id, server_url).await?;
         Ok(OAuthStatusResponse { authenticated })
     }
 
@@ -100,8 +101,8 @@ impl McpOAuthService {
     /// 4. Build authorization URL and open it in the system browser
     /// 5. Wait for the redirect with the authorization code
     /// 6. Exchange code for tokens and persist them
-    pub async fn login(&self, server_url: &str) -> Result<OAuthLoginResponse, McpError> {
-        let (authorize_url, listener) = self.prepare_login_flow(server_url).await?;
+    pub async fn login(&self, user_id: &str, server_url: &str) -> Result<OAuthLoginResponse, McpError> {
+        let (authorize_url, listener) = self.prepare_login_flow(user_id, server_url).await?;
 
         // Open browser.
         debug!(url = %authorize_url, "Opening browser for OAuth authorization");
@@ -110,10 +111,10 @@ impl McpOAuthService {
         }
 
         // Wait for callback.
-        let code = match self.wait_for_callback(listener).await {
-            Ok(code) => code,
+        let (code, state) = match self.wait_for_callback(user_id, listener).await {
+            Ok(callback) => callback,
             Err(e) => {
-                self.clear_pending().await;
+                self.clear_pending_for_user(user_id).await;
                 return Ok(OAuthLoginResponse {
                     success: false,
                     error: Some(e.to_string()),
@@ -122,13 +123,13 @@ impl McpOAuthService {
         };
 
         // Exchange code for tokens.
-        match self.exchange_code(server_url, code).await {
+        match self.exchange_code(user_id, server_url, code, state).await {
             Ok(()) => Ok(OAuthLoginResponse {
                 success: true,
                 error: None,
             }),
             Err(e) => {
-                self.clear_pending().await;
+                self.clear_pending_for_user(user_id).await;
                 Ok(OAuthLoginResponse {
                     success: false,
                     error: Some(e.to_string()),
@@ -140,8 +141,8 @@ impl McpOAuthService {
     /// Logout from the given MCP server URL (delete stored token).
     ///
     /// Idempotent: returns Ok even if no token was stored.
-    pub async fn logout(&self, server_url: &str) -> Result<(), McpError> {
-        match self.token_repo.delete(server_url).await {
+    pub async fn logout(&self, user_id: &str, server_url: &str) -> Result<(), McpError> {
+        match self.token_repo.delete(user_id, server_url).await {
             Ok(()) => {
                 debug!(server_url, "OAuth token deleted");
                 Ok(())
@@ -155,8 +156,8 @@ impl McpOAuthService {
     }
 
     /// Return the list of server URLs that have stored OAuth tokens.
-    pub async fn get_authenticated_servers(&self) -> Result<Vec<String>, McpError> {
-        let urls = self.token_repo.list_authenticated_urls().await?;
+    pub async fn get_authenticated_servers(&self, user_id: &str) -> Result<Vec<String>, McpError> {
+        let urls = self.token_repo.list_authenticated_urls(user_id).await?;
         Ok(urls)
     }
 
@@ -165,8 +166,8 @@ impl McpOAuthService {
     /// If the stored token is expired and a refresh token is available,
     /// automatically refreshes before returning.
     /// Returns `None` if no token is stored for this URL.
-    pub async fn get_token(&self, server_url: &str) -> Result<Option<String>, McpError> {
-        let row = match self.token_repo.get_by_url(server_url).await? {
+    pub async fn get_token(&self, user_id: &str, server_url: &str) -> Result<Option<String>, McpError> {
+        let row = match self.token_repo.get_by_url(user_id, server_url).await? {
             Some(row) => row,
             None => return Ok(None),
         };
@@ -177,7 +178,7 @@ impl McpOAuthService {
             if now >= expires_at - EXPIRY_MARGIN_MS
                 && let Some(ref refresh_token) = row.refresh_token
             {
-                match self.refresh_token(server_url, refresh_token).await {
+                match self.refresh_token(user_id, server_url, refresh_token).await {
                     Ok(new_token) => return Ok(Some(new_token)),
                     Err(e) => {
                         warn!(
@@ -199,7 +200,7 @@ impl McpOAuthService {
 
     /// Discover endpoints, build OAuth client, generate PKCE, bind callback
     /// server, store pending state, and return the authorization URL + listener.
-    async fn prepare_login_flow(&self, server_url: &str) -> Result<(String, TcpListener), McpError> {
+    async fn prepare_login_flow(&self, user_id: &str, server_url: &str) -> Result<(String, TcpListener), McpError> {
         let metadata = self.discover_endpoints(server_url).await?;
 
         let auth_url_str = metadata.authorization_endpoint.clone();
@@ -236,21 +237,25 @@ impl McpOAuthService {
 
         {
             let mut pending = self.pending.lock().await;
-            *pending = Some(PendingLogin {
-                csrf_token,
-                pkce_verifier,
-                auth_url: auth_url_str,
-                token_url: token_url_str,
-                redirect_url: redirect_url_str,
-            });
+            let state = csrf_token.secret().clone();
+            pending.insert(
+                (user_id.to_string(), state),
+                PendingLogin {
+                    csrf_token,
+                    pkce_verifier,
+                    auth_url: auth_url_str,
+                    token_url: token_url_str,
+                    redirect_url: redirect_url_str,
+                },
+            );
         }
 
         Ok((authorize_url.to_string(), listener))
     }
 
     /// Check if a valid (non-expired) token exists for the URL.
-    async fn has_valid_token(&self, server_url: &str) -> Result<bool, McpError> {
-        let row = match self.token_repo.get_by_url(server_url).await? {
+    async fn has_valid_token(&self, user_id: &str, server_url: &str) -> Result<bool, McpError> {
+        let row = match self.token_repo.get_by_url(user_id, server_url).await? {
             Some(row) => row,
             None => return Ok(false),
         };
@@ -309,12 +314,13 @@ impl McpOAuthService {
     }
 
     /// Wait for the OAuth callback redirect on the given listener.
-    async fn wait_for_callback(&self, listener: TcpListener) -> Result<String, McpError> {
-        let (code_tx, code_rx) = tokio::sync::oneshot::channel::<Result<String, McpError>>();
+    async fn wait_for_callback(&self, user_id: &str, listener: TcpListener) -> Result<(String, String), McpError> {
+        let (code_tx, code_rx) = tokio::sync::oneshot::channel::<Result<(String, String), McpError>>();
         let pending = self.pending.clone();
+        let user_id = user_id.to_string();
 
         tokio::spawn(async move {
-            let result = Self::handle_callback_connection(listener, pending).await;
+            let result = Self::handle_callback_connection(&user_id, listener, pending).await;
             let _ = code_tx.send(result);
         });
 
@@ -329,9 +335,10 @@ impl McpOAuthService {
 
     /// Handle a single HTTP connection on the callback server.
     async fn handle_callback_connection(
+        user_id: &str,
         listener: TcpListener,
-        pending: Arc<Mutex<Option<PendingLogin>>>,
-    ) -> Result<String, McpError> {
+        pending: Arc<Mutex<HashMap<(String, String), PendingLogin>>>,
+    ) -> Result<(String, String), McpError> {
         let (mut stream, _) = listener
             .accept()
             .await
@@ -349,7 +356,7 @@ impl McpOAuthService {
         // Validate CSRF state.
         let guard = pending.lock().await;
         let pending_login = guard
-            .as_ref()
+            .get(&(user_id.to_string(), state.clone()))
             .ok_or_else(|| McpError::OAuth("No pending login state".to_string()))?;
 
         if state != *pending_login.csrf_token.secret() {
@@ -366,7 +373,7 @@ impl McpOAuthService {
 
         let _ = stream.write_all(response.as_bytes()).await;
 
-        Ok(code)
+        Ok((code, state))
     }
 
     /// Build a no-redirect reqwest client for OAuth token exchange.
@@ -378,11 +385,17 @@ impl McpOAuthService {
     }
 
     /// Exchange the authorization code for tokens and persist them.
-    async fn exchange_code(&self, server_url: &str, code: String) -> Result<(), McpError> {
+    async fn exchange_code(
+        &self,
+        user_id: &str,
+        server_url: &str,
+        code: String,
+        state: String,
+    ) -> Result<(), McpError> {
         let (auth_url_str, token_url_str, redirect_url_str, pkce_verifier) = {
             let mut guard = self.pending.lock().await;
             let pending = guard
-                .take()
+                .remove(&(user_id.to_string(), state))
                 .ok_or_else(|| McpError::OAuth("No pending login state".to_string()))?;
             (
                 pending.auth_url,
@@ -411,13 +424,18 @@ impl McpOAuthService {
             .await
             .map_err(|e| McpError::OAuth(format!("Token exchange failed: {e}")))?;
 
-        self.persist_token(server_url, &token_result).await?;
+        self.persist_token(user_id, server_url, &token_result).await?;
         debug!(server_url, "OAuth tokens stored successfully");
         Ok(())
     }
 
     /// Refresh an expired access token using the refresh token.
-    async fn refresh_token(&self, server_url: &str, refresh_token_value: &str) -> Result<String, McpError> {
+    async fn refresh_token(
+        &self,
+        user_id: &str,
+        server_url: &str,
+        refresh_token_value: &str,
+    ) -> Result<String, McpError> {
         let metadata = self.discover_endpoints(server_url).await?;
         let token_url =
             TokenUrl::new(metadata.token_endpoint).map_err(|e| McpError::OAuth(format!("Invalid token URL: {e}")))?;
@@ -445,6 +463,7 @@ impl McpOAuthService {
 
         self.token_repo
             .upsert(UpsertOAuthTokenParams {
+                user_id,
                 server_url,
                 access_token: &new_access_token,
                 refresh_token: Some(new_refresh),
@@ -458,11 +477,17 @@ impl McpOAuthService {
     }
 
     /// Persist token response to DB.
-    async fn persist_token<TR: TokenResponse>(&self, server_url: &str, token_result: &TR) -> Result<(), McpError> {
+    async fn persist_token<TR: TokenResponse>(
+        &self,
+        user_id: &str,
+        server_url: &str,
+        token_result: &TR,
+    ) -> Result<(), McpError> {
         let expires_at: Option<TimestampMs> = token_result.expires_in().map(|d| now_ms() + d.as_millis() as i64);
 
         self.token_repo
             .upsert(UpsertOAuthTokenParams {
+                user_id,
                 server_url,
                 access_token: token_result.access_token().secret(),
                 refresh_token: token_result.refresh_token().map(|t| t.secret().as_str()),
@@ -475,9 +500,9 @@ impl McpOAuthService {
     }
 
     /// Clear the pending login state.
-    async fn clear_pending(&self) {
+    async fn clear_pending_for_user(&self, user_id: &str) {
         let mut guard = self.pending.lock().await;
-        *guard = None;
+        guard.retain(|(pending_user_id, _), _| pending_user_id != user_id);
     }
 }
 
@@ -562,6 +587,8 @@ fn url_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_USER_ID: &str = "user-1";
 
     // -- parse_callback_query ------------------------------------------------
 
@@ -653,13 +680,45 @@ mod tests {
         let _clone = svc.clone();
     }
 
+    #[tokio::test]
+    async fn clear_pending_for_user_keeps_other_user_same_oauth_state() {
+        let svc = McpOAuthService::new(Arc::new(MockTokenRepo), reqwest::Client::new());
+        insert_pending_login(&svc, "user-a", "shared-state").await;
+        insert_pending_login(&svc, "user-b", "shared-state").await;
+
+        svc.clear_pending_for_user("user-a").await;
+
+        let pending = svc.pending.lock().await;
+        assert!(!pending.contains_key(&("user-a".to_string(), "shared-state".to_string())));
+        assert!(pending.contains_key(&("user-b".to_string(), "shared-state".to_string())));
+    }
+
     // -- Mock repositories ---------------------------------------------------
+
+    async fn insert_pending_login(svc: &McpOAuthService, user_id: &str, state: &str) {
+        let (_, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+        let mut pending = svc.pending.lock().await;
+        pending.insert(
+            (user_id.to_string(), state.to_string()),
+            PendingLogin {
+                csrf_token: CsrfToken::new(state.to_string()),
+                pkce_verifier,
+                auth_url: "https://auth.example.com/authorize".to_string(),
+                token_url: "https://auth.example.com/token".to_string(),
+                redirect_url: "http://127.0.0.1/callback".to_string(),
+            },
+        );
+    }
 
     struct MockTokenRepo;
 
     #[async_trait::async_trait]
     impl IOAuthTokenRepository for MockTokenRepo {
-        async fn get_by_url(&self, _: &str) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
+        async fn get_by_url(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
             Ok(None)
         }
 
@@ -670,11 +729,11 @@ mod tests {
             unimplemented!()
         }
 
-        async fn delete(&self, _: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _: &str, _: &str) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn list_authenticated_urls(&self) -> Result<Vec<String>, aionui_db::DbError> {
+        async fn list_authenticated_urls(&self, _: &str) -> Result<Vec<String>, aionui_db::DbError> {
             Ok(vec![])
         }
     }
@@ -683,7 +742,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IOAuthTokenRepository for IdempotentDeleteRepo {
-        async fn get_by_url(&self, _: &str) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
+        async fn get_by_url(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
             Ok(None)
         }
 
@@ -694,13 +757,13 @@ mod tests {
             unimplemented!()
         }
 
-        async fn delete(&self, url: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _: &str, url: &str) -> Result<(), aionui_db::DbError> {
             Err(aionui_db::DbError::NotFound(format!(
                 "OAuth token for '{url}' not found"
             )))
         }
 
-        async fn list_authenticated_urls(&self) -> Result<Vec<String>, aionui_db::DbError> {
+        async fn list_authenticated_urls(&self, _: &str) -> Result<Vec<String>, aionui_db::DbError> {
             Ok(vec![])
         }
     }
@@ -709,8 +772,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IOAuthTokenRepository for ValidTokenRepo {
-        async fn get_by_url(&self, _: &str) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
+        async fn get_by_url(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
             Ok(Some(aionui_db::models::OAuthTokenRow {
+                user_id: TEST_USER_ID.to_string(),
                 server_url: "https://example.com".to_string(),
                 access_token: "valid_access_token".to_string(),
                 refresh_token: None,
@@ -728,11 +796,11 @@ mod tests {
             unimplemented!()
         }
 
-        async fn delete(&self, _: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _: &str, _: &str) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn list_authenticated_urls(&self) -> Result<Vec<String>, aionui_db::DbError> {
+        async fn list_authenticated_urls(&self, _: &str) -> Result<Vec<String>, aionui_db::DbError> {
             Ok(vec!["https://example.com".to_string()])
         }
     }
@@ -741,8 +809,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IOAuthTokenRepository for ExpiredTokenRepo {
-        async fn get_by_url(&self, _: &str) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
+        async fn get_by_url(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
             Ok(Some(aionui_db::models::OAuthTokenRow {
+                user_id: TEST_USER_ID.to_string(),
                 server_url: "https://example.com".to_string(),
                 access_token: "expired_token".to_string(),
                 refresh_token: None,
@@ -760,11 +833,11 @@ mod tests {
             unimplemented!()
         }
 
-        async fn delete(&self, _: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _: &str, _: &str) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn list_authenticated_urls(&self) -> Result<Vec<String>, aionui_db::DbError> {
+        async fn list_authenticated_urls(&self, _: &str) -> Result<Vec<String>, aionui_db::DbError> {
             Ok(vec![])
         }
     }
@@ -773,8 +846,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IOAuthTokenRepository for NoExpiryTokenRepo {
-        async fn get_by_url(&self, _: &str) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
+        async fn get_by_url(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
             Ok(Some(aionui_db::models::OAuthTokenRow {
+                user_id: TEST_USER_ID.to_string(),
                 server_url: "https://example.com".to_string(),
                 access_token: "no_expiry_token".to_string(),
                 refresh_token: None,
@@ -792,11 +870,11 @@ mod tests {
             unimplemented!()
         }
 
-        async fn delete(&self, _: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _: &str, _: &str) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn list_authenticated_urls(&self) -> Result<Vec<String>, aionui_db::DbError> {
+        async fn list_authenticated_urls(&self, _: &str) -> Result<Vec<String>, aionui_db::DbError> {
             Ok(vec!["https://example.com".to_string()])
         }
     }
@@ -806,62 +884,76 @@ mod tests {
     #[tokio::test]
     async fn check_status_no_token_returns_false() {
         let svc = McpOAuthService::new(Arc::new(MockTokenRepo), reqwest::Client::new());
-        let status = svc.check_oauth_status("https://example.com").await.unwrap();
+        let status = svc
+            .check_oauth_status(TEST_USER_ID, "https://example.com")
+            .await
+            .unwrap();
         assert!(!status.authenticated);
     }
 
     #[tokio::test]
     async fn check_status_with_valid_token() {
         let svc = McpOAuthService::new(Arc::new(ValidTokenRepo), reqwest::Client::new());
-        let status = svc.check_oauth_status("https://example.com").await.unwrap();
+        let status = svc
+            .check_oauth_status(TEST_USER_ID, "https://example.com")
+            .await
+            .unwrap();
         assert!(status.authenticated);
     }
 
     #[tokio::test]
     async fn check_status_with_expired_token() {
         let svc = McpOAuthService::new(Arc::new(ExpiredTokenRepo), reqwest::Client::new());
-        let status = svc.check_oauth_status("https://example.com").await.unwrap();
+        let status = svc
+            .check_oauth_status(TEST_USER_ID, "https://example.com")
+            .await
+            .unwrap();
         assert!(!status.authenticated);
     }
 
     #[tokio::test]
     async fn check_status_no_expiry_treated_as_valid() {
         let svc = McpOAuthService::new(Arc::new(NoExpiryTokenRepo), reqwest::Client::new());
-        let status = svc.check_oauth_status("https://example.com").await.unwrap();
+        let status = svc
+            .check_oauth_status(TEST_USER_ID, "https://example.com")
+            .await
+            .unwrap();
         assert!(status.authenticated);
     }
 
     #[tokio::test]
     async fn logout_idempotent_for_nonexistent() {
         let svc = McpOAuthService::new(Arc::new(IdempotentDeleteRepo), reqwest::Client::new());
-        svc.logout("https://nonexistent.example.com").await.unwrap();
+        svc.logout(TEST_USER_ID, "https://nonexistent.example.com")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn get_authenticated_servers_empty() {
         let svc = McpOAuthService::new(Arc::new(MockTokenRepo), reqwest::Client::new());
-        let urls = svc.get_authenticated_servers().await.unwrap();
+        let urls = svc.get_authenticated_servers(TEST_USER_ID).await.unwrap();
         assert!(urls.is_empty());
     }
 
     #[tokio::test]
     async fn get_authenticated_servers_returns_urls() {
         let svc = McpOAuthService::new(Arc::new(ValidTokenRepo), reqwest::Client::new());
-        let urls = svc.get_authenticated_servers().await.unwrap();
+        let urls = svc.get_authenticated_servers(TEST_USER_ID).await.unwrap();
         assert_eq!(urls, vec!["https://example.com"]);
     }
 
     #[tokio::test]
     async fn get_token_returns_none_when_no_token() {
         let svc = McpOAuthService::new(Arc::new(MockTokenRepo), reqwest::Client::new());
-        let token = svc.get_token("https://example.com").await.unwrap();
+        let token = svc.get_token(TEST_USER_ID, "https://example.com").await.unwrap();
         assert!(token.is_none());
     }
 
     #[tokio::test]
     async fn get_token_returns_access_token() {
         let svc = McpOAuthService::new(Arc::new(ValidTokenRepo), reqwest::Client::new());
-        let token = svc.get_token("https://example.com").await.unwrap();
+        let token = svc.get_token(TEST_USER_ID, "https://example.com").await.unwrap();
         assert_eq!(token.as_deref(), Some("valid_access_token"));
     }
 
@@ -869,7 +961,7 @@ mod tests {
     async fn get_token_returns_expired_when_no_refresh() {
         let svc = McpOAuthService::new(Arc::new(ExpiredTokenRepo), reqwest::Client::new());
         // Expired token with no refresh_token: returns the expired token as-is.
-        let token = svc.get_token("https://example.com").await.unwrap();
+        let token = svc.get_token(TEST_USER_ID, "https://example.com").await.unwrap();
         assert_eq!(token.as_deref(), Some("expired_token"));
     }
 }

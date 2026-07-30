@@ -1,8 +1,10 @@
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigSelectOptions, SessionModeState, SessionModelState,
+    SessionConfigSelectOptions, SessionModeState,
 };
 use aionui_api_types::{AcpConfigOptionDto, AcpConfigSelectOptionDto};
+
+use super::legacy_session_model::LegacySessionModelState;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ConfigSnapshot {
@@ -58,7 +60,10 @@ impl ConfigSnapshot {
         Self::new(options, option_origins)
     }
 
-    pub(crate) fn from_legacy_catalogs(modes: Option<&SessionModeState>, models: Option<&SessionModelState>) -> Self {
+    pub(crate) fn from_legacy_catalogs(
+        modes: Option<&SessionModeState>,
+        models: Option<&LegacySessionModelState>,
+    ) -> Self {
         let mut options = Vec::new();
         let mut option_origins = Vec::new();
         if let Some(modes) = modes {
@@ -75,7 +80,7 @@ impl ConfigSnapshot {
     pub(crate) fn supplement_summary_for_real_options(
         options: &[SessionConfigOption],
         modes: Option<&SessionModeState>,
-        models: Option<&SessionModelState>,
+        models: Option<&LegacySessionModelState>,
     ) -> ConfigSupplementSummary {
         let has_real_mode = options
             .iter()
@@ -93,7 +98,7 @@ impl ConfigSnapshot {
     pub(crate) fn from_real_options_with_runtime_supplements(
         options: Vec<SessionConfigOption>,
         modes: Option<&SessionModeState>,
-        models: Option<&SessionModelState>,
+        models: Option<&LegacySessionModelState>,
     ) -> Self {
         let summary = Self::supplement_summary_for_real_options(&options, modes, models);
         let mut snapshot = Self::from_real_options(options);
@@ -251,7 +256,7 @@ fn dto_from_modes(modes: &SessionModeState) -> AcpConfigOptionDto {
     }
 }
 
-fn dto_from_models(models: &SessionModelState) -> AcpConfigOptionDto {
+fn dto_from_models(models: &LegacySessionModelState) -> AcpConfigOptionDto {
     AcpConfigOptionDto {
         id: "model".to_owned(),
         name: Some("Model".to_owned()),
@@ -259,12 +264,12 @@ fn dto_from_models(models: &SessionModelState) -> AcpConfigOptionDto {
         description: None,
         category: Some("model".to_owned()),
         option_type: "select".to_owned(),
-        current_value: Some(models.current_model_id.to_string()),
+        current_value: Some(models.current_model_id.clone()),
         options: models
             .available_models
             .iter()
             .map(|model| AcpConfigSelectOptionDto {
-                value: model.model_id.to_string(),
+                value: model.model_id.clone(),
                 name: Some(model.name.clone()),
                 label: None,
                 description: model.description.clone(),
@@ -309,10 +314,10 @@ fn flatten_select_options(options: &SessionConfigSelectOptions) -> Vec<&SessionC
 
 #[cfg(test)]
 mod tests {
+    use super::super::legacy_session_model::{LegacyModelEntry, LegacySessionModelState};
     use super::*;
-    use agent_client_protocol::schema::{
-        ModelInfo, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode,
-        SessionModeState, SessionModelState,
+    use agent_client_protocol::schema::v1::{
+        SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode, SessionModeState,
     };
 
     #[test]
@@ -356,9 +361,12 @@ mod tests {
             "plan",
             vec![SessionMode::new("plan", "Plan"), SessionMode::new("build", "Build")],
         );
-        let models = SessionModelState::new(
+        let models = LegacySessionModelState::new(
             "opus",
-            vec![ModelInfo::new("opus", "Opus"), ModelInfo::new("sonnet", "Sonnet")],
+            vec![
+                LegacyModelEntry::new("opus", "Opus"),
+                LegacyModelEntry::new("sonnet", "Sonnet"),
+            ],
         );
 
         let snapshot = ConfigSnapshot::from_legacy_catalogs(Some(&modes), Some(&models));

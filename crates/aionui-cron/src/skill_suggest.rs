@@ -39,17 +39,19 @@ impl SkillSuggestDetector {
         }
     }
 
-    pub fn schedule_check(&self, conversation_id: String, job_id: String, workspace: String) {
+    pub fn schedule_check(&self, user_id: String, conversation_id: String, job_id: String, workspace: String) {
         let detector = self.clone();
         tokio::spawn(async move {
-            detector.check_with_retry(&conversation_id, &job_id, &workspace).await;
+            detector
+                .check_with_retry(&user_id, &conversation_id, &job_id, &workspace)
+                .await;
         });
     }
 
-    async fn check_with_retry(&self, conversation_id: &str, job_id: &str, workspace: &str) {
+    async fn check_with_retry(&self, user_id: &str, conversation_id: &str, job_id: &str, workspace: &str) {
         for delay_ms in RETRY_DELAYS_MS {
             sleep(Duration::from_millis(delay_ms)).await;
-            match self.check_and_emit(conversation_id, job_id, workspace).await {
+            match self.check_and_emit(user_id, conversation_id, job_id, workspace).await {
                 Ok(true) => return,
                 Ok(false) => continue,
                 Err(err) => {
@@ -64,7 +66,13 @@ impl SkillSuggestDetector {
         }
     }
 
-    async fn check_and_emit(&self, conversation_id: &str, job_id: &str, workspace: &str) -> Result<bool, CronError> {
+    async fn check_and_emit(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+        workspace: &str,
+    ) -> Result<bool, CronError> {
         if workspace.trim().is_empty() {
             return Ok(false);
         }
@@ -99,6 +107,7 @@ impl SkillSuggestDetector {
 
         self.set_last_hash(conversation_id, job_id, hash);
         self.emit(
+            user_id,
             conversation_id,
             job_id,
             &validated.name,
@@ -109,13 +118,22 @@ impl SkillSuggestDetector {
         Ok(true)
     }
 
-    async fn emit(&self, conversation_id: &str, job_id: &str, name: &str, description: &str, skill_content: &str) {
-        self.persist_and_broadcast(conversation_id, job_id, name, description, skill_content)
+    async fn emit(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        job_id: &str,
+        name: &str,
+        description: &str,
+        skill_content: &str,
+    ) {
+        self.persist_and_broadcast(user_id, conversation_id, job_id, name, description, skill_content)
             .await;
     }
 
     async fn persist_and_broadcast(
         &self,
+        user_id: &str,
         conversation_id: &str,
         job_id: &str,
         name: &str,
@@ -124,7 +142,7 @@ impl SkillSuggestDetector {
     ) {
         let row = build_skill_suggest_artifact(conversation_id, job_id, name, description, skill_content, now_ms());
 
-        let row = match self.conversation_repo.upsert_artifact(&row).await {
+        let row = match self.conversation_repo.upsert_artifact(user_id, &row).await {
             Ok(row) => row,
             Err(err) => {
                 warn!(
@@ -137,7 +155,7 @@ impl SkillSuggestDetector {
             }
         };
 
-        if let Err(err) = broadcast_artifact(&self.broadcaster, &row) {
+        if let Err(err) = broadcast_artifact(&self.broadcaster, user_id, &row) {
             warn!(
                 conversation_id,
                 job_id,
@@ -224,7 +242,7 @@ mod tests {
         let mut rx = bus.subscribe();
 
         let emitted = detector
-            .check_and_emit("conv-1", "cron-1", &workspace.to_string_lossy())
+            .check_and_emit("system_default_user", "conv-1", "cron-1", &workspace.to_string_lossy())
             .await
             .unwrap();
 
@@ -236,7 +254,7 @@ mod tests {
         assert_eq!(msg.data["payload"]["cron_job_id"], "cron-1");
         assert_eq!(msg.data["payload"]["name"], "daily-report");
 
-        let rows = repo.list_artifacts("conv-1").await.unwrap();
+        let rows = repo.list_artifacts("system_default_user", "conv-1").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, "skill_suggest");
         assert_eq!(rows[0].status, "pending");
@@ -266,7 +284,7 @@ mod tests {
 
         assert!(
             detector
-                .check_and_emit("conv-1", "cron-1", &workspace.to_string_lossy())
+                .check_and_emit("system_default_user", "conv-1", "cron-1", &workspace.to_string_lossy(),)
                 .await
                 .unwrap()
         );
@@ -274,7 +292,7 @@ mod tests {
 
         assert!(
             detector
-                .check_and_emit("conv-2", "cron-1", &workspace.to_string_lossy())
+                .check_and_emit("system_default_user", "conv-2", "cron-1", &workspace.to_string_lossy(),)
                 .await
                 .unwrap()
         );
@@ -306,7 +324,7 @@ mod tests {
 
         assert!(
             detector
-                .check_and_emit("conv-1", "cron-1", &workspace.to_string_lossy())
+                .check_and_emit("system_default_user", "conv-1", "cron-1", &workspace.to_string_lossy(),)
                 .await
                 .unwrap()
         );
@@ -314,7 +332,7 @@ mod tests {
 
         assert!(
             detector
-                .check_and_emit("conv-1", "cron-1", &workspace.to_string_lossy())
+                .check_and_emit("system_default_user", "conv-1", "cron-1", &workspace.to_string_lossy(),)
                 .await
                 .unwrap()
         );
@@ -350,7 +368,7 @@ mod tests {
         let mut rx = bus.subscribe();
 
         let emitted = detector
-            .check_and_emit("conv-1", "cron-1", &workspace.to_string_lossy())
+            .check_and_emit("system_default_user", "conv-1", "cron-1", &workspace.to_string_lossy())
             .await
             .unwrap();
 

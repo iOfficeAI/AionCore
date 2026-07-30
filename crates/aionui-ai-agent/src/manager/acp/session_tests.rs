@@ -3,7 +3,8 @@
 //! `#[path = "session_tests.rs"] mod tests;` from `session.rs`, so
 //! `super::*` resolves to the `session` module's private scope.
 
-use agent_client_protocol::schema::{ModelInfo, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode};
+use super::super::legacy_session_model::LegacyModelEntry;
+use agent_client_protocol::schema::v1::{SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode};
 
 use super::*;
 
@@ -234,7 +235,7 @@ fn apply_observed_mode_does_not_change_desired() {
 
 #[test]
 fn apply_observed_mode_syncs_advertised_current_without_losing_available() {
-    use agent_client_protocol::schema::SessionMode;
+    use agent_client_protocol::schema::v1::SessionMode;
     let mut session = make_session();
     session.apply_advertised_modes(SessionModeState::new(
         "default",
@@ -252,13 +253,13 @@ fn apply_observed_mode_syncs_advertised_current_without_losing_available() {
 
 #[test]
 fn apply_observed_model_syncs_advertised_current_without_losing_available() {
-    use agent_client_protocol::schema::ModelInfo;
+    use super::super::legacy_session_model::LegacyModelEntry;
     let mut session = make_session();
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "claude-sonnet-4",
         vec![
-            ModelInfo::new("claude-sonnet-4", "Sonnet 4"),
-            ModelInfo::new("claude-opus-4", "Opus 4"),
+            LegacyModelEntry::new("claude-sonnet-4", "Sonnet 4"),
+            LegacyModelEntry::new("claude-opus-4", "Opus 4"),
         ],
     ));
     session.drain_events();
@@ -310,13 +311,13 @@ fn confirm_mode_aligns_desired_and_current() {
 
 #[test]
 fn confirm_model_aligns_desired_and_current() {
-    use agent_client_protocol::schema::ModelInfo;
+    use super::super::legacy_session_model::LegacyModelEntry;
     let mut session = AcpSession::new(None, None, HashMap::new());
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "claude-sonnet-4",
         vec![
-            ModelInfo::new("claude-sonnet-4", "Sonnet 4"),
-            ModelInfo::new("claude-opus-4", "Opus 4"),
+            LegacyModelEntry::new("claude-sonnet-4", "Sonnet 4"),
+            LegacyModelEntry::new("claude-opus-4", "Opus 4"),
         ],
     ));
     session.drain_events();
@@ -359,13 +360,13 @@ fn confirm_mode_preserves_available_mode_catalog() {
 
 #[test]
 fn confirm_model_preserves_available_model_catalog() {
-    use agent_client_protocol::schema::ModelInfo;
+    use super::super::legacy_session_model::LegacyModelEntry;
     let mut session = AcpSession::new(None, None, HashMap::new());
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "claude-sonnet-4",
         vec![
-            ModelInfo::new("claude-sonnet-4", "Sonnet 4"),
-            ModelInfo::new("claude-opus-4", "Opus 4"),
+            LegacyModelEntry::new("claude-sonnet-4", "Sonnet 4"),
+            LegacyModelEntry::new("claude-opus-4", "Opus 4"),
         ],
     ));
     session.drain_events();
@@ -495,7 +496,7 @@ fn apply_advertised_modes_sets_observed() {
 #[test]
 fn apply_advertised_models_sets_observed() {
     let mut session = make_session();
-    session.apply_advertised_models(SessionModelState::new("claude-4", Vec::new()));
+    session.apply_advertised_models(LegacySessionModelState::new("claude-4", Vec::new()));
     assert_eq!(session.observed_model(), Some("claude-4"));
 }
 
@@ -532,13 +533,13 @@ fn set_desired_model_no_op_when_unchanged() {
 
 #[test]
 fn set_desired_model_validates_against_advertised() {
-    use agent_client_protocol::schema::ModelInfo;
+    use super::super::legacy_session_model::LegacyModelEntry;
     let mut session = make_session();
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "claude-sonnet-4",
         vec![
-            ModelInfo::new("claude-sonnet-4", "Sonnet 4"),
-            ModelInfo::new("claude-opus-4", "Opus 4"),
+            LegacyModelEntry::new("claude-sonnet-4", "Sonnet 4"),
+            LegacyModelEntry::new("claude-opus-4", "Opus 4"),
         ],
     ));
     assert!(session.set_desired_model(ModelId::new("claude-opus-4")));
@@ -547,13 +548,13 @@ fn set_desired_model_validates_against_advertised() {
 
 #[test]
 fn can_select_model_reports_unavailable_advertised_model() {
-    use agent_client_protocol::schema::ModelInfo;
+    use super::super::legacy_session_model::LegacyModelEntry;
     let mut session = make_session();
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "claude-sonnet-4",
         vec![
-            ModelInfo::new("claude-sonnet-4", "Sonnet 4"),
-            ModelInfo::new("claude-opus-4", "Opus 4"),
+            LegacyModelEntry::new("claude-sonnet-4", "Sonnet 4"),
+            LegacyModelEntry::new("claude-opus-4", "Opus 4"),
         ],
     ));
 
@@ -608,15 +609,15 @@ fn new_with_initial_model_sets_desired_model() {
 
 #[test]
 fn clear_invalid_desired_model_drops_stale_initial_model() {
-    use agent_client_protocol::schema::ModelInfo;
+    use super::super::legacy_session_model::LegacyModelEntry;
 
     let mut session = AcpSession::new(None, Some(ModelId::new("deepseek-v4-pro")), HashMap::new());
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "opus",
         vec![
-            ModelInfo::new("default", "Default"),
-            ModelInfo::new("opus", "Opus"),
-            ModelInfo::new("sonnet", "Sonnet"),
+            LegacyModelEntry::new("default", "Default"),
+            LegacyModelEntry::new("opus", "Opus"),
+            LegacyModelEntry::new("sonnet", "Sonnet"),
         ],
     ));
 
@@ -743,9 +744,12 @@ fn apply_advertised_config_options_falls_back_to_existing_catalogs_when_config_o
         "build",
         vec![SessionMode::new("build", "Build"), SessionMode::new("plan", "Plan")],
     ));
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "sonnet",
-        vec![ModelInfo::new("sonnet", "Sonnet"), ModelInfo::new("opus", "Opus")],
+        vec![
+            LegacyModelEntry::new("sonnet", "Sonnet"),
+            LegacyModelEntry::new("opus", "Opus"),
+        ],
     ));
     session.drain_events();
 
@@ -776,9 +780,9 @@ fn apply_advertised_config_options_prefers_config_option_catalogs_over_existing_
         "available-mode",
         vec![SessionMode::new("available-mode", "Available Mode")],
     ));
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "available-model",
-        vec![ModelInfo::new("available-model", "Available Model")],
+        vec![LegacyModelEntry::new("available-model", "Available Model")],
     ));
     session.drain_events();
 
@@ -882,7 +886,7 @@ fn apply_advertised_config_options_merges_partial_updates_and_keeps_model_reason
             .iter()
             .find(|option| option.id.to_string() == "reasoning_effort")
             .and_then(|option| match &option.kind {
-                agent_client_protocol::schema::SessionConfigKind::Select(select) => {
+                agent_client_protocol::schema::v1::SessionConfigKind::Select(select) => {
                     Some(select.current_value.to_string())
                 }
                 _ => None,
@@ -1155,7 +1159,7 @@ fn pending_mode_seed_falls_back_to_legacy_set_mode_when_mode_config_option_is_ab
     let mut session = AcpSession::new(Some(ModeId::new("build")), None, HashMap::new());
     session.seed_pending_startup_config(SessionConfigOptionCategory::Mode, ConfigValue::new("build"));
 
-    session.apply_advertised_models(SessionModelState::new("gpt-5".to_owned(), vec![]));
+    session.apply_advertised_models(LegacySessionModelState::new("gpt-5".to_owned(), vec![]));
 
     assert_eq!(
         session.resolve_pending_startup_config_seeds(),
@@ -1291,7 +1295,7 @@ fn startup_model_seed_prevents_opencode_default_model_config_from_remaining_sele
             .config_options()
             .and_then(|options| options.iter().find(|option| option.id.to_string() == "model"))
             .and_then(|option| match &option.kind {
-                agent_client_protocol::schema::SessionConfigKind::Select(select) => {
+                agent_client_protocol::schema::v1::SessionConfigKind::Select(select) => {
                     Some(select.current_value.to_string())
                 }
                 _ => None,

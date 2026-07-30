@@ -273,6 +273,8 @@ pub struct BotInfo {
 /// Message received from an IM platform, normalized to a common format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UnifiedIncomingMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_user_id: Option<String>,
     pub id: String,
     pub platform: PluginType,
     pub chat_id: String,
@@ -716,6 +718,7 @@ mod tests {
     #[test]
     fn unified_incoming_message_text() {
         let msg = UnifiedIncomingMessage {
+            owner_user_id: None,
             id: "msg_1".into(),
             platform: PluginType::Telegram,
             chat_id: "chat_42".into(),
@@ -969,6 +972,7 @@ mod tests {
     #[test]
     fn incoming_message_roundtrip() {
         let msg = UnifiedIncomingMessage {
+            owner_user_id: None,
             id: "m1".into(),
             platform: PluginType::Lark,
             chat_id: "c1".into(),

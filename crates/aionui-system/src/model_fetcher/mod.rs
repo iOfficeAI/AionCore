@@ -49,10 +49,11 @@ impl ModelFetchService {
     /// URL auto-correction with parallel probing.
     pub async fn fetch_models(
         &self,
+        user_id: &str,
         provider_id: &str,
         req: &FetchModelsRequest,
     ) -> Result<FetchModelsResponse, SystemError> {
-        let config = self.load_provider_config(provider_id).await?;
+        let config = self.load_provider_config(user_id, provider_id).await?;
         self.fetch_with_config(&config, req.try_fix).await
     }
 
@@ -89,10 +90,10 @@ impl ModelFetchService {
     }
 
     /// Extract and decrypt provider configuration from DB.
-    async fn load_provider_config(&self, provider_id: &str) -> Result<FetchConfig, SystemError> {
+    async fn load_provider_config(&self, user_id: &str, provider_id: &str) -> Result<FetchConfig, SystemError> {
         let row = self
             .repo
-            .find_by_id(provider_id)
+            .find_by_id(user_id, provider_id)
             .await?
             .ok_or_else(|| SystemError::NotFound(format!("Provider {provider_id} not found")))?;
 
@@ -143,9 +144,19 @@ mod tests {
     use aionui_db::{CreateProviderParams, SqliteProviderRepository, init_database_memory};
 
     const TEST_KEY: [u8; 32] = [0x42; 32];
+    const TEST_USER_ID: &str = "user-1";
 
     async fn setup() -> (ModelFetchService, aionui_db::Database) {
         let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, '', 'active', 0, 1, 1)",
+        )
+        .bind(TEST_USER_ID)
+        .bind(TEST_USER_ID)
+        .execute(db.pool())
+        .await
+        .unwrap();
         let repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
         let svc = ModelFetchService::new(repo, TEST_KEY, reqwest::Client::new());
         (svc, db)
@@ -157,6 +168,7 @@ mod tests {
         let row = repo
             .create(CreateProviderParams {
                 id: None,
+                user_id: TEST_USER_ID,
                 platform,
                 name: "Test",
                 base_url,
@@ -198,7 +210,7 @@ mod tests {
     #[tokio::test]
     async fn load_config_nonexistent_provider_returns_not_found() {
         let (svc, _db) = setup().await;
-        let err = svc.load_provider_config("no_such_id").await.unwrap_err();
+        let err = svc.load_provider_config(TEST_USER_ID, "no_such_id").await.unwrap_err();
         assert!(matches!(err, SystemError::NotFound(_)));
     }
 
@@ -206,7 +218,7 @@ mod tests {
     async fn load_config_empty_api_key_returns_bad_request() {
         let (svc, db) = setup().await;
         let id = create_provider(&db, "openai", "https://api.openai.com", "   ").await;
-        let err = svc.load_provider_config(&id).await.unwrap_err();
+        let err = svc.load_provider_config(TEST_USER_ID, &id).await.unwrap_err();
         assert!(matches!(err, SystemError::BadRequest(_)));
     }
 
@@ -214,7 +226,7 @@ mod tests {
     async fn load_config_decrypts_api_key() {
         let (svc, db) = setup().await;
         let id = create_provider(&db, "openai", "https://api.openai.com", "sk-test-key").await;
-        let config = svc.load_provider_config(&id).await.unwrap();
+        let config = svc.load_provider_config(TEST_USER_ID, &id).await.unwrap();
         assert_eq!(config.api_key, "sk-test-key");
         assert_eq!(config.platform, "openai");
         assert_eq!(config.base_url, "https://api.openai.com");
@@ -226,7 +238,7 @@ mod tests {
         let (svc, db) = setup().await;
         let id = create_provider(&db, "vertex-ai", "https://unused", "fake-key").await;
         let req = FetchModelsRequest { try_fix: false };
-        let resp = svc.fetch_models(&id, &req).await.unwrap();
+        let resp = svc.fetch_models(TEST_USER_ID, &id, &req).await.unwrap();
         assert_eq!(resp.models.len(), 2);
         assert!(resp.fixed_base_url.is_none());
     }
@@ -236,7 +248,7 @@ mod tests {
         let (svc, db) = setup().await;
         let id = create_provider(&db, "minimax", "https://unused", "fake-key").await;
         let req = FetchModelsRequest { try_fix: false };
-        let resp = svc.fetch_models(&id, &req).await.unwrap();
+        let resp = svc.fetch_models(TEST_USER_ID, &id, &req).await.unwrap();
         assert_eq!(resp.models.len(), 3);
     }
 
@@ -244,7 +256,7 @@ mod tests {
     async fn fetch_models_nonexistent_provider() {
         let (svc, _db) = setup().await;
         let req = FetchModelsRequest { try_fix: false };
-        let err = svc.fetch_models("no_such_id", &req).await.unwrap_err();
+        let err = svc.fetch_models(TEST_USER_ID, "no_such_id", &req).await.unwrap_err();
         assert!(matches!(err, SystemError::NotFound(_)));
     }
 
@@ -354,7 +366,7 @@ mod tests {
         let (svc, db) = setup().await;
         // Save a provider with multi-key api_key
         let id = create_provider(&db, "openai", "https://api.openai.com", "sk-key1\nsk-key2").await;
-        let config = svc.load_provider_config(&id).await.unwrap();
+        let config = svc.load_provider_config(TEST_USER_ID, &id).await.unwrap();
         // Must extract only the first key for model fetching
         assert_eq!(config.api_key, "sk-key1");
     }

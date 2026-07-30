@@ -1,0 +1,258 @@
+use serde_json::{Value, json};
+
+use crate::runtime::{Change, DeltaBatch, EntryFact, FsError, Kind, Snapshot};
+use crate::types::ProjectError;
+
+use super::*;
+
+fn fact(kind: Kind) -> EntryFact {
+    EntryFact {
+        kind,
+        inode: 7,
+        symlink_target: None,
+    }
+}
+
+// ── IncomingFrame ─────────────────────────────────────────────────────────
+
+#[test]
+fn incoming_request_parses_id_method_params() {
+    let v =
+        json!({"jsonrpc":"2.0","id":3,"method":"fs/read","params":{"file":{"pe_id":"pe1","relative_path":"a.txt"}}});
+    let frame: IncomingFrame = serde_json::from_value(v).unwrap();
+    assert_eq!(frame.id, Some(json!(3)));
+    assert_eq!(frame.method, "fs/read");
+    assert_eq!(frame.params["file"]["pe_id"], "pe1");
+}
+
+#[test]
+fn incoming_notification_has_no_id() {
+    let v = json!({"jsonrpc":"2.0","method":"fs/unsubscribe","params":{"targets":[]}});
+    let frame: IncomingFrame = serde_json::from_value(v).unwrap();
+    assert_eq!(frame.id, None);
+    assert_eq!(frame.method, "fs/unsubscribe");
+}
+
+#[test]
+fn incoming_params_default_null_when_absent() {
+    let v = json!({"jsonrpc":"2.0","id":0,"method":"initialize"});
+    let frame: IncomingFrame = serde_json::from_value(v).unwrap();
+    assert!(frame.params.is_null());
+}
+
+#[test]
+fn incoming_missing_method_is_error() {
+    let v = json!({"jsonrpc":"2.0","id":1,"params":{}});
+    assert!(serde_json::from_value::<IncomingFrame>(v).is_err());
+}
+
+// ── params / encoding ─────────────────────────────────────────────────────
+
+#[test]
+fn subscribe_params_parse_targets() {
+    let v = json!({"targets":[{"pe_id":"pe1","relative_path":""},{"pe_id":"pe2","relative_path":"src"}]});
+    let p: SubscribeParams = serde_json::from_value(v).unwrap();
+    assert_eq!(p.targets.len(), 2);
+    assert_eq!(p.targets[1].relative_path, "src");
+}
+
+#[test]
+fn encoding_parses_utf8_and_base64_and_defaults() {
+    assert_eq!(
+        serde_json::from_value::<Encoding>(json!("utf-8")).unwrap(),
+        Encoding::Utf8
+    );
+    assert_eq!(
+        serde_json::from_value::<Encoding>(json!("base64")).unwrap(),
+        Encoding::Base64
+    );
+    assert_eq!(Encoding::default(), Encoding::Utf8);
+}
+
+#[test]
+fn remove_params_recursive_defaults_false() {
+    let p: RemoveParams = serde_json::from_value(json!({"target":{"pe_id":"pe1","relative_path":"d"}})).unwrap();
+    assert!(!p.recursive);
+}
+
+// ── entry / kind ──────────────────────────────────────────────────────────
+
+#[test]
+fn wire_kind_serializes_lowercase() {
+    assert_eq!(serde_json::to_value(WireKind::File).unwrap(), json!("file"));
+    assert_eq!(serde_json::to_value(WireKind::Dir).unwrap(), json!("dir"));
+    assert_eq!(serde_json::to_value(WireKind::Symlink).unwrap(), json!("symlink"));
+}
+
+#[test]
+fn wire_entry_from_fact_maps_kind_and_drops_inode() {
+    let e = WireEntry::from_fact("a.txt", &fact(Kind::File));
+    let v = serde_json::to_value(&e).unwrap();
+    assert_eq!(v, json!({"name":"a.txt","kind":"file"}));
+    // inode is internal and must never appear on the wire.
+    assert!(v.get("inode").is_none());
+}
+
+#[test]
+fn wire_entry_symlink_includes_target() {
+    let ef = EntryFact {
+        kind: Kind::Symlink,
+        inode: 1,
+        symlink_target: Some("target".to_owned()),
+    };
+    let v = serde_json::to_value(WireEntry::from_fact("link", &ef)).unwrap();
+    assert_eq!(v["kind"], "symlink");
+    assert_eq!(v["symlink_target"], "target");
+}
+
+// ── snapshot / delta params ───────────────────────────────────────────────
+
+fn target() -> ResourceRef {
+    ResourceRef {
+        pe_id: "pe1".to_owned(),
+        relative_path: "src".to_owned(),
+    }
+}
+
+#[test]
+fn snapshot_params_carries_target_and_entries() {
+    let snap = Snapshot {
+        canonical: "file:///x".to_owned(),
+        entries: vec![
+            ("main.ts".to_owned(), fact(Kind::File)),
+            ("sub".to_owned(), fact(Kind::Dir)),
+        ],
+    };
+    let v = snapshot_params(&snap, &target());
+    assert_eq!(v["target"], json!({"pe_id":"pe1","relative_path":"src"}));
+    assert_eq!(v["entries"][0], json!({"name":"main.ts","kind":"file"}));
+    assert_eq!(v["entries"][1], json!({"name":"sub","kind":"dir"}));
+    // canonical must never leak to the wire.
+    assert!(v.get("canonical").is_none());
+}
+
+#[test]
+fn delta_params_tags_each_change_op() {
+    let delta = DeltaBatch {
+        canonical: "file:///x".to_owned(),
+        changes: vec![
+            Change::Added {
+                name: "new.ts".to_owned(),
+                kind: Kind::File,
+            },
+            Change::Removed {
+                name: "old.ts".to_owned(),
+            },
+            Change::Renamed {
+                from: "a".to_owned(),
+                to: "b".to_owned(),
+            },
+        ],
+    };
+    let v = delta_params(&delta, &target());
+    assert_eq!(v["target"]["pe_id"], "pe1");
+    assert_eq!(v["changes"][0], json!({"op":"added","name":"new.ts","kind":"file"}));
+    assert_eq!(v["changes"][1], json!({"op":"removed","name":"old.ts"}));
+    assert_eq!(v["changes"][2], json!({"op":"renamed","from":"a","to":"b"}));
+}
+
+// ── frame builders ────────────────────────────────────────────────────────
+
+#[test]
+fn success_frame_shape() {
+    let v = success(Some(json!(5)), json!({"ok":true}));
+    assert_eq!(v, json!({"jsonrpc":"2.0","id":5,"result":{"ok":true}}));
+}
+
+#[test]
+fn error_frame_includes_data_when_present() {
+    let v = error(
+        Some(json!(6)),
+        CODE_RESOURCE_NOT_FOUND,
+        "resource_not_found",
+        json!({"pe_id":"pe1"}),
+    );
+    assert_eq!(v["jsonrpc"], "2.0");
+    assert_eq!(v["id"], 6);
+    assert_eq!(v["error"]["code"], -32002);
+    assert_eq!(v["error"]["message"], "resource_not_found");
+    assert_eq!(v["error"]["data"]["pe_id"], "pe1");
+}
+
+#[test]
+fn error_frame_omits_data_when_null() {
+    let v = error(None, CODE_INVALID_REQUEST, "invalid_request", Value::Null);
+    assert_eq!(v["error"]["code"], -32600);
+    assert!(v["error"].get("data").is_none());
+    assert!(v["id"].is_null());
+}
+
+#[test]
+fn notification_frame_has_no_id() {
+    let v = notification("fs/delta", json!({"target":{}}));
+    assert_eq!(v["jsonrpc"], "2.0");
+    assert_eq!(v["method"], "fs/delta");
+    assert!(v.get("id").is_none());
+}
+
+// ── error mapping ─────────────────────────────────────────────────────────
+
+#[test]
+fn project_error_maps_to_protocol_codes() {
+    let cases: Vec<(ProjectError, i64, &str)> = vec![
+        (
+            ProjectError::ProjectExplorerNotFound { pe_id: "pe1".into() },
+            CODE_OUT_OF_SCOPE,
+            "out_of_scope",
+        ),
+        (
+            ProjectError::InvalidRelativePath {
+                relative_path: "/x".into(),
+            },
+            CODE_INVALID_RELATIVE_PATH,
+            "invalid_relative_path",
+        ),
+        (
+            ProjectError::ResourceOutsideFolder {
+                relative_path: "../x".into(),
+            },
+            CODE_RESOURCE_OUTSIDE_FOLDER,
+            "resource_outside_folder",
+        ),
+        (
+            ProjectError::UnsupportedResourceScheme { scheme: "ssh".into() },
+            CODE_UNSUPPORTED_RESOURCE_SCHEME,
+            "unsupported_resource_scheme",
+        ),
+    ];
+    for (err, code, msg) in cases {
+        assert_eq!(project_error_to_rpc(&err), (code, msg), "for {err:?}");
+    }
+}
+
+#[test]
+fn fs_error_maps_to_protocol_codes() {
+    assert_eq!(
+        fs_error_to_rpc(&FsError::NotFound {
+            uri: "file:///x".into()
+        }),
+        (CODE_RESOURCE_NOT_FOUND, "resource_not_found")
+    );
+    assert_eq!(
+        fs_error_to_rpc(&FsError::UnsupportedScheme { scheme: "ssh".into() }),
+        (CODE_UNSUPPORTED_RESOURCE_SCHEME, "unsupported_resource_scheme")
+    );
+    assert_eq!(
+        fs_error_to_rpc(&FsError::PermissionDenied {
+            uri: "file:///x".into()
+        }),
+        (CODE_PROVIDER_UNAVAILABLE, "provider_unavailable")
+    );
+    assert_eq!(
+        fs_error_to_rpc(&FsError::Io {
+            uri: "file:///x".into(),
+            message: "boom".into(),
+        }),
+        (CODE_PROVIDER_UNAVAILABLE, "provider_unavailable")
+    );
+}

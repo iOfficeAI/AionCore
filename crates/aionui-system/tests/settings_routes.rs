@@ -12,9 +12,10 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use aionui_auth::CurrentUser;
 use aionui_db::{
     SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteSettingsRepository, init_database_memory,
+    SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
 };
 use aionui_system::{
     ClientPrefService, FeedbackDiagnosticsService, ModelFetchService, ProtocolDetectionService, ProviderService,
@@ -26,6 +27,8 @@ use aionui_system::{
 // ---------------------------------------------------------------------------
 
 const TEST_ENCRYPTION_KEY: [u8; 32] = [0x42; 32];
+const TEST_USER_ID: &str = "user-1";
+const OTHER_USER_ID: &str = "user-2";
 
 fn build_state(db: &aionui_db::Database) -> SystemRouterState {
     let provider_repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
@@ -46,6 +49,17 @@ fn build_state(db: &aionui_db::Database) -> SystemRouterState {
 
 async fn setup() -> (axum::Router, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
+    for user_id in [TEST_USER_ID, OTHER_USER_ID] {
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, '', 'active', 0, 1, 1)",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
     let state = build_state(&db);
     (settings_routes(state), db)
 }
@@ -56,16 +70,38 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 }
 
 fn get_request(uri: &str) -> Request<Body> {
-    Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
+    get_request_for_user(TEST_USER_ID, uri)
+}
+
+fn get_request_for_user(user_id: &str, uri: &str) -> Request<Body> {
+    let mut req = Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
+    req.extensions_mut().insert(CurrentUser {
+        id: user_id.to_owned(),
+        username: user_id.to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
+    });
+    req
 }
 
 fn json_request(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
-    Request::builder()
+    json_request_for_user(TEST_USER_ID, method, uri, body)
+}
+
+fn json_request_for_user(user_id: &str, method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
+    let mut req = Request::builder()
         .method(method)
         .uri(uri)
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap()
+        .unwrap();
+    req.extensions_mut().insert(CurrentUser {
+        id: user_id.to_owned(),
+        username: user_id.to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
+    });
+    req
 }
 
 // ===========================================================================
@@ -190,6 +226,44 @@ async fn patch_then_get_reflects_changes() {
     assert_eq!(json["data"]["save_upload_to_workspace"], true);
 }
 
+#[tokio::test]
+async fn settings_are_scoped_by_current_user() {
+    let (app, db) = setup().await;
+
+    let resp = app
+        .oneshot(json_request_for_user(
+            TEST_USER_ID,
+            "PATCH",
+            "/api/settings",
+            serde_json::json!({
+                "language": "zh-CN",
+                "notification_enabled": false,
+                "user_id": OTHER_USER_ID
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let owner_app = settings_routes(build_state(&db));
+    let owner_resp = owner_app
+        .oneshot(get_request_for_user(TEST_USER_ID, "/api/settings"))
+        .await
+        .unwrap();
+    let owner_json = body_json(owner_resp).await;
+    assert_eq!(owner_json["data"]["language"], "zh-CN");
+    assert_eq!(owner_json["data"]["notification_enabled"], false);
+
+    let other_app = settings_routes(build_state(&db));
+    let other_resp = other_app
+        .oneshot(get_request_for_user(OTHER_USER_ID, "/api/settings"))
+        .await
+        .unwrap();
+    let other_json = body_json(other_resp).await;
+    assert_eq!(other_json["data"]["language"], "en-US");
+    assert_eq!(other_json["data"]["notification_enabled"], true);
+}
+
 // ===========================================================================
 // Client Preferences (GET/PUT /api/settings/client)
 // ===========================================================================
@@ -293,6 +367,41 @@ async fn put_batch_write() {
     assert_eq!(json["data"]["a"], 1);
     assert_eq!(json["data"]["b"], "x");
     assert_eq!(json["data"]["c"], true);
+}
+
+#[tokio::test]
+async fn client_preferences_are_scoped_by_current_user() {
+    let (app, db) = setup().await;
+
+    let resp = app
+        .oneshot(json_request_for_user(
+            TEST_USER_ID,
+            "PUT",
+            "/api/settings/client",
+            serde_json::json!({
+                "theme": "dark",
+                "user_id": OTHER_USER_ID
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let owner_app = settings_routes(build_state(&db));
+    let owner_resp = owner_app
+        .oneshot(get_request_for_user(TEST_USER_ID, "/api/settings/client"))
+        .await
+        .unwrap();
+    let owner_json = body_json(owner_resp).await;
+    assert_eq!(owner_json["data"]["theme"], "dark");
+
+    let other_app = settings_routes(build_state(&db));
+    let other_resp = other_app
+        .oneshot(get_request_for_user(OTHER_USER_ID, "/api/settings/client"))
+        .await
+        .unwrap();
+    let other_json = body_json(other_resp).await;
+    assert_eq!(other_json["data"], serde_json::json!({}));
 }
 
 #[tokio::test]

@@ -107,6 +107,42 @@ async fn sp2_state_restored_after_restart() {
     }
 }
 
+#[tokio::test]
+async fn user_enablement_is_persisted_and_isolated() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("extension-states.json");
+
+    let store = ExtensionStateStore::new(path.clone());
+    store.load().await.unwrap();
+    store.set_user_enabled("user-a", "ext-a", false).await;
+    store.set_user_enabled("user-b", "ext-a", true).await;
+    store.flush().await.unwrap();
+
+    let restored = ExtensionStateStore::new(path);
+    restored.load().await.unwrap();
+    assert_eq!(restored.get_user_enabled("user-a", "ext-a").await, Some(false));
+    assert_eq!(restored.get_user_enabled("user-b", "ext-a").await, Some(true));
+    assert_eq!(restored.get_user_enabled("user-c", "ext-a").await, None);
+}
+
+#[tokio::test]
+async fn legacy_state_becomes_default_user_enablement() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("extension-states.json");
+    let mut states = HashMap::new();
+    states.insert("ext-a".to_string(), make_state("ext-a", "1.0.0", false));
+    save_states_to_file(&path, &states).unwrap();
+
+    let store = ExtensionStateStore::new(path);
+    store.load().await.unwrap();
+
+    assert_eq!(
+        store.get_user_enabled("system_default_user", "ext-a").await,
+        Some(false)
+    );
+    assert_eq!(store.get_user_enabled("user-a", "ext-a").await, None);
+}
+
 // ---------------------------------------------------------------------------
 // SP-3: No state file on first launch → all extensions default to enabled
 // ---------------------------------------------------------------------------

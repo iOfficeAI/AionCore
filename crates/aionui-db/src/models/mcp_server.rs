@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct McpServerRow {
     pub id: String,
+    pub user_id: String,
     /// Unique server name (used as identifier when syncing to Agent CLIs).
     pub name: String,
     pub description: Option<String>,

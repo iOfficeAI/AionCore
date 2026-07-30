@@ -370,7 +370,11 @@ async fn mark_batch_messages_read(ctx: &AgentLoopContext, batch: &WorkBatch) {
     if batch.mailbox_message_ids.is_empty() {
         return;
     }
-    if let Err(error) = ctx.mailbox.mark_read_batch(&batch.mailbox_message_ids).await {
+    if let Err(error) = ctx
+        .mailbox
+        .mark_read_batch(&ctx.team_id, &batch.mailbox_message_ids)
+        .await
+    {
         warn!(
             team_id = %ctx.team_id,
             slot_id = %ctx.slot_id,

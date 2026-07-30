@@ -11,13 +11,31 @@
 
 use std::sync::Arc;
 
+use aionui_common::now_ms;
 use aionui_db::{ITeamRepository, SqliteTeamRepository, init_database_memory};
 use aionui_team::{TaskBoard, TaskStatus, TaskUpdate};
 
 async fn setup() -> (TaskBoard, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
-    let repo = Arc::new(SqliteTeamRepository::new(db.pool().clone())) as Arc<dyn ITeamRepository>;
-    (TaskBoard::new(repo), db)
+    let repo = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
+    repo.create_team(&aionui_db::models::TeamRow {
+        id: "t1".to_owned(),
+        user_id: "system_default_user".to_owned(),
+        name: "t1".to_owned(),
+        workspace: String::new(),
+        workspace_mode: "shared".to_owned(),
+        agents: "[]".to_owned(),
+        lead_agent_id: None,
+        session_mode: None,
+        agents_version: "1.0.1".to_owned(),
+        created_at: now_ms(),
+        updated_at: now_ms(),
+        project_id: None,
+        folder_id: None,
+    })
+    .await
+    .unwrap();
+    (TaskBoard::new(repo as Arc<dyn ITeamRepository>), db)
 }
 
 // -- TK: Create tasks ---------------------------------------------------------

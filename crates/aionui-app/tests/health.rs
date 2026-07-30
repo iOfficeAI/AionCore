@@ -42,7 +42,7 @@ async fn health_check_returns_ok() {
 #[tokio::test]
 async fn health_check_returns_ok_when_agent_metadata_cache_field_has_invalid_utf8() {
     let db = aionui_db::init_database_memory().await.unwrap();
-    sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE id = ?")
+    sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE agent_id = ?")
         .bind("2d23ff1c")
         .execute(db.pool())
         .await

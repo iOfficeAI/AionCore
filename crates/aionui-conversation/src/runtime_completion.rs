@@ -11,6 +11,7 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 
 #[derive(Clone)]
 pub struct RuntimeCompletionPublisher {
+    user_id: String,
     repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     persistence: RuntimePersistenceCoordinator,
@@ -18,11 +19,13 @@ pub struct RuntimeCompletionPublisher {
 
 impl RuntimeCompletionPublisher {
     pub fn new(
+        user_id: String,
         repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
         persistence: RuntimePersistenceCoordinator,
     ) -> Self {
         Self {
+            user_id,
             repo,
             broadcaster,
             persistence,
@@ -42,7 +45,7 @@ impl RuntimeCompletionPublisher {
             return;
         }
 
-        match self.repo.get(conversation_id).await {
+        match self.repo.get(&self.user_id, conversation_id).await {
             Ok(Some(_)) => {}
             Ok(None) => {
                 debug!(
@@ -67,7 +70,7 @@ impl RuntimeCompletionPublisher {
             updated_at: Some(now_ms()),
             ..Default::default()
         };
-        if let Err(error) = self.repo.update(conversation_id, &update).await {
+        if let Err(error) = self.repo.update(&self.user_id, conversation_id, &update).await {
             error!(
                 conversation_id,
                 turn_id,
@@ -78,6 +81,7 @@ impl RuntimeCompletionPublisher {
         }
 
         let payload = json!({
+            "user_id": self.user_id,
             "conversation_id": conversation_id,
             "session_id": conversation_id,
             "turn_id": turn_id,

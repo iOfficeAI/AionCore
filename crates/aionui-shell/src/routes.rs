@@ -1,7 +1,7 @@
 #![allow(clippy::disallowed_types)]
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Multipart, State, WebSocketUpgrade};
+use axum::extract::{Extension, Multipart, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -13,6 +13,7 @@ use aionui_api_types::{
     ApiResponse, CheckToolInstalledRequest, CheckToolInstalledResponse, OpenExternalRequest, OpenFileRequest,
     OpenFolderWithRequest, ShowItemInFolderRequest, SpeechToTextConfig, SttStreamServerMessage,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_system::ClientPrefService;
 
@@ -186,6 +187,7 @@ async fn extract_stt_multipart(mut multipart: Multipart) -> Result<SttMultipartF
 
 async fn speech_to_text(
     State(state): State<ShellRouterState>,
+    Extension(user): Extension<CurrentUser>,
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     let fields = extract_stt_multipart(multipart).await.map_err(|e| {
@@ -198,16 +200,18 @@ async fn speech_to_text(
         (status, Json(body))
     })?;
 
-    let config = load_stt_config(&state.client_pref_service).await.map_err(|e| {
-        let e = ApiError::from(e);
-        let status = e.status_code();
-        let body = serde_json::json!({
-            "success": false,
-            "error": e.to_string(),
-            "code": e.error_code(),
-        });
-        (status, Json(body))
-    })?;
+    let config = load_stt_config(&state.client_pref_service, &user.id)
+        .await
+        .map_err(|e| {
+            let e = ApiError::from(e);
+            let status = e.status_code();
+            let body = serde_json::json!({
+                "success": false,
+                "error": e.to_string(),
+                "code": e.error_code(),
+            });
+            (status, Json(body))
+        })?;
 
     let result = state
         .stt_service
@@ -247,9 +251,10 @@ fn stt_error_response(err: &SttError) -> (StatusCode, Json<serde_json::Value>) {
 /// `STT_DISABLED` error.
 pub(crate) async fn load_stt_config(
     client_pref_service: &ClientPrefService,
+    user_id: &str,
 ) -> Result<SpeechToTextConfig, aionui_system::SystemError> {
     let prefs = client_pref_service
-        .get_preferences(Some(&["speechToText", "tools.speechToText"]))
+        .get_preferences(user_id, Some(&["speechToText", "tools.speechToText"]))
         .await?;
     Ok(prefs
         .get("tools.speechToText")
@@ -283,18 +288,22 @@ const STT_STREAM_CHANNEL_CAPACITY: usize = 32;
 /// reaches the client as a uniform `{"type":"error",...}` WS frame
 /// (`STT_DISABLED`, `STT_*_NOT_CONFIGURED`, ...) emitted by the session,
 /// instead of a mix of HTTP handshake statuses and protocol frames.
-async fn speech_to_text_stream(State(state): State<ShellRouterState>, ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| speech_to_text_stream_socket(socket, state))
+async fn speech_to_text_stream(
+    State(state): State<ShellRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| speech_to_text_stream_socket(socket, state, user.id))
 }
 
 /// Pump WebSocket frames in/out of the transport-agnostic streaming session.
 ///
 /// This stays a pure frame adapter: all protocol and business logic lives in
 /// `stt_stream::run_stream_session`.
-async fn speech_to_text_stream_socket(socket: WebSocket, state: ShellRouterState) {
+async fn speech_to_text_stream_socket(socket: WebSocket, state: ShellRouterState, user_id: String) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    let config = match load_stt_config(&state.client_pref_service).await {
+    let config = match load_stt_config(&state.client_pref_service, &user_id).await {
         Ok(config) => config,
         Err(e) => {
             tracing::error!(error = %e, "stt stream: failed to load config");

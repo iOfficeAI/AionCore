@@ -26,6 +26,7 @@ pub enum TeamProjectionSource {
 
 #[derive(Debug, Clone)]
 pub struct TeamProjectionRequest {
+    pub user_id: String,
     pub team_id: String,
     pub slot_id: String,
     pub conversation_id: String,
@@ -38,6 +39,7 @@ pub struct TeamProjectionRequest {
 
 impl TeamProjectionRequest {
     pub fn user_visible(
+        user_id: impl Into<String>,
         team_id: impl Into<String>,
         slot_id: impl Into<String>,
         conversation_id: impl Into<String>,
@@ -45,6 +47,7 @@ impl TeamProjectionRequest {
         files: Vec<String>,
     ) -> Self {
         Self {
+            user_id: user_id.into(),
             team_id: team_id.into(),
             slot_id: slot_id.into(),
             conversation_id: conversation_id.into(),
@@ -56,7 +59,9 @@ impl TeamProjectionRequest {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn teammate_visible(
+        user_id: impl Into<String>,
         team_id: impl Into<String>,
         slot_id: impl Into<String>,
         conversation_id: impl Into<String>,
@@ -69,6 +74,7 @@ impl TeamProjectionRequest {
         let conversation_id = conversation_id.into();
         let mailbox_message_id = mailbox_message_id.into();
         Self {
+            user_id: user_id.into(),
             dedupe_key: Some(teammate_dedupe_key(&team_id, &mailbox_message_id, &conversation_id)),
             team_id,
             slot_id: slot_id.into(),
@@ -86,6 +92,7 @@ impl TeamProjectionRequest {
     }
 
     pub fn team_system_visible(
+        user_id: impl Into<String>,
         team_id: impl Into<String>,
         slot_id: impl Into<String>,
         conversation_id: impl Into<String>,
@@ -96,6 +103,7 @@ impl TeamProjectionRequest {
         let conversation_id = conversation_id.into();
         let mailbox_message_id = mailbox_message_id.into();
         Self {
+            user_id: user_id.into(),
             dedupe_key: Some(teammate_dedupe_key(&team_id, &mailbox_message_id, &conversation_id)),
             team_id,
             slot_id: slot_id.into(),
@@ -202,6 +210,7 @@ where
                 sender_backend,
                 sender_conversation_id,
             } => Some(serde_json::json!({
+                "user_id": request.user_id,
                 "team_id": request.team_id,
                 "slot_id": request.slot_id,
                 "conversation_id": request.conversation_id,
@@ -214,6 +223,7 @@ where
                 "sender_conversation_id": sender_conversation_id,
             })),
             TeamProjectionSource::TeamSystem => Some(serde_json::json!({
+                "user_id": request.user_id,
                 "team_id": request.team_id,
                 "slot_id": request.slot_id,
                 "conversation_id": request.conversation_id,

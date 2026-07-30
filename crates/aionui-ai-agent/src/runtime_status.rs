@@ -9,10 +9,12 @@ use aionui_runtime::{NodeRuntimeFailureKind, NodeRuntimeProgress, SharedNodeRunt
 
 pub(crate) fn conversation_runtime_reporter(
     broadcaster: Arc<dyn EventBroadcaster>,
+    user_id: impl Into<String>,
     conversation_id: impl Into<String>,
 ) -> SharedNodeRuntimeProgressReporter {
     node_runtime_reporter(
         broadcaster,
+        Some(user_id.into()),
         RuntimeStatusScope {
             kind: RuntimeStatusScopeKind::Conversation,
             id: conversation_id.into(),
@@ -22,10 +24,12 @@ pub(crate) fn conversation_runtime_reporter(
 
 pub(crate) fn custom_agent_runtime_reporter(
     broadcaster: Arc<dyn EventBroadcaster>,
+    user_id: impl Into<String>,
     scope_id: impl Into<String>,
 ) -> SharedNodeRuntimeProgressReporter {
     node_runtime_reporter(
         broadcaster,
+        Some(user_id.into()),
         RuntimeStatusScope {
             kind: RuntimeStatusScopeKind::CustomAgent,
             id: scope_id.into(),
@@ -35,10 +39,12 @@ pub(crate) fn custom_agent_runtime_reporter(
 
 fn node_runtime_reporter(
     broadcaster: Arc<dyn EventBroadcaster>,
+    user_id: Option<String>,
     scope: RuntimeStatusScope,
 ) -> SharedNodeRuntimeProgressReporter {
     Arc::new(move |update: NodeRuntimeProgress| {
         let payload = RuntimeStatusPayload {
+            user_id: user_id.clone(),
             resource: RuntimeResourceKind::Node,
             resource_id: None,
             scope: scope.clone(),
@@ -74,5 +80,55 @@ fn map_failure_kind(kind: NodeRuntimeFailureKind) -> RuntimeFailureKind {
         NodeRuntimeFailureKind::BundledResourceMissing => RuntimeFailureKind::BundledResourceMissing,
         NodeRuntimeFailureKind::BundledResourceInvalid => RuntimeFailureKind::BundledResourceInvalid,
         NodeRuntimeFailureKind::Unknown => RuntimeFailureKind::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use aionui_runtime::{NodeRuntimeProgress, NodeRuntimeProgressPhase};
+
+    use super::*;
+
+    struct RecordingBroadcaster {
+        events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
+    }
+
+    impl RecordingBroadcaster {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<WebSocketMessage<serde_json::Value>> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl EventBroadcaster for RecordingBroadcaster {
+        fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[test]
+    fn conversation_runtime_reporter_scopes_event_to_user() {
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let reporter = conversation_runtime_reporter(broadcaster.clone(), "user-1", "conv-1");
+
+        reporter.report(NodeRuntimeProgress {
+            phase: NodeRuntimeProgressPhase::Ready,
+            failure_kind: None,
+            message: None,
+            status_code: None,
+        });
+
+        let events = broadcaster.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "runtime.statusChanged");
+        assert_eq!(events[0].data["user_id"], "user-1");
+        assert_eq!(events[0].data["scope"]["id"], "conv-1");
     }
 }

@@ -42,48 +42,64 @@ pub fn remote_agent_routes(state: RemoteAgentRouterState) -> Router {
 
 async fn list(
     State(state): State<RemoteAgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<RemoteAgentListItem>>>, ApiError> {
-    let items = state.service.list().await.map_err(agent_error_to_api_error)?;
+    let items = state.service.list(&user.id).await.map_err(agent_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(items)))
 }
 
 async fn get_one(
     State(state): State<RemoteAgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<RemoteAgentResponse>>, ApiError> {
-    let agent = state.service.get(&id).await.map_err(agent_error_to_api_error)?;
+    let agent = state
+        .service
+        .get(&user.id, &id)
+        .await
+        .map_err(agent_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(agent)))
 }
 
 async fn create(
     State(state): State<RemoteAgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateRemoteAgentRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<RemoteAgentResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let agent = state.service.create(req).await.map_err(agent_error_to_api_error)?;
+    let agent = state
+        .service
+        .create(&user.id, req)
+        .await
+        .map_err(agent_error_to_api_error)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(agent))))
 }
 
 async fn update(
     State(state): State<RemoteAgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<UpdateRemoteAgentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RemoteAgentResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let agent = state.service.update(&id, req).await.map_err(agent_error_to_api_error)?;
+    let agent = state
+        .service
+        .update(&user.id, &id, req)
+        .await
+        .map_err(agent_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(agent)))
 }
 
 async fn delete_one(
     State(state): State<RemoteAgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state.service.delete(&id).await.map_err(agent_error_to_api_error)?;
+    state
+        .service
+        .delete(&user.id, &id)
+        .await
+        .map_err(agent_error_to_api_error)?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -103,9 +119,13 @@ async fn test_connection(
 
 async fn handshake(
     State(state): State<RemoteAgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<HandshakeResponse>>, ApiError> {
-    let resp = state.service.handshake(&id).await.map_err(agent_error_to_api_error)?;
+    let resp = state
+        .service
+        .handshake(&user.id, &id)
+        .await
+        .map_err(agent_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(resp)))
 }

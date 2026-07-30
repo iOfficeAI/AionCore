@@ -19,6 +19,7 @@ use aionui_ai_agent::{
     AcpSkillManager, build_skills_index_text, build_system_instructions, detect_skill_load_request,
     prepare_first_message, prepare_first_message_with_skills_index,
 };
+use aionui_db::{ISkillRepository, SqliteSkillRepository, UpsertSkillParams, init_database_memory};
 use aionui_extension::{BUILTIN_SKILLS_ENV_VAR, resolve_skill_paths};
 use tempfile::TempDir;
 /// Serialize env var mutations across tests — `BUILTIN_SKILLS_ENV_VAR` is
@@ -154,6 +155,107 @@ async fn get_skill_loads_custom_body_via_fs_read() {
 
     let skill = mgr.get_skill("mine").await.unwrap();
     assert_eq!(skill.body.as_deref(), Some("Custom body here"));
+}
+
+#[tokio::test]
+async fn discover_by_names_for_user_ignores_other_users_skills() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let current_dir = data_dir.join("skills").join("current-skill");
+    fs::create_dir_all(&current_dir).unwrap();
+    fs::write(
+        current_dir.join("SKILL.md"),
+        "---\nname: current-skill\ndescription: Current user skill\n---\nCurrent body",
+    )
+    .unwrap();
+
+    let foreign_dir = data_dir.join("skills").join("foreign-skill");
+    fs::create_dir_all(&foreign_dir).unwrap();
+    fs::write(
+        foreign_dir.join("SKILL.md"),
+        "---\nname: foreign-skill\ndescription: Foreign user skill\n---\nForeign body",
+    )
+    .unwrap();
+
+    let builtin_src = tmp.path().join("builtin");
+    let builtin_dir = builtin_src.join("global-skill");
+    fs::create_dir_all(&builtin_dir).unwrap();
+    fs::write(
+        builtin_dir.join("SKILL.md"),
+        "---\nname: global-skill\ndescription: Global skill\n---\nGlobal body",
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var(BUILTIN_SKILLS_ENV_VAR, &builtin_src);
+    }
+
+    let db = init_database_memory().await.unwrap();
+    sqlx::query(
+        "INSERT INTO users \
+            (id, user_type, external_user_id, username, email, password_hash, avatar_path, jwt_secret, \
+             status, session_generation, created_at, updated_at, last_login) \
+         VALUES ('user-b', 'aionpro', 'external-user-b', 'User B', NULL, NULL, NULL, NULL, 'active', 0, 1, 1, NULL)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let repo = Arc::new(SqliteSkillRepository::new(db.pool().clone()));
+    repo.upsert_for_user(
+        "system_default_user",
+        UpsertSkillParams {
+            name: "current-skill",
+            description: Some("Current user skill"),
+            path: &current_dir.to_string_lossy(),
+            source: "user",
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+    repo.upsert_for_user(
+        "user-b",
+        UpsertSkillParams {
+            name: "foreign-skill",
+            description: Some("Foreign user skill"),
+            path: &foreign_dir.to_string_lossy(),
+            source: "user",
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+    repo.upsert_global(UpsertSkillParams {
+        name: "global-skill",
+        description: Some("Global skill"),
+        path: "global-skill",
+        source: "builtin",
+        enabled: true,
+    })
+    .await
+    .unwrap();
+
+    let paths = Arc::new(resolve_skill_paths(tmp.path(), &data_dir));
+    let mgr = AcpSkillManager::new_with_repo(paths, repo);
+    let requested = vec![
+        "current-skill".to_owned(),
+        "foreign-skill".to_owned(),
+        "global-skill".to_owned(),
+    ];
+
+    let idx = mgr.discover_by_names_for_user("system_default_user", &requested).await;
+    let names: std::collections::HashSet<&str> = idx.iter().map(|s| s.name.as_str()).collect();
+
+    assert!(names.contains("current-skill"));
+    assert!(names.contains("global-skill"));
+    assert!(!names.contains("foreign-skill"));
+
+    unsafe {
+        std::env::remove_var(BUILTIN_SKILLS_ENV_VAR);
+    }
 }
 
 #[tokio::test]

@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use aionui_db::{DbError, IUserRepository, SqliteUserRepository, init_database_memory};
+use aionui_db::{
+    DbError, ExternalUserProjection, IUserRepository, SqliteUserRepository, UserStatus, UserType, init_database_memory,
+};
 
 async fn repo() -> Arc<dyn IUserRepository> {
     let db = init_database_memory().await.unwrap();
@@ -20,8 +22,11 @@ async fn t2_1_create_user_returns_user_with_populated_fields() {
     let user = r.create_user("testuser", "$2b$12$fakehash").await.unwrap();
 
     assert!(!user.id.is_empty(), "id should be non-empty");
-    assert_eq!(user.username, "testuser");
-    assert_eq!(user.password_hash, "$2b$12$fakehash");
+    assert_eq!(user.user_type, UserType::Local);
+    assert_eq!(user.status, UserStatus::Active);
+    assert_eq!(user.session_generation, 0);
+    assert_eq!(user.username.as_deref(), Some("testuser"));
+    assert_eq!(user.password_hash.as_deref(), Some("$2b$12$fakehash"));
     assert!(user.created_at > 0);
     assert!(user.updated_at > 0);
 }
@@ -44,7 +49,7 @@ async fn t2_2_find_by_username_existing() {
 
     let found = r.find_by_username("findme").await.unwrap();
     assert!(found.is_some());
-    assert_eq!(found.unwrap().username, "findme");
+    assert_eq!(found.unwrap().username.as_deref(), Some("findme"));
 }
 
 #[tokio::test]
@@ -153,8 +158,8 @@ async fn t2_9_set_system_user_credentials_updates_username_and_hash() {
     r.set_system_user_credentials("newadmin", "secure_hash").await.unwrap();
 
     let user = r.get_system_user().await.unwrap().unwrap();
-    assert_eq!(user.username, "newadmin");
-    assert_eq!(user.password_hash, "secure_hash");
+    assert_eq!(user.username.as_deref(), Some("newadmin"));
+    assert_eq!(user.password_hash.as_deref(), Some("secure_hash"));
 }
 
 #[tokio::test]
@@ -176,7 +181,7 @@ async fn t2_10_update_password_changes_hash_and_updated_at() {
     r.update_password(&user.id, "new_hash").await.unwrap();
 
     let updated = r.find_by_id(&user.id).await.unwrap().unwrap();
-    assert_eq!(updated.password_hash, "new_hash");
+    assert_eq!(updated.password_hash.as_deref(), Some("new_hash"));
     assert!(updated.updated_at >= user.updated_at);
 }
 
@@ -190,7 +195,7 @@ async fn t2_11_update_username_succeeds() {
     r.update_username(&user.id, "newname").await.unwrap();
 
     let updated = r.find_by_id(&user.id).await.unwrap().unwrap();
-    assert_eq!(updated.username, "newname");
+    assert_eq!(updated.username.as_deref(), Some("newname"));
 }
 
 #[tokio::test]
@@ -230,4 +235,68 @@ async fn t2_13_update_jwt_secret_sets_value() {
 
     let updated = r.find_by_id(&user.id).await.unwrap().unwrap();
     assert_eq!(updated.jwt_secret.as_deref(), Some("my_secret"));
+}
+
+#[tokio::test]
+async fn t2_14_external_user_provision_is_idempotent() {
+    let r = repo().await;
+
+    let first = r
+        .ensure_external_user(
+            UserType::Aionpro,
+            "pro-user-1",
+            ExternalUserProjection {
+                username: Some("Pro User".to_string()),
+                email: Some("pro@example.com".to_string()),
+                avatar_path: None,
+            },
+        )
+        .await
+        .unwrap();
+    let second = r
+        .ensure_external_user(UserType::Aionpro, "pro-user-1", ExternalUserProjection::default())
+        .await
+        .unwrap();
+
+    assert_eq!(first.id, second.id);
+    assert_eq!(first.user_type, UserType::Aionpro);
+    assert_eq!(first.external_user_id.as_deref(), Some("pro-user-1"));
+    assert!(first.password_hash.is_none());
+    assert!(r.find_by_username("Pro User").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn t2_15_disabled_user_is_not_active() {
+    let r = repo().await;
+    let user = r
+        .ensure_external_user(
+            UserType::Aionpro,
+            "pro-user-disabled",
+            ExternalUserProjection::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(r.find_active_by_id(&user.id).await.unwrap().is_some());
+    r.set_status(&user.id, UserStatus::Disabled).await.unwrap();
+
+    let disabled = r.find_by_id(&user.id).await.unwrap().unwrap();
+    assert_eq!(disabled.session_generation, 1);
+    assert!(r.find_active_by_id(&user.id).await.unwrap().is_none());
+
+    r.set_status(&user.id, UserStatus::Disabled).await.unwrap();
+    let disabled_again = r.find_by_id(&user.id).await.unwrap().unwrap();
+    assert_eq!(disabled_again.session_generation, 1);
+}
+
+#[tokio::test]
+async fn t2_16_increment_session_generation_revokes_old_sessions() {
+    let r = repo().await;
+    let user = r.create_user("generation-user", "h").await.unwrap();
+
+    assert_eq!(r.increment_session_generation(&user.id).await.unwrap(), 1);
+    assert_eq!(r.increment_session_generation(&user.id).await.unwrap(), 2);
+
+    let updated = r.find_by_id(&user.id).await.unwrap().unwrap();
+    assert_eq!(updated.session_generation, 2);
 }

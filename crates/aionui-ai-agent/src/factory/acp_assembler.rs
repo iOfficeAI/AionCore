@@ -1,5 +1,5 @@
 use crate::shared_kernel::PersistedSessionState;
-use agent_client_protocol::schema::{EnvVariable, McpServer, McpServerStdio, NewSessionRequest};
+use agent_client_protocol::schema::v1::{EnvVariable, McpServer, McpServerStdio, NewSessionRequest};
 use aionui_api_types::AgentMetadata;
 use aionui_api_types::{AcpBuildExtra, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 use aionui_common::CommandSpec;
@@ -21,6 +21,7 @@ pub struct WorkspaceInfo {
 #[derive(Debug, Clone)]
 pub struct AcpSessionParams {
     pub conversation_id: String,
+    pub user_id: String,
     pub workspace: WorkspaceInfo,
     pub metadata: AgentMetadata,
     pub command_spec: CommandSpec,
@@ -59,6 +60,7 @@ impl AcpSessionParams {
 #[allow(clippy::too_many_arguments)]
 pub async fn assemble_acp_params(
     conversation_id: String,
+    user_id: String,
     workspace: WorkspaceInfo,
     metadata: AgentMetadata,
     command_spec: CommandSpec,
@@ -73,6 +75,7 @@ pub async fn assemble_acp_params(
 
     AcpSessionParams {
         conversation_id,
+        user_id,
         workspace,
         metadata,
         command_spec,
@@ -200,6 +203,7 @@ mod tests {
 
         let params = assemble_acp_params(
             "conv-1".into(),
+            "user-1".into(),
             WorkspaceInfo {
                 path: "/tmp/workspace".into(),
                 is_custom: false,

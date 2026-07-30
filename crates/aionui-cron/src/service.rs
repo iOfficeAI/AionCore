@@ -12,9 +12,10 @@ use aionui_common::{
     validate_workspace_path_availability,
 };
 use aionui_db::{
-    ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, IAgentMetadataRepository,
-    IAssistantDefinitionRepository, IAssistantOverlayRepository, ICronRepository, UpdateCronJobParams,
-    models::AgentMetadataRow, resolve_agent_binding_from_rows, runtime_backend_for_agent,
+    ClaimCronRunParams, CronRunClaimResult, DbError, FinishCronRunParams, IAgentMetadataRepository,
+    IAssistantDefinitionRepository, IAssistantOverlayRepository, ICronRepository, ISkillRepository,
+    UpdateCronJobParams, UpsertSkillParams, models::AgentMetadataRow, resolve_agent_binding_from_rows,
+    runtime_backend_for_agent,
 };
 use tracing::{debug, error, info, warn};
 
@@ -25,7 +26,10 @@ use crate::executor::{ExecutionResult, JobExecutor, PreparedRunNow, RETRY_INTERV
 use crate::scheduler::{
     CronScheduler, compute_next_run, compute_next_run_after_occurrence, validate_schedule, validate_timezone,
 };
-use crate::skill_file::{delete_skill_file, has_skill_file, write_raw_skill_file, write_skill_file};
+use crate::skill_file::{
+    cron_skill_dir, cron_skill_name, delete_skill_file, has_skill_file, parse_skill_content, read_skill_content,
+    write_raw_skill_file, write_skill_file,
+};
 use crate::types::{
     CreatedBy, CronAgentConfig, CronJob, CronSchedule, ExecutionMode, cron_job_from_row, cron_job_to_response,
     cron_job_to_row, schedule_from_dto,
@@ -52,6 +56,7 @@ pub struct CronService {
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+    skill_repo: Arc<dyn ISkillRepository>,
     scheduler: Arc<CronScheduler>,
     executor: Arc<JobExecutor>,
     emitter: CronEventEmitter,
@@ -64,6 +69,7 @@ pub struct CronServiceDeps {
     pub agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     pub assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     pub assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+    pub skill_repo: Arc<dyn ISkillRepository>,
     pub scheduler: Arc<CronScheduler>,
     pub executor: Arc<JobExecutor>,
     pub emitter: CronEventEmitter,
@@ -77,6 +83,7 @@ impl CronService {
             agent_metadata_repo: deps.agent_metadata_repo,
             assistant_definition_repo: deps.assistant_definition_repo,
             assistant_overlay_repo: deps.assistant_overlay_repo,
+            skill_repo: deps.skill_repo,
             scheduler: deps.scheduler,
             executor: deps.executor,
             emitter: deps.emitter,
@@ -89,8 +96,8 @@ impl CronService {
     // CRUD
     // -----------------------------------------------------------------------
 
-    pub async fn add_job(&self, req: CreateCronJobRequest) -> Result<CronJob, CronError> {
-        self.add_job_internal(req, None, None).await
+    pub async fn add_job(&self, user_id: &str, req: CreateCronJobRequest) -> Result<CronJob, CronError> {
+        self.add_job_internal(user_id, req, None, None).await
     }
 
     pub async fn create_for_conversation_helper(
@@ -123,7 +130,7 @@ impl CronService {
         };
 
         let job = self
-            .add_job_internal(create_req, Some(agent_type), assistant_backend_override)
+            .add_job_internal(user_id, create_req, Some(agent_type), assistant_backend_override)
             .await?;
         if let Err(err) = self
             .executor
@@ -134,7 +141,7 @@ impl CronService {
             )
             .await
         {
-            if let Err(cleanup_err) = self.remove_job(&job.id).await {
+            if let Err(cleanup_err) = self.remove_job(user_id, &job.id).await {
                 warn!(
                     conversation_id,
                     job_id = %job.id,
@@ -164,9 +171,12 @@ impl CronService {
     ) -> Result<Vec<CronJob>, CronError> {
         self.verify_conversation_helper_context(user_id, conversation_id)
             .await?;
-        self.list_jobs(&ListCronJobsQuery {
-            conversation_id: Some(conversation_id.to_owned()),
-        })
+        self.list_jobs(
+            user_id,
+            &ListCronJobsQuery {
+                conversation_id: Some(conversation_id.to_owned()),
+            },
+        )
         .await
     }
 
@@ -180,13 +190,14 @@ impl CronService {
         self.verify_conversation_helper_context(user_id, conversation_id)
             .await?;
 
-        let existing = self.get_job(job_id).await?;
+        let existing = self.get_job(user_id, job_id).await?;
         if existing.conversation_id != conversation_id {
             return Err(CronError::JobNotFound(job_id.to_owned()));
         }
 
         let job = self
             .update_job(
+                user_id,
                 job_id,
                 UpdateCronJobRequest {
                     name: Some(req.name),
@@ -230,9 +241,8 @@ impl CronService {
         }
 
         self.executor
-            .get_conversation_row(conversation_id)
+            .get_conversation_row_for_user(user_id, conversation_id)
             .await?
-            .filter(|row| row.user_id == user_id)
             .ok_or_else(|| {
                 CronError::Conversation(aionui_conversation::ConversationError::NotFound {
                     id: conversation_id.to_owned(),
@@ -242,6 +252,7 @@ impl CronService {
 
     async fn add_job_internal(
         &self,
+        user_id: &str,
         req: CreateCronJobRequest,
         runtime_agent_type: Option<String>,
         assistant_backend_override: Option<String>,
@@ -250,17 +261,26 @@ impl CronService {
         validate_schedule(&schedule)?;
         let resolved_agent_type = match runtime_agent_type {
             Some(agent_type) => agent_type,
-            None => self.resolve_new_job_agent_type(req.agent_config.as_ref()).await?,
+            None => {
+                self.resolve_new_job_agent_type(user_id, req.agent_config.as_ref())
+                    .await?
+            }
         };
         validate_aionrs_agent_config(&resolved_agent_type, req.agent_config.as_ref())?;
 
         let execution_mode = parse_execution_mode(req.execution_mode.as_deref())?;
         let created_by = CreatedBy::from_str(&req.created_by)?;
         let message = req.message.or(req.prompt).unwrap_or_default();
+        let conversation_id = req.conversation_id.trim();
+        if matches!(execution_mode, ExecutionMode::Existing) {
+            self.require_existing_conversation_scope(user_id, conversation_id)
+                .await?;
+        }
 
         let agent_config = match req.agent_config {
             Some(config) => Some(
                 self.build_cron_agent_config(
+                    user_id,
                     &resolved_agent_type,
                     sanitize_agent_config_dto(config),
                     assistant_backend_override.as_deref(),
@@ -275,13 +295,14 @@ impl CronService {
 
         let job = CronJob {
             id: generate_prefixed_id("cron"),
+            user_id: user_id.to_owned(),
             name: req.name,
             enabled: true,
             schedule,
             message,
             execution_mode,
             agent_config,
-            conversation_id: req.conversation_id,
+            conversation_id: conversation_id.to_owned(),
             conversation_title: req.conversation_title,
             agent_type: resolved_agent_type,
             created_by,
@@ -305,16 +326,21 @@ impl CronService {
         self.repo.insert(&row).await?;
         self.bind_existing_conversation_if_needed(&job).await;
         self.scheduler.schedule_job(&job);
-        self.emitter.emit_job_created(&cron_job_to_response(&job));
+        self.emitter.emit_job_created(user_id, &cron_job_to_response(&job));
 
         info!(job_id = %job.id, name = %job.name, "Cron job created");
         Ok(job)
     }
 
-    pub async fn update_job(&self, job_id: &str, req: UpdateCronJobRequest) -> Result<CronJob, CronError> {
+    pub async fn update_job(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        req: UpdateCronJobRequest,
+    ) -> Result<CronJob, CronError> {
         let existing_row = self
             .repo
-            .get_by_id(job_id)
+            .get_by_id_for_user(user_id, job_id)
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(existing_row)?;
@@ -350,9 +376,7 @@ impl CronService {
             }
             job.execution_mode = requested_mode;
             if requested_mode != original_execution_mode && matches!(requested_mode, ExecutionMode::NewConversation) {
-                clear_conversation_binding = !job.conversation_id.trim().is_empty();
-                job.conversation_id.clear();
-                job.conversation_title = None;
+                clear_conversation_binding = true;
             }
         }
         if req.agent_config.is_some()
@@ -365,9 +389,12 @@ impl CronService {
         }
         if let Some(config_dto) = &req.agent_config {
             let config_dto = sanitize_agent_config_dto(config_dto.clone());
-            job.agent_type = self.resolve_new_job_agent_type(Some(&config_dto)).await?;
+            job.agent_type = self.resolve_new_job_agent_type(&job.user_id, Some(&config_dto)).await?;
             validate_aionrs_agent_config(&job.agent_type, Some(&config_dto))?;
-            job.agent_config = Some(self.build_cron_agent_config(&job.agent_type, config_dto, None).await?);
+            job.agent_config = Some(
+                self.build_cron_agent_config(&job.user_id, &job.agent_type, config_dto, None)
+                    .await?,
+            );
         }
         if let Some(title) = &req.conversation_title
             && !clear_conversation_binding
@@ -397,13 +424,12 @@ impl CronService {
 
         let mut params = build_update_params(&job, &req);
         if clear_conversation_binding {
-            params.conversation_id = Some(String::new());
             params.conversation_title = Some(None);
         }
         if agent_config_changed {
             params.agent_config = Some(job.agent_config.as_ref().map(serde_json::to_string).transpose()?);
         }
-        self.repo.update(job_id, &params).await?;
+        self.repo.update_for_user(user_id, job_id, &params).await?;
 
         if clear_conversation_binding
             && let Err(err) = self
@@ -421,27 +447,28 @@ impl CronService {
 
         self.bind_existing_conversation_if_needed(&job).await;
         self.scheduler.reschedule_job(&job);
-        self.emitter.emit_job_updated(&cron_job_to_response(&job));
+        self.emitter.emit_job_updated(user_id, &cron_job_to_response(&job));
 
         info!(job_id = %job.id, "Cron job updated");
         Ok(job)
     }
 
-    pub async fn remove_job(&self, job_id: &str) -> Result<(), CronError> {
+    pub async fn remove_job(&self, user_id: &str, job_id: &str) -> Result<(), CronError> {
         self.scheduler.cancel_job(job_id);
         if let Err(err) = delete_skill_file(&self.data_dir, job_id).await {
             warn!(job_id, error = %err, "Failed to delete cron skill file during job removal");
         }
-        self.repo.delete(job_id).await?;
-        self.emitter.emit_job_removed(job_id);
+        self.delete_skill_row_for_job(user_id, job_id).await;
+        self.repo.delete_for_user(user_id, job_id).await?;
+        self.emitter.emit_job_removed(user_id, job_id);
         info!(job_id, "Cron job removed");
         Ok(())
     }
 
-    pub async fn get_job(&self, job_id: &str) -> Result<CronJob, CronError> {
+    pub async fn get_job(&self, user_id: &str, job_id: &str) -> Result<CronJob, CronError> {
         let row = self
             .repo
-            .get_by_id(job_id)
+            .get_by_id_for_user(user_id, job_id)
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(row)?;
@@ -449,11 +476,11 @@ impl CronService {
         Ok(job)
     }
 
-    pub async fn list_jobs(&self, query: &ListCronJobsQuery) -> Result<Vec<CronJob>, CronError> {
+    pub async fn list_jobs(&self, user_id: &str, query: &ListCronJobsQuery) -> Result<Vec<CronJob>, CronError> {
         let rows = if let Some(conv_id) = &query.conversation_id {
-            self.repo.list_by_conversation(conv_id).await?
+            self.repo.list_by_conversation_for_user(user_id, conv_id).await?
         } else {
-            self.repo.list_all().await?
+            self.repo.list_all_for_user(user_id).await?
         };
 
         let mut jobs = Vec::with_capacity(rows.len());
@@ -475,7 +502,9 @@ impl CronService {
             warn!(error = %error, "Failed to clean up old cron run records");
         }
 
-        let rows = match self.repo.list_enabled().await {
+        self.reconcile_skill_rows().await;
+
+        let rows = match self.repo.list_enabled_system().await {
             Ok(rows) => rows,
             Err(e) => {
                 error!(error = %e, "Failed to load enabled cron jobs");
@@ -516,8 +545,78 @@ impl CronService {
         info!(scheduled, "Cron service initialized");
     }
 
+    /// Reconcile owner-scoped skill rows for saved cron skills at startup.
+    ///
+    /// For each job whose skill file exists on disk, ensure an owner-scoped
+    /// row named `cron-{job_id}` exists. Legacy rows produced by the old
+    /// machine-level catalog scan were named after the SKILL.md frontmatter
+    /// name instead; those duplicates are soft-deleted so listings do not
+    /// double up while historical conversations can still materialize them.
+    async fn reconcile_skill_rows(&self) {
+        let rows = match self.repo.list_all_system().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "Failed to list cron jobs for skill row reconciliation");
+                return;
+            }
+        };
+
+        let mut reconciled = 0u32;
+        let mut cleaned = 0u32;
+        for row in rows {
+            let owner_user_id = row.user_id.clone();
+            let job = match cron_job_from_row(row) {
+                Ok(job) => job,
+                Err(_) => continue,
+            };
+            match has_skill_file(&self.data_dir, &job.id).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    warn!(job_id = %job.id, error = %e, "Failed to check cron skill file during reconciliation");
+                    continue;
+                }
+            }
+
+            if let Ok(Some(content)) = read_skill_content(&self.data_dir, &job.id).await
+                && let Ok(parsed) = parse_skill_content(&content)
+                && let Ok(dir_name) = cron_skill_name(&job.id)
+                && parsed.name != dir_name
+                && let Ok(Some(legacy)) = self
+                    .skill_repo
+                    .find_by_name_for_user(&owner_user_id, &parsed.name)
+                    .await
+                && legacy.source == "cron"
+                && legacy.user_id.is_some()
+            {
+                match self
+                    .skill_repo
+                    .delete_by_name_for_user(&owner_user_id, &parsed.name)
+                    .await
+                {
+                    Ok(_) => cleaned += 1,
+                    Err(DbError::NotFound(_)) => {}
+                    Err(e) => {
+                        warn!(job_id = %job.id, error = %e, "Failed to clean legacy cron skill row");
+                    }
+                }
+            }
+
+            match self.upsert_skill_row_for_job(&owner_user_id, &job).await {
+                Ok(()) => reconciled += 1,
+                Err(e) => {
+                    warn!(job_id = %job.id, error = %e, "Failed to reconcile cron skill row");
+                }
+            }
+        }
+
+        if reconciled > 0 || cleaned > 0 {
+            info!(reconciled, cleaned, "Cron skill rows reconciled");
+        }
+    }
+
     pub async fn tick(&self, job_id: &str, scheduled_at: i64) {
-        let row = match self.repo.get_by_id(job_id).await {
+        let row = match self.repo.get_by_id_system(job_id).await {
             Ok(Some(r)) => r,
             Ok(None) => {
                 warn!(job_id, "Tick: job not found, cancelling timer");
@@ -581,7 +680,9 @@ impl CronService {
             Ok(CronRunClaimResult::QueueBusy) => {
                 self.record_queue_busy_skip(&job).await;
                 self.reschedule_after_execution(&job, scheduled_at).await;
-                self.emitter.emit_job_executed(job_id, "skipped", None);
+                if let Some(user_id) = self.owner_user_id_for_job(&job).await {
+                    self.emitter.emit_job_executed(&user_id, job_id, "skipped", None);
+                }
                 return;
             }
             Err(error) => {
@@ -629,7 +730,7 @@ impl CronService {
     }
 
     pub async fn handle_system_resume(&self) {
-        let rows = match self.repo.list_enabled().await {
+        let rows = match self.repo.list_enabled_system().await {
             Ok(r) => r,
             Err(e) => {
                 error!(error = %e, "Resume: failed to load enabled jobs");
@@ -674,7 +775,9 @@ impl CronService {
                 self.record_missed_execution(&job).await;
                 self.insert_missed_job_tips(&job).await;
                 self.reschedule_after_missed(&job).await;
-                self.emitter.emit_job_executed(&job.id, "missed", None);
+                if let Some(user_id) = self.owner_user_id_for_job(&job).await {
+                    self.emitter.emit_job_executed(&user_id, &job.id, "missed", None);
+                }
                 continue;
             }
 
@@ -684,10 +787,10 @@ impl CronService {
         info!("System resume: all cron timers rescheduled");
     }
 
-    pub async fn run_now(&self, job_id: &str) -> Result<RunNowResponse, CronError> {
+    pub async fn run_now(&self, user_id: &str, job_id: &str) -> Result<RunNowResponse, CronError> {
         let row = self
             .repo
-            .get_by_id(job_id)
+            .get_by_id_for_user(user_id, job_id)
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(row)?;
@@ -703,10 +806,11 @@ impl CronService {
         let conversation_id = prepared.conversation_id.clone();
         let service = self.clone();
         let job_id = job.id.clone();
+        let user_id = user_id.to_owned();
 
         tokio::spawn(async move {
             let result = service.executor.execute_prepared(&job, prepared).await;
-            service.handle_run_now_result(&job_id, result).await;
+            service.handle_run_now_result(&user_id, &job_id, result).await;
         });
 
         Ok(RunNowResponse { conversation_id })
@@ -716,10 +820,10 @@ impl CronService {
     // Skill management
     // -----------------------------------------------------------------------
 
-    pub async fn save_skill(&self, job_id: &str, req: SaveCronSkillRequest) -> Result<(), CronError> {
+    pub async fn save_skill(&self, user_id: &str, job_id: &str, req: SaveCronSkillRequest) -> Result<(), CronError> {
         let row = self
             .repo
-            .get_by_id(job_id)
+            .get_by_id_for_user(user_id, job_id)
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
 
@@ -731,17 +835,69 @@ impl CronService {
             skill_content: Some(Some(req.content)),
             ..Default::default()
         };
-        self.repo.update(job_id, &params).await?;
-        self.executor.mark_skill_suggest_artifacts_saved(job_id).await?;
+        self.repo.update_for_user(user_id, job_id, &params).await?;
+        self.upsert_skill_row_for_job(user_id, &job).await?;
+        self.executor
+            .mark_skill_suggest_artifacts_saved(user_id, job_id)
+            .await?;
 
         info!(job_id, "Skill content saved");
         Ok(())
     }
 
-    pub async fn has_skill(&self, job_id: &str) -> Result<HasSkillResponse, CronError> {
+    /// Upsert the owner-scoped skill row for a job's saved cron skill.
+    ///
+    /// Cron skill content is user data (the job prompt), so the catalog row
+    /// is owned by the job owner and named after the on-disk skill dir
+    /// (`cron-{job_id}`) — the stable name the executor materializes by.
+    async fn upsert_skill_row_for_job(&self, user_id: &str, job: &CronJob) -> Result<(), CronError> {
+        let name = cron_skill_name(&job.id)?;
+        let path = cron_skill_dir(&self.data_dir, &job.id)?;
+        let description = match read_skill_content(&self.data_dir, &job.id).await? {
+            Some(content) => parse_skill_content(&content)
+                .map(|parsed| parsed.description)
+                .ok()
+                .filter(|desc| !desc.trim().is_empty()),
+            None => None,
+        };
+        let description = description
+            .or_else(|| job.description.clone())
+            .unwrap_or_else(|| format!("Saved cron skill for {}", job.name));
+
+        self.skill_repo
+            .upsert_for_user(
+                user_id,
+                UpsertSkillParams {
+                    name: &name,
+                    description: Some(&description),
+                    path: &path.to_string_lossy(),
+                    source: "cron",
+                    enabled: true,
+                },
+            )
+            .await
+            .map_err(|e| CronError::Scheduler(format!("Failed to upsert cron skill row: {e}")))?;
+        Ok(())
+    }
+
+    /// Soft-delete the owner-scoped skill row for a job. Missing rows are
+    /// fine — jobs without a saved skill never had one.
+    async fn delete_skill_row_for_job(&self, user_id: &str, job_id: &str) {
+        let Ok(name) = cron_skill_name(job_id) else {
+            return;
+        };
+        match self.skill_repo.delete_by_name_for_user(user_id, &name).await {
+            Ok(_) | Err(DbError::NotFound(_)) => {}
+            Err(e) => {
+                warn!(job_id, error = %e, "Failed to delete cron skill row");
+            }
+        }
+    }
+
+    pub async fn has_skill(&self, user_id: &str, job_id: &str) -> Result<HasSkillResponse, CronError> {
         let row = self
             .repo
-            .get_by_id(job_id)
+            .get_by_id_for_user(user_id, job_id)
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
 
@@ -751,9 +907,9 @@ impl CronService {
         Ok(HasSkillResponse { has_skill })
     }
 
-    pub async fn delete_skill(&self, job_id: &str) -> Result<(), CronError> {
+    pub async fn delete_skill(&self, user_id: &str, job_id: &str) -> Result<(), CronError> {
         self.repo
-            .get_by_id(job_id)
+            .get_by_id_for_user(user_id, job_id)
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
 
@@ -763,7 +919,8 @@ impl CronService {
             skill_content: Some(None),
             ..Default::default()
         };
-        self.repo.update(job_id, &params).await?;
+        self.repo.update_for_user(user_id, job_id, &params).await?;
+        self.delete_skill_row_for_job(user_id, job_id).await;
 
         info!(job_id, "Skill content deleted");
         Ok(())
@@ -779,6 +936,7 @@ impl CronService {
 
     async fn resolve_new_job_agent_type(
         &self,
+        user_id: &str,
         agent_config: Option<&aionui_api_types::CronAgentConfigWriteDto>,
     ) -> Result<String, CronError> {
         let Some(assistant_id) = agent_config.and_then(|config| config.assistant_id.as_deref()) else {
@@ -787,7 +945,7 @@ impl CronService {
             ));
         };
 
-        self.resolve_agent_type_for_assistant_id(assistant_id).await
+        self.resolve_agent_type_for_assistant_id(user_id, assistant_id).await
     }
 
     async fn resolve_job_agent_type(&self, job: &CronJob) -> Result<String, CronError> {
@@ -806,7 +964,75 @@ impl CronService {
             ));
         };
 
-        self.resolve_agent_type_for_assistant_id(assistant_id).await
+        self.resolve_agent_type_for_assistant_id(&job.user_id, assistant_id)
+            .await
+    }
+
+    async fn owner_user_id_for_job(&self, job: &CronJob) -> Option<String> {
+        if !job.user_id.trim().is_empty() {
+            return Some(job.user_id.clone());
+        }
+
+        let conversation_id = job.conversation_id.trim();
+        if conversation_id.is_empty() {
+            warn!(job_id = %job.id, "Cron event skipped because job has no conversation owner");
+            return None;
+        }
+
+        match self.executor.get_conversation_row(conversation_id).await {
+            Ok(Some(row)) if !row.user_id.trim().is_empty() => Some(row.user_id),
+            Ok(Some(_)) => {
+                warn!(
+                    job_id = %job.id,
+                    conversation_id,
+                    "Cron event skipped because conversation owner is empty"
+                );
+                None
+            }
+            Ok(None) => {
+                warn!(
+                    job_id = %job.id,
+                    conversation_id,
+                    "Cron event skipped because conversation owner could not be resolved"
+                );
+                None
+            }
+            Err(err) => {
+                warn!(
+                    job_id = %job.id,
+                    conversation_id,
+                    error = %err,
+                    "Cron event skipped because conversation owner lookup failed"
+                );
+                None
+            }
+        }
+    }
+
+    async fn require_existing_conversation_scope(&self, user_id: &str, conversation_id: &str) -> Result<(), CronError> {
+        if conversation_id.is_empty() {
+            return Err(CronError::Conversation(
+                aionui_conversation::ConversationError::NotFound {
+                    id: conversation_id.to_owned(),
+                },
+            ));
+        }
+
+        let Some(row) = self.executor.get_conversation_row(conversation_id).await? else {
+            return Err(CronError::Conversation(
+                aionui_conversation::ConversationError::NotFound {
+                    id: conversation_id.to_owned(),
+                },
+            ));
+        };
+
+        if row.user_id != user_id {
+            return Err(CronError::CrossAccountReference(
+                "Referenced conversation belongs to another user.".into(),
+            ));
+        }
+
+        Ok(())
     }
 
     async fn is_team_conversation_job(&self, job: &CronJob) -> Result<bool, CronError> {
@@ -826,18 +1052,25 @@ impl CronService {
             .is_some_and(|value| !value.trim().is_empty()))
     }
 
-    async fn resolve_agent_type_for_assistant_id(&self, assistant_id: &str) -> Result<String, CronError> {
+    async fn resolve_agent_type_for_assistant_id(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<String, CronError> {
         let definition = self
             .assistant_definition_repo
-            .get_by_assistant_id(assistant_id)
+            .get_by_assistant_id_for_user(user_id, assistant_id)
             .await?
             .ok_or_else(|| CronError::InvalidAgentConfig(format!("assistant '{assistant_id}' not found")))?;
-        let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
+        let overlay = self
+            .assistant_overlay_repo
+            .get_for_user(user_id, &definition.id)
+            .await?;
         let effective_agent_id = overlay
             .as_ref()
             .and_then(|item| item.agent_id_override.as_deref())
             .unwrap_or(definition.agent_id.as_str());
-        let effective_backend = self.runtime_backend_for_agent_id(effective_agent_id).await?;
+        let effective_backend = self.runtime_backend_for_agent_id(user_id, effective_agent_id).await?;
 
         Ok(runtime_agent_type_for_backend(&effective_backend).to_owned())
     }
@@ -882,7 +1115,7 @@ impl CronService {
             conversation_id: Some(conversation_id.to_owned()),
             ..Default::default()
         };
-        self.repo.update(&job.id, &params).await?;
+        self.repo.update_for_user(&job.user_id, &job.id, &params).await?;
         self.executor
             .bind_cron_job_to_conversation(
                 conversation_id,
@@ -917,7 +1150,7 @@ impl CronService {
         };
         let workspace_to_clear = match self
             .executor
-            .auto_workspace_to_delete_for_conversation(conversation_id)
+            .auto_workspace_to_delete_for_conversation(&job.user_id, conversation_id)
             .await
         {
             Ok(Some(path)) => path,
@@ -943,6 +1176,7 @@ impl CronService {
 
     async fn handle_execution_result(&self, job: CronJob, scheduled_at: i64, result: ExecutionResult) {
         let job_id = &job.id;
+        let owner_user_id = self.owner_user_id_for_job(&job).await;
 
         match result {
             ExecutionResult::Success { conversation_id } => {
@@ -952,9 +1186,12 @@ impl CronService {
                 {
                     return;
                 }
-                self.update_job_after_success(job_id, &conversation_id).await;
+                self.update_job_after_success(&job.user_id, job_id, &conversation_id)
+                    .await;
                 self.reschedule_after_execution(&job, scheduled_at).await;
-                self.emitter.emit_job_executed(job_id, "ok", None);
+                if let Some(user_id) = owner_user_id.as_deref() {
+                    self.emitter.emit_job_executed(user_id, job_id, "ok", None);
+                }
             }
             ExecutionResult::Retrying { attempt } => {
                 if !self.schedule_retry(job_id, scheduled_at, attempt).await {
@@ -964,7 +1201,7 @@ impl CronService {
                     retry_count: Some(attempt),
                     ..Default::default()
                 };
-                if let Err(e) = self.repo.update(job_id, &params).await {
+                if let Err(e) = self.repo.update_for_user(&job.user_id, job_id, &params).await {
                     error!(job_id, error = %e, "Failed to update retry count");
                 }
             }
@@ -980,11 +1217,13 @@ impl CronService {
                     retry_count: Some(0),
                     ..Default::default()
                 };
-                if let Err(e) = self.repo.update(job_id, &params).await {
+                if let Err(e) = self.repo.update_for_user(&job.user_id, job_id, &params).await {
                     error!(job_id, error = %e, "Failed to update skipped status");
                 }
                 self.reschedule_after_execution(&job, scheduled_at).await;
-                self.emitter.emit_job_executed(job_id, "skipped", None);
+                if let Some(user_id) = owner_user_id.as_deref() {
+                    self.emitter.emit_job_executed(user_id, job_id, "skipped", None);
+                }
             }
             ExecutionResult::Error { message } => {
                 if !self
@@ -993,29 +1232,31 @@ impl CronService {
                 {
                     return;
                 }
-                self.update_job_after_error(job_id, &message).await;
+                self.update_job_after_error(&job.user_id, job_id, &message).await;
                 self.reschedule_after_execution(&job, scheduled_at).await;
-                self.emitter.emit_job_executed(job_id, "error", Some(&message));
+                if let Some(user_id) = owner_user_id.as_deref() {
+                    self.emitter.emit_job_executed(user_id, job_id, "error", Some(&message));
+                }
             }
         }
     }
 
-    async fn handle_run_now_result(&self, job_id: &str, result: ExecutionResult) {
+    async fn handle_run_now_result(&self, user_id: &str, job_id: &str, result: ExecutionResult) {
         match result {
             ExecutionResult::Success { conversation_id } => {
-                self.update_job_after_success(job_id, &conversation_id).await;
-                self.emitter.emit_job_executed(job_id, "ok", None);
+                self.update_job_after_success(user_id, job_id, &conversation_id).await;
+                self.emitter.emit_job_executed(user_id, job_id, "ok", None);
             }
             ExecutionResult::Error { message } => {
-                self.update_job_after_error(job_id, &message).await;
-                self.emitter.emit_job_executed(job_id, "error", Some(&message));
+                self.update_job_after_error(user_id, job_id, &message).await;
+                self.emitter.emit_job_executed(user_id, job_id, "error", Some(&message));
             }
             ExecutionResult::Retrying { attempt } => {
                 let params = UpdateCronJobParams {
                     retry_count: Some(attempt),
                     ..Default::default()
                 };
-                if let Err(err) = self.repo.update(job_id, &params).await {
+                if let Err(err) = self.repo.update_for_user(user_id, job_id, &params).await {
                     error!(
                         job_id,
                         error = %err,
@@ -1029,20 +1270,20 @@ impl CronService {
                     retry_count: Some(0),
                     ..Default::default()
                 };
-                if let Err(err) = self.repo.update(job_id, &params).await {
+                if let Err(err) = self.repo.update_for_user(user_id, job_id, &params).await {
                     error!(
                         job_id,
                         error = %err,
                         "Failed to update run-now skipped status"
                     );
                 }
-                self.emitter.emit_job_executed(job_id, "skipped", None);
+                self.emitter.emit_job_executed(user_id, job_id, "skipped", None);
             }
         }
     }
 
-    async fn update_job_after_success(&self, job_id: &str, conversation_id: &str) {
-        let existing_row = match self.repo.get_by_id(job_id).await {
+    async fn update_job_after_success(&self, user_id: &str, job_id: &str, conversation_id: &str) {
+        let existing_row = match self.repo.get_by_id_for_user(user_id, job_id).await {
             Ok(Some(r)) => r,
             Ok(None) => return,
             Err(e) => {
@@ -1068,7 +1309,7 @@ impl CronService {
             conversation_id: needs_conversation_bind.then(|| conversation_id.to_owned()),
             ..Default::default()
         };
-        if let Err(e) = self.repo.update(job_id, &params).await {
+        if let Err(e) = self.repo.update_for_user(user_id, job_id, &params).await {
             error!(job_id, error = %e, "Failed to update job after success");
             return;
         }
@@ -1088,8 +1329,8 @@ impl CronService {
         }
     }
 
-    async fn update_job_after_error(&self, job_id: &str, message: &str) {
-        let run_count = match self.repo.get_by_id(job_id).await {
+    async fn update_job_after_error(&self, user_id: &str, job_id: &str, message: &str) {
+        let run_count = match self.repo.get_by_id_for_user(user_id, job_id).await {
             Ok(Some(r)) => r.run_count,
             Ok(None) => return,
             Err(e) => {
@@ -1106,7 +1347,7 @@ impl CronService {
             run_count: Some(run_count + 1),
             ..Default::default()
         };
-        if let Err(e) = self.repo.update(job_id, &params).await {
+        if let Err(e) = self.repo.update_for_user(user_id, job_id, &params).await {
             error!(job_id, error = %e, "Failed to update job after error");
         }
     }
@@ -1130,7 +1371,7 @@ impl CronService {
                 next_run_at: Some(None),
                 ..Default::default()
             };
-            if let Err(e) = self.repo.update(&job.id, &params).await {
+            if let Err(e) = self.repo.update_for_user(&job.user_id, &job.id, &params).await {
                 error!(job_id = %job.id, error = %e, "Failed to disable at-type job");
             }
             self.scheduler.cancel_job(&job.id);
@@ -1140,7 +1381,10 @@ impl CronService {
                 next_run_at: None,
                 ..job.clone()
             };
-            self.emitter.emit_job_updated(&cron_job_to_response(&disabled));
+            if let Some(user_id) = self.owner_user_id_for_job(job).await {
+                self.emitter
+                    .emit_job_updated(&user_id, &cron_job_to_response(&disabled));
+            }
 
             info!(job_id = %job.id, "At-type job executed, auto-disabled");
             return;
@@ -1155,7 +1399,7 @@ impl CronService {
             next_run_at: Some(next),
             ..Default::default()
         };
-        if let Err(e) = self.repo.update(&job.id, &params).await {
+        if let Err(e) = self.repo.update_for_user(&job.user_id, &job.id, &params).await {
             error!(job_id = %job.id, error = %e, "Failed to update next_run_at");
         }
         self.scheduler.reschedule_job(&updated);
@@ -1168,7 +1412,7 @@ impl CronService {
             retry_count: Some(0),
             ..Default::default()
         };
-        if let Err(err) = self.repo.update(&job.id, &params).await {
+        if let Err(err) = self.repo.update_for_user(&job.user_id, &job.id, &params).await {
             error!(
                 job_id = %job.id,
                 error = %err,
@@ -1192,9 +1436,12 @@ impl CronService {
             .insert_tips_message(&job.conversation_id, &content, "warning")
             .await
         {
-            Ok(()) => self
-                .emitter
-                .emit_conversation_tips(&job.conversation_id, &content, "warning"),
+            Ok(()) => {
+                if let Some(user_id) = self.owner_user_id_for_job(job).await {
+                    self.emitter
+                        .emit_conversation_tips(&user_id, &job.conversation_id, &content, "warning");
+                }
+            }
             Err(err) => {
                 warn!(
                     job_id = %job.id,
@@ -1214,7 +1461,7 @@ impl CronService {
                 next_run_at: Some(None),
                 ..Default::default()
             };
-            if let Err(err) = self.repo.update(&job.id, &params).await {
+            if let Err(err) = self.repo.update_for_user(&job.user_id, &job.id, &params).await {
                 error!(
                     job_id = %job.id,
                     error = %err,
@@ -1230,7 +1477,7 @@ impl CronService {
             next_run_at: Some(next),
             ..Default::default()
         };
-        if let Err(err) = self.repo.update(&job.id, &params).await {
+        if let Err(err) = self.repo.update_for_user(&job.user_id, &job.id, &params).await {
             error!(
                 job_id = %job.id,
                 error = %err,
@@ -1332,15 +1579,15 @@ impl CronService {
             retry_count: Some(0),
             ..Default::default()
         };
-        if let Err(error) = self.repo.update(&job.id, &params).await {
+        if let Err(error) = self.repo.update_for_user(&job.user_id, &job.id, &params).await {
             error!(job_id = %job.id, error = %error, "Failed to record queue-busy cron skip");
         }
     }
 
-    pub async fn delete_jobs_by_conversation(&self, conversation_id: &str) {
+    pub async fn delete_jobs_by_conversation(&self, user_id: &str, conversation_id: &str) {
         let workspace_to_clear = match self
             .executor
-            .auto_workspace_to_delete_for_conversation(conversation_id)
+            .auto_workspace_to_delete_for_conversation(user_id, conversation_id)
             .await
         {
             Ok(value) => value,
@@ -1359,16 +1606,17 @@ impl CronService {
             return;
         };
 
-        self.clear_deleted_workspace_from_jobs(conversation_id, &workspace_to_clear)
+        self.clear_deleted_workspace_from_jobs(user_id, conversation_id, &workspace_to_clear)
             .await;
         debug!(conversation_id, "Conversation deleted; cron jobs are preserved");
     }
 
-    async fn clear_deleted_workspace_from_jobs(&self, conversation_id: &str, workspace_to_clear: &Path) {
-        let jobs = match self.repo.list_by_conversation(conversation_id).await {
+    async fn clear_deleted_workspace_from_jobs(&self, user_id: &str, conversation_id: &str, workspace_to_clear: &Path) {
+        let jobs = match self.repo.list_by_conversation_for_user(user_id, conversation_id).await {
             Ok(rows) => rows,
             Err(err) => {
                 error!(
+                    user_id,
                     conversation_id,
                     error = %err,
                     "Failed to list cron jobs for deleted workspace cleanup"
@@ -1419,7 +1667,7 @@ impl CronService {
                 agent_config: Some(Some(agent_config_json)),
                 ..Default::default()
             };
-            match self.repo.update(&row.id, &params).await {
+            match self.repo.update_for_user(&row.user_id, &row.id, &params).await {
                 Ok(()) => cleared += 1,
                 Err(err) => {
                     error!(
@@ -1489,7 +1737,7 @@ impl CronService {
             extra_assistant_id.as_ref(),
             legacy_agent_label,
         ) {
-            (None, None, Some(label)) => self.resolve_assistant_id_for_agent_label(&label).await,
+            (None, None, Some(label)) => self.resolve_assistant_id_for_agent_label(&row.user_id, &label).await,
             _ => None,
         };
         let fallback_assistant_id = match (
@@ -1497,7 +1745,7 @@ impl CronService {
             extra_assistant_id.as_ref(),
             legacy_assistant_id.as_ref(),
         ) {
-            (None, None, None) => self.resolve_default_assistant_id().await,
+            (None, None, None) => self.resolve_default_assistant_id(&row.user_id).await,
             _ => None,
         };
         let uses_default_assistant_fallback = fallback_assistant_id.is_some();
@@ -1506,7 +1754,7 @@ impl CronService {
             .or(legacy_assistant_id)
             .or(fallback_assistant_id);
         let assistant_name = match assistant_id.as_deref() {
-            Some(assistant_id) => match self.resolve_assistant_name(Some(assistant_id)).await {
+            Some(assistant_id) => match self.resolve_assistant_name(&row.user_id, Some(assistant_id)).await {
                 Ok(value) => value,
                 Err(err) => {
                     warn!(
@@ -1521,7 +1769,10 @@ impl CronService {
             None => None,
         };
         let snapshot_backend = match assistant_snapshot.as_ref() {
-            Some(snapshot) => match self.runtime_backend_for_agent_id(snapshot.agent_id.trim()).await {
+            Some(snapshot) => match self
+                .runtime_backend_for_agent_id(&row.user_id, snapshot.agent_id.trim())
+                .await
+            {
                 Ok(value) => Some(value).filter(|value| !value.is_empty()),
                 Err(err) => {
                     warn!(
@@ -1538,7 +1789,7 @@ impl CronService {
             None
         } else {
             snapshot_backend.clone().or(self
-                .resolve_assistant_backend(assistant_id.as_deref())
+                .resolve_assistant_backend(&row.user_id, assistant_id.as_deref())
                 .await
                 .unwrap_or(None))
         };
@@ -1569,6 +1820,7 @@ impl CronService {
         };
         let full_auto_mode = match self
             .resolve_cron_full_auto_mode(
+                &row.user_id,
                 &row.r#type,
                 assistant_id_for_mode,
                 assistant_snapshot.as_ref().map(|snapshot| snapshot.agent_id.as_str()),
@@ -1625,6 +1877,7 @@ impl CronService {
 
     async fn build_cron_agent_config(
         &self,
+        user_id: &str,
         runtime_agent_type: &str,
         config: aionui_api_types::CronAgentConfigWriteDto,
         _assistant_backend_override: Option<&str>,
@@ -1636,7 +1889,7 @@ impl CronService {
         };
 
         let assistant_backend = self
-            .resolve_assistant_backend(Some(assistant_id))
+            .resolve_assistant_backend(user_id, Some(assistant_id))
             .await?
             .ok_or_else(|| {
                 CronError::InvalidAgentConfig(format!(
@@ -1645,6 +1898,7 @@ impl CronService {
             })?;
         let full_auto_mode = self
             .resolve_cron_full_auto_mode(
+                user_id,
                 runtime_agent_type,
                 Some(assistant_id),
                 None,
@@ -1666,41 +1920,58 @@ impl CronService {
         })
     }
 
-    async fn resolve_assistant_backend(&self, assistant_id: Option<&str>) -> Result<Option<String>, CronError> {
+    async fn resolve_assistant_backend(
+        &self,
+        user_id: &str,
+        assistant_id: Option<&str>,
+    ) -> Result<Option<String>, CronError> {
         let Some(assistant_id) = assistant_id.filter(|value| !value.is_empty()) else {
             return Ok(None);
         };
 
-        let Some(definition) = self.assistant_definition_repo.get_by_assistant_id(assistant_id).await? else {
+        let Some(definition) = self
+            .assistant_definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await?
+        else {
             return Ok(None);
         };
-        let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
+        let overlay = self
+            .assistant_overlay_repo
+            .get_for_user(user_id, &definition.id)
+            .await?;
         let effective_agent_id = overlay
             .as_ref()
             .and_then(|item| item.agent_id_override.as_deref())
             .unwrap_or(definition.agent_id.as_str());
 
-        Ok(Some(self.runtime_backend_for_agent_id(effective_agent_id).await?))
+        Ok(Some(
+            self.runtime_backend_for_agent_id(user_id, effective_agent_id).await?,
+        ))
     }
 
-    async fn resolve_assistant_name(&self, assistant_id: Option<&str>) -> Result<Option<String>, CronError> {
+    async fn resolve_assistant_name(
+        &self,
+        user_id: &str,
+        assistant_id: Option<&str>,
+    ) -> Result<Option<String>, CronError> {
         let Some(assistant_id) = assistant_id.filter(|value| !value.is_empty()) else {
             return Ok(None);
         };
 
         Ok(self
             .assistant_definition_repo
-            .get_by_assistant_id(assistant_id)
+            .get_by_assistant_id_for_user(user_id, assistant_id)
             .await?
             .map(|definition| definition.name.trim().to_owned())
             .filter(|value| !value.is_empty()))
     }
 
-    async fn resolve_assistant_id_for_agent_label(&self, agent_label: &str) -> Option<String> {
-        let rows = self.agent_metadata_repo.list_all().await.ok()?;
+    async fn resolve_assistant_id_for_agent_label(&self, user_id: &str, agent_label: &str) -> Option<String> {
+        let rows = self.agent_metadata_repo.list_all_for_user(user_id).await.ok()?;
         let binding = resolve_agent_binding_from_rows(&rows, agent_label)?;
         self.assistant_definition_repo
-            .list()
+            .list_for_user(user_id)
             .await
             .ok()?
             .into_iter()
@@ -1717,9 +1988,9 @@ impl CronService {
             .map(|definition| definition.assistant_id)
     }
 
-    async fn resolve_default_assistant_id(&self) -> Option<String> {
+    async fn resolve_default_assistant_id(&self, user_id: &str) -> Option<String> {
         self.assistant_definition_repo
-            .list()
+            .list_for_user(user_id)
             .await
             .ok()?
             .into_iter()
@@ -1736,8 +2007,8 @@ impl CronService {
             .map(|definition| definition.assistant_id)
     }
 
-    async fn runtime_backend_for_agent_id(&self, agent_id: &str) -> Result<String, CronError> {
-        let rows = self.agent_metadata_repo.list_all().await?;
+    async fn runtime_backend_for_agent_id(&self, user_id: &str, agent_id: &str) -> Result<String, CronError> {
+        let rows = self.agent_metadata_repo.list_all_for_user(user_id).await?;
         Ok(resolve_agent_binding_from_rows(&rows, agent_id)
             .map(|binding| binding.runtime_backend)
             .unwrap_or_else(|| agent_id.to_owned()))
@@ -1745,20 +2016,21 @@ impl CronService {
 
     async fn resolve_cron_full_auto_mode(
         &self,
+        user_id: &str,
         runtime_agent_type: &str,
         assistant_id: Option<&str>,
         agent_id_hint: Option<&str>,
         backend_hint: Option<&str>,
     ) -> Result<String, CronError> {
-        if let Some(row) = self.resolve_agent_metadata_for_assistant(assistant_id).await? {
+        if let Some(row) = self.resolve_agent_metadata_for_assistant(user_id, assistant_id).await? {
             return Ok(full_auto_mode_from_metadata(&row, runtime_agent_type));
         }
 
-        if let Some(row) = self.resolve_agent_metadata_for_value(agent_id_hint).await? {
+        if let Some(row) = self.resolve_agent_metadata_for_value(user_id, agent_id_hint).await? {
             return Ok(full_auto_mode_from_metadata(&row, runtime_agent_type));
         }
 
-        if let Some(row) = self.resolve_agent_metadata_for_value(backend_hint).await? {
+        if let Some(row) = self.resolve_agent_metadata_for_value(user_id, backend_hint).await? {
             return Ok(full_auto_mode_from_metadata(&row, runtime_agent_type));
         }
 
@@ -1767,33 +2039,43 @@ impl CronService {
 
     async fn resolve_agent_metadata_for_assistant(
         &self,
+        user_id: &str,
         assistant_id: Option<&str>,
     ) -> Result<Option<AgentMetadataRow>, CronError> {
         let Some(assistant_id) = assistant_id.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(None);
         };
 
-        let Some(definition) = self.assistant_definition_repo.get_by_assistant_id(assistant_id).await? else {
+        let Some(definition) = self
+            .assistant_definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await?
+        else {
             return Ok(None);
         };
-        let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
+        let overlay = self
+            .assistant_overlay_repo
+            .get_for_user(user_id, &definition.id)
+            .await?;
         let effective_agent_id = overlay
             .as_ref()
             .and_then(|item| item.agent_id_override.as_deref())
             .unwrap_or(definition.agent_id.as_str());
 
-        self.resolve_agent_metadata_for_value(Some(effective_agent_id)).await
+        self.resolve_agent_metadata_for_value(user_id, Some(effective_agent_id))
+            .await
     }
 
     async fn resolve_agent_metadata_for_value(
         &self,
+        user_id: &str,
         value: Option<&str>,
     ) -> Result<Option<AgentMetadataRow>, CronError> {
         let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(None);
         };
 
-        let rows = self.agent_metadata_repo.list_all().await?;
+        let rows = self.agent_metadata_repo.list_all_for_user(user_id).await?;
         let Some(binding) = resolve_agent_binding_from_rows(&rows, value) else {
             return Ok(None);
         };
@@ -1826,8 +2108,8 @@ fn fallback_full_auto_mode(runtime_agent_type: &str, backend_hint: Option<&str>)
 
 #[async_trait::async_trait]
 impl aionui_common::OnConversationDelete for CronService {
-    async fn on_conversation_deleted(&self, conversation_id: &str) {
-        self.delete_jobs_by_conversation(conversation_id).await;
+    async fn on_conversation_deleted(&self, user_id: &str, conversation_id: &str) {
+        self.delete_jobs_by_conversation(user_id, conversation_id).await;
     }
 }
 
@@ -2313,6 +2595,7 @@ mod tests {
     fn sample_job() -> CronJob {
         CronJob {
             id: "cron_test".into(),
+            user_id: "user1".into(),
             name: "Test".into(),
             enabled: true,
             schedule: CronSchedule::Every {

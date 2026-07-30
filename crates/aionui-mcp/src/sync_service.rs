@@ -34,7 +34,7 @@ impl McpSyncService {
     /// server configurations.
     ///
     /// Agents that are not installed are silently skipped.
-    pub async fn get_agent_configs(&self) -> Result<Vec<DetectedMcpServerResponse>, McpError> {
+    pub async fn get_agent_configs(&self, user_id: &str) -> Result<Vec<DetectedMcpServerResponse>, McpError> {
         let _guard = self.service_lock.lock().await;
 
         let mut results = Vec::new();
@@ -46,7 +46,7 @@ impl McpSyncService {
                 continue;
             }
 
-            match adapter.detect_existing().await {
+            match adapter.detect_existing(user_id).await {
                 Ok(detected) => {
                     let servers = detected.into_iter().map(detected_to_response).collect();
                     results.push(DetectedMcpServerResponse {
@@ -121,6 +121,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
 
+    const TEST_USER_ID: &str = "user-1";
+
     struct MockAdapter {
         source: McpSource,
         installed: bool,
@@ -152,7 +154,7 @@ mod tests {
             Ok(self.installed)
         }
 
-        async fn detect_existing(&self) -> Result<Vec<DetectedServer>, McpError> {
+        async fn detect_existing(&self, _user_id: &str) -> Result<Vec<DetectedServer>, McpError> {
             if !self.installed {
                 return Err(McpError::AgentNotInstalled(format!("{:?}", self.source)));
             }
@@ -173,15 +175,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IMcpServerRepository for MockRepo {
-        async fn list(&self) -> Result<Vec<McpServerRow>, DbError> {
+        async fn list(&self, _user_id: &str) -> Result<Vec<McpServerRow>, DbError> {
             Ok(Vec::new())
         }
 
-        async fn find_by_id(&self, _id: &str) -> Result<Option<McpServerRow>, DbError> {
+        async fn find_by_id(&self, _user_id: &str, _id: &str) -> Result<Option<McpServerRow>, DbError> {
             Ok(None)
         }
 
-        async fn find_by_name(&self, _name: &str) -> Result<Option<McpServerRow>, DbError> {
+        async fn find_by_name(&self, _user_id: &str, _name: &str) -> Result<Option<McpServerRow>, DbError> {
             Ok(None)
         }
 
@@ -189,20 +191,30 @@ mod tests {
             unimplemented!("not needed for detection tests")
         }
 
-        async fn update(&self, _id: &str, _params: UpdateMcpServerParams<'_>) -> Result<McpServerRow, DbError> {
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _params: UpdateMcpServerParams<'_>,
+        ) -> Result<McpServerRow, DbError> {
             unimplemented!("not needed for detection tests")
         }
 
-        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
             unimplemented!("not needed for detection tests")
         }
 
-        async fn batch_upsert(&self, _params_list: &[CreateMcpServerParams<'_>]) -> Result<Vec<McpServerRow>, DbError> {
+        async fn batch_upsert(
+            &self,
+            _user_id: &str,
+            _params_list: &[CreateMcpServerParams<'_>],
+        ) -> Result<Vec<McpServerRow>, DbError> {
             unimplemented!("not needed for detection tests")
         }
 
         async fn update_status(
             &self,
+            _user_id: &str,
             _id: &str,
             _status: &str,
             _last_connected: Option<TimestampMs>,
@@ -210,7 +222,7 @@ mod tests {
             unimplemented!("not needed for detection tests")
         }
 
-        async fn update_tools(&self, _id: &str, _tools: Option<&str>) -> Result<(), DbError> {
+        async fn update_tools(&self, _user_id: &str, _id: &str, _tools: Option<&str>) -> Result<(), DbError> {
             unimplemented!("not needed for detection tests")
         }
     }
@@ -241,7 +253,7 @@ mod tests {
         let adapter_c = Arc::new(MockAdapter::new(McpSource::Qwen, true).with_existing(vec![]));
 
         let svc = make_service(vec![adapter_a, adapter_b, adapter_c]);
-        let configs = svc.get_agent_configs().await.unwrap();
+        let configs = svc.get_agent_configs(TEST_USER_ID).await.unwrap();
 
         assert_eq!(configs.len(), 2);
         assert_eq!(configs[0].source, McpSource::Claude);
@@ -267,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn get_agent_configs_no_adapters() {
         let svc = make_service(vec![]);
-        let configs = svc.get_agent_configs().await.unwrap();
+        let configs = svc.get_agent_configs(TEST_USER_ID).await.unwrap();
         assert!(configs.is_empty());
     }
 

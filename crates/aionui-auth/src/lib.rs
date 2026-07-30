@@ -12,6 +12,7 @@ pub mod qr_token;
 mod rate_limit;
 mod routes;
 mod security;
+mod service;
 mod validation;
 
 // Error type
@@ -50,10 +51,15 @@ pub use security::security_headers_middleware;
 pub use csrf::csrf_middleware;
 
 // Auth middleware
-pub use middleware::{AuthState, CurrentUser, auth_middleware, local_auth_middleware};
+pub use middleware::{
+    AuthIdentityMode, AuthState, CurrentUser, IRuntimeTokenVerifier, RUNTIME_CONVERSATION_ID_HEADER,
+    RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, auth_middleware, local_auth_middleware,
+};
 
 // QR token store
 pub use qr_token::QrTokenStore;
 
 // Routes
-pub use routes::{AuthRouterState, auth_routes};
+pub use routes::{AuthRouterState, SessionRevokedHook, auth_routes};
+
+pub use service::{AuthProvisionService, ProvisionError, SystemDefaultFilesystemAdopter};

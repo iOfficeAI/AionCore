@@ -5,32 +5,39 @@ use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, State};
-use axum::http::{HeaderMap, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::from_fn_with_state;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Extension, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use aionui_api_types::{
-    ApiResponse, AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser, QrLoginRequest,
-    RefreshResponse, RefreshTokenRequest, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
-    WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
+    ApiResponse, AuthStatusResponse, ChangePasswordRequest, EnsureExternalSessionRequest, EnsureExternalUserRequest,
+    EnsureExternalUserResponse, LoginRequest, LoginResponse, PublicUser, QrLoginRequest, RefreshResponse,
+    RefreshTokenRequest, RevokeExternalSessionRequest, RevokeExternalSessionResponse, UserInfoResponse,
+    WebuiChangePasswordRequest, WebuiChangeUsernameRequest, WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse,
+    WebuiResetPasswordResponse, WsTokenResponse,
 };
 use aionui_common::ApiError;
 use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
-use aionui_db::{DbError, IUserRepository, models::User};
+use aionui_db::{DbError, IUserRepository, UserStatus, UserType, models::User};
 
 use crate::error::AuthError;
 use crate::extract::extract_token_from_headers;
-use crate::middleware::{AuthState, CurrentUser, auth_middleware};
+use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, auth_middleware};
 use crate::password::{dummy_password_hash, generate_password, hash_password, verify_password_timed};
 use crate::qr_token::QrTokenStore;
 use crate::rate_limit::{
     RateLimiter, api_rate_limit_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware,
 };
+use crate::service::{AuthProvisionService, ProvisionError};
 use crate::validation::{validate_password, validate_username};
 use crate::{CookieConfig, JwtService};
+
+const BOOTSTRAP_SECRET_HEADER: &str = "x-aioncore-bootstrap-secret";
+
+pub type SessionRevokedHook = dyn Fn(&str) + Send + Sync;
 
 impl From<AuthError> for ApiError {
     fn from(err: AuthError) -> Self {
@@ -62,9 +69,15 @@ fn db_error_to_api_error(err: DbError) -> ApiError {
 pub struct AuthRouterState {
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
+    /// Optional on-disk adoption side-effect (AionUi → AionPro upgrade).
+    pub fs_adopter: Option<Arc<dyn crate::service::SystemDefaultFilesystemAdopter>>,
     pub cookie_config: Arc<CookieConfig>,
     pub qr_token_store: Arc<QrTokenStore>,
+    pub identity_mode: AuthIdentityMode,
+    pub bootstrap_secret: Option<Arc<str>>,
+    pub session_revoked_hook: Option<Arc<SessionRevokedHook>>,
     pub local: bool,
+    pub aionpro_mode: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +107,39 @@ struct UpdateJwtSecretRequest {
     jwt_secret: String,
 }
 
+#[derive(Debug, Serialize)]
+struct InternalUserResponse {
+    id: String,
+    user_type: UserType,
+    external_user_id: Option<String>,
+    username: Option<String>,
+    email: Option<String>,
+    avatar_path: Option<String>,
+    status: UserStatus,
+    session_generation: i64,
+    created_at: i64,
+    updated_at: i64,
+    last_login: Option<i64>,
+}
+
+impl From<User> for InternalUserResponse {
+    fn from(user: User) -> Self {
+        Self {
+            id: user.id,
+            user_type: user.user_type,
+            external_user_id: user.external_user_id,
+            username: user.username,
+            email: user.email,
+            avatar_path: user.avatar_path,
+            status: user.status,
+            session_generation: user.session_generation,
+            created_at: user.created_at,
+            updated_at: user.updated_at,
+            last_login: user.last_login,
+        }
+    }
+}
+
 fn ensure_local_mode(local: bool) -> Result<(), ApiError> {
     if local {
         return Ok(());
@@ -101,6 +147,76 @@ fn ensure_local_mode(local: bool) -> Result<(), ApiError> {
     Err(ApiError::Forbidden(
         "This endpoint is only available in local mode".into(),
     ))
+}
+
+fn require_bootstrap_secret(headers: &HeaderMap, expected: Option<&str>) -> Result<(), ApiError> {
+    let Some(expected) = expected else {
+        return Err(ApiError::coded(
+            StatusCode::UNAUTHORIZED,
+            "BOOTSTRAP_SECRET_REQUIRED",
+            "Bootstrap secret required.",
+            None,
+        ));
+    };
+    let Some(actual) = headers.get(BOOTSTRAP_SECRET_HEADER).and_then(|v| v.to_str().ok()) else {
+        return Err(ApiError::coded(
+            StatusCode::UNAUTHORIZED,
+            "BOOTSTRAP_SECRET_REQUIRED",
+            "Bootstrap secret required.",
+            None,
+        ));
+    };
+    if constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err(ApiError::coded(
+            StatusCode::UNAUTHORIZED,
+            "INVALID_BOOTSTRAP_SECRET",
+            "Invalid bootstrap secret.",
+            None,
+        ))
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for idx in 0..max_len {
+        let l = left.get(idx).copied().unwrap_or(0);
+        let r = right.get(idx).copied().unwrap_or(0);
+        diff |= usize::from(l ^ r);
+    }
+    diff == 0
+}
+
+fn provision_error_to_api_error(err: ProvisionError) -> ApiError {
+    match err {
+        ProvisionError::UnsupportedUserType => ApiError::BadRequest("Unsupported external user type".into()),
+        ProvisionError::UserDisabled => ApiError::coded(StatusCode::FORBIDDEN, "USER_DISABLED", "User disabled.", None),
+        ProvisionError::UserNotProvisioned => ApiError::coded(
+            StatusCode::UNAUTHORIZED,
+            "USER_CONTEXT_REQUIRED",
+            "User context required.",
+            None,
+        ),
+        ProvisionError::Db(DbError::Conflict(_)) => ApiError::coded(
+            StatusCode::CONFLICT,
+            "EXTERNAL_USER_CONFLICT",
+            "External user conflict.",
+            None,
+        ),
+        ProvisionError::Db(e) => db_error_to_api_error(e),
+        ProvisionError::Token(e) => ApiError::Internal(format!("Token signing error: {e}")),
+    }
+}
+
+fn user_context_required() -> ApiError {
+    ApiError::coded(
+        StatusCode::UNAUTHORIZED,
+        "USER_CONTEXT_REQUIRED",
+        "User context required.",
+        None,
+    )
 }
 
 /// Build the auth router with all endpoints and middleware layers.
@@ -133,7 +249,14 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let auth_state = AuthState {
         jwt_service: state.jwt_service.clone(),
         user_repo: state.user_repo.clone(),
-        local: false,
+        identity_mode: if state.aionpro_mode {
+            AuthIdentityMode::AionPro
+        } else {
+            AuthIdentityMode::UserSession
+        },
+        // Auth endpoints manage sessions themselves; the helper CLI never
+        // calls them, so the runtime-token channel stays disabled here.
+        runtime_token_verifier: None,
     };
 
     // Auth rate limited routes (login, qr-login)
@@ -146,6 +269,18 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     // API rate limited public routes (no auth required)
     let api_public = Router::new()
         .route("/api/auth/status", get(status_handler))
+        .route(
+            "/api/auth/internal/external-users/{external_user_id}",
+            put(ensure_external_user_handler),
+        )
+        .route(
+            "/api/auth/internal/external-sessions",
+            post(create_external_session_handler),
+        )
+        .route(
+            "/api/auth/internal/external-sessions/revoke",
+            post(revoke_external_session_handler),
+        )
         .route(
             "/api/auth/internal/users",
             get(list_internal_users_handler).post(create_internal_user_handler),
@@ -221,6 +356,85 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
 }
 
 // ---------------------------------------------------------------------------
+// PUT /api/auth/internal/external-users/{external_user_id}
+// ---------------------------------------------------------------------------
+
+async fn ensure_external_user_handler(
+    State(state): State<AuthRouterState>,
+    headers: HeaderMap,
+    Path(external_user_id): Path<String>,
+    body: Result<Json<EnsureExternalUserRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<EnsureExternalUserResponse>>, ApiError> {
+    require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
+    let Json(req) = body.map_err(ApiError::from)?;
+    let mut service = AuthProvisionService::new(state.user_repo, state.jwt_service);
+    if let Some(fs_adopter) = state.fs_adopter {
+        service = service.with_filesystem_adopter(fs_adopter);
+    }
+    let response = service
+        .ensure_external_user(&external_user_id, req)
+        .await
+        .map_err(provision_error_to_api_error)?;
+    tracing::info!(
+        user_id = %response.user_id,
+        user_type = ?response.user_type,
+        "external user provision succeeded"
+    );
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/auth/internal/external-sessions
+// ---------------------------------------------------------------------------
+
+async fn create_external_session_handler(
+    State(state): State<AuthRouterState>,
+    headers: HeaderMap,
+    body: Result<Json<EnsureExternalSessionRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
+    let Json(req) = body.map_err(ApiError::from)?;
+    let service = AuthProvisionService::new(state.user_repo, state.jwt_service);
+    let exchange = service
+        .create_external_session(req)
+        .await
+        .map_err(provision_error_to_api_error)?;
+    tracing::info!(
+        user_id = %exchange.response.user.id,
+        "external core session exchange succeeded"
+    );
+    let cookie = state.cookie_config.build_session_cookie(&exchange.token);
+    Ok(([(header::SET_COOKIE, cookie)], Json(ApiResponse::ok(exchange.response))).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/auth/internal/external-sessions/revoke
+// ---------------------------------------------------------------------------
+
+async fn revoke_external_session_handler(
+    State(state): State<AuthRouterState>,
+    headers: HeaderMap,
+    body: Result<Json<RevokeExternalSessionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<RevokeExternalSessionResponse>>, ApiError> {
+    require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
+    let Json(req) = body.map_err(ApiError::from)?;
+    let service = AuthProvisionService::new(state.user_repo, state.jwt_service);
+    let response = service
+        .revoke_external_session(req)
+        .await
+        .map_err(provision_error_to_api_error)?;
+    tracing::info!(
+        user_id = %response.user_id,
+        session_generation = response.session_generation,
+        "external core session revoked"
+    );
+    if let Some(hook) = &state.session_revoked_hook {
+        hook(&response.user_id);
+    }
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+// ---------------------------------------------------------------------------
 // POST /login
 // ---------------------------------------------------------------------------
 
@@ -228,6 +442,10 @@ async fn login_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    if state.aionpro_mode {
+        return Err(user_context_required());
+    }
+
     let Json(req) = body.map_err(ApiError::from)?;
 
     // Input length validation (per API spec)
@@ -246,7 +464,7 @@ async fn login_handler(
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     let (found_user, password_valid) = match user {
-        Some(u) if u.password_hash.trim().is_empty() => {
+        Some(u) if u.password_hash.as_deref().unwrap_or_default().trim().is_empty() => {
             // Seeded user with no password yet (first-run local mode).
             // Treat as invalid credentials; run dummy verify for timing symmetry
             // and to avoid bcrypt error on empty hash leaking as a 500.
@@ -254,7 +472,11 @@ async fn login_handler(
             (None, false)
         }
         Some(u) => {
-            let valid = verify_password_timed(&req.password, &u.password_hash).await?;
+            let Some(password_hash) = u.password_hash.as_deref() else {
+                let _ = verify_password_timed(&req.password, dummy_password_hash()).await;
+                return Err(ApiError::Unauthorized("Invalid username or password".into()));
+            };
+            let valid = verify_password_timed(&req.password, password_hash).await?;
             (Some(u), valid)
         }
         None => {
@@ -272,7 +494,11 @@ async fn login_handler(
 
     let token = state
         .jwt_service
-        .sign(&user.id, &user.username)
+        .sign_with_session_generation(
+            &user.id,
+            user.username.as_deref().unwrap_or("external_user"),
+            user.session_generation,
+        )
         .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
 
     // Update last login (best-effort)
@@ -284,7 +510,7 @@ async fn login_handler(
     let resp = LoginResponse::new(
         PublicUser {
             id: user.id,
-            username: user.username,
+            username: user.username.unwrap_or_else(|| "external_user".to_string()),
         },
         token,
     );
@@ -346,46 +572,48 @@ async fn status_handler(
 
 async fn list_internal_users_handler(
     State(state): State<AuthRouterState>,
-) -> Result<Json<ApiResponse<Vec<User>>>, ApiError> {
+) -> Result<Json<ApiResponse<Vec<InternalUserResponse>>>, ApiError> {
     ensure_local_mode(state.local)?;
     let users = state.user_repo.list_users().await.map_err(db_error_to_api_error)?;
-    Ok(Json(ApiResponse::ok(users)))
+    Ok(Json(ApiResponse::ok(
+        users.into_iter().map(InternalUserResponse::from).collect(),
+    )))
 }
 
 async fn get_system_user_handler(
     State(state): State<AuthRouterState>,
-) -> Result<Json<ApiResponse<Option<User>>>, ApiError> {
+) -> Result<Json<ApiResponse<Option<InternalUserResponse>>>, ApiError> {
     ensure_local_mode(state.local)?;
     let user = state.user_repo.get_system_user().await.map_err(db_error_to_api_error)?;
-    Ok(Json(ApiResponse::ok(user)))
+    Ok(Json(ApiResponse::ok(user.map(InternalUserResponse::from))))
 }
 
 async fn find_user_by_username_handler(
     State(state): State<AuthRouterState>,
     Path(username): Path<String>,
-) -> Result<Json<ApiResponse<Option<User>>>, ApiError> {
+) -> Result<Json<ApiResponse<Option<InternalUserResponse>>>, ApiError> {
     ensure_local_mode(state.local)?;
     let user = state
         .user_repo
         .find_by_username(&username)
         .await
         .map_err(db_error_to_api_error)?;
-    Ok(Json(ApiResponse::ok(user)))
+    Ok(Json(ApiResponse::ok(user.map(InternalUserResponse::from))))
 }
 
 async fn find_user_by_id_handler(
     State(state): State<AuthRouterState>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<Option<User>>>, ApiError> {
+) -> Result<Json<ApiResponse<Option<InternalUserResponse>>>, ApiError> {
     ensure_local_mode(state.local)?;
     let user = state.user_repo.find_by_id(&id).await.map_err(db_error_to_api_error)?;
-    Ok(Json(ApiResponse::ok(user)))
+    Ok(Json(ApiResponse::ok(user.map(InternalUserResponse::from))))
 }
 
 async fn create_internal_user_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<CreateInternalUserRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<User>>, ApiError> {
+) -> Result<Json<ApiResponse<InternalUserResponse>>, ApiError> {
     ensure_local_mode(state.local)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let user = state
@@ -393,7 +621,7 @@ async fn create_internal_user_handler(
         .create_user(&req.username, &req.password_hash)
         .await
         .map_err(db_error_to_api_error)?;
-    Ok(Json(ApiResponse::ok(user)))
+    Ok(Json(ApiResponse::ok(InternalUserResponse::from(user))))
 }
 
 async fn set_system_user_credentials_handler(
@@ -505,7 +733,10 @@ async fn change_password_handler(
         .ok_or_else(|| ApiError::NotFound("User not found".into()))?;
 
     // Verify current password
-    let valid = verify_password_timed(&req.current_password, &user.password_hash).await?;
+    let Some(password_hash) = user.password_hash.as_deref() else {
+        return Err(ApiError::Unauthorized("Current password is incorrect".into()));
+    };
+    let valid = verify_password_timed(&req.current_password, password_hash).await?;
     if !valid {
         return Err(ApiError::Unauthorized("Current password is incorrect".into()));
     }
@@ -554,9 +785,31 @@ async fn refresh_handler(
         .verify(&req.token)
         .map_err(|_| ApiError::Unauthorized("Invalid or expired token".into()))?;
 
+    let user = state
+        .user_repo
+        .find_active_by_id(&payload.user_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "refresh token user lookup failed");
+            ApiError::Internal("Authentication service unavailable".into())
+        })?
+        .ok_or_else(|| ApiError::Unauthorized("Invalid authentication subject".into()))?;
+
+    if state.aionpro_mode && user.user_type != aionui_db::UserType::Aionpro {
+        return Err(user_context_required());
+    }
+
+    if payload.session_generation != user.session_generation {
+        return Err(ApiError::Unauthorized("Invalid authentication session".into()));
+    }
+
     let new_token = state
         .jwt_service
-        .sign(&payload.user_id, &payload.username)
+        .sign_with_session_generation(
+            &user.id,
+            user.username.as_deref().unwrap_or("external_user"),
+            user.session_generation,
+        )
         .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
 
     Ok(Json(RefreshResponse {
@@ -603,6 +856,10 @@ async fn qr_login_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<QrLoginRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    if state.aionpro_mode {
+        return Err(user_context_required());
+    }
+
     let Json(req) = body.map_err(ApiError::from)?;
 
     // Validate and consume QR token (one-time use)
@@ -618,7 +875,11 @@ async fn qr_login_handler(
 
     let token = state
         .jwt_service
-        .sign(&user.id, &user.username)
+        .sign_with_session_generation(
+            &user.id,
+            user.username.as_deref().unwrap_or("external_user"),
+            user.session_generation,
+        )
         .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
 
     // Update last login (best-effort)
@@ -630,7 +891,7 @@ async fn qr_login_handler(
     let resp = LoginResponse::new(
         PublicUser {
             id: user.id,
-            username: user.username,
+            username: user.username.unwrap_or_else(|| "external_user".to_string()),
         },
         token,
     );
@@ -763,7 +1024,7 @@ async fn webui_change_username_handler(
 
     let user = resolve_webui_admin(&*state.user_repo).await?;
 
-    if user.username != trimmed {
+    if user.username.as_deref() != Some(trimmed.as_str()) {
         state
             .user_repo
             .update_username(&user.id, &trimmed)

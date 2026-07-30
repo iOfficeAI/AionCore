@@ -18,6 +18,7 @@ pub struct TaskBoard {
     /// `team.taskChanged`. Absent in unit tests that use [`TaskBoard::new`]
     /// directly.
     events: Option<Arc<TeamEventEmitter>>,
+    user_id: String,
 }
 
 /// Optional fields for task update.
@@ -32,7 +33,15 @@ pub struct TaskUpdate {
 
 impl TaskBoard {
     pub fn new(repo: Arc<dyn ITeamRepository>) -> Self {
-        Self { repo, events: None }
+        Self::new_for_user(repo, "system_default_user")
+    }
+
+    pub fn new_for_user(repo: Arc<dyn ITeamRepository>, user_id: impl Into<String>) -> Self {
+        Self {
+            repo,
+            events: None,
+            user_id: user_id.into(),
+        }
     }
 
     /// Attaches a real-time event emitter for `team.taskChanged` broadcasts.
@@ -50,7 +59,7 @@ impl TaskBoard {
         blocked_by: &[String],
     ) -> Result<TeamTask, TeamError> {
         for dep_id in blocked_by {
-            let dep = self.repo.find_task_by_id(team_id, dep_id).await?;
+            let dep = self.repo.find_task_by_id(&self.user_id, team_id, dep_id).await?;
             if dep.is_none() {
                 return Err(TeamError::BlockedTaskNotFound(dep_id.clone()));
             }
@@ -74,10 +83,12 @@ impl TaskBoard {
             updated_at: now,
         };
 
-        self.repo.create_task(&row).await?;
+        self.repo.create_task(&self.user_id, &row).await?;
 
         for dep_id in blocked_by {
-            self.repo.append_to_blocks(dep_id, &task_id).await?;
+            self.repo
+                .append_to_blocks(&self.user_id, team_id, dep_id, &task_id)
+                .await?;
         }
 
         debug!(team_id, task_id = %task_id, subject, "task created");
@@ -92,7 +103,7 @@ impl TaskBoard {
     pub async fn update_task(&self, team_id: &str, task_id: &str, update: &TaskUpdate) -> Result<TeamTask, TeamError> {
         let existing = self
             .repo
-            .find_task_by_id(team_id, task_id)
+            .find_task_by_id(&self.user_id, team_id, task_id)
             .await?
             .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
 
@@ -104,15 +115,15 @@ impl TaskBoard {
             metadata: update.metadata.as_ref().map(serde_json::to_string).transpose()?,
         };
 
-        self.repo.update_task(task_id, &params).await?;
+        self.repo.update_task(&self.user_id, team_id, task_id, &params).await?;
 
         if update.status == Some(TaskStatus::Completed) {
-            self.check_unblocks(task_id, &existing).await?;
+            self.check_unblocks(team_id, task_id, &existing).await?;
         }
 
         let updated = self
             .repo
-            .find_task_by_id(team_id, task_id)
+            .find_task_by_id(&self.user_id, team_id, task_id)
             .await?
             .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
 
@@ -128,16 +139,21 @@ impl TaskBoard {
     }
 
     pub async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTask>, TeamError> {
-        let rows = self.repo.list_tasks(team_id).await?;
+        let rows = self.repo.list_tasks(&self.user_id, team_id).await?;
         let tasks = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
         Ok(tasks)
     }
 
-    async fn check_unblocks(&self, completed_task_id: &str, completed_row: &TeamTaskRow) -> Result<(), TeamError> {
+    async fn check_unblocks(
+        &self,
+        team_id: &str,
+        completed_task_id: &str,
+        completed_row: &TeamTaskRow,
+    ) -> Result<(), TeamError> {
         let blocks: Vec<String> = serde_json::from_str(&completed_row.blocks)?;
         for downstream_id in &blocks {
             self.repo
-                .remove_from_blocked_by(downstream_id, completed_task_id)
+                .remove_from_blocked_by(&self.user_id, team_id, downstream_id, completed_task_id)
                 .await?;
             debug!(
                 completed = completed_task_id,
@@ -180,7 +196,7 @@ mod tests {
 
     fn board_with_events(repo: Arc<MockTeamRepo>) -> (TaskBoard, Arc<RecordingBroadcaster>) {
         let bc = Arc::new(RecordingBroadcaster::new());
-        let emitter = Arc::new(TeamEventEmitter::new("t1".into(), bc.clone()));
+        let emitter = Arc::new(TeamEventEmitter::new("t1".into(), "system_default_user".into(), bc.clone()));
         (TaskBoard::new(repo).with_events(emitter), bc)
     }
 
@@ -298,7 +314,11 @@ mod tests {
 
         assert_eq!(task_b.blocked_by, vec![task_a.id.clone()]);
 
-        let updated_a = repo.find_task_by_id("t1", &task_a.id).await.unwrap().unwrap();
+        let updated_a = repo
+            .find_task_by_id("system_default_user", "t1", &task_a.id)
+            .await
+            .unwrap()
+            .unwrap();
         let blocks_a: Vec<String> = serde_json::from_str(&updated_a.blocks).unwrap();
         assert_eq!(blocks_a, vec![task_b.id]);
     }

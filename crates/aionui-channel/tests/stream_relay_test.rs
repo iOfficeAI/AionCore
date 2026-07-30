@@ -13,6 +13,7 @@ use tokio::sync::broadcast;
 #[test]
 fn relay_config_fields() {
     let config = RelayConfig {
+        owner_user_id: "system_default_user".to_owned(),
         platform: PluginType::Telegram,
         plugin_id: "telegram".into(),
         chat_id: "123".into(),
@@ -30,6 +31,7 @@ async fn relay_sends_thinking_then_final_message() {
     let recorder = Arc::new(MessageRecorder::new());
 
     let config = RelayConfig {
+        owner_user_id: "system_default_user".to_owned(),
         platform: PluginType::Telegram,
         plugin_id: "telegram".into(),
         chat_id: "chat_1".into(),
@@ -71,6 +73,7 @@ async fn relay_handles_error_event() {
     let recorder = Arc::new(MessageRecorder::new());
 
     let config = RelayConfig {
+        owner_user_id: "system_default_user".to_owned(),
         platform: PluginType::Telegram,
         plugin_id: "telegram".into(),
         chat_id: "chat_1".into(),
@@ -102,6 +105,7 @@ async fn weixin_flushes_pending_text_before_tool_call() {
     let recorder = Arc::new(MessageRecorder::new());
 
     let config = RelayConfig {
+        owner_user_id: "system_default_user".to_owned(),
         platform: PluginType::Weixin,
         plugin_id: "weixin".into(),
         chat_id: "chat_1".into(),
@@ -154,6 +158,7 @@ async fn telegram_does_not_flush_text_before_tool_call() {
     let recorder = Arc::new(MessageRecorder::new());
 
     let config = RelayConfig {
+        owner_user_id: "system_default_user".to_owned(),
         platform: PluginType::Telegram,
         plugin_id: "telegram".into(),
         chat_id: "chat_1".into(),
@@ -196,6 +201,7 @@ async fn weixin_skips_flush_when_buffer_is_empty() {
     let recorder = Arc::new(MessageRecorder::new());
 
     let config = RelayConfig {
+        owner_user_id: "system_default_user".to_owned(),
         platform: PluginType::Weixin,
         plugin_id: "weixin".into(),
         chat_id: "chat_1".into(),
@@ -233,6 +239,7 @@ async fn relay_handles_channel_closed() {
     let recorder = Arc::new(MessageRecorder::new());
 
     let config = RelayConfig {
+        owner_user_id: "system_default_user".to_owned(),
         platform: PluginType::Telegram,
         plugin_id: "telegram".into(),
         chat_id: "chat_1".into(),

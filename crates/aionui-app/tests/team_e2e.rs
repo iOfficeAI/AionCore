@@ -46,7 +46,7 @@ async fn ensure_default_team_agent_installed(services: &aionui_app::AppServices)
         "UPDATE agent_metadata \
          SET agent_source = 'custom', agent_source_info = ?, command = ?, args = '[]', env = '[]', \
              updated_at = unixepoch('now','subsec') * 1000 \
-         WHERE id = ?",
+         WHERE agent_id = ?",
     )
     .bind(&source_info)
     .bind(&command)
@@ -268,7 +268,8 @@ async fn tc3b_create_team_writes_legacy_extra_shape() {
     let conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
 
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
-    let row = repo.get(conversation_id).await.unwrap().unwrap();
+    let user_id = repo.owner_user_id(conversation_id).await.unwrap().unwrap();
+    let row = repo.get(&user_id, conversation_id).await.unwrap().unwrap();
     let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
 
     assert_eq!(extra["teamId"], data["id"]);
@@ -488,9 +489,9 @@ async fn team_api_rejects_cross_user_access() {
 
     let req = get_with_token(&format!("/api/teams/{team_id}"), &other_token);
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    let forbidden_requests = [
+    let hidden_requests = [
         json_with_token(
             "PATCH",
             &format!("/api/teams/{team_id}/name"),
@@ -535,9 +536,9 @@ async fn team_api_rejects_cross_user_access() {
         ),
     ];
 
-    for req in forbidden_requests {
+    for req in hidden_requests {
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
 
@@ -657,9 +658,9 @@ async fn trs5_run_state_rejects_cross_user_access() {
     let req = get_with_token(&format!("/api/teams/{team_id}/run-state"), &other_token);
     let resp = app.oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = body_json(resp).await;
-    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["code"], "NOT_FOUND");
 }
 
 // TL-3: Each team contains full assistants info
@@ -1087,9 +1088,15 @@ async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
     let ensure_resp = app.clone().oneshot(ensure_req).await.unwrap();
     assert_eq!(ensure_resp.status(), StatusCode::OK);
 
+    let lead_user_id = services
+        .conversation_repo
+        .owner_user_id(lead_conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
     let lead_conversation = services
         .conversation_repo
-        .get(lead_conversation_id)
+        .get(&lead_user_id, lead_conversation_id)
         .await
         .unwrap()
         .unwrap();
@@ -1255,8 +1262,10 @@ async fn sm1b_team_send_persists_user_bubble_through_projection_adapter() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let user_id = repo.owner_user_id(lead_conversation_id).await.unwrap().unwrap();
     let messages = repo
         .list_messages_page(
+            &user_id,
             lead_conversation_id,
             &MessagePageParams {
                 limit: 50,

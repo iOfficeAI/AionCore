@@ -199,6 +199,30 @@ impl ConversationRuntimeStateService {
             .unwrap_or(false)
     }
 
+    pub fn clear_conversation(&self, conversation_id: &str) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                let had_active_turn = state.active_turns.remove(conversation_id).is_some();
+                let had_deleting = state.deleting_conversations.remove(conversation_id);
+                let had_cancelling = state.cancelling_conversations.remove(conversation_id);
+                if had_active_turn || had_deleting || had_cancelling {
+                    info!(
+                        conversation_id,
+                        had_active_turn, had_deleting, had_cancelling, "conversation runtime state cleared"
+                    );
+                    drop(state);
+                    self.release_notify.notify_waiters();
+                }
+            }
+            Err(_) => {
+                warn!(
+                    conversation_id,
+                    "conversation runtime state lock poisoned while clearing conversation"
+                );
+            }
+        }
+    }
+
     pub fn mark_shutting_down(&self) -> usize {
         match self.state.lock() {
             Ok(mut state) => {
@@ -528,6 +552,23 @@ mod tests {
         assert!(!claim.release());
 
         assert!(!state.is_cancelling("conv-1"));
+    }
+
+    #[test]
+    fn clear_conversation_removes_active_turn_and_lifecycle_flags() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let _claim = state
+            .try_claim_turn("conv-1", "turn-1")
+            .expect("claim should be created");
+
+        state.mark_deleting("conv-1");
+        state.mark_cancelling("conv-1");
+        state.clear_conversation("conv-1");
+
+        assert!(!state.is_claimed("conv-1"));
+        assert!(!state.is_deleting("conv-1"));
+        assert!(!state.is_cancelling("conv-1"));
+        assert!(state.active_turn_id_for("conv-1").is_none());
     }
 
     #[test]

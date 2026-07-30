@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+const TEST_USER_ID: &str = "system_default_user";
+
 use aionui_common::McpSource;
 use aionui_db::SqliteMcpServerRepository;
 use aionui_mcp::{DetectedServer, McpAgentAdapter, McpError, McpServerTransport, McpSyncService};
@@ -41,7 +43,7 @@ impl McpAgentAdapter for MockAdapter {
         Ok(self.installed)
     }
 
-    async fn detect_existing(&self) -> Result<Vec<DetectedServer>, McpError> {
+    async fn detect_existing(&self, _user_id: &str) -> Result<Vec<DetectedServer>, McpError> {
         if !self.installed {
             return Err(McpError::AgentNotInstalled(format!("{:?}", self.source)));
         }
@@ -91,7 +93,7 @@ async fn get_agent_configs_returns_installed_agents() {
         adapter_qwen,
     ])
     .await;
-    let configs = sync_svc.get_agent_configs().await.unwrap();
+    let configs = sync_svc.get_agent_configs(TEST_USER_ID).await.unwrap();
 
     assert_eq!(configs.len(), 2);
     assert_eq!(configs[0].source, McpSource::Claude);
@@ -106,6 +108,6 @@ async fn get_agent_configs_empty_when_none_installed() {
     let adapter = Arc::new(MockAdapter::new(McpSource::Claude, false));
     let sync_svc = make_service(vec![adapter as Arc<dyn McpAgentAdapter>]).await;
 
-    let configs = sync_svc.get_agent_configs().await.unwrap();
+    let configs = sync_svc.get_agent_configs(TEST_USER_ID).await.unwrap();
     assert!(configs.is_empty());
 }

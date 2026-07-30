@@ -23,7 +23,7 @@ pub(crate) fn data() -> Value {
                 },
                 "user_id": {
                     "current": "resolve from AIONUI_USER_ID",
-                    "literal": "treat as user id"
+                    "literal": "ignored and replaced with AIONUI_USER_ID"
                 }
             }
         },

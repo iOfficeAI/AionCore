@@ -9,11 +9,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use aionui_api_types::{ApiResponse, AssistantSource, SkillImportLimitsResponse};
+use aionui_auth::CurrentUser;
+use aionui_db::{UserStatus, UserType};
 use aionui_extension::classifier::{AssistantClassifier, AssistantRuleDispatcher};
 use aionui_extension::error::ExtensionError;
 use aionui_extension::external_paths::ExternalPathsManager;
 use aionui_extension::skill_routes::{SkillRouterState, skill_routes};
 use aionui_extension::skill_service::SkillPaths;
+use axum::Extension;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
@@ -25,12 +28,12 @@ use tower::ServiceExt;
 
 #[derive(Default)]
 struct CallLog {
-    rule_reads: Vec<(String, Option<String>)>,
-    rule_writes: Vec<(String, Option<String>, String)>,
-    rule_deletes: Vec<String>,
-    skill_reads: Vec<(String, Option<String>)>,
-    skill_writes: Vec<(String, Option<String>, String)>,
-    skill_deletes: Vec<String>,
+    rule_reads: Vec<(String, String, Option<String>)>,
+    rule_writes: Vec<(String, String, Option<String>, String)>,
+    rule_deletes: Vec<(String, String)>,
+    skill_reads: Vec<(String, String, Option<String>)>,
+    skill_writes: Vec<(String, String, Option<String>, String)>,
+    skill_deletes: Vec<(String, String)>,
 }
 
 struct FakeDispatcher {
@@ -55,69 +58,91 @@ impl AssistantClassifier for FakeDispatcher {
 
 #[async_trait::async_trait]
 impl AssistantRuleDispatcher for FakeDispatcher {
-    async fn read_rule(&self, id: &str, locale: Option<&str>) -> Result<String, ExtensionError> {
+    async fn read_rule(&self, user_id: &str, id: &str, locale: Option<&str>) -> Result<String, ExtensionError> {
         self.log
             .lock()
             .unwrap()
             .rule_reads
-            .push((id.to_string(), locale.map(str::to_string)));
+            .push((user_id.to_string(), id.to_string(), locale.map(str::to_string)));
         Ok(self.rule_content.get(id).cloned().unwrap_or_default())
     }
 
-    async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ExtensionError> {
+    async fn write_rule(
+        &self,
+        user_id: &str,
+        id: &str,
+        locale: Option<&str>,
+        content: &str,
+    ) -> Result<(), ExtensionError> {
         if self.reject_writes_for.contains(id) {
             return Err(ExtensionError::InvalidRequest(
                 "Cannot write rule for built-in assistant".into(),
             ));
         }
-        self.log
-            .lock()
-            .unwrap()
-            .rule_writes
-            .push((id.to_string(), locale.map(str::to_string), content.to_string()));
+        self.log.lock().unwrap().rule_writes.push((
+            user_id.to_string(),
+            id.to_string(),
+            locale.map(str::to_string),
+            content.to_string(),
+        ));
         Ok(())
     }
 
-    async fn delete_rule(&self, id: &str) -> Result<bool, ExtensionError> {
+    async fn delete_rule(&self, user_id: &str, id: &str) -> Result<bool, ExtensionError> {
         if self.reject_writes_for.contains(id) {
             return Err(ExtensionError::InvalidRequest(
                 "Cannot delete rule for built-in assistant".into(),
             ));
         }
-        self.log.lock().unwrap().rule_deletes.push(id.to_string());
+        self.log
+            .lock()
+            .unwrap()
+            .rule_deletes
+            .push((user_id.to_string(), id.to_string()));
         Ok(true)
     }
 
-    async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, ExtensionError> {
+    async fn read_skill(&self, user_id: &str, id: &str, locale: Option<&str>) -> Result<String, ExtensionError> {
         self.log
             .lock()
             .unwrap()
             .skill_reads
-            .push((id.to_string(), locale.map(str::to_string)));
+            .push((user_id.to_string(), id.to_string(), locale.map(str::to_string)));
         Ok(self.skill_content.get(id).cloned().unwrap_or_default())
     }
 
-    async fn write_skill(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ExtensionError> {
+    async fn write_skill(
+        &self,
+        user_id: &str,
+        id: &str,
+        locale: Option<&str>,
+        content: &str,
+    ) -> Result<(), ExtensionError> {
         if self.reject_writes_for.contains(id) {
             return Err(ExtensionError::InvalidRequest(
                 "Cannot write skill for built-in assistant".into(),
             ));
         }
-        self.log
-            .lock()
-            .unwrap()
-            .skill_writes
-            .push((id.to_string(), locale.map(str::to_string), content.to_string()));
+        self.log.lock().unwrap().skill_writes.push((
+            user_id.to_string(),
+            id.to_string(),
+            locale.map(str::to_string),
+            content.to_string(),
+        ));
         Ok(())
     }
 
-    async fn delete_skill(&self, id: &str) -> Result<bool, ExtensionError> {
+    async fn delete_skill(&self, user_id: &str, id: &str) -> Result<bool, ExtensionError> {
         if self.reject_writes_for.contains(id) {
             return Err(ExtensionError::InvalidRequest(
                 "Cannot delete skill for built-in assistant".into(),
             ));
         }
-        self.log.lock().unwrap().skill_deletes.push(id.to_string());
+        self.log
+            .lock()
+            .unwrap()
+            .skill_deletes
+            .push((user_id.to_string(), id.to_string()));
         Ok(true)
     }
 }
@@ -149,7 +174,12 @@ async fn router_with_dispatcher(dispatcher: Arc<FakeDispatcher>) -> axum::Router
         external_paths_manager: ext_mgr,
         assistant_dispatcher: Some(dispatcher),
     };
-    skill_routes(state)
+    skill_routes(state).layer(Extension(CurrentUser {
+        id: "user-current".into(),
+        username: "user-current".into(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
+    }))
 }
 
 async fn body_json<T: serde::de::DeserializeOwned>(resp: axum::response::Response) -> T {
@@ -238,8 +268,9 @@ async fn read_rule_routes_through_dispatcher_for_builtin() {
 
     let log = dispatcher.log.lock().unwrap();
     assert_eq!(log.rule_reads.len(), 1);
-    assert_eq!(log.rule_reads[0].0, "builtin-office");
-    assert_eq!(log.rule_reads[0].1.as_deref(), Some("en-US"));
+    assert_eq!(log.rule_reads[0].0, "user-current");
+    assert_eq!(log.rule_reads[0].1, "builtin-office");
+    assert_eq!(log.rule_reads[0].2.as_deref(), Some("en-US"));
 }
 
 #[tokio::test]
@@ -342,7 +373,8 @@ async fn write_rule_allows_user() {
 
     let log = dispatcher.log.lock().unwrap();
     assert_eq!(log.rule_writes.len(), 1);
-    assert_eq!(log.rule_writes[0].2, "rule!");
+    assert_eq!(log.rule_writes[0].0, "user-current");
+    assert_eq!(log.rule_writes[0].3, "rule!");
 }
 
 #[tokio::test]
@@ -385,7 +417,7 @@ async fn delete_rule_user_dispatches() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let log = dispatcher.log.lock().unwrap();
-    assert_eq!(log.rule_deletes, vec!["u1".to_string()]);
+    assert_eq!(log.rule_deletes, vec![("user-current".to_string(), "u1".to_string())]);
 }
 
 #[tokio::test]
@@ -413,6 +445,7 @@ async fn read_skill_routes_through_dispatcher_for_builtin() {
 
     let log = dispatcher.log.lock().unwrap();
     assert_eq!(log.skill_reads.len(), 1);
+    assert_eq!(log.skill_reads[0].0, "user-current");
 }
 
 #[tokio::test]
@@ -457,5 +490,5 @@ async fn delete_skill_user_dispatches() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let log = dispatcher.log.lock().unwrap();
-    assert_eq!(log.skill_deletes, vec!["u1".to_string()]);
+    assert_eq!(log.skill_deletes, vec![("user-current".to_string(), "u1".to_string())]);
 }

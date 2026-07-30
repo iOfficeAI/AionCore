@@ -28,6 +28,7 @@ impl CatalogForwarder {
     /// awaited — callers drop it and rely on the broadcast channel
     /// closing to terminate the task.
     pub fn spawn(
+        user_id: String,
         agent_id: String,
         mut event_rx: broadcast::Receiver<AgentStreamEvent>,
         catalog_tx: CatalogSender,
@@ -37,14 +38,14 @@ impl CatalogForwarder {
                 match event_rx.recv().await {
                     Ok(event) => {
                         if let Some(partial) = catalog_partial_from_event(&event) {
-                            catalog_tx.send_partial(agent_id.clone(), partial);
+                            catalog_tx.send_partial(user_id.clone(), agent_id.clone(), partial);
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 }
             }
-            debug!(agent_id, "CatalogForwarder exiting");
+            debug!(user_id, agent_id, "CatalogForwarder exiting");
         })
     }
 }

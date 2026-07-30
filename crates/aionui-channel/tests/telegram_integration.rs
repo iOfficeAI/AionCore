@@ -25,6 +25,8 @@ mod telegram_tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
+    const OWNER_USER_ID: &str = "system_default_user";
+
     // -- Test infrastructure ------------------------------------------------
 
     struct MockBroadcaster {
@@ -203,7 +205,9 @@ mod telegram_tests {
         let factory = telegram_factory();
 
         let config = make_config_value(Some("bot:123"));
-        let result = manager.enable_plugin("nonexistent", &config, &factory).await;
+        let result = manager
+            .enable_plugin(OWNER_USER_ID, "nonexistent", &config, &factory)
+            .await;
         assert!(result.is_err());
     }
 
@@ -215,7 +219,9 @@ mod telegram_tests {
         let factory = telegram_factory();
 
         let config = make_config_value(Some("bad-token"));
-        let result = manager.enable_plugin("telegram", &config, &factory).await;
+        let result = manager
+            .enable_plugin(OWNER_USER_ID, "telegram", &config, &factory)
+            .await;
         assert!(result.is_err());
     }
 
@@ -225,7 +231,7 @@ mod telegram_tests {
     async fn disable_without_db_row_returns_error() {
         let (manager, _repo, _bc) = setup().await;
         // Plugin was never enabled (no DB row), so update_plugin_status fails
-        let result = manager.disable_plugin("telegram").await;
+        let result = manager.disable_plugin(OWNER_USER_ID, "telegram").await;
         assert!(result.is_err());
     }
 
@@ -234,7 +240,7 @@ mod telegram_tests {
     #[tokio::test]
     async fn get_plugin_status_empty() {
         let (manager, _repo, _bc) = setup().await;
-        let statuses = manager.get_plugin_status().await.unwrap();
+        let statuses = manager.get_plugin_status(OWNER_USER_ID).await.unwrap();
         assert!(statuses.is_empty());
     }
 
@@ -244,7 +250,7 @@ mod telegram_tests {
     async fn restore_plugins_none_stored() {
         let (manager, _repo, _bc) = setup().await;
         let factory = telegram_factory();
-        let result = manager.restore_plugins(&factory).await;
+        let result = manager.restore_plugins(OWNER_USER_ID, &factory).await;
         assert!(result.is_ok());
         assert_eq!(manager.active_plugin_count(), 0);
     }
@@ -254,6 +260,6 @@ mod telegram_tests {
     #[tokio::test]
     async fn is_plugin_running_false_when_not_enabled() {
         let (manager, _repo, _bc) = setup().await;
-        assert!(!manager.is_plugin_running("telegram"));
+        assert!(!manager.is_plugin_running(OWNER_USER_ID, "telegram"));
     }
 }

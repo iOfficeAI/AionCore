@@ -19,7 +19,7 @@
     "dimcode": {
       "registry_json_id": "dimcode",
       "package": "dimcode",
-      "version": "0.2.36"
+      "version": "0.2.38"
     },
     "dirac": {
       "registry_json_id": "dirac",
@@ -58,7 +58,7 @@
     "sigit": {
       "registry_json_id": "sigit",
       "package": "@smbcloud/sigit",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "skip_version_probe": true
     }
   }

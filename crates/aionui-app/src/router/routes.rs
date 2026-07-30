@@ -6,19 +6,22 @@ use std::time::Instant;
 use axum::Json;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::Request;
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderName, Method, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Router, middleware};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-use aionui_ai_agent::{agent_routes, remote_agent_routes};
+use aionui_ai_agent::{
+    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, agent_routes, remote_agent_routes,
+};
 use aionui_api_types::ErrorResponse;
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
-    AuthRouterState, AuthState, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
+    AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, SystemDefaultFilesystemAdopter,
+    auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
 };
 use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
@@ -30,13 +33,15 @@ use aionui_extension::{extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
 use aionui_mcp::mcp_routes;
 use aionui_office::{office_proxy_routes, office_routes};
-use aionui_realtime::{WsHandlerState, ws_upgrade_handler};
+use aionui_project::project_routes;
+use aionui_realtime::{NoopMessageRouter, WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
 use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
 use aionui_team::{TeamSessionService, team_routes};
 
 use crate::services::AppServices;
 
+use super::fs_monitor::spawn_fs_monitor;
 use super::health::health_check;
 use super::runtime_team_tools::{RuntimeTeamToolsState, runtime_team_tools_routes};
 use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
@@ -70,7 +75,21 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     let ws_manager = services.ws_manager.clone();
     tokio::spawn(async move {
         while let Ok(event) = event_rx.recv().await {
-            ws_manager.broadcast_all(event);
+            if let Some(user_id) = event
+                .data
+                .get("user_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+            {
+                ws_manager.broadcast_to_user(&user_id, event);
+            } else if is_global_websocket_event(&event.name) {
+                ws_manager.broadcast_all(event);
+            } else {
+                tracing::warn!(
+                    event_name = %event.name,
+                    "dropping websocket event without user_id; add user_id to payload or whitelist explicit global event"
+                );
+            }
         }
     });
 
@@ -93,13 +112,22 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     // Restore enabled channel plugins (starts receiving IM messages)
     let chan_mgr = channel_components.manager;
     let chan_factory = channel_components.plugin_factory;
+    let chan_owner_user_id = channel_components.owner_user_id;
     tokio::spawn(async move {
-        if let Err(e) = chan_mgr.restore_plugins(&chan_factory).await {
-            tracing::warn!(
-                code = "BOOTSTRAP_DEGRADED_CHANNEL_RESTORE",
+        if let Some(chan_owner_user_id) = chan_owner_user_id {
+            if let Err(e) = chan_mgr.restore_plugins(&chan_owner_user_id, &chan_factory).await {
+                tracing::warn!(
+                    code = "BOOTSTRAP_DEGRADED_CHANNEL_RESTORE",
+                    stage = "channel.restore",
+                    owner_user_id = %chan_owner_user_id,
+                    error = %e,
+                    "failed to restore channel plugins"
+                );
+            }
+        } else {
+            tracing::info!(
                 stage = "channel.restore",
-                error = %e,
-                "failed to restore channel plugins"
+                "skipping channel plugin restore until an owner user is available"
             );
         }
     });
@@ -112,7 +140,12 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: route tree build started"
     );
-    let router = create_router_with_states(services, states);
+    // Spawn the Project Explorer filesystem monitor and install its inbound
+    // router (fs/* frames). Built here — inside the runtime — because the actor
+    // runs as a background task. The sync test-only assembly path keeps a no-op.
+    let fs_router = spawn_fs_monitor(Arc::new(services.project_service.clone()), services.ws_manager.clone());
+    let ws_state = build_ws_state(services, fs_router);
+    let router = create_router_with_all_state(services, states, ws_state);
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: router assembly completed"
@@ -131,7 +164,9 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
 /// Used for testing when specific service overrides are needed
 /// (e.g. injecting a mock HTTP server URL for version check).
 pub fn create_router_with_states(services: &AppServices, states: ModuleStates) -> Router {
-    let ws_state = build_ws_state(services);
+    // No-op inbound router: this sync assembly path is for HTTP-focused tests and
+    // does not spawn the fs monitor (which requires a runtime task).
+    let ws_state = build_ws_state(services, Arc::new(NoopMessageRouter));
     create_router_with_all_state(services, states, ws_state)
 }
 
@@ -146,15 +181,83 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let auth_state = AuthRouterState {
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
+        fs_adopter: Some(Arc::new(SkillFilesystemAdopter {
+            skill_paths: services.skill_paths.clone(),
+            skill_repo: services.skill_repo.clone(),
+        })),
         cookie_config: services.cookie_config.clone(),
         qr_token_store: services.qr_token_store.clone(),
+        identity_mode: auth_identity_mode(services.identity_mode),
+        bootstrap_secret: services.bootstrap_secret.clone(),
+        session_revoked_hook: {
+            let ws_manager = services.ws_manager.clone();
+            let conversation_service = states.conversation.service.clone();
+            let team_service = states.team.service.clone();
+            let channel_manager = states.channel.manager.clone();
+            let channel_session_manager = states.channel.session_manager.clone();
+            let file_watch_service = states.file.watch_service.clone();
+            let office_watch_manager = states.office.watch_manager.clone();
+            Some(Arc::new(move |user_id: &str| {
+                ws_manager.disconnect_user(user_id, "session revoked");
+                let stopped_team_sessions = team_service.stop_sessions_for_user(user_id);
+                if stopped_team_sessions > 0 {
+                    tracing::info!(
+                        user_id = %user_id,
+                        stopped_team_sessions,
+                        "stopped team sessions after session revocation"
+                    );
+                }
+                let user_id = user_id.to_owned();
+                let conversation_service = conversation_service.clone();
+                let channel_manager = channel_manager.clone();
+                let channel_session_manager = channel_session_manager.clone();
+                let file_watch_service = file_watch_service.clone();
+                let office_watch_manager = office_watch_manager.clone();
+                tokio::spawn(async move {
+                    channel_manager.shutdown_for_user(&user_id).await;
+                    office_watch_manager.stop_all_for_user(&user_id);
+                    if let Err(err) = channel_session_manager.clear_all_sessions(&user_id).await {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            error = %err,
+                            "failed to clear channel sessions after session revocation"
+                        );
+                    }
+                    if let Err(err) = conversation_service.terminate_runtime_for_user(&user_id).await {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            error = %err,
+                            "failed to terminate runtimes after session revocation"
+                        );
+                    }
+                    if let Err(err) = file_watch_service.stop_all_watches_for_user(&user_id).await {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            error = %err,
+                            "failed to stop file watches after session revocation"
+                        );
+                    }
+                    if let Err(err) = file_watch_service.stop_all_office_watches_for_user(&user_id).await {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            error = %err,
+                            "failed to stop office file watches after session revocation"
+                        );
+                    }
+                });
+            }))
+        },
         local: services.local,
+        aionpro_mode: services.identity_mode == crate::config::IdentityMode::AionPro,
     };
 
     let auth_mw_state = AuthState {
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
-        local: services.local,
+        identity_mode: auth_identity_mode(services.identity_mode),
+        runtime_token_verifier: Some(Arc::new(ConversationHelperTokenVerifier {
+            runtime_token_service: services.runtime_token_service.clone(),
+        })),
     };
 
     // System routes protected by auth middleware
@@ -183,6 +286,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // File routes protected by auth middleware
     let file_authenticated =
         file_routes(states.file).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
+    // Project control-plane routes protected by auth middleware
+    let project_authenticated =
+        project_routes(states.project).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // MCP routes protected by auth middleware
     let mcp_authenticated =
@@ -228,8 +335,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let assistant_authenticated =
         assistant_routes(states.assistant).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
-    // Office proxy routes — exempt from auth (serve iframe content)
-    let office_proxy = office_proxy_routes(states.office);
+    // Office proxy routes serve iframe content but still require auth so
+    // preview ports remain scoped to the active Core user.
+    let office_proxy =
+        office_proxy_routes(states.office).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     let public_assets = asset_routes(AssetRouterState::default());
 
     // WebSocket upgrade route — exempt from CSRF (no cookie-based
@@ -251,6 +360,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(agent_authenticated)
         .merge(connection_test_authenticated)
         .merge(file_authenticated)
+        .merge(project_authenticated)
         .merge(mcp_authenticated)
         .merge(extension_authenticated)
         .merge(hub_authenticated)
@@ -266,7 +376,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     #[cfg(feature = "weixin")]
     let router = router.merge(weixin_login_authenticated);
 
-    let router = if services.local {
+    let router = if services.identity_mode.is_local() {
         router
     } else {
         router.layer(middleware::from_fn_with_state(
@@ -292,7 +402,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         "startup: route tree build with states completed"
     );
 
-    if services.local {
+    if services.identity_mode.is_local() {
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods([
@@ -306,8 +416,85 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
             .allow_headers(Any);
         router.layer(cors)
     } else {
-        router
+        // Non-local (external identity) mode: the desktop renderer is a
+        // cross-origin browser context (localhost:5173 in dev, file:// when
+        // packaged) authenticating with the session cookie, so responses must
+        // opt in to credentialed CORS. Credentialed mode forbids wildcards:
+        // reflect the request origin and enumerate headers explicitly
+        // (x-csrf-token is required by the CSRF double-submit middleware).
+        let cors = CorsLayer::new()
+            .allow_origin(AllowOrigin::mirror_request())
+            .allow_credentials(true)
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([
+                header::CONTENT_TYPE,
+                header::AUTHORIZATION,
+                HeaderName::from_static("x-csrf-token"),
+            ]);
+        router.layer(cors)
     }
+}
+
+/// Adapter running the on-disk side of AionUi → AionPro adoption over the
+/// skill filesystem (auth crate cannot depend on the extension/filesystem).
+struct SkillFilesystemAdopter {
+    skill_paths: Arc<aionui_extension::SkillPaths>,
+    skill_repo: Arc<dyn aionui_db::ISkillRepository>,
+}
+
+#[async_trait::async_trait]
+impl SystemDefaultFilesystemAdopter for SkillFilesystemAdopter {
+    async fn adopt_filesystem(&self, adopter_user_id: &str) {
+        aionui_extension::fs_adopt::adopt_user_filesystem(
+            self.skill_paths.as_ref(),
+            self.skill_repo.as_ref(),
+            adopter_user_id,
+        )
+        .await;
+    }
+}
+
+/// Adapter exposing the agent runtime's token service to the auth middleware
+/// as the conversation-helper credential channel (aionui-auth cannot depend on
+/// aionui-ai-agent, so the binding happens here in the composition layer).
+struct ConversationHelperTokenVerifier {
+    runtime_token_service: Arc<RuntimeTokenService>,
+}
+
+impl IRuntimeTokenVerifier for ConversationHelperTokenVerifier {
+    fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool {
+        self.runtime_token_service
+            .validate(
+                Some(token),
+                user_id,
+                conversation_id,
+                RuntimeTokenScope::ConversationHelper,
+                TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            )
+            .is_ok()
+    }
+}
+
+fn auth_identity_mode(identity_mode: crate::config::IdentityMode) -> AuthIdentityMode {
+    match identity_mode {
+        crate::config::IdentityMode::Local => AuthIdentityMode::Local,
+        crate::config::IdentityMode::WebUi => AuthIdentityMode::UserSession,
+        crate::config::IdentityMode::AionPro => AuthIdentityMode::AionPro,
+    }
+}
+
+fn is_global_websocket_event(event_name: &str) -> bool {
+    matches!(
+        event_name,
+        "runtime.statusChanged" | "extensions.lifecycle" | "hub.state-changed"
+    )
 }
 
 async fn normalize_boundary_error_response(request: Request, next: Next) -> Response {
@@ -367,7 +554,7 @@ fn boundary_error_for_status(status: StatusCode) -> Option<(&'static str, &'stat
 mod tests {
     use axum::http::StatusCode;
 
-    use super::{boundary_error_for_status, create_router_with_runtime};
+    use super::{boundary_error_for_status, create_router_with_runtime, is_global_websocket_event};
     use crate::config::AppConfig;
     use crate::services::AppServices;
 
@@ -394,6 +581,12 @@ mod tests {
             let (_, actual_code) = boundary_error_for_status(status).expect("status should be normalized");
             assert_eq!(actual_code, code);
         }
+    }
+
+    #[test]
+    fn extension_enablement_events_are_user_scoped() {
+        assert!(!is_global_websocket_event("extensions.state-changed"));
+        assert!(is_global_websocket_event("extensions.lifecycle"));
     }
 
     #[tokio::test]

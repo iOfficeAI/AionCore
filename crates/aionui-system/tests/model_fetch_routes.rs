@@ -13,10 +13,11 @@ use tower::ServiceExt;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use aionui_auth::CurrentUser;
 use aionui_common::encrypt_string;
 use aionui_db::{
     CreateProviderParams, IProviderRepository, SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository,
-    SqliteProviderRepository, SqliteSettingsRepository, init_database_memory,
+    SqliteProviderRepository, SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
 };
 use aionui_realtime::BroadcastEventBus;
 use aionui_system::{
@@ -29,6 +30,7 @@ use aionui_system::{
 // ---------------------------------------------------------------------------
 
 const TEST_KEY: [u8; 32] = [0x42; 32];
+const TEST_USER_ID: &str = "user-1";
 
 fn build_state(db: &aionui_db::Database) -> SystemRouterState {
     let provider_repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
@@ -49,6 +51,15 @@ fn build_state(db: &aionui_db::Database) -> SystemRouterState {
 
 async fn setup() -> (axum::Router, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+         VALUES (?, 'local', ?, '', 'active', 0, 1, 1)",
+    )
+    .bind(TEST_USER_ID)
+    .bind(TEST_USER_ID)
+    .execute(db.pool())
+    .await
+    .unwrap();
     let state = build_state(&db);
     (system_routes(state), db)
 }
@@ -58,6 +69,7 @@ async fn create_provider(db: &aionui_db::Database, platform: &str, base_url: &st
     let encrypted = encrypt_string(api_key, &TEST_KEY).unwrap();
     let row = repo
         .create(CreateProviderParams {
+            user_id: TEST_USER_ID,
             id: None,
             platform,
             name: "Test Provider",
@@ -85,12 +97,19 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 }
 
 fn post_request(uri: &str, body: serde_json::Value) -> Request<Body> {
-    Request::builder()
+    let mut req = Request::builder()
         .method("POST")
         .uri(uri)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
-        .unwrap()
+        .unwrap();
+    req.extensions_mut().insert(CurrentUser {
+        id: TEST_USER_ID.to_owned(),
+        username: TEST_USER_ID.to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
+    });
+    req
 }
 
 // ---------------------------------------------------------------------------

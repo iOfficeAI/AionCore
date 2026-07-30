@@ -18,8 +18,9 @@ impl SqliteSettingsRepository {
 
 #[async_trait::async_trait]
 impl ISettingsRepository for SqliteSettingsRepository {
-    async fn get_settings(&self) -> Result<Option<SystemSettings>, DbError> {
-        let row = sqlx::query_as::<_, SystemSettings>("SELECT * FROM system_settings WHERE id = 1")
+    async fn get_settings(&self, user_id: &str) -> Result<Option<SystemSettings>, DbError> {
+        let row = sqlx::query_as::<_, SystemSettings>("SELECT * FROM system_settings WHERE user_id = ?")
+            .bind(user_id)
             .fetch_optional(&self.pool)
             .await?;
 
@@ -28,6 +29,7 @@ impl ISettingsRepository for SqliteSettingsRepository {
 
     async fn upsert_settings(
         &self,
+        user_id: &str,
         language: &str,
         notification_enabled: bool,
         cron_notification_enabled: bool,
@@ -38,10 +40,10 @@ impl ISettingsRepository for SqliteSettingsRepository {
 
         sqlx::query(
             "INSERT INTO system_settings \
-                (id, language, notification_enabled, cron_notification_enabled, \
+                (user_id, language, notification_enabled, cron_notification_enabled, \
                  command_queue_enabled, save_upload_to_workspace, updated_at) \
-             VALUES (1, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(id) DO UPDATE SET \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(user_id) DO UPDATE SET \
                 language = excluded.language, \
                 notification_enabled = excluded.notification_enabled, \
                 cron_notification_enabled = excluded.cron_notification_enabled, \
@@ -49,6 +51,7 @@ impl ISettingsRepository for SqliteSettingsRepository {
                 save_upload_to_workspace = excluded.save_upload_to_workspace, \
                 updated_at = excluded.updated_at",
         )
+        .bind(user_id)
         .bind(language)
         .bind(notification_enabled)
         .bind(cron_notification_enabled)
@@ -59,7 +62,7 @@ impl ISettingsRepository for SqliteSettingsRepository {
         .await?;
 
         Ok(SystemSettings {
-            id: 1,
+            user_id: user_id.to_string(),
             language: language.to_string(),
             notification_enabled,
             cron_notification_enabled,
@@ -75,8 +78,20 @@ mod tests {
     use super::*;
     use crate::init_database_memory;
 
+    const USER_A: &str = "system_default_user";
+    const USER_B: &str = "user_b";
+
     async fn setup() -> (SqliteSettingsRepository, crate::Database) {
         let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, 'hash', 'active', 0, 1, 1)",
+        )
+        .bind(USER_B)
+        .bind(USER_B)
+        .execute(db.pool())
+        .await
+        .unwrap();
         let repo = SqliteSettingsRepository::new(db.pool().clone());
         (repo, db)
     }
@@ -84,15 +99,18 @@ mod tests {
     #[tokio::test]
     async fn get_settings_returns_none_when_empty() {
         let (repo, _db) = setup().await;
-        assert!(repo.get_settings().await.unwrap().is_none());
+        assert!(repo.get_settings(USER_A).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn upsert_creates_settings() {
         let (repo, _db) = setup().await;
-        let s = repo.upsert_settings("zh-CN", false, true, true, false).await.unwrap();
+        let s = repo
+            .upsert_settings(USER_A, "zh-CN", false, true, true, false)
+            .await
+            .unwrap();
 
-        assert_eq!(s.id, 1);
+        assert_eq!(s.user_id, USER_A);
         assert_eq!(s.language, "zh-CN");
         assert!(!s.notification_enabled);
         assert!(s.cron_notification_enabled);
@@ -104,9 +122,11 @@ mod tests {
     #[tokio::test]
     async fn upsert_then_get_returns_same() {
         let (repo, _db) = setup().await;
-        repo.upsert_settings("en-US", true, false, false, true).await.unwrap();
+        repo.upsert_settings(USER_A, "en-US", true, false, false, true)
+            .await
+            .unwrap();
 
-        let s = repo.get_settings().await.unwrap().unwrap();
+        let s = repo.get_settings(USER_A).await.unwrap().unwrap();
         assert_eq!(s.language, "en-US");
         assert!(s.notification_enabled);
         assert!(!s.cron_notification_enabled);
@@ -117,8 +137,13 @@ mod tests {
     #[tokio::test]
     async fn upsert_overwrites_existing() {
         let (repo, _db) = setup().await;
-        repo.upsert_settings("en-US", true, false, false, false).await.unwrap();
-        let s = repo.upsert_settings("ja-JP", false, true, true, true).await.unwrap();
+        repo.upsert_settings(USER_A, "en-US", true, false, false, false)
+            .await
+            .unwrap();
+        let s = repo
+            .upsert_settings(USER_A, "ja-JP", false, true, true, true)
+            .await
+            .unwrap();
 
         assert_eq!(s.language, "ja-JP");
         assert!(!s.notification_enabled);
@@ -127,7 +152,25 @@ mod tests {
         assert!(s.save_upload_to_workspace);
 
         // Verify persisted via get
-        let fetched = repo.get_settings().await.unwrap().unwrap();
+        let fetched = repo.get_settings(USER_A).await.unwrap().unwrap();
         assert_eq!(fetched.language, "ja-JP");
+    }
+
+    #[tokio::test]
+    async fn settings_are_scoped_by_user() {
+        let (repo, _db) = setup().await;
+        repo.upsert_settings(USER_A, "en-US", true, false, false, false)
+            .await
+            .unwrap();
+        repo.upsert_settings(USER_B, "zh-CN", false, true, true, true)
+            .await
+            .unwrap();
+
+        let a = repo.get_settings(USER_A).await.unwrap().unwrap();
+        let b = repo.get_settings(USER_B).await.unwrap().unwrap();
+        assert_eq!(a.language, "en-US");
+        assert_eq!(b.language, "zh-CN");
+        assert!(a.notification_enabled);
+        assert!(!b.notification_enabled);
     }
 }

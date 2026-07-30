@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -26,6 +26,8 @@ use crate::types::{
 // Re-export ExtensionSummary from registry_helpers so that
 // `registry::{ExtensionRegistry, ExtensionSummary}` continues to work.
 pub use crate::registry_helpers::ExtensionSummary;
+
+const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -118,7 +120,7 @@ impl ExtensionRegistry {
         let extensions = self.run_activation_hooks(extensions, &persisted).await;
 
         // 6. Resolve contributions.
-        let contributions = resolve_all_contributions(&extensions);
+        let contributions = resolve_all_installed_contributions(&extensions);
 
         // 7. Persist updated states.
         let states = build_state_map(&extensions);
@@ -171,7 +173,7 @@ impl ExtensionRegistry {
 
         let extensions = merge_persisted_states(extensions, &persisted);
         let extensions = self.run_activation_hooks(extensions, &persisted).await;
-        let contributions = resolve_all_contributions(&extensions);
+        let contributions = resolve_all_installed_contributions(&extensions);
 
         let states = build_state_map(&extensions);
         self.state_store.set_all(states).await;
@@ -198,78 +200,82 @@ impl ExtensionRegistry {
 impl ExtensionRegistry {
     /// Enable an extension by name.
     ///
-    /// Updates the in-memory state, re-resolves contributions, persists the
-    /// change, and broadcasts `extensions.state-changed`.
+    /// Compatibility wrapper for the local system user.
     pub async fn enable_extension(&self, name: &str) -> Result<(), ExtensionError> {
-        let state = {
-            let mut guard = self.inner.write().await;
+        self.enable_extension_for_user(SYSTEM_DEFAULT_USER_ID, name).await
+    }
 
-            let idx = guard
-                .extensions
-                .iter()
-                .position(|e| e.manifest.name == name)
-                .ok_or_else(|| ExtensionError::NotFound(name.to_owned()))?;
+    /// Enable an installed extension for one application user.
+    pub async fn enable_extension_for_user(&self, user_id: &str, name: &str) -> Result<(), ExtensionError> {
+        self.require_installed(name).await?;
+        if self.extension_enabled_for_user(user_id, name).await {
+            debug!(user_id, name, "extension already enabled for user");
+            return Ok(());
+        }
 
-            if guard.extensions[idx].state.enabled {
-                debug!(name, "extension already enabled");
-                return Ok(());
-            }
+        self.state_store.set_user_enabled(user_id, name, true).await;
+        self.broadcast_state_changed(user_id, name, true);
 
-            guard.extensions[idx].state.enabled = true;
-            guard.extensions[idx].state.last_activated_at = Some(now_ms());
-
-            // Re-resolve contributions with updated enabled set.
-            guard.contributions = resolve_all_contributions(&guard.extensions);
-
-            guard.extensions[idx].state.clone()
-        };
-
-        // Persist + broadcast outside the write lock.
-        self.state_store.set(state).await;
-        self.broadcast_state_changed(name, true);
-
-        info!(name, "extension enabled");
+        info!(user_id, name, "extension enabled for user");
         Ok(())
     }
 
     /// Disable an extension by name.
     ///
-    /// Optionally records a reason (logged for auditing). Updates state,
-    /// re-resolves contributions, persists, and broadcasts
-    /// `extensions.state-changed`.
+    /// Compatibility wrapper for the local system user.
     pub async fn disable_extension(&self, name: &str, reason: Option<&str>) -> Result<(), ExtensionError> {
-        let state = {
-            let mut guard = self.inner.write().await;
+        self.disable_extension_for_user(SYSTEM_DEFAULT_USER_ID, name, reason)
+            .await
+    }
 
-            let idx = guard
-                .extensions
-                .iter()
-                .position(|e| e.manifest.name == name)
-                .ok_or_else(|| ExtensionError::NotFound(name.to_owned()))?;
-
-            if !guard.extensions[idx].state.enabled {
-                debug!(name, "extension already disabled");
-                return Ok(());
-            }
-
-            guard.extensions[idx].state.enabled = false;
-
-            // Re-resolve contributions with updated enabled set.
-            guard.contributions = resolve_all_contributions(&guard.extensions);
-
-            guard.extensions[idx].state.clone()
-        };
-
-        // Persist + broadcast outside the write lock.
-        self.state_store.set(state).await;
-        self.broadcast_state_changed(name, false);
-
-        if let Some(r) = reason {
-            info!(name, reason = r, "extension disabled");
-        } else {
-            info!(name, "extension disabled");
+    /// Disable an installed extension for one application user.
+    pub async fn disable_extension_for_user(
+        &self,
+        user_id: &str,
+        name: &str,
+        reason: Option<&str>,
+    ) -> Result<(), ExtensionError> {
+        self.require_installed(name).await?;
+        if !self.extension_enabled_for_user(user_id, name).await {
+            debug!(user_id, name, "extension already disabled for user");
+            return Ok(());
         }
+
+        self.state_store.set_user_enabled(user_id, name, false).await;
+        self.broadcast_state_changed(user_id, name, false);
+
+        info!(
+            user_id,
+            name,
+            reason_supplied = reason.is_some(),
+            "extension disabled for user"
+        );
         Ok(())
+    }
+
+    async fn require_installed(&self, name: &str) -> Result<(), ExtensionError> {
+        let guard = self.inner.read().await;
+        guard
+            .extensions
+            .iter()
+            .any(|extension| extension.manifest.name == name)
+            .then_some(())
+            .ok_or_else(|| ExtensionError::NotFound(name.to_owned()))
+    }
+
+    async fn extension_enabled_for_user(&self, user_id: &str, name: &str) -> bool {
+        if let Some(enabled) = self.state_store.get_user_enabled(user_id, name).await {
+            return enabled;
+        }
+        if user_id != SYSTEM_DEFAULT_USER_ID {
+            return true;
+        }
+        let guard = self.inner.read().await;
+        guard
+            .extensions
+            .iter()
+            .find(|extension| extension.manifest.name == name)
+            .is_none_or(|extension| extension.state.enabled)
     }
 }
 
@@ -280,8 +286,12 @@ impl ExtensionRegistry {
 impl ExtensionRegistry {
     /// Return summaries of all loaded extensions.
     pub async fn get_loaded_extensions(&self) -> Vec<ExtensionSummary> {
-        let guard = self.inner.read().await;
-        guard.extensions.iter().map(to_summary).collect()
+        self.get_loaded_extensions_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    /// Return summaries with enabled state overlaid for one user.
+    pub async fn get_loaded_extensions_for_user(&self, user_id: &str) -> Vec<ExtensionSummary> {
+        self.extensions_for_user(user_id).await.iter().map(to_summary).collect()
     }
 
     pub(crate) fn event_broadcaster(&self) -> Arc<dyn EventBroadcaster> {
@@ -294,78 +304,150 @@ impl ExtensionRegistry {
         guard.extensions.iter().find(|e| e.manifest.name == name).cloned()
     }
 
+    /// Look up an installed extension with one user's enabled state overlaid.
+    pub async fn get_extension_by_name_for_user(&self, user_id: &str, name: &str) -> Option<LoadedExtension> {
+        self.extensions_for_user(user_id)
+            .await
+            .into_iter()
+            .find(|extension| extension.manifest.name == name)
+    }
+
     /// Snapshot of all resolved contributions.
     pub async fn get_contributions(&self) -> ResolvedContributions {
-        let guard = self.inner.read().await;
-        guard.contributions.clone()
+        self.get_contributions_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_contributions_for_user(&self, user_id: &str) -> ResolvedContributions {
+        let enabled: HashSet<String> = self
+            .extensions_for_user(user_id)
+            .await
+            .into_iter()
+            .filter(|extension| extension.state.enabled)
+            .map(|extension| extension.manifest.name)
+            .collect();
+        let mut contributions = {
+            let guard = self.inner.read().await;
+            guard.contributions.clone()
+        };
+        retain_contributions(&mut contributions, &enabled);
+        contributions
     }
 
     pub async fn get_themes(&self) -> Vec<ResolvedTheme> {
-        let guard = self.inner.read().await;
-        guard.contributions.themes.clone()
+        self.get_themes_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_themes_for_user(&self, user_id: &str) -> Vec<ResolvedTheme> {
+        self.get_contributions_for_user(user_id).await.themes
     }
 
     pub async fn get_assistants(&self) -> Vec<ResolvedAssistant> {
-        let guard = self.inner.read().await;
-        guard.contributions.assistants.clone()
+        self.get_assistants_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_assistants_for_user(&self, user_id: &str) -> Vec<ResolvedAssistant> {
+        self.get_contributions_for_user(user_id).await.assistants
     }
 
     /// Return `true` if any extension contributes an assistant with this id.
     pub async fn has_assistant(&self, id: &str) -> bool {
-        let guard = self.inner.read().await;
-        guard.contributions.assistants.iter().any(|a| a.id == id)
+        self.has_assistant_for_user(SYSTEM_DEFAULT_USER_ID, id).await
+    }
+
+    pub async fn has_assistant_for_user(&self, user_id: &str, id: &str) -> bool {
+        self.get_assistants_for_user(user_id)
+            .await
+            .iter()
+            .any(|assistant| assistant.id == id)
     }
 
     /// Lookup a single extension-contributed assistant by id.
     pub async fn get_assistant_by_id(&self, id: &str) -> Option<ResolvedAssistant> {
-        let guard = self.inner.read().await;
-        guard.contributions.assistants.iter().find(|a| a.id == id).cloned()
+        self.get_assistant_by_id_for_user(SYSTEM_DEFAULT_USER_ID, id).await
+    }
+
+    pub async fn get_assistant_by_id_for_user(&self, user_id: &str, id: &str) -> Option<ResolvedAssistant> {
+        self.get_assistants_for_user(user_id)
+            .await
+            .into_iter()
+            .find(|assistant| assistant.id == id)
     }
 
     pub async fn get_acp_adapters(&self) -> Vec<ResolvedAcpAdapter> {
-        let guard = self.inner.read().await;
-        guard.contributions.acp_adapters.clone()
+        self.get_acp_adapters_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_acp_adapters_for_user(&self, user_id: &str) -> Vec<ResolvedAcpAdapter> {
+        self.get_contributions_for_user(user_id).await.acp_adapters
     }
 
     pub async fn get_agents(&self) -> Vec<ResolvedAgent> {
-        let guard = self.inner.read().await;
-        guard.contributions.agents.clone()
+        self.get_agents_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_agents_for_user(&self, user_id: &str) -> Vec<ResolvedAgent> {
+        self.get_contributions_for_user(user_id).await.agents
     }
 
     pub async fn get_mcp_servers(&self) -> Vec<crate::types::ResolvedMcpServer> {
-        let guard = self.inner.read().await;
-        guard.contributions.mcp_servers.clone()
+        self.get_mcp_servers_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_mcp_servers_for_user(&self, user_id: &str) -> Vec<crate::types::ResolvedMcpServer> {
+        self.get_contributions_for_user(user_id).await.mcp_servers
     }
 
     pub async fn get_skills(&self) -> Vec<ResolvedSkill> {
-        let guard = self.inner.read().await;
-        guard.contributions.skills.clone()
+        self.get_skills_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_skills_for_user(&self, user_id: &str) -> Vec<ResolvedSkill> {
+        self.get_contributions_for_user(user_id).await.skills
     }
 
     pub async fn get_settings_tabs(&self) -> Vec<ResolvedSettingsTab> {
-        let guard = self.inner.read().await;
-        guard.contributions.settings_tabs.clone()
+        self.get_settings_tabs_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_settings_tabs_for_user(&self, user_id: &str) -> Vec<ResolvedSettingsTab> {
+        self.get_contributions_for_user(user_id).await.settings_tabs
     }
 
     pub async fn get_webui_contributions(&self) -> Vec<WebuiContribution> {
-        let guard = self.inner.read().await;
-        guard.contributions.webui.clone()
+        self.get_webui_contributions_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_webui_contributions_for_user(&self, user_id: &str) -> Vec<WebuiContribution> {
+        self.get_contributions_for_user(user_id).await.webui
     }
 
     pub async fn get_channel_plugins(&self) -> Vec<ResolvedChannelPlugin> {
-        let guard = self.inner.read().await;
-        guard.contributions.channel_plugins.clone()
+        self.get_channel_plugins_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_channel_plugins_for_user(&self, user_id: &str) -> Vec<ResolvedChannelPlugin> {
+        self.get_contributions_for_user(user_id).await.channel_plugins
     }
 
     pub async fn get_model_providers(&self) -> Vec<ResolvedModelProvider> {
-        let guard = self.inner.read().await;
-        guard.contributions.model_providers.clone()
+        self.get_model_providers_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_model_providers_for_user(&self, user_id: &str) -> Vec<ResolvedModelProvider> {
+        self.get_contributions_for_user(user_id).await.model_providers
     }
 
     /// Resolve i18n data for a given locale across all enabled extensions.
     pub async fn get_i18n_for_locale(&self, locale: &str) -> HashMap<String, HashMap<String, String>> {
-        let guard = self.inner.read().await;
-        resolve_i18n_for_all(&guard.extensions, locale)
+        self.get_i18n_for_locale_for_user(SYSTEM_DEFAULT_USER_ID, locale).await
+    }
+
+    pub async fn get_i18n_for_locale_for_user(
+        &self,
+        user_id: &str,
+        locale: &str,
+    ) -> HashMap<String, HashMap<String, String>> {
+        resolve_i18n_for_all(&self.extensions_for_user(user_id).await, locale)
     }
 
     /// Whether the registry has been initialized.
@@ -373,6 +455,65 @@ impl ExtensionRegistry {
         let guard = self.inner.read().await;
         guard.initialized
     }
+
+    async fn extensions_for_user(&self, user_id: &str) -> Vec<LoadedExtension> {
+        let mut extensions = {
+            let guard = self.inner.read().await;
+            guard.extensions.clone()
+        };
+        let overrides = self.state_store.get_user_enabled_all(user_id).await;
+        for extension in &mut extensions {
+            extension.state.enabled = overrides
+                .get(&extension.manifest.name)
+                .copied()
+                .unwrap_or(user_id != SYSTEM_DEFAULT_USER_ID || extension.state.enabled);
+        }
+        extensions
+    }
+}
+
+fn resolve_all_installed_contributions(extensions: &[LoadedExtension]) -> ResolvedContributions {
+    let mut installed = extensions.to_vec();
+    for extension in &mut installed {
+        extension.state.enabled = true;
+    }
+    resolve_all_contributions(&installed)
+}
+
+fn retain_contributions(contributions: &mut ResolvedContributions, enabled: &HashSet<String>) {
+    contributions
+        .acp_adapters
+        .retain(|item| enabled.contains(&item.extension_name));
+    contributions
+        .mcp_servers
+        .retain(|item| enabled.contains(&item.extension_name));
+    contributions
+        .assistants
+        .retain(|item| enabled.contains(&item.extension_name));
+    contributions
+        .agents
+        .retain(|item| enabled.contains(&item.extension_name));
+    contributions
+        .skills
+        .retain(|item| enabled.contains(&item.extension_name));
+    contributions
+        .themes
+        .retain(|item| enabled.contains(&item.extension_name));
+    contributions
+        .channel_plugins
+        .retain(|item| enabled.contains(&item.extension_name));
+    contributions
+        .webui
+        .retain(|item| enabled.contains(&item.extension_name));
+    contributions
+        .settings_tabs
+        .retain(|item| enabled.contains(&item.extension_name));
+    contributions
+        .model_providers
+        .retain(|item| enabled.contains(&item.extension_name));
+    contributions
+        .i18n
+        .retain(|extension_name, _| enabled.contains(extension_name));
 }
 
 // ---------------------------------------------------------------------------
@@ -380,8 +521,11 @@ impl ExtensionRegistry {
 // ---------------------------------------------------------------------------
 
 impl ExtensionRegistry {
-    fn broadcast_state_changed(&self, name: &str, enabled: bool) {
-        let event = WebSocketMessage::new("extensions.state-changed", json!({ "name": name, "enabled": enabled }));
+    fn broadcast_state_changed(&self, user_id: &str, name: &str, enabled: bool) {
+        let event = WebSocketMessage::new(
+            "extensions.state-changed",
+            json!({ "user_id": user_id, "name": name, "enabled": enabled }),
+        );
         self.broadcaster.broadcast(event);
     }
 
@@ -552,13 +696,11 @@ mod tests {
 
         // Enable
         registry.enable_extension("test-ext").await.unwrap();
-        {
-            let guard = registry.inner.read().await;
-            assert!(guard.extensions[0].state.enabled);
-        }
+        assert!(registry.get_loaded_extensions().await[0].enabled);
 
         let msg = rx.recv().await.unwrap();
         assert_eq!(msg.name, "extensions.state-changed");
+        assert_eq!(msg.data["user_id"], SYSTEM_DEFAULT_USER_ID);
         assert_eq!(msg.data["enabled"], true);
 
         // Disable
@@ -566,10 +708,7 @@ mod tests {
             .disable_extension("test-ext", Some("test reason"))
             .await
             .unwrap();
-        {
-            let guard = registry.inner.read().await;
-            assert!(!guard.extensions[0].state.enabled);
-        }
+        assert!(!registry.get_loaded_extensions().await[0].enabled);
 
         let msg = rx.recv().await.unwrap();
         assert_eq!(msg.name, "extensions.state-changed");

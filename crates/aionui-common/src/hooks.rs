@@ -10,10 +10,10 @@ use async_trait::async_trait;
 /// `ConversationService::delete`.
 ///
 /// Implementors are responsible for cleaning up their per-conversation state
-/// (kill agent processes, drop cron jobs, etc.). Hooks run sequentially in
-/// registration order; failures must be logged inside the hook and not
+/// (kill agent processes, drop cron job state, etc.). Hooks run sequentially
+/// in registration order; failures must be logged inside the hook and not
 /// propagated.
 #[async_trait]
 pub trait OnConversationDelete: Send + Sync {
-    async fn on_conversation_deleted(&self, conversation_id: &str);
+    async fn on_conversation_deleted(&self, user_id: &str, conversation_id: &str);
 }

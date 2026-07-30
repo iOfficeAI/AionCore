@@ -49,6 +49,7 @@ pub trait ProcessHandle: Send + Sync {
 // ---------------------------------------------------------------------------
 
 struct WatchSession {
+    user_id: String,
     port: u16,
     process: Box<dyn ProcessHandle>,
     file_path: String,
@@ -61,10 +62,27 @@ struct WatchSession {
 // ---------------------------------------------------------------------------
 
 pub struct OfficecliWatchManager {
-    sessions: DashMap<String, WatchSession>,
+    sessions: DashMap<WatchSessionKey, WatchSession>,
     spawner: Arc<dyn ProcessSpawner>,
     broadcaster: Arc<dyn EventBroadcaster>,
     last_version_check: Mutex<Option<std::time::Instant>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WatchSessionKey {
+    user_id: String,
+    doc_type: DocType,
+    resolved_path: String,
+}
+
+impl WatchSessionKey {
+    fn new(user_id: &str, resolved_path: &str, doc_type: DocType) -> Self {
+        Self {
+            user_id: user_id.to_owned(),
+            doc_type,
+            resolved_path: resolved_path.to_owned(),
+        }
+    }
 }
 
 impl OfficecliWatchManager {
@@ -78,8 +96,12 @@ impl OfficecliWatchManager {
     }
 
     pub async fn start(&self, file_path: &str, doc_type: DocType) -> Result<u16, OfficeError> {
+        self.start_for_user("system_default_user", file_path, doc_type).await
+    }
+
+    pub async fn start_for_user(&self, user_id: &str, file_path: &str, doc_type: DocType) -> Result<u16, OfficeError> {
         let resolved = resolve_path(file_path)?;
-        let key = session_key(&resolved, doc_type);
+        let key = session_key(user_id, &resolved, doc_type);
 
         if let Some(entry) = self.sessions.get(&key) {
             if !entry.aborted && entry.process.is_alive() {
@@ -89,20 +111,25 @@ impl OfficecliWatchManager {
             self.sessions.remove(&key);
         }
 
-        self.broadcast_status(doc_type, PreviewState::Starting, None);
+        self.broadcast_status_for_user(user_id, doc_type, PreviewState::Starting, None);
 
-        let result = self.try_start(&resolved, doc_type).await;
+        let result = self.try_start(user_id, &resolved, doc_type).await;
 
         match &result {
             Ok(port) => {
-                self.broadcast_status(doc_type, PreviewState::Ready, None);
+                self.broadcast_status_for_user(user_id, doc_type, PreviewState::Ready, None);
                 if doc_type == DocType::Ppt {
                     self.maybe_check_update(doc_type).await;
                 }
                 Ok(*port)
             }
             Err(e) => {
-                self.broadcast_status(doc_type, PreviewState::Error, Some(public_preview_error_message(e)));
+                self.broadcast_status_for_user(
+                    user_id,
+                    doc_type,
+                    PreviewState::Error,
+                    Some(public_preview_error_message(e)),
+                );
                 Err(match e {
                     OfficeError::OfficecliNotFound => OfficeError::OfficecliNotFound,
                     OfficeError::InstallFailed(m) => OfficeError::InstallFailed(m.clone()),
@@ -118,17 +145,21 @@ impl OfficecliWatchManager {
         }
     }
 
-    async fn try_start(&self, resolved: &str, doc_type: DocType) -> Result<u16, OfficeError> {
+    async fn try_start(&self, user_id: &str, resolved: &str, doc_type: DocType) -> Result<u16, OfficeError> {
         for attempt in 1..=START_PORT_MAX_ATTEMPTS {
             let port = allocate_port()?;
-            match self.spawn_officecli_with_install(resolved, port, doc_type).await {
+            match self
+                .spawn_officecli_with_install(user_id, resolved, port, doc_type)
+                .await
+            {
                 Ok(process) => {
                     self.poll_port_ready(port, resolved).await?;
 
-                    let key = session_key(resolved, doc_type);
+                    let key = session_key(user_id, resolved, doc_type);
                     self.sessions.insert(
                         key,
                         WatchSession {
+                            user_id: user_id.to_owned(),
                             port,
                             process,
                             file_path: resolved.to_owned(),
@@ -158,6 +189,7 @@ impl OfficecliWatchManager {
 
     async fn spawn_officecli_with_install(
         &self,
+        user_id: &str,
         resolved: &str,
         port: u16,
         doc_type: DocType,
@@ -165,7 +197,7 @@ impl OfficecliWatchManager {
         match self.spawner.spawn_officecli(resolved, port, doc_type).await {
             Ok(process) => Ok(process),
             Err(OfficeError::OfficecliNotFound) => {
-                self.broadcast_status(doc_type, PreviewState::Installing, None);
+                self.broadcast_status_for_user(user_id, doc_type, PreviewState::Installing, None);
                 self.spawner.install_officecli().await?;
                 self.spawner.spawn_officecli(resolved, port, doc_type).await
             }
@@ -184,11 +216,15 @@ impl OfficecliWatchManager {
     }
 
     pub async fn stop(&self, file_path: &str, doc_type: DocType) {
+        self.stop_for_user("system_default_user", file_path, doc_type).await;
+    }
+
+    pub async fn stop_for_user(&self, user_id: &str, file_path: &str, doc_type: DocType) {
         let resolved = match resolve_path(file_path) {
             Ok(p) => p,
             Err(_) => return,
         };
-        let key = session_key(&resolved, doc_type);
+        let key = session_key(user_id, &resolved, doc_type);
 
         tokio::time::sleep(Duration::from_millis(STOP_DELAY_MS)).await;
 
@@ -209,16 +245,49 @@ impl OfficecliWatchManager {
         self.sessions.clear();
     }
 
+    pub fn stop_all_for_user(&self, user_id: &str) -> usize {
+        let keys: Vec<WatchSessionKey> = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.key().user_id == user_id)
+            .map(|entry| entry.key().clone())
+            .collect();
+        let stopped = keys.len();
+
+        for key in keys {
+            if let Some((_, session)) = self.sessions.remove(&key) {
+                session.process.kill();
+            }
+        }
+
+        if stopped > 0 {
+            tracing::info!(user_id = %user_id, stopped, "stopped office preview sessions for user");
+        }
+        stopped
+    }
+
     pub fn is_active_port(&self, port: u16, doc_type: DocType) -> bool {
         self.sessions
             .iter()
             .any(|entry| entry.port == port && entry.doc_type == doc_type)
     }
 
+    pub fn is_active_port_for_user(&self, user_id: &str, port: u16, doc_type: DocType) -> bool {
+        self.sessions
+            .iter()
+            .any(|entry| entry.user_id == user_id && entry.port == port && entry.doc_type == doc_type)
+    }
+
     pub fn is_active_watch_port(&self, port: u16) -> bool {
         self.sessions
             .iter()
             .any(|entry| entry.port == port && matches!(entry.doc_type, DocType::Word | DocType::Excel))
+    }
+
+    pub fn is_active_watch_port_for_user(&self, user_id: &str, port: u16) -> bool {
+        self.sessions.iter().any(|entry| {
+            entry.user_id == user_id && entry.port == port && matches!(entry.doc_type, DocType::Word | DocType::Excel)
+        })
     }
 
     pub fn active_session_count(&self) -> usize {
@@ -243,16 +312,23 @@ impl OfficecliWatchManager {
         }
     }
 
-    fn broadcast_status(&self, doc_type: DocType, state: PreviewState, message: Option<String>) {
+    fn broadcast_status_for_user(
+        &self,
+        user_id: &str,
+        doc_type: DocType,
+        state: PreviewState,
+        message: Option<String>,
+    ) {
         let event_name = format!("{}.status", doc_type.event_prefix());
         let payload = PreviewStatusEvent { state, message };
-        let data = match serde_json::to_value(payload) {
+        let mut data = match serde_json::to_value(payload) {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("failed to serialize preview status: {e}");
                 return;
             }
         };
+        data["user_id"] = serde_json::Value::String(user_id.to_owned());
         self.broadcaster.broadcast(WebSocketMessage::new(event_name, data));
     }
 }
@@ -424,8 +500,8 @@ fn resolve_path(file_path: &str) -> Result<String, OfficeError> {
     Ok(resolved.to_string_lossy().into_owned())
 }
 
-fn session_key(resolved_path: &str, doc_type: DocType) -> String {
-    format!("{doc_type}:{resolved_path}")
+fn session_key(user_id: &str, resolved_path: &str, doc_type: DocType) -> WatchSessionKey {
+    WatchSessionKey::new(user_id, resolved_path, doc_type)
 }
 
 fn is_port_in_use_start_failure(error: &OfficeError) -> bool {
@@ -604,16 +680,32 @@ mod tests {
     }
 
     #[test]
-    fn session_key_format() {
-        let key = session_key("/path/to/doc.docx", DocType::Word);
-        assert_eq!(key, "word:/path/to/doc.docx");
+    fn session_key_preserves_fields() {
+        let key = session_key("user-1", "/path/to/doc.docx", DocType::Word);
+        assert_eq!(key.user_id, "user-1");
+        assert_eq!(key.doc_type, DocType::Word);
+        assert_eq!(key.resolved_path, "/path/to/doc.docx");
     }
 
     #[test]
     fn session_key_different_doc_types() {
-        let k1 = session_key("/a.docx", DocType::Word);
-        let k2 = session_key("/a.docx", DocType::Excel);
+        let k1 = session_key("user-1", "/a.docx", DocType::Word);
+        let k2 = session_key("user-1", "/a.docx", DocType::Excel);
         assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn session_key_different_users() {
+        let k1 = session_key("user-1", "/a.docx", DocType::Word);
+        let k2 = session_key("user-2", "/a.docx", DocType::Word);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn session_key_keeps_user_type_and_path_boundaries() {
+        let first = session_key("user:word", "/a.docx", DocType::Excel);
+        let second = session_key("user", "word:/a.docx", DocType::Excel);
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -693,6 +785,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_same_file_for_different_users_creates_independent_sessions() {
+        let spawner = Arc::new(MockSpawner::new());
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let mgr = make_manager(Arc::clone(&spawner), Arc::clone(&broadcaster));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.docx");
+        std::fs::write(&file, b"test").unwrap();
+        let path = file.to_str().unwrap();
+
+        let user_a_port = mgr.start_for_user("user-a", path, DocType::Word).await.unwrap();
+        let user_b_port = mgr.start_for_user("user-b", path, DocType::Word).await.unwrap();
+
+        assert_ne!(user_a_port, user_b_port);
+        assert_eq!(mgr.active_session_count(), 2);
+        assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 2);
+
+        mgr.stop_for_user("user-a", path, DocType::Word).await;
+        assert_eq!(mgr.active_session_count(), 1);
+        assert!(!mgr.is_active_port(user_a_port, DocType::Word));
+        assert!(!mgr.is_active_port_for_user("user-a", user_a_port, DocType::Word));
+        assert!(mgr.is_active_port(user_b_port, DocType::Word));
+        assert!(mgr.is_active_port_for_user("user-b", user_b_port, DocType::Word));
+        assert!(!mgr.is_active_port_for_user("user-a", user_b_port, DocType::Word));
+
+        mgr.stop_for_user("user-b", path, DocType::Word).await;
+        assert_eq!(mgr.active_session_count(), 0);
+    }
+
+    #[tokio::test]
     async fn start_retries_when_allocated_port_is_taken() {
         let spawner = Arc::new(MockSpawner::new());
         spawner.fail_with_address_in_use_once.store(true, Ordering::SeqCst);
@@ -767,6 +889,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_all_for_user_keeps_other_user_sessions() {
+        let spawner = Arc::new(MockSpawner::new());
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let mgr = make_manager(Arc::clone(&spawner), Arc::clone(&broadcaster));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shared.docx");
+        std::fs::write(&file, b"test").unwrap();
+        let path = file.to_str().unwrap();
+
+        let user_a_port = mgr.start_for_user("user-a", path, DocType::Word).await.unwrap();
+        let user_b_port = mgr.start_for_user("user-b", path, DocType::Word).await.unwrap();
+        assert_eq!(mgr.active_session_count(), 2);
+
+        assert_eq!(mgr.stop_all_for_user("user-a"), 1);
+
+        assert_eq!(mgr.active_session_count(), 1);
+        assert!(!mgr.is_active_port_for_user("user-a", user_a_port, DocType::Word));
+        assert!(mgr.is_active_port_for_user("user-b", user_b_port, DocType::Word));
+    }
+
+    #[tokio::test]
     async fn is_active_port_returns_true_for_active() {
         let spawner = Arc::new(MockSpawner::new());
         let broadcaster = Arc::new(RecordingBroadcaster::new());
@@ -778,6 +922,8 @@ mod tests {
 
         let port = mgr.start(file.to_str().unwrap(), DocType::Word).await.unwrap();
         assert!(mgr.is_active_port(port, DocType::Word));
+        assert!(mgr.is_active_port_for_user("system_default_user", port, DocType::Word));
+        assert!(!mgr.is_active_port_for_user("other-user", port, DocType::Word));
         assert!(!mgr.is_active_port(port, DocType::Ppt));
         assert!(!mgr.is_active_port(12345, DocType::Word));
     }
@@ -802,6 +948,9 @@ mod tests {
 
         assert!(mgr.is_active_watch_port(word_port));
         assert!(mgr.is_active_watch_port(excel_port));
+        assert!(mgr.is_active_watch_port_for_user("system_default_user", word_port));
+        assert!(mgr.is_active_watch_port_for_user("system_default_user", excel_port));
+        assert!(!mgr.is_active_watch_port_for_user("other-user", word_port));
         assert!(!mgr.is_active_watch_port(ppt_port));
         assert!(!mgr.is_active_watch_port(12345));
     }

@@ -130,6 +130,7 @@ pub struct TeammateManager {
 impl TeammateManager {
     pub fn new(
         team_id: String,
+        user_id: String,
         agents: &[TeamAgent],
         mailbox: Arc<Mailbox>,
         task_board: Arc<TaskBoard>,
@@ -148,7 +149,7 @@ impl TeammateManager {
                 },
             );
         }
-        let events = TeamEventEmitter::new(team_id.clone(), broadcaster);
+        let events = TeamEventEmitter::new(team_id.clone(), user_id, broadcaster);
         Self {
             team_id,
             slots: Mutex::new(slots),

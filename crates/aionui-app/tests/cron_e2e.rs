@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
 
+use aionui_db::models::ConversationRow;
 use aionui_db::{
     CreateMcpServerParams, IConversationRepository, ICronRepository, IMcpServerRepository,
     SqliteConversationRepository, SqliteCronRepository, SqliteMcpServerRepository,
@@ -86,8 +87,53 @@ async fn ensure_default_assistant(app: &mut axum::Router, token: &str, csrf: &st
     );
 }
 
-async fn create_job(app: &mut axum::Router, token: &str, csrf: &str, body: serde_json::Value) -> serde_json::Value {
+async fn ensure_conversation(services: &aionui_app::AppServices, user_id: &str, conversation_id: &str, title: &str) {
+    if conversation_id.trim().is_empty() {
+        return;
+    }
+    let repo = SqliteConversationRepository::new(services.database.pool().clone());
+    if repo.get(user_id, conversation_id).await.unwrap().is_some() {
+        return;
+    }
+    let now = aionui_common::now_ms();
+    repo.create(&ConversationRow {
+        id: conversation_id.to_owned(),
+        user_id: user_id.to_owned(),
+        name: title.to_owned(),
+        r#type: "acp".to_owned(),
+        extra: "{}".to_owned(),
+        model: None,
+        status: Some("finished".to_owned()),
+        source: Some("aionui".to_owned()),
+        channel_chat_id: None,
+        pinned: false,
+        pinned_at: None,
+        created_at: now,
+        updated_at: now,
+        project_id: None,
+        folder_id: None,
+    })
+    .await
+    .unwrap();
+}
+
+async fn create_job(
+    app: &mut axum::Router,
+    services: &aionui_app::AppServices,
+    token: &str,
+    csrf: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
     ensure_default_assistant(app, token, csrf).await;
+    let admin = services
+        .user_repo
+        .find_by_username("admin")
+        .await
+        .unwrap()
+        .expect("admin user should exist");
+    let conversation_id = body["conversation_id"].as_str().unwrap_or_default();
+    let title = body["conversation_title"].as_str().unwrap_or("Cron Test Conversation");
+    ensure_conversation(services, &admin.id, conversation_id, title).await;
     let req = json_with_token("POST", "/api/cron/jobs", body, token, csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -169,7 +215,7 @@ async fn cj1_create_cron_job() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_job(&mut app, &token, &csrf, create_job_body("Daily Report")).await;
+    let data = create_job(&mut app, &services, &token, &csrf, create_job_body("Daily Report")).await;
 
     assert!(data["id"].as_str().unwrap().starts_with("cron_"));
     assert_eq!(data["name"], "Daily Report");
@@ -188,7 +234,7 @@ async fn cj1b_create_job_allows_missing_task_description() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let data = create_job(&mut app, &token, &csrf, create_job_body("No Description")).await;
+    let data = create_job(&mut app, &services, &token, &csrf, create_job_body("No Description")).await;
 
     assert!(data.get("description").is_none());
     assert_eq!(data["schedule"]["description"], "every minute");
@@ -203,17 +249,25 @@ async fn cj2_create_three_schedule_types() {
 
     let now = aionui_common::now_ms();
 
-    let at = create_job(&mut app, &token, &csrf, create_at_job_body("At Job", now + 3_600_000)).await;
+    let at = create_job(
+        &mut app,
+        &services,
+        &token,
+        &csrf,
+        create_at_job_body("At Job", now + 3_600_000),
+    )
+    .await;
     assert_eq!(at["schedule"]["kind"], "at");
     assert!(at["state"]["next_run_at_ms"].as_i64().unwrap() > now);
 
-    let every = create_job(&mut app, &token, &csrf, create_job_body("Every Job")).await;
+    let every = create_job(&mut app, &services, &token, &csrf, create_job_body("Every Job")).await;
     assert_eq!(every["schedule"]["kind"], "every");
     let next = every["state"]["next_run_at_ms"].as_i64().unwrap();
     assert!((next - now - 60000).abs() < 3000);
 
     let cron = create_job(
         &mut app,
+        &services,
         &token,
         &csrf,
         create_cron_job_body("Cron Job", "0 */5 * * * *"),
@@ -333,7 +387,7 @@ async fn cj4_get_single_job() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let created = create_job(&mut app, &token, &csrf, create_job_body("Get Test")).await;
+    let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Get Test")).await;
     let job_id = created["id"].as_str().unwrap();
 
     let req = get_with_token(&format!("/api/cron/jobs/{job_id}"), &token);
@@ -361,6 +415,7 @@ async fn cj5_get_nonexistent() {
 async fn cj5b_run_now_legacy_workspace_with_whitespace_succeeds() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let owner = services.user_repo.find_by_username("admin").await.unwrap().unwrap();
     ensure_default_assistant(&mut app, &token, &csrf).await;
     let cron_repo = SqliteCronRepository::new(services.database.pool().clone());
     let now = aionui_common::now_ms();
@@ -372,6 +427,7 @@ async fn cj5b_run_now_legacy_workspace_with_whitespace_succeeds() {
     cron_repo
         .insert(&aionui_db::models::CronJobRow {
             id: "cron_whitespace_workspace".into(),
+            user_id: owner.id,
             name: "Legacy Workspace".into(),
             enabled: true,
             schedule_kind: "every".into(),
@@ -430,7 +486,7 @@ async fn cj6_list_all_jobs() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     for i in 0..3 {
-        create_job(&mut app, &token, &csrf, create_job_body(&format!("Job {i}"))).await;
+        create_job(&mut app, &services, &token, &csrf, create_job_body(&format!("Job {i}"))).await;
     }
 
     let req = get_with_token("/api/cron/jobs", &token);
@@ -451,15 +507,15 @@ async fn cj7_list_by_conversation() {
 
     let mut body_a = create_job_body("Job A");
     body_a["conversation_id"] = json!("conv_target");
-    create_job(&mut app, &token, &csrf, body_a).await;
+    create_job(&mut app, &services, &token, &csrf, body_a).await;
 
     let mut body_b = create_job_body("Job B");
     body_b["conversation_id"] = json!("conv_target");
-    create_job(&mut app, &token, &csrf, body_b).await;
+    create_job(&mut app, &services, &token, &csrf, body_b).await;
 
     let mut body_c = create_job_body("Job C");
     body_c["conversation_id"] = json!("conv_other");
-    create_job(&mut app, &token, &csrf, body_c).await;
+    create_job(&mut app, &services, &token, &csrf, body_c).await;
 
     let req = get_with_token("/api/cron/jobs?conversation_id=conv_target", &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -477,7 +533,7 @@ async fn cj8_update_job() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let created = create_job(&mut app, &token, &csrf, create_job_body("Original")).await;
+    let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Original")).await;
     let job_id = created["id"].as_str().unwrap();
 
     let update_body = json!({"name": "Updated Name", "enabled": false});
@@ -500,7 +556,7 @@ async fn cj9_update_schedule_type() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let created = create_job(&mut app, &token, &csrf, create_job_body("Schedule Change")).await;
+    let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Schedule Change")).await;
     let job_id = created["id"].as_str().unwrap();
 
     let update_body = json!({"schedule": {"kind": "cron", "expr": "0 */5 * * * *"}});
@@ -520,6 +576,7 @@ async fn cj9b_update_schedule_preserves_existing_timezone_when_omitted() {
 
     let created = create_job(
         &mut app,
+        &services,
         &token,
         &csrf,
         json!({
@@ -565,7 +622,7 @@ async fn cj11_delete_job() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let created = create_job(&mut app, &token, &csrf, create_job_body("To Delete")).await;
+    let created = create_job(&mut app, &services, &token, &csrf, create_job_body("To Delete")).await;
     let job_id = created["id"].as_str().unwrap();
 
     let req = delete_with_token(&format!("/api/cron/jobs/{job_id}"), &token, &csrf);
@@ -614,7 +671,7 @@ async fn rn1_run_now_returns_conversation_id_for_new_conversation_job() {
 
     let mut body = create_job_body("Run Now Job");
     body["conversation_id"] = json!(conversation_id);
-    let created = create_job(&mut app, &token, &csrf, body).await;
+    let created = create_job(&mut app, &services, &token, &csrf, body).await;
     let job_id = created["id"].as_str().unwrap();
 
     let req = json_with_token(
@@ -654,7 +711,7 @@ async fn rn1b_run_now_returns_active_conversation_when_conversation_is_busy() {
 
     let mut body = create_job_body("Busy Run Now Job");
     body["conversation_id"] = json!(conversation_id);
-    let created = create_job(&mut app, &token, &csrf, body).await;
+    let created = create_job(&mut app, &services, &token, &csrf, body).await;
     let job_id = created["id"].as_str().unwrap();
 
     let claim = services
@@ -686,6 +743,7 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
     let mcp_repo = SqliteMcpServerRepository::new(services.database.pool().clone());
     let fixed_mcp = mcp_repo
         .create(CreateMcpServerParams {
+            user_id: "system_default_user",
             name: "fixed-mcp",
             description: None,
             enabled: true,
@@ -699,6 +757,7 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
         .expect("create fixed mcp");
     let extra_mcp = mcp_repo
         .create(CreateMcpServerParams {
+            user_id: "system_default_user",
             name: "extra-mcp",
             description: None,
             enabled: true,
@@ -784,8 +843,13 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
         .expect("run-now should return created conversation id");
 
     let conversation_repo = SqliteConversationRepository::new(services.database.pool().clone());
+    let user_id = conversation_repo
+        .owner_user_id(conversation_id)
+        .await
+        .expect("load conversation owner")
+        .expect("conversation should have an owner");
     let conversation = conversation_repo
-        .get(conversation_id)
+        .get(&user_id, conversation_id)
         .await
         .expect("load conversation")
         .expect("conversation should exist");
@@ -805,7 +869,7 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
     assert_ne!(fixed_mcp.id, extra_mcp.id, "fixture should seed two distinct MCP rows");
 
     let snapshot = conversation_repo
-        .get_assistant_snapshot(conversation_id)
+        .get_assistant_snapshot(&user_id, conversation_id)
         .await
         .expect("load assistant snapshot")
         .expect("preset assistant cron conversation should persist snapshot");
@@ -830,7 +894,7 @@ async fn sk1_save_skill() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let created = create_job(&mut app, &token, &csrf, create_job_body("Skill Job")).await;
+    let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Skill Job")).await;
     let job_id = created["id"].as_str().unwrap();
 
     let skill_body = json!({"content": "---\nname: test\ndescription: test skill\n---\nDo something"});
@@ -852,7 +916,7 @@ async fn sk2_has_skill_true() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let created = create_job(&mut app, &token, &csrf, create_job_body("Skill Check")).await;
+    let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Skill Check")).await;
     let job_id = created["id"].as_str().unwrap();
 
     let skill_body = json!({"content": "---\nname: x\n---\nContent"});
@@ -880,7 +944,7 @@ async fn sk3_has_skill_false() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let created = create_job(&mut app, &token, &csrf, create_job_body("No Skill")).await;
+    let created = create_job(&mut app, &services, &token, &csrf, create_job_body("No Skill")).await;
     let job_id = created["id"].as_str().unwrap();
 
     let req = get_with_token(&format!("/api/cron/jobs/{job_id}/skill"), &token);
@@ -898,7 +962,7 @@ async fn sk4_save_empty_skill() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let created = create_job(&mut app, &token, &csrf, create_job_body("Empty Skill")).await;
+    let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Empty Skill")).await;
     let job_id = created["id"].as_str().unwrap();
 
     let skill_body = json!({"content": ""});
@@ -920,7 +984,7 @@ async fn sk5_save_placeholder_skill() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let created = create_job(&mut app, &token, &csrf, create_job_body("Placeholder Skill")).await;
+    let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Placeholder Skill")).await;
     let job_id = created["id"].as_str().unwrap();
 
     let skill_body = json!({"content": "TODO: fill in later"});
@@ -961,7 +1025,7 @@ async fn sk7_delete_skill() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let created = create_job(&mut app, &token, &csrf, create_job_body("Delete Skill Job")).await;
+    let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Delete Skill Job")).await;
     let job_id = created["id"].as_str().unwrap();
 
     let save_req = json_with_token(
@@ -1028,7 +1092,7 @@ async fn sc6_cron_with_timezone() {
         "agent_config": default_assistant_agent_config("Shanghai Job")
     });
 
-    let data = create_job(&mut app, &token, &csrf, body).await;
+    let data = create_job(&mut app, &services, &token, &csrf, body).await;
     let now = aionui_common::now_ms();
     assert!(data["state"]["next_run_at_ms"].as_i64().unwrap() > now);
 }
@@ -1073,4 +1137,74 @@ async fn sc8_every_negative_interval() {
     let req = json_with_token("POST", "/api/cron/jobs", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── Cross-account: cron job may not bind another user's conversation ─
+//
+// Real HTTP round-trip for the CROSS_ACCOUNT_REFERENCE contract: user B
+// creates a cron job whose conversation_id belongs to user A and must get a
+// 409 with the exact error code — not a generic conflict.
+
+#[tokio::test]
+async fn cross_account_conversation_reference_returns_409_over_http() {
+    let (mut app, services) = build_app().await;
+
+    // User A owns a conversation.
+    let (_token_a, _csrf_a) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let user_a = services
+        .user_repo
+        .find_by_username("admin")
+        .await
+        .unwrap()
+        .expect("admin user should exist");
+    ensure_conversation(&services, &user_a.id, "conv_cross_acct", "A's Conversation").await;
+
+    // User B (their own assistant, so agent resolution succeeds and the
+    // request reaches the conversation ownership check).
+    let (token_b, csrf_b) = setup_and_login(&mut app, &services, "mallory", "StrongP@ss2").await;
+    let req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "cron-e2e-assistant-b",
+            "name": "Mallory Assistant",
+            "agent_id": "2d23ff1c"
+        }),
+        &token_b,
+        &csrf_b,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::CREATED || resp.status() == StatusCode::CONFLICT,
+        "assistant seed for B failed: {}",
+        resp.status()
+    );
+
+    let body = json!({
+        "name": "Steal A's Conversation",
+        "schedule": { "kind": "every", "every_ms": 60000 },
+        "message": "x",
+        "conversation_id": "conv_cross_acct",
+        "created_by": "user",
+        "agent_config": { "name": "Steal A's Conversation", "assistant_id": "cron-e2e-assistant-b" }
+    });
+    let req = json_with_token("POST", "/api/cron/jobs", body, &token_b, &csrf_b);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "cross-account bind must be 409");
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["code"], "CROSS_ACCOUNT_REFERENCE",
+        "must surface the exact contract code, got: {json}"
+    );
+
+    // And no job leaked into the store for either user.
+    let repo = SqliteCronRepository::new(services.database.pool().clone());
+    assert!(repo.list_all_for_user(&user_a.id).await.unwrap().is_empty());
+    let user_b = services
+        .user_repo
+        .find_by_username("mallory")
+        .await
+        .unwrap()
+        .expect("mallory should exist");
+    assert!(repo.list_all_for_user(&user_b.id).await.unwrap().is_empty());
 }

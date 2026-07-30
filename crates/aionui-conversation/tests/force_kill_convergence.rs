@@ -78,7 +78,14 @@ async fn setup_repo() -> (Arc<SqliteConversationRepository>, aionui_db::Database
 
 fn session_task() -> Arc<SessionAgentTask> {
     let backend: Arc<dyn SessionBackend> = Arc::new(PendingBackend);
-    SessionAgentTask::new(AgentType::Acp, "conv-1".into(), "/w".into(), backend, None)
+    SessionAgentTask::new(
+        AgentType::Acp,
+        "conv-1".into(),
+        "user-1".into(),
+        "/w".into(),
+        backend,
+        None,
+    )
 }
 
 /// T7: a cancelling, in-flight Session turn is gated (`can_send_message=false`);

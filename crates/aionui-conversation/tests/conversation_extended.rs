@@ -207,7 +207,7 @@ async fn t7_1_reset_clears_messages_and_status() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
     // Insert messages
     for i in 0..3 {
-        repo.insert_message(&make_message(&conv.id, &format!("msg {i}"), i))
+        repo.insert_message(USER_ID, &make_message(&conv.id, &format!("msg {i}"), i))
             .await
             .unwrap();
     }
@@ -259,7 +259,7 @@ async fn t8_2_cursor_pagination() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     for i in 0..10 {
-        repo.insert_message(&make_message(&conv.id, &format!("msg {i}"), i * 100))
+        repo.insert_message(USER_ID, &make_message(&conv.id, &format!("msg {i}"), i * 100))
             .await
             .unwrap();
     }
@@ -299,7 +299,7 @@ async fn t8_3_asc_order_default() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     for i in 0..3 {
-        repo.insert_message(&make_message(&conv.id, &format!("msg {i}"), i * 1000))
+        repo.insert_message(USER_ID, &make_message(&conv.id, &format!("msg {i}"), i * 1000))
             .await
             .unwrap();
     }
@@ -319,7 +319,7 @@ async fn t8_4_asc_order() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     for i in 0..3 {
-        repo.insert_message(&make_message(&conv.id, &format!("msg {i}"), i * 1000))
+        repo.insert_message(USER_ID, &make_message(&conv.id, &format!("msg {i}"), i * 1000))
             .await
             .unwrap();
     }
@@ -419,7 +419,7 @@ async fn t8_9_anchor_returns_window_containing_target() {
         if i == 3 {
             target_id = msg.id.clone();
         }
-        repo.insert_message(&msg).await.unwrap();
+        repo.insert_message(USER_ID, &msg).await.unwrap();
     }
 
     let page = svc
@@ -449,7 +449,7 @@ async fn t8_6_compact_mode_truncates_large_tool_content_only_for_list_response()
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
     let large_output = "match line\n".repeat(10_000);
 
-    repo.insert_message(&make_acp_tool_message(&conv.id, "tool-big", &large_output, 0))
+    repo.insert_message(USER_ID, &make_acp_tool_message(&conv.id, "tool-big", &large_output, 0))
         .await
         .unwrap();
 
@@ -492,9 +492,12 @@ async fn t8_7_get_message_returns_full_tool_content_after_compact_list() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
     let large_output = "wide rg output\n".repeat(10_000);
 
-    repo.insert_message(&make_acp_tool_message(&conv.id, "tool-detail", &large_output, 0))
-        .await
-        .unwrap();
+    repo.insert_message(
+        USER_ID,
+        &make_acp_tool_message(&conv.id, "tool-detail", &large_output, 0),
+    )
+    .await
+    .unwrap();
 
     let _ = svc
         .list_messages(
@@ -537,10 +540,10 @@ async fn t9_1_keyword_match() {
     let workspace = ensure_test_workspace_path();
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
-    repo.insert_message(&make_message(&conv.id, "Rust review report", 0))
+    repo.insert_message(USER_ID, &make_message(&conv.id, "Rust review report", 0))
         .await
         .unwrap();
-    repo.insert_message(&make_message(&conv.id, "Python test", 100))
+    repo.insert_message(USER_ID, &make_message(&conv.id, "Python test", 100))
         .await
         .unwrap();
 
@@ -567,7 +570,7 @@ async fn t9_1_keyword_match() {
 async fn t9_2_no_match() {
     let (svc, repo, _b) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
-    repo.insert_message(&make_message(&conv.id, "hello world", 0))
+    repo.insert_message(USER_ID, &make_message(&conv.id, "hello world", 0))
         .await
         .unwrap();
 
@@ -587,9 +590,12 @@ async fn t9_3_search_pagination() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     for i in 0..5 {
-        repo.insert_message(&make_message(&conv.id, &format!("match keyword item {i}"), i * 100))
-            .await
-            .unwrap();
+        repo.insert_message(
+            USER_ID,
+            &make_message(&conv.id, &format!("match keyword item {i}"), i * 100),
+        )
+        .await
+        .unwrap();
     }
 
     let query = SearchMessagesQuery {
@@ -632,7 +638,7 @@ async fn t9_5_preview_text_extracts_from_json_content() {
         hidden: false,
         created_at: now_ms(),
     };
-    repo.insert_message(&complex_msg).await.unwrap();
+    repo.insert_message(USER_ID, &complex_msg).await.unwrap();
 
     let query = SearchMessagesQuery {
         keyword: "search".into(),
@@ -664,7 +670,7 @@ async fn t9_6_search_result_includes_conversation_model() {
     .unwrap();
     let conv = svc.create(USER_ID, aionrs_req).await.unwrap();
 
-    repo.insert_message(&make_message(&conv.id, "model test keyword", 0))
+    repo.insert_message(USER_ID, &make_message(&conv.id, "model test keyword", 0))
         .await
         .unwrap();
 
@@ -687,7 +693,7 @@ async fn t9_7_search_does_not_leak_other_users_messages() {
     let (svc, repo, _b) = setup().await;
 
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
-    repo.insert_message(&make_message(&conv.id, "secret keyword data", 0))
+    repo.insert_message(USER_ID, &make_message(&conv.id, "secret keyword data", 0))
         .await
         .unwrap();
 
@@ -768,7 +774,7 @@ async fn t10_3_associated_not_found() {
 async fn t12_4_search_sql_injection() {
     let (svc, repo, _b) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
-    repo.insert_message(&make_message(&conv.id, "safe content", 0))
+    repo.insert_message(USER_ID, &make_message(&conv.id, "safe content", 0))
         .await
         .unwrap();
 
@@ -788,7 +794,9 @@ async fn t12_4_search_sql_injection() {
 async fn messages_wrong_user_returns_not_found() {
     let (svc, repo, _b) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
-    repo.insert_message(&make_message(&conv.id, "hello", 0)).await.unwrap();
+    repo.insert_message(USER_ID, &make_message(&conv.id, "hello", 0))
+        .await
+        .unwrap();
 
     let err = svc
         .list_messages("other_user", &conv.id, ListMessagesQuery::default())

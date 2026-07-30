@@ -138,6 +138,8 @@ impl RealtimeError {
 
 /// Per-connection client state maintained by the server.
 pub struct ClientInfo {
+    /// Internal user ID this connection is authenticated as.
+    pub user_id: String,
     /// The JWT token this connection authenticated with.
     pub token: String,
     /// Timestamp of last ping/pong activity.

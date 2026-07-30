@@ -11,6 +11,11 @@ pub const TEAM_RUNTIME_TOKEN_SESSION_GENERATION: &str = "default";
 pub enum RuntimeTokenScope {
     TeamContext,
     TeamCall,
+    /// Conversation-scoped helper CLI access (`aioncore config` / `diagnose`
+    /// invoked from inside an agent conversation). Grants the token holder the
+    /// bound user's identity on ordinary API routes via the auth middleware's
+    /// runtime-token channel — it does NOT grant team-tools access.
+    ConversationHelper,
 }
 
 impl RuntimeTokenScope {
@@ -18,6 +23,7 @@ impl RuntimeTokenScope {
         match self {
             Self::TeamContext => "team:context",
             Self::TeamCall => "team:call",
+            Self::ConversationHelper => "conversation:helper",
         }
     }
 }

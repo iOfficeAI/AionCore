@@ -17,6 +17,7 @@ use crate::commands::diagnose_capabilities;
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
 const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
 const ENV_USER_ID: &str = "AIONUI_USER_ID";
+const ENV_RUNTIME_TOKEN: &str = "AIONUI_RUNTIME_TOKEN";
 const ENV_LOG_DIR: &str = "AIONUI_LOG_DIR";
 const MAX_HTTP_OUTPUT_BYTES: usize = 200_000;
 const MAX_LOG_LINES: usize = 1000;
@@ -259,6 +260,10 @@ struct DiagnoseEnv {
     base_url: String,
     conversation_id: String,
     user_id: String,
+    /// Conversation-helper credential minted by the backend. Optional so the
+    /// CLI stays usable against runtimes that predate token injection; the
+    /// backend rejects tokenless requests in AionPro mode.
+    runtime_token: Option<String>,
 }
 
 impl DiagnoseEnv {
@@ -267,8 +272,16 @@ impl DiagnoseEnv {
             base_url: required_env(command, ENV_BASE_URL)?.trim_end_matches('/').to_owned(),
             conversation_id: required_env(command, ENV_CONVERSATION_ID)?,
             user_id: required_env(command, ENV_USER_ID)?,
+            runtime_token: optional_env(ENV_RUNTIME_TOKEN),
         })
     }
+}
+
+fn optional_env(name: &'static str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn required_env(command: &str, name: &'static str) -> Result<String, DiagnoseError> {
@@ -293,21 +306,22 @@ async fn request_json(
     command: &str,
 ) -> Result<Value, DiagnoseError> {
     let url = format!("{}{}", env.base_url, path);
-    let response = client
+    let mut request = client
         .get(&url)
         .header("content-type", "application/json")
         .header("x-aionui-conversation-id", &env.conversation_id)
-        .header("x-aionui-user-id", &env.user_id)
-        .send()
-        .await
-        .map_err(|_| {
-            DiagnoseError::new(
-                DiagnoseErrorCode::HttpRequestFailed,
-                command,
-                "failed to call AionUi backend",
-            )
-            .field("path", path)
-        })?;
+        .header("x-aionui-user-id", &env.user_id);
+    if let Some(runtime_token) = &env.runtime_token {
+        request = request.header("x-aionui-runtime-token", runtime_token);
+    }
+    let response = request.send().await.map_err(|_| {
+        DiagnoseError::new(
+            DiagnoseErrorCode::HttpRequestFailed,
+            command,
+            "failed to call AionUi backend",
+        )
+        .field("path", path)
+    })?;
 
     let status = response.status();
     let text = response.text().await.map_err(|_| {

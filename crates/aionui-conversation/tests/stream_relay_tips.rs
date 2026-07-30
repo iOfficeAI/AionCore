@@ -70,6 +70,7 @@ async fn persist_info_tip_preserves_code_and_params() {
 
     let messages = repo
         .list_messages_page(
+            "system_default_user",
             "conv-1",
             &MessagePageParams {
                 limit: 100,

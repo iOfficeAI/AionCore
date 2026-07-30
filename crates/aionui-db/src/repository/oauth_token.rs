@@ -10,22 +10,23 @@ use crate::models::OAuthTokenRow;
 #[async_trait::async_trait]
 pub trait IOAuthTokenRepository: Send + Sync {
     /// Gets a token by server URL, or `None` if not found.
-    async fn get_by_url(&self, server_url: &str) -> Result<Option<OAuthTokenRow>, DbError>;
+    async fn get_by_url(&self, user_id: &str, server_url: &str) -> Result<Option<OAuthTokenRow>, DbError>;
 
     /// Inserts or updates a token for the given server URL.
     async fn upsert(&self, params: UpsertOAuthTokenParams<'_>) -> Result<OAuthTokenRow, DbError>;
 
     /// Deletes a token by server URL. Returns `DbError::NotFound` if the URL
     /// doesn't exist.
-    async fn delete(&self, server_url: &str) -> Result<(), DbError>;
+    async fn delete(&self, user_id: &str, server_url: &str) -> Result<(), DbError>;
 
     /// Returns the list of server URLs that have stored tokens.
-    async fn list_authenticated_urls(&self) -> Result<Vec<String>, DbError>;
+    async fn list_authenticated_urls(&self, user_id: &str) -> Result<Vec<String>, DbError>;
 }
 
 /// Parameters for inserting or updating an OAuth token.
 #[derive(Debug)]
 pub struct UpsertOAuthTokenParams<'a> {
+    pub user_id: &'a str,
     pub server_url: &'a str,
     pub access_token: &'a str,
     pub refresh_token: Option<&'a str>,

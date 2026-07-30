@@ -52,10 +52,18 @@ pub fn resolve_agent_binding_from_rows(rows: &[AgentMetadataRow], value: &str) -
         .map(binding_resolution_for_agent)
 }
 
-pub async fn resolve_agent_binding(pool: &SqlitePool, value: &str) -> Result<Option<AgentBindingResolution>, DbError> {
+pub async fn resolve_agent_binding_for_user(
+    pool: &SqlitePool,
+    user_id: &str,
+    value: &str,
+) -> Result<Option<AgentBindingResolution>, DbError> {
     let repo = SqliteAgentMetadataRepository::new(pool.clone());
-    let rows = repo.list_all().await?;
+    let rows = repo.list_all_for_user(user_id).await?;
     Ok(resolve_agent_binding_from_rows(&rows, value))
+}
+
+pub async fn resolve_agent_binding(pool: &SqlitePool, value: &str) -> Result<Option<AgentBindingResolution>, DbError> {
+    resolve_agent_binding_for_user(pool, "system_default_user", value).await
 }
 
 fn agent_match_rank(row: &AgentMetadataRow) -> (i32, i64, &str) {
@@ -75,7 +83,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_agent_binding_uses_safe_agent_metadata_reads() {
         let db = init_database_memory().await.unwrap();
-        sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE id = ?")
+        sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE agent_id = ?")
             .bind("2d23ff1c")
             .execute(db.pool())
             .await

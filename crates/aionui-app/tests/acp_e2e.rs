@@ -16,6 +16,16 @@ use aionui_db::{
 
 use common::{body_json, build_app, get_with_token, json_with_token, setup_and_login};
 
+async fn user_id_for_username(services: &aionui_app::AppServices, username: &str) -> String {
+    services
+        .user_repo
+        .find_by_username(username)
+        .await
+        .unwrap()
+        .expect("test user should exist")
+        .id
+}
+
 // ── Global ACP routes ────────────────────────────────────────────
 
 #[tokio::test]
@@ -71,35 +81,39 @@ async fn test_custom_agent_nonexistent_command() {
 async fn management_list_includes_missing_custom_agents() {
     let (mut app, services) = build_app().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let user_id = user_id_for_username(&services, "user1").await;
 
     let repo: std::sync::Arc<dyn IAgentMetadataRepository> =
         std::sync::Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone()));
-    repo.upsert(&UpsertAgentMetadataParams {
-        id: "custom-missing-agent",
-        icon: None,
-        name: "Missing Custom Agent",
-        name_i18n: None,
-        description: None,
-        description_i18n: None,
-        backend: Some("claude"),
-        agent_type: "acp",
-        agent_source: "custom",
-        agent_source_info: Some(r#"{"binary_name":"aionui-missing-agent-binary"}"#),
-        enabled: true,
-        command: Some("aionui-missing-agent-binary"),
-        args: Some("[]"),
-        env: Some("[]"),
-        native_skills_dirs: None,
-        behavior_policy: None,
-        yolo_id: None,
-        agent_capabilities: None,
-        auth_methods: None,
-        config_options: None,
-        available_modes: None,
-        available_models: None,
-        available_commands: None,
-        sort_order: 1500,
-    })
+    repo.upsert_for_user(
+        &user_id,
+        &UpsertAgentMetadataParams {
+            id: "custom-missing-agent",
+            icon: None,
+            name: "Missing Custom Agent",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("claude"),
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some(r#"{"binary_name":"aionui-missing-agent-binary"}"#),
+            enabled: true,
+            command: Some("aionui-missing-agent-binary"),
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 1500,
+        },
+    )
     .await
     .unwrap();
     services.agent_registry.hydrate().await.unwrap();
@@ -122,38 +136,43 @@ async fn management_list_includes_missing_custom_agents() {
 async fn management_list_marks_rows_with_unavailable_snapshot() {
     let (mut app, services) = build_app().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let user_id = user_id_for_username(&services, "user1").await;
 
     let repo: std::sync::Arc<dyn IAgentMetadataRepository> =
         std::sync::Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone()));
-    repo.upsert(&UpsertAgentMetadataParams {
-        id: "custom-unavailable-agent",
-        icon: None,
-        name: "Unavailable Custom Agent",
-        name_i18n: None,
-        description: None,
-        description_i18n: None,
-        backend: Some("claude"),
-        agent_type: "acp",
-        agent_source: "custom",
-        agent_source_info: Some(r#"{"binary_name":"cargo"}"#),
-        enabled: true,
-        command: Some("cargo"),
-        args: Some("[]"),
-        env: Some("[]"),
-        native_skills_dirs: None,
-        behavior_policy: None,
-        yolo_id: None,
-        agent_capabilities: None,
-        auth_methods: None,
-        config_options: None,
-        available_modes: None,
-        available_models: None,
-        available_commands: None,
-        sort_order: 1500,
-    })
+    repo.upsert_for_user(
+        &user_id,
+        &UpsertAgentMetadataParams {
+            id: "custom-unavailable-agent",
+            icon: None,
+            name: "Unavailable Custom Agent",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("claude"),
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some(r#"{"binary_name":"cargo"}"#),
+            enabled: true,
+            command: Some("cargo"),
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 1500,
+        },
+    )
     .await
     .unwrap();
-    repo.update_availability_snapshot(
+    repo.update_availability_snapshot_for_user(
+        &user_id,
         "custom-unavailable-agent",
         &UpdateAgentAvailabilitySnapshotParams {
             last_check_status: Some("offline"),
@@ -198,35 +217,39 @@ async fn legacy_agents_endpoint_is_not_found() {
 async fn health_check_by_id_returns_missing_status_for_uninstalled_agent() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let user_id = user_id_for_username(&services, "user1").await;
 
     let repo: std::sync::Arc<dyn IAgentMetadataRepository> =
         std::sync::Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone()));
-    repo.upsert(&UpsertAgentMetadataParams {
-        id: "custom-missing-agent",
-        icon: None,
-        name: "Missing Custom Agent",
-        name_i18n: None,
-        description: None,
-        description_i18n: None,
-        backend: Some("claude"),
-        agent_type: "acp",
-        agent_source: "custom",
-        agent_source_info: Some(r#"{"binary_name":"aionui-missing-agent-binary"}"#),
-        enabled: true,
-        command: Some("aionui-missing-agent-binary"),
-        args: Some("[]"),
-        env: Some("[]"),
-        native_skills_dirs: None,
-        behavior_policy: None,
-        yolo_id: None,
-        agent_capabilities: None,
-        auth_methods: None,
-        config_options: None,
-        available_modes: None,
-        available_models: None,
-        available_commands: None,
-        sort_order: 1500,
-    })
+    repo.upsert_for_user(
+        &user_id,
+        &UpsertAgentMetadataParams {
+            id: "custom-missing-agent",
+            icon: None,
+            name: "Missing Custom Agent",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("claude"),
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some(r#"{"binary_name":"aionui-missing-agent-binary"}"#),
+            enabled: true,
+            command: Some("aionui-missing-agent-binary"),
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 1500,
+        },
+    )
     .await
     .unwrap();
     services.agent_registry.hydrate().await.unwrap();

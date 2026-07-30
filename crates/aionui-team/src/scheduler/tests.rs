@@ -94,7 +94,14 @@ fn make_manager(agents: &[TeamAgent]) -> (TeammateManager, Arc<RecordingBroadcas
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), agents, mailbox, task_board, broadcaster.clone());
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        agents,
+        mailbox,
+        task_board,
+        broadcaster.clone(),
+    );
     (mgr, broadcaster)
 }
 
@@ -463,7 +470,14 @@ async fn execute_send_message_writes_to_mailbox() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     let action = SchedulerAction::SendMessage {
         to: "worker-1".into(),
@@ -486,7 +500,14 @@ async fn execute_broadcast_message_writes_to_all_others() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     let action = SchedulerAction::SendMessage {
         to: "*".into(),
@@ -512,7 +533,14 @@ async fn execute_task_create() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board.clone(), broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox,
+        task_board.clone(),
+        broadcaster,
+    );
 
     let action = SchedulerAction::TaskCreate {
         subject: "Implement feature".into(),
@@ -537,7 +565,14 @@ async fn execute_task_update() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board.clone(), broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox,
+        task_board.clone(),
+        broadcaster,
+    );
 
     let task = task_board.create_task("t1", "Work", None, None, &[]).await.unwrap();
 
@@ -563,7 +598,14 @@ async fn execute_idle_notification_writes_to_lead_mailbox() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
 
@@ -587,7 +629,14 @@ async fn lead_idle_notification_does_not_write_to_self() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     mgr.set_status("lead-1", TeammateStatus::Working).await.unwrap();
 
@@ -609,7 +658,14 @@ async fn execute_shutdown_agent_writes_shutdown_request() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     let action = SchedulerAction::ShutdownAgent {
         slot_id: "worker-1".into(),
@@ -643,7 +699,14 @@ async fn lead_cannot_shutdown_lead() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     let action = SchedulerAction::ShutdownAgent {
         slot_id: "lead-1".into(),
@@ -669,7 +732,14 @@ async fn lead_can_shutdown_worker() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     let action = SchedulerAction::ShutdownAgent {
         slot_id: "worker-1".into(),
@@ -715,7 +785,14 @@ async fn finalize_turn_executes_actions_and_marks_idle() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board.clone(), broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board.clone(),
+        broadcaster,
+    );
 
     mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
     mgr.set_status("worker-2", TeammateStatus::Working).await.unwrap();
@@ -767,7 +844,14 @@ async fn finalize_turn_with_idle_notification_skips_double_idle() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board, broadcaster.clone());
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox,
+        task_board,
+        broadcaster.clone(),
+    );
 
     mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
 
@@ -794,7 +878,7 @@ async fn finalize_turn_all_teammates_done_signals_leader_wake() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board, broadcaster);
+    let mgr = TeammateManager::new("t1".into(), "user-1".into(), &agents, mailbox, task_board, broadcaster);
 
     mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
     mgr.set_status("worker-2", TeammateStatus::Working).await.unwrap();
@@ -814,7 +898,14 @@ async fn wake_payload_includes_tasks_and_unread() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board.clone(), broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board.clone(),
+        broadcaster,
+    );
 
     task_board.create_task("t1", "Task A", None, None, &[]).await.unwrap();
 
@@ -845,7 +936,14 @@ async fn mark_idle_with_summary_writes_idle_notification_to_lead() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
     mgr.mark_idle("worker-1", Some("sub-task done")).await.unwrap();
@@ -865,7 +963,14 @@ async fn mark_idle_without_summary_still_writes_fallback_content() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
     mgr.mark_idle("worker-1", None).await.unwrap();
@@ -883,7 +988,14 @@ async fn mark_idle_from_lead_does_not_write_notification() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     mgr.set_status("lead-1", TeammateStatus::Working).await.unwrap();
     mgr.mark_idle("lead-1", Some("done")).await.unwrap();
@@ -1304,7 +1416,14 @@ async fn write_crash_testament_delivers_to_lead_mailbox() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     mgr.write_crash_testament("worker-1", "Worker1", &CrashReason::ProcessExited, None)
         .await
@@ -1330,7 +1449,14 @@ async fn write_crash_testament_noop_when_no_lead() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     // Should not panic or error
     mgr.write_crash_testament("worker-1", "Worker1", &CrashReason::SessionNotFound, Some("last words"))
@@ -1353,7 +1479,14 @@ async fn write_crash_testament_noop_when_lead_crashes() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     // Lead crashing should not write to itself
     mgr.write_crash_testament("lead-1", "Lead", &CrashReason::ProcessExited, None)
@@ -1410,7 +1543,14 @@ async fn handle_agent_crash_writes_testament_to_lead() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     mgr.handle_agent_crash("worker-1", CrashReason::Unknown("segfault".into()), Some("cleaning up"))
         .await
@@ -1454,7 +1594,14 @@ async fn handle_agent_crash_leader_branch_returns_none() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     mgr.set_status("lead-1", TeammateStatus::Working).await.unwrap();
     assert!(mgr.acquire_wake_lock("lead-1"));
@@ -1564,7 +1711,14 @@ async fn handle_inactivity_timeout_teammate_marks_error_and_wakes_lead() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
 
@@ -1592,7 +1746,14 @@ async fn handle_inactivity_timeout_leader_returns_none_no_mailbox_write() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     mgr.set_status("lead-1", TeammateStatus::Working).await.unwrap();
     assert!(mgr.acquire_wake_lock("lead-1"));
@@ -1669,7 +1830,14 @@ async fn handle_inactivity_timeout_no_lead_returns_none() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     let wake_target = mgr.handle_inactivity_timeout("worker-1").await.unwrap();
 
@@ -1689,7 +1857,14 @@ async fn notify_shutdown_rejected_delivers_to_lead_mailbox() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     mgr.notify_shutdown_rejected("worker-1", "still working on task X")
         .await
@@ -1716,7 +1891,14 @@ async fn notify_shutdown_rejected_noop_when_no_lead() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     mgr.notify_shutdown_rejected("worker-1", "busy").await.unwrap();
 
@@ -1733,7 +1915,14 @@ async fn notify_shutdown_rejected_noop_when_sender_is_lead() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox.clone(), task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox.clone(),
+        task_board,
+        broadcaster,
+    );
 
     mgr.notify_shutdown_rejected("lead-1", "irrelevant").await.unwrap();
 

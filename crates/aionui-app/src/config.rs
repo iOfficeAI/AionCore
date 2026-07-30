@@ -4,6 +4,27 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityMode {
+    Local,
+    WebUi,
+    AionPro,
+}
+
+impl IdentityMode {
+    pub fn auth_label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::WebUi => "webui",
+            Self::AionPro => "aionpro",
+        }
+    }
+
+    pub fn is_local(self) -> bool {
+        self == Self::Local
+    }
+}
+
 /// Application configuration parsed from CLI arguments.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -14,6 +35,8 @@ pub struct AppConfig {
     pub app_version: String,
     /// Run in local embedded mode (skip authentication, use system_default_user).
     pub local: bool,
+    pub identity_mode: IdentityMode,
+    pub bootstrap_secret: Option<String>,
     /// Dump prompt diagnostics under `data_dir/prompt-dumps`.
     pub dump_prompts: bool,
     /// Explicitly authorize backup and rebuild for corruption-like local databases.
@@ -21,6 +44,14 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    pub fn effective_identity_mode(&self) -> IdentityMode {
+        if self.local {
+            IdentityMode::Local
+        } else {
+            self.identity_mode
+        }
+    }
+
     /// Format as `host:port` for socket binding.
     pub fn socket_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
@@ -50,6 +81,8 @@ impl Default for AppConfig {
             work_dir: PathBuf::from("data"),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             local: false,
+            identity_mode: IdentityMode::WebUi,
+            bootstrap_secret: None,
             dump_prompts: false,
             recover_corrupted_database: false,
         }
@@ -75,6 +108,8 @@ mod tests {
         assert_eq!(config.port, 25808);
         assert_eq!(config.data_dir, PathBuf::from("data"));
         assert_eq!(config.app_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(config.identity_mode, IdentityMode::WebUi);
+        assert!(config.bootstrap_secret.is_none());
         assert!(!config.dump_prompts);
         assert!(!config.recover_corrupted_database);
     }

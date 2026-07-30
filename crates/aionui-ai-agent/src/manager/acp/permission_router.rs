@@ -2,7 +2,7 @@ use crate::agent_runtime::AgentRuntime;
 use crate::error::AgentError;
 use crate::protocol::acp::{PermissionDecision, PermissionRequest};
 use crate::protocol::events::{AgentStreamEvent, permission_request_to_event_data};
-use agent_client_protocol::schema::PermissionOptionKind as SdkPermissionOptionKind;
+use agent_client_protocol::schema::v1::PermissionOptionKind as SdkPermissionOptionKind;
 use aionui_api_types::TEAM_MCP_SERVER_NAME;
 use aionui_common::Confirmation;
 use std::collections::HashMap;
@@ -173,11 +173,11 @@ impl PermissionRouter {
 }
 
 #[cfg(test)]
-fn is_auto_approve_tool(request: &agent_client_protocol::schema::RequestPermissionRequest) -> bool {
+fn is_auto_approve_tool(request: &agent_client_protocol::schema::v1::RequestPermissionRequest) -> bool {
     auto_approve_option_id(request).is_some()
 }
 
-fn auto_approve_option_id(request: &agent_client_protocol::schema::RequestPermissionRequest) -> Option<String> {
+fn auto_approve_option_id(request: &agent_client_protocol::schema::v1::RequestPermissionRequest) -> Option<String> {
     let server_name = extract_mcp_server_name(request)?;
     if !AUTO_APPROVE_MCP_SERVERS.contains(&server_name.as_str()) {
         return None;
@@ -185,7 +185,7 @@ fn auto_approve_option_id(request: &agent_client_protocol::schema::RequestPermis
     select_allow_option_id(request)
 }
 
-fn select_allow_option_id(request: &agent_client_protocol::schema::RequestPermissionRequest) -> Option<String> {
+fn select_allow_option_id(request: &agent_client_protocol::schema::v1::RequestPermissionRequest) -> Option<String> {
     request
         .options
         .iter()
@@ -199,7 +199,7 @@ fn select_allow_option_id(request: &agent_client_protocol::schema::RequestPermis
         .map(|option| option.option_id.to_string())
 }
 
-fn extract_mcp_server_name(request: &agent_client_protocol::schema::RequestPermissionRequest) -> Option<String> {
+fn extract_mcp_server_name(request: &agent_client_protocol::schema::v1::RequestPermissionRequest) -> Option<String> {
     extract_mcp_server_from_raw_input(request).or_else(|| {
         request
             .tool_call
@@ -212,7 +212,7 @@ fn extract_mcp_server_name(request: &agent_client_protocol::schema::RequestPermi
 }
 
 fn extract_mcp_server_from_raw_input(
-    request: &agent_client_protocol::schema::RequestPermissionRequest,
+    request: &agent_client_protocol::schema::v1::RequestPermissionRequest,
 ) -> Option<String> {
     request
         .tool_call
@@ -238,7 +238,7 @@ fn extract_mcp_server_from_prefixed_title(title: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::protocol::events::AgentStreamEvent;
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         PermissionOption, PermissionOptionKind as SdkPermissionOptionKind, RequestPermissionRequest,
         ToolCallUpdate as SdkToolCallUpdate, ToolCallUpdateFields, ToolKind as SdkToolKind,
     };

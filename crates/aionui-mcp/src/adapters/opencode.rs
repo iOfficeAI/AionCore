@@ -48,7 +48,7 @@ impl McpAgentAdapter for OpencodeAdapter {
         Ok(config_dir().is_some_and(|d| d.exists()))
     }
 
-    async fn detect_existing(&self) -> Result<Vec<DetectedServer>, McpError> {
+    async fn detect_existing(&self, _user_id: &str) -> Result<Vec<DetectedServer>, McpError> {
         let path = config_file_path().ok_or_else(|| McpError::AgentNotInstalled("opencode".into()))?;
 
         if !path.exists() {

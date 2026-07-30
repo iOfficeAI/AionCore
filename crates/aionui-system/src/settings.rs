@@ -23,10 +23,10 @@ impl SettingsService {
     }
 
     /// Get current system settings, falling back to defaults if not yet persisted.
-    pub async fn get_settings(&self) -> Result<SystemSettingsResponse, SystemError> {
+    pub async fn get_settings(&self, user_id: &str) -> Result<SystemSettingsResponse, SystemError> {
         let row = self
             .repo
-            .get_settings()
+            .get_settings(user_id)
             .await
             .map_err(|e| SystemError::Internal(format!("Failed to get settings: {e}")))?;
 
@@ -42,13 +42,17 @@ impl SettingsService {
     }
 
     /// Partially update system settings. Only fields present in the request are changed.
-    pub async fn update_settings(&self, req: UpdateSettingsRequest) -> Result<SystemSettingsResponse, SystemError> {
+    pub async fn update_settings(
+        &self,
+        user_id: &str,
+        req: UpdateSettingsRequest,
+    ) -> Result<SystemSettingsResponse, SystemError> {
         if let Some(ref lang) = req.language {
             validate_language(lang)?;
         }
 
         // Merge with current settings (or defaults)
-        let current = self.get_settings().await?;
+        let current = self.get_settings(user_id).await?;
 
         let language = req.language.unwrap_or(current.language);
         let notification_enabled = req.notification_enabled.unwrap_or(current.notification_enabled);
@@ -61,6 +65,7 @@ impl SettingsService {
         let row = self
             .repo
             .upsert_settings(
+                user_id,
                 &language,
                 notification_enabled,
                 cron_notification_enabled,
@@ -91,10 +96,21 @@ fn validate_language(lang: &str) -> Result<(), SystemError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_USER_ID: &str = "user-1";
     use aionui_db::{SqliteSettingsRepository, init_database_memory};
 
     async fn setup() -> SettingsService {
         let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, '', 'active', 0, 1, 1)",
+        )
+        .bind(TEST_USER_ID)
+        .bind(TEST_USER_ID)
+        .execute(db.pool())
+        .await
+        .unwrap();
         let repo = Arc::new(SqliteSettingsRepository::new(db.pool().clone()));
         // Leak the db handle so the pool stays alive for the test
         std::mem::forget(db);
@@ -118,7 +134,7 @@ mod tests {
     #[tokio::test]
     async fn get_settings_returns_defaults_when_empty() {
         let svc = setup().await;
-        let settings = svc.get_settings().await.unwrap();
+        let settings = svc.get_settings(TEST_USER_ID).await.unwrap();
         assert_eq!(settings, SystemSettingsResponse::default());
     }
 
@@ -129,7 +145,7 @@ mod tests {
             language: Some("zh-CN".into()),
             ..Default::default()
         };
-        let result = svc.update_settings(req).await.unwrap();
+        let result = svc.update_settings(TEST_USER_ID, req).await.unwrap();
         assert_eq!(result.language, "zh-CN");
         // Other fields stay at defaults
         assert!(result.notification_enabled);
@@ -144,7 +160,7 @@ mod tests {
             command_queue_enabled: Some(true),
             ..Default::default()
         };
-        let result = svc.update_settings(req).await.unwrap();
+        let result = svc.update_settings(TEST_USER_ID, req).await.unwrap();
         assert!(!result.notification_enabled);
         assert!(result.command_queue_enabled);
         assert_eq!(result.language, "en-US");
@@ -153,7 +169,10 @@ mod tests {
     #[tokio::test]
     async fn update_empty_request_returns_current() {
         let svc = setup().await;
-        let result = svc.update_settings(UpdateSettingsRequest::default()).await.unwrap();
+        let result = svc
+            .update_settings(TEST_USER_ID, UpdateSettingsRequest::default())
+            .await
+            .unwrap();
         assert_eq!(result, SystemSettingsResponse::default());
     }
 
@@ -164,22 +183,25 @@ mod tests {
             language: Some("invalid-lang".into()),
             ..Default::default()
         };
-        let err = svc.update_settings(req).await.unwrap_err();
+        let err = svc.update_settings(TEST_USER_ID, req).await.unwrap_err();
         assert!(matches!(err, SystemError::BadRequest(_)));
     }
 
     #[tokio::test]
     async fn update_then_get_reflects_changes() {
         let svc = setup().await;
-        svc.update_settings(UpdateSettingsRequest {
-            language: Some("ja-JP".into()),
-            save_upload_to_workspace: Some(true),
-            ..Default::default()
-        })
+        svc.update_settings(
+            TEST_USER_ID,
+            UpdateSettingsRequest {
+                language: Some("ja-JP".into()),
+                save_upload_to_workspace: Some(true),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
-        let settings = svc.get_settings().await.unwrap();
+        let settings = svc.get_settings(TEST_USER_ID).await.unwrap();
         assert_eq!(settings.language, "ja-JP");
         assert!(settings.save_upload_to_workspace);
     }

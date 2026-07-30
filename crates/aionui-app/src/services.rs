@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::{AppConfig, derive_encryption_key};
+use crate::config::{AppConfig, IdentityMode, derive_encryption_key};
 use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
     RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
@@ -52,6 +52,8 @@ pub struct AppServices {
     pub work_dir: PathBuf,
     /// When `true`, skip JWT authentication and use a fixed default user.
     pub local: bool,
+    pub identity_mode: IdentityMode,
+    pub bootstrap_secret: Option<Arc<str>>,
     pub app_version: String,
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
@@ -97,7 +99,8 @@ impl AppServices {
     pub async fn from_config(database: Database, config: &AppConfig) -> anyhow::Result<Self> {
         let data_dir = config.data_dir.clone();
         let work_dir = config.work_dir.clone();
-        let local = config.local;
+        let identity_mode = config.effective_identity_mode();
+        let local = identity_mode.is_local();
         let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
@@ -169,9 +172,18 @@ impl AppServices {
             .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let skill_paths = Arc::new(aionui_extension::resolve_skill_paths(&app_resource_dir, &data_dir));
-        aionui_extension::sync_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
+        if identity_mode.is_local() {
+            aionui_extension::sync_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
+        } else {
+            // AionPro: never ingest the legacy shared skill directory — its
+            // files carry no account attribution and would only create rows
+            // for the never-logged-in local default user.
+            aionui_extension::sync_builtin_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
+        }
 
         // Absolute path to this process's binary. Reused as the `command` for
         // the stdio MCP bridge spawned by ACP CLIs when a team session is
@@ -259,6 +271,8 @@ impl AppServices {
             dump_prompts,
             work_dir,
             local,
+            identity_mode,
+            bootstrap_secret: config.bootstrap_secret.clone().map(Arc::<str>::from),
             app_version,
             skill_paths,
             skill_repo,

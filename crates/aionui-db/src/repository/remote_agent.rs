@@ -11,24 +11,30 @@ use crate::models::RemoteAgentRow;
 #[async_trait::async_trait]
 pub trait IRemoteAgentRepository: Send + Sync {
     /// Returns all remote agents, ordered by creation time ascending.
-    async fn list(&self) -> Result<Vec<RemoteAgentRow>, DbError>;
+    async fn list(&self, user_id: &str) -> Result<Vec<RemoteAgentRow>, DbError>;
 
     /// Finds a remote agent by ID, or `None` if not found.
-    async fn find_by_id(&self, id: &str) -> Result<Option<RemoteAgentRow>, DbError>;
+    async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<RemoteAgentRow>, DbError>;
 
     /// Creates a new remote agent and returns the inserted row.
     async fn create(&self, params: CreateRemoteAgentParams<'_>) -> Result<RemoteAgentRow, DbError>;
 
     /// Updates an existing remote agent. Returns `DbError::NotFound` if the ID doesn't exist.
-    async fn update(&self, id: &str, params: UpdateRemoteAgentParams<'_>) -> Result<RemoteAgentRow, DbError>;
+    async fn update(
+        &self,
+        user_id: &str,
+        id: &str,
+        params: UpdateRemoteAgentParams<'_>,
+    ) -> Result<RemoteAgentRow, DbError>;
 
     /// Deletes a remote agent by ID. Returns `DbError::NotFound` if the ID doesn't exist.
-    async fn delete(&self, id: &str) -> Result<(), DbError>;
+    async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError>;
 
     /// Updates only the connection status (and optionally last_connected_at).
     /// Returns `DbError::NotFound` if the ID doesn't exist.
     async fn update_status(
         &self,
+        user_id: &str,
         id: &str,
         status: &str,
         last_connected_at: Option<TimestampMs>,
@@ -38,6 +44,7 @@ pub trait IRemoteAgentRepository: Send + Sync {
 /// Parameters for creating a new remote agent.
 #[derive(Debug)]
 pub struct CreateRemoteAgentParams<'a> {
+    pub user_id: &'a str,
     pub name: &'a str,
     pub protocol: &'a str,
     pub url: &'a str,

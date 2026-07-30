@@ -87,7 +87,7 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
-    async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, TeamError>;
+    async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError>;
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;
 
@@ -178,7 +178,7 @@ impl TeamAgentProvisioner {
         let leader_role = TeammateRole::Lead;
         let leader_assistant_id = Self::effective_assistant_id(leader_input.assistant_id.as_deref());
         let leader_backend = self
-            .resolve_requested_backend(leader_input.backend.as_deref(), leader_assistant_id.as_deref())
+            .resolve_requested_backend(user_id, leader_input.backend.as_deref(), leader_assistant_id.as_deref())
             .await?;
         let leader_conversation = self
             .create_team_conversation_for_agent(
@@ -199,6 +199,7 @@ impl TeamAgentProvisioner {
             Some(workspace) => workspace.to_owned(),
             None => {
                 self.resolve_initial_leader_workspace(
+                    user_id,
                     team_id,
                     &leader_conversation.conversation_id,
                     leader_conversation.workspace,
@@ -229,7 +230,7 @@ impl TeamAgentProvisioner {
             let slot_id = generate_id();
             let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
             let backend = self
-                .resolve_requested_backend(input.backend.as_deref(), assistant_id.as_deref())
+                .resolve_requested_backend(user_id, input.backend.as_deref(), assistant_id.as_deref())
                 .await?;
             let conversation = self
                 .create_team_conversation_for_agent(
@@ -294,7 +295,7 @@ impl TeamAgentProvisioner {
         let workspace = self.workspace_resolver().resolve_for_new_agent(row, team).await?;
         let assistant_id = Self::effective_assistant_id(req.assistant_id.as_deref());
         let backend = self
-            .resolve_requested_backend(req.backend.as_deref(), assistant_id.as_deref())
+            .resolve_requested_backend(user_id, req.backend.as_deref(), assistant_id.as_deref())
             .await?;
         let agent = self
             .provision_new_agent(NewAgentProvisioning {
@@ -317,6 +318,7 @@ impl TeamAgentProvisioner {
 
     async fn resolve_requested_backend(
         &self,
+        user_id: &str,
         requested_backend: Option<&str>,
         assistant_id: Option<&str>,
     ) -> Result<String, TeamError> {
@@ -324,7 +326,7 @@ impl TeamAgentProvisioner {
         if let Some(assistant_id) = assistant_id {
             return self
                 .assistant_catalog
-                .resolve_team_selectable_assistant(assistant_id)
+                .resolve_team_selectable_assistant(user_id, assistant_id)
                 .await?
                 .map(|assistant| assistant.backend)
                 .ok_or_else(|| {
@@ -343,7 +345,7 @@ impl TeamAgentProvisioner {
     pub(crate) async fn persist_spawned_agent(&self, req: PersistSpawnedAgentRequest) -> Result<TeamAgent, TeamError> {
         let row = self
             .repo
-            .get_team(&req.team_id)
+            .get_team(&req.user_id, &req.team_id)
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(req.team_id.clone()))?;
         let mut team = Team::from_row(&row)?;
@@ -375,10 +377,13 @@ impl TeamAgentProvisioner {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), TeamError> {
         let team_id = mcp_stdio_cfg.team_id.clone();
-        let transport = self.team_tool_transport(agent).await?;
+        let transport = self.team_tool_transport(user_id, agent).await?;
         match transport {
-            TeamToolTransport::Mcp => self.write_team_mcp_runtime_config(agent, mcp_stdio_cfg).await?,
-            TeamToolTransport::CliAssumed => self.write_team_cli_runtime_config(agent).await?,
+            TeamToolTransport::Mcp => {
+                self.write_team_mcp_runtime_config(user_id, agent, mcp_stdio_cfg)
+                    .await?
+            }
+            TeamToolTransport::CliAssumed => self.write_team_cli_runtime_config(user_id, agent).await?,
         }
         task_manager
             .kill_and_wait(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
@@ -401,8 +406,12 @@ impl TeamAgentProvisioner {
         Ok(())
     }
 
-    pub(crate) async fn team_tool_transport(&self, agent: &TeamAgent) -> Result<TeamToolTransport, TeamError> {
-        let capabilities = self.agent_capabilities(&agent.backend).await?;
+    pub(crate) async fn team_tool_transport(
+        &self,
+        user_id: &str,
+        agent: &TeamAgent,
+    ) -> Result<TeamToolTransport, TeamError> {
+        let capabilities = self.agent_capabilities(user_id, &agent.backend).await?;
         if supports_team_mcp_backend(&agent.backend, capabilities.as_ref()) {
             return Ok(TeamToolTransport::Mcp);
         }
@@ -415,8 +424,8 @@ impl TeamAgentProvisioner {
         )))
     }
 
-    async fn agent_capabilities(&self, backend: &str) -> Result<Option<serde_json::Value>, TeamError> {
-        let Some(metadata) = acp_backend_metadata(&self.agent_metadata_repo, backend).await? else {
+    async fn agent_capabilities(&self, user_id: &str, backend: &str) -> Result<Option<serde_json::Value>, TeamError> {
+        let Some(metadata) = acp_backend_metadata(&self.agent_metadata_repo, user_id, backend).await? else {
             return Ok(None);
         };
         let Some(raw) = metadata
@@ -432,10 +441,11 @@ impl TeamAgentProvisioner {
 
     pub(crate) async fn write_team_mcp_runtime_config(
         &self,
+        user_id: &str,
         agent: &TeamAgent,
         mcp_stdio_cfg: TeamMcpStdioConfig,
     ) -> Result<(), TeamError> {
-        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, &agent.backend).await?;
+        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
         let agent_type = if acp_metadata.is_some() {
             AgentType::Acp
         } else {
@@ -457,8 +467,12 @@ impl TeamAgentProvisioner {
             })
     }
 
-    pub(crate) async fn write_team_cli_runtime_config(&self, agent: &TeamAgent) -> Result<(), TeamError> {
-        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, &agent.backend).await?;
+    pub(crate) async fn write_team_cli_runtime_config(
+        &self,
+        user_id: &str,
+        agent: &TeamAgent,
+    ) -> Result<(), TeamError> {
+        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
         let agent_type = if acp_metadata.is_some() {
             AgentType::Acp
         } else {
@@ -539,7 +553,7 @@ impl TeamAgentProvisioner {
         workspace: Option<&str>,
         session_mode: Option<&str>,
     ) -> Result<ProvisionedConversation, TeamError> {
-        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, backend).await?;
+        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, user_id, backend).await?;
         let agent_type = if acp_metadata.is_some() {
             AgentType::Acp
         } else {
@@ -558,7 +572,7 @@ impl TeamAgentProvisioner {
             session_mode,
         );
         let provider_id = if agent_type == AgentType::Aionrs {
-            self.resolve_provider_for_model(model)
+            self.resolve_provider_for_model(user_id, model)
                 .await
                 .unwrap_or_else(|| backend.to_owned())
         } else {
@@ -607,6 +621,7 @@ impl TeamAgentProvisioner {
 
     async fn resolve_initial_leader_workspace(
         &self,
+        user_id: &str,
         team_id: &str,
         leader_conversation_id: &str,
         created_workspace: Option<String>,
@@ -629,7 +644,10 @@ impl TeamAgentProvisioner {
             return Ok(workspace);
         }
 
-        let workspace = self.conversation_port.create_team_temp_workspace(team_id).await?;
+        let workspace = self
+            .conversation_port
+            .create_team_temp_workspace(user_id, team_id)
+            .await?;
         if let Err(e) = self
             .conversation_port
             .patch_runtime_config(leader_conversation_id, serde_json::json!({ "workspace": workspace }))
@@ -685,8 +703,14 @@ impl TeamAgentProvisioner {
 
     async fn persist_agents(&self, team_id: &str, agents: &[TeamAgent]) -> Result<(), TeamError> {
         let agents_json = serde_json::to_string(agents)?;
+        let row = self
+            .repo
+            .get_team_for_restore(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
         self.repo
             .update_team(
+                &row.user_id,
                 team_id,
                 &UpdateTeamParams {
                     agents: Some(agents_json),
@@ -697,8 +721,8 @@ impl TeamAgentProvisioner {
         Ok(())
     }
 
-    async fn resolve_provider_for_model(&self, model: &str) -> Option<String> {
-        let providers = self.provider_repo.list().await.ok()?;
+    async fn resolve_provider_for_model(&self, user_id: &str, model: &str) -> Option<String> {
+        let providers = self.provider_repo.list(user_id).await.ok()?;
         for provider in providers {
             if !provider.enabled {
                 continue;
@@ -747,7 +771,7 @@ mod tests {
             Ok(None)
         }
 
-        async fn create_team_temp_workspace(&self, _team_id: &str) -> Result<String, TeamError> {
+        async fn create_team_temp_workspace(&self, _user_id: &str, _team_id: &str) -> Result<String, TeamError> {
             Err(TeamError::InvalidRequest("unused".into()))
         }
 
@@ -851,6 +875,7 @@ mod tests {
     impl TeamAssistantCatalogPort for EmptyTeamAssistantCatalog {
         async fn list_team_selectable_assistants(
             &self,
+            _user_id: &str,
         ) -> Result<Vec<crate::ports::TeamAssistantCatalogEntry>, TeamError> {
             Ok(Vec::new())
         }
@@ -861,8 +886,14 @@ mod tests {
         async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
             Ok(Vec::new())
         }
+        async fn list_all_for_user(&self, _user_id: &str) -> Result<Vec<AgentMetadataRow>, DbError> {
+            self.list_all().await
+        }
         async fn get(&self, _id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
             Ok(None)
+        }
+        async fn get_for_user(&self, _user_id: &str, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+            self.get(id).await
         }
         async fn find_by_source_and_name(
             &self,
@@ -871,11 +902,33 @@ mod tests {
         ) -> Result<Option<AgentMetadataRow>, DbError> {
             Ok(None)
         }
+        async fn find_by_source_and_name_for_user(
+            &self,
+            _user_id: &str,
+            agent_source: &str,
+            name: &str,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            self.find_by_source_and_name(agent_source, name).await
+        }
         async fn find_builtin_by_backend(&self, _backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
             Ok(None)
         }
+        async fn find_builtin_by_backend_for_user(
+            &self,
+            _user_id: &str,
+            backend: &str,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            self.find_builtin_by_backend(backend).await
+        }
         async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
             Err(DbError::Init("unused".into()))
+        }
+        async fn upsert_for_user(
+            &self,
+            _user_id: &str,
+            params: &UpsertAgentMetadataParams<'_>,
+        ) -> Result<AgentMetadataRow, DbError> {
+            self.upsert(params).await
         }
         async fn apply_handshake(
             &self,
@@ -884,12 +937,28 @@ mod tests {
         ) -> Result<Option<AgentMetadataRow>, DbError> {
             Ok(None)
         }
+        async fn apply_handshake_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+            params: &UpdateAgentHandshakeParams<'_>,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            self.apply_handshake(id, params).await
+        }
         async fn update_availability_snapshot(
             &self,
             _id: &str,
             _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
         ) -> Result<Option<AgentMetadataRow>, DbError> {
             Ok(None)
+        }
+        async fn update_availability_snapshot_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+            params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            self.update_availability_snapshot(id, params).await
         }
         async fn update_agent_overrides(
             &self,
@@ -899,11 +968,26 @@ mod tests {
         ) -> Result<(), DbError> {
             Ok(())
         }
+        async fn update_agent_overrides_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+            command_override: Option<&str>,
+            env_override: Option<&str>,
+        ) -> Result<(), DbError> {
+            self.update_agent_overrides(id, command_override, env_override).await
+        }
         async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
             Ok(false)
         }
+        async fn set_enabled_for_user(&self, _user_id: &str, id: &str, enabled: bool) -> Result<bool, DbError> {
+            self.set_enabled(id, enabled).await
+        }
         async fn delete(&self, _id: &str) -> Result<bool, DbError> {
             Ok(false)
+        }
+        async fn delete_for_user(&self, _user_id: &str, id: &str) -> Result<bool, DbError> {
+            self.delete(id).await
         }
     }
 
@@ -911,19 +995,24 @@ mod tests {
 
     #[async_trait]
     impl IProviderRepository for EmptyProviderRepo {
-        async fn list(&self) -> Result<Vec<Provider>, DbError> {
+        async fn list(&self, _user_id: &str) -> Result<Vec<Provider>, DbError> {
             Ok(Vec::new())
         }
-        async fn find_by_id(&self, _id: &str) -> Result<Option<Provider>, DbError> {
+        async fn find_by_id(&self, _user_id: &str, _id: &str) -> Result<Option<Provider>, DbError> {
             Ok(None)
         }
         async fn create(&self, _params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
             Err(DbError::Init("unused".into()))
         }
-        async fn update(&self, _id: &str, _params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _params: UpdateProviderParams<'_>,
+        ) -> Result<Provider, DbError> {
             Err(DbError::Init("unused".into()))
         }
-        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
             Ok(())
         }
     }
@@ -976,7 +1065,7 @@ mod tests {
         let mut agent = test_agent();
         agent.backend = "aionrs".into();
 
-        let transport = provisioner.team_tool_transport(&agent).await.unwrap();
+        let transport = provisioner.team_tool_transport("user-test", &agent).await.unwrap();
 
         assert_eq!(transport, TeamToolTransport::Mcp);
     }
@@ -987,7 +1076,7 @@ mod tests {
         let mut agent = test_agent();
         agent.backend = "custom-acp".into();
 
-        let transport = provisioner.team_tool_transport(&agent).await.unwrap();
+        let transport = provisioner.team_tool_transport("user-test", &agent).await.unwrap();
 
         assert_eq!(transport, TeamToolTransport::CliAssumed);
     }
@@ -998,7 +1087,10 @@ mod tests {
         let patches = Arc::new(Mutex::new(Vec::new()));
         let provisioner = test_provisioner_with_patches(events, Arc::clone(&patches));
 
-        provisioner.write_team_cli_runtime_config(&test_agent()).await.unwrap();
+        provisioner
+            .write_team_cli_runtime_config("user-test", &test_agent())
+            .await
+            .unwrap();
 
         let patches = patches.lock().unwrap();
         assert_eq!(patches[0]["team_mcp_stdio_config"], serde_json::Value::Null);

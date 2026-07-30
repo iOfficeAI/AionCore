@@ -62,6 +62,12 @@ pub trait IWorkerTaskManager: Send + Sync {
     /// Number of active tasks (useful for diagnostics).
     fn active_count(&self) -> usize;
 
+    /// Conversation IDs for active tasks, used by callers that need to apply
+    /// owner-aware filtering outside the task manager.
+    fn active_conversation_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Collect tasks eligible for idle cleanup.
     ///
     /// Returns conversation IDs of tasks that:
@@ -129,17 +135,19 @@ impl WorkerTaskManagerImpl {
     }
 
     fn refresh_runtime_token_for_new_task(&self, options: &mut BuildTaskOptions) {
-        if options.context.team.is_none() {
-            return;
-        }
         let Some(service) = &self.runtime_token_service else {
             return;
         };
+        // Helper scope for every conversation; team scopes only when team-bound.
+        let mut scopes = vec![RuntimeTokenScope::ConversationHelper];
+        if options.context.team.is_some() {
+            scopes.extend([RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall]);
+        }
         let issue = service.issue(
             options.context.conversation.user_id.clone(),
             options.context.conversation.conversation_id.clone(),
             TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
+            scopes,
         );
         options
             .context
@@ -283,6 +291,13 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         self.tasks.iter().filter(|entry| entry.value().get().is_some()).count()
     }
 
+    fn active_conversation_ids(&self) -> Vec<String> {
+        self.tasks
+            .iter()
+            .filter_map(|entry| entry.value().get().map(|_| entry.key().clone()))
+            .collect()
+    }
+
     fn collect_idle(&self, idle_threshold_ms: TimestampMs) -> Vec<String> {
         let now = now_ms();
         self.tasks
@@ -336,7 +351,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
 /// (Sentry ELECTRON-1BD).
 #[async_trait]
 impl OnConversationDelete for WorkerTaskManagerImpl {
-    async fn on_conversation_deleted(&self, conversation_id: &str) {
+    async fn on_conversation_deleted(&self, _user_id: &str, conversation_id: &str) {
         if let Err(e) = self.kill(conversation_id, Some(AgentKillReason::ConversationDeleted)) {
             warn!(
                 conversation_id,
@@ -571,6 +586,18 @@ mod tests {
         let instance = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
         assert_eq!(instance.conversation_id(), "conv-1");
         assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn active_conversation_ids_returns_initialized_tasks() {
+        let mgr = make_manager();
+        mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
+        mgr.get_or_build_task("conv-2", make_options("conv-2")).await.unwrap();
+
+        let mut ids = mgr.active_conversation_ids();
+        ids.sort();
+
+        assert_eq!(ids, vec!["conv-1".to_owned(), "conv-2".to_owned()]);
     }
 
     #[tokio::test]

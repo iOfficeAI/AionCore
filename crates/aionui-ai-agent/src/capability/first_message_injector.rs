@@ -11,6 +11,8 @@ use crate::capability::skill_manager::{AcpSkillManager, prepare_first_message_wi
 
 /// Configuration for the first-message injector.
 pub struct InjectionConfig<'a> {
+    /// Core user that owns the conversation and its user-scoped skills.
+    pub user_id: &'a str,
     /// Preset context (assistant-level system prompt injection).
     pub preset_context: Option<&'a str>,
     /// Resolved skill names (snapshot from `conversation.extra.skills`).
@@ -42,7 +44,7 @@ pub async fn inject_first_message_prefix(
         };
     }
 
-    let skills = manager.discover_by_names(config.skills).await;
+    let skills = manager.discover_by_names_for_user(config.user_id, config.skills).await;
     let has_context = config.preset_context.is_some_and(|s| !s.is_empty());
     if skills.is_empty() && !has_context {
         return content.to_string();
@@ -89,6 +91,7 @@ mod tests {
             "Hello",
             &mgr,
             InjectionConfig {
+                user_id: "system_default_user",
                 preset_context: Some("Be concise."),
                 skills: &[],
                 native_skill_support: true,
@@ -110,6 +113,7 @@ mod tests {
             "Hello",
             &mgr,
             InjectionConfig {
+                user_id: "system_default_user",
                 preset_context: None,
                 skills: &[],
                 native_skill_support: true,
@@ -129,6 +133,7 @@ mod tests {
             "Hello",
             &mgr,
             InjectionConfig {
+                user_id: "system_default_user",
                 preset_context: None,
                 skills: &[],
                 native_skill_support: false,
@@ -148,6 +153,7 @@ mod tests {
             "Go.",
             &mgr,
             InjectionConfig {
+                user_id: "system_default_user",
                 preset_context: Some("Rule 1."),
                 skills: &[],
                 native_skill_support: false,
@@ -184,6 +190,7 @@ mod tests {
             "Hello",
             &mgr,
             InjectionConfig {
+                user_id: "system_default_user",
                 preset_context: None,
                 skills: &["cron".to_owned()],
                 native_skill_support: false,
@@ -205,6 +212,7 @@ mod tests {
             "Do stuff",
             &mgr,
             InjectionConfig {
+                user_id: "system_default_user",
                 preset_context: Some("Custom rule"),
                 skills: &["cron".to_owned()],
                 native_skill_support: true,

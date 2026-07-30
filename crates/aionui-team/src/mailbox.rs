@@ -17,11 +17,20 @@ pub struct Mailbox {
     /// broadcast `team.mailboxChanged`. Absent in unit tests that use
     /// [`Mailbox::new`] directly.
     events: Option<Arc<TeamEventEmitter>>,
+    user_id: String,
 }
 
 impl Mailbox {
     pub fn new(repo: Arc<dyn ITeamRepository>) -> Self {
-        Self { repo, events: None }
+        Self::new_for_user(repo, "system_default_user")
+    }
+
+    pub fn new_for_user(repo: Arc<dyn ITeamRepository>, user_id: impl Into<String>) -> Self {
+        Self {
+            repo,
+            events: None,
+            user_id: user_id.into(),
+        }
     }
 
     /// Attaches a real-time event emitter for `team.mailboxChanged` broadcasts.
@@ -70,7 +79,7 @@ impl Mailbox {
             created_at: now_ms(),
         };
 
-        self.repo.write_message(&row).await?;
+        self.repo.write_message(&self.user_id, &row).await?;
 
         debug!(
             team_id,
@@ -89,7 +98,7 @@ impl Mailbox {
     }
 
     pub async fn read_unread(&self, team_id: &str, agent_id: &str) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self.repo.read_unread_and_mark(team_id, agent_id).await?;
+        let rows = self.repo.read_unread_and_mark(&self.user_id, team_id, agent_id).await?;
 
         debug!(team_id, agent_id, count = rows.len(), "mailbox unread messages read");
 
@@ -111,15 +120,15 @@ impl Mailbox {
     /// Reads all unread messages without marking them as read.
     /// Used by the drain_mailbox pattern: peek → prompt → mark_read on success.
     pub async fn peek_unread(&self, team_id: &str, agent_id: &str) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self.repo.peek_unread(team_id, agent_id).await?;
+        let rows = self.repo.peek_unread(&self.user_id, team_id, agent_id).await?;
         debug!(team_id, agent_id, count = rows.len(), "mailbox peek_unread");
         let messages = rows.iter().filter_map(MailboxMessage::from_row).collect();
         Ok(messages)
     }
 
     /// Marks the given message IDs as read. Called after successful prompt delivery.
-    pub async fn mark_read_batch(&self, ids: &[String]) -> Result<(), TeamError> {
-        self.repo.mark_read_batch(ids).await?;
+    pub async fn mark_read_batch(&self, team_id: &str, ids: &[String]) -> Result<(), TeamError> {
+        self.repo.mark_read_batch(&self.user_id, team_id, ids).await?;
 
         // Fetch the (now-read) rows to build full payloads and broadcast one
         // `read` change per message; the frontend upserts by id idempotently.
@@ -150,7 +159,7 @@ impl Mailbox {
         }
         let count = ids.len();
         if !ids.is_empty() {
-            self.mark_read_batch(&ids).await?;
+            self.mark_read_batch(team_id, &ids).await?;
         }
         Ok(count)
     }
@@ -161,18 +170,23 @@ impl Mailbox {
         agent_id: &str,
         limit: Option<i64>,
     ) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self.repo.get_history(team_id, agent_id, limit).await?;
+        let rows = self.repo.get_history(&self.user_id, team_id, agent_id, limit).await?;
         let messages = rows.iter().filter_map(MailboxMessage::from_row).collect();
         Ok(messages)
     }
 
     pub async fn has_unread(&self, team_id: &str, agent_id: &str) -> Result<bool, TeamError> {
-        let rows = self.repo.get_history(team_id, agent_id, None).await?;
+        let rows = self.repo.get_history(&self.user_id, team_id, agent_id, None).await?;
         Ok(rows.iter().any(|r| !r.read))
     }
 
     pub async fn delete_by_team(&self, team_id: &str) -> Result<(), TeamError> {
-        self.repo.delete_mailbox_by_team(team_id).await?;
+        let row = self
+            .repo
+            .get_team_for_restore(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
+        self.repo.delete_mailbox_by_team(&row.user_id, team_id).await?;
         debug!(team_id, "mailbox messages deleted for team");
         Ok(())
     }
@@ -209,7 +223,7 @@ mod tests {
 
     fn mailbox_with_events(repo: Arc<MockTeamRepo>) -> (Mailbox, Arc<RecordingBroadcaster>) {
         let bc = Arc::new(RecordingBroadcaster::new());
-        let emitter = Arc::new(TeamEventEmitter::new("t1".into(), bc.clone()));
+        let emitter = Arc::new(TeamEventEmitter::new("t1".into(), "system_default_user".into(), bc.clone()));
         (Mailbox::new(repo).with_events(emitter), bc)
     }
 
@@ -270,7 +284,7 @@ mod tests {
             .write("t1", "a1", "a2", MailboxMessageType::Message, "m1", None)
             .await
             .unwrap();
-        mailbox.mark_read_batch(&[m.id.clone()]).await.unwrap();
+        mailbox.mark_read_batch("t1", &[m.id.clone()]).await.unwrap();
 
         let read_changes: Vec<_> = mailbox_changes(&bc)
             .into_iter()
@@ -290,7 +304,7 @@ mod tests {
             .await
             .unwrap();
         mailbox.read_unread("t1", "a1").await.unwrap();
-        mailbox.mark_read_batch(&[m.id]).await.unwrap();
+        mailbox.mark_read_batch("t1", &[m.id]).await.unwrap();
         // No broadcaster attached: nothing to assert beyond not panicking.
     }
 

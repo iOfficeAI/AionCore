@@ -102,6 +102,7 @@ async fn run_tool_call_with_empty_call_id_is_not_persisted() {
 
     let messages = repo
         .list_messages_page(
+            "system_default_user",
             "conv-1",
             &MessagePageParams {
                 limit: 100,
@@ -159,6 +160,7 @@ async fn run_tool_call_late_running_event_does_not_regress_completed_message() {
 
     let messages = repo
         .list_messages_page(
+            "system_default_user",
             "conv-1",
             &MessagePageParams {
                 limit: 100,
@@ -225,6 +227,7 @@ async fn run_tool_call_canceled_status_persists_as_terminal_finish() {
 
     let messages = repo
         .list_messages_page(
+            "system_default_user",
             "conv-1",
             &MessagePageParams {
                 limit: 100,
@@ -400,6 +403,7 @@ async fn run_agent_turn_with_empty_call_id_tool_call_is_not_persisted() {
 
     let messages = repo
         .list_messages_page(
+            "system_default_user",
             "conv-1",
             &MessagePageParams {
                 limit: 100,

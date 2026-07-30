@@ -101,6 +101,7 @@ async fn setup_team_with_lead() -> SmokeEnv {
     ];
     let scheduler = Arc::new(TeammateManager::new(
         team_id.clone(),
+        "user-1".into(),
         &agents,
         mailbox.clone(),
         task_board.clone(),

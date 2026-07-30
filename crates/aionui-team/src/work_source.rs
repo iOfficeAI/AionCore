@@ -57,23 +57,6 @@ impl WorkSource {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// AC3 (ELECTRON-3RN): `UserCommand` is aligned with `UserMessage` so it
-    /// shares the Foreground lane (FIFO, no preemption) and mailbox/paused
-    /// semantics, but carries its own `as_str` for the recognition log.
-    #[test]
-    fn user_command_matches_user_message_semantics() {
-        assert_eq!(WorkSource::UserCommand.priority(), WorkPriority::Foreground);
-        assert_eq!(WorkSource::UserCommand.priority(), WorkSource::UserMessage.priority());
-        assert!(WorkSource::UserCommand.resumes_paused_slot());
-        assert!(WorkSource::UserCommand.requires_mailbox_message());
-        assert_eq!(WorkSource::UserCommand.to_string(), "user_command");
-    }
-}
-
 impl fmt::Display for WorkSource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
@@ -91,5 +74,22 @@ impl fmt::Display for WorkSource {
             Self::RecoveryDrain => "recovery_drain",
         };
         formatter.write_str(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AC3 (ELECTRON-3RN): `UserCommand` is aligned with `UserMessage` so it
+    /// shares the Foreground lane (FIFO, no preemption) and mailbox/paused
+    /// semantics, but carries its own `as_str` for the recognition log.
+    #[test]
+    fn user_command_matches_user_message_semantics() {
+        assert_eq!(WorkSource::UserCommand.priority(), WorkPriority::Foreground);
+        assert_eq!(WorkSource::UserCommand.priority(), WorkSource::UserMessage.priority());
+        assert!(WorkSource::UserCommand.resumes_paused_slot());
+        assert!(WorkSource::UserCommand.requires_mailbox_message());
+        assert_eq!(WorkSource::UserCommand.to_string(), "user_command");
     }
 }

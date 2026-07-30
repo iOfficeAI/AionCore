@@ -31,24 +31,34 @@ pub struct McpConfigService {
     repo: Arc<dyn IMcpServerRepository>,
 }
 
+struct UpsertMcpServer<'a> {
+    user_id: &'a str,
+    name: &'a str,
+    description: Option<&'a str>,
+    transport: &'a McpServerTransport,
+    original_json: Option<&'a str>,
+    builtin: bool,
+    enabled: bool,
+}
+
 impl McpConfigService {
     pub fn new(repo: Arc<dyn IMcpServerRepository>) -> Self {
         Self { repo }
     }
 
     /// List all MCP servers.
-    pub async fn list_servers(&self) -> Result<Vec<McpServerResponse>, McpError> {
-        let rows = self.repo.list().await?;
+    pub async fn list_servers(&self, user_id: &str) -> Result<Vec<McpServerResponse>, McpError> {
+        let rows = self.repo.list(user_id).await?;
         rows.into_iter()
             .map(|row| McpServer::from_row(row).map(McpServer::into_response))
             .collect()
     }
 
     /// Get a single MCP server by ID.
-    pub async fn get_server(&self, id: &str) -> Result<McpServerResponse, McpError> {
+    pub async fn get_server(&self, user_id: &str, id: &str) -> Result<McpServerResponse, McpError> {
         let row = self
             .repo
-            .find_by_id(id)
+            .find_by_id(user_id, id)
             .await?
             .ok_or_else(|| McpError::NotFound(id.to_owned()))?;
         let server = McpServer::from_row(row)?;
@@ -59,25 +69,31 @@ impl McpConfigService {
     ///
     /// If a server with the same name already exists, it is updated
     /// (transport, description, original_json) rather than creating a duplicate.
-    pub async fn add_server(&self, req: CreateMcpServerRequest) -> Result<McpServerResponse, McpError> {
+    pub async fn add_server(&self, user_id: &str, req: CreateMcpServerRequest) -> Result<McpServerResponse, McpError> {
         let transport = normalize_transport(McpServerTransport::from(req.transport))?;
-        self.upsert_server(
-            &req.name,
-            req.description.as_deref(),
-            &transport,
-            req.original_json.as_deref(),
-            req.builtin,
-            false,
-        )
+        self.upsert_server(UpsertMcpServer {
+            user_id,
+            name: &req.name,
+            description: req.description.as_deref(),
+            transport: &transport,
+            original_json: req.original_json.as_deref(),
+            builtin: req.builtin,
+            enabled: false,
+        })
         .await
     }
 
     /// Edit an existing MCP server (partial update).
-    pub async fn edit_server(&self, id: &str, req: UpdateMcpServerRequest) -> Result<McpServerResponse, McpError> {
+    pub async fn edit_server(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: UpdateMcpServerRequest,
+    ) -> Result<McpServerResponse, McpError> {
         // Verify the server exists
         let existing_server = self
             .repo
-            .find_by_id(id)
+            .find_by_id(user_id, id)
             .await?
             .ok_or_else(|| McpError::NotFound(id.to_owned()))?;
 
@@ -92,7 +108,7 @@ impl McpConfigService {
 
         // Check name uniqueness if renaming
         if let Some(ref new_name) = req.name
-            && let Some(existing) = self.repo.find_by_name_any(new_name).await?
+            && let Some(existing) = self.repo.find_by_name_any(user_id, new_name).await?
             && existing.id != id
         {
             if existing.builtin {
@@ -121,7 +137,7 @@ impl McpConfigService {
             ..Default::default()
         };
 
-        let row = self.repo.update(id, params).await?;
+        let row = self.repo.update(user_id, id, params).await?;
         let server = McpServer::from_row(row)?;
         Ok(server.into_response())
     }
@@ -129,24 +145,24 @@ impl McpConfigService {
     /// Soft-delete an MCP server by ID.
     ///
     /// Returns whether the deleted server was enabled.
-    pub async fn delete_server(&self, id: &str) -> Result<bool, McpError> {
+    pub async fn delete_server(&self, user_id: &str, id: &str) -> Result<bool, McpError> {
         let row = self
             .repo
-            .find_by_id(id)
+            .find_by_id(user_id, id)
             .await?
             .ok_or_else(|| McpError::NotFound(id.to_owned()))?;
         let was_enabled = row.enabled;
-        self.repo.delete(id).await?;
+        self.repo.delete(user_id, id).await?;
         Ok(was_enabled)
     }
 
     /// Toggle the enabled state of an MCP server.
     ///
     /// Returns the updated server response.
-    pub async fn toggle_server(&self, id: &str) -> Result<McpServerResponse, McpError> {
+    pub async fn toggle_server(&self, user_id: &str, id: &str) -> Result<McpServerResponse, McpError> {
         let row = self
             .repo
-            .find_by_id(id)
+            .find_by_id(user_id, id)
             .await?
             .ok_or_else(|| McpError::NotFound(id.to_owned()))?;
 
@@ -155,7 +171,7 @@ impl McpConfigService {
             enabled: Some(new_enabled),
             ..Default::default()
         };
-        let updated = self.repo.update(id, params).await?;
+        let updated = self.repo.update(user_id, id, params).await?;
         let server = McpServer::from_row(updated)?;
         Ok(server.into_response())
     }
@@ -164,12 +180,16 @@ impl McpConfigService {
     ///
     /// Each server is processed individually: existing names are updated,
     /// new names are created.
-    pub async fn batch_import(&self, req: BatchImportMcpServersRequest) -> Result<Vec<McpServerResponse>, McpError> {
+    pub async fn batch_import(
+        &self,
+        user_id: &str,
+        req: BatchImportMcpServersRequest,
+    ) -> Result<Vec<McpServerResponse>, McpError> {
         let requested_count = req.servers.len();
         let mut rows = Vec::with_capacity(requested_count);
         let mut skipped_reserved_count = 0usize;
         for server_req in req.servers {
-            if let Some(existing) = self.repo.find_by_name_any(&server_req.name).await?
+            if let Some(existing) = self.repo.find_by_name_any(user_id, &server_req.name).await?
                 && existing.builtin
             {
                 skipped_reserved_count += 1;
@@ -182,14 +202,15 @@ impl McpConfigService {
 
             let transport = normalize_transport(McpServerTransport::from(server_req.transport))?;
             let server = self
-                .upsert_server(
-                    &server_req.name,
-                    server_req.description.as_deref(),
-                    &transport,
-                    server_req.original_json.as_deref(),
-                    server_req.builtin,
-                    server_req.enabled.unwrap_or(false),
-                )
+                .upsert_server(UpsertMcpServer {
+                    user_id,
+                    name: &server_req.name,
+                    description: server_req.description.as_deref(),
+                    transport: &transport,
+                    original_json: server_req.original_json.as_deref(),
+                    builtin: server_req.builtin,
+                    enabled: server_req.enabled.unwrap_or(false),
+                })
                 .await?;
             rows.push(server);
         }
@@ -204,28 +225,34 @@ impl McpConfigService {
     }
 
     /// Persist the latest connection test result for an existing MCP server.
-    pub async fn persist_test_result(&self, id: &str, result: &McpConnectionTestResult) -> Result<(), McpError> {
+    pub async fn persist_test_result(
+        &self,
+        user_id: &str,
+        id: &str,
+        result: &McpConnectionTestResult,
+    ) -> Result<(), McpError> {
         let status = if result.success { "connected" } else { "error" };
         let last_connected = if result.success { Some(now_ms()) } else { None };
         let tools_json = result.tools.as_ref().map(serde_json::to_string).transpose()?;
 
-        self.repo.update_status(id, status, last_connected).await?;
-        self.repo.update_tools(id, tools_json.as_deref()).await?;
+        self.repo.update_status(user_id, id, status, last_connected).await?;
+        self.repo.update_tools(user_id, id, tools_json.as_deref()).await?;
         Ok(())
     }
 
-    async fn upsert_server(
-        &self,
-        name: &str,
-        description: Option<&str>,
-        transport: &McpServerTransport,
-        original_json: Option<&str>,
-        builtin: bool,
-        enabled: bool,
-    ) -> Result<McpServerResponse, McpError> {
+    async fn upsert_server(&self, params: UpsertMcpServer<'_>) -> Result<McpServerResponse, McpError> {
+        let UpsertMcpServer {
+            user_id,
+            name,
+            description,
+            transport,
+            original_json,
+            builtin,
+            enabled,
+        } = params;
         let config_json = transport.to_config_json()?;
 
-        if let Some(existing) = self.repo.find_by_name_any(name).await? {
+        if let Some(existing) = self.repo.find_by_name_any(user_id, name).await? {
             if existing.builtin {
                 return Err(McpError::Conflict(format!(
                     "Builtin MCP server name '{name}' is reserved"
@@ -242,12 +269,13 @@ impl McpConfigService {
                 deleted_at: Some(None),
                 ..Default::default()
             };
-            let updated = self.repo.update(&existing.id, params).await?;
+            let updated = self.repo.update(user_id, &existing.id, params).await?;
             let server = McpServer::from_row(updated)?;
             return Ok(server.into_response());
         }
 
         let params = CreateMcpServerParams {
+            user_id,
             name,
             description,
             enabled,
@@ -361,6 +389,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    const TEST_USER_ID: &str = "user-1";
+
     // -- In-memory mock repository -------------------------------------------
 
     #[derive(Debug)]
@@ -390,39 +420,46 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IMcpServerRepository for MockMcpServerRepo {
-        async fn list(&self) -> Result<Vec<McpServerRow>, DbError> {
-            let servers = self.servers.lock().unwrap();
-            Ok(servers.iter().filter(|s| s.deleted_at.is_none()).cloned().collect())
-        }
-
-        async fn find_by_id(&self, id: &str) -> Result<Option<McpServerRow>, DbError> {
-            let servers = self.servers.lock().unwrap();
-            Ok(servers.iter().find(|s| s.id == id && s.deleted_at.is_none()).cloned())
-        }
-
-        async fn find_by_name(&self, name: &str) -> Result<Option<McpServerRow>, DbError> {
+        async fn list(&self, user_id: &str) -> Result<Vec<McpServerRow>, DbError> {
             let servers = self.servers.lock().unwrap();
             Ok(servers
                 .iter()
-                .find(|s| s.name == name && s.deleted_at.is_none())
+                .filter(|s| s.user_id == user_id && s.deleted_at.is_none())
+                .cloned()
+                .collect())
+        }
+
+        async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<McpServerRow>, DbError> {
+            let servers = self.servers.lock().unwrap();
+            Ok(servers
+                .iter()
+                .find(|s| s.user_id == user_id && s.id == id && s.deleted_at.is_none())
                 .cloned())
         }
 
-        async fn find_by_id_any(&self, id: &str) -> Result<Option<McpServerRow>, DbError> {
-            let servers = self.servers.lock().unwrap();
-            Ok(servers.iter().find(|s| s.id == id).cloned())
-        }
-
-        async fn find_by_name_any(&self, name: &str) -> Result<Option<McpServerRow>, DbError> {
-            let servers = self.servers.lock().unwrap();
-            Ok(servers.iter().find(|s| s.name == name).cloned())
-        }
-
-        async fn list_by_ids_any(&self, ids: &[String]) -> Result<Vec<McpServerRow>, DbError> {
+        async fn find_by_name(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, DbError> {
             let servers = self.servers.lock().unwrap();
             Ok(servers
                 .iter()
-                .filter(|server| ids.iter().any(|id| id == &server.id))
+                .find(|s| s.user_id == user_id && s.name == name && s.deleted_at.is_none())
+                .cloned())
+        }
+
+        async fn find_by_id_any(&self, user_id: &str, id: &str) -> Result<Option<McpServerRow>, DbError> {
+            let servers = self.servers.lock().unwrap();
+            Ok(servers.iter().find(|s| s.user_id == user_id && s.id == id).cloned())
+        }
+
+        async fn find_by_name_any(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, DbError> {
+            let servers = self.servers.lock().unwrap();
+            Ok(servers.iter().find(|s| s.user_id == user_id && s.name == name).cloned())
+        }
+
+        async fn list_by_ids_any(&self, user_id: &str, ids: &[String]) -> Result<Vec<McpServerRow>, DbError> {
+            let servers = self.servers.lock().unwrap();
+            Ok(servers
+                .iter()
+                .filter(|server| server.user_id == user_id && ids.iter().any(|id| id == &server.id))
                 .cloned()
                 .collect())
         }
@@ -437,6 +474,7 @@ mod tests {
             }
             let row = McpServerRow {
                 id: self.next_id(),
+                user_id: params.user_id.to_owned(),
                 name: params.name.to_owned(),
                 description: params.description.map(String::from),
                 enabled: params.enabled,
@@ -455,16 +493,24 @@ mod tests {
             Ok(row)
         }
 
-        async fn update(&self, id: &str, params: UpdateMcpServerParams<'_>) -> Result<McpServerRow, DbError> {
+        async fn update(
+            &self,
+            user_id: &str,
+            id: &str,
+            params: UpdateMcpServerParams<'_>,
+        ) -> Result<McpServerRow, DbError> {
             let mut servers = self.servers.lock().unwrap();
             let idx = servers
                 .iter()
-                .position(|s| s.id == id)
+                .position(|s| s.user_id == user_id && s.id == id)
                 .ok_or_else(|| DbError::NotFound(format!("MCP server {id}")))?;
 
             // Check name conflict
             if let Some(new_name) = params.name {
-                if servers.iter().any(|s| s.name == new_name && s.id != id) {
+                if servers
+                    .iter()
+                    .any(|s| s.user_id == user_id && s.name == new_name && s.id != id)
+                {
                     return Err(DbError::Conflict(format!(
                         "MCP server name '{new_name}' already exists"
                     )));
@@ -499,11 +545,11 @@ mod tests {
             Ok(servers[idx].clone())
         }
 
-        async fn delete(&self, id: &str) -> Result<(), DbError> {
+        async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
             let mut servers = self.servers.lock().unwrap();
             let idx = servers
                 .iter()
-                .position(|s| s.id == id && s.deleted_at.is_none())
+                .position(|s| s.user_id == user_id && s.id == id && s.deleted_at.is_none())
                 .ok_or_else(|| DbError::NotFound(format!("MCP server {id}")))?;
             servers[idx].enabled = false;
             servers[idx].deleted_at = Some(Self::now());
@@ -511,11 +557,18 @@ mod tests {
             Ok(())
         }
 
-        async fn batch_upsert(&self, params_list: &[CreateMcpServerParams<'_>]) -> Result<Vec<McpServerRow>, DbError> {
+        async fn batch_upsert(
+            &self,
+            user_id: &str,
+            params_list: &[CreateMcpServerParams<'_>],
+        ) -> Result<Vec<McpServerRow>, DbError> {
             let mut results = Vec::new();
             for params in params_list {
                 let mut servers = self.servers.lock().unwrap();
-                if let Some(idx) = servers.iter().position(|s| s.name == params.name) {
+                if let Some(idx) = servers
+                    .iter()
+                    .position(|s| s.user_id == user_id && s.name == params.name)
+                {
                     // Update existing
                     servers[idx].description = params.description.map(String::from);
                     servers[idx].transport_type = params.transport_type.to_owned();
@@ -527,6 +580,7 @@ mod tests {
                     // Create new
                     let row = McpServerRow {
                         id: self.next_id(),
+                        user_id: params.user_id.to_owned(),
                         name: params.name.to_owned(),
                         description: params.description.map(String::from),
                         enabled: params.enabled,
@@ -550,6 +604,7 @@ mod tests {
 
         async fn update_status(
             &self,
+            user_id: &str,
             id: &str,
             status: &str,
             last_connected: Option<TimestampMs>,
@@ -557,7 +612,7 @@ mod tests {
             let mut servers = self.servers.lock().unwrap();
             let idx = servers
                 .iter()
-                .position(|s| s.id == id)
+                .position(|s| s.user_id == user_id && s.id == id)
                 .ok_or_else(|| DbError::NotFound(format!("MCP server {id}")))?;
             servers[idx].last_test_status = status.to_owned();
             if let Some(lc) = last_connected {
@@ -566,11 +621,11 @@ mod tests {
             Ok(())
         }
 
-        async fn update_tools(&self, id: &str, tools: Option<&str>) -> Result<(), DbError> {
+        async fn update_tools(&self, user_id: &str, id: &str, tools: Option<&str>) -> Result<(), DbError> {
             let mut servers = self.servers.lock().unwrap();
             let idx = servers
                 .iter()
-                .position(|s| s.id == id)
+                .position(|s| s.user_id == user_id && s.id == id)
                 .ok_or_else(|| DbError::NotFound(format!("MCP server {id}")))?;
             servers[idx].tools = tools.map(String::from);
             Ok(())
@@ -642,17 +697,17 @@ mod tests {
     #[tokio::test]
     async fn list_servers_empty() {
         let svc = make_service();
-        let result = svc.list_servers().await.unwrap();
+        let result = svc.list_servers(TEST_USER_ID).await.unwrap();
         assert!(result.is_empty());
     }
 
     #[tokio::test]
     async fn list_servers_returns_all() {
         let svc = make_service();
-        svc.add_server(stdio_create_req("a")).await.unwrap();
-        svc.add_server(http_create_req("b")).await.unwrap();
+        svc.add_server(TEST_USER_ID, stdio_create_req("a")).await.unwrap();
+        svc.add_server(TEST_USER_ID, http_create_req("b")).await.unwrap();
 
-        let result = svc.list_servers().await.unwrap();
+        let result = svc.list_servers(TEST_USER_ID).await.unwrap();
         assert_eq!(result.len(), 2);
     }
 
@@ -661,8 +716,8 @@ mod tests {
     #[tokio::test]
     async fn get_server_found() {
         let svc = make_service();
-        let created = svc.add_server(stdio_create_req("test")).await.unwrap();
-        let found = svc.get_server(&created.id).await.unwrap();
+        let created = svc.add_server(TEST_USER_ID, stdio_create_req("test")).await.unwrap();
+        let found = svc.get_server(TEST_USER_ID, &created.id).await.unwrap();
         assert_eq!(found.id, created.id);
         assert_eq!(found.name, "test");
     }
@@ -670,7 +725,7 @@ mod tests {
     #[tokio::test]
     async fn get_server_not_found() {
         let svc = make_service();
-        let result = svc.get_server("nonexistent").await;
+        let result = svc.get_server(TEST_USER_ID, "nonexistent").await;
         assert!(matches!(result, Err(McpError::NotFound(_))));
     }
 
@@ -679,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn add_server_creates_new() {
         let svc = make_service();
-        let resp = svc.add_server(stdio_create_req("new-srv")).await.unwrap();
+        let resp = svc.add_server(TEST_USER_ID, stdio_create_req("new-srv")).await.unwrap();
         assert_eq!(resp.name, "new-srv");
         assert!(!resp.enabled);
         assert_eq!(resp.last_test_status, McpServerStatus::Disconnected);
@@ -689,10 +744,16 @@ mod tests {
     #[tokio::test]
     async fn add_server_upserts_existing() {
         let svc = make_service();
-        let first = svc.add_server(stdio_create_req("upsert-test")).await.unwrap();
+        let first = svc
+            .add_server(TEST_USER_ID, stdio_create_req("upsert-test"))
+            .await
+            .unwrap();
 
         // Second add with same name updates existing
-        let updated = svc.add_server(http_create_req("upsert-test")).await.unwrap();
+        let updated = svc
+            .add_server(TEST_USER_ID, http_create_req("upsert-test"))
+            .await
+            .unwrap();
         assert_eq!(updated.id, first.id);
         // Transport should be updated to http
         match updated.transport {
@@ -707,17 +768,20 @@ mod tests {
     async fn add_server_stdio_complete() {
         let svc = make_service();
         let resp = svc
-            .add_server(CreateMcpServerRequest {
-                name: "stdio-full".into(),
-                description: Some("full stdio".into()),
-                transport: McpTransport::Stdio {
-                    command: "node".into(),
-                    args: vec!["index.js".into()],
-                    env: HashMap::from([("KEY".into(), "val".into())]),
+            .add_server(
+                TEST_USER_ID,
+                CreateMcpServerRequest {
+                    name: "stdio-full".into(),
+                    description: Some("full stdio".into()),
+                    transport: McpTransport::Stdio {
+                        command: "node".into(),
+                        args: vec!["index.js".into()],
+                        env: HashMap::from([("KEY".into(), "val".into())]),
+                    },
+                    original_json: Some(r#"{"name":"stdio-full"}"#.into()),
+                    builtin: true,
                 },
-                original_json: Some(r#"{"name":"stdio-full"}"#.into()),
-                builtin: true,
-            })
+            )
             .await
             .unwrap();
         assert_eq!(resp.name, "stdio-full");
@@ -730,9 +794,13 @@ mod tests {
     #[tokio::test]
     async fn edit_server_rejects_name_change() {
         let svc = make_service();
-        let created = svc.add_server(stdio_create_req("old-name")).await.unwrap();
+        let created = svc
+            .add_server(TEST_USER_ID, stdio_create_req("old-name"))
+            .await
+            .unwrap();
         let err = svc
             .edit_server(
+                TEST_USER_ID,
                 &created.id,
                 UpdateMcpServerRequest {
                     name: Some("new-name".into()),
@@ -750,9 +818,10 @@ mod tests {
     #[tokio::test]
     async fn edit_server_updates_transport() {
         let svc = make_service();
-        let created = svc.add_server(stdio_create_req("test")).await.unwrap();
+        let created = svc.add_server(TEST_USER_ID, stdio_create_req("test")).await.unwrap();
         let updated = svc
             .edit_server(
+                TEST_USER_ID,
                 &created.id,
                 UpdateMcpServerRequest {
                     name: None,
@@ -776,11 +845,12 @@ mod tests {
     #[tokio::test]
     async fn edit_server_clears_description() {
         let svc = make_service();
-        let created = svc.add_server(stdio_create_req("test")).await.unwrap();
+        let created = svc.add_server(TEST_USER_ID, stdio_create_req("test")).await.unwrap();
         assert!(created.description.is_some());
 
         let updated = svc
             .edit_server(
+                TEST_USER_ID,
                 &created.id,
                 UpdateMcpServerRequest {
                     name: None,
@@ -800,6 +870,7 @@ mod tests {
         let svc = make_service();
         let result = svc
             .edit_server(
+                TEST_USER_ID,
                 "nonexistent",
                 UpdateMcpServerRequest {
                     name: Some("x".into()),
@@ -816,11 +887,17 @@ mod tests {
     #[tokio::test]
     async fn edit_server_name_conflict() {
         let svc = make_service();
-        svc.add_server(stdio_create_req("server-a")).await.unwrap();
-        let b = svc.add_server(stdio_create_req("server-b")).await.unwrap();
+        svc.add_server(TEST_USER_ID, stdio_create_req("server-a"))
+            .await
+            .unwrap();
+        let b = svc
+            .add_server(TEST_USER_ID, stdio_create_req("server-b"))
+            .await
+            .unwrap();
 
         let result = svc
             .edit_server(
+                TEST_USER_ID,
                 &b.id,
                 UpdateMcpServerRequest {
                     name: Some("server-a".into()), // conflict
@@ -837,11 +914,15 @@ mod tests {
     #[tokio::test]
     async fn edit_server_rename_to_same_name() {
         let svc = make_service();
-        let a = svc.add_server(stdio_create_req("server-a")).await.unwrap();
+        let a = svc
+            .add_server(TEST_USER_ID, stdio_create_req("server-a"))
+            .await
+            .unwrap();
 
         // Renaming to the same name should succeed
         let result = svc
             .edit_server(
+                TEST_USER_ID,
                 &a.id,
                 UpdateMcpServerRequest {
                     name: Some("server-a".into()),
@@ -858,11 +939,15 @@ mod tests {
     #[tokio::test]
     async fn edit_server_updates_builtin_flag() {
         let svc = make_service();
-        let created = svc.add_server(stdio_create_req("chrome-devtools")).await.unwrap();
+        let created = svc
+            .add_server(TEST_USER_ID, stdio_create_req("chrome-devtools"))
+            .await
+            .unwrap();
         assert!(!created.builtin);
 
         let updated = svc
             .edit_server(
+                TEST_USER_ID,
                 &created.id,
                 UpdateMcpServerRequest {
                     name: None,
@@ -882,31 +967,31 @@ mod tests {
     #[tokio::test]
     async fn delete_server_removes_and_returns_enabled_status() {
         let svc = make_service();
-        let created = svc.add_server(stdio_create_req("test")).await.unwrap();
+        let created = svc.add_server(TEST_USER_ID, stdio_create_req("test")).await.unwrap();
 
         // Not enabled
-        let was_enabled = svc.delete_server(&created.id).await.unwrap();
+        let was_enabled = svc.delete_server(TEST_USER_ID, &created.id).await.unwrap();
         assert!(!was_enabled);
 
         // Should be hidden from active queries
-        let result = svc.get_server(&created.id).await;
+        let result = svc.get_server(TEST_USER_ID, &created.id).await;
         assert!(matches!(result, Err(McpError::NotFound(_))));
     }
 
     #[tokio::test]
     async fn delete_enabled_server_returns_true() {
         let svc = make_service();
-        let created = svc.add_server(stdio_create_req("test")).await.unwrap();
-        svc.toggle_server(&created.id).await.unwrap(); // enable
+        let created = svc.add_server(TEST_USER_ID, stdio_create_req("test")).await.unwrap();
+        svc.toggle_server(TEST_USER_ID, &created.id).await.unwrap(); // enable
 
-        let was_enabled = svc.delete_server(&created.id).await.unwrap();
+        let was_enabled = svc.delete_server(TEST_USER_ID, &created.id).await.unwrap();
         assert!(was_enabled);
     }
 
     #[tokio::test]
     async fn delete_server_not_found() {
         let svc = make_service();
-        let result = svc.delete_server("nonexistent").await;
+        let result = svc.delete_server(TEST_USER_ID, "nonexistent").await;
         assert!(matches!(result, Err(McpError::NotFound(_))));
     }
 
@@ -915,20 +1000,20 @@ mod tests {
     #[tokio::test]
     async fn toggle_server_enables_then_disables() {
         let svc = make_service();
-        let created = svc.add_server(stdio_create_req("toggle")).await.unwrap();
+        let created = svc.add_server(TEST_USER_ID, stdio_create_req("toggle")).await.unwrap();
         assert!(!created.enabled);
 
-        let toggled = svc.toggle_server(&created.id).await.unwrap();
+        let toggled = svc.toggle_server(TEST_USER_ID, &created.id).await.unwrap();
         assert!(toggled.enabled);
 
-        let toggled_back = svc.toggle_server(&created.id).await.unwrap();
+        let toggled_back = svc.toggle_server(TEST_USER_ID, &created.id).await.unwrap();
         assert!(!toggled_back.enabled);
     }
 
     #[tokio::test]
     async fn toggle_server_not_found() {
         let svc = make_service();
-        let result = svc.toggle_server("nonexistent").await;
+        let result = svc.toggle_server(TEST_USER_ID, "nonexistent").await;
         assert!(matches!(result, Err(McpError::NotFound(_))));
     }
 
@@ -940,17 +1025,19 @@ mod tests {
         let req = BatchImportMcpServersRequest {
             servers: vec![stdio_import_req("a"), http_import_req("b")],
         };
-        let results = svc.batch_import(req).await.unwrap();
+        let results = svc.batch_import(TEST_USER_ID, req).await.unwrap();
         assert_eq!(results.len(), 2);
 
-        let all = svc.list_servers().await.unwrap();
+        let all = svc.list_servers(TEST_USER_ID).await.unwrap();
         assert_eq!(all.len(), 2);
     }
 
     #[tokio::test]
     async fn batch_import_upserts_existing() {
         let svc = make_service();
-        svc.add_server(stdio_create_req("existing")).await.unwrap();
+        svc.add_server(TEST_USER_ID, stdio_create_req("existing"))
+            .await
+            .unwrap();
 
         let req = BatchImportMcpServersRequest {
             servers: vec![
@@ -958,20 +1045,23 @@ mod tests {
                 stdio_import_req("brand-new"), // create
             ],
         };
-        let results = svc.batch_import(req).await.unwrap();
+        let results = svc.batch_import(TEST_USER_ID, req).await.unwrap();
         assert_eq!(results.len(), 2);
 
-        let all = svc.list_servers().await.unwrap();
+        let all = svc.list_servers(TEST_USER_ID).await.unwrap();
         assert_eq!(all.len(), 2);
     }
 
     #[tokio::test]
     async fn add_server_restores_soft_deleted_row() {
         let svc = make_service();
-        let created = svc.add_server(stdio_create_req("restored")).await.unwrap();
-        svc.delete_server(&created.id).await.unwrap();
+        let created = svc
+            .add_server(TEST_USER_ID, stdio_create_req("restored"))
+            .await
+            .unwrap();
+        svc.delete_server(TEST_USER_ID, &created.id).await.unwrap();
 
-        let restored = svc.add_server(http_create_req("restored")).await.unwrap();
+        let restored = svc.add_server(TEST_USER_ID, http_create_req("restored")).await.unwrap();
         assert_eq!(restored.id, created.id);
         match restored.transport {
             McpTransport::Http { .. } => {}
@@ -982,52 +1072,64 @@ mod tests {
     #[tokio::test]
     async fn add_server_rejects_overriding_builtin_name() {
         let svc = make_service();
-        svc.add_server(CreateMcpServerRequest {
-            name: "chrome-devtools".into(),
-            description: Some("builtin".into()),
-            transport: McpTransport::Stdio {
-                command: "npx".into(),
-                args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
-                env: HashMap::new(),
+        svc.add_server(
+            TEST_USER_ID,
+            CreateMcpServerRequest {
+                name: "chrome-devtools".into(),
+                description: Some("builtin".into()),
+                transport: McpTransport::Stdio {
+                    command: "npx".into(),
+                    args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
+                    env: HashMap::new(),
+                },
+                original_json: None,
+                builtin: true,
             },
-            original_json: None,
-            builtin: true,
-        })
+        )
         .await
         .unwrap();
 
-        let err = svc.add_server(stdio_create_req("chrome-devtools")).await.unwrap_err();
+        let err = svc
+            .add_server(TEST_USER_ID, stdio_create_req("chrome-devtools"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, McpError::Conflict(_)));
     }
 
     #[tokio::test]
     async fn add_server_rejects_overriding_builtin_name_even_with_builtin_payload() {
         let svc = make_service();
-        svc.add_server(CreateMcpServerRequest {
-            name: "chrome-devtools".into(),
-            description: Some("builtin".into()),
-            transport: McpTransport::Stdio {
-                command: "npx".into(),
-                args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
-                env: HashMap::new(),
+        svc.add_server(
+            TEST_USER_ID,
+            CreateMcpServerRequest {
+                name: "chrome-devtools".into(),
+                description: Some("builtin".into()),
+                transport: McpTransport::Stdio {
+                    command: "npx".into(),
+                    args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
+                    env: HashMap::new(),
+                },
+                original_json: None,
+                builtin: true,
             },
-            original_json: None,
-            builtin: true,
-        })
+        )
         .await
         .unwrap();
 
         let err = svc
-            .add_server(CreateMcpServerRequest {
-                name: "chrome-devtools".into(),
-                description: Some("malicious override".into()),
-                transport: McpTransport::Http {
-                    url: "https://example.com/mcp".into(),
-                    headers: HashMap::new(),
+            .add_server(
+                TEST_USER_ID,
+                CreateMcpServerRequest {
+                    name: "chrome-devtools".into(),
+                    description: Some("malicious override".into()),
+                    transport: McpTransport::Http {
+                        url: "https://example.com/mcp".into(),
+                        headers: HashMap::new(),
+                    },
+                    original_json: None,
+                    builtin: true,
                 },
-                original_json: None,
-                builtin: true,
-            })
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, McpError::Conflict(_)));
@@ -1036,48 +1138,54 @@ mod tests {
     #[tokio::test]
     async fn batch_import_skips_reserved_builtin_name() {
         let svc = make_service();
-        svc.add_server(CreateMcpServerRequest {
-            name: "chrome-devtools".into(),
-            description: Some("builtin".into()),
-            transport: McpTransport::Stdio {
-                command: "npx".into(),
-                args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
-                env: HashMap::new(),
+        svc.add_server(
+            TEST_USER_ID,
+            CreateMcpServerRequest {
+                name: "chrome-devtools".into(),
+                description: Some("builtin".into()),
+                transport: McpTransport::Stdio {
+                    command: "npx".into(),
+                    args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
+                    env: HashMap::new(),
+                },
+                original_json: None,
+                builtin: true,
             },
-            original_json: None,
-            builtin: true,
-        })
+        )
         .await
         .unwrap();
 
         let results = svc
-            .batch_import(BatchImportMcpServersRequest {
-                servers: vec![
-                    ImportMcpServerRequest {
-                        name: "chrome-devtools".into(),
-                        description: Some("imported".into()),
-                        transport: McpTransport::Http {
-                            url: "https://example.com/mcp".into(),
-                            headers: HashMap::new(),
+            .batch_import(
+                TEST_USER_ID,
+                BatchImportMcpServersRequest {
+                    servers: vec![
+                        ImportMcpServerRequest {
+                            name: "chrome-devtools".into(),
+                            description: Some("imported".into()),
+                            transport: McpTransport::Http {
+                                url: "https://example.com/mcp".into(),
+                                headers: HashMap::new(),
+                            },
+                            original_json: None,
+                            builtin: false,
+                            enabled: Some(false),
                         },
-                        original_json: None,
-                        builtin: false,
-                        enabled: Some(false),
-                    },
-                    ImportMcpServerRequest {
-                        name: "playwright".into(),
-                        description: Some("imported".into()),
-                        transport: McpTransport::Stdio {
-                            command: "npx".into(),
-                            args: vec!["@playwright/mcp@latest".into()],
-                            env: HashMap::new(),
+                        ImportMcpServerRequest {
+                            name: "playwright".into(),
+                            description: Some("imported".into()),
+                            transport: McpTransport::Stdio {
+                                command: "npx".into(),
+                                args: vec!["@playwright/mcp@latest".into()],
+                                env: HashMap::new(),
+                            },
+                            original_json: None,
+                            builtin: false,
+                            enabled: Some(false),
                         },
-                        original_json: None,
-                        builtin: false,
-                        enabled: Some(false),
-                    },
-                ],
-            })
+                    ],
+                },
+            )
             .await
             .unwrap();
 
@@ -1089,17 +1197,20 @@ mod tests {
     async fn add_server_normalizes_shell_style_stdio_command() {
         let svc = make_service();
         let created = svc
-            .add_server(CreateMcpServerRequest {
-                name: "sentry".into(),
-                description: None,
-                transport: McpTransport::Stdio {
-                    command: "npx @sentry/mcp-server@latest --organization-slug=demo".into(),
-                    args: vec![],
-                    env: HashMap::new(),
+            .add_server(
+                TEST_USER_ID,
+                CreateMcpServerRequest {
+                    name: "sentry".into(),
+                    description: None,
+                    transport: McpTransport::Stdio {
+                        command: "npx @sentry/mcp-server@latest --organization-slug=demo".into(),
+                        args: vec![],
+                        env: HashMap::new(),
+                    },
+                    original_json: None,
+                    builtin: false,
                 },
-                original_json: None,
-                builtin: false,
-            })
+            )
             .await
             .unwrap();
 
@@ -1118,7 +1229,7 @@ mod tests {
         let mut req = stdio_import_req("enabled-mcp");
         req.enabled = Some(true);
         let result = svc
-            .batch_import(BatchImportMcpServersRequest { servers: vec![req] })
+            .batch_import(TEST_USER_ID, BatchImportMcpServersRequest { servers: vec![req] })
             .await
             .unwrap();
 
@@ -1130,14 +1241,17 @@ mod tests {
     async fn batch_import_empty_list() {
         let svc = make_service();
         let req = BatchImportMcpServersRequest { servers: vec![] };
-        let results = svc.batch_import(req).await.unwrap();
+        let results = svc.batch_import(TEST_USER_ID, req).await.unwrap();
         assert!(results.is_empty());
     }
 
     #[tokio::test]
     async fn persist_test_result_records_success_status_and_tools() {
         let svc = make_service();
-        let created = svc.add_server(stdio_create_req("persist-success")).await.unwrap();
+        let created = svc
+            .add_server(TEST_USER_ID, stdio_create_req("persist-success"))
+            .await
+            .unwrap();
         let result = McpConnectionTestResult {
             success: true,
             tools: Some(vec![aionui_api_types::McpToolResponse {
@@ -1153,9 +1267,11 @@ mod tests {
             www_authenticate: None,
         };
 
-        svc.persist_test_result(&created.id, &result).await.unwrap();
+        svc.persist_test_result(TEST_USER_ID, &created.id, &result)
+            .await
+            .unwrap();
 
-        let updated = svc.get_server(&created.id).await.unwrap();
+        let updated = svc.get_server(TEST_USER_ID, &created.id).await.unwrap();
         assert_eq!(updated.last_test_status, aionui_common::McpServerStatus::Connected);
         assert_eq!(updated.tools.unwrap().len(), 1);
         assert!(updated.last_connected.is_some());
@@ -1164,7 +1280,10 @@ mod tests {
     #[tokio::test]
     async fn persist_test_result_records_error_and_clears_tools() {
         let svc = make_service();
-        let created = svc.add_server(stdio_create_req("persist-error")).await.unwrap();
+        let created = svc
+            .add_server(TEST_USER_ID, stdio_create_req("persist-error"))
+            .await
+            .unwrap();
 
         let success = McpConnectionTestResult {
             success: true,
@@ -1180,7 +1299,9 @@ mod tests {
             auth_method: None,
             www_authenticate: None,
         };
-        svc.persist_test_result(&created.id, &success).await.unwrap();
+        svc.persist_test_result(TEST_USER_ID, &created.id, &success)
+            .await
+            .unwrap();
 
         let failure = McpConnectionTestResult {
             success: false,
@@ -1192,9 +1313,11 @@ mod tests {
             auth_method: None,
             www_authenticate: None,
         };
-        svc.persist_test_result(&created.id, &failure).await.unwrap();
+        svc.persist_test_result(TEST_USER_ID, &created.id, &failure)
+            .await
+            .unwrap();
 
-        let updated = svc.get_server(&created.id).await.unwrap();
+        let updated = svc.get_server(TEST_USER_ID, &created.id).await.unwrap();
         assert_eq!(updated.last_test_status, aionui_common::McpServerStatus::Error);
         assert!(updated.tools.is_none());
         assert!(updated.last_connected.is_some());

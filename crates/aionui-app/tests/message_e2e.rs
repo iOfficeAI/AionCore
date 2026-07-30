@@ -35,6 +35,7 @@ async fn insert_message(
     created_at: i64,
 ) {
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let user_id = repo.owner_user_id(conv_id).await.unwrap().unwrap();
     let msg = aionui_db::models::MessageRow {
         id: msg_id.into(),
         conversation_id: conv_id.into(),
@@ -46,15 +47,17 @@ async fn insert_message(
         hidden: false,
         created_at,
     };
-    aionui_db::IConversationRepository::insert_message(&repo, &msg)
+    aionui_db::IConversationRepository::insert_message(&repo, &user_id, &msg)
         .await
         .unwrap();
 }
 
 async fn update_conversation_workspace(services: &aionui_app::AppServices, conv_id: &str, workspace: &str) {
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let user_id = repo.owner_user_id(conv_id).await.unwrap().unwrap();
     IConversationRepository::update(
         &repo,
+        &user_id,
         conv_id,
         &ConversationRowUpdate {
             extra: Some(json!({ "workspace": workspace, "backend": "gemini" }).to_string()),
@@ -73,6 +76,7 @@ async fn insert_acp_tool_message(
     created_at: i64,
 ) {
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let user_id = repo.owner_user_id(conv_id).await.unwrap().unwrap();
     let msg = aionui_db::models::MessageRow {
         id: msg_id.into(),
         conversation_id: conv_id.into(),
@@ -99,14 +103,15 @@ async fn insert_acp_tool_message(
         hidden: false,
         created_at,
     };
-    aionui_db::IConversationRepository::insert_message(&repo, &msg)
+    aionui_db::IConversationRepository::insert_message(&repo, &user_id, &msg)
         .await
         .unwrap();
 }
 
 async fn upsert_artifact(services: &aionui_app::AppServices, artifact: aionui_db::ConversationArtifactRow) {
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
-    aionui_db::IConversationRepository::upsert_artifact(&repo, &artifact)
+    let user_id = repo.owner_user_id(&artifact.conversation_id).await.unwrap().unwrap();
+    aionui_db::IConversationRepository::upsert_artifact(&repo, &user_id, &artifact)
         .await
         .unwrap();
 }
@@ -424,7 +429,8 @@ async fn t8_7_messages_exclude_legacy_cron_rows() {
             hidden: false,
             created_at: 2000,
         };
-        aionui_db::IConversationRepository::insert_message(&repo, &msg)
+        let user_id = repo.owner_user_id(&conv_id).await.unwrap().unwrap();
+        aionui_db::IConversationRepository::insert_message(&repo, &user_id, &msg)
             .await
             .unwrap();
     }

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AgentMetadataRow {
     pub id: String,
+    pub user_id: Option<String>,
     pub icon: Option<String>,
     pub name: String,
     pub name_i18n: Option<String>,

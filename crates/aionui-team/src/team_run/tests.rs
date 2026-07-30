@@ -12,7 +12,7 @@ use crate::work_source::WorkSource;
 
 fn coordinator_and_manager() -> (Arc<SlotWorkCoordinator>, Arc<TeamRunManager>) {
     let broadcaster = Arc::new(RecordingBroadcaster::new());
-    let emitter = Arc::new(TeamEventEmitter::new("team-1".into(), broadcaster));
+    let emitter = Arc::new(TeamEventEmitter::new("team-1".into(), "user-1".into(), broadcaster));
     let manager = Arc::new(TeamRunManager::new("team-1".into(), emitter));
     let coordinator = Arc::new(SlotWorkCoordinator::new(
         "team-1".into(),
@@ -133,7 +133,11 @@ fn aborting_the_creator_lease_preserves_a_concurrent_committed_enqueue() {
 #[test]
 fn accepted_event_is_emitted_only_after_the_durable_enqueue_commits() {
     let broadcaster = Arc::new(RecordingBroadcaster::new());
-    let emitter = Arc::new(TeamEventEmitter::new("team-1".into(), broadcaster.clone()));
+    let emitter = Arc::new(TeamEventEmitter::new(
+        "team-1".into(),
+        "user-1".into(),
+        broadcaster.clone(),
+    ));
     let manager = Arc::new(TeamRunManager::new("team-1".into(), emitter));
     let coordinator = SlotWorkCoordinator::new("team-1".into(), "generation-1".into(), manager);
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);

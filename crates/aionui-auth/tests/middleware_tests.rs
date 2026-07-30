@@ -10,11 +10,11 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode}
 use tower::ServiceExt;
 
 use aionui_auth::{
-    AuthState, CookieConfig, CurrentUser, JwtService, RateLimiter, TokenPayload, api_rate_limit_middleware,
-    auth_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware, csrf_middleware,
-    security_headers_middleware,
+    AuthIdentityMode, AuthState, CookieConfig, CurrentUser, IRuntimeTokenVerifier, JwtService, RateLimiter,
+    TokenPayload, api_rate_limit_middleware, auth_middleware, auth_rate_limit_middleware,
+    authenticated_action_rate_limit_middleware, csrf_middleware, security_headers_middleware,
 };
-use aionui_db::{IUserRepository, SqliteUserRepository, init_database_memory};
+use aionui_db::{IUserRepository, SqliteUserRepository, UserStatus, UserType, init_database_memory};
 
 async fn json_body(resp: axum::response::Response) -> serde_json::Value {
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -131,14 +131,55 @@ async fn auth_app(jwt_service: Arc<JwtService>) -> Router {
 }
 
 fn protected_auth_app(jwt_service: Arc<JwtService>, user_repo: Arc<dyn IUserRepository>) -> Router {
+    protected_auth_app_with_mode(jwt_service, user_repo, AuthIdentityMode::UserSession)
+}
+
+fn protected_auth_app_with_mode(
+    jwt_service: Arc<JwtService>,
+    user_repo: Arc<dyn IUserRepository>,
+    identity_mode: AuthIdentityMode,
+) -> Router {
+    protected_auth_app_with_mode_and_verifier(jwt_service, user_repo, identity_mode, None)
+}
+
+fn protected_auth_app_with_mode_and_verifier(
+    jwt_service: Arc<JwtService>,
+    user_repo: Arc<dyn IUserRepository>,
+    identity_mode: AuthIdentityMode,
+    runtime_token_verifier: Option<Arc<dyn IRuntimeTokenVerifier>>,
+) -> Router {
     let state = AuthState {
         jwt_service,
         user_repo,
-        local: false,
+        identity_mode,
+        runtime_token_verifier,
     };
 
     Router::new()
         .route("/protected", get(|| async { "ok" }))
+        .route_layer(middleware::from_fn_with_state(state, auth_middleware))
+}
+
+/// Like the protected app, but echoes the injected `CurrentUser.id` so tests
+/// can assert which identity the runtime-token channel resolved.
+fn identity_echo_app(
+    jwt_service: Arc<JwtService>,
+    user_repo: Arc<dyn IUserRepository>,
+    identity_mode: AuthIdentityMode,
+    runtime_token_verifier: Option<Arc<dyn IRuntimeTokenVerifier>>,
+) -> Router {
+    let state = AuthState {
+        jwt_service,
+        user_repo,
+        identity_mode,
+        runtime_token_verifier,
+    };
+
+    Router::new()
+        .route(
+            "/whoami",
+            get(|user: axum::Extension<CurrentUser>| async move { user.id.clone() }),
+        )
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
 }
 
@@ -237,6 +278,57 @@ async fn auth_middleware_missing_user_returns_unauthorized_code() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let json = json_body(resp).await;
     assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn auth_middleware_session_generation_mismatch_returns_unauthorized_code() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let token = jwt_service
+        .sign_with_session_generation("system_default_user", "system_default_user", 0)
+        .unwrap();
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone()));
+    repo.increment_session_generation("system_default_user").await.unwrap();
+    let app = protected_auth_app(jwt_service, repo as Arc<dyn IUserRepository>);
+
+    let resp = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn auth_middleware_aionpro_rejects_local_user_token() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let token = jwt_service
+        .sign_with_session_generation("system_default_user", "system_default_user", 0)
+        .unwrap();
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone()));
+    let app = protected_auth_app_with_mode(jwt_service, repo as Arc<dyn IUserRepository>, AuthIdentityMode::AionPro);
+
+    let resp = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "USER_CONTEXT_REQUIRED");
 }
 
 #[tokio::test]
@@ -410,6 +502,8 @@ async fn authenticated_action_limit_uses_user_id_key() {
                 request.extensions_mut().insert(CurrentUser {
                     id: "user_42".into(),
                     username: "admin".into(),
+                    user_type: UserType::Local,
+                    status: UserStatus::Active,
                 });
                 Ok::<_, std::convert::Infallible>(next.run(request).await)
             },
@@ -487,4 +581,251 @@ fn t13_2_cookie_fallback() {
 fn t13_3_no_token_returns_none() {
     let headers = axum::http::HeaderMap::new();
     assert_eq!(aionui_auth::extract_token_from_headers(&headers), None);
+}
+
+// ============================================================
+// Runtime-token channel (conversation helper CLI)
+// ============================================================
+
+struct MatchVerifier {
+    token: &'static str,
+    user_id: &'static str,
+    conversation_id: &'static str,
+}
+
+impl IRuntimeTokenVerifier for MatchVerifier {
+    fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool {
+        token == self.token && user_id == self.user_id && conversation_id == self.conversation_id
+    }
+}
+
+fn helper_request(token: Option<&str>, user_id: &str, conversation_id: &str) -> Request<Body> {
+    let mut builder = Request::get("/whoami")
+        .header("x-aionui-user-id", user_id)
+        .header("x-aionui-conversation-id", conversation_id);
+    if let Some(token) = token {
+        builder = builder.header("x-aionui-runtime-token", token);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn runtime_token_channel_authenticates_helper_and_injects_bound_user() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let app = identity_echo_app(
+        jwt_service,
+        repo,
+        AuthIdentityMode::UserSession,
+        Some(Arc::new(MatchVerifier {
+            token: "tok-1",
+            user_id: "system_default_user",
+            conversation_id: "conv-1",
+        })),
+    );
+
+    let resp = app
+        .oneshot(helper_request(Some("tok-1"), "system_default_user", "conv-1"))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"system_default_user");
+}
+
+#[tokio::test]
+async fn runtime_token_channel_aionpro_authenticates_external_user() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone()));
+    let user = repo
+        .ensure_external_user(
+            UserType::Aionpro,
+            "ext-user-1",
+            aionui_db::ExternalUserProjection {
+                username: Some("pro-user".into()),
+                email: None,
+                avatar_path: None,
+            },
+        )
+        .await
+        .unwrap();
+    let token: &'static str = "tok-pro";
+    let user_id: &'static str = Box::leak(user.id.clone().into_boxed_str());
+    let app = identity_echo_app(
+        jwt_service,
+        repo as Arc<dyn IUserRepository>,
+        AuthIdentityMode::AionPro,
+        Some(Arc::new(MatchVerifier {
+            token,
+            user_id,
+            conversation_id: "conv-pro",
+        })),
+    );
+
+    let resp = app
+        .oneshot(helper_request(Some(token), user_id, "conv-pro"))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(std::str::from_utf8(&body).unwrap(), user_id);
+}
+
+#[tokio::test]
+async fn runtime_token_channel_rejects_forged_user_header() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let app = identity_echo_app(
+        jwt_service,
+        repo,
+        AuthIdentityMode::UserSession,
+        Some(Arc::new(MatchVerifier {
+            token: "tok-1",
+            user_id: "system_default_user",
+            conversation_id: "conv-1",
+        })),
+    );
+
+    let resp = app
+        .oneshot(helper_request(Some("tok-1"), "another_user", "conv-1"))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+    assert_eq!(json["error"], "Invalid runtime token");
+}
+
+#[tokio::test]
+async fn runtime_token_channel_rejects_cross_conversation_token() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let app = identity_echo_app(
+        jwt_service,
+        repo,
+        AuthIdentityMode::UserSession,
+        Some(Arc::new(MatchVerifier {
+            token: "tok-1",
+            user_id: "system_default_user",
+            conversation_id: "conv-1",
+        })),
+    );
+
+    let resp = app
+        .oneshot(helper_request(Some("tok-1"), "system_default_user", "conv-other"))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(resp).await;
+    assert_eq!(json["error"], "Invalid runtime token");
+}
+
+#[tokio::test]
+async fn runtime_token_channel_without_token_returns_authentication_required() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let app = identity_echo_app(
+        jwt_service,
+        repo,
+        AuthIdentityMode::AionPro,
+        Some(Arc::new(MatchVerifier {
+            token: "tok-1",
+            user_id: "system_default_user",
+            conversation_id: "conv-1",
+        })),
+    );
+
+    let resp = app
+        .oneshot(helper_request(None, "system_default_user", "conv-1"))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+    assert_eq!(json["error"], "Authentication required");
+}
+
+#[tokio::test]
+async fn runtime_token_channel_disabled_when_verifier_absent() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let app = identity_echo_app(jwt_service, repo, AuthIdentityMode::UserSession, None);
+
+    let resp = app
+        .oneshot(helper_request(Some("tok-1"), "system_default_user", "conv-1"))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(resp).await;
+    assert_eq!(json["error"], "Authentication required");
+}
+
+#[tokio::test]
+async fn runtime_token_channel_aionpro_rejects_local_user_token_binding() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let app = identity_echo_app(
+        jwt_service,
+        repo,
+        AuthIdentityMode::AionPro,
+        Some(Arc::new(MatchVerifier {
+            token: "tok-1",
+            user_id: "system_default_user",
+            conversation_id: "conv-1",
+        })),
+    );
+
+    let resp = app
+        .oneshot(helper_request(Some("tok-1"), "system_default_user", "conv-1"))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "USER_CONTEXT_REQUIRED");
+}
+
+#[tokio::test]
+async fn csrf_exempts_requests_bearing_runtime_token_header() {
+    let cookie_config = Arc::new(CookieConfig {
+        secure: false,
+        same_site: "Lax",
+    });
+    let app = Router::new()
+        .route("/api/thing", post(|| async { "ok" }))
+        .layer(middleware::from_fn_with_state(cookie_config, csrf_middleware));
+
+    // Without the runtime-token header a cookieless POST is rejected.
+    let resp = app
+        .clone()
+        .oneshot(Request::post("/api/thing").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // With the header, CSRF is skipped (token validity is enforced later by
+    // the auth middleware, which is not part of this app).
+    let resp = app
+        .oneshot(
+            Request::post("/api/thing")
+                .header("x-aionui-runtime-token", "tok-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

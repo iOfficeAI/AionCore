@@ -135,6 +135,14 @@ fn build_http_response(status: u16, headers: &[(&str, &str)], body: &str) -> Str
 }
 
 async fn setup_proxy(doc_type: DocType, response_template: &str) -> (ProxyService, u16, tempfile::TempDir) {
+    setup_proxy_for_user("system_default_user", doc_type, response_template).await
+}
+
+async fn setup_proxy_for_user(
+    user_id: &str,
+    doc_type: DocType,
+    response_template: &str,
+) -> (ProxyService, u16, tempfile::TempDir) {
     let spawner = HttpMockSpawner {
         response_template: response_template.to_owned(),
     };
@@ -144,7 +152,10 @@ async fn setup_proxy(doc_type: DocType, response_template: &str) -> (ProxyServic
     let file = dir.path().join("test.docx");
     std::fs::write(&file, b"test").unwrap();
 
-    let port = mgr.start(file.to_str().unwrap(), doc_type).await.unwrap();
+    let port = mgr
+        .start_for_user(user_id, file.to_str().unwrap(), doc_type)
+        .await
+        .unwrap();
     let proxy = ProxyService::new(mgr);
 
     (proxy, port, dir)
@@ -204,6 +215,35 @@ async fn ssrf_wrong_doc_type_rejected() {
     let result = proxy.forward(active_port, "/index.html", DocType::Ppt, &[]).await;
 
     assert!(matches!(result.unwrap_err(), ProxyError::PortNotActive(_)));
+}
+
+#[tokio::test]
+async fn proxy_rejects_active_port_owned_by_another_user() {
+    let response = build_http_response(200, &[("Content-Type", "text/plain")], "owner preview");
+    let (proxy, port, _dir) = setup_proxy_for_user("user-a", DocType::Ppt, &response).await;
+
+    let owner = proxy
+        .forward_for_user("user-a", port, "/index.html", DocType::Ppt, &[])
+        .await
+        .unwrap();
+    assert_eq!(owner.status, 200);
+
+    let other = proxy
+        .forward_for_user("user-b", port, "/index.html", DocType::Ppt, &[])
+        .await;
+    assert!(matches!(other.unwrap_err(), ProxyError::PortNotActive(_)));
+}
+
+#[tokio::test]
+async fn watch_proxy_rejects_active_port_owned_by_another_user() {
+    let response = build_http_response(200, &[("Content-Type", "text/plain")], "owner preview");
+    let (proxy, port, _dir) = setup_proxy_for_user("user-a", DocType::Word, &response).await;
+
+    let owner = proxy.forward_watch_for_user("user-a", port, "/", &[]).await.unwrap();
+    assert_eq!(owner.status, 200);
+
+    let other = proxy.forward_watch_for_user("user-b", port, "/", &[]).await;
+    assert!(matches!(other.unwrap_err(), ProxyError::PortNotActive(_)));
 }
 
 // ---------------------------------------------------------------------------

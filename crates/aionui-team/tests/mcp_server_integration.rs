@@ -83,6 +83,7 @@ async fn setup_with_prompt_dump(prompt_dump: Option<TeamPromptDumpConfig>) -> Te
     let agents = make_agents();
     let scheduler = Arc::new(TeammateManager::new(
         "team-1".into(),
+        "user-1".into(),
         &agents,
         mailbox,
         task_board,

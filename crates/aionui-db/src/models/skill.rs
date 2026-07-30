@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SkillRow {
     pub id: String,
+    pub user_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub path: String,

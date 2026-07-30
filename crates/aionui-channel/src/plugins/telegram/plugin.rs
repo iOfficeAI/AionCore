@@ -372,6 +372,7 @@ async fn handle_callback_query(
     });
 
     let msg = UnifiedIncomingMessage {
+        owner_user_id: None,
         id: cb.id.clone(),
         platform: PluginType::Telegram,
         chat_id: chat_id.to_string(),
@@ -417,6 +418,7 @@ async fn handle_message(msg: &TgMessage, message_tx: &mpsc::Sender<UnifiedIncomi
     let reply_to = msg.reply_to_message.as_ref().map(|r| r.message_id.to_string());
 
     let unified = UnifiedIncomingMessage {
+        owner_user_id: None,
         id: msg.message_id.to_string(),
         platform: PluginType::Telegram,
         chat_id: msg.chat.id.to_string(),

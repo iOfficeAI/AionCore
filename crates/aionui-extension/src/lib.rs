@@ -8,6 +8,7 @@ pub mod constants;
 pub mod dependency;
 pub mod error;
 pub mod external_paths;
+pub mod fs_adopt;
 pub mod hub;
 pub mod hub_routes;
 pub mod lifecycle;
@@ -55,9 +56,10 @@ pub use skill_service::{
     SkillPaths, SkillSource, builtin_skills_corpus, builtin_skills_materialize_marker, delete_skill,
     delete_skill_with_repo, detect_and_count_external_skills, detect_common_skill_paths, export_skill_with_symlink,
     get_skill_paths, import_skill, import_skills_with_repo, link_workspace_skills, list_available_skills,
-    list_available_skills_with_repo, materialize_skills_for_agent, materialize_skills_for_agent_with_repo,
-    read_builtin_rule, read_builtin_skill, read_skill_info, resolve_skill_paths, scan_for_skills,
-    sync_skill_catalog_into_repo,
+    list_available_skills_with_repo, list_available_skills_with_repo_for_user, materialize_skills_for_agent,
+    materialize_skills_for_agent_with_repo, materialize_skills_for_agent_with_repo_for_user, read_builtin_rule,
+    read_builtin_skill, read_skill_info, resolve_skill_paths, scan_for_skills, sync_builtin_skill_catalog_into_repo,
+    sync_skill_catalog_into_repo, sync_skill_catalog_into_repo_for_user,
 };
 pub use skill_service::{
     delete_assistant_rule, delete_assistant_skill, read_assistant_rule, read_assistant_skill, write_assistant_rule,

@@ -12,6 +12,7 @@ weixin = ["dep:reqwest", "dep:futures-util", "dep:base64", "dep:uuid"]
 
 [dependencies]
 aionui-common.workspace = true
+aionui-auth.workspace = true
 aionui-db.workspace = true
 aionui-api-types.workspace = true
 aionui-realtime.workspace = true

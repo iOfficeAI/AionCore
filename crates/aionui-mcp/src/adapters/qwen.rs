@@ -38,7 +38,7 @@ impl McpAgentAdapter for QwenAdapter {
         is_cli_installed(CLI_NAME).await
     }
 
-    async fn detect_existing(&self) -> Result<Vec<DetectedServer>, McpError> {
+    async fn detect_existing(&self, _user_id: &str) -> Result<Vec<DetectedServer>, McpError> {
         if !self.is_installed().await? {
             return Err(McpError::AgentNotInstalled(CLI_NAME.into()));
         }

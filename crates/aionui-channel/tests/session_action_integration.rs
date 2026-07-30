@@ -21,6 +21,7 @@ use aionui_channel::types::{
 };
 
 // ── Test infrastructure ─────────────────────────────────────────────
+const OWNER_ID: &str = "system_default_user";
 
 struct MockBroadcaster {
     events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
@@ -57,7 +58,7 @@ async fn setup() -> (
     let pref_repo: Arc<dyn aionui_db::IClientPreferenceRepository> =
         Arc::new(aionui_db::SqliteClientPreferenceRepository::new(db.pool().clone()));
     let settings = Arc::new(ChannelSettingsService::new(pref_repo));
-    let executor = ActionExecutor::new(pairing_arc, session_mgr_arc, settings);
+    let executor = ActionExecutor::new(pairing_arc, session_mgr_arc, settings, Some(OWNER_ID.to_owned()));
 
     // Keep db alive
     std::mem::forget(db);
@@ -69,6 +70,7 @@ async fn create_user(repo: &Arc<dyn IChannelRepository>, platform_user_id: &str,
     let user_id = generate_id();
     let row = AssistantUserRow {
         id: user_id.clone(),
+        owner_user_id: OWNER_ID.to_owned(),
         platform_user_id: platform_user_id.to_owned(),
         platform_type: platform_type.to_owned(),
         display_name: Some("Test User".into()),
@@ -76,12 +78,13 @@ async fn create_user(repo: &Arc<dyn IChannelRepository>, platform_user_id: &str,
         last_active: None,
         session_id: None,
     };
-    repo.create_user(&row).await.unwrap();
+    repo.create_user(OWNER_ID, &row).await.unwrap();
     user_id
 }
 
 fn make_text_message(user_id: &str, chat_id: &str, text: &str) -> UnifiedIncomingMessage {
     UnifiedIncomingMessage {
+        owner_user_id: None,
         id: format!("msg_{}", now_ms()),
         platform: PluginType::Telegram,
         chat_id: chat_id.into(),
@@ -110,6 +113,7 @@ fn make_action_message(
     category: ActionCategory,
 ) -> UnifiedIncomingMessage {
     UnifiedIncomingMessage {
+        owner_user_id: None,
         id: format!("msg_{}", now_ms()),
         platform: PluginType::Telegram,
         chat_id: chat_id.into(),
@@ -145,10 +149,10 @@ fn make_action_message(
 /// Helper: authorize a user via the pairing flow.
 async fn authorize_user(pairing: &PairingService, platform_user_id: &str, platform_type: &str) {
     let code = pairing
-        .request_pairing(platform_user_id, platform_type, Some("Test"))
+        .request_pairing(OWNER_ID, platform_user_id, platform_type, Some("Test"))
         .await
         .unwrap();
-    pairing.approve_pairing(&code).await.unwrap();
+    pairing.approve_pairing(OWNER_ID, &code).await.unwrap();
 }
 
 // ── GS-1: No active sessions returns empty ─────────────────────────
@@ -156,7 +160,7 @@ async fn authorize_user(pairing: &PairingService, platform_user_id: &str, platfo
 #[tokio::test]
 async fn gs1_no_sessions_returns_empty() {
     let (session_mgr, _, _, _) = setup().await;
-    let sessions = session_mgr.get_active_sessions().await.unwrap();
+    let sessions = session_mgr.get_active_sessions(OWNER_ID).await.unwrap();
     assert!(sessions.is_empty());
 }
 
@@ -171,15 +175,15 @@ async fn gs2_multiple_sessions_returned() {
     let uid2 = create_user(&repo, "p2", "telegram").await;
 
     session_mgr
-        .get_or_create_session(&uid1, "c1", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid1, "c1", "gemini", None)
         .await
         .unwrap();
     session_mgr
-        .get_or_create_session(&uid2, "c2", "acp", None)
+        .get_or_create_session(OWNER_ID, &uid2, "c2", "acp", None)
         .await
         .unwrap();
 
-    let sessions = session_mgr.get_active_sessions().await.unwrap();
+    let sessions = session_mgr.get_active_sessions(OWNER_ID).await.unwrap();
     assert_eq!(sessions.len(), 2);
 
     for s in &sessions {
@@ -201,11 +205,11 @@ async fn pc1_same_user_different_chat() {
     let uid = create_user(&repo, "p1", "telegram").await;
 
     let s1 = session_mgr
-        .get_or_create_session(&uid, "chatA", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid, "chatA", "gemini", None)
         .await
         .unwrap();
     let s2 = session_mgr
-        .get_or_create_session(&uid, "chatB", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid, "chatB", "gemini", None)
         .await
         .unwrap();
 
@@ -226,11 +230,11 @@ async fn pc2_different_users_same_chat() {
     let uid2 = create_user(&repo, "p2", "telegram").await;
 
     let s1 = session_mgr
-        .get_or_create_session(&uid1, "chatA", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid1, "chatA", "gemini", None)
         .await
         .unwrap();
     let s2 = session_mgr
-        .get_or_create_session(&uid2, "chatA", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid2, "chatA", "gemini", None)
         .await
         .unwrap();
 
@@ -246,11 +250,11 @@ async fn pc3_same_user_same_chat_reuses() {
     let uid = create_user(&repo, "p1", "telegram").await;
 
     let s1 = session_mgr
-        .get_or_create_session(&uid, "chatA", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid, "chatA", "gemini", None)
         .await
         .unwrap();
     let s2 = session_mgr
-        .get_or_create_session(&uid, "chatA", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid, "chatA", "gemini", None)
         .await
         .unwrap();
 
@@ -267,22 +271,22 @@ async fn ru3_revoke_clears_sessions() {
     let uid2 = create_user(&repo, "p2", "telegram").await;
 
     session_mgr
-        .get_or_create_session(&uid1, "c1", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid1, "c1", "gemini", None)
         .await
         .unwrap();
     session_mgr
-        .get_or_create_session(&uid1, "c2", "acp", None)
+        .get_or_create_session(OWNER_ID, &uid1, "c2", "acp", None)
         .await
         .unwrap();
     session_mgr
-        .get_or_create_session(&uid2, "c1", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid2, "c1", "gemini", None)
         .await
         .unwrap();
 
     // Cleanup user1 sessions
-    session_mgr.cleanup_user_sessions(&uid1).await.unwrap();
+    session_mgr.cleanup_user_sessions(OWNER_ID, &uid1).await.unwrap();
 
-    let sessions = repo.get_all_sessions().await.unwrap();
+    let sessions = repo.get_all_sessions(OWNER_ID).await.unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].user_id, uid2);
 }
@@ -409,7 +413,7 @@ async fn action_session_new_resets_existing() {
     assert_ne!(sid1, sid3);
 
     // Only 1 session should exist for this user+chat in the DB
-    let all = repo.get_all_sessions().await.unwrap();
+    let all = repo.get_all_sessions(OWNER_ID).await.unwrap();
     let user_sessions: Vec<_> = all.iter().filter(|s| s.chat_id.as_deref() == Some("chat1")).collect();
     assert_eq!(user_sessions.len(), 1);
 }

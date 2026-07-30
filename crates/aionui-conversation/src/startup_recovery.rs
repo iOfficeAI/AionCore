@@ -26,7 +26,8 @@ impl ConversationService {
         };
 
         let mut recovered = 0usize;
-        for row in rows {
+        for stale in rows {
+            let row = stale.message;
             if !self
                 .runtime_persistence()
                 .allows(&row.conversation_id, RuntimeWriteKind::StartupRecovery)
@@ -41,7 +42,11 @@ impl ConversationService {
                 hidden: Some(matches!(action, StartupRecoveryAction::FinishEmptyPlaceholder)),
             };
 
-            match self.conversation_repo().update_message(&row.id, &update).await {
+            match self
+                .conversation_repo()
+                .update_message(&stale.user_id, &row.conversation_id, &row.id, &update)
+                .await
+            {
                 Ok(()) => {
                     recovered += 1;
                     info!(

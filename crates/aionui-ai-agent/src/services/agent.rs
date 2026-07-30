@@ -66,8 +66,8 @@ impl AgentService {
 
 // Agent operations
 impl AgentService {
-    pub async fn list_management_agents(&self) -> Result<Vec<AgentManagementRow>, AgentError> {
-        Ok(self.availability.list_management_rows().await)
+    pub async fn list_management_agents(&self, user_id: &str) -> Result<Vec<AgentManagementRow>, AgentError> {
+        self.availability.list_management_rows(user_id).await
     }
 
     /// Backend → logo URL catalog for business surfaces.
@@ -102,27 +102,29 @@ impl AgentService {
         Ok(entries)
     }
 
-    pub async fn health_check_agent_by_id(&self, id: &str) -> Result<AgentManagementRow, AgentError> {
-        self.availability.run_manual_health_check(id).await
+    pub async fn health_check_agent_by_id(&self, user_id: &str, id: &str) -> Result<AgentManagementRow, AgentError> {
+        self.availability.run_manual_health_check(user_id, id).await
     }
 
     pub async fn provider_health_check(
         &self,
+        user_id: &str,
         req: ProviderHealthCheckRequest,
     ) -> Result<ProviderHealthCheckResponse, AgentError> {
-        self.provider_health.health_check(req).await
+        self.provider_health.health_check(user_id, req).await
     }
 
     pub async fn set_agent_overrides(
         &self,
+        user_id: &str,
         id: &str,
         req: aionui_api_types::SetAgentOverridesRequest,
     ) -> Result<AgentManagementRow, AgentError> {
         let repo = self.registry.repo_handle();
         let row = repo
-            .get(id)
+            .get_for_user(user_id, id)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
+            .map_err(|e| AgentError::internal(format!("repo.get_for_user: {e}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
 
         let command_override = req
@@ -159,20 +161,24 @@ impl AgentService {
             _ => None,
         };
 
-        repo.update_agent_overrides(id, command_override.as_deref(), env_json.as_deref())
+        repo.update_agent_overrides_for_user(user_id, id, command_override.as_deref(), env_json.as_deref())
             .await
-            .map_err(|e| AgentError::internal(format!("repo.update_agent_overrides: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("repo.update_agent_overrides_for_user: {e}")))?;
 
-        self.availability.run_manual_health_check(id).await
+        self.availability.run_manual_health_check(user_id, id).await
     }
 
-    pub async fn get_agent_overrides(&self, id: &str) -> Result<aionui_api_types::AgentOverridesResponse, AgentError> {
+    pub async fn get_agent_overrides(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<aionui_api_types::AgentOverridesResponse, AgentError> {
         let row = self
             .registry
             .repo_handle()
-            .get(id)
+            .get_for_user(user_id, id)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
+            .map_err(|e| AgentError::internal(format!("repo.get_for_user: {e}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
 
         let env_override = row

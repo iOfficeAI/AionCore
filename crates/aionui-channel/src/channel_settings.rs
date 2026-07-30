@@ -26,6 +26,18 @@ pub struct ChannelSettingsService {
     agent_metadata_repo: Option<Arc<dyn IAgentMetadataRepository>>,
     assistant_definition_repo: Option<Arc<dyn IAssistantDefinitionRepository>>,
     assistant_overlay_repo: Option<Arc<dyn IAssistantOverlayRepository>>,
+    generated_assistant_materializer: Option<Arc<dyn ChannelGeneratedAssistantMaterializer>>,
+}
+
+/// Port for materializing a user's generated assistants before the channel
+/// default falls back to them. Generated definitions are created lazily per
+/// user by the assistant service; without this hook a channel-settings read
+/// that happens before the user's first assistant listing would miss them.
+/// Implemented over the assistant service in the composition layer.
+#[async_trait::async_trait]
+pub trait ChannelGeneratedAssistantMaterializer: Send + Sync {
+    /// Best-effort: failures must not break channel settings reads.
+    async fn ensure_generated_assistants(&self, user_id: &str);
 }
 
 /// Resolved agent configuration for a channel platform.
@@ -53,7 +65,16 @@ impl ChannelSettingsService {
             agent_metadata_repo: None,
             assistant_definition_repo: None,
             assistant_overlay_repo: None,
+            generated_assistant_materializer: None,
         }
+    }
+
+    pub fn with_generated_assistant_materializer(
+        mut self,
+        materializer: Arc<dyn ChannelGeneratedAssistantMaterializer>,
+    ) -> Self {
+        self.generated_assistant_materializer = Some(materializer);
+        self
     }
 
     pub fn with_agent_metadata_repo(mut self, agent_metadata_repo: Arc<dyn IAgentMetadataRepository>) -> Self {
@@ -78,9 +99,13 @@ impl ChannelSettingsService {
     /// - **Legacy:** `{"backend":"claude","name":"Claude"}` (no agent_type field)
     ///
     /// Falls back to `agent_type=aionrs, backend=None` when no config exists.
-    pub async fn get_agent_config(&self, platform: PluginType) -> Result<ResolvedAgentConfig, ChannelError> {
+    pub async fn get_agent_config(
+        &self,
+        user_id: &str,
+        platform: PluginType,
+    ) -> Result<ResolvedAgentConfig, ChannelError> {
         let key = agent_key(platform);
-        let prefs = self.pref_repo.get_by_keys(&[&key]).await?;
+        let prefs = self.pref_repo.get_by_keys(user_id, &[&key]).await?;
 
         let Some(pref) = prefs.into_iter().next() else {
             return Ok(default_agent_config());
@@ -88,7 +113,7 @@ impl ChannelSettingsService {
 
         if let Some(setting) = parse_channel_assistant_setting(&pref.value) {
             if let Some(assistant_id) = setting.assistant_id.as_deref() {
-                if let Some(resolved) = self.resolve_assistant_agent_config(assistant_id).await? {
+                if let Some(resolved) = self.resolve_assistant_agent_config(user_id, assistant_id).await? {
                     debug!(
                         platform = %platform,
                         assistant_id,
@@ -137,9 +162,13 @@ impl ChannelSettingsService {
     /// Reads the model configuration for a platform from `client_preferences`.
     ///
     /// Returns `None` when no model is configured (common for ACP agents).
-    pub async fn get_model_config(&self, platform: PluginType) -> Result<Option<ResolvedModelConfig>, ChannelError> {
+    pub async fn get_model_config(
+        &self,
+        user_id: &str,
+        platform: PluginType,
+    ) -> Result<Option<ResolvedModelConfig>, ChannelError> {
         let key = model_key(platform);
-        let prefs = self.pref_repo.get_by_keys(&[&key]).await?;
+        let prefs = self.pref_repo.get_by_keys(user_id, &[&key]).await?;
 
         let Some(pref) = prefs.into_iter().next() else {
             return Ok(None);
@@ -165,11 +194,12 @@ impl ChannelSettingsService {
 
     pub async fn get_platform_settings(
         &self,
+        user_id: &str,
         platform: PluginType,
     ) -> Result<ChannelPlatformSettingsResponse, ChannelError> {
         let key_agent = agent_key(platform);
         let key_model = model_key(platform);
-        let prefs = self.pref_repo.get_by_keys(&[&key_agent, &key_model]).await?;
+        let prefs = self.pref_repo.get_by_keys(user_id, &[&key_agent, &key_model]).await?;
 
         let mut assistant = None;
         let mut default_model = None;
@@ -177,7 +207,10 @@ impl ChannelSettingsService {
         for pref in prefs {
             if pref.key == key_agent {
                 if let Some(parsed) = parse_channel_assistant_setting(&pref.value) {
-                    assistant = Some(self.normalize_channel_assistant_setting_for_response(parsed).await?);
+                    assistant = Some(
+                        self.normalize_channel_assistant_setting_for_response(user_id, parsed)
+                            .await?,
+                    );
                 }
             } else if pref.key == key_model {
                 default_model = parse_channel_model_setting(&pref.value);
@@ -185,7 +218,7 @@ impl ChannelSettingsService {
         }
 
         if assistant.is_none() {
-            assistant = self.resolve_default_channel_assistant_setting().await?;
+            assistant = self.resolve_default_channel_assistant_setting(user_id).await?;
         }
 
         Ok(ChannelPlatformSettingsResponse {
@@ -197,17 +230,21 @@ impl ChannelSettingsService {
 
     pub async fn get_assistant_setting(
         &self,
+        user_id: &str,
         platform: PluginType,
     ) -> Result<Option<ChannelAssistantSettingResponse>, ChannelError> {
         let key = agent_key(platform);
-        let prefs = self.pref_repo.get_by_keys(&[&key]).await?;
+        let prefs = self.pref_repo.get_by_keys(user_id, &[&key]).await?;
 
         let Some(pref) = prefs.into_iter().next() else {
-            return self.resolve_default_channel_assistant_setting().await;
+            return self.resolve_default_channel_assistant_setting(user_id).await;
         };
 
         let parsed = if let Some(assistant) = parse_channel_assistant_setting(&pref.value) {
-            Some(self.normalize_channel_assistant_setting_for_response(assistant).await?)
+            Some(
+                self.normalize_channel_assistant_setting_for_response(user_id, assistant)
+                    .await?,
+            )
         } else {
             None
         };
@@ -217,29 +254,36 @@ impl ChannelSettingsService {
 
     pub async fn set_assistant_setting(
         &self,
+        user_id: &str,
         platform: PluginType,
         assistant: &ChannelAssistantSettingRequest,
     ) -> Result<(), ChannelError> {
         let normalized = normalize_channel_assistant_setting_for_write(assistant);
         let payload = serde_json::to_string(&normalized).map_err(ChannelError::Json)?;
         let key = agent_key(platform);
-        self.pref_repo.upsert_batch(&[(&key, payload.as_str())]).await?;
+        self.pref_repo
+            .upsert_batch(user_id, &[(&key, payload.as_str())])
+            .await?;
         Ok(())
     }
 
     pub async fn set_model_setting(
         &self,
+        user_id: &str,
         platform: PluginType,
         model: &ChannelDefaultModelSetting,
     ) -> Result<(), ChannelError> {
         let payload = serde_json::to_string(model).map_err(ChannelError::Json)?;
         let key = model_key(platform);
-        self.pref_repo.upsert_batch(&[(&key, payload.as_str())]).await?;
+        self.pref_repo
+            .upsert_batch(user_id, &[(&key, payload.as_str())])
+            .await?;
         Ok(())
     }
 
     async fn resolve_assistant_agent_config(
         &self,
+        user_id: &str,
         assistant_id: &str,
     ) -> Result<Option<ResolvedAgentConfig>, ChannelError> {
         let (Some(definition_repo), Some(overlay_repo)) =
@@ -248,16 +292,19 @@ impl ChannelSettingsService {
             return Ok(None);
         };
 
-        let Some(definition) = definition_repo.get_by_assistant_id(assistant_id).await? else {
+        let Some(definition) = definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await?
+        else {
             return Ok(None);
         };
 
         let agent_id = overlay_repo
-            .get(&definition.id)
+            .get_for_user(user_id, &definition.id)
             .await?
             .and_then(|row| row.agent_id_override)
             .unwrap_or(definition.agent_id);
-        let agent_backend = self.runtime_backend_for_agent_id(&agent_id).await?;
+        let agent_backend = self.runtime_backend_for_agent_id(user_id, &agent_id).await?;
         let agent_type = backend_to_agent_type(&agent_backend);
         let backend = if agent_type == "acp" { Some(agent_backend) } else { None };
 
@@ -266,6 +313,7 @@ impl ChannelSettingsService {
 
     async fn resolve_assistant_identity_for_legacy_binding(
         &self,
+        user_id: &str,
         assistant: &ChannelAssistantSettingResponse,
     ) -> Result<Option<String>, ChannelError> {
         let (Some(definition_repo), Some(_overlay_repo)) =
@@ -284,13 +332,13 @@ impl ChannelSettingsService {
             return Ok(None);
         };
 
-        let definitions = definition_repo.list().await?;
+        let definitions = definition_repo.list_for_user(user_id).await?;
 
         for definition in definitions {
             if definition.source != "generated" {
                 continue;
             }
-            let runtime_backend = self.runtime_backend_for_agent_id(&definition.agent_id).await?;
+            let runtime_backend = self.runtime_backend_for_agent_id(user_id, &definition.agent_id).await?;
             if runtime_backend == legacy_backend {
                 return Ok(Some(definition.assistant_id));
             }
@@ -301,6 +349,7 @@ impl ChannelSettingsService {
 
     async fn normalize_channel_assistant_setting_for_response(
         &self,
+        user_id: &str,
         assistant: ChannelAssistantSettingResponse,
     ) -> Result<ChannelAssistantSettingResponse, ChannelError> {
         let assistant_id = assistant
@@ -319,7 +368,8 @@ impl ChannelSettingsService {
         let canonical_assistant_id = if assistant_id.is_some() {
             assistant_id
         } else {
-            self.resolve_assistant_identity_for_legacy_binding(&assistant).await?
+            self.resolve_assistant_identity_for_legacy_binding(user_id, &assistant)
+                .await?
         };
 
         if canonical_assistant_id.is_some() {
@@ -337,8 +387,9 @@ impl ChannelSettingsService {
 
     async fn resolve_default_channel_assistant_setting(
         &self,
+        user_id: &str,
     ) -> Result<Option<ChannelAssistantSettingResponse>, ChannelError> {
-        let Some(assistant_id) = self.resolve_default_assistant_identity().await? else {
+        let Some(assistant_id) = self.resolve_default_assistant_identity(user_id).await? else {
             return Ok(None);
         };
 
@@ -351,25 +402,31 @@ impl ChannelSettingsService {
         }))
     }
 
-    async fn resolve_default_assistant_identity(&self) -> Result<Option<String>, ChannelError> {
+    async fn resolve_default_assistant_identity(&self, user_id: &str) -> Result<Option<String>, ChannelError> {
         let (Some(definition_repo), Some(overlay_repo)) =
             (&self.assistant_definition_repo, &self.assistant_overlay_repo)
         else {
             return Ok(None);
         };
 
-        let definitions = definition_repo.list().await?;
-        let overlays = overlay_repo.list().await?;
+        // Generated assistants materialize lazily per user; make sure this
+        // user's exist before we look for the bare fallback.
+        if let Some(materializer) = &self.generated_assistant_materializer {
+            materializer.ensure_generated_assistants(user_id).await;
+        }
+
+        let definitions = definition_repo.list_for_user(user_id).await?;
+        let overlays = overlay_repo.list_for_user(user_id).await?;
 
         for definition in definitions.iter().filter(|definition| definition.source == "generated") {
-            if self.effective_assistant_backend(definition, &overlays).await? == DEFAULT_AGENT_TYPE {
+            if self.effective_assistant_backend(user_id, definition, &overlays).await? == DEFAULT_AGENT_TYPE {
                 return Ok(Some(definition.assistant_id.clone()));
             }
         }
 
         let mut any_aionrs = None;
         for definition in &definitions {
-            if self.effective_assistant_backend(definition, &overlays).await? == DEFAULT_AGENT_TYPE {
+            if self.effective_assistant_backend(user_id, definition, &overlays).await? == DEFAULT_AGENT_TYPE {
                 any_aionrs = Some(definition);
                 break;
             }
@@ -383,6 +440,7 @@ impl ChannelSettingsService {
 
     async fn effective_assistant_backend(
         &self,
+        user_id: &str,
         definition: &aionui_db::models::AssistantDefinitionRow,
         overlays: &[aionui_db::models::AssistantOverlayRow],
     ) -> Result<String, ChannelError> {
@@ -391,14 +449,14 @@ impl ChannelSettingsService {
             .find(|overlay| overlay.assistant_definition_id == definition.id)
             .and_then(|overlay| overlay.agent_id_override.as_deref())
             .unwrap_or(definition.agent_id.as_str());
-        self.runtime_backend_for_agent_id(agent_id).await
+        self.runtime_backend_for_agent_id(user_id, agent_id).await
     }
 
-    async fn runtime_backend_for_agent_id(&self, agent_id: &str) -> Result<String, ChannelError> {
+    async fn runtime_backend_for_agent_id(&self, user_id: &str, agent_id: &str) -> Result<String, ChannelError> {
         let Some(agent_metadata_repo) = self.agent_metadata_repo.as_ref() else {
             return Ok(agent_id.to_owned());
         };
-        let rows = agent_metadata_repo.list_all().await?;
+        let rows = agent_metadata_repo.list_all_for_user(user_id).await?;
         Ok(resolve_agent_binding_from_rows(&rows, agent_id)
             .map(|binding| binding.runtime_backend)
             .unwrap_or_else(|| agent_id.to_owned()))
@@ -506,6 +564,8 @@ mod tests {
     use aionui_db::{IAssistantDefinitionRepository, IAssistantOverlayRepository};
     use std::sync::Mutex;
 
+    const TEST_USER_ID: &str = "user-1";
+
     struct MockPrefRepo {
         data: Mutex<Vec<(String, String)>>,
     }
@@ -526,11 +586,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IClientPreferenceRepository for MockPrefRepo {
-        async fn get_all(&self) -> Result<Vec<ClientPreference>, DbError> {
+        async fn get_all(&self, _user_id: &str) -> Result<Vec<ClientPreference>, DbError> {
             let data = self.data.lock().unwrap();
             Ok(data
                 .iter()
                 .map(|(k, v)| ClientPreference {
+                    user_id: TEST_USER_ID.to_owned(),
                     key: k.clone(),
                     value: v.clone(),
                     updated_at: 0,
@@ -538,12 +599,13 @@ mod tests {
                 .collect())
         }
 
-        async fn get_by_keys(&self, keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
+        async fn get_by_keys(&self, _user_id: &str, keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
             let data = self.data.lock().unwrap();
             Ok(data
                 .iter()
                 .filter(|(k, _)| keys.contains(&k.as_str()))
                 .map(|(k, v)| ClientPreference {
+                    user_id: TEST_USER_ID.to_owned(),
                     key: k.clone(),
                     value: v.clone(),
                     updated_at: 0,
@@ -551,7 +613,7 @@ mod tests {
                 .collect())
         }
 
-        async fn upsert_batch(&self, entries: &[(&str, &str)]) -> Result<(), DbError> {
+        async fn upsert_batch(&self, _user_id: &str, entries: &[(&str, &str)]) -> Result<(), DbError> {
             let mut data = self.data.lock().unwrap();
             for (key, value) in entries {
                 if let Some(existing) = data.iter_mut().find(|(k, _)| k == key) {
@@ -563,7 +625,7 @@ mod tests {
             Ok(())
         }
 
-        async fn delete_keys(&self, keys: &[&str]) -> Result<(), DbError> {
+        async fn delete_keys(&self, _user_id: &str, keys: &[&str]) -> Result<(), DbError> {
             let mut data = self.data.lock().unwrap();
             data.retain(|(k, _)| !keys.contains(&k.as_str()));
             Ok(())
@@ -580,12 +642,47 @@ mod tests {
             Ok(self.rows.clone())
         }
 
+        async fn list_for_user(&self, _user_id: &str) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+            self.list().await
+        }
+
+        async fn list_including_deleted_for_user(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+            self.list().await
+        }
+
         async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
             Ok(self.rows.iter().find(|row| row.assistant_id == assistant_id).cloned())
         }
 
+        async fn get_by_assistant_id_for_user(
+            &self,
+            _user_id: &str,
+            assistant_id: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            self.get_by_assistant_id(assistant_id).await
+        }
+
+        async fn get_by_assistant_id_including_deleted_for_user(
+            &self,
+            _user_id: &str,
+            assistant_id: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            self.get_by_assistant_id(assistant_id).await
+        }
+
         async fn get_by_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
             Ok(self.rows.iter().find(|row| row.id == definition_id).cloned())
+        }
+
+        async fn get_by_id_for_user(
+            &self,
+            _user_id: &str,
+            definition_id: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            self.get_by_id(definition_id).await
         }
 
         async fn get_by_source_ref(
@@ -600,6 +697,24 @@ mod tests {
                 .cloned())
         }
 
+        async fn get_by_source_ref_for_user(
+            &self,
+            _user_id: &str,
+            source: &str,
+            source_ref: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            self.get_by_source_ref(source, source_ref).await
+        }
+
+        async fn get_by_source_ref_including_deleted_for_user(
+            &self,
+            _user_id: &str,
+            source: &str,
+            source_ref: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            self.get_by_source_ref(source, source_ref).await
+        }
+
         async fn upsert(
             &self,
             _params: &UpsertAssistantDefinitionParams<'_>,
@@ -607,8 +722,25 @@ mod tests {
             panic!("unused in channel settings tests")
         }
 
+        async fn upsert_for_user(
+            &self,
+            _user_id: &str,
+            params: &UpsertAssistantDefinitionParams<'_>,
+        ) -> Result<AssistantDefinitionRow, DbError> {
+            self.upsert(params).await
+        }
+
         async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
             panic!("unused in channel settings tests")
+        }
+
+        async fn soft_delete_for_user(
+            &self,
+            _user_id: &str,
+            definition_id: &str,
+            deleted_at: i64,
+        ) -> Result<bool, DbError> {
+            self.soft_delete(definition_id, deleted_at).await
         }
     }
 
@@ -626,16 +758,40 @@ mod tests {
                 .cloned())
         }
 
+        async fn get_for_user(
+            &self,
+            _user_id: &str,
+            definition_id: &str,
+        ) -> Result<Option<AssistantOverlayRow>, DbError> {
+            self.get(definition_id).await
+        }
+
         async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
             Ok(self.rows.clone())
+        }
+
+        async fn list_for_user(&self, _user_id: &str) -> Result<Vec<AssistantOverlayRow>, DbError> {
+            self.list().await
         }
 
         async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
             panic!("unused in channel settings tests")
         }
 
+        async fn upsert_for_user(
+            &self,
+            _user_id: &str,
+            params: &UpsertAssistantOverlayParams<'_>,
+        ) -> Result<AssistantOverlayRow, DbError> {
+            self.upsert(params).await
+        }
+
         async fn delete(&self, _definition_id: &str) -> Result<bool, DbError> {
             panic!("unused in channel settings tests")
+        }
+
+        async fn delete_for_user(&self, _user_id: &str, definition_id: &str) -> Result<bool, DbError> {
+            self.delete(definition_id).await
         }
     }
 
@@ -731,7 +887,7 @@ mod tests {
         let repo = Arc::new(MockPrefRepo::new());
         let svc = ChannelSettingsService::new(repo);
 
-        let config = svc.get_agent_config(PluginType::Telegram).await.unwrap();
+        let config = svc.get_agent_config(TEST_USER_ID, PluginType::Telegram).await.unwrap();
         assert_eq!(config.agent_type, "aionrs");
         assert!(config.backend.is_none());
     }
@@ -744,7 +900,7 @@ mod tests {
         )]));
         let svc = ChannelSettingsService::new(repo);
 
-        let config = svc.get_agent_config(PluginType::Telegram).await.unwrap();
+        let config = svc.get_agent_config(TEST_USER_ID, PluginType::Telegram).await.unwrap();
         assert_eq!(config.agent_type, "acp");
         assert_eq!(config.backend.as_deref(), Some("codex"));
     }
@@ -757,7 +913,7 @@ mod tests {
         )]));
         let svc = ChannelSettingsService::new(repo);
 
-        let config = svc.get_agent_config(PluginType::Lark).await.unwrap();
+        let config = svc.get_agent_config(TEST_USER_ID, PluginType::Lark).await.unwrap();
         assert_eq!(config.agent_type, "aionrs");
         assert!(config.backend.is_none());
     }
@@ -772,7 +928,7 @@ mod tests {
         )]));
         let svc = ChannelSettingsService::new(repo);
 
-        let config = svc.get_agent_config(PluginType::Telegram).await.unwrap();
+        let config = svc.get_agent_config(TEST_USER_ID, PluginType::Telegram).await.unwrap();
         assert_eq!(config.agent_type, "acp");
         assert_eq!(config.backend.as_deref(), Some("claude"));
     }
@@ -785,7 +941,7 @@ mod tests {
         )]));
         let svc = ChannelSettingsService::new(repo);
 
-        let config = svc.get_agent_config(PluginType::Lark).await.unwrap();
+        let config = svc.get_agent_config(TEST_USER_ID, PluginType::Lark).await.unwrap();
         assert_eq!(config.agent_type, "aionrs");
         assert!(config.backend.is_none());
     }
@@ -798,7 +954,7 @@ mod tests {
         )]));
         let svc = ChannelSettingsService::new(repo);
 
-        let config = svc.get_agent_config(PluginType::Weixin).await.unwrap();
+        let config = svc.get_agent_config(TEST_USER_ID, PluginType::Weixin).await.unwrap();
         assert_eq!(config.agent_type, "openclaw-gateway");
         assert!(config.backend.is_none());
     }
@@ -815,7 +971,7 @@ mod tests {
         let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(MockAssistantOverlayRepo { rows: vec![] });
         let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
 
-        let config = svc.get_agent_config(PluginType::Telegram).await.unwrap();
+        let config = svc.get_agent_config(TEST_USER_ID, PluginType::Telegram).await.unwrap();
         assert_eq!(config.agent_type, "acp");
         assert_eq!(config.backend.as_deref(), Some("claude"));
     }
@@ -835,7 +991,7 @@ mod tests {
         });
         let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
 
-        let config = svc.get_agent_config(PluginType::Telegram).await.unwrap();
+        let config = svc.get_agent_config(TEST_USER_ID, PluginType::Telegram).await.unwrap();
         assert_eq!(config.agent_type, "acp");
         assert_eq!(config.backend.as_deref(), Some("codex"));
     }
@@ -851,7 +1007,10 @@ mod tests {
         let overlay_repo: Arc<dyn IAssistantOverlayRepository> = Arc::new(MockAssistantOverlayRepo { rows: vec![] });
         let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
 
-        let err = svc.get_agent_config(PluginType::Telegram).await.unwrap_err();
+        let err = svc
+            .get_agent_config(TEST_USER_ID, PluginType::Telegram)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ChannelError::InvalidConfig(_)));
         assert!(
             err.to_string().contains("missing-assistant"),
@@ -866,7 +1025,7 @@ mod tests {
         let repo = Arc::new(MockPrefRepo::new());
         let svc = ChannelSettingsService::new(repo);
 
-        let config = svc.get_model_config(PluginType::Telegram).await.unwrap();
+        let config = svc.get_model_config(TEST_USER_ID, PluginType::Telegram).await.unwrap();
         assert!(config.is_none());
     }
 
@@ -878,7 +1037,11 @@ mod tests {
         )]));
         let svc = ChannelSettingsService::new(repo);
 
-        let config = svc.get_model_config(PluginType::Weixin).await.unwrap().unwrap();
+        let config = svc
+            .get_model_config(TEST_USER_ID, PluginType::Weixin)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(config.provider_id, "490fdb4e");
         assert_eq!(config.use_model.as_deref(), Some("global.anthropic.claude-opus-4-6-v1"));
     }
@@ -891,7 +1054,7 @@ mod tests {
         )]));
         let svc = ChannelSettingsService::new(repo);
 
-        let config = svc.get_model_config(PluginType::Telegram).await.unwrap();
+        let config = svc.get_model_config(TEST_USER_ID, PluginType::Telegram).await.unwrap();
         assert!(config.is_none());
     }
 
@@ -901,6 +1064,7 @@ mod tests {
         let svc = ChannelSettingsService::new(repo.clone());
 
         svc.set_assistant_setting(
+            TEST_USER_ID,
             PluginType::Telegram,
             &ChannelAssistantSettingRequest {
                 assistant_id: "assistant-1".into(),
@@ -910,7 +1074,10 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = repo.get_by_keys(&["assistant.telegram.agent"]).await.unwrap();
+        let stored = repo
+            .get_by_keys(TEST_USER_ID, &["assistant.telegram.agent"])
+            .await
+            .unwrap();
         let payload = serde_json::from_str::<serde_json::Value>(&stored[0].value).unwrap();
 
         assert_eq!(payload["assistant_id"], "assistant-1");
@@ -926,6 +1093,7 @@ mod tests {
         let svc = ChannelSettingsService::new(repo.clone());
 
         svc.set_assistant_setting(
+            TEST_USER_ID,
             PluginType::Lark,
             &ChannelAssistantSettingRequest {
                 assistant_id: "  legacy-custom  ".into(),
@@ -935,7 +1103,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = repo.get_by_keys(&["assistant.lark.agent"]).await.unwrap();
+        let stored = repo.get_by_keys(TEST_USER_ID, &["assistant.lark.agent"]).await.unwrap();
         let payload = serde_json::from_str::<serde_json::Value>(&stored[0].value).unwrap();
 
         assert_eq!(payload["assistant_id"], "legacy-custom");
@@ -953,7 +1121,11 @@ mod tests {
         )]));
         let svc = ChannelSettingsService::new(repo);
 
-        let setting = svc.get_assistant_setting(PluginType::Telegram).await.unwrap().unwrap();
+        let setting = svc
+            .get_assistant_setting(TEST_USER_ID, PluginType::Telegram)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(setting.assistant_id.as_deref(), Some("legacy-custom"));
         assert!(setting.custom_agent_id.is_none());
@@ -974,7 +1146,11 @@ mod tests {
         let overlay_repo = Arc::new(MockAssistantOverlayRepo { rows: vec![] });
         let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
 
-        let setting = svc.get_assistant_setting(PluginType::Telegram).await.unwrap().unwrap();
+        let setting = svc
+            .get_assistant_setting(TEST_USER_ID, PluginType::Telegram)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(setting.assistant_id.as_deref(), Some("bare-aionrs"));
         assert!(setting.custom_agent_id.is_none());
@@ -991,7 +1167,11 @@ mod tests {
         )]));
         let svc = ChannelSettingsService::new(repo);
 
-        let setting = svc.get_assistant_setting(PluginType::Lark).await.unwrap().unwrap();
+        let setting = svc
+            .get_assistant_setting(TEST_USER_ID, PluginType::Lark)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert!(setting.assistant_id.is_none());
         assert!(setting.custom_agent_id.is_none());
@@ -1012,7 +1192,11 @@ mod tests {
         let overlay_repo = Arc::new(MockAssistantOverlayRepo { rows: vec![] });
         let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
 
-        let setting = svc.get_assistant_setting(PluginType::Lark).await.unwrap().unwrap();
+        let setting = svc
+            .get_assistant_setting(TEST_USER_ID, PluginType::Lark)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(setting.assistant_id.as_deref(), Some("bare-codex"));
         assert!(setting.custom_agent_id.is_none());
@@ -1029,7 +1213,10 @@ mod tests {
         )]));
         let svc = ChannelSettingsService::new(repo);
 
-        let settings = svc.get_platform_settings(PluginType::Telegram).await.unwrap();
+        let settings = svc
+            .get_platform_settings(TEST_USER_ID, PluginType::Telegram)
+            .await
+            .unwrap();
         let assistant = settings.assistant.expect("assistant settings");
 
         assert_eq!(assistant.assistant_id.as_deref(), Some("legacy-custom"));
@@ -1051,7 +1238,10 @@ mod tests {
         let overlay_repo = Arc::new(MockAssistantOverlayRepo { rows: vec![] });
         let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
 
-        let settings = svc.get_platform_settings(PluginType::Telegram).await.unwrap();
+        let settings = svc
+            .get_platform_settings(TEST_USER_ID, PluginType::Telegram)
+            .await
+            .unwrap();
         let assistant = settings.assistant.expect("assistant settings");
 
         assert_eq!(assistant.assistant_id.as_deref(), Some("bare-aionrs"));
@@ -1073,7 +1263,10 @@ mod tests {
         let overlay_repo = Arc::new(MockAssistantOverlayRepo { rows: vec![] });
         let svc = ChannelSettingsService::new(repo).with_assistant_repos(definition_repo, overlay_repo);
 
-        let settings = svc.get_platform_settings(PluginType::Telegram).await.unwrap();
+        let settings = svc
+            .get_platform_settings(TEST_USER_ID, PluginType::Telegram)
+            .await
+            .unwrap();
         let assistant = settings.assistant.expect("assistant settings");
 
         assert_eq!(assistant.assistant_id.as_deref(), Some("bare-codex"));

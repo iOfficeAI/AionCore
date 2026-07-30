@@ -22,18 +22,44 @@ impl SqliteMcpServerRepository {
 
 #[async_trait::async_trait]
 impl IMcpServerRepository for SqliteMcpServerRepository {
-    async fn list(&self) -> Result<Vec<McpServerRow>, DbError> {
+    async fn list(&self, user_id: &str) -> Result<Vec<McpServerRow>, DbError> {
         let rows = sqlx::query_as::<_, McpServerRow>(
-            "SELECT * FROM mcp_servers WHERE deleted_at IS NULL ORDER BY created_at ASC",
+            "SELECT * FROM mcp_servers WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at ASC, rowid ASC",
         )
+        .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
 
         Ok(rows)
     }
 
-    async fn find_by_id(&self, id: &str) -> Result<Option<McpServerRow>, DbError> {
-        let row = sqlx::query_as::<_, McpServerRow>("SELECT * FROM mcp_servers WHERE id = ? AND deleted_at IS NULL")
+    async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<McpServerRow>, DbError> {
+        let row = sqlx::query_as::<_, McpServerRow>(
+            "SELECT * FROM mcp_servers WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
+        )
+        .bind(user_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    async fn find_by_name(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, DbError> {
+        let row = sqlx::query_as::<_, McpServerRow>(
+            "SELECT * FROM mcp_servers WHERE user_id = ? AND name = ? AND deleted_at IS NULL",
+        )
+        .bind(user_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    async fn find_by_id_any(&self, user_id: &str, id: &str) -> Result<Option<McpServerRow>, DbError> {
+        let row = sqlx::query_as::<_, McpServerRow>("SELECT * FROM mcp_servers WHERE user_id = ? AND id = ?")
+            .bind(user_id)
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -41,8 +67,9 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         Ok(row)
     }
 
-    async fn find_by_name(&self, name: &str) -> Result<Option<McpServerRow>, DbError> {
-        let row = sqlx::query_as::<_, McpServerRow>("SELECT * FROM mcp_servers WHERE name = ? AND deleted_at IS NULL")
+    async fn find_by_name_any(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, DbError> {
+        let row = sqlx::query_as::<_, McpServerRow>("SELECT * FROM mcp_servers WHERE user_id = ? AND name = ?")
+            .bind(user_id)
             .bind(name)
             .fetch_optional(&self.pool)
             .await?;
@@ -50,35 +77,19 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         Ok(row)
     }
 
-    async fn find_by_id_any(&self, id: &str) -> Result<Option<McpServerRow>, DbError> {
-        let row = sqlx::query_as::<_, McpServerRow>("SELECT * FROM mcp_servers WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        Ok(row)
-    }
-
-    async fn find_by_name_any(&self, name: &str) -> Result<Option<McpServerRow>, DbError> {
-        let row = sqlx::query_as::<_, McpServerRow>("SELECT * FROM mcp_servers WHERE name = ?")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        Ok(row)
-    }
-
-    async fn list_by_ids_any(&self, ids: &[String]) -> Result<Vec<McpServerRow>, DbError> {
+    async fn list_by_ids_any(&self, user_id: &str, ids: &[String]) -> Result<Vec<McpServerRow>, DbError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut query = QueryBuilder::new("SELECT * FROM mcp_servers WHERE id IN (");
+        let mut query = QueryBuilder::new("SELECT * FROM mcp_servers WHERE user_id = ");
+        query.push_bind(user_id);
+        query.push(" AND id IN (");
         let mut separated = query.separated(", ");
         for id in ids {
             separated.push_bind(id);
         }
-        separated.push_unseparated(") ORDER BY created_at ASC");
+        separated.push_unseparated(") ORDER BY created_at ASC, rowid ASC");
 
         let rows = query.build_query_as::<McpServerRow>().fetch_all(&self.pool).await?;
         let rows_by_id: HashMap<_, _> = rows.into_iter().map(|row| (row.id.clone(), row)).collect();
@@ -93,12 +104,13 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
 
         sqlx::query(
             "INSERT INTO mcp_servers \
-                (id, name, description, enabled, transport_type, transport_config, \
+                (id, user_id, name, description, enabled, transport_type, transport_config, \
                  tools, last_test_status, last_connected, original_json, builtin, \
                  deleted_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
+        .bind(params.user_id)
         .bind(params.name)
         .bind(params.description)
         .bind(params.enabled)
@@ -123,6 +135,7 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
 
         Ok(McpServerRow {
             id,
+            user_id: params.user_id.to_string(),
             name: params.name.to_string(),
             description: params.description.map(String::from),
             enabled: params.enabled,
@@ -139,9 +152,14 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         })
     }
 
-    async fn update(&self, id: &str, params: UpdateMcpServerParams<'_>) -> Result<McpServerRow, DbError> {
+    async fn update(
+        &self,
+        user_id: &str,
+        id: &str,
+        params: UpdateMcpServerParams<'_>,
+    ) -> Result<McpServerRow, DbError> {
         let existing = self
-            .find_by_id_any(id)
+            .find_by_id_any(user_id, id)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("MCP server '{id}' not found")))?;
 
@@ -152,7 +170,7 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
                 name = ?, description = ?, enabled = ?, transport_type = ?, \
                 transport_config = ?, tools = ?, original_json = ?, \
                 builtin = ?, deleted_at = ?, updated_at = ? \
-             WHERE id = ?",
+             WHERE user_id = ? AND id = ?",
         )
         .bind(&merged.name)
         .bind(&merged.description)
@@ -164,6 +182,7 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         .bind(merged.builtin)
         .bind(merged.deleted_at)
         .bind(merged.updated_at)
+        .bind(user_id)
         .bind(id)
         .execute(&self.pool)
         .await
@@ -177,13 +196,15 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         Ok(merged)
     }
 
-    async fn delete(&self, id: &str) -> Result<(), DbError> {
+    async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
         let now = aionui_common::now_ms();
         let result = sqlx::query(
-            "UPDATE mcp_servers SET enabled = 0, deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+            "UPDATE mcp_servers SET enabled = 0, deleted_at = ?, updated_at = ? \
+             WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
         )
         .bind(now)
         .bind(now)
+        .bind(user_id)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -195,11 +216,15 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         Ok(())
     }
 
-    async fn batch_upsert(&self, servers: &[CreateMcpServerParams<'_>]) -> Result<Vec<McpServerRow>, DbError> {
+    async fn batch_upsert(
+        &self,
+        user_id: &str,
+        servers: &[CreateMcpServerParams<'_>],
+    ) -> Result<Vec<McpServerRow>, DbError> {
         let mut results = Vec::with_capacity(servers.len());
 
         for params in servers {
-            let row = match self.find_by_name(params.name).await? {
+            let row = match self.find_by_name(user_id, params.name).await? {
                 Some(existing) => {
                     let update_params = UpdateMcpServerParams {
                         description: Some(params.description),
@@ -211,7 +236,7 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
                         builtin: Some(params.builtin),
                         ..Default::default()
                     };
-                    self.update(&existing.id, update_params).await?
+                    self.update(user_id, &existing.id, update_params).await?
                 }
                 None => self.create(params.clone()).await?,
             };
@@ -221,17 +246,24 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         Ok(results)
     }
 
-    async fn update_status(&self, id: &str, status: &str, last_connected: Option<TimestampMs>) -> Result<(), DbError> {
+    async fn update_status(
+        &self,
+        user_id: &str,
+        id: &str,
+        status: &str,
+        last_connected: Option<TimestampMs>,
+    ) -> Result<(), DbError> {
         let now = aionui_common::now_ms();
 
         let result = sqlx::query(
             "UPDATE mcp_servers SET last_test_status = ?, \
              last_connected = COALESCE(?, last_connected), \
-             updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+	             updated_at = ? WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
         )
         .bind(status)
         .bind(last_connected)
         .bind(now)
+        .bind(user_id)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -243,16 +275,19 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         Ok(())
     }
 
-    async fn update_tools(&self, id: &str, tools: Option<&str>) -> Result<(), DbError> {
+    async fn update_tools(&self, user_id: &str, id: &str, tools: Option<&str>) -> Result<(), DbError> {
         let now = aionui_common::now_ms();
 
-        let result =
-            sqlx::query("UPDATE mcp_servers SET tools = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL")
-                .bind(tools)
-                .bind(now)
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(
+            "UPDATE mcp_servers SET tools = ?, updated_at = ? \
+             WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
+        )
+        .bind(tools)
+        .bind(now)
+        .bind(user_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("MCP server '{id}' not found")));
@@ -267,6 +302,7 @@ fn merge_update(existing: McpServerRow, params: UpdateMcpServerParams<'_>) -> Mc
     let now = aionui_common::now_ms();
     McpServerRow {
         id: existing.id,
+        user_id: existing.user_id,
         name: params.name.unwrap_or(&existing.name).to_string(),
         description: params.description.map_or(existing.description, |v| v.map(String::from)),
         enabled: params.enabled.unwrap_or(existing.enabled),
@@ -297,14 +333,27 @@ mod tests {
     use super::*;
     use crate::init_database_memory;
 
+    const USER_A: &str = "system_default_user";
+    const USER_B: &str = "user_b";
+
     async fn setup() -> (SqliteMcpServerRepository, crate::Database) {
         let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, 'hash', 'active', 0, 1, 1)",
+        )
+        .bind(USER_B)
+        .bind(USER_B)
+        .execute(db.pool())
+        .await
+        .unwrap();
         let repo = SqliteMcpServerRepository::new(db.pool().clone());
         (repo, db)
     }
 
     fn stdio_params() -> CreateMcpServerParams<'static> {
         CreateMcpServerParams {
+            user_id: USER_A,
             name: "test-mcp",
             description: Some("A test MCP server"),
             enabled: false,
@@ -318,6 +367,7 @@ mod tests {
 
     fn http_params() -> CreateMcpServerParams<'static> {
         CreateMcpServerParams {
+            user_id: USER_A,
             name: "http-mcp",
             description: None,
             enabled: true,
@@ -332,7 +382,7 @@ mod tests {
     #[tokio::test]
     async fn list_empty() {
         let (repo, _db) = setup().await;
-        let servers = repo.list().await.unwrap();
+        let servers = repo.list(USER_A).await.unwrap();
         assert!(servers.is_empty());
     }
 
@@ -370,7 +420,7 @@ mod tests {
         let (repo, _db) = setup().await;
         let created = repo.create(stdio_params()).await.unwrap();
 
-        let found = repo.find_by_id(&created.id).await.unwrap().unwrap();
+        let found = repo.find_by_id(USER_A, &created.id).await.unwrap().unwrap();
         assert_eq!(found.id, created.id);
         assert_eq!(found.name, "test-mcp");
     }
@@ -378,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn find_by_id_nonexistent() {
         let (repo, _db) = setup().await;
-        assert!(repo.find_by_id("no_such_id").await.unwrap().is_none());
+        assert!(repo.find_by_id(USER_A, "no_such_id").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -386,14 +436,14 @@ mod tests {
         let (repo, _db) = setup().await;
         let created = repo.create(stdio_params()).await.unwrap();
 
-        let found = repo.find_by_name("test-mcp").await.unwrap().unwrap();
+        let found = repo.find_by_name(USER_A, "test-mcp").await.unwrap().unwrap();
         assert_eq!(found.id, created.id);
     }
 
     #[tokio::test]
     async fn find_by_name_nonexistent() {
         let (repo, _db) = setup().await;
-        assert!(repo.find_by_name("nope").await.unwrap().is_none());
+        assert!(repo.find_by_name(USER_A, "nope").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -402,7 +452,7 @@ mod tests {
         let s1 = repo.create(stdio_params()).await.unwrap();
         let s2 = repo.create(http_params()).await.unwrap();
 
-        let all = repo.list().await.unwrap();
+        let all = repo.list(USER_A).await.unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].id, s1.id);
         assert_eq!(all[1].id, s2.id);
@@ -415,6 +465,7 @@ mod tests {
 
         let updated = repo
             .update(
+                USER_A,
                 &created.id,
                 UpdateMcpServerParams {
                     enabled: Some(true),
@@ -438,6 +489,7 @@ mod tests {
 
         let err = repo
             .update(
+                USER_A,
                 &s2.id,
                 UpdateMcpServerParams {
                     name: Some("test-mcp"),
@@ -457,6 +509,7 @@ mod tests {
 
         let updated = repo
             .update(
+                USER_A,
                 &created.id,
                 UpdateMcpServerParams {
                     description: Some(None),
@@ -475,7 +528,7 @@ mod tests {
     async fn update_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
         let err = repo
-            .update("no_id", UpdateMcpServerParams::default())
+            .update(USER_A, "no_id", UpdateMcpServerParams::default())
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
@@ -486,14 +539,14 @@ mod tests {
         let (repo, _db) = setup().await;
         let created = repo.create(stdio_params()).await.unwrap();
 
-        repo.delete(&created.id).await.unwrap();
-        assert!(repo.find_by_id(&created.id).await.unwrap().is_none());
+        repo.delete(USER_A, &created.id).await.unwrap();
+        assert!(repo.find_by_id(USER_A, &created.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn delete_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.delete("no_id").await.unwrap_err();
+        let err = repo.delete(USER_A, "no_id").await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -504,13 +557,16 @@ mod tests {
         assert!(!existing.enabled);
 
         let results = repo
-            .batch_upsert(&[
-                CreateMcpServerParams {
-                    enabled: true,
-                    ..stdio_params()
-                },
-                http_params(),
-            ])
+            .batch_upsert(
+                USER_A,
+                &[
+                    CreateMcpServerParams {
+                        enabled: true,
+                        ..stdio_params()
+                    },
+                    http_params(),
+                ],
+            )
             .await
             .unwrap();
 
@@ -529,9 +585,11 @@ mod tests {
         let created = repo.create(stdio_params()).await.unwrap();
 
         let ts = aionui_common::now_ms();
-        repo.update_status(&created.id, "connected", Some(ts)).await.unwrap();
+        repo.update_status(USER_A, &created.id, "connected", Some(ts))
+            .await
+            .unwrap();
 
-        let found = repo.find_by_id(&created.id).await.unwrap().unwrap();
+        let found = repo.find_by_id(USER_A, &created.id).await.unwrap().unwrap();
         assert_eq!(found.last_test_status, "connected");
         assert_eq!(found.last_connected, Some(ts));
     }
@@ -542,11 +600,13 @@ mod tests {
         let created = repo.create(stdio_params()).await.unwrap();
 
         let ts = aionui_common::now_ms();
-        repo.update_status(&created.id, "connected", Some(ts)).await.unwrap();
+        repo.update_status(USER_A, &created.id, "connected", Some(ts))
+            .await
+            .unwrap();
 
-        repo.update_status(&created.id, "error", None).await.unwrap();
+        repo.update_status(USER_A, &created.id, "error", None).await.unwrap();
 
-        let found = repo.find_by_id(&created.id).await.unwrap().unwrap();
+        let found = repo.find_by_id(USER_A, &created.id).await.unwrap().unwrap();
         assert_eq!(found.last_test_status, "error");
         assert_eq!(found.last_connected, Some(ts));
     }
@@ -554,7 +614,10 @@ mod tests {
     #[tokio::test]
     async fn update_status_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.update_status("no_id", "connected", None).await.unwrap_err();
+        let err = repo
+            .update_status(USER_A, "no_id", "connected", None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -565,9 +628,9 @@ mod tests {
         assert!(created.tools.is_none());
 
         let tools_json = r#"[{"name":"read_file","description":"Read a file"}]"#;
-        repo.update_tools(&created.id, Some(tools_json)).await.unwrap();
+        repo.update_tools(USER_A, &created.id, Some(tools_json)).await.unwrap();
 
-        let found = repo.find_by_id(&created.id).await.unwrap().unwrap();
+        let found = repo.find_by_id(USER_A, &created.id).await.unwrap().unwrap();
         assert_eq!(found.tools.as_deref(), Some(tools_json));
     }
 
@@ -583,16 +646,55 @@ mod tests {
             .unwrap();
         assert!(created.tools.is_some());
 
-        repo.update_tools(&created.id, None).await.unwrap();
+        repo.update_tools(USER_A, &created.id, None).await.unwrap();
 
-        let found = repo.find_by_id(&created.id).await.unwrap().unwrap();
+        let found = repo.find_by_id(USER_A, &created.id).await.unwrap().unwrap();
         assert!(found.tools.is_none());
     }
 
     #[tokio::test]
     async fn update_tools_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.update_tools("no_id", Some("[]")).await.unwrap_err();
+        let err = repo.update_tools(USER_A, "no_id", Some("[]")).await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn mcp_server_operations_are_scoped_by_user() {
+        let (repo, _db) = setup().await;
+        let server_a = repo.create(stdio_params()).await.unwrap();
+        let server_b = repo
+            .create(CreateMcpServerParams {
+                user_id: USER_B,
+                ..stdio_params()
+            })
+            .await
+            .unwrap();
+
+        assert_ne!(server_a.id, server_b.id);
+        assert_eq!(repo.list(USER_A).await.unwrap().len(), 1);
+        assert_eq!(repo.list(USER_B).await.unwrap().len(), 1);
+        assert!(repo.find_by_id(USER_B, &server_a.id).await.unwrap().is_none());
+        assert_eq!(
+            repo.find_by_name(USER_B, "test-mcp").await.unwrap().unwrap().id,
+            server_b.id
+        );
+
+        let err = repo
+            .update(
+                USER_B,
+                &server_a.id,
+                UpdateMcpServerParams {
+                    enabled: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::NotFound(_)));
+
+        repo.delete(USER_B, &server_b.id).await.unwrap();
+        assert_eq!(repo.list(USER_A).await.unwrap().len(), 1);
+        assert!(repo.list(USER_B).await.unwrap().is_empty());
     }
 }

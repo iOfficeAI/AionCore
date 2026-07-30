@@ -24,6 +24,8 @@ use aionui_realtime::EventBroadcaster;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
+const TEST_OWNER_USER_ID: &str = "system_default_user";
+
 struct TestBroadcaster {
     events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
 }
@@ -237,12 +239,7 @@ async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
     let settings = Arc::new(ChannelSettingsService::new(Arc::new(
         SqliteClientPreferenceRepository::new(pool),
     )));
-    let message_svc = ChannelMessageService::new(
-        conversation_svc,
-        Arc::clone(&task_manager),
-        settings,
-        "system_default_user".to_owned(),
-    );
+    let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
 
     let session = AssistantSessionRow {
         id: "session-1".to_owned(),
@@ -261,7 +258,10 @@ async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
         PluginType::Dingtalk,
         PluginType::Weixin,
     ] {
-        let result = message_svc.send_to_agent(&session, "hello", platform).await.unwrap();
+        let result = message_svc
+            .send_to_agent(TEST_OWNER_USER_ID, &session, "hello", platform)
+            .await
+            .unwrap();
 
         assert!(
             result.stream_rx.is_some(),
@@ -306,20 +306,18 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
         .await
         .unwrap();
     pref_repo
-        .upsert_batch(&[(
-            "assistant.telegram.agent",
-            r#"{"assistant_id":"bare-claude","name":"Claude"}"#,
-        )])
+        .upsert_batch(
+            TEST_OWNER_USER_ID,
+            &[(
+                "assistant.telegram.agent",
+                r#"{"assistant_id":"bare-claude","name":"Claude"}"#,
+            )],
+        )
         .await
         .unwrap();
 
     let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
-    let message_svc = ChannelMessageService::new(
-        conversation_svc,
-        Arc::clone(&task_manager),
-        settings,
-        "system_default_user".to_owned(),
-    );
+    let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
 
     let session = AssistantSessionRow {
         id: "session-assisted".to_owned(),
@@ -333,12 +331,12 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
     };
 
     let result = message_svc
-        .send_to_agent(&session, "hello", PluginType::Telegram)
+        .send_to_agent(TEST_OWNER_USER_ID, &session, "hello", PluginType::Telegram)
         .await
         .unwrap();
 
     let snapshot = conversation_repo
-        .get_assistant_snapshot(&result.conversation_id)
+        .get_assistant_snapshot(TEST_OWNER_USER_ID, &result.conversation_id)
         .await
         .unwrap();
     assert!(
@@ -346,10 +344,14 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
         "channel-created conversation should persist an assistant snapshot when the platform is bound to an assistant"
     );
     let snapshot = snapshot.unwrap();
-    let conversation = conversation_repo.get(&result.conversation_id).await.unwrap().unwrap();
+    let conversation = conversation_repo
+        .get(TEST_OWNER_USER_ID, &result.conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(conversation.r#type, AgentType::Acp.serde_name());
     let session_row = acp_session_repo
-        .get(&result.conversation_id)
+        .get_for_user(TEST_OWNER_USER_ID, &result.conversation_id)
         .await
         .unwrap()
         .expect("acp_session row should exist for ACP assistant conversations");
@@ -380,21 +382,19 @@ async fn send_to_agent_rejects_unresolvable_channel_assistant_binding() {
 
     let pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
     pref_repo
-        .upsert_batch(&[(
-            "assistant.telegram.agent",
-            r#"{"assistant_id":"missing-assistant","name":"Missing"}"#,
-        )])
+        .upsert_batch(
+            TEST_OWNER_USER_ID,
+            &[(
+                "assistant.telegram.agent",
+                r#"{"assistant_id":"missing-assistant","name":"Missing"}"#,
+            )],
+        )
         .await
         .unwrap();
     let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
     let overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()));
     let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
-    let message_svc = ChannelMessageService::new(
-        conversation_svc,
-        Arc::clone(&task_manager),
-        settings,
-        "system_default_user".to_owned(),
-    );
+    let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
 
     let session = AssistantSessionRow {
         id: "session-assisted-missing".to_owned(),
@@ -408,7 +408,7 @@ async fn send_to_agent_rejects_unresolvable_channel_assistant_binding() {
     };
 
     let err = message_svc
-        .send_to_agent(&session, "hello", PluginType::Telegram)
+        .send_to_agent(TEST_OWNER_USER_ID, &session, "hello", PluginType::Telegram)
         .await
         .unwrap_err();
     assert!(matches!(err, ChannelError::MessageSendFailed(_)));
@@ -454,12 +454,7 @@ async fn send_to_agent_without_saved_binding_defaults_to_bare_aionrs_assistant()
         .unwrap();
 
     let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
-    let message_svc = ChannelMessageService::new(
-        conversation_svc,
-        Arc::clone(&task_manager),
-        settings,
-        "system_default_user".to_owned(),
-    );
+    let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
 
     let session = AssistantSessionRow {
         id: "session-assisted-default-aionrs".to_owned(),
@@ -473,16 +468,20 @@ async fn send_to_agent_without_saved_binding_defaults_to_bare_aionrs_assistant()
     };
 
     let result = message_svc
-        .send_to_agent(&session, "hello", PluginType::Telegram)
+        .send_to_agent(TEST_OWNER_USER_ID, &session, "hello", PluginType::Telegram)
         .await
         .unwrap();
 
     let snapshot = conversation_repo
-        .get_assistant_snapshot(&result.conversation_id)
+        .get_assistant_snapshot(TEST_OWNER_USER_ID, &result.conversation_id)
         .await
         .unwrap()
         .expect("channel-created conversation should default to a bare assistant snapshot");
-    let conversation = conversation_repo.get(&result.conversation_id).await.unwrap().unwrap();
+    let conversation = conversation_repo
+        .get(TEST_OWNER_USER_ID, &result.conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     assert_eq!(snapshot.assistant_id, "bare-aionrs");
     assert_eq!(snapshot.agent_id, "632f31d2");
@@ -525,17 +524,15 @@ async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name(
         .await
         .unwrap();
     pref_repo
-        .upsert_batch(&[("assistant.telegram.agent", r#"{"assistant_id":"bare-codex"}"#)])
+        .upsert_batch(
+            TEST_OWNER_USER_ID,
+            &[("assistant.telegram.agent", r#"{"assistant_id":"bare-codex"}"#)],
+        )
         .await
         .unwrap();
 
     let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
-    let message_svc = ChannelMessageService::new(
-        conversation_svc,
-        Arc::clone(&task_manager),
-        settings,
-        "system_default_user".to_owned(),
-    );
+    let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
 
     let session = AssistantSessionRow {
         id: "session-assisted-fallback-name".to_owned(),
@@ -549,10 +546,14 @@ async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name(
     };
 
     let result = message_svc
-        .send_to_agent(&session, "hello", PluginType::Telegram)
+        .send_to_agent(TEST_OWNER_USER_ID, &session, "hello", PluginType::Telegram)
         .await
         .unwrap();
 
-    let conversation = conversation_repo.get(&result.conversation_id).await.unwrap().unwrap();
+    let conversation = conversation_repo
+        .get(TEST_OWNER_USER_ID, &result.conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(conversation.name, "tg-acp-codex-70880480");
 }

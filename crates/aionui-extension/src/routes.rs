@@ -6,7 +6,7 @@ use std::path::Path as FsPath;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, Path, State};
+use axum::extract::{Extension, Json, Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -15,6 +15,7 @@ use aionui_api_types::{
     ApiResponse, DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest,
     GetPermissionsRequest, GetRiskLevelRequest, PermissionDetailResponse, PermissionSummaryResponse,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::{ApiError, now_ms};
 use serde_json::json;
 
@@ -172,8 +173,9 @@ pub fn extension_routes(state: ExtensionRouterState) -> Router {
 /// `GET /api/extensions` — list all loaded extensions.
 async fn get_loaded_extensions(
     State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<ExtensionSummaryResponse>>>, ApiError> {
-    let summaries = state.registry.get_loaded_extensions().await;
+    let summaries = state.registry.get_loaded_extensions_for_user(&user.id).await;
     let resp: Vec<ExtensionSummaryResponse> = summaries
         .into_iter()
         .map(|s| {
@@ -197,8 +199,9 @@ async fn get_loaded_extensions(
 /// `GET /api/extensions/themes` — get all resolved themes.
 async fn get_themes(
     State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let themes = state.registry.get_themes().await;
+    let themes = state.registry.get_themes_for_user(&user.id).await;
     let timestamp = now_ms();
     let value = serde_json::Value::Array(
         themes
@@ -222,8 +225,9 @@ async fn get_themes(
 /// `GET /api/extensions/assistants` — get all resolved assistants.
 async fn get_assistants(
     State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let assistants = state.registry.get_assistants().await;
+    let assistants = state.registry.get_assistants_for_user(&user.id).await;
     let value = serde_json::Value::Array(
         assistants
             .into_iter()
@@ -254,8 +258,9 @@ async fn get_assistants(
 /// `GET /api/extensions/acp-adapters` — get all resolved ACP adapters.
 async fn get_acp_adapters(
     State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let adapters = state.registry.get_acp_adapters().await;
+    let adapters = state.registry.get_acp_adapters_for_user(&user.id).await;
     let value = serde_json::Value::Array(
         adapters
             .into_iter()
@@ -294,8 +299,9 @@ async fn get_acp_adapters(
 /// `GET /api/extensions/agents` — get all resolved agents.
 async fn get_agents(
     State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let agents = state.registry.get_agents().await;
+    let agents = state.registry.get_agents_for_user(&user.id).await;
     let value = serde_json::Value::Array(
         agents
             .into_iter()
@@ -326,8 +332,9 @@ async fn get_agents(
 /// `GET /api/extensions/mcp-servers` — get all resolved MCP servers.
 async fn get_mcp_servers(
     State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let servers = state.registry.get_mcp_servers().await;
+    let servers = state.registry.get_mcp_servers_for_user(&user.id).await;
     let timestamp = now_ms();
     let value = serde_json::Value::Array(
         servers
@@ -371,8 +378,9 @@ async fn get_mcp_servers(
 /// `GET /api/extensions/skills` — get all resolved skills.
 async fn get_skills(
     State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let skills = state.registry.get_skills().await;
+    let skills = state.registry.get_skills_for_user(&user.id).await;
     let value = serde_json::Value::Array(
         skills
             .into_iter()
@@ -391,8 +399,9 @@ async fn get_skills(
 /// `GET /api/extensions/channel-plugins` — get all resolved channel plugins.
 async fn get_channel_plugins(
     State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let plugins = state.registry.get_channel_plugins().await;
+    let plugins = state.registry.get_channel_plugins_for_user(&user.id).await;
     let value = serde_json::Value::Array(
         plugins
             .into_iter()
@@ -425,8 +434,9 @@ async fn get_channel_plugins(
 /// `GET /api/extensions/settings-tabs` — get all resolved settings tabs.
 async fn get_settings_tabs(
     State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let tabs = state.registry.get_settings_tabs().await;
+    let tabs = state.registry.get_settings_tabs_for_user(&user.id).await;
     let value = serde_json::to_value(&tabs).unwrap_or_default();
     Ok(Json(ApiResponse::ok(value)))
 }
@@ -435,13 +445,17 @@ async fn get_settings_tabs(
 /// extension asset under the trusted extension root.
 async fn get_extension_asset(
     State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path((extension_name, asset_path)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let ext = state
         .registry
-        .get_extension_by_name(&extension_name)
+        .get_extension_by_name_for_user(&user.id, &extension_name)
         .await
         .ok_or_else(|| ApiError::NotFound(format!("Extension not found: {extension_name}")))?;
+    if !ext.state.enabled {
+        return Err(ApiError::NotFound(format!("Extension not found: {extension_name}")));
+    }
 
     let canonical_root = tokio::fs::canonicalize(&ext.directory)
         .await
@@ -480,8 +494,9 @@ async fn get_extension_asset(
 /// `GET /api/extensions/webui` — get all WebUI contributions.
 async fn get_webui(
     State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let webui = state.registry.get_webui_contributions().await;
+    let webui = state.registry.get_webui_contributions_for_user(&user.id).await;
     let value = serde_json::to_value(&webui).unwrap_or_default();
     Ok(Json(ApiResponse::ok(value)))
 }
@@ -501,10 +516,11 @@ async fn get_agent_activity(
 /// `POST /api/extensions/i18n` — get i18n data for a locale.
 async fn get_i18n(
     State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetI18nRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<HashMap<String, HashMap<String, String>>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let data = state.registry.get_i18n_for_locale(&req.locale).await;
+    let data = state.registry.get_i18n_for_locale_for_user(&user.id, &req.locale).await;
     Ok(Json(ApiResponse::ok(data)))
 }
 
@@ -572,22 +588,24 @@ async fn get_risk_level(
 /// `POST /api/extensions/enable` — enable an extension.
 async fn enable_extension(
     State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<EnableExtensionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state.registry.enable_extension(&req.name).await?;
+    state.registry.enable_extension_for_user(&user.id, &req.name).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 /// `POST /api/extensions/disable` — disable an extension.
 async fn disable_extension(
     State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<DisableExtensionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     state
         .registry
-        .disable_extension(&req.name, req.reason.as_deref())
+        .disable_extension_for_user(&user.id, &req.name, req.reason.as_deref())
         .await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -700,7 +718,11 @@ mod tests {
             .await
             .unwrap();
 
-        (extension_routes(ExtensionRouterState { registry }), tmp, ext_dir)
+        (
+            extension_routes(ExtensionRouterState { registry }).layer(Extension(CurrentUser::local_default())),
+            tmp,
+            ext_dir,
+        )
     }
 
     #[tokio::test]

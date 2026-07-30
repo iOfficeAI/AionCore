@@ -127,6 +127,7 @@ fn visibility_policy_user_message_has_explicit_decisions() {
 #[test]
 fn projection_request_for_teammate_mirror_uses_stable_mailbox_dedupe_key() {
     let req = TeamProjectionRequest::teammate_visible(
+        "user-1",
         "team-1",
         "lead-1",
         "conv-lead",
@@ -147,6 +148,7 @@ fn projection_request_for_teammate_mirror_uses_stable_mailbox_dedupe_key() {
 #[test]
 fn projection_request_for_team_system_message_uses_stable_mailbox_dedupe_key() {
     let req = TeamProjectionRequest::team_system_visible(
+        "user-1",
         "team-1",
         "lead-1",
         "conv-lead",
@@ -168,6 +170,7 @@ async fn projection_inserts_user_visible_bubble_with_stripped_system_notes() {
     let bc = Arc::new(RecordingBroadcaster::new());
     let projection = TeamMessageProjection::new(store.clone(), bc.clone());
     let req = TeamProjectionRequest {
+        user_id: "user-1".into(),
         team_id: "team-1".into(),
         slot_id: "lead-1".into(),
         conversation_id: "conv-lead".into(),
@@ -197,6 +200,7 @@ async fn projection_dedupes_teammate_mirror_and_broadcasts_persisted_msg_id() {
     let bc = Arc::new(RecordingBroadcaster::new());
     let projection = TeamMessageProjection::new(store.clone(), bc.clone());
     let req = TeamProjectionRequest::teammate_visible(
+        "user-1",
         "team-1",
         "lead-1",
         "conv-lead",
@@ -226,6 +230,7 @@ async fn projection_dedupes_teammate_mirror_and_broadcasts_persisted_msg_id() {
     let events = bc.events();
     assert_eq!(events.len(), 1, "duplicate projection must not re-broadcast");
     assert_eq!(events[0].name, "team.teammateMessage");
+    assert_eq!(events[0].data["user_id"], "user-1");
     assert_eq!(events[0].data["conversation_id"], "conv-lead");
     assert_eq!(events[0].data["msg_id"], first_msg_id);
     assert_eq!(events[0].data["from_slot_id"], "worker-1");
@@ -238,6 +243,7 @@ async fn projection_inserts_team_system_bubble_and_broadcasts_it_like_existing_m
     let bc = Arc::new(RecordingBroadcaster::new());
     let projection = TeamMessageProjection::new(store.clone(), bc.clone());
     let req = TeamProjectionRequest::team_system_visible(
+        "user-1",
         "team-1",
         "lead-1",
         "conv-lead",
@@ -522,7 +528,7 @@ async fn we1_agent_status_change_event() {
         make_agent("lead-1", "Lead", TeammateRole::Lead),
         make_agent("w1", "Worker", TeammateRole::Teammate),
     ];
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new("t1".into(), "user-1".into(), &agents, mailbox, task_board, bc.clone());
 
     mgr.set_status("w1", TeammateStatus::Working).await.unwrap();
 
@@ -545,7 +551,7 @@ async fn we2_agent_spawned_event() {
     let task_board = Arc::new(TaskBoard::new(repo));
     let bc = Arc::new(RecordingBroadcaster::new());
     let agents = vec![make_agent("lead-1", "Lead", TeammateRole::Lead)];
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new("t1".into(), "user-1".into(), &agents, mailbox, task_board, bc.clone());
 
     let new_agent = make_agent("w2", "NewWorker", TeammateRole::Teammate);
     mgr.add_agent(&new_agent).await;
@@ -575,7 +581,7 @@ async fn we3_agent_removed_event() {
         make_agent("lead-1", "Lead", TeammateRole::Lead),
         make_agent("w1", "Worker", TeammateRole::Teammate),
     ];
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new("t1".into(), "user-1".into(), &agents, mailbox, task_board, bc.clone());
 
     mgr.remove_agent("w1").await.unwrap();
 
@@ -603,7 +609,7 @@ async fn we4_agent_renamed_event() {
         make_agent("lead-1", "Lead", TeammateRole::Lead),
         make_agent("w1", "Worker", TeammateRole::Teammate),
     ];
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new("t1".into(), "user-1".into(), &agents, mailbox, task_board, bc.clone());
 
     mgr.rename_agent("w1", "SuperWorker").await.unwrap();
 
@@ -625,7 +631,7 @@ async fn we4_agent_renamed_event() {
 #[test]
 fn event_emitter_uses_typed_payloads() {
     let bc = Arc::new(RecordingBroadcaster::new());
-    let emitter = TeamEventEmitter::new("team-x".into(), bc.clone());
+    let emitter = TeamEventEmitter::new("team-x".into(), "user-1".into(), bc.clone());
 
     let agent = make_agent("s1", "A", TeammateRole::Teammate);
     emitter.broadcast_agent_status("s1", TeammateStatus::Thinking);

@@ -24,6 +24,8 @@ mod lark_tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
+    const OWNER_USER_ID: &str = "system_default_user";
+
     // -- Test infrastructure ------------------------------------------------
 
     struct MockBroadcaster {
@@ -222,7 +224,9 @@ mod lark_tests {
         let factory = lark_factory();
 
         let config = make_lark_config_value(Some("cli_123"), Some("secret"));
-        let result = manager.enable_plugin("nonexistent", &config, &factory).await;
+        let result = manager
+            .enable_plugin(OWNER_USER_ID, "nonexistent", &config, &factory)
+            .await;
         assert!(result.is_err());
     }
 
@@ -234,7 +238,7 @@ mod lark_tests {
         let factory = lark_factory();
 
         let config = make_lark_config_value(Some("bad_id"), Some("bad_secret"));
-        let result = manager.enable_plugin("lark", &config, &factory).await;
+        let result = manager.enable_plugin(OWNER_USER_ID, "lark", &config, &factory).await;
         assert!(result.is_err());
     }
 
@@ -243,7 +247,7 @@ mod lark_tests {
     #[tokio::test]
     async fn disable_without_db_row_returns_error() {
         let (manager, _repo, _bc) = setup().await;
-        let result = manager.disable_plugin("lark").await;
+        let result = manager.disable_plugin(OWNER_USER_ID, "lark").await;
         assert!(result.is_err());
     }
 
@@ -252,7 +256,7 @@ mod lark_tests {
     #[tokio::test]
     async fn get_plugin_status_empty() {
         let (manager, _repo, _bc) = setup().await;
-        let statuses = manager.get_plugin_status().await.unwrap();
+        let statuses = manager.get_plugin_status(OWNER_USER_ID).await.unwrap();
         assert!(statuses.is_empty());
     }
 
@@ -262,7 +266,7 @@ mod lark_tests {
     async fn restore_plugins_none_stored() {
         let (manager, _repo, _bc) = setup().await;
         let factory = lark_factory();
-        let result = manager.restore_plugins(&factory).await;
+        let result = manager.restore_plugins(OWNER_USER_ID, &factory).await;
         assert!(result.is_ok());
         assert_eq!(manager.active_plugin_count(), 0);
     }
@@ -272,6 +276,6 @@ mod lark_tests {
     #[tokio::test]
     async fn is_plugin_running_false_when_not_enabled() {
         let (manager, _repo, _bc) = setup().await;
-        assert!(!manager.is_plugin_running("lark"));
+        assert!(!manager.is_plugin_running(OWNER_USER_ID, "lark"));
     }
 }

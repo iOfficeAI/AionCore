@@ -8,6 +8,7 @@ pub(crate) mod config_option_catalog;
 pub(crate) mod config_options;
 mod error_mapping;
 pub mod hooks;
+pub mod legacy_session_model;
 pub(crate) mod mode_normalize;
 pub mod permission_router;
 pub mod session;

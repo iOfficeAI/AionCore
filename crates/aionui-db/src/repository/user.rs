@@ -1,5 +1,5 @@
 use crate::error::DbError;
-use crate::models::User;
+use crate::models::{ExternalUserProjection, User, UserStatus, UserType};
 
 /// User data access abstraction.
 ///
@@ -32,11 +32,52 @@ pub trait IUserRepository: Send + Sync {
     /// Returns `DbError::Conflict` if the username already exists.
     async fn create_user(&self, username: &str, password_hash: &str) -> Result<User, DbError>;
 
-    /// Finds a user by username.
+    /// Finds an active local password user by username.
     async fn find_by_username(&self, username: &str) -> Result<Option<User>, DbError>;
+
+    /// Idempotently creates or returns an external identity projection.
+    async fn ensure_external_user(
+        &self,
+        user_type: UserType,
+        external_user_id: &str,
+        projection: ExternalUserProjection,
+    ) -> Result<User, DbError>;
+
+    /// Finds a user by external identity mapping.
+    async fn find_by_external_user_id(
+        &self,
+        user_type: UserType,
+        external_user_id: &str,
+    ) -> Result<Option<User>, DbError>;
+
+    /// One-time adoption of the machine's pre-multi-account data: while
+    /// `owner_id` is the ONLY external (aionpro) user in this database,
+    /// re-own every user-scoped row currently held by `system_default_user`
+    /// to `owner_id`. Returns the number of rows moved.
+    ///
+    /// Self-idempotent: after the first successful adoption the source set is
+    /// empty, so repeated calls move nothing. Once a second external user is
+    /// provisioned the adoption window closes permanently. Rows that would
+    /// collide with an existing row of the new owner (per-user PK/UNIQUE
+    /// tables such as `system_settings`) are skipped, keeping the owner's own
+    /// data authoritative.
+    async fn adopt_system_default_data(&self, owner_id: &str) -> Result<u64, DbError>;
+
+    /// Whether `owner_id` currently holds the adoption window — i.e. it is the
+    /// ONLY external (aionpro) user in this database. This is the same
+    /// precondition `adopt_system_default_data` checks internally, exposed so
+    /// the on-disk file adoption can re-run after a partial move: once the DB
+    /// rows are adopted `adopt_system_default_data` returns 0, but leftover
+    /// files under `users/system_default_user/` may still need moving on a
+    /// later login. Returns `false` the moment a second external user exists,
+    /// so files can never leak to a later account.
+    async fn is_sole_external_user(&self, owner_id: &str) -> Result<bool, DbError>;
 
     /// Finds a user by ID.
     async fn find_by_id(&self, id: &str) -> Result<Option<User>, DbError>;
+
+    /// Finds an active user by ID.
+    async fn find_active_by_id(&self, id: &str) -> Result<Option<User>, DbError>;
 
     /// Lists all users.
     async fn list_users(&self) -> Result<Vec<User>, DbError>;
@@ -57,4 +98,11 @@ pub trait IUserRepository: Send + Sync {
 
     /// Updates a user's JWT secret.
     async fn update_jwt_secret(&self, user_id: &str, jwt_secret: &str) -> Result<(), DbError>;
+
+    /// Updates a user's status. Transitioning into `disabled` also revokes
+    /// existing sessions by incrementing `session_generation`.
+    async fn set_status(&self, user_id: &str, status: UserStatus) -> Result<(), DbError>;
+
+    /// Increments a user's session generation and returns the new value.
+    async fn increment_session_generation(&self, user_id: &str) -> Result<i64, DbError>;
 }

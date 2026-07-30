@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct CronJobRow {
     pub id: String,
+    pub user_id: String,
     pub name: String,
     pub enabled: bool,
     pub schedule_kind: String,
@@ -39,6 +40,7 @@ mod tests {
     fn cron_job_row_serialization_roundtrip() {
         let row = CronJobRow {
             id: "cron_abc123".into(),
+            user_id: "user1".into(),
             name: "Daily report".into(),
             enabled: true,
             schedule_kind: "cron".into(),
@@ -77,6 +79,7 @@ mod tests {
     fn cron_job_row_optional_fields_default_to_none() {
         let row = CronJobRow {
             id: "cron_min".into(),
+            user_id: "user1".into(),
             name: "Minimal".into(),
             enabled: true,
             schedule_kind: "every".into(),

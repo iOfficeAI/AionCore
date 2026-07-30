@@ -153,6 +153,7 @@ pub struct CronAgentConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CronJob {
     pub id: String,
+    pub user_id: String,
     pub name: String,
     pub enabled: bool,
     pub schedule: CronSchedule,
@@ -202,6 +203,7 @@ pub fn cron_job_from_row(row: CronJobRow) -> Result<CronJob, CronError> {
 
     Ok(CronJob {
         id: row.id,
+        user_id: row.user_id,
         name: row.name,
         enabled: row.enabled,
         schedule,
@@ -272,6 +274,7 @@ pub fn cron_job_to_row(job: &CronJob) -> Result<CronJobRow, CronError> {
 
     Ok(CronJobRow {
         id: job.id.clone(),
+        user_id: job.user_id.clone(),
         name: job.name.clone(),
         enabled: job.enabled,
         schedule_kind,
@@ -556,6 +559,7 @@ mod tests {
     fn sample_row() -> CronJobRow {
         CronJobRow {
             id: "cron_test1".into(),
+            user_id: "user1".into(),
             name: "Test Job".into(),
             enabled: true,
             schedule_kind: "every".into(),
@@ -586,6 +590,7 @@ mod tests {
     fn sample_job() -> CronJob {
         CronJob {
             id: "cron_test1".into(),
+            user_id: "user1".into(),
             name: "Test Job".into(),
             enabled: true,
             schedule: CronSchedule::Every {

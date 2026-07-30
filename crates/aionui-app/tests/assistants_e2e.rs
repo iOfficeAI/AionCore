@@ -37,6 +37,8 @@ use tower::ServiceExt;
 
 use common::{body_json, delete_with_token, get_with_token, json_with_token, setup_and_login};
 
+const DEFAULT_USER_ID: &str = "system_default_user";
+
 // ---------------------------------------------------------------------------
 // Fixture — router + temp dirs + services
 // ---------------------------------------------------------------------------
@@ -65,7 +67,10 @@ struct TestAgentCatalog {
 
 #[async_trait::async_trait]
 impl AssistantAgentCatalogPort for TestAgentCatalog {
-    async fn list_management_agents(&self) -> Result<Vec<AgentManagementRow>, aionui_assistant::AssistantError> {
+    async fn list_management_agents(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<AgentManagementRow>, aionui_assistant::AssistantError> {
         Ok(self.rows.clone())
     }
 }
@@ -289,6 +294,7 @@ async fn fixture() -> Fixture {
     // erroring out — mirroring a configured production setup.
     provider_repo
         .create(aionui_db::CreateProviderParams {
+            user_id: "system_default_user",
             id: None,
             platform: "openai",
             name: "Test OpenAI",
@@ -693,7 +699,9 @@ async fn create_user_avatar_from_local_file_is_served_via_assistant_avatar_route
     let body = body_json(resp).await;
     assert_versioned_avatar_route(&body, "/api/assistants/u-avatar/avatar");
 
-    let persisted_avatar = fx.user_data_dir.join("assistant-avatars/u-avatar.png");
+    let persisted_avatar = fx
+        .user_data_dir
+        .join("assistant-avatars/users/system_default_user/u-avatar.png");
     assert!(
         persisted_avatar.exists(),
         "persisted avatar missing: {}",
@@ -740,7 +748,9 @@ async fn create_user_avatar_from_builtin_avatar_route_copies_builtin_asset() {
     let body = body_json(resp).await;
     assert_versioned_avatar_route(&body, "/api/assistants/u-avatar-from-builtin/avatar");
 
-    let persisted_avatar = fx.user_data_dir.join("assistant-avatars/u-avatar-from-builtin.png");
+    let persisted_avatar = fx
+        .user_data_dir
+        .join("assistant-avatars/users/system_default_user/u-avatar-from-builtin.png");
     assert!(
         persisted_avatar.exists(),
         "persisted avatar missing: {}",
@@ -792,7 +802,7 @@ async fn create_user_avatar_from_absolute_builtin_avatar_route_copies_builtin_as
 
     let persisted_avatar = fx
         .user_data_dir
-        .join("assistant-avatars/u-avatar-from-builtin-absolute.png");
+        .join("assistant-avatars/users/system_default_user/u-avatar-from-builtin-absolute.png");
     assert!(
         persisted_avatar.exists(),
         "persisted avatar missing: {}",
@@ -834,7 +844,9 @@ async fn update_user_avatar_with_existing_route_preserves_served_file() {
     let update_resp = fx.app.clone().oneshot(update_req).await.unwrap();
     assert_eq!(update_resp.status(), StatusCode::OK);
 
-    let persisted_avatar = fx.user_data_dir.join("assistant-avatars/u-avatar-stable.png");
+    let persisted_avatar = fx
+        .user_data_dir
+        .join("assistant-avatars/users/system_default_user/u-avatar-stable.png");
     assert!(
         persisted_avatar.exists(),
         "persisted avatar missing: {}",
@@ -939,6 +951,44 @@ async fn update_extension_registry_id_without_user_row_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn assistant_routes_hide_other_users_rows() {
+    let fx = fixture().await;
+    create_user(&fx, "private-a", "Private A").await;
+
+    let mut app = fx.app.clone();
+    let (token_b, csrf_b) = setup_and_login(&mut app, &fx.services, "other-user", "OtherP@ss1").await;
+
+    let requests = [
+        get_with_token("/api/assistants/private-a", &token_b),
+        json_with_token(
+            "PUT",
+            "/api/assistants/private-a",
+            json!({ "name": "hijacked" }),
+            &token_b,
+            &csrf_b,
+        ),
+        delete_with_token("/api/assistants/private-a", &token_b, &csrf_b),
+    ];
+
+    for request in requests {
+        let resp = fx.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_json(resp).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["code"], "NOT_FOUND");
+    }
+
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants/private-a", &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["profile"]["name"], "Private A");
+}
+
 // ===========================================================================
 // DELETE /api/assistants/{id}
 // ===========================================================================
@@ -949,9 +999,21 @@ async fn delete_happy_path_removes_row_and_user_assets() {
     create_user(&fx, "u1", "A").await;
     // Drop a rule, skill, and avatar on disk so the fs-cleanup branch has
     // something to remove.
-    let rules_dir = fx.user_data_dir.join("assistant-rules");
-    let skills_dir = fx.user_data_dir.join("assistant-skills");
-    let avatars_dir = fx.user_data_dir.join("assistant-avatars");
+    let rules_dir = fx
+        .user_data_dir
+        .join("assistant-rules")
+        .join("users")
+        .join(DEFAULT_USER_ID);
+    let skills_dir = fx
+        .user_data_dir
+        .join("assistant-skills")
+        .join("users")
+        .join(DEFAULT_USER_ID);
+    let avatars_dir = fx
+        .user_data_dir
+        .join("assistant-avatars")
+        .join("users")
+        .join(DEFAULT_USER_ID);
     std::fs::create_dir_all(&rules_dir).unwrap();
     std::fs::create_dir_all(&skills_dir).unwrap();
     std::fs::create_dir_all(&avatars_dir).unwrap();
@@ -1229,7 +1291,11 @@ async fn avatar_builtin_returns_bytes_with_content_type() {
 async fn avatar_user_ignores_planted_file_without_managed_value() {
     let fx = fixture().await;
     create_user(&fx, "u1", "A").await;
-    let avatars_dir = fx.user_data_dir.join("assistant-avatars");
+    let avatars_dir = fx
+        .user_data_dir
+        .join("assistant-avatars")
+        .join("users")
+        .join(DEFAULT_USER_ID);
     std::fs::create_dir_all(&avatars_dir).unwrap();
     std::fs::write(avatars_dir.join("u1.svg"), b"<svg></svg>").unwrap();
 
@@ -1318,6 +1384,116 @@ async fn read_rule_user_round_trip_through_write() {
     assert_eq!(json["data"], "my rule");
 }
 
+#[tokio::test]
+async fn rule_and_skill_files_are_isolated_by_current_user() {
+    let fx = fixture().await;
+    let mut app = fx.app.clone();
+    let (token_b, csrf_b) = setup_and_login(&mut app, &fx.services, "other-user", "OtherP@ss1").await;
+    let user_b = fx
+        .services
+        .user_repo
+        .find_by_username("other-user")
+        .await
+        .unwrap()
+        .unwrap();
+
+    for (token, csrf, endpoint, content) in [
+        (
+            fx.token.as_str(),
+            fx.csrf.as_str(),
+            "/api/skills/assistant-rule/write",
+            "rule-a",
+        ),
+        (
+            token_b.as_str(),
+            csrf_b.as_str(),
+            "/api/skills/assistant-rule/write",
+            "rule-b",
+        ),
+        (
+            fx.token.as_str(),
+            fx.csrf.as_str(),
+            "/api/skills/assistant-skill/write",
+            "skill-a",
+        ),
+        (
+            token_b.as_str(),
+            csrf_b.as_str(),
+            "/api/skills/assistant-skill/write",
+            "skill-b",
+        ),
+    ] {
+        let req = json_with_token(
+            "POST",
+            endpoint,
+            json!({ "assistant_id": "shared-assistant", "content": content }),
+            token,
+            csrf,
+        );
+        let resp = fx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    for (token, csrf, expected) in [
+        (fx.token.as_str(), fx.csrf.as_str(), "rule-a"),
+        (token_b.as_str(), csrf_b.as_str(), "rule-b"),
+    ] {
+        let req = json_with_token(
+            "POST",
+            "/api/skills/assistant-rule/read",
+            json!({ "assistant_id": "shared-assistant" }),
+            token,
+            csrf,
+        );
+        let resp = fx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["data"], expected);
+    }
+
+    let rule_root = fx.user_data_dir.join("assistant-rules");
+    let skill_root = fx.user_data_dir.join("assistant-skills");
+    assert_eq!(
+        std::fs::read_to_string(
+            rule_root
+                .join("users")
+                .join(DEFAULT_USER_ID)
+                .join("shared-assistant.md")
+        )
+        .unwrap(),
+        "rule-a"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            rule_root
+                .join("users")
+                .join(aionui_common::user_dir_name(&user_b.id).unwrap())
+                .join("shared-assistant.md")
+        )
+        .unwrap(),
+        "rule-b"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            skill_root
+                .join("users")
+                .join(DEFAULT_USER_ID)
+                .join("shared-assistant.md")
+        )
+        .unwrap(),
+        "skill-a"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            skill_root
+                .join("users")
+                .join(aionui_common::user_dir_name(&user_b.id).unwrap())
+                .join("shared-assistant.md")
+        )
+        .unwrap(),
+        "skill-b"
+    );
+}
+
 // ===========================================================================
 // POST /api/skills/assistant-rule/write
 // ===========================================================================
@@ -1336,7 +1512,12 @@ async fn write_rule_user_happy_path() {
     let resp = fx.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     // File was actually written.
-    let file = fx.user_data_dir.join("assistant-rules/u1.md");
+    let file = fx
+        .user_data_dir
+        .join("assistant-rules")
+        .join("users")
+        .join(DEFAULT_USER_ID)
+        .join("u1.md");
     assert_eq!(std::fs::read_to_string(file).unwrap(), "rule body");
 }
 
@@ -1376,7 +1557,11 @@ async fn write_rule_extension_registry_id_behaves_like_user_id() {
 async fn delete_rule_user_removes_file() {
     let fx = fixture().await;
     create_user(&fx, "u1", "A").await;
-    let rules_dir = fx.user_data_dir.join("assistant-rules");
+    let rules_dir = fx
+        .user_data_dir
+        .join("assistant-rules")
+        .join("users")
+        .join(DEFAULT_USER_ID);
     std::fs::create_dir_all(&rules_dir).unwrap();
     std::fs::write(rules_dir.join("u1.md"), "body").unwrap();
 
@@ -1502,7 +1687,12 @@ async fn write_skill_user_happy_path() {
     );
     let resp = fx.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let file = fx.user_data_dir.join("assistant-skills/u1.md");
+    let file = fx
+        .user_data_dir
+        .join("assistant-skills")
+        .join("users")
+        .join(DEFAULT_USER_ID)
+        .join("u1.md");
     assert_eq!(std::fs::read_to_string(file).unwrap(), "skill body");
 }
 
@@ -1542,7 +1732,11 @@ async fn write_skill_extension_registry_id_behaves_like_user_id() {
 async fn delete_skill_user_removes_file() {
     let fx = fixture().await;
     create_user(&fx, "u1", "A").await;
-    let skills_dir = fx.user_data_dir.join("assistant-skills");
+    let skills_dir = fx
+        .user_data_dir
+        .join("assistant-skills")
+        .join("users")
+        .join(DEFAULT_USER_ID);
     std::fs::create_dir_all(&skills_dir).unwrap();
     std::fs::write(skills_dir.join("u1.md"), "body").unwrap();
 
@@ -1606,4 +1800,110 @@ async fn create_user(fx: &Fixture, id: &str, name: &str) {
 
 fn find_id<'a>(list: &'a Value, id: &str) -> Option<&'a Value> {
     list.as_array()?.iter().find(|a| a["id"].as_str() == Some(id))
+}
+
+// ---------------------------------------------------------------------------
+// Two-user filesystem isolation: avatars
+// ---------------------------------------------------------------------------
+
+/// Two Core Users each upload an avatar. Each must land under its owner's
+/// `assistant-avatars/users/{dir}/` (never a shared flat dir), keep its own
+/// bytes, and be served per-user. (The service rejects reusing another user's
+/// assistant id outright — asserted here too — so a same-name overwrite can't
+/// even be attempted.)
+#[tokio::test]
+async fn avatars_of_two_users_are_physically_isolated() {
+    let mut fx = fixture().await;
+
+    // Second user alongside the fixture's admin (system_default_user).
+    let (token_b, csrf_b) = setup_and_login(&mut fx.app, &fx.services, "bob", "StrongP@ss2").await;
+    let user_b = fx
+        .services
+        .user_repo
+        .find_by_username("bob")
+        .await
+        .unwrap()
+        .expect("bob should exist");
+    let dir_b = aionui_common::user_dir_name(&user_b.id).unwrap();
+
+    // Same-named source file, different bytes per user.
+    let src_a = fx.user_data_dir.join("picked-a.png");
+    let src_b = fx.user_data_dir.join("picked-b.png");
+    std::fs::write(&src_a, b"avatar-bytes-A").unwrap();
+    std::fs::write(&src_b, b"avatar-bytes-B").unwrap();
+
+    for (id_body, token, csrf) in [
+        (
+            json!({ "id": "av-iso-a", "name": "Iso A", "avatar": src_a.to_string_lossy(), "agent_id": "632f31d2" }),
+            &fx.token,
+            &fx.csrf,
+        ),
+        (
+            json!({ "id": "av-iso-b", "name": "Iso B", "avatar": src_b.to_string_lossy(), "agent_id": "632f31d2" }),
+            &token_b,
+            &csrf_b,
+        ),
+    ] {
+        let req = json_with_token("POST", "/api/assistants", id_body, token, csrf);
+        let resp = fx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // Reusing another user's assistant id is rejected outright, so a
+    // same-name avatar overwrite cannot even be attempted.
+    let req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({ "id": "av-iso-a", "name": "Steal", "avatar": src_b.to_string_lossy(), "agent_id": "632f31d2" }),
+        &token_b,
+        &csrf_b,
+    );
+    let resp = fx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "cross-user assistant id reuse must be rejected"
+    );
+
+    // Physically distinct per-user files, each with its own bytes.
+    let file_a = fx
+        .user_data_dir
+        .join("assistant-avatars/users/system_default_user/av-iso-a.png");
+    let file_b = fx
+        .user_data_dir
+        .join(format!("assistant-avatars/users/{dir_b}/av-iso-b.png"));
+    assert!(file_a.exists(), "A's avatar missing: {}", file_a.display());
+    assert!(file_b.exists(), "B's avatar missing: {}", file_b.display());
+    assert_eq!(
+        std::fs::read(&file_a).unwrap(),
+        b"avatar-bytes-A",
+        "A's avatar bytes must be untouched"
+    );
+    assert_eq!(std::fs::read(&file_b).unwrap(), b"avatar-bytes-B");
+    // Nothing leaked into a shared flat root or the other user's dir.
+    assert!(!fx.user_data_dir.join("assistant-avatars/av-iso-b.png").exists());
+    assert!(
+        !fx.user_data_dir
+            .join("assistant-avatars/users/system_default_user/av-iso-b.png")
+            .exists()
+    );
+
+    // Serving is per-user: each token gets its own bytes.
+    for (id, token, expected) in [
+        ("av-iso-a", &fx.token, &b"avatar-bytes-A"[..]),
+        ("av-iso-b", &token_b, &b"avatar-bytes-B"[..]),
+    ] {
+        let resp = fx
+            .app
+            .clone()
+            .oneshot(get_with_token(&format!("/api/assistants/{id}/avatar"), token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&bytes[..], expected);
+    }
 }

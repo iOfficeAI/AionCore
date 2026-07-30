@@ -63,7 +63,19 @@ impl ProxyService {
         doc_type: DocType,
         request_headers: &[(String, String)],
     ) -> Result<ProxyResponse, ProxyError> {
-        if !self.watch_manager.is_active_port(port, doc_type) {
+        self.forward_for_user("system_default_user", port, path, doc_type, request_headers)
+            .await
+    }
+
+    pub async fn forward_for_user(
+        &self,
+        user_id: &str,
+        port: u16,
+        path: &str,
+        doc_type: DocType,
+        request_headers: &[(String, String)],
+    ) -> Result<ProxyResponse, ProxyError> {
+        if !self.watch_manager.is_active_port_for_user(user_id, port, doc_type) {
             return Err(ProxyError::PortNotActive(port));
         }
         let proxy_base = format!("/api/{}/{}", doc_type.proxy_prefix(), port);
@@ -76,7 +88,18 @@ impl ProxyService {
         path: &str,
         request_headers: &[(String, String)],
     ) -> Result<ProxyResponse, ProxyError> {
-        if !self.watch_manager.is_active_watch_port(port) {
+        self.forward_watch_for_user("system_default_user", port, path, request_headers)
+            .await
+    }
+
+    pub async fn forward_watch_for_user(
+        &self,
+        user_id: &str,
+        port: u16,
+        path: &str,
+        request_headers: &[(String, String)],
+    ) -> Result<ProxyResponse, ProxyError> {
+        if !self.watch_manager.is_active_watch_port_for_user(user_id, port) {
             return Err(ProxyError::PortNotActive(port));
         }
         let proxy_base = format!("/api/office-watch-proxy/{port}");

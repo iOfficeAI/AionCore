@@ -107,6 +107,10 @@ impl TestBroadcaster {
             .filter_map(|e| e.data["state"].as_str().map(String::from))
             .collect()
     }
+
+    fn events(&self) -> Vec<WebSocketMessage<serde_json::Value>> {
+        self.events.lock().unwrap().clone()
+    }
 }
 
 impl EventBroadcaster for TestBroadcaster {
@@ -270,6 +274,31 @@ async fn status_events_use_correct_prefix() {
     assert!(names.contains(&"word-preview.status".to_string()));
     assert!(names.contains(&"excel-preview.status".to_string()));
     assert!(names.contains(&"ppt-preview.status".to_string()));
+    assert!(
+        broadcaster
+            .events()
+            .iter()
+            .all(|event| event.data["user_id"].as_str() == Some("system_default_user"))
+    );
+}
+
+#[tokio::test]
+async fn status_events_include_starting_user() {
+    let spawner = Arc::new(TestSpawner::new(true));
+    let broadcaster = Arc::new(TestBroadcaster::new());
+    let mgr = OfficecliWatchManager::new(spawner, broadcaster.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = create_temp_file(&dir, "user.docx");
+
+    mgr.start_for_user("user-123", &file, DocType::Word).await.unwrap();
+
+    assert!(
+        broadcaster
+            .events()
+            .iter()
+            .any(|event| event.name == "word-preview.status" && event.data["user_id"].as_str() == Some("user-123"))
+    );
 }
 
 // ---------------------------------------------------------------------------

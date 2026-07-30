@@ -106,8 +106,13 @@ pub fn settings_routes(state: SystemRouterState) -> Router {
 
 async fn get_settings(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<SystemSettingsResponse>>, ApiError> {
-    let settings = state.settings_service.get_settings().await.map_err(ApiError::from)?;
+    let settings = state
+        .settings_service
+        .get_settings(&user.id)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(settings)))
 }
 
@@ -126,12 +131,13 @@ async fn get_feedback_diagnostics(
 
 async fn update_settings(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<UpdateSettingsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SystemSettingsResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let settings = state
         .settings_service
-        .update_settings(req)
+        .update_settings(&user.id, req)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(settings)))
@@ -148,6 +154,7 @@ struct ClientPrefQuery {
 
 async fn get_client_preferences(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Query(query): Query<ClientPrefQuery>,
 ) -> Result<Json<ApiResponse<ClientPreferencesResponse>>, ApiError> {
     let keys_filter: Option<Vec<String>> = query.keys.map(|k| {
@@ -161,7 +168,7 @@ async fn get_client_preferences(
 
     let prefs = state
         .client_pref_service
-        .get_preferences(key_refs.as_deref())
+        .get_preferences(&user.id, key_refs.as_deref())
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(prefs)))
@@ -169,12 +176,13 @@ async fn get_client_preferences(
 
 async fn update_client_preferences(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<UpdateClientPreferencesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     state
         .client_pref_service
-        .update_preferences(req)
+        .update_preferences(&user.id, req)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
@@ -186,47 +194,64 @@ async fn update_client_preferences(
 
 async fn list_providers(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<ProviderResponse>>>, ApiError> {
-    let providers = state.provider_service.list().await.map_err(ApiError::from)?;
+    let providers = state.provider_service.list(&user.id).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(providers)))
 }
 
 async fn create_provider(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateProviderRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ProviderResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let provider = state.provider_service.create(req).await.map_err(ApiError::from)?;
+    let provider = state
+        .provider_service
+        .create(&user.id, req)
+        .await
+        .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(provider))))
 }
 
 async fn update_provider(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<UpdateProviderRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProviderResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let provider = state.provider_service.update(&id, req).await.map_err(ApiError::from)?;
+    let provider = state
+        .provider_service
+        .update(&user.id, &id, req)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(provider)))
 }
 
 async fn delete_provider(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state.provider_service.delete(&id).await.map_err(ApiError::from)?;
+    state
+        .provider_service
+        .delete(&user.id, &id)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn fetch_models(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<FetchModelsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FetchModelsResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .model_fetch_service
-        .fetch_models(&id, &req)
+        .fetch_models(&user.id, &id, &req)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
@@ -282,9 +307,13 @@ async fn check_update(
 
 async fn ensure_node_runtime(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<EnsureNodeRuntimeRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<EnsureNodeRuntimeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let result = state.runtime_prepare_service.ensure_node_runtime(req.scope).await?;
+    let result = state
+        .runtime_prepare_service
+        .ensure_node_runtime_for_user(&user.id, req.scope)
+        .await?;
     Ok(Json(ApiResponse::ok(result)))
 }

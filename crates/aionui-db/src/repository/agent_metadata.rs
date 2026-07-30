@@ -17,12 +17,23 @@ pub trait IAgentMetadataRepository: Send + Sync {
     /// Return every row, in insertion order.
     async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError>;
 
+    async fn list_all_for_user(&self, user_id: &str) -> Result<Vec<AgentMetadataRow>, DbError>;
+
     /// Look up by primary key.
     async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError>;
+
+    async fn get_for_user(&self, user_id: &str, id: &str) -> Result<Option<AgentMetadataRow>, DbError>;
 
     /// Look up by the unique `(agent_source, name)` pair.
     async fn find_by_source_and_name(
         &self,
+        agent_source: &str,
+        name: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError>;
+
+    async fn find_by_source_and_name_for_user(
+        &self,
+        user_id: &str,
         agent_source: &str,
         name: &str,
     ) -> Result<Option<AgentMetadataRow>, DbError>;
@@ -32,8 +43,24 @@ pub trait IAgentMetadataRepository: Send + Sync {
     /// not a full agent id.
     async fn find_builtin_by_backend(&self, backend: &str) -> Result<Option<AgentMetadataRow>, DbError>;
 
+    async fn find_builtin_by_backend_for_user(
+        &self,
+        user_id: &str,
+        backend: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError>;
+
     /// Insert or replace a row. Returns the row as stored.
     async fn upsert(&self, params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError>;
+
+    async fn upsert_for_user(
+        &self,
+        user_id: &str,
+        params: &UpsertAgentMetadataParams<'_>,
+    ) -> Result<AgentMetadataRow, DbError>;
+
+    async fn upsert_global(&self, params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
+        self.upsert(params).await
+    }
 
     /// Apply handshake-derived fields on top of an existing row.
     /// Returns `Ok(None)` if no row matches `id`.
@@ -43,10 +70,24 @@ pub trait IAgentMetadataRepository: Send + Sync {
         params: &UpdateAgentHandshakeParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError>;
 
+    async fn apply_handshake_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        params: &UpdateAgentHandshakeParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError>;
+
     /// Persist the latest availability snapshot for an existing row.
     /// Returns `Ok(None)` if no row matches `id`.
     async fn update_availability_snapshot(
         &self,
+        id: &str,
+        params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError>;
+
+    async fn update_availability_snapshot_for_user(
+        &self,
+        user_id: &str,
         id: &str,
         params: &UpdateAgentAvailabilitySnapshotParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError>;
@@ -62,9 +103,21 @@ pub trait IAgentMetadataRepository: Send + Sync {
         env_override: Option<&str>,
     ) -> Result<(), DbError>;
 
+    async fn update_agent_overrides_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        command_override: Option<&str>,
+        env_override: Option<&str>,
+    ) -> Result<(), DbError>;
+
     /// Toggle the `enabled` flag. Returns `true` if a row was updated.
     async fn set_enabled(&self, id: &str, enabled: bool) -> Result<bool, DbError>;
 
+    async fn set_enabled_for_user(&self, user_id: &str, id: &str, enabled: bool) -> Result<bool, DbError>;
+
     /// Delete a row. Returns `true` if a row was removed.
     async fn delete(&self, id: &str) -> Result<bool, DbError>;
+
+    async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<bool, DbError>;
 }

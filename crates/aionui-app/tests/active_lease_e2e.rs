@@ -269,8 +269,8 @@ async fn team_active_lease_rejects_cross_user_without_renewing() {
     let req = empty_post_with_token("/api/teams/team-cross-user/active-lease", &other_token, &other_csrf);
     let resp = app.oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = body_json(resp).await;
-    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["code"], "NOT_FOUND");
     assert!(services.active_lease_registry.active_until("team-cross-conv").is_none());
 }

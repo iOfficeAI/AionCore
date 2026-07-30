@@ -5,7 +5,7 @@ use aionui_db::{SqliteAgentMetadataRepository, init_database_memory};
 
 use crate::manager::acp::config_option_catalog::extract_config_options_from_value;
 
-use super::AgentRegistry;
+use super::{AgentRegistry, SYSTEM_DEFAULT_USER_ID};
 
 async fn registry() -> Arc<AgentRegistry> {
     let db = init_database_memory().await.unwrap();
@@ -21,6 +21,7 @@ async fn apply_handshake_derives_catalogs_from_config_options_before_persisting(
     let opencode = reg.find_builtin_by_backend("opencode").await.unwrap();
 
     reg.apply_handshake_inner(
+        SYSTEM_DEFAULT_USER_ID,
         &opencode.id,
         &AgentHandshake {
             config_options: Some(serde_json::json!({
@@ -90,6 +91,7 @@ async fn apply_handshake_falls_back_to_available_catalogs_when_config_options_ha
     });
 
     reg.apply_handshake_inner(
+        SYSTEM_DEFAULT_USER_ID,
         &opencode.id,
         &AgentHandshake {
             config_options: Some(serde_json::json!([
@@ -127,6 +129,7 @@ async fn apply_handshake_prefers_config_options_over_available_catalogs() {
     });
 
     reg.apply_handshake_inner(
+        SYSTEM_DEFAULT_USER_ID,
         &opencode.id,
         &AgentHandshake {
             available_modes: Some(existing_modes),
@@ -138,6 +141,7 @@ async fn apply_handshake_prefers_config_options_over_available_catalogs() {
     .unwrap();
 
     reg.apply_handshake_inner(
+        SYSTEM_DEFAULT_USER_ID,
         &opencode.id,
         &AgentHandshake {
             config_options: Some(serde_json::json!({
@@ -206,6 +210,7 @@ async fn apply_handshake_config_only_partial_prefers_config_options_over_existin
     });
 
     reg.apply_handshake_inner(
+        SYSTEM_DEFAULT_USER_ID,
         &opencode.id,
         &AgentHandshake {
             available_modes: Some(explicit_modes.clone()),
@@ -217,6 +222,7 @@ async fn apply_handshake_config_only_partial_prefers_config_options_over_existin
     .unwrap();
 
     reg.apply_handshake_inner(
+        SYSTEM_DEFAULT_USER_ID,
         &opencode.id,
         &AgentHandshake {
             config_options: Some(serde_json::json!({
@@ -267,6 +273,7 @@ async fn apply_handshake_merges_partial_config_option_updates_before_persisting(
     let opencode = reg.find_builtin_by_backend("opencode").await.unwrap();
 
     reg.apply_handshake_inner(
+        SYSTEM_DEFAULT_USER_ID,
         &opencode.id,
         &AgentHandshake {
             config_options: Some(serde_json::json!({
@@ -307,6 +314,7 @@ async fn apply_handshake_merges_partial_config_option_updates_before_persisting(
     .unwrap();
 
     reg.apply_handshake_inner(
+        SYSTEM_DEFAULT_USER_ID,
         &opencode.id,
         &AgentHandshake {
             config_options: Some(serde_json::json!({

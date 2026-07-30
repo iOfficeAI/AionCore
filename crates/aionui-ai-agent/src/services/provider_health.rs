@@ -44,6 +44,7 @@ impl ProviderHealthCheckService {
 
     pub async fn health_check(
         &self,
+        user_id: &str,
         req: ProviderHealthCheckRequest,
     ) -> Result<ProviderHealthCheckResponse, AgentError> {
         if req.provider_id.trim().is_empty() {
@@ -57,7 +58,7 @@ impl ProviderHealthCheckService {
         let model = req.model.trim();
         let row = self
             .provider_repo
-            .find_by_id(provider_id)
+            .find_by_id(user_id, provider_id)
             .await
             .map_err(|e| AgentError::internal(format!("Failed to load provider config: {e}")))?
             .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;
@@ -338,16 +339,17 @@ mod tests {
     use aionui_db::{CreateProviderParams, DbError, UpdateProviderParams};
 
     const TEST_KEY: [u8; 32] = [0xAB; 32];
+    const TEST_USER_ID: &str = "user-1";
 
     struct UnusedProviderRepository;
 
     #[async_trait::async_trait]
     impl IProviderRepository for UnusedProviderRepository {
-        async fn list(&self) -> Result<Vec<Provider>, DbError> {
+        async fn list(&self, _user_id: &str) -> Result<Vec<Provider>, DbError> {
             unreachable!("provider repo is not used by resolve_probe_config")
         }
 
-        async fn find_by_id(&self, _id: &str) -> Result<Option<Provider>, DbError> {
+        async fn find_by_id(&self, _user_id: &str, _id: &str) -> Result<Option<Provider>, DbError> {
             unreachable!("provider repo is not used by resolve_probe_config")
         }
 
@@ -355,11 +357,16 @@ mod tests {
             unreachable!("provider repo is not used by resolve_probe_config")
         }
 
-        async fn update(&self, _id: &str, _params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _params: UpdateProviderParams<'_>,
+        ) -> Result<Provider, DbError> {
             unreachable!("provider repo is not used by resolve_probe_config")
         }
 
-        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
             unreachable!("provider repo is not used by resolve_probe_config")
         }
     }
@@ -375,6 +382,7 @@ mod tests {
     fn test_provider() -> Provider {
         Provider {
             id: "provider-1".to_owned(),
+            user_id: TEST_USER_ID.to_owned(),
             platform: "anthropic".to_owned(),
             name: "Test Anthropic".to_owned(),
             base_url: "https://api.anthropic.com".to_owned(),

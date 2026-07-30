@@ -85,14 +85,14 @@ impl SqliteFeedbackDiagnosticsRepository {
                 "created_at": conversation.try_get::<i64, _>("created_at")?,
                 "updated_at": conversation.try_get::<i64, _>("updated_at")?,
             },
-            "messages": self.collect_message_diagnostics(conversation_id).await?,
+            "messages": self.collect_message_diagnostics(&request.user_id, conversation_id).await?,
             "recent_conversations": self.collect_recent_conversations(
                 &request.user_id,
                 conversation_id,
                 conversation.try_get::<i64, _>("updated_at")?,
             ).await?,
-            "acp_session": self.collect_acp_session(conversation_id).await?,
-            "agent_metadata": self.collect_agent_metadata(agent_id.as_deref()).await?,
+            "acp_session": self.collect_acp_session(&request.user_id, conversation_id).await?,
+            "agent_metadata": self.collect_agent_metadata(&request.user_id, agent_id.as_deref()).await?,
             "assistant_snapshot": self.collect_assistant_snapshot(&request.user_id, conversation_id).await?,
         });
 
@@ -218,13 +218,15 @@ impl SqliteFeedbackDiagnosticsRepository {
         }))
     }
 
-    async fn collect_message_diagnostics(&self, conversation_id: &str) -> Result<Value, DbError> {
+    async fn collect_message_diagnostics(&self, user_id: &str, conversation_id: &str) -> Result<Value, DbError> {
         let aggregate_rows = sqlx::query(
-            "SELECT type, status, hidden, COUNT(*) AS count, SUM(length(content)) AS content_bytes \
-             FROM messages \
-             WHERE conversation_id = ? \
-             GROUP BY type, status, hidden",
+            "SELECT m.type, m.status, m.hidden, COUNT(*) AS count, SUM(length(m.content)) AS content_bytes \
+             FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? \
+             GROUP BY m.type, m.status, m.hidden",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .fetch_all(&self.pool)
         .await?;
@@ -253,16 +255,18 @@ impl SqliteFeedbackDiagnosticsRepository {
 
         let recent_messages = sqlx::query(
             "SELECT \
-                id, msg_id, type, position, status, hidden, created_at, length(content) AS content_bytes, \
-                CASE WHEN json_valid(content) THEN length(json_extract(content, '$.text')) END AS text_length, \
-                CASE WHEN json_valid(content) THEN json_array_length(content, '$.attachments') END AS attachment_count, \
-                CASE WHEN json_valid(content) THEN json_array_length(content, '$.images') END AS image_count, \
-                CASE WHEN json_valid(content) THEN json_array_length(content, '$.toolCalls') END AS tool_call_count \
-             FROM messages \
-             WHERE conversation_id = ? \
-             ORDER BY created_at DESC, id DESC \
+                m.id, m.msg_id, m.type, m.position, m.status, m.hidden, m.created_at, length(m.content) AS content_bytes, \
+                CASE WHEN json_valid(m.content) THEN length(json_extract(m.content, '$.text')) END AS text_length, \
+                CASE WHEN json_valid(m.content) THEN json_array_length(m.content, '$.attachments') END AS attachment_count, \
+                CASE WHEN json_valid(m.content) THEN json_array_length(m.content, '$.images') END AS image_count, \
+                CASE WHEN json_valid(m.content) THEN json_array_length(m.content, '$.toolCalls') END AS tool_call_count \
+             FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? \
+             ORDER BY m.created_at DESC, m.id DESC \
              LIMIT 20",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .fetch_all(&self.pool)
         .await?;
@@ -289,19 +293,21 @@ impl SqliteFeedbackDiagnosticsRepository {
 
         let recent_errors = sqlx::query(
             "SELECT \
-                id, type, status, position, created_at, length(content) AS content_bytes, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.code'), json_extract(content, '$.code')) END AS code, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.ownership'), json_extract(content, '$.ownership')) END AS ownership, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.retryable'), json_extract(content, '$.retryable')) END AS retryable, \
-                CASE WHEN json_valid(content) THEN json_extract(content, '$.resolution.kind') END AS resolution_kind, \
-                CASE WHEN json_valid(content) THEN json_extract(content, '$.resolution.targetId') END AS resolution_target_id, \
-                CASE WHEN json_valid(content) THEN json_extract(content, '$.feedbackRecommended') END AS feedback_recommended \
-             FROM messages \
-             WHERE conversation_id = ? \
-               AND (status = 'error' OR type = 'tips' OR (json_valid(content) AND json_extract(content, '$.error.code') IS NOT NULL)) \
-             ORDER BY created_at DESC, id DESC \
+                m.id, m.type, m.status, m.position, m.created_at, length(m.content) AS content_bytes, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.code'), json_extract(m.content, '$.code')) END AS code, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.ownership'), json_extract(m.content, '$.ownership')) END AS ownership, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.retryable'), json_extract(m.content, '$.retryable')) END AS retryable, \
+                CASE WHEN json_valid(m.content) THEN json_extract(m.content, '$.resolution.kind') END AS resolution_kind, \
+                CASE WHEN json_valid(m.content) THEN json_extract(m.content, '$.resolution.targetId') END AS resolution_target_id, \
+                CASE WHEN json_valid(m.content) THEN json_extract(m.content, '$.feedbackRecommended') END AS feedback_recommended \
+             FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? \
+               AND (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL)) \
+             ORDER BY m.created_at DESC, m.id DESC \
              LIMIT 10",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .fetch_all(&self.pool)
         .await?;
@@ -328,16 +334,18 @@ impl SqliteFeedbackDiagnosticsRepository {
 
         let recent_error_detail_rows = sqlx::query(
             "SELECT \
-                id, msg_id, type, status, position, hidden, created_at, length(content) AS content_bytes, content, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.code'), json_extract(content, '$.code')) END AS code, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.ownership'), json_extract(content, '$.ownership')) END AS ownership, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.retryable'), json_extract(content, '$.retryable')) END AS retryable \
-             FROM messages \
-             WHERE conversation_id = ? \
-               AND (status = 'error' OR type = 'tips' OR (json_valid(content) AND json_extract(content, '$.error.code') IS NOT NULL)) \
-             ORDER BY created_at DESC, id DESC \
+                m.id, m.msg_id, m.type, m.status, m.position, m.hidden, m.created_at, length(m.content) AS content_bytes, m.content, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.code'), json_extract(m.content, '$.code')) END AS code, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.ownership'), json_extract(m.content, '$.ownership')) END AS ownership, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.retryable'), json_extract(m.content, '$.retryable')) END AS retryable \
+             FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? \
+               AND (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL)) \
+             ORDER BY m.created_at DESC, m.id DESC \
              LIMIT 10",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .fetch_all(&self.pool)
         .await?;
@@ -388,17 +396,19 @@ impl SqliteFeedbackDiagnosticsRepository {
         }))
     }
 
-    async fn collect_acp_session(&self, conversation_id: &str) -> Result<Value, DbError> {
+    async fn collect_acp_session(&self, user_id: &str, conversation_id: &str) -> Result<Value, DbError> {
         let row = sqlx::query(
             "SELECT \
-                conversation_id, agent_source, agent_id, session_id, session_status, \
-                session_config, length(session_config) AS session_config_bytes, \
-                last_active_at, suspended_at, \
-                CASE WHEN json_valid(session_config) THEN json_extract(session_config, '$.runtime.current_mode_id') END AS current_mode_id, \
-                CASE WHEN json_valid(session_config) THEN json_extract(session_config, '$.runtime.current_model_id') END AS current_model_id \
-             FROM acp_session \
-             WHERE conversation_id = ?",
+                s.conversation_id, s.agent_source, s.agent_id, s.session_id, s.session_status, \
+                s.session_config, length(s.session_config) AS session_config_bytes, \
+                s.last_active_at, s.suspended_at, \
+                CASE WHEN json_valid(s.session_config) THEN json_extract(s.session_config, '$.runtime.current_mode_id') END AS current_mode_id, \
+                CASE WHEN json_valid(s.session_config) THEN json_extract(s.session_config, '$.runtime.current_model_id') END AS current_model_id \
+             FROM acp_session s \
+             JOIN conversations c ON c.id = s.conversation_id \
+             WHERE c.user_id = ? AND s.conversation_id = ?",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -428,22 +438,23 @@ impl SqliteFeedbackDiagnosticsRepository {
         }))
     }
 
-    async fn collect_agent_metadata(&self, agent_id: Option<&str>) -> Result<Value, DbError> {
+    async fn collect_agent_metadata(&self, user_id: &str, agent_id: Option<&str>) -> Result<Value, DbError> {
         let Some(agent_id) = agent_id else {
             return Ok(Value::Null);
         };
 
         let row = sqlx::query(
             "SELECT \
-                id, name, backend, agent_type, agent_source, enabled, sort_order, \
+                agent_id AS id, name, backend, agent_type, agent_source, enabled, sort_order, \
                 length(command) AS command_bytes, length(args) AS args_bytes, length(env) AS env_bytes, \
                 available_modes, available_models, available_commands, config_options, \
                 last_check_status, last_check_kind, last_check_error_code, last_check_latency_ms, \
                 last_check_at, last_success_at, last_failure_at \
              FROM agent_metadata \
-             WHERE id = ?",
+             WHERE agent_id = ? AND (user_id IS NULL OR user_id = ?)",
         )
         .bind(agent_id)
+        .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -528,17 +539,22 @@ impl SqliteFeedbackDiagnosticsRepository {
         let provider_id = self.resolve_provider_id(request).await?;
         let mut query = "SELECT id, platform, name, base_url, api_key_encrypted, models, enabled, capabilities, \
                             context_limit, model_enabled, model_health, is_full_url, created_at, updated_at \
-                         FROM providers"
+                         FROM providers \
+                         WHERE user_id = ?"
             .to_owned();
         if provider_id.is_some() {
-            query.push_str(" WHERE id = ?");
+            query.push_str(" AND id = ?");
         }
         query.push_str(" ORDER BY updated_at DESC LIMIT 20");
 
         let rows = if let Some(provider_id) = provider_id.as_deref() {
-            sqlx::query(&query).bind(provider_id).fetch_all(&self.pool).await?
+            sqlx::query(&query)
+                .bind(&request.user_id)
+                .bind(provider_id)
+                .fetch_all(&self.pool)
+                .await?
         } else {
-            sqlx::query(&query).fetch_all(&self.pool).await?
+            sqlx::query(&query).bind(&request.user_id).fetch_all(&self.pool).await?
         };
 
         let providers = rows
@@ -726,7 +742,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                             original_json, builtin, deleted_at, created_at, updated_at, length(transport_config) AS transport_config_bytes, \
                             length(original_json) AS original_json_bytes \
                          FROM mcp_servers \
-                         WHERE deleted_at IS NULL"
+                         WHERE user_id = ? AND deleted_at IS NULL"
             .to_owned();
         if request.context.mcp_server_id.is_some() {
             query.push_str(" AND id = ?");
@@ -734,9 +750,13 @@ impl SqliteFeedbackDiagnosticsRepository {
         query.push_str(" ORDER BY updated_at DESC LIMIT 30");
 
         let rows = if let Some(mcp_server_id) = request.context.mcp_server_id.as_deref() {
-            sqlx::query(&query).bind(mcp_server_id).fetch_all(&self.pool).await?
+            sqlx::query(&query)
+                .bind(&request.user_id)
+                .bind(mcp_server_id)
+                .fetch_all(&self.pool)
+                .await?
         } else {
-            sqlx::query(&query).fetch_all(&self.pool).await?
+            sqlx::query(&query).bind(&request.user_id).fetch_all(&self.pool).await?
         };
 
         let servers = rows
@@ -774,18 +794,20 @@ impl SqliteFeedbackDiagnosticsRepository {
         ))
     }
 
-    async fn collect_client_ui_settings(&self) -> Result<FeedbackDiagnosticsProfileResult, DbError> {
+    async fn collect_client_ui_settings(&self, user_id: &str) -> Result<FeedbackDiagnosticsProfileResult, DbError> {
         let preference_rows = sqlx::query(
             "SELECT key, value, updated_at \
              FROM client_preferences \
-             WHERE key LIKE 'appearance.%' \
+             WHERE user_id = ? \
+               AND (key LIKE 'appearance.%' \
                 OR key LIKE 'window.%' \
                 OR key LIKE 'display.%' \
                 OR key LIKE 'workspace.%' \
-                OR key LIKE 'settings.%' \
+                OR key LIKE 'settings.%') \
              ORDER BY updated_at DESC, key ASC \
              LIMIT 50",
         )
+        .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
 
@@ -805,8 +827,9 @@ impl SqliteFeedbackDiagnosticsRepository {
         let settings = sqlx::query(
             "SELECT language, notification_enabled, cron_notification_enabled, command_queue_enabled, save_upload_to_workspace, updated_at \
              FROM system_settings \
-             WHERE id = 1",
+             WHERE user_id = ?",
         )
+        .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -962,15 +985,20 @@ impl SqliteFeedbackDiagnosticsRepository {
         .bind(&request.user_id)
         .fetch_one(&self.pool)
         .await?;
-        let provider_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM providers")
+        let provider_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM providers WHERE user_id = ?")
+            .bind(&request.user_id)
             .fetch_one(&self.pool)
             .await?;
-        let agent_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_metadata")
-            .fetch_one(&self.pool)
-            .await?;
-        let active_mcp_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mcp_servers WHERE deleted_at IS NULL")
-            .fetch_one(&self.pool)
-            .await?;
+        let agent_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_metadata WHERE user_id IS NULL OR user_id = ?")
+                .bind(&request.user_id)
+                .fetch_one(&self.pool)
+                .await?;
+        let active_mcp_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM mcp_servers WHERE user_id = ? AND deleted_at IS NULL")
+                .bind(&request.user_id)
+                .fetch_one(&self.pool)
+                .await?;
 
         Ok(profile_result(
             FeedbackDiagnosticsProfile::GlobalSummary,
@@ -984,8 +1012,8 @@ impl SqliteFeedbackDiagnosticsRepository {
                 "conversation_status_counts": self.collect_global_conversation_status_counts(&request.user_id).await?,
                 "recent_conversations": self.collect_global_recent_conversations(&request.user_id).await?,
                 "recent_errors": self.collect_global_recent_errors(&request.user_id).await?,
-                "agent_health": self.collect_global_agent_health().await?,
-                "provider_health": self.collect_global_provider_health().await?,
+                "agent_health": self.collect_global_agent_health(&request.user_id).await?,
+                "provider_health": self.collect_global_provider_health(&request.user_id).await?,
             }),
         ))
     }
@@ -1116,7 +1144,7 @@ impl SqliteFeedbackDiagnosticsRepository {
             let conversation_message_count = row.try_get::<i64, _>("message_count")?;
             let conversation_error_message_count = row.try_get::<i64, _>("error_message_count")?;
             let conversation_updated_at = row.try_get::<i64, _>("updated_at")?;
-            let messages = self.collect_global_conversation_message_samples(&id).await?;
+            let messages = self.collect_global_conversation_message_samples(user_id, &id).await?;
             let item = json!({
                 "id": id.clone(),
                 "conversation_id": id,
@@ -1243,22 +1271,28 @@ impl SqliteFeedbackDiagnosticsRepository {
         }))
     }
 
-    async fn collect_global_conversation_message_samples(&self, conversation_id: &str) -> Result<Value, DbError> {
+    async fn collect_global_conversation_message_samples(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Value, DbError> {
         let error_rows = sqlx::query(
             "SELECT \
-                id, msg_id, type, status, position, hidden, created_at, length(content) AS content_bytes, content, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.code'), json_extract(content, '$.code')) END AS code, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.ownership'), json_extract(content, '$.ownership')) END AS ownership, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.retryable'), json_extract(content, '$.retryable')) END AS retryable, \
-                CASE WHEN json_valid(content) THEN json_extract(content, '$.resolution.kind') END AS resolution_kind, \
-                CASE WHEN json_valid(content) THEN json_extract(content, '$.resolution.targetId') END AS resolution_target_id, \
-                CASE WHEN json_valid(content) THEN json_extract(content, '$.feedbackRecommended') END AS feedback_recommended \
-             FROM messages \
-             WHERE conversation_id = ? \
-               AND (status = 'error' OR type = 'tips' OR (json_valid(content) AND json_extract(content, '$.error.code') IS NOT NULL)) \
-             ORDER BY created_at DESC, id DESC \
+                m.id, m.msg_id, m.type, m.status, m.position, m.hidden, m.created_at, length(m.content) AS content_bytes, m.content, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.code'), json_extract(m.content, '$.code')) END AS code, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.ownership'), json_extract(m.content, '$.ownership')) END AS ownership, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.retryable'), json_extract(m.content, '$.retryable')) END AS retryable, \
+                CASE WHEN json_valid(m.content) THEN json_extract(m.content, '$.resolution.kind') END AS resolution_kind, \
+                CASE WHEN json_valid(m.content) THEN json_extract(m.content, '$.resolution.targetId') END AS resolution_target_id, \
+                CASE WHEN json_valid(m.content) THEN json_extract(m.content, '$.feedbackRecommended') END AS feedback_recommended \
+             FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? \
+               AND (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL)) \
+             ORDER BY m.created_at DESC, m.id DESC \
              LIMIT ?",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .bind(GLOBAL_CONVERSATION_ERROR_LIMIT)
         .fetch_all(&self.pool)
@@ -1293,17 +1327,19 @@ impl SqliteFeedbackDiagnosticsRepository {
 
         let message_rows = sqlx::query(
             "SELECT \
-                id, msg_id, type, status, position, hidden, created_at, length(content) AS content_bytes, content, \
-                CASE WHEN json_valid(content) THEN length(json_extract(content, '$.text')) END AS text_length, \
-                CASE WHEN json_valid(content) THEN json_array_length(content, '$.attachments') END AS attachment_count, \
-                CASE WHEN json_valid(content) THEN json_array_length(content, '$.images') END AS image_count, \
-                CASE WHEN json_valid(content) THEN json_array_length(content, '$.toolCalls') END AS tool_call_count \
-             FROM messages \
-             WHERE conversation_id = ? \
-               AND NOT (status = 'error' OR type = 'tips' OR (json_valid(content) AND json_extract(content, '$.error.code') IS NOT NULL)) \
-             ORDER BY created_at DESC, id DESC \
+                m.id, m.msg_id, m.type, m.status, m.position, m.hidden, m.created_at, length(m.content) AS content_bytes, m.content, \
+                CASE WHEN json_valid(m.content) THEN length(json_extract(m.content, '$.text')) END AS text_length, \
+                CASE WHEN json_valid(m.content) THEN json_array_length(m.content, '$.attachments') END AS attachment_count, \
+                CASE WHEN json_valid(m.content) THEN json_array_length(m.content, '$.images') END AS image_count, \
+                CASE WHEN json_valid(m.content) THEN json_array_length(m.content, '$.toolCalls') END AS tool_call_count \
+             FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? \
+               AND NOT (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL)) \
+             ORDER BY m.created_at DESC, m.id DESC \
              LIMIT ?",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .bind(GLOBAL_CONVERSATION_MESSAGE_LIMIT)
         .fetch_all(&self.pool)
@@ -1404,17 +1440,19 @@ impl SqliteFeedbackDiagnosticsRepository {
         }))
     }
 
-    async fn collect_global_agent_health(&self) -> Result<Value, DbError> {
+    async fn collect_global_agent_health(&self, user_id: &str) -> Result<Value, DbError> {
         let rows = sqlx::query(
             "SELECT \
-                id, name, backend, agent_type, agent_source, enabled, sort_order, \
+                agent_id AS id, name, backend, agent_type, agent_source, enabled, sort_order, \
                 length(command) AS command_bytes, length(args) AS args_bytes, length(env) AS env_bytes, \
                 last_check_status, last_check_kind, last_check_error_code, last_check_latency_ms, \
                 last_check_at, last_success_at, last_failure_at, updated_at \
              FROM agent_metadata \
+             WHERE user_id IS NULL OR user_id = ? \
              ORDER BY updated_at DESC, id DESC \
              LIMIT ?",
         )
+        .bind(user_id)
         .bind(GLOBAL_HEALTH_LIMIT)
         .fetch_all(&self.pool)
         .await?;
@@ -1451,14 +1489,16 @@ impl SqliteFeedbackDiagnosticsRepository {
         }))
     }
 
-    async fn collect_global_provider_health(&self) -> Result<Value, DbError> {
+    async fn collect_global_provider_health(&self, user_id: &str) -> Result<Value, DbError> {
         let rows = sqlx::query(
             "SELECT id, platform, name, base_url, api_key_encrypted, models, enabled, capabilities, \
                     context_limit, model_enabled, model_health, is_full_url, created_at, updated_at \
              FROM providers \
+             WHERE user_id = ? \
              ORDER BY updated_at DESC, id DESC \
              LIMIT ?",
         )
+        .bind(user_id)
         .bind(GLOBAL_HEALTH_LIMIT)
         .fetch_all(&self.pool)
         .await?;
@@ -1514,7 +1554,9 @@ impl IFeedbackDiagnosticsRepository for SqliteFeedbackDiagnosticsRepository {
                 FeedbackDiagnosticsProfile::ModelAuth => self.collect_model_auth(request).await?,
                 FeedbackDiagnosticsProfile::AgentTeam => self.collect_agent_team(request).await?,
                 FeedbackDiagnosticsProfile::McpTools => self.collect_mcp_tools(request).await?,
-                FeedbackDiagnosticsProfile::ClientUiSettings => self.collect_client_ui_settings().await?,
+                FeedbackDiagnosticsProfile::ClientUiSettings => {
+                    self.collect_client_ui_settings(&request.user_id).await?
+                }
                 FeedbackDiagnosticsProfile::WorkspaceSummary => self.collect_workspace_summary(request).await?,
                 FeedbackDiagnosticsProfile::GlobalSummary => self.collect_global_summary(request).await?,
             };

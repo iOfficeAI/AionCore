@@ -691,6 +691,7 @@ mod tests {
         use crate::types::{CreatedBy, ExecutionMode};
         CronJob {
             id: id.to_owned(),
+            user_id: "user1".into(),
             name: "Test".into(),
             enabled,
             schedule: CronSchedule::Every {
