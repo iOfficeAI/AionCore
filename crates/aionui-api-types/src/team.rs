@@ -638,6 +638,43 @@ pub struct TeamTaskResponse {
     pub updated_at: TimestampMs,
 }
 
+/// Discriminates a unified activity item.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamActivityKind {
+    Message,
+    Task,
+}
+
+/// One entry of the unified team activity feed. `created_at`/`id` are surfaced
+/// at top level so the client can sort/cursor without unwrapping the payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamActivityItemResponse {
+    pub kind: TeamActivityKind,
+    pub created_at: TimestampMs,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<TeamMailboxMessageResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TeamTaskResponse>,
+}
+
+/// Keyset cursor echoed back for the next page.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamActivityCursor {
+    pub ts: TimestampMs,
+    pub id: String,
+}
+
+/// Response of `GET /api/teams/{id}/activity`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamActivityPageResponse {
+    pub items: Vec<TeamActivityItemResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<TeamActivityCursor>,
+    pub has_more: bool,
+}
+
 /// Kind of mailbox change carried by `team.mailboxChanged`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -688,6 +725,47 @@ pub struct TeamMailboxChangedPayload {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // -- Unified team activity feed -------------------------------------------
+
+    #[test]
+    fn team_activity_item_serializes_with_kind_tag() {
+        let item = TeamActivityItemResponse {
+            kind: TeamActivityKind::Message,
+            created_at: 1000,
+            id: "m1".into(),
+            message: Some(TeamMailboxMessageResponse {
+                id: "m1".into(),
+                team_id: "t1".into(),
+                from_agent_id: "a".into(),
+                to_agent_id: "b".into(),
+                msg_type: "message".into(),
+                content: "hi".into(),
+                summary: None,
+                files: vec![],
+                read: false,
+                created_at: 1000,
+            }),
+            task: None,
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["kind"], "message");
+        assert_eq!(v["id"], "m1");
+        assert!(v.get("task").is_none() || v["task"].is_null());
+    }
+
+    #[test]
+    fn team_activity_page_roundtrips() {
+        let page = TeamActivityPageResponse {
+            items: vec![],
+            next_cursor: Some(TeamActivityCursor { ts: 42, id: "x".into() }),
+            has_more: true,
+        };
+        let json = serde_json::to_string(&page).unwrap();
+        let back: TeamActivityPageResponse = serde_json::from_str(&json).unwrap();
+        assert!(back.has_more);
+        assert_eq!(back.next_cursor.unwrap().ts, 42);
+    }
 
     // -- A. Team management requests ------------------------------------------
 
