@@ -83,15 +83,6 @@ pub struct BehaviorPolicy {
 
     #[serde(default)]
     pub supports_team: bool,
-
-    /// Explicitly override team-mode inference for protocol outliers.
-    ///
-    /// ACP normally requires stdio MCP support, so the presence of
-    /// `mcp_capabilities` is enough to infer team support. Some adapters accept
-    /// `mcpServers` but do not wire them into the wrapped agent; those adapters
-    /// must set this to `Some(false)`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub team_capable_override: Option<bool>,
 }
 
 /// Handshake-derived fields captured from the ACP init/session-response.
@@ -453,22 +444,24 @@ mod behavior_policy_tests {
     fn supports_team_defaults_false_and_roundtrips() {
         let empty: BehaviorPolicy = serde_json::from_str("{}").unwrap();
         assert!(!empty.supports_team);
-        assert_eq!(empty.team_capable_override, None);
 
         let with_team: BehaviorPolicy = serde_json::from_str(r#"{"supports_team":true}"#).unwrap();
         assert!(with_team.supports_team);
 
         let serialized = serde_json::to_string(&with_team).unwrap();
         assert!(serialized.contains("\"supports_team\":true"));
-        assert!(!serialized.contains("team_capable_override"));
     }
 
+    /// A retired veto flag must not resurrect itself: older persisted rows still
+    /// carry `team_capable_override`, and deserializing them has to ignore the key
+    /// rather than fail (the field was removed together with its veto branch).
     #[test]
-    fn team_capable_override_roundtrips_explicit_false() {
-        let policy: BehaviorPolicy = serde_json::from_str(r#"{"team_capable_override":false}"#).unwrap();
-        assert_eq!(policy.team_capable_override, Some(false));
+    fn retired_team_capable_override_key_is_ignored() {
+        let policy: BehaviorPolicy =
+            serde_json::from_str(r#"{"supports_team":false,"team_capable_override":false}"#).unwrap();
+        assert!(!policy.supports_team);
 
         let serialized = serde_json::to_string(&policy).unwrap();
-        assert!(serialized.contains("\"team_capable_override\":false"));
+        assert!(!serialized.contains("team_capable_override"));
     }
 }

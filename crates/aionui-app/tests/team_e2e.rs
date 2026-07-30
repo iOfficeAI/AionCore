@@ -89,8 +89,12 @@ async fn ensure_default_team_assistant(
 }
 
 async fn mark_claude_backend_team_mcp_stdio_capable(services: &aionui_app::AppServices) {
+    // Team injects a stdio MCP server, but an agent never ADVERTISES stdio: ACP
+    // makes that transport mandatory, so `mcpCapabilities` only carries the
+    // optional `http`/`sse` flags. This mirrors what real claude reports; the
+    // fixture used to claim `stdio: true`, a shape no ACP agent emits.
     let capabilities = json!({
-        "mcp_capabilities": { "stdio": true },
+        "mcp_capabilities": { "http": true, "sse": true },
         "shell": true
     })
     .to_string();

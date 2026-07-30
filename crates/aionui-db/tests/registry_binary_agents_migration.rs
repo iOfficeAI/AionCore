@@ -28,6 +28,9 @@ async fn verified_registry_binary_agents_store_stable_registry_identity() {
         assert!(source.get("distribution").is_none());
         assert!(source.get("version").is_none());
         let policy: serde_json::Value = serde_json::from_str(row.behavior_policy.as_deref().unwrap()).unwrap();
-        assert_eq!(policy["team_capable_override"], false);
+        // 033 retired both team veto keys; capability is derived from the agent's
+        // advertised MCP transports, never pinned in the stored policy.
+        assert!(policy.get("team_capable_override").is_none());
+        assert!(policy.get("supports_team").is_none());
     }
 }

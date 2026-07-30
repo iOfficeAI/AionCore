@@ -31,18 +31,24 @@ mod tests {
     }
 
     #[test]
-    fn acp_backend_mcp_transport_requires_stdio_or_http_capabilities() {
-        let caps_stdio = json!({"mcp_capabilities": {"stdio": true}});
-        assert!(is_team_capable_backend("qwen", Some(&caps_stdio)));
-        assert!(supports_team_mcp_backend("qwen", Some(&caps_stdio)));
+    fn acp_backend_mcp_transport_requires_an_advertised_optional_transport() {
+        let caps_sse_only = json!({"mcp_capabilities": {"http": false, "sse": true}});
+        assert!(is_team_capable_backend("qwen", Some(&caps_sse_only)));
+        assert!(supports_team_mcp_backend("qwen", Some(&caps_sse_only)));
 
         let caps_http = json!({"mcpCapabilities": {"http": true, "sse": true}});
         assert!(is_team_capable_backend("droid", Some(&caps_http)));
         assert!(supports_team_mcp_backend("droid", Some(&caps_http)));
 
-        let caps_mcp = json!({"mcp": {"stdio": true}});
+        let caps_mcp = json!({"mcp": {"http": true}});
         assert!(is_team_capable_backend("goose", Some(&caps_mcp)));
         assert!(supports_team_mcp_backend("goose", Some(&caps_mcp)));
+
+        // Spec-mandatory stdio is never advertised, so a claimed `stdio` flag is
+        // not evidence that the agent wired MCP up: Team keeps it on CLI.
+        let caps_stdio = json!({"mcp_capabilities": {"stdio": true}});
+        assert!(is_team_capable_backend("zed", Some(&caps_stdio)));
+        assert!(!supports_team_mcp_backend("zed", Some(&caps_stdio)));
 
         let caps_disabled_transport = json!({"mcp_capabilities": {"http": false, "sse": false}});
         assert!(is_team_capable_backend("zed", Some(&caps_disabled_transport)));
