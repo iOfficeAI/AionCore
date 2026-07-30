@@ -57,7 +57,7 @@ pub use runtime_tools::ResolvedTeamToolContext;
 pub use scheduler::{
     SchedulerAction, TeammateManager, WAKE_TIMEOUT_MS, WakePayload, format_crash_testament, normalize_name,
 };
-pub use service::{TeamIdleCleanupCoordinator, TeamSessionService};
+pub use service::{ActivityKind, TeamIdleCleanupCoordinator, TeamSessionService};
 pub use session::{TeamSession, WakeInput};
 pub use task_board::{TaskBoard, TaskUpdate};
 pub use team_run::{TeamRunManager, target_role_for};

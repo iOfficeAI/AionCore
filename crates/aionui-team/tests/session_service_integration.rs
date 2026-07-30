@@ -7456,3 +7456,107 @@ async fn list_team_activity_rejects_other_user() {
     let tasks_err = svc.list_team_tasks("intruder", "t1", 500).await.unwrap_err();
     assert!(matches!(tasks_err, TeamError::TeamNotFound(_)));
 }
+
+// ── Unified paginated activity feed (list_team_activity) ──────────────
+
+#[tokio::test]
+async fn activity_all_merges_and_orders_desc_with_cursor() {
+    let (svc, team_repo, _tm, _cr) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.create_team(&activity_team_row("t1", "user1")).await.unwrap();
+    // Interleaved timestamps: msg@1000,3000  task@2000,4000.
+    for (id, ts) in [("m1", 1000), ("m2", 3000)] {
+        team_repo
+            .write_message("user1", &activity_message_row(id, "t1", ts))
+            .await
+            .unwrap();
+    }
+    for (id, ts) in [("k1", 2000), ("k2", 4000)] {
+        team_repo.create_task("user1", &activity_task_row(id, "t1", ts)).await.unwrap();
+    }
+
+    let page = svc
+        .list_team_activity(
+            "user1",
+            "t1",
+            None,
+            aionui_db::PageDirection::Desc,
+            aionui_team::ActivityKind::All,
+            3,
+        )
+        .await
+        .unwrap();
+
+    // desc top3: k2(4000), m2(3000), k1(2000)
+    let ids: Vec<_> = page.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, ["k2", "m2", "k1"]);
+    assert!(page.has_more); // m1 not yet fetched
+    let c = page.next_cursor.unwrap();
+    assert_eq!((c.ts, c.id.as_str()), (2000, "k1"));
+
+    // Next page.
+    let page2 = svc
+        .list_team_activity(
+            "user1",
+            "t1",
+            Some(aionui_db::ActivityCursor { created_at: c.ts, id: c.id }),
+            aionui_db::PageDirection::Desc,
+            aionui_team::ActivityKind::All,
+            3,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page2.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["m1"]);
+    assert!(!page2.has_more);
+}
+
+#[tokio::test]
+async fn activity_kind_task_only_paginates_tasks() {
+    let (svc, team_repo, _tm, _cr) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.create_team(&activity_team_row("t1", "user1")).await.unwrap();
+    team_repo
+        .write_message("user1", &activity_message_row("m1", "t1", 5000))
+        .await
+        .unwrap();
+    team_repo.create_task("user1", &activity_task_row("k1", "t1", 1000)).await.unwrap();
+
+    let page = svc
+        .list_team_activity(
+            "user1",
+            "t1",
+            None,
+            aionui_db::PageDirection::Desc,
+            aionui_team::ActivityKind::Task,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert!(matches!(page.items[0].kind, aionui_api_types::TeamActivityKind::Task));
+}
+
+#[tokio::test]
+async fn activity_rejects_other_user() {
+    let (svc, team_repo, _tm, _cr) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.create_team(&activity_team_row("t1", "user1")).await.unwrap();
+    let err = svc
+        .list_team_activity(
+            "intruder",
+            "t1",
+            None,
+            aionui_db::PageDirection::Desc,
+            aionui_team::ActivityKind::All,
+            10,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TeamError::TeamNotFound(_)));
+}

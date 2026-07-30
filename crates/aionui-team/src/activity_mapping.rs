@@ -3,8 +3,11 @@
 //! Keeps the projection out of `aionui-api-types` (which must not depend on
 //! domain types) and out of the repository layer.
 
-use aionui_api_types::{TeamMailboxMessageResponse, TeamTaskResponse};
-use aionui_db::models::MailboxMessageRow;
+use aionui_api_types::{
+    TeamActivityItemResponse, TeamActivityKind, TeamMailboxMessageResponse, TeamTaskResponse,
+};
+use aionui_db::PageDirection;
+use aionui_db::models::{MailboxMessageRow, TeamTaskRow};
 use tracing::warn;
 
 use crate::types::TeamTask;
@@ -55,6 +58,44 @@ pub fn task_to_response(task: &TeamTask) -> TeamTaskResponse {
         blocks: task.blocks.clone(),
         created_at: task.created_at,
         updated_at: task.updated_at,
+    }
+}
+
+/// Wraps a mailbox row as a unified activity item (`kind = message`).
+pub fn message_row_to_activity_item(row: &MailboxMessageRow) -> TeamActivityItemResponse {
+    let message = mailbox_row_to_response(row);
+    TeamActivityItemResponse {
+        kind: TeamActivityKind::Message,
+        created_at: message.created_at,
+        id: message.id.clone(),
+        message: Some(message),
+        task: None,
+    }
+}
+
+/// Wraps a task row as a unified activity item (`kind = task`). A row whose
+/// stored fields fail to parse is skipped (returns `None`) so one bad row never
+/// breaks the whole feed.
+pub fn task_row_to_activity_item(row: &TeamTaskRow) -> Option<TeamActivityItemResponse> {
+    let task = TeamTask::from_row(row).ok()?;
+    let resp = task_to_response(&task);
+    Some(TeamActivityItemResponse {
+        kind: TeamActivityKind::Task,
+        created_at: resp.created_at,
+        id: resp.id.clone(),
+        task: Some(resp),
+        message: None,
+    })
+}
+
+/// Sorts unified activity items by `(created_at, id)` in the given direction,
+/// matching the repository `ORDER BY created_at, id` used by the paged queries.
+pub fn sort_activity_items(items: &mut [TeamActivityItemResponse], direction: PageDirection) {
+    match direction {
+        PageDirection::Desc => {
+            items.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)))
+        }
+        PageDirection::Asc => items.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id))),
     }
 }
 
