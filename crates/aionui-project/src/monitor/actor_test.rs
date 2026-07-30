@@ -655,6 +655,42 @@ async fn live_change_fans_delta_to_subscriber_only() {
 }
 
 #[tokio::test]
+async fn noise_file_change_produces_no_delta() {
+    // Creating a noise file in a subscribed dir must not fan any delta (the
+    // precise-event stat path and the coarse read_dir rescan both hide noise),
+    // while a real sibling file still fans its delta.
+    let (actor, raw_rx, push, pe, dir, _db) = setup().await;
+    let (tx, rx) = unbounded_channel();
+    let handle = tokio::spawn(actor.run(rx, raw_rx));
+
+    tx.send(FsInbound::Frame {
+        session: "1".to_owned(),
+        user_id: "system_default_user".to_owned(),
+        frame: request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
+    })
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // A noise file and a real file land together.
+    std::fs::write(dir.path().join(".DS_Store"), b"x").unwrap();
+    std::fs::write(dir.path().join("real.ts"), b"x").unwrap();
+
+    // The real file's delta arrives (control) — proving the watch is live.
+    assert!(
+        wait_until(&push, Duration::from_secs(5), |f| has_delta_adding(f, "1", "real.ts")).await,
+        "the real file must fan a delta"
+    );
+    // The noise file must never appear in any pushed frame.
+    assert!(
+        !push.frames().iter().any(|(_, f)| f.to_string().contains(".DS_Store")),
+        "noise file must not appear in any delta/snapshot"
+    );
+
+    drop(tx);
+    let _ = handle.await;
+}
+
+#[tokio::test]
 async fn overflow_fans_full_snapshot_through_event_loop() {
     // Drive a real event loop, but feed the raw-event channel ourselves (ignore
     // the watcher's) so we can inject a synthetic kernel overflow deterministically.

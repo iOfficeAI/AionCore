@@ -19,6 +19,7 @@ use ignore::WalkBuilder;
 use crate::canonical;
 
 use super::error::FsError;
+use super::noise::should_hide;
 use super::provider::{EntryFact, IFsProvider, Kind};
 use super::search::{Budget, CancellationToken, IFsSearchProvider, NameMatcher, SearchSink};
 
@@ -126,6 +127,12 @@ impl IFsProvider for LocalFsProvider {
         let mut out = Vec::new();
         while let Some(entry) = rd.next_entry().await.map_err(|e| map_io(uri, &e))? {
             let name = entry.file_name().to_string_lossy().into_owned();
+            // Hide OS-junk / VCS-internal noise from the tree listing (same gate
+            // the search walk and precise-event apply use — keeps all three
+            // pipelines consistent).
+            if should_hide(&name) {
+                continue;
+            }
             let child = entry.path();
             let child_uri = canonical::to_file_uri(&child).unwrap_or_else(|_| uri.to_owned());
             let fact = fact_of(&child_uri, &child).await?;
@@ -250,6 +257,10 @@ fn walk_names(
         .git_global(false)
         .git_exclude(true)
         .require_git(false)
+        // Hide OS-junk / VCS-internal noise, matching the tree listing. On a
+        // directory this also prevents descent, so `.git` internals never leak
+        // into search results (the `ignore` crate does not skip `.git` itself).
+        .filter_entry(|entry| entry.file_name().to_str().map(|n| !should_hide(n)).unwrap_or(true))
         .build();
 
     for (seen, entry) in walker.enumerate() {

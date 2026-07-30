@@ -13,6 +13,7 @@ mod error;
 mod fs_runtime;
 mod local_provider;
 mod local_watcher;
+mod noise;
 mod provider;
 mod search;
 mod subscription;
