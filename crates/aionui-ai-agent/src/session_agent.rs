@@ -2622,8 +2622,10 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         // frontend renders the allow/deny card. The `tool_call_id` MUST equal the
         // `request_id` — `SessionAgentTask::confirm` dispatches `AnswerPermission`
         // keyed on the same id (the frontend echoes the `call_id` it received here).
-        // `input` (AskUserQuestion question content) rides as `raw_input`; the
-        // generic `Approved`/`Denied` options let the reducer + card render.
+        // `input` (the raised tool's raw input — a Bash `command`, AskUserQuestion
+        // `{questions:[…]}`) rides as `raw_input` so the card can show the approver
+        // what they are approving (AionUi issue #3779); the generic
+        // `Approved`/`Denied` options let the reducer + card render.
         SessionEvent::Permission {
             request_id,
             tool_name,

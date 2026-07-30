@@ -17,6 +17,7 @@ pub(crate) mod wire;
 mod actor;
 mod dispatch;
 mod port;
+mod search;
 
 pub use actor::FsMonitorActor;
 pub use port::{FsInbound, FsWirePush, SessionId};

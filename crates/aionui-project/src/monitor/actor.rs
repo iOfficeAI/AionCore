@@ -9,10 +9,11 @@
 //!
 //! Request dispatch (initialize / fs commands) lives in [`super::dispatch`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::{Interval, interval};
 
 use crate::ProjectService;
@@ -20,7 +21,8 @@ use crate::runtime::{
     Command, Debouncer, FsError, FsRuntimeRegistry, IFsRuntime, LocalFsRuntime, RawEvent, Shard, ShardOutput, TreeModel,
 };
 
-use super::port::{FsInbound, FsWirePush};
+use super::port::{FsInbound, FsWirePush, SessionId};
+use super::search::{ActiveSearch, SearchDone};
 use super::wire;
 
 /// Debounce-flush cadence: a burst of watcher events within this window
@@ -43,6 +45,20 @@ pub struct FsMonitorActor {
     push: Arc<dyn FsWirePush>,
     /// Monotonic origin; `now()` is elapsed millis (immune to wall-clock jumps).
     clock: Instant,
+    /// In-flight filename search per connection (at most one; a new search on the
+    /// same session supersedes the previous). Keyed by session so cancel /
+    /// supersede / disconnect can reach the running search's cancel token.
+    active_searches: HashMap<SessionId, ActiveSearch>,
+    /// Spawned search coordinators signal natural completion here so the loop can
+    /// clear the finished `active_searches` entry. Sender is cloned into each
+    /// coordinator; receiver is taken by `run`.
+    search_done_tx: UnboundedSender<SearchDone>,
+    search_done_rx: Option<UnboundedReceiver<SearchDone>>,
+    /// Test-only override for the filename-search provider, letting tests inject a
+    /// barrier/scripted provider (the real runtime is built internally and cannot
+    /// otherwise be swapped). Never set outside tests.
+    #[cfg(test)]
+    search_provider_override: Option<Arc<dyn crate::runtime::IFsSearchProvider>>,
 }
 
 impl FsMonitorActor {
@@ -58,6 +74,7 @@ impl FsMonitorActor {
         let mut registry = FsRuntimeRegistry::new();
         registry.register("file", Arc::clone(&runtime));
         let shard = Shard::new(TreeModel::new(registry), warm_budget);
+        let (search_done_tx, search_done_rx) = unbounded_channel();
         let actor = Self {
             shard,
             debouncer: Debouncer::new(),
@@ -65,6 +82,11 @@ impl FsMonitorActor {
             project,
             push,
             clock: Instant::now(),
+            active_searches: HashMap::new(),
+            search_done_tx,
+            search_done_rx: Some(search_done_rx),
+            #[cfg(test)]
+            search_provider_override: None,
         };
         Ok((actor, raw_rx))
     }
@@ -87,6 +109,75 @@ impl FsMonitorActor {
     /// Current logical time: monotonic millis since actor start.
     pub(super) fn now(&self) -> u64 {
         self.clock.elapsed().as_millis() as u64
+    }
+
+    /// Clonable outbound push handle (moved into the spawned search coordinator).
+    pub(super) fn push_handle(&self) -> Arc<dyn FsWirePush> {
+        Arc::clone(&self.push)
+    }
+
+    /// The `file:` runtime's filename-search provider, if the scheme supports it.
+    pub(super) fn search_provider(&self) -> Option<Arc<dyn crate::runtime::IFsSearchProvider>> {
+        #[cfg(test)]
+        if let Some(provider) = &self.search_provider_override {
+            return Some(Arc::clone(provider));
+        }
+        self.runtime.search_provider()
+    }
+
+    /// Test-only: swap the filename-search provider for a barrier/scripted double.
+    #[cfg(test)]
+    pub(super) fn set_search_provider_override(&mut self, provider: Arc<dyn crate::runtime::IFsSearchProvider>) {
+        self.search_provider_override = Some(provider);
+    }
+
+    /// Register a newly-started search for `session`, superseding (cancelling)
+    /// any previous in-flight search on the same connection.
+    pub(super) fn register_search(&mut self, session: &str, active: ActiveSearch) {
+        if let Some(prev) = self.active_searches.insert(session.to_owned(), active) {
+            prev.cancel.cancel();
+        }
+    }
+
+    /// Cancel the in-flight search for `session` iff it matches `search_id`
+    /// (explicit `fs/searchCancel`). Returns whether a search was cancelled.
+    pub(super) fn cancel_search(&mut self, session: &str, search_id: &serde_json::Value) -> bool {
+        if self
+            .active_searches
+            .get(session)
+            .is_some_and(|a| &a.search_id == search_id)
+        {
+            let active = self.active_searches.remove(session).expect("just checked present");
+            active.cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop any in-flight search for a disconnected session, cascading cancel.
+    pub(super) fn drop_session_search(&mut self, session: &str) {
+        if let Some(active) = self.active_searches.remove(session) {
+            active.cancel.cancel();
+        }
+    }
+
+    /// Clonable completion-signal sender, moved into a spawned search coordinator.
+    pub(super) fn search_done_handle(&self) -> UnboundedSender<SearchDone> {
+        self.search_done_tx.clone()
+    }
+
+    /// A coordinator finished naturally: clear its `active_searches` entry, but
+    /// only if it is still the current search for that session — a superseding
+    /// search may have replaced it (different id) before this signal arrived.
+    fn on_search_done(&mut self, done: SearchDone) {
+        if self
+            .active_searches
+            .get(&done.session)
+            .is_some_and(|a| a.search_id == done.search_id)
+        {
+            self.active_searches.remove(&done.session);
+        }
     }
 
     /// Feed a command through the shard and return its raw outputs (no fan-out).
@@ -120,6 +211,10 @@ impl FsMonitorActor {
     pub async fn run(mut self, mut inbound: UnboundedReceiver<FsInbound>, mut raw_rx: UnboundedReceiver<RawEvent>) {
         let mut flush: Interval = interval(Duration::from_millis(DEBOUNCE_FLUSH_MS));
         let mut reap: Interval = interval(Duration::from_millis(REAP_INTERVAL_MS));
+        // Search coordinators (spawned tasks) report natural completion here; the
+        // sender clone lives on in `self.search_done_tx`, so the channel never
+        // closes for the actor's life.
+        let mut search_done = self.search_done_rx.take().expect("search_done_rx taken once in run");
         loop {
             tokio::select! {
                 inbound_event = inbound.recv() => match inbound_event {
@@ -131,6 +226,9 @@ impl FsMonitorActor {
                 // receiver stays open for the actor's whole life.
                 raw = raw_rx.recv() => if let Some(raw) = raw {
                     self.debouncer.push(raw);
+                },
+                done = search_done.recv() => if let Some(done) = done {
+                    self.on_search_done(done);
                 },
                 _ = flush.tick() => self.flush_debounced().await,
                 _ = reap.tick() => self.drive(Command::ReapTick { now: self.now() }).await,
@@ -148,8 +246,10 @@ impl FsMonitorActor {
             } => self.dispatch_frame(&session, &user_id, frame).await,
             FsInbound::Disconnect { session } => {
                 // Connection teardown — lifecycle boundary; releases the session's
-                // subscriptions (nodes go warm, reaper unmounts later).
+                // subscriptions (nodes go warm, reaper unmounts later) and cancels
+                // any in-flight search on the gone connection.
                 tracing::info!(session = %session, "fs session disconnect");
+                self.drop_session_search(&session);
                 let now = self.now();
                 self.drive(Command::DropSession { session, now }).await;
             }

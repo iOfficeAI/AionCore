@@ -92,6 +92,16 @@ pub struct ReadParams {
     pub encoding: Option<Encoding>,
 }
 
+// PATCH(ELECTRON-3SZ): `fs/resolve` params. Violates the pe_id identity boundary
+// (the backend must not expose absolute paths, the frontend must not know them).
+// Added only as an emergency line fix so preview's office/pdf viewers can obtain
+// an absolute `file_path`. REMOVE together with `handle_resolve` once preview is
+// redesigned to consume content over the wire.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveParams {
+    pub file: ResourceRef,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WriteParams {
     pub file: ResourceRef,
@@ -116,6 +126,52 @@ pub struct RemoveParams {
 pub struct RenameParams {
     pub from: ResourceRef,
     pub to: ResourceRef,
+}
+
+// ── Filename search (fs/search) ───────────────────────────────────────────
+
+/// `fs/search` request params (protocol.md). `roots` = the project's bound
+/// folders (or narrowed subdirs); `query` empty = browse; `limit` is the global
+/// hit budget shared across all roots (server default when omitted).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchParams {
+    pub roots: Vec<ResourceRef>,
+    pub query: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// `fs/searchCancel` notification params. `search_id` echoes the originating
+/// `fs/search` request `id` (any JSON value the client used as its id).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchCancelParams {
+    pub search_id: Value,
+}
+
+/// One filename hit — the chat-ref `project` identity (files only). `pe_id` is
+/// stamped by the orchestration layer from the root the hit came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SearchHit {
+    pub pe_id: String,
+    pub relative_path: String,
+    pub name: String,
+}
+
+/// Build the `fs/searchMatch` notification params: a batch of hits keyed to the
+/// originating search's `id` (echoed as `search_id`).
+pub fn search_match_params(search_id: &Value, matches: &[SearchHit]) -> Value {
+    json!({
+        "search_id": search_id,
+        "matches": matches,
+    })
+}
+
+/// Build the `fs/search` terminal response `result` (`{ limit_reached, total }`).
+pub fn search_result(limit_reached: bool, total: usize) -> Value {
+    json!({
+        "limit_reached": limit_reached,
+        "total": total,
+    })
 }
 
 // ── Outward entry / snapshot / delta ──────────────────────────────────────
