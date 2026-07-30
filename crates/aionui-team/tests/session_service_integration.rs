@@ -777,13 +777,13 @@ impl FullMockTeamRepo {
 #[async_trait::async_trait]
 impl ITeamRepository for FullMockTeamRepo {
     async fn create_team(&self, row: &aionui_db::models::TeamRow) -> Result<(), DbError> {
-        if let Some(ref conflict_origin) = *self.fail_create_team_conflict.lock().unwrap() {
-            if row.origin_conversation_id.as_deref() == Some(conflict_origin.as_str()) {
-                return Err(DbError::Conflict(format!(
-                    "team with origin conversation id '{}' already exists",
-                    conflict_origin
-                )));
-            }
+        if let Some(ref conflict_origin) = *self.fail_create_team_conflict.lock().unwrap()
+            && row.origin_conversation_id.as_deref() == Some(conflict_origin.as_str())
+        {
+            return Err(DbError::Conflict(format!(
+                "team with origin conversation id '{}' already exists",
+                conflict_origin
+            )));
         }
         self.teams.lock().unwrap().push(row.clone());
         Ok(())
@@ -7136,7 +7136,7 @@ async fn route_create_ad_hoc_team_from_conversation_rejects_cross_user() {
 // ── team_id marker in conversation extra ─────────────────────────────
 
 #[tokio::test]
-async fn teammate_conversation_extra_has_team_id_marker_for_sidebar_filtering() {
+async fn formal_team_conversations_carry_team_id_marker_for_sidebar_filtering() {
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
     let (svc, _, conv_repo) =
         setup_with_factory_and_metadata_and_conversation_repo(success_factory(), agent_metadata_repo);
@@ -7160,18 +7160,19 @@ async fn teammate_conversation_extra_has_team_id_marker_for_sidebar_filtering() 
     let leader_extra = conv_repo.get_extra(&leader.conversation_id).unwrap();
     let teammate_extra = conv_repo.get_extra(&teammate.conversation_id).unwrap();
 
-    // Leader must have teamId (session binding) but NOT team_id (sidebar visible)
+    // Both leader and teammate must carry teamId for session binding and team_id
+    // for sidebar/GroupedHistory filtering.
     assert_eq!(
         leader_extra.get("teamId").and_then(serde_json::Value::as_str),
         Some(created.id.as_str()),
         "leader must carry teamId for session binding"
     );
-    assert!(
-        leader_extra.get("team_id").is_none(),
-        "leader must NOT carry team_id so it stays visible in sidebar"
+    assert_eq!(
+        leader_extra.get("team_id").and_then(serde_json::Value::as_str),
+        Some(created.id.as_str()),
+        "leader must carry team_id so sidebar can filter it out"
     );
 
-    // Teammate must have BOTH teamId and team_id (hidden from sidebar)
     assert_eq!(
         teammate_extra.get("teamId").and_then(serde_json::Value::as_str),
         Some(created.id.as_str()),
@@ -7181,6 +7182,58 @@ async fn teammate_conversation_extra_has_team_id_marker_for_sidebar_filtering() 
         teammate_extra.get("team_id").and_then(serde_json::Value::as_str),
         Some(created.id.as_str()),
         "teammate must carry team_id so sidebar can filter it out"
+    );
+}
+
+#[tokio::test]
+async fn ad_hoc_team_leader_origin_stays_visible_without_team_id_marker() {
+    let (svc, _team_repo, _task_manager, conv_repo) = setup_ad_hoc_team_service(success_factory());
+    let conversation_id = "conv-adhoc-origin-visible";
+    seed_conversation(&conv_repo, "user1", conversation_id, "assistant-lead");
+
+    let resp = svc
+        .create_ad_hoc_team_from_conversation(
+            "user1",
+            CreateAdHocTeamFromConversationRequest {
+                conversation_id: conversation_id.to_owned(),
+                user_id: "user1".to_owned(),
+                target_assistant_id: Some("assistant-lead".to_owned()),
+                name: None,
+                workspace_mode: None,
+            },
+        )
+        .await
+        .expect("create ad-hoc team");
+
+    let team = svc.get_team("user1", &resp.team_id).await.expect("get team");
+    let leader = team.assistants.iter().find(|a| a.role == "lead").unwrap();
+    let teammate = team.assistants.iter().find(|a| a.role == "teammate").unwrap();
+
+    let origin_extra = conv_repo.get_extra(&leader.conversation_id).unwrap();
+    let teammate_extra = conv_repo.get_extra(&teammate.conversation_id).unwrap();
+
+    // Reused origin conversation must keep teamId for session binding but must
+    // NOT receive team_id, so it remains visible in the ordinary history list.
+    assert_eq!(
+        origin_extra.get("teamId").and_then(serde_json::Value::as_str),
+        Some(resp.team_id.as_str()),
+        "ad-hoc leader must carry teamId for session binding"
+    );
+    assert!(
+        origin_extra.get("team_id").is_none(),
+        "ad-hoc leader origin must NOT carry team_id so it stays visible"
+    );
+
+    // Teammate conversation created for the ad-hoc team should be hidden.
+    assert_eq!(
+        teammate_extra.get("teamId").and_then(serde_json::Value::as_str),
+        Some(resp.team_id.as_str()),
+        "ad-hoc teammate must carry teamId for session binding"
+    );
+    assert_eq!(
+        teammate_extra.get("team_id").and_then(serde_json::Value::as_str),
+        Some(resp.team_id.as_str()),
+        "ad-hoc teammate must carry team_id so sidebar can filter it out"
     );
 }
 
@@ -7209,15 +7262,15 @@ async fn route_create_ad_hoc_team_from_conversation_rejects_unknown_conversation
 // Helper: ad-hoc team service setup that exposes RecordingBroadcaster
 // ===========================================================================
 
-fn setup_ad_hoc_team_service_with_broadcaster(
-    factory: AgentFactory,
-) -> (
+type AdHocTeamServiceWithBroadcaster = (
     Arc<TeamSessionService>,
     Arc<FullMockTeamRepo>,
     Arc<CountingTaskManager>,
     Arc<MockConversationRepo>,
     Arc<RecordingBroadcaster>,
-) {
+);
+
+fn setup_ad_hoc_team_service_with_broadcaster(factory: AgentFactory) -> AdHocTeamServiceWithBroadcaster {
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::with_rows(vec![
         AgentMetadataRow {
             id: "assistant-lead".into(),
@@ -7444,7 +7497,7 @@ async fn ad_hoc_team_from_conversation_broadcasts_team_created_event() {
 
     let list_changed_events = broadcaster.events_by_name("team.listChanged");
     assert!(
-        list_changed_events.len() >= 1,
+        !list_changed_events.is_empty(),
         "team.listChanged must be broadcast after ad-hoc team creation"
     );
 }

@@ -589,6 +589,7 @@ impl TeamAgentProvisioner {
             agent_type,
             acp_metadata.as_ref(),
             session_mode,
+            true,
         );
         let provider_id = if agent_type == AgentType::Aionrs {
             self.resolve_provider_for_model(model)
@@ -667,6 +668,7 @@ impl TeamAgentProvisioner {
             agent_type,
             acp_metadata.as_ref(),
             None,
+            false,
         );
         if agent_type != AgentType::Aionrs {
             extra["current_model_id"] = serde_json::Value::String(model.to_owned());
@@ -744,6 +746,7 @@ impl TeamAgentProvisioner {
         agent_type: AgentType,
         acp_metadata: Option<&AgentMetadataRow>,
         session_mode: Option<&str>,
+        include_team_id_marker: bool,
     ) -> serde_json::Value {
         let session_mode = session_mode
             .map(str::trim)
@@ -763,7 +766,12 @@ impl TeamAgentProvisioner {
         if let Some(assistant_id) = assistant_id {
             extra["assistant_id"] = serde_json::Value::String(assistant_id.to_owned());
         }
-        if role == TeammateRole::Teammate {
+        // `team_id` is the sidebar/GroupedHistory ownership marker. New team
+        // conversations (both lead and teammates) carry it so they are hidden
+        // from ordinary history. Existing conversations reused as an ad-hoc
+        // team lead must NOT receive this marker so the original solo
+        // conversation stays visible.
+        if role == TeammateRole::Teammate || (role == TeammateRole::Lead && include_team_id_marker) {
             extra["team_id"] = serde_json::Value::String(team_id.to_owned());
         }
         if let Some(workspace) = workspace {
@@ -1139,5 +1147,54 @@ mod tests {
         );
         let patches = patches.lock().unwrap();
         assert!(patches[0]["team_mcp_stdio_config"].is_object());
+    }
+
+    #[test]
+    fn build_team_extra_includes_team_id_for_formal_leader() {
+        let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
+
+        let extra = provisioner.build_team_extra(
+            "team-formal",
+            "slot-lead",
+            TeammateRole::Lead,
+            "acp",
+            "sonnet",
+            Some("assistant-lead"),
+            None,
+            AgentType::Acp,
+            None,
+            None,
+            true,
+        );
+
+        assert_eq!(extra["teamId"], "team-formal");
+        assert_eq!(extra["team_id"], "team-formal");
+        assert_eq!(extra["role"], "lead");
+    }
+
+    #[test]
+    fn build_team_extra_omits_team_id_for_reused_ad_hoc_origin() {
+        let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
+
+        let extra = provisioner.build_team_extra(
+            "team-adhoc",
+            "slot-lead",
+            TeammateRole::Lead,
+            "acp",
+            "sonnet",
+            Some("assistant-lead"),
+            None,
+            AgentType::Acp,
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(extra["teamId"], "team-adhoc");
+        assert!(
+            extra.get("team_id").is_none(),
+            "reused ad-hoc leader origin must not receive team_id marker"
+        );
+        assert_eq!(extra["role"], "lead");
     }
 }
