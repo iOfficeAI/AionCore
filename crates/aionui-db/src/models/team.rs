@@ -1,6 +1,44 @@
 use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
 
+/// Single member entry inside a `team_presets` leader/members JSON array.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamPresetMemberRow {
+    pub assistant_backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub assistant_name: String,
+    pub role: String,
+    pub order: i64,
+}
+
+/// Row mapping for the `team_presets` table.
+///
+/// `expertise_tags`, `example_prompts`, `leader`, and `members` store JSON
+/// strings. The service layer serializes/deserializes the typed arrays.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TeamPresetRow {
+    pub id: String,
+    pub user_id: String,
+    pub name: String,
+    pub icon: Option<String>,
+    pub category: Option<String>,
+    pub description: String,
+    /// JSON array of tag strings.
+    pub expertise_tags: String,
+    /// JSON array of example prompt strings.
+    pub example_prompts: String,
+    /// JSON object representing the preset leader.
+    pub leader: String,
+    /// JSON array of preset members (excluding the leader).
+    pub members: String,
+    pub version: i64,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
 /// Row mapping for the `teams` table.
 ///
 /// The `agents` column stores a JSON array of `TeamAgent` objects.

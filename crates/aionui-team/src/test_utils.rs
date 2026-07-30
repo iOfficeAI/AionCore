@@ -1,6 +1,6 @@
 use aionui_common::now_ms;
-use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
-use aionui_db::{DbError, ITeamRepository, UpdateTaskParams, UpdateTeamParams};
+use aionui_db::models::{MailboxMessageRow, TeamPresetRow, TeamRow, TeamTaskRow};
+use aionui_db::{DbError, ITeamRepository, UpdateTaskParams, UpdateTeamParams, UpdateTeamPresetParams};
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -50,6 +50,28 @@ impl ITeamRepository for MockTeamRepo {
         Ok(())
     }
     async fn delete_team(&self, _id: &str) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    // ── Team Presets (stubs) ────────────────────────────────────────
+
+    async fn create_team_preset(&self, _row: &TeamPresetRow) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn list_team_presets_by_user(&self, _user_id: &str) -> Result<Vec<TeamPresetRow>, DbError> {
+        Ok(vec![])
+    }
+
+    async fn get_team_preset(&self, _preset_id: &str) -> Result<Option<TeamPresetRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn update_team_preset(&self, _preset_id: &str, _params: &UpdateTeamPresetParams) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn delete_team_preset(&self, _preset_id: &str) -> Result<(), DbError> {
         Ok(())
     }
 
@@ -214,14 +236,14 @@ pub(crate) mod workspace_harness {
     };
     use aionui_common::{AgentKillReason, AgentType, PaginatedResult, now_ms};
     use aionui_db::models::{
-        AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow, TeamRow,
-        TeamTaskRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
+        AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow, TeamPresetRow,
+        TeamRow, TeamTaskRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
         UpsertAssistantOverlayParams,
     };
     use aionui_db::{
         ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IAssistantDefinitionRepository,
         IAssistantOverlayRepository, IConversationRepository, IProviderRepository, ITeamRepository, MessagePageParams,
-        MessagePageResult, MessageRowUpdate, MessageSearchRow, UpdateTeamParams,
+        MessagePageResult, MessageRowUpdate, MessageSearchRow, UpdateTeamParams, UpdateTeamPresetParams,
     };
     use aionui_realtime::EventBroadcaster;
     use async_trait::async_trait;
@@ -473,6 +495,26 @@ pub(crate) mod workspace_harness {
 
         async fn delete_team(&self, id: &str) -> Result<(), DbError> {
             self.teams.lock().unwrap().retain(|t| t.id != id);
+            Ok(())
+        }
+
+        async fn create_team_preset(&self, _row: &TeamPresetRow) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn list_team_presets_by_user(&self, _user_id: &str) -> Result<Vec<TeamPresetRow>, DbError> {
+            Ok(vec![])
+        }
+
+        async fn get_team_preset(&self, _preset_id: &str) -> Result<Option<TeamPresetRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn update_team_preset(&self, _preset_id: &str, _params: &UpdateTeamPresetParams) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn delete_team_preset(&self, _preset_id: &str) -> Result<(), DbError> {
             Ok(())
         }
 

@@ -18,14 +18,14 @@ use aionui_api_types::{
 };
 use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
-    AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow,
+    AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow, TeamPresetRow,
     UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
     UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
 };
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IAssistantDefinitionRepository,
     IAssistantOverlayRepository, IConversationRepository, IProviderRepository, ITeamRepository, MessagePageParams,
-    MessagePageResult, MessageRowUpdate, MessageSearchRow, resolve_agent_binding_from_rows,
+    MessagePageResult, MessageRowUpdate, MessageSearchRow, UpdateTeamPresetParams, resolve_agent_binding_from_rows,
 };
 use aionui_realtime::EventBroadcaster;
 
@@ -846,6 +846,26 @@ impl ITeamRepository for FullMockTeamRepo {
     }
     async fn delete_team(&self, id: &str) -> Result<(), DbError> {
         self.teams.lock().unwrap().retain(|t| t.id != id);
+        Ok(())
+    }
+
+    async fn create_team_preset(&self, _row: &TeamPresetRow) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn list_team_presets_by_user(&self, _user_id: &str) -> Result<Vec<TeamPresetRow>, DbError> {
+        Ok(vec![])
+    }
+
+    async fn get_team_preset(&self, _preset_id: &str) -> Result<Option<TeamPresetRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn update_team_preset(&self, _preset_id: &str, _params: &UpdateTeamPresetParams) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn delete_team_preset(&self, _preset_id: &str) -> Result<(), DbError> {
         Ok(())
     }
 
@@ -6966,8 +6986,12 @@ fn ad_hoc_router_for_user(svc: Arc<TeamSessionService>, user_id: &str) -> axum::
     use aionui_auth::CurrentUser;
     use aionui_team::{TeamRouterState, team_routes};
 
+    let preset_service = Arc::new(aionui_team::TeamPresetService::new(Arc::new(
+        common::MockTeamRepo::new(),
+    )));
     let state = TeamRouterState {
         service: svc,
+        preset_service,
         active_leases: Arc::new(aionui_ai_agent::ActiveLeaseRegistry::new()),
     };
     team_routes(state).layer(axum::Extension(CurrentUser {

@@ -45,7 +45,8 @@ use aionui_system::{
 };
 use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogEntry, TeamAssistantCatalogPort,
-    TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState, TeamSessionService,
+    TeamConversationProvisioningPort, TeamPresetService, TeamProjectionMessageStore, TeamRouterState,
+    TeamSessionService,
 };
 
 use crate::config::derive_encryption_key;
@@ -645,6 +646,7 @@ pub fn build_team_state(
 
     let pool = services.database.pool().clone();
     let team_repo: Arc<dyn aionui_db::ITeamRepository> = Arc::new(aionui_db::SqliteTeamRepository::new(pool.clone()));
+    let preset_service = Arc::new(TeamPresetService::new(team_repo.clone()));
     let conv_service = services.conversation_service.clone();
     let conv_repo: Arc<dyn IConversationRepository> = Arc::new(SqliteConversationRepository::new(pool));
     let adapters = Arc::new(TeamConversationAdapters::new(
@@ -676,6 +678,7 @@ pub fn build_team_state(
     );
     TeamRouterState {
         service,
+        preset_service,
         active_leases: services.active_lease_registry.clone(),
     }
 }

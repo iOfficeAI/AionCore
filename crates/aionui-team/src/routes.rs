@@ -11,21 +11,24 @@ use axum::routing::{get, post};
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AdHocTeamAssociationResponse, AdHocTeamFromConversationResponse, AddAgentRequest, ApiResponse,
-    CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateAdHocTeamFromConversationRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
-    SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
-    TeamRunStateResponse,
+    CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateAdHocTeamFromConversationRequest, CreateTeamPresetRequest,
+    CreateTeamRequest, GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
+    SendAgentMessageRequest, SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse,
+    TeamPresetListResponse, TeamPresetResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
+    UpdateTeamPresetRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_db::DbError;
 
 use crate::error::{TeamError, classify_public_error};
+use crate::preset_service::TeamPresetService;
 use crate::service::TeamSessionService;
 
 #[derive(Clone)]
 pub struct TeamRouterState {
     pub service: Arc<TeamSessionService>,
+    pub preset_service: Arc<TeamPresetService>,
     pub active_leases: Arc<ActiveLeaseRegistry>,
 }
 
@@ -45,6 +48,7 @@ impl From<TeamError> for ApiError {
             TeamError::TeamNotFound(msg) => ApiError::NotFound(msg),
             TeamError::AgentNotFound(msg) => ApiError::NotFound(msg),
             TeamError::TaskNotFound(msg) => ApiError::NotFound(msg),
+            TeamError::PresetNotFound(msg) => ApiError::NotFound(msg),
             TeamError::InvalidRequest(msg) => {
                 if let Some(public) = classify_public_error(&msg) {
                     ApiError::coded(StatusCode::BAD_REQUEST, public.code, msg, public.details)
@@ -90,6 +94,11 @@ impl From<TeamError> for ApiError {
 
 pub fn team_routes(state: TeamRouterState) -> Router {
     Router::new()
+        .route("/api/team-presets", post(create_preset).get(list_presets))
+        .route(
+            "/api/team-presets/{id}",
+            get(get_preset).patch(update_preset).delete(delete_preset),
+        )
         .route("/api/teams", post(create_team).get(list_teams))
         .route(
             "/api/teams/from-conversation",
@@ -125,6 +134,53 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams/{id}/active-lease", post(active_lease))
         .route("/api/teams/{id}/session-mode", post(set_session_mode))
         .with_state(state)
+}
+
+async fn create_preset(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<CreateTeamPresetRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<TeamPresetResponse>>), ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let preset = state.preset_service.create_preset(&user.id, req).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(preset))))
+}
+
+async fn list_presets(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<TeamPresetListResponse>>, ApiError> {
+    let presets = state.preset_service.list_presets(&user.id).await?;
+    Ok(Json(ApiResponse::ok(presets)))
+}
+
+async fn get_preset(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<TeamPresetResponse>>, ApiError> {
+    let preset = state.preset_service.get_preset(&user.id, &id).await?;
+    Ok(Json(ApiResponse::ok(preset)))
+}
+
+async fn update_preset(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateTeamPresetRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TeamPresetResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let preset = state.preset_service.update_preset(&user.id, &id, req).await?;
+    Ok(Json(ApiResponse::ok(preset)))
+}
+
+async fn delete_preset(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state.preset_service.delete_preset(&user.id, &id).await?;
+    Ok(Json(ApiResponse::success()))
 }
 
 async fn create_team(
@@ -441,6 +497,12 @@ mod tests {
     fn task_not_found_maps_to_app_not_found() {
         let err: ApiError = TeamError::TaskNotFound("tk-1".into()).into();
         assert!(matches!(err, ApiError::NotFound(_)));
+    }
+
+    #[test]
+    fn preset_not_found_maps_to_app_not_found() {
+        let err: ApiError = TeamError::PresetNotFound("p1".into()).into();
+        assert!(matches!(err, ApiError::NotFound(msg) if msg == "p1"));
     }
 
     #[test]

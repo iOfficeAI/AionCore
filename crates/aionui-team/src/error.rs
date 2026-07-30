@@ -11,6 +11,9 @@ pub enum TeamError {
     #[error("Task not found: {0}")]
     TaskNotFound(String),
 
+    #[error("Team preset not found: {0}")]
+    PresetNotFound(String),
+
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 

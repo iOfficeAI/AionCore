@@ -1,5 +1,5 @@
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use crate::models::{MailboxMessageRow, TeamPresetRow, TeamRow, TeamTaskRow};
 
 /// Parameters for updating a team record.
 #[derive(Debug, Clone, Default)]
@@ -20,6 +20,23 @@ pub struct UpdateTaskParams {
     pub owner: Option<String>,
     pub blocked_by: Option<String>,
     pub metadata: Option<String>,
+}
+
+/// Parameters for updating a team preset record.
+///
+/// All fields are optional. When present, the corresponding column is
+/// overwritten. `expertise_tags`, `example_prompts`, `leader`, and `members`
+/// are JSON strings produced by the service layer.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateTeamPresetParams {
+    pub name: Option<String>,
+    pub icon: Option<String>,
+    pub category: Option<String>,
+    pub description: Option<String>,
+    pub expertise_tags: Option<String>,
+    pub example_prompts: Option<String>,
+    pub leader: Option<String>,
+    pub members: Option<String>,
 }
 
 /// Data access abstraction for team collaboration tables.
@@ -56,6 +73,24 @@ pub trait ITeamRepository: Send + Sync {
 
     /// Deletes a team by id. Returns `DbError::NotFound` if absent.
     async fn delete_team(&self, team_id: &str) -> Result<(), DbError>;
+
+    // ── Team Presets ─────────────────────────────────────────────────
+
+    /// Inserts a new team preset record.
+    async fn create_team_preset(&self, row: &TeamPresetRow) -> Result<(), DbError>;
+
+    /// Returns team presets owned by `user_id`, ordered by updated time descending.
+    async fn list_team_presets_by_user(&self, user_id: &str) -> Result<Vec<TeamPresetRow>, DbError>;
+
+    /// Returns a single team preset by id, or `None` if not found.
+    async fn get_team_preset(&self, preset_id: &str) -> Result<Option<TeamPresetRow>, DbError>;
+
+    /// Updates a team preset by id with the provided fields and bumps `version`.
+    /// Returns `DbError::NotFound` if absent.
+    async fn update_team_preset(&self, preset_id: &str, params: &UpdateTeamPresetParams) -> Result<(), DbError>;
+
+    /// Deletes a team preset by id. Returns `DbError::NotFound` if absent.
+    async fn delete_team_preset(&self, preset_id: &str) -> Result<(), DbError>;
 
     // ── Mailbox ──────────────────────────────────────────────────────
 

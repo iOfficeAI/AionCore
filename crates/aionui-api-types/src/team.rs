@@ -516,7 +516,91 @@ pub struct TeamResponse {
 pub type TeamListResponse = Vec<TeamResponse>;
 
 // ---------------------------------------------------------------------------
-// F. WebSocket event payloads
+// F. Team presets — Request/response DTOs
+// ---------------------------------------------------------------------------
+
+/// Single member entry within a team preset.
+///
+/// Preserved on both request and response wires; `order` determines the
+/// display/execution ordering inside the preset roster.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamPresetMember {
+    pub assistant_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub assistant_name: String,
+    pub role: String,
+    pub order: i64,
+}
+
+/// Request body for `POST /api/team-presets`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTeamPresetRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    pub description: String,
+    #[serde(default)]
+    pub expertise_tags: Vec<String>,
+    #[serde(default)]
+    pub example_prompts: Vec<String>,
+    pub leader: TeamPresetMember,
+    #[serde(default)]
+    pub members: Vec<TeamPresetMember>,
+}
+
+/// Request body for `PATCH /api/team-presets/:id`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateTeamPresetRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expertise_tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub example_prompts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader: Option<TeamPresetMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<Vec<TeamPresetMember>>,
+}
+
+/// Full team preset response returned by create, get, list, and update endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamPresetResponse {
+    pub id: String,
+    pub user_id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    pub description: String,
+    pub expertise_tags: Vec<String>,
+    pub example_prompts: Vec<String>,
+    pub leader: TeamPresetMember,
+    pub members: Vec<TeamPresetMember>,
+    pub version: i64,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+/// Type alias for team preset list responses.
+pub type TeamPresetListResponse = Vec<TeamPresetResponse>;
+
+// ---------------------------------------------------------------------------
+// G. WebSocket event payloads
 // ---------------------------------------------------------------------------
 
 /// Payload for `team.agentStatusChanged` WebSocket event.
@@ -1574,5 +1658,116 @@ mod tests {
         );
         let parsed: TeamAgentRuntimeStatus = serde_json::from_value(json!("dormant")).unwrap();
         assert_eq!(parsed, TeamAgentRuntimeStatus::Dormant);
+    }
+
+    // -- Team preset DTOs ----------------------------------------------------
+
+    #[test]
+    fn deserialize_create_team_preset_request_full() {
+        let raw = json!({
+            "name": "Rust Squad",
+            "icon": "🦀",
+            "category": "engineering",
+            "description": "A preset for Rust code reviews",
+            "expertise_tags": ["rust", "review"],
+            "example_prompts": ["refactor this"],
+            "leader": {
+                "assistant_backend": "acp",
+                "assistant_id": "lead-1",
+                "model": "claude",
+                "assistant_name": "Lead",
+                "role": "lead",
+                "order": 0
+            },
+            "members": [
+                {
+                    "assistant_backend": "acp",
+                    "assistant_id": "lead-1",
+                    "model": "claude",
+                    "assistant_name": "Lead",
+                    "role": "lead",
+                    "order": 0
+                },
+                {
+                    "assistant_backend": "acp",
+                    "assistant_id": "worker-1",
+                    "model": "claude",
+                    "assistant_name": "Worker",
+                    "role": "teammate",
+                    "order": 1
+                }
+            ]
+        });
+        let req: CreateTeamPresetRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.name, "Rust Squad");
+        assert_eq!(req.leader.role, "lead");
+        assert_eq!(req.members.len(), 2);
+        assert_eq!(req.expertise_tags, vec!["rust", "review"]);
+    }
+
+    #[test]
+    fn deserialize_create_team_preset_request_minimal() {
+        let raw = json!({
+            "name": "Minimal",
+            "description": "desc",
+            "leader": {
+                "assistant_backend": "acp",
+                "assistant_name": "Lead",
+                "role": "lead",
+                "order": 0
+            }
+        });
+        let req: CreateTeamPresetRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.icon.is_none());
+        assert!(req.expertise_tags.is_empty());
+        assert!(req.members.is_empty());
+    }
+
+    #[test]
+    fn deserialize_create_team_preset_request_rejects_unknown_field() {
+        let raw = json!({
+            "name": "X",
+            "description": "desc",
+            "leader": {
+                "assistant_backend": "acp",
+                "assistant_name": "Lead",
+                "role": "lead",
+                "order": 0
+            },
+            "unknown": true
+        });
+        assert!(serde_json::from_value::<CreateTeamPresetRequest>(raw).is_err());
+    }
+
+    #[test]
+    fn serialize_team_preset_response_snake_case() {
+        let response = TeamPresetResponse {
+            id: "preset-1".into(),
+            user_id: "user-a".into(),
+            name: "Squad".into(),
+            icon: Some("🦀".into()),
+            category: None,
+            description: "desc".into(),
+            expertise_tags: vec!["rust".into()],
+            example_prompts: vec![],
+            leader: TeamPresetMember {
+                assistant_backend: "acp".into(),
+                assistant_id: Some("lead-1".into()),
+                model: Some("claude".into()),
+                assistant_name: "Lead".into(),
+                role: "lead".into(),
+                order: 0,
+            },
+            members: vec![],
+            version: 3,
+            created_at: 1700000000000,
+            updated_at: 1700001000000,
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["id"], "preset-1");
+        assert_eq!(json["user_id"], "user-a");
+        assert_eq!(json["assistant_backend"], serde_json::Value::Null);
+        assert!(json.get("category").is_none());
+        assert_eq!(json["version"], 3);
     }
 }

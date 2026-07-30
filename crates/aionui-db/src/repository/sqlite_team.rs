@@ -2,8 +2,8 @@ use aionui_common::now_ms;
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
-use crate::repository::team::{ITeamRepository, UpdateTaskParams, UpdateTeamParams};
+use crate::models::{MailboxMessageRow, TeamPresetRow, TeamRow, TeamTaskRow};
+use crate::repository::team::{ITeamRepository, UpdateTaskParams, UpdateTeamParams, UpdateTeamPresetParams};
 
 /// SQLite-backed implementation of [`ITeamRepository`].
 #[derive(Clone, Debug)]
@@ -159,6 +159,136 @@ impl ITeamRepository for SqliteTeamRepository {
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("team {team_id}")));
+        }
+        Ok(())
+    }
+
+    // ── Team Presets ─────────────────────────────────────────────────
+
+    async fn create_team_preset(&self, row: &TeamPresetRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO team_presets \
+                (id, user_id, name, icon, category, description, expertise_tags, example_prompts, leader, members, version, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.user_id)
+        .bind(&row.name)
+        .bind(&row.icon)
+        .bind(&row.category)
+        .bind(&row.description)
+        .bind(&row.expertise_tags)
+        .bind(&row.example_prompts)
+        .bind(&row.leader)
+        .bind(&row.members)
+        .bind(row.version)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => {
+                DbError::Conflict(format!("team preset with id '{}' already exists", row.id))
+            }
+            _ => DbError::Query(e),
+        })?;
+        Ok(())
+    }
+
+    async fn list_team_presets_by_user(&self, user_id: &str) -> Result<Vec<TeamPresetRow>, DbError> {
+        let rows =
+            sqlx::query_as::<_, TeamPresetRow>("SELECT * FROM team_presets WHERE user_id = ? ORDER BY updated_at DESC")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows)
+    }
+
+    async fn get_team_preset(&self, preset_id: &str) -> Result<Option<TeamPresetRow>, DbError> {
+        let row = sqlx::query_as::<_, TeamPresetRow>("SELECT * FROM team_presets WHERE id = ?")
+            .bind(preset_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
+    }
+
+    async fn update_team_preset(&self, preset_id: &str, params: &UpdateTeamPresetParams) -> Result<(), DbError> {
+        let mut set_clauses = Vec::new();
+        if params.name.is_some() {
+            set_clauses.push("name = ?");
+        }
+        if params.icon.is_some() {
+            set_clauses.push("icon = ?");
+        }
+        if params.category.is_some() {
+            set_clauses.push("category = ?");
+        }
+        if params.description.is_some() {
+            set_clauses.push("description = ?");
+        }
+        if params.expertise_tags.is_some() {
+            set_clauses.push("expertise_tags = ?");
+        }
+        if params.example_prompts.is_some() {
+            set_clauses.push("example_prompts = ?");
+        }
+        if params.leader.is_some() {
+            set_clauses.push("leader = ?");
+        }
+        if params.members.is_some() {
+            set_clauses.push("members = ?");
+        }
+
+        if set_clauses.is_empty() {
+            return Ok(());
+        }
+
+        set_clauses.push("updated_at = ?");
+        set_clauses.push("version = version + 1");
+        let sql = format!("UPDATE team_presets SET {} WHERE id = ?", set_clauses.join(", "));
+
+        let mut query = sqlx::query(&sql);
+        if let Some(ref name) = params.name {
+            query = query.bind(name);
+        }
+        if let Some(ref icon) = params.icon {
+            query = query.bind(icon);
+        }
+        if let Some(ref category) = params.category {
+            query = query.bind(category);
+        }
+        if let Some(ref description) = params.description {
+            query = query.bind(description);
+        }
+        if let Some(ref expertise_tags) = params.expertise_tags {
+            query = query.bind(expertise_tags);
+        }
+        if let Some(ref example_prompts) = params.example_prompts {
+            query = query.bind(example_prompts);
+        }
+        if let Some(ref leader) = params.leader {
+            query = query.bind(leader);
+        }
+        if let Some(ref members) = params.members {
+            query = query.bind(members);
+        }
+        query = query.bind(now_ms());
+        query = query.bind(preset_id);
+
+        let result = query.execute(&self.pool).await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("team preset {preset_id}")));
+        }
+        Ok(())
+    }
+
+    async fn delete_team_preset(&self, preset_id: &str) -> Result<(), DbError> {
+        let result = sqlx::query("DELETE FROM team_presets WHERE id = ?")
+            .bind(preset_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("team preset {preset_id}")));
         }
         Ok(())
     }

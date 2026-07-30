@@ -12,9 +12,11 @@
 use std::sync::Arc;
 
 use aionui_common::now_ms;
+use aionui_db::models::TeamPresetRow;
 use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
 use aionui_db::{
-    DbError, ITeamRepository, SqliteTeamRepository, UpdateTaskParams, UpdateTeamParams, init_database_memory,
+    DbError, ITeamRepository, SqliteTeamRepository, UpdateTaskParams, UpdateTeamParams, UpdateTeamPresetParams,
+    init_database_memory,
 };
 
 async fn repo() -> (Arc<dyn ITeamRepository>, aionui_db::Database) {
@@ -794,4 +796,158 @@ async fn task_blocked_by_blocks_bidirectional_consistency() {
         b_blocked_by.contains(&"tkA".to_string()),
         "B.blockedBy should contain A"
     );
+}
+
+// ── Team Preset Tests ────────────────────────────────────────────────
+
+fn make_preset(id: &str, user_id: &str, name: &str) -> TeamPresetRow {
+    let now = now_ms();
+    TeamPresetRow {
+        id: id.into(),
+        user_id: user_id.into(),
+        name: name.into(),
+        icon: Some("🤖".into()),
+        category: Some("dev".into()),
+        description: "A preset for testing".into(),
+        expertise_tags: r#"["rust","testing"]"#.into(),
+        example_prompts: r#"["write tests","refactor"]"#.into(),
+        leader: r#"{"assistant_backend":"acp","assistant_id":"lead-1","model":"claude","assistant_name":"Lead","role":"lead","order":0}"#.into(),
+        members: r#"[{"assistant_backend":"acp","assistant_id":"lead-1","model":"claude","assistant_name":"Lead","role":"lead","order":0},{"assistant_backend":"acp","assistant_id":"worker-1","model":"claude","assistant_name":"Worker","role":"teammate","order":1}]"#.into(),
+        version: 1,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+#[tokio::test]
+async fn create_and_get_team_preset() {
+    let (repo, _db) = repo().await;
+    let preset = make_preset("p1", "user-a", "Alpha Preset");
+    repo.create_team_preset(&preset).await.unwrap();
+
+    let fetched = repo.get_team_preset("p1").await.unwrap().expect("preset exists");
+    assert_eq!(fetched.id, "p1");
+    assert_eq!(fetched.name, "Alpha Preset");
+    assert_eq!(fetched.user_id, "user-a");
+    assert_eq!(fetched.version, 1);
+}
+
+#[tokio::test]
+async fn get_nonexistent_team_preset_returns_none() {
+    let (repo, _db) = repo().await;
+    let result = repo.get_team_preset("missing").await.unwrap();
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn list_team_presets_by_user_filters_and_orders() {
+    let (repo, _db) = repo().await;
+    repo.create_team_preset(&make_preset("p1", "user-a", "First"))
+        .await
+        .unwrap();
+    repo.create_team_preset(&make_preset("p2", "user-b", "Other"))
+        .await
+        .unwrap();
+    repo.create_team_preset(&make_preset("p3", "user-a", "Third"))
+        .await
+        .unwrap();
+
+    let presets = repo.list_team_presets_by_user("user-a").await.unwrap();
+    assert_eq!(presets.len(), 2);
+    assert!(presets.iter().all(|preset| preset.user_id == "user-a"));
+    // Newest first: p3 was created after p1.
+    assert_eq!(presets[0].id, "p3");
+    assert_eq!(presets[1].id, "p1");
+}
+
+#[tokio::test]
+async fn list_team_presets_by_user_empty() {
+    let (repo, _db) = repo().await;
+    let presets = repo.list_team_presets_by_user("no-one").await.unwrap();
+    assert!(presets.is_empty());
+}
+
+#[tokio::test]
+async fn update_team_preset_patches_fields_and_bumps_version() {
+    let (repo, _db) = repo().await;
+    repo.create_team_preset(&make_preset("p1", "user-a", "Old Name"))
+        .await
+        .unwrap();
+
+    repo.update_team_preset(
+        "p1",
+        &UpdateTeamPresetParams {
+            name: Some("New Name".into()),
+            description: Some("Updated description".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let updated = repo.get_team_preset("p1").await.unwrap().unwrap();
+    assert_eq!(updated.name, "New Name");
+    assert_eq!(updated.description, "Updated description");
+    assert_eq!(updated.version, 2);
+}
+
+#[tokio::test]
+async fn update_team_preset_empty_is_no_op() {
+    let (repo, _db) = repo().await;
+    repo.create_team_preset(&make_preset("p1", "user-a", "Name"))
+        .await
+        .unwrap();
+
+    repo.update_team_preset("p1", &UpdateTeamPresetParams::default())
+        .await
+        .unwrap();
+
+    let updated = repo.get_team_preset("p1").await.unwrap().unwrap();
+    assert_eq!(updated.name, "Name");
+    assert_eq!(updated.version, 1);
+}
+
+#[tokio::test]
+async fn update_nonexistent_team_preset_returns_not_found() {
+    let (repo, _db) = repo().await;
+    let result = repo
+        .update_team_preset(
+            "missing",
+            &UpdateTeamPresetParams {
+                name: Some("X".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(result, Err(DbError::NotFound(_))));
+}
+
+#[tokio::test]
+async fn delete_team_preset() {
+    let (repo, _db) = repo().await;
+    repo.create_team_preset(&make_preset("p1", "user-a", "Preset"))
+        .await
+        .unwrap();
+
+    repo.delete_team_preset("p1").await.unwrap();
+    assert!(repo.get_team_preset("p1").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn delete_nonexistent_team_preset_returns_not_found() {
+    let (repo, _db) = repo().await;
+    let result = repo.delete_team_preset("missing").await;
+    assert!(matches!(result, Err(DbError::NotFound(_))));
+}
+
+#[tokio::test]
+async fn create_team_preset_with_duplicate_id_returns_conflict() {
+    let (repo, _db) = repo().await;
+    let preset = make_preset("p1", "user-a", "Preset");
+    repo.create_team_preset(&preset).await.unwrap();
+
+    let mut duplicate = make_preset("p2", "user-a", "Other");
+    duplicate.id = "p1".into();
+    let result = repo.create_team_preset(&duplicate).await;
+    assert!(matches!(result, Err(DbError::Conflict(_))));
 }

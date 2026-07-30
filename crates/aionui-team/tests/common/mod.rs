@@ -1,6 +1,6 @@
 use aionui_common::now_ms;
-use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
-use aionui_db::{DbError, ITeamRepository, UpdateTaskParams, UpdateTeamParams};
+use aionui_db::models::{MailboxMessageRow, TeamPresetRow, TeamRow, TeamTaskRow};
+use aionui_db::{DbError, ITeamRepository, UpdateTaskParams, UpdateTeamParams, UpdateTeamPresetParams};
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -46,6 +46,26 @@ impl ITeamRepository for MockTeamRepo {
         Ok(())
     }
     async fn delete_team(&self, _id: &str) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn create_team_preset(&self, _row: &TeamPresetRow) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn list_team_presets_by_user(&self, _user_id: &str) -> Result<Vec<TeamPresetRow>, DbError> {
+        Ok(vec![])
+    }
+
+    async fn get_team_preset(&self, _preset_id: &str) -> Result<Option<TeamPresetRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn update_team_preset(&self, _preset_id: &str, _params: &UpdateTeamPresetParams) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn delete_team_preset(&self, _preset_id: &str) -> Result<(), DbError> {
         Ok(())
     }
 
