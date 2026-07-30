@@ -265,11 +265,30 @@ async fn try_init_file_staged(path: &Path) -> Result<Database, DatabaseInitError
 
     let pool = PoolOptions::<Sqlite>::new()
         .max_connections(MAX_CONNECTIONS)
-        .connect_with(opts)
+        .connect_with(opts.clone())
         .await
         .map_err(|e| DatabaseInitError::new("database.open", DbError::Query(e)))?;
 
     run_migrations_staged(&pool).await?;
+
+    // Discard the bootstrap pool and reconnect on a FRESH pool before any
+    // business query runs. Migrations DROP+rebuild tables (e.g. 030 rebuilt
+    // `users` from 9 to 16 columns); connections opened before the DDL can
+    // still serve stale schema through sqlx's per-connection statement cache
+    // and SQLite's connection-level schema snapshot. On a real upgraded
+    // database this made the first post-migration `SELECT * FROM users`
+    // return the OLD column layout: row decoding panicked in the sqlx
+    // worker, the startup secret resolution saw "no system user", silently
+    // derived a brand-new encryption key, and every previously encrypted
+    // credential (provider API keys, channel configs) failed to decrypt for
+    // that session (ELECTRON-3T0). A fresh pool has no pre-DDL state.
+    pool.close().await;
+    let pool = PoolOptions::<Sqlite>::new()
+        .max_connections(MAX_CONNECTIONS)
+        .connect_with(opts)
+        .await
+        .map_err(|e| DatabaseInitError::new("database.reopen", DbError::Query(e)))?;
+
     ensure_system_user(&pool)
         .await
         .map_err(|e| DatabaseInitError::new("database.seed", e))?;
