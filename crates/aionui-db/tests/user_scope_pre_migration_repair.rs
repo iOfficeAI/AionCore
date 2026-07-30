@@ -30,7 +30,12 @@ async fn build_v29_db(path: &Path, seed: &[&str]) {
         .filter(|m| m.version <= 29)
         .cloned()
         .collect::<Vec<_>>();
-    let migrator = Migrator { migrations: Cow::Owned(subset), ignore_missing: false, locking: true, no_tx: false };
+    let migrator = Migrator {
+        migrations: Cow::Owned(subset),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
     migrator.run(&pool).await.unwrap();
     for sql in seed {
         sqlx::query(sql).execute(&pool).await.unwrap();
@@ -65,14 +70,20 @@ async fn stuck_user_with_orphans_self_heals_and_030_applies() {
     )
     .await;
 
-    let db = init_database_staged(&path).await.expect("stuck DB must self-heal and finish 030");
+    let db = init_database_staged(&path)
+        .await
+        .expect("stuck DB must self-heal and finish 030");
     assert_eq!(max_applied_version(&db).await, 30, "migration 030 applied after repair");
 
     let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id='m_valid'")
-        .fetch_one(db.pool()).await.unwrap();
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
     assert_eq!(valid, 1, "valid message preserved");
     let orphan: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id='m_orphan'")
-        .fetch_one(db.pool()).await.unwrap();
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
     assert_eq!(orphan, 0, "orphan message removed");
     db.close().await;
 }
@@ -86,12 +97,19 @@ async fn already_applied_030_upgrades_without_version_mismatch() {
         let url = format!("sqlite://{}?mode=rwc", path.display());
         let pool = SqlitePoolOptions::new().max_connections(1).connect(&url).await.unwrap();
         sqlx::query("PRAGMA foreign_keys = OFF").execute(&pool).await.unwrap();
-        Migrator::new(Path::new("migrations")).await.unwrap().run(&pool).await.unwrap();
+        Migrator::new(Path::new("migrations"))
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&pool).await.ok();
         pool.close().await;
     }
 
-    let db = init_database_staged(&path).await.expect("already-migrated DB must open without VersionMismatch");
+    let db = init_database_staged(&path)
+        .await
+        .expect("already-migrated DB must open without VersionMismatch");
     assert_eq!(max_applied_version(&db).await, 30);
     db.close().await;
 }
@@ -102,8 +120,10 @@ async fn repair_then_startup_is_idempotent() {
     let path = dir.path().join("aionui-backend.db");
     build_v29_db(
         &path,
-        &["INSERT INTO mailbox (id, team_id, to_agent_id, from_agent_id, type, content, created_at) \
-           VALUES ('mb_orphan','t_missing','a1','a2','message','x',1)"],
+        &[
+            "INSERT INTO mailbox (id, team_id, to_agent_id, from_agent_id, type, content, created_at) \
+           VALUES ('mb_orphan','t_missing','a1','a2','message','x',1)",
+        ],
     )
     .await;
 
@@ -147,10 +167,14 @@ async fn defensive_dedup_prevents_unique_family_failure() {
     )
     .await;
 
-    let db = init_database_staged(&path).await.expect("duplicate mcp name must be deduped, not abort 030");
+    let db = init_database_staged(&path)
+        .await
+        .expect("duplicate mcp name must be deduped, not abort 030");
     assert_eq!(max_applied_version(&db).await, 30);
     let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mcp_servers WHERE name='dup'")
-        .fetch_one(db.pool()).await.unwrap();
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
     assert_eq!(kept, 1, "one row kept after dedup");
     db.close().await;
 }
