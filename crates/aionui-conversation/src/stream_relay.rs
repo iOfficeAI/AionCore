@@ -1736,6 +1736,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_persists_empty_thinking_segment_with_duration() {
+        // Encrypted-thinking models (Opus 4.8+ / Claude 5 family) emit thinking
+        // blocks with no plaintext. The empty segment must still land in the DB —
+        // it carries the duration and keeps reloaded tool groups split the same
+        // way the live WS stream showed them.
+        use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+
+        let mut ws_rx = bus.subscribe();
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Thinking(ThinkingEventData {
+            content: String::new(),
+            subject: None,
+            duration: None,
+            status: Some("thinking".into()),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "tc-001".into(),
+            name: "read_file".into(),
+            args: json!({"path": "a.ts"}),
+            status: ToolCallStatus::Running,
+            description: None,
+            input: None,
+            output: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let inserts = repo.take_inserts();
+        let thinking_msgs: Vec<_> = inserts.iter().filter(|msg| msg.r#type == "thinking").collect();
+        assert_eq!(thinking_msgs.len(), 1, "empty thinking segment must be persisted");
+        let content: serde_json::Value = serde_json::from_str(&thinking_msgs[0].content).unwrap();
+        assert_eq!(content["content"], "");
+        assert_eq!(content["status"], "done");
+        assert!(content["duration_ms"].is_u64(), "duration must be recorded");
+
+        // The live stream still closes the card via a done frame.
+        let mut saw_done = false;
+        while let Ok(evt) = ws_rx.try_recv() {
+            if evt.name == "message.stream" && evt.data["type"] == "thinking" && evt.data["data"]["status"] == "done" {
+                saw_done = true;
+            }
+        }
+        assert!(saw_done);
+    }
+
+    #[tokio::test]
     async fn run_thinking_tool_thinking_splits_thinking_segments() {
         use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 
