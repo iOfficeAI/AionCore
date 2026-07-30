@@ -1,4 +1,4 @@
--- Migration 031: one-shot marker for the AionUi -> AionPro data adoption.
+-- Migration 032: one-shot marker for the AionUi -> AionPro data adoption.
 --
 -- The adoption window used to be a pure eligibility predicate ("exactly one
 -- external user, and it is the caller"), evaluated on EVERY provision call.
