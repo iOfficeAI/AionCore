@@ -20,6 +20,8 @@
 -- permission gate (src/session/acp-permission-gate.ts) always gates
 -- bash/edit/delete/move; `--yolo`/`--auto-approve` are CLI launch flags,
 -- which must not be recorded as an ACP mode id.
+-- Display name is the product brand "omp" (omp.sh, CLI `omp`) rather than
+-- the ACP agentInfo.title "Oh My Pi", so users searching the CLI name find it.
 -- Post-030 seed shape: builtin rows use agent_id = id and user_id NULL
 -- (agents are machine-level; see 030_user_scope.sql backfill).
 INSERT INTO agent_metadata
@@ -27,7 +29,7 @@ INSERT INTO agent_metadata
      enabled, command, args, env, native_skills_dirs, behavior_policy, yolo_id,
      sort_order, created_at, updated_at)
 VALUES
-    ('c9e8a2f4', 'c9e8a2f4', '/api/assets/logos/acp-registry/omp.svg', 'Oh My Pi',
+    ('c9e8a2f4', 'c9e8a2f4', '/api/assets/logos/acp-registry/omp.svg', 'omp',
      'omp', 'acp', 'builtin', '{"binary_name":"omp","bridge_binary":"npx"}',
      1, 'npx', '["-y","@oh-my-pi/pi-coding-agent","acp"]', '[]',
      '[".omp/skills",".claude/skills"]',
