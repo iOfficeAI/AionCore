@@ -1,4 +1,4 @@
--- Migration 032: Enable Team mode for builtin Grok Build.
+-- Migration 037: Enable Team mode for builtin Grok Build.
 --
 -- Migration 025 seeded registry ACP agents with a conservative
 -- `team_capable_override: false` policy. Grok Build actually supports Team

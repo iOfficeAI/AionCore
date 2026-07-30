@@ -1,4 +1,4 @@
--- Migration 030: Add team_presets table for persisted expert-team presets.
+-- Migration 035: Add team_presets table for persisted expert-team presets.
 --
 -- Presets are user-owned templates that describe an expert team roster,
 -- including the leader, members, roles, and descriptive metadata.

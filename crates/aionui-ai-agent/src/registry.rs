@@ -1361,7 +1361,7 @@ mod tests {
         assert_eq!(grok.args, ["-y", "@xai-official/grok", "agent", "stdio"]);
         assert_eq!(grok.agent_source_info.binary_name.as_deref(), Some("grok"));
         assert_eq!(grok.agent_source_info.bridge_binary.as_deref(), Some("npx"));
-        // Migration 032 clears the hard team disable and sets supports_team so
+        // Migration 037 clears the hard team disable and sets supports_team so
         // agent.team_capable → assistant.team_selectable can become true.
         assert!(grok.behavior_policy.supports_team);
         assert_eq!(grok.behavior_policy.team_capable_override, None);

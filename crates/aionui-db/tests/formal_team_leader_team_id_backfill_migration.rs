@@ -24,13 +24,13 @@ async fn run_migrations_through(pool: &sqlx::SqlitePool, max_version: i64) {
 }
 
 #[tokio::test]
-async fn migration_031_backfills_team_id_for_formal_team_leaders() {
+async fn migration_036_backfills_team_id_for_formal_team_leaders() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 30).await;
+    run_migrations_through(&pool, 35).await;
 
     sqlx::query(
         "INSERT INTO users (id, username, password_hash, created_at, updated_at)
@@ -66,7 +66,7 @@ async fn migration_031_backfills_team_id_for_formal_team_leaders() {
     .await
     .unwrap();
 
-    run_migrations_through(&pool, 31).await;
+    run_migrations_through(&pool, 36).await;
 
     let row: (String,) = sqlx::query_as("SELECT extra FROM conversations WHERE id = 'conv-formal-lead'")
         .fetch_one(&pool)
@@ -81,13 +81,13 @@ async fn migration_031_backfills_team_id_for_formal_team_leaders() {
 }
 
 #[tokio::test]
-async fn migration_031_leaves_ad_hoc_origin_conversation_visible() {
+async fn migration_036_leaves_ad_hoc_origin_conversation_visible() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 30).await;
+    run_migrations_through(&pool, 35).await;
 
     sqlx::query(
         "INSERT INTO users (id, username, password_hash, created_at, updated_at)
@@ -123,7 +123,7 @@ async fn migration_031_leaves_ad_hoc_origin_conversation_visible() {
     .await
     .unwrap();
 
-    run_migrations_through(&pool, 31).await;
+    run_migrations_through(&pool, 36).await;
 
     let row: (String,) = sqlx::query_as("SELECT extra FROM conversations WHERE id = 'conv-adhoc-origin'")
         .fetch_one(&pool)

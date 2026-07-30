@@ -1,4 +1,4 @@
--- Migration 031: Backfill team_id marker for formal team leader conversations
+-- Migration 036: Backfill team_id marker for formal team leader conversations
 --
 -- Before the provisioning fix, formal Teams created a new leader conversation
 -- with `teamId` (session binding) but omitted `team_id` (sidebar ownership

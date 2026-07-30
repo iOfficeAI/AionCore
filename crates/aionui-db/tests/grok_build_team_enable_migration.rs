@@ -47,7 +47,7 @@ async fn full_migrate_enables_grok_build_team_policy() {
 }
 
 #[tokio::test]
-async fn migration_032_backfills_existing_grok_override_false() {
+async fn migration_037_backfills_existing_grok_override_false() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -67,8 +67,8 @@ async fn migration_032_backfills_existing_grok_override_false() {
     assert_eq!(before_policy["team_capable_override"], false);
     assert_eq!(before_policy["supports_team"], false);
 
-    // Run remaining migrations including 032.
-    run_migrations_through(&pool, 32).await;
+    // Run remaining migrations including 037.
+    run_migrations_through(&pool, 37).await;
 
     let after: (String,) = sqlx::query_as(
         "SELECT behavior_policy FROM agent_metadata WHERE backend = 'grok' AND agent_source = 'builtin'",
