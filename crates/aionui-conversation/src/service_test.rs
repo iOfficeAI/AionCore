@@ -4036,6 +4036,144 @@ async fn ensure_runtime_uses_existing_agent_snapshot_without_recovery() {
 }
 
 #[tokio::test]
+async fn restart_runtime_without_existing_task_builds_runtime_like_ensure() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let result = svc
+        .restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    assert!(result.recovered);
+    assert!(result.runtime.has_task);
+    assert!(task_mgr.get_task(&conv.id).is_some());
+    assert!(result.config_options.is_empty());
+}
+
+#[tokio::test]
+async fn restart_runtime_evicts_existing_task_before_rebuild() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let old_agent = MockAgent::new(&conv.id).with_config_options(vec![AcpConfigOptionDto {
+        id: "model".to_owned(),
+        name: Some("Old Model".to_owned()),
+        label: None,
+        description: None,
+        category: Some("model".to_owned()),
+        option_type: "select".to_owned(),
+        current_value: Some("old-model".to_owned()),
+        options: Vec::new(),
+    }]);
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(old_agent)));
+
+    let result = svc
+        .restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert_eq!(task_mgr.kill_records(), vec![(conv.id.clone(), None)]);
+    assert!(result.recovered);
+    assert!(result.runtime.has_task);
+    assert!(
+        result.config_options.is_empty(),
+        "response must come from the newly built task, not the evicted instance"
+    );
+}
+
+#[tokio::test]
+async fn restart_runtime_cancels_active_turn_before_rebuild() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let old_agent = Arc::new(BlockingCancelAgent::new(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(old_agent.clone()));
+    let _turn_claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn-before-restart")
+        .unwrap();
+
+    let result = svc
+        .restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    assert_eq!(old_agent.cancel_count.load(Ordering::SeqCst), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert!(result.runtime.has_task);
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+}
+
+#[tokio::test]
+async fn restart_runtime_preserves_persisted_messages() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.insert_message(
+        "user_1",
+        &MessageRow {
+            id: "message-before-restart".into(),
+            conversation_id: conv.id.clone(),
+            msg_id: Some("message-before-restart".into()),
+            r#type: "user".into(),
+            content: json!({ "text": "keep me" }).to_string(),
+            position: Some("right".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 1234,
+        },
+    )
+    .await
+    .unwrap();
+
+    svc.restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    let messages = repo_messages_asc(&repo, &conv.id, 10).await;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "message-before-restart");
+}
+
+#[tokio::test]
+async fn restart_runtime_not_found_does_not_touch_task_manager() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+
+    let error = svc
+        .restart_runtime(
+            "user_1",
+            "missing-conversation",
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ConversationError::NotFound { .. }));
+    assert_eq!(task_mgr.kill_count(), 0);
+}
+
+#[tokio::test]
+async fn restart_runtime_rejects_cross_user_access_without_eviction() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+
+    let error = svc
+        .restart_runtime("user_2", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ConversationError::NotFound { .. }));
+    assert_eq!(task_mgr.kill_count(), 0);
+    assert!(task_mgr.get_task(&conv.id).is_some());
+}
+
+#[tokio::test]
 async fn set_config_option_returns_observed_confirmation() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());

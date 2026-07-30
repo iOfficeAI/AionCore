@@ -120,6 +120,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
         .route("/api/conversations/{id}/runtime/ensure", post(ensure_runtime))
+        .route("/api/conversations/{id}/runtime/restart", post(restart_runtime))
         .route("/api/conversations/{id}/active-lease", post(active_lease))
         // Confirmation system
         .route("/api/conversations/{id}/confirmations", get(list_confirmations))
@@ -328,6 +329,19 @@ async fn ensure_runtime(
     let response = state
         .service
         .ensure_runtime(&user.id, &id, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn restart_runtime(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<EnsureConversationRuntimeResponse>>, ApiError> {
+    let response = state
+        .service
+        .restart_runtime(&user.id, &id, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(response)))

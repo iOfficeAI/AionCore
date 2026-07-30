@@ -3370,6 +3370,60 @@ impl ConversationService {
         })
     }
 
+    /// Cancel any active turn, recycle the agent process, and eagerly rebuild it.
+    ///
+    /// Conversation messages, artifacts, and the persisted backend session anchor
+    /// are intentionally left untouched so the rebuilt runtime can resume the
+    /// existing backend session.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
+    pub async fn restart_runtime(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if let Some(team_id) = team_id_from_extra(&row.extra) {
+            info!(
+                conversation_id,
+                team_id, "Rejected standalone runtime restart for team-owned conversation"
+            );
+            return Err(ConversationError::TeamRuntimeRequired {
+                conversation_id: conversation_id.to_owned(),
+                team_id,
+            });
+        }
+
+        if let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) {
+            self.cancel(user_id, conversation_id, &turn_id, task_manager).await?;
+        }
+
+        info!(conversation_id, "Restarting conversation runtime");
+        task_manager.kill_and_wait(conversation_id, None).await;
+        self.runtime_state.clear_conversation(conversation_id);
+
+        let (agent, recovered) = self
+            .ensure_runtime_agent(user_id, conversation_id, task_manager, "runtime_restart")
+            .await?;
+        let config_options = agent
+            .get_config_options()
+            .await
+            .map_err(ConversationError::from)?
+            .config_options;
+
+        Ok(EnsureConversationRuntimeResponse {
+            recovered,
+            config_options,
+            runtime: self.runtime_summary_for(conversation_id).await,
+        })
+    }
+
     async fn ensure_runtime_agent(
         &self,
         user_id: &str,
