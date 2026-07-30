@@ -51,6 +51,20 @@ async fn max_applied_version(db: &aionui_db::Database) -> i64 {
         .unwrap()
 }
 
+/// Highest migration version bundled in `migrations/`. Staged init runs the
+/// full migrator, so a healed DB must reach exactly this version — asserting a
+/// hardcoded literal (e.g. 30) breaks whenever a later migration is added.
+async fn latest_bundled_version() -> i64 {
+    Migrator::new(Path::new("migrations"))
+        .await
+        .unwrap()
+        .migrations
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .expect("bundled migrations are non-empty")
+}
+
 #[tokio::test]
 async fn stuck_user_with_orphans_self_heals_and_030_applies() {
     let dir = tempfile::tempdir().unwrap();
@@ -73,7 +87,11 @@ async fn stuck_user_with_orphans_self_heals_and_030_applies() {
     let db = init_database_staged(&path)
         .await
         .expect("stuck DB must self-heal and finish 030");
-    assert_eq!(max_applied_version(&db).await, 30, "migration 030 applied after repair");
+    assert_eq!(
+        max_applied_version(&db).await,
+        latest_bundled_version().await,
+        "migration 030+ applied after repair"
+    );
 
     let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id='m_valid'")
         .fetch_one(db.pool())
@@ -110,7 +128,7 @@ async fn already_applied_030_upgrades_without_version_mismatch() {
     let db = init_database_staged(&path)
         .await
         .expect("already-migrated DB must open without VersionMismatch");
-    assert_eq!(max_applied_version(&db).await, 30);
+    assert_eq!(max_applied_version(&db).await, latest_bundled_version().await);
     db.close().await;
 }
 
@@ -127,12 +145,14 @@ async fn repair_then_startup_is_idempotent() {
     )
     .await;
 
+    let latest = latest_bundled_version().await;
     let db1 = init_database_staged(&path).await.unwrap();
-    assert_eq!(max_applied_version(&db1).await, 30);
+    assert_eq!(max_applied_version(&db1).await, latest);
     db1.close().await;
-    // Second startup on the healed DB must also succeed (gate now max==30 → skip).
+    // Second startup on the healed DB must also succeed (gate now sees the DB
+    // already past 030 → skips the repair).
     let db2 = init_database_staged(&path).await.unwrap();
-    assert_eq!(max_applied_version(&db2).await, 30);
+    assert_eq!(max_applied_version(&db2).await, latest);
     db2.close().await;
 }
 
@@ -170,7 +190,7 @@ async fn defensive_dedup_prevents_unique_family_failure() {
     let db = init_database_staged(&path)
         .await
         .expect("duplicate mcp name must be deduped, not abort 030");
-    assert_eq!(max_applied_version(&db).await, 30);
+    assert_eq!(max_applied_version(&db).await, latest_bundled_version().await);
     let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mcp_servers WHERE name='dup'")
         .fetch_one(db.pool())
         .await
