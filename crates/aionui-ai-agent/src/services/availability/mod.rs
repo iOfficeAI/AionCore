@@ -176,11 +176,15 @@ async fn run_probe(
     let start = Instant::now();
 
     let (status, error_code, error_message) = if meta.agent_source == AgentSource::Builtin
-        && matches!(meta.backend.as_deref(), Some("claude") | Some("codex"))
-    {
-        // Builtin claude/codex are direct CLIs that do not speak ACP, so
-        // their deep check is PATH + `--version` (integrity), never a
-        // session/new-style handshake (#675). Uses the wide recheck budget:
+        && matches!(
+            meta.backend.as_deref(),
+            Some("claude") | Some("codex") | Some("antigravity")
+        ) {
+        // These builtins are direct CLIs that do not speak ACP, so their deep
+        // check is PATH + `--version` (integrity), never a session/new-style
+        // handshake (#675). Without antigravity here, agy falls through to the
+        // `try_connect_custom_agent` branch below and every health check fails
+        // with acp_init_failed. Uses the wide recheck budget:
         // the user is explicitly waiting and large Node CLIs load slowly.
         match crate::cli_probe::validate_with_budget(meta, crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT).await {
             Ok(_) => (AgentSnapshotCheckStatus::Online, None, None),

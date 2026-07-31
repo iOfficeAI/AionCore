@@ -7,6 +7,21 @@
 use super::wire::{AgyEvent, AgyState, AgyStepType, AgyStepUpdate, AgyUsage};
 use crate::event::{CancelReason, SessionEvent, ToolResultContent, TurnOutcome, UsageBreakdown};
 
+/// Rewrite agy's terminal error into something the user can act on.
+///
+/// agy reports a signed-out run as `authentication failed or timed out`, which
+/// tells the user nothing about what to do. Everything else is passed through
+/// unchanged rather than guessed at.
+pub(crate) fn explain_turn_error(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("authentication") || lower.contains("not logged in") || lower.contains("sign in") {
+        return format!(
+            "Antigravity is not signed in. Run `agy` in a terminal to log in with your Google account, then try again. (agy: {raw})"
+        );
+    }
+    raw.to_owned()
+}
+
 /// Folds the agy stream into `SessionEvent`s, carrying the small amount of
 /// cross-frame state the translation needs.
 #[derive(Debug, Default)]
@@ -63,7 +78,7 @@ impl Translator {
                 };
                 // On failure agy puts the reason in `error`, not `response`.
                 let result_text = if is_error {
-                    r.error.unwrap_or(r.response)
+                    explain_turn_error(&r.error.unwrap_or(r.response))
                 } else {
                     r.response
                 };
@@ -384,6 +399,40 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_signed_out_turn_tells_the_user_how_to_fix_it() {
+        // Probing cannot detect a signed-out install (agy --version exits 0
+        // either way), so this message is the user's ONLY signal.
+        let (_, evs) = tr(&[
+            r#"{"event":"result","result":{"conversation_id":"","status":"ERROR","error":"authentication failed or timed out"}}"#,
+        ]);
+        match evs.last() {
+            Some(SessionEvent::TurnResult {
+                is_error, result_text, ..
+            }) => {
+                assert!(is_error);
+                assert!(
+                    result_text.contains("agy"),
+                    "must name the command to run: {result_text}"
+                );
+                assert!(
+                    result_text.to_lowercase().contains("sign"),
+                    "must say what is wrong: {result_text}"
+                );
+                // The original text stays for diagnosis.
+                assert!(result_text.contains("authentication failed or timed out"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unrelated_error_is_passed_through_untouched() {
+        // Only the auth case is recognised; inventing explanations for other
+        // failures would mislead.
+        assert_eq!(explain_turn_error("disk quota exceeded"), "disk quota exceeded");
     }
 
     #[test]
