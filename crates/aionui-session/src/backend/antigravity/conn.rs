@@ -16,9 +16,9 @@
 //! - `Cancel` kills the process; the turn's own `result` frame may never
 //!   arrive, so the reader synthesizes the terminal event on exit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aionui_common::CommandSpec;
 use aionui_process::Spawner;
@@ -77,6 +77,10 @@ pub fn antigravity_capabilities() -> Capabilities {
         },
         // agy has no prompt-ack frame; the backend synthesizes one.
         prompt_accepted: PromptAcceptedSource::Synthesized,
+        // A Send during a running turn is QUEUED for the next one. agy cannot
+        // take input mid-turn, but its next turn is a fresh process anyway, so
+        // the input box can stay usable instead of locking until the turn ends.
+        accepts_proactive_input: true,
         ..Default::default()
     }
 }
@@ -149,6 +153,9 @@ impl BackendConnection for AntigravityConnection {
             current: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
+            weak_self: std::sync::OnceLock::new(),
+            in_flight: Arc::new(AtomicBool::new(false)),
+            queued: Arc::new(Mutex::new(VecDeque::new())),
         });
 
         // Discover models OFF the open path. `agy models` costs a process
@@ -156,6 +163,7 @@ impl BackendConnection for AntigravityConnection {
         // open for a list that only the picker needs. The catalog write-back
         // already polls `capabilities()` for late discovery, so it picks this
         // up when it lands.
+        let _ = backend.weak_self.set(Arc::downgrade(&backend));
         backend.spawn_model_probe();
         Ok(backend)
     }
@@ -195,6 +203,19 @@ pub struct AntigravitySessionBackend {
     pending: Arc<Mutex<HashMap<String, PendingPermission>>>,
     /// Monotonic counter behind each permission's `request_id`.
     permission_seq: AtomicU64,
+    /// True while a turn's process is alive. agy has no way to accept input
+    /// mid-turn, so a Send arriving now has to wait for the next process.
+    in_flight: Arc<AtomicBool>,
+    /// Handle to itself, so the reader task can start the next queued turn when
+    /// this one ends. `dispatch` only has `&self` (trait signature), so the
+    /// Arc cannot be threaded through the call.
+    weak_self: std::sync::OnceLock<std::sync::Weak<Self>>,
+    /// Messages the user sent while a turn was running, in order.
+    ///
+    /// Each becomes its OWN next turn rather than being merged: merging would
+    /// silently collapse two things the user said into one, and they would
+    /// never see the second one echoed.
+    queued: Arc<Mutex<VecDeque<Vec<ContentBlock>>>>,
 }
 
 struct PendingPermission {
@@ -303,6 +324,7 @@ impl AntigravitySessionBackend {
             .await
             .map_err(|e| BackendError::Transport(format!("spawn agy: {e}")))?;
         *self.current.lock().await = Some(Arc::clone(&proc));
+        self.in_flight.store(true, Ordering::SeqCst);
 
         self.spawn_reader(Arc::clone(&proc), turn_gen);
         Ok(turn_gen)
@@ -311,6 +333,7 @@ impl AntigravitySessionBackend {
     /// Drain the process's stdout, translating each NDJSON line, and close the
     /// turn out when the process exits.
     fn spawn_reader(&self, proc: Arc<aionui_process::ManagedProcess>, turn_gen: u64) {
+        let backend = self.weak_self.get().cloned();
         let event_tx = self.event_tx.clone();
         let session_id = self.session_id.clone();
         // The SESSION's anchor, not a fresh one: the id agy reports in `init`
@@ -384,6 +407,21 @@ impl AntigravitySessionBackend {
             if slot.as_ref().is_some_and(|p| Arc::ptr_eq(p, &proc)) {
                 *slot = None;
             }
+            drop(slot);
+
+            // The turn is over, so anything the user typed while it ran can run
+            // now — as its own turn, resuming the same agy conversation.
+            let Some(backend) = backend.and_then(|w| w.upgrade()) else {
+                // Session dropped; nothing left to run for.
+                return;
+            };
+            backend.in_flight.store(false, Ordering::SeqCst);
+            let next = backend.queued.lock().await.pop_front();
+            if let Some(content) = next
+                && let Err(e) = backend.start_turn(content).await
+            {
+                tracing::error!(error = %e, "antigravity: queued message could not be started");
+            }
         });
     }
 }
@@ -393,6 +431,14 @@ impl SessionBackend for AntigravitySessionBackend {
     async fn dispatch(&self, command: Command) -> Result<CommandReceipt, BackendError> {
         match command {
             Command::Send { content, .. } => {
+                if self.in_flight.load(Ordering::SeqCst) {
+                    self.queued.lock().await.push_back(content);
+                    return Ok(CommandReceipt {
+                        accepted: true,
+                        admission: Admission::Queued,
+                        turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                    });
+                }
                 let turn_gen = self.start_turn(content).await?;
                 // agy has no prompt-ack frame of its own.
                 self.emit(
@@ -438,6 +484,9 @@ impl SessionBackend for AntigravitySessionBackend {
                     return Err(BackendError::CommandNotSupported { command: "cancel_tool" });
                 }
                 self.terminate().await;
+                // The user asked to stop — running what they queued afterwards
+                // would be the opposite of what they meant.
+                self.queued.lock().await.clear();
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::Started,
@@ -672,6 +721,9 @@ mod tests {
             current: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
+            weak_self: std::sync::OnceLock::new(),
+            in_flight: Arc::new(AtomicBool::new(false)),
+            queued: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
@@ -785,6 +837,9 @@ mod tests {
             current: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
+            weak_self: std::sync::OnceLock::new(),
+            in_flight: Arc::new(AtomicBool::new(false)),
+            queued: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let caps = backend.capabilities();
@@ -806,6 +861,60 @@ mod tests {
         assert_eq!(modes.len(), 3);
         assert_eq!(modes[1].id, "accept-edits");
         assert_eq!(modes[1].name, "Accept Edits");
+    }
+
+    #[tokio::test]
+    async fn a_send_during_a_running_turn_is_queued_not_rejected() {
+        // agy cannot take input mid-turn, but its next turn is a fresh process
+        // anyway — so the input box stays usable instead of locking.
+        let b = backend_for_permissions().await;
+        b.in_flight.store(true, Ordering::SeqCst);
+
+        let receipt = b.dispatch(send("second")).await.expect("queued send is accepted");
+        assert!(receipt.accepted);
+        assert_eq!(receipt.admission, Admission::Queued);
+        assert_eq!(b.queued.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_messages_stay_separate_and_ordered() {
+        // Merging them would collapse two things the user said into one turn,
+        // and the second would never be echoed back.
+        let b = backend_for_permissions().await;
+        b.in_flight.store(true, Ordering::SeqCst);
+
+        b.dispatch(send("first")).await.unwrap();
+        b.dispatch(send("second")).await.unwrap();
+
+        let q = b.queued.lock().await;
+        assert_eq!(q.len(), 2, "must not merge");
+        assert!(matches!(&q[0][0], ContentBlock::Text(t) if t == "first"));
+        assert!(matches!(&q[1][0], ContentBlock::Text(t) if t == "second"));
+    }
+
+    #[tokio::test]
+    async fn cancel_discards_queued_messages() {
+        // The user asked to stop; running what they queued afterwards would be
+        // the opposite of what they meant.
+        let b = backend_for_permissions().await;
+        b.in_flight.store(true, Ordering::SeqCst);
+        b.dispatch(send("queued")).await.unwrap();
+
+        b.dispatch(Command::Cancel {
+            target: CancelTarget::Turn,
+        })
+        .await
+        .unwrap();
+        assert!(b.queued.lock().await.is_empty());
+    }
+
+    #[test]
+    fn capabilities_allow_queueing_but_not_steering() {
+        let c = antigravity_capabilities();
+        // agy ignores stdin mid-turn, so steering is impossible...
+        assert!(!c.supported_commands.steer);
+        // ...but queueing for the next turn is natural for a per-turn process.
+        assert!(c.accepts_proactive_input);
     }
 
     #[test]
