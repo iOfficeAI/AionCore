@@ -2219,7 +2219,7 @@ fn spawn_event_pump(
             // Finish, so the translated frame below would be shouted into an empty
             // room. Broadcasting straight from the pump (session-scoped, still alive)
             // is what turns claude's indicator on without waiting for a reload.
-            if let (Some(bus), SessionEvent::UsageDelta { .. }) = (broadcaster.as_ref(), &env.event) {
+            if let (Some(bus), Some(_)) = (broadcaster.as_ref(), informative_usage(&env.event)) {
                 broadcast_usage_frame(bus.as_ref(), &conversation_id, &user_id, &env.event);
             }
             for mut ev in translate_event(env.event, &conversation_id, terminal_result_seen) {
@@ -2380,28 +2380,34 @@ async fn persist_side_effects(
         // is session-scoped and outlives the per-turn `StreamRelay`, so it still
         // sees claude's `UsageDelta` — which rides the `result` frame that lands
         // AFTER the relay has already broken on Finish.
-        // Token usage -> the `context_usage` runtime snapshot the usage indicator
-        // reads back. This is the ONLY durable sink for direct-CLI usage: the pump
-        // is session-scoped and outlives the per-turn `StreamRelay`, so it still
-        // sees claude's `UsageDelta` — which rides the `result` frame that lands
-        // AFTER the relay has already broken on Finish.
+        _ => {}
+    }
+    if let Some((used, cost_usd, context_window)) = informative_usage(event) {
+        persist_context_usage(repo, user_id, conversation_id, used, cost_usd, context_window).await;
+    }
+}
+
+/// The single gate on whether a usage report says anything about context
+/// occupancy. Both consumers — the durable snapshot and the live broadcast — ask
+/// this, so a report can never be broadcast without being stored, or vice versa.
+///
+/// A zero-token report is DISCARDED. claude ends a no-op turn with an all-zero
+/// `usage` object, most visibly after `/compact`: live-captured (2.1.220), the
+/// compaction turn returns `num_turns: 0` and
+/// `usage{input_tokens:0, cache_creation:0, cache_read:0, output_tokens:0}` while
+/// `total_cost_usd` stays put. Recording that overwrites a real occupancy figure
+/// with 0 — not merely stale but wrong, since a compaction leaves the context
+/// SMALLER, never empty. Dropping it keeps the last true reading until the next
+/// real turn reports the post-compaction size.
+fn informative_usage(event: &SessionEvent) -> Option<(u64, Option<f64>, Option<u64>)> {
+    match event {
         SessionEvent::UsageDelta {
             total_tokens,
             cost_usd,
             context_window,
             ..
-        } => {
-            persist_context_usage(
-                repo,
-                user_id,
-                conversation_id,
-                *total_tokens,
-                *cost_usd,
-                *context_window,
-            )
-            .await;
-        }
-        _ => {}
+        } if *total_tokens > 0 => Some((*total_tokens, *cost_usd, *context_window)),
+        _ => None,
     }
 }
 
@@ -4072,6 +4078,38 @@ mod persist_tests {
         );
     }
 
+    /// A `/compact` turn ends with an all-zero `usage` object (live-captured on
+    /// claude 2.1.220: `num_turns: 0`, every token bucket 0, `total_cost_usd`
+    /// unchanged). Recording it wiped the real figure to `used: 0` — observed in
+    /// the wild as "the indicator showed 0, then vanished". The zero report must be
+    /// dropped so the last true reading survives until the next real turn.
+    #[tokio::test]
+    async fn zero_usage_after_compaction_does_not_wipe_the_real_figure() {
+        let (repo, _db) = seeded_repo().await;
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &usage(26_420, Some(0.0133), Some(1_000_000)),
+        )
+        .await;
+        // The compaction turn: cost carries over unchanged, every token bucket 0.
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &usage(0, Some(0.0133), Some(1_000_000)),
+        )
+        .await;
+
+        let stored = stored_usage(repo.as_ref()).await;
+        assert_eq!(
+            stored["used"], 26_420,
+            "a zero-token turn must not overwrite real occupancy"
+        );
+        assert_eq!(stored["size"], 1_000_000);
+    }
+
     /// The live frame must match what the renderer actually switches on.
     /// `useAcpMessage.ts` handles `case 'acp_context_usage'`, reads `data.used`
     /// into the indicator and `data.size` into `context_limit` (only when > 0), so
@@ -4099,6 +4137,39 @@ mod persist_tests {
         assert_eq!(msg.data["data"]["used"], 26_420);
         assert_eq!(msg.data["data"]["size"], 1_000_000, "drives context_limit");
         assert_eq!(msg.data["conversation_id"], "conv-1");
+    }
+
+    /// The gate is shared by the snapshot and the live broadcast, so a report can
+    /// never be pushed to the UI without also being stored.
+    #[test]
+    fn informative_usage_gates_zero_reports_only() {
+        assert!(informative_usage(&usage(0, Some(1.0), Some(200_000))).is_none());
+        assert_eq!(
+            informative_usage(&usage(11_030, None, Some(258_400))),
+            Some((11_030, None, Some(258_400)))
+        );
+    }
+
+    /// Defect 3: after a conversation switch the task is rebuilt with no in-memory
+    /// usage, so `get_usage` must serve the value straight out of the snapshot —
+    /// otherwise the indicator sits blank until the next turn produces fresh usage.
+    #[tokio::test]
+    async fn get_usage_serves_the_persisted_snapshot_on_a_cold_task() {
+        let (repo, _db) = seeded_repo().await;
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &usage(47_579, None, Some(258_400))).await;
+
+        // A freshly built task: nothing in memory, only the repo.
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/tmp".into(),
+            Arc::new(super::pump_tests::StaticCapsBackend),
+            Some(repo.clone()),
+        );
+        let served = task.get_usage().await.unwrap().expect("cold task serves the snapshot");
+        assert_eq!(served["used"], 47_579);
+        assert_eq!(served["size"], 258_400);
     }
 
     #[tokio::test]
