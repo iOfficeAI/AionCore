@@ -17,6 +17,33 @@
 /// `AdapterSpecific.payload` is an opaque escape hatch this contract does NOT
 /// promise total equality over; `assert_eq!` only needs `PartialEq`. Deriving
 /// fewer traits than available is always legal ⇒ the shape compiles as-is.
+/// Per-turn token counters for the usage indicator's detail line
+/// ("input · output · cache read · thinking"). Every field is a per-turn total,
+/// NOT a running context figure — `UsageDelta.total_tokens` carries occupancy.
+///
+/// Both direct backends report all of it (live-verified): claude via
+/// `result.usage` plus the `thinking_tokens` summed off each `message_delta`,
+/// codex via `tokenUsage.last`. Backends that report none leave it zeroed, and
+/// the renderer then omits the line entirely.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageBreakdown {
+    /// Cache HITS — tokens read from an existing prefix cache.
+    pub cached_read_tokens: u64,
+    /// Cache WRITES — tokens newly committed to the cache this turn.
+    pub cached_write_tokens: u64,
+    /// Reasoning/thinking tokens, billed as output but rendered separately.
+    pub thought_tokens: u64,
+}
+
+impl UsageBreakdown {
+    /// Whether anything was reported. A fully zeroed breakdown is indistinguishable
+    /// from "this backend tells us nothing", so it is omitted rather than rendered
+    /// as a row of zeros.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)] // +Serialize/Deserialize (Addendum 2a, 007 §C2). only PartialEq — see FIX 4a above
 pub enum SessionEvent {
     // ---- command lower (FIX 2): orchestration lowers Command::Send here ----
@@ -275,6 +302,10 @@ pub enum SessionEvent {
         output_tokens: u64,
         total_tokens: u64,
         cost_usd: Option<f64>,
+        /// Per-turn counters behind the indicator's detail line. Separate from
+        /// `total_tokens`, which is context OCCUPANCY: on claude the two even come
+        /// from different frames (the turn aggregate vs. the last API call).
+        breakdown: UsageBreakdown,
         /// The model's total context window, when the backend reports one
         /// (claude `result.modelUsage.<model>.contextWindow`; codex
         /// `tokenUsage.modelContextWindow`, which is nullable). Renders as the
@@ -1129,6 +1160,7 @@ mod additive_tests {
                     total_tokens: 2,
                     cost_usd: None,
                     context_window: None,
+                    breakdown: Default::default(),
                 },
                 BackendProduced,
                 Display,
@@ -1393,6 +1425,7 @@ mod additive_tests {
                 total_tokens: 150,
                 cost_usd: Some(0.0021),
                 context_window: None,
+                breakdown: Default::default(),
             },
             SessionEvent::Provisioning {
                 phase: ProvisioningPhase::ToolsWaiting,

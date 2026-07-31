@@ -41,6 +41,12 @@ pub struct ClaudeAdapter {
     /// 15_493+26_345+26_485+27_386 summed). Feeding the aggregate to the usage
     /// indicator drove it past 100% of the context window.
     last_call_tokens: Option<u64>,
+    /// Thinking tokens accumulated across the turn's API calls. `result.usage`
+    /// reports `output_tokens_details: null` (live-captured), so the only source is
+    /// each `message_delta.usage.output_tokens_details.thinking_tokens` — 60 on the
+    /// first call of a captured four-call turn. Summed here because the breakdown
+    /// is a PER-TURN figure; reset when the `result` frame consumes it.
+    turn_thought_tokens: u64,
 }
 
 /// Per-message streaming state for `--include-partial-messages`. Reset on each
@@ -477,7 +483,7 @@ impl ClaudeAdapter {
     /// on the same result frame). Returns a Vec so the usage rides alongside the
     /// terminal — codex already emits UsageDelta (map_usage); this closes the
     /// claude/codex asymmetry. The wrapping ClaudeConnection inherits both for free.
-    fn parse_result(&self, v: &Value) -> Vec<SessionEvent> {
+    fn parse_result(&mut self, v: &Value) -> Vec<SessionEvent> {
         let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
         let result_text = match v.get("result").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -562,7 +568,16 @@ impl ClaudeAdapter {
                 output_tokens,
                 total_tokens,
                 cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
-                context_window: Self::result_context_window(v),
+                context_window: self.result_context_window(v),
+                // Per-turn detail line. These stay on the AGGREGATE `result.usage`
+                // (unlike `total_tokens`, which must be the last call's occupancy):
+                // the breakdown answers "what did this turn cost", so counting every
+                // API call is the correct reading.
+                breakdown: crate::event::UsageBreakdown {
+                    cached_read_tokens: cache_read,
+                    cached_write_tokens: cache_creation,
+                    thought_tokens: std::mem::take(&mut self.turn_thought_tokens),
+                },
             });
         }
         out
@@ -578,7 +593,7 @@ impl ClaudeAdapter {
     /// entry by `inputTokens + outputTokens` wins, i.e. the main conversation model.
     /// That tie-break is a heuristic: only the single-entry shape has been captured.
     /// Absent / non-integer → `None`, which renders as a counter with no percentage.
-    fn result_context_window(v: &Value) -> Option<u64> {
+    fn result_context_window(&self, v: &Value) -> Option<u64> {
         let entries = v.get("modelUsage")?.as_object()?;
         entries
             .values()
@@ -755,6 +770,11 @@ impl ClaudeAdapter {
                     if occupancy > 0 {
                         self.last_call_tokens = Some(occupancy);
                     }
+                    self.turn_thought_tokens += usage
+                        .get("output_tokens_details")
+                        .and_then(|d| d.get("thinking_tokens"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
                 }
                 let stop_reason = event
                     .and_then(|e| e.get("delta"))
@@ -2077,6 +2097,49 @@ mod tests {
             total, 27_472,
             "occupancy is the last call (2+79+27386+5), NOT the 107_974 aggregate"
         );
+    }
+
+    /// The detail line's counters are PER-TURN, so they ride the aggregate
+    /// `result.usage` even though `total_tokens` must not. Thinking tokens are the
+    /// exception: `result.usage.output_tokens_details` is null (live-captured), so
+    /// they are summed off each `message_delta` — 60 + 12 across two calls here.
+    #[test]
+    fn breakdown_sums_thinking_across_calls_and_reads_caches_from_the_aggregate() {
+        let mut a = ClaudeAdapter::new();
+        for (cr, think) in [(15493u64, 60u64), (27386, 12)] {
+            let line = format!(
+                r#"{{"type":"stream_event","event":{{"type":"message_delta","delta":{{"stop_reason":"tool_use"}},"usage":{{"input_tokens":2,"cache_creation_input_tokens":79,"cache_read_input_tokens":{cr},"output_tokens":5,"output_tokens_details":{{"thinking_tokens":{think}}}}}}}}}"#
+            );
+            a.parse_chunk(format!("{line}\n").as_bytes());
+        }
+        let result = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":8,"cache_creation_input_tokens":11972,"#,
+            r#""cache_read_input_tokens":95709,"output_tokens":285}}"#,
+            "\n"
+        );
+        let b = a
+            .parse_chunk(result.as_bytes())
+            .into_iter()
+            .find_map(|e| match e {
+                SessionEvent::UsageDelta { breakdown, .. } => Some(breakdown),
+                _ => None,
+            })
+            .expect("result emits a UsageDelta");
+        assert_eq!(b.cached_read_tokens, 95_709, "per-turn cache reads");
+        assert_eq!(b.cached_write_tokens, 11_972, "per-turn cache writes");
+        assert_eq!(b.thought_tokens, 72, "thinking summed across the turn's calls");
+
+        // The accumulator resets, or the next turn would inherit this turn's total.
+        let next = a
+            .parse_chunk(result.as_bytes())
+            .into_iter()
+            .find_map(|e| match e {
+                SessionEvent::UsageDelta { breakdown, .. } => Some(breakdown),
+                _ => None,
+            })
+            .expect("second result emits a UsageDelta");
+        assert_eq!(next.thought_tokens, 0, "thinking must not carry into the next turn");
     }
 
     /// Without any streamed `message_delta` the aggregate is the only figure

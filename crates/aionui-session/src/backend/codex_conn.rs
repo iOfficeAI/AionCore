@@ -2827,6 +2827,14 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
         total_tokens: g("totalTokens"),
         cost_usd: None,
         context_window: usage.get("modelContextWindow").and_then(Value::as_u64),
+        // Per-turn detail line. codex reports every field natively on `last`
+        // (verified: TokenUsageBreakdown in the generated schema), including the
+        // reasoning tokens claude only exposes per-call.
+        breakdown: crate::event::UsageBreakdown {
+            cached_read_tokens: g("cachedInputTokens"),
+            cached_write_tokens: g("cacheWriteInputTokens"),
+            thought_tokens: g("reasoningOutputTokens"),
+        },
     }]
 }
 
@@ -2860,10 +2868,31 @@ mod usage_window_tests {
                     total_tokens: 11030,
                     context_window: Some(258_400),
                     cost_usd: None,
+                    ..
                 }]
             ),
             "expected last-based occupancy + window, got {events:?}"
         );
+    }
+
+    /// codex reports the whole detail line natively on `last`, including the
+    /// reasoning tokens claude only exposes per-call. Values from the live two-turn
+    /// probe (turn 2).
+    #[test]
+    fn breakdown_comes_straight_off_last() {
+        let params: Value = serde_json::from_str(
+            r#"{"tokenUsage":{"modelContextWindow":258400,
+                 "last":{"totalTokens":11030,"inputTokens":11024,"cachedInputTokens":11006,
+                         "cacheWriteInputTokens":16,"outputTokens":6,"reasoningOutputTokens":242}}}"#,
+        )
+        .unwrap();
+        let b = match map_usage(&params).into_iter().next() {
+            Some(SessionEvent::UsageDelta { breakdown, .. }) => breakdown,
+            other => panic!("expected UsageDelta, got {other:?}"),
+        };
+        assert_eq!(b.cached_read_tokens, 11_006);
+        assert_eq!(b.cached_write_tokens, 16);
+        assert_eq!(b.thought_tokens, 242, "reasoningOutputTokens is the thinking count");
     }
 
     /// `modelContextWindow` is `int|null` in the schema — a null (or absent) field

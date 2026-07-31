@@ -65,6 +65,7 @@ pub use capability::{
     SlashCommandInfo, block_kind_name,
 };
 pub use error::SessionError;
+pub use event::UsageBreakdown;
 pub use event::{
     CancelReason, CheckpointEntry, EventClass, ExitStatusLite, FinalizedMessage, ItemKind, NoticeLevel, Outcome,
     PermissionKind, PersistTier, PlanEntry, PlanPriority, PlanStatus, ProvisioningPhase, SessionEvent, StopReason,

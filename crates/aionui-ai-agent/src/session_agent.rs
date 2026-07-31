@@ -2382,8 +2382,8 @@ async fn persist_side_effects(
         // AFTER the relay has already broken on Finish.
         _ => {}
     }
-    if let Some((used, cost_usd, context_window)) = informative_usage(event) {
-        persist_context_usage(repo, user_id, conversation_id, used, cost_usd, context_window).await;
+    if let Some(usage) = informative_usage(event) {
+        persist_context_usage(repo, user_id, conversation_id, usage).await;
     }
 }
 
@@ -2413,14 +2413,9 @@ async fn persist_side_effects(
 /// 27_238, not `post_tokens`' 2_065. `post_tokens` counts only the compacted
 /// transcript while `usage` also carries the system prompt and tool definitions
 /// (~25k here). Different baselines; mixing them would understate occupancy ~13x.
-fn informative_usage(event: &SessionEvent) -> Option<(u64, Option<f64>, Option<u64>)> {
+fn informative_usage(event: &SessionEvent) -> Option<&SessionEvent> {
     match event {
-        SessionEvent::UsageDelta {
-            total_tokens,
-            cost_usd,
-            context_window,
-            ..
-        } if *total_tokens > 0 => Some((*total_tokens, *cost_usd, *context_window)),
+        SessionEvent::UsageDelta { total_tokens, .. } if *total_tokens > 0 => Some(event),
         // Discarding is silent otherwise, which makes "the indicator is stuck on an
         // old number" undiagnosable from logs. One line per no-op turn is cheap.
         SessionEvent::UsageDelta { .. } => {
@@ -2487,10 +2482,20 @@ async fn persist_context_usage(
     repo: &dyn IAcpSessionRepository,
     user_id: &str,
     conversation_id: &str,
-    used: u64,
-    cost_usd: Option<f64>,
-    context_window: Option<u64>,
+    event: &SessionEvent,
 ) {
+    let SessionEvent::UsageDelta {
+        input_tokens,
+        output_tokens,
+        total_tokens: used,
+        cost_usd,
+        context_window,
+        breakdown,
+    } = event
+    else {
+        return;
+    };
+    let (used, cost_usd, context_window) = (*used, *cost_usd, *context_window);
     let mut usage = match repo.load_runtime_state_for_user(user_id, conversation_id).await {
         Ok(Some(state)) => state
             .context_usage_json
@@ -2510,6 +2515,21 @@ async fn persist_context_usage(
     }
     if let Some(cost) = cost_usd {
         usage.insert("cost".into(), serde_json::json!({ "amount": cost, "currency": "USD" }));
+    }
+    // The detail line must survive a reload too — the renderer reads `_meta` off
+    // the GET /usage snapshot exactly as it does off a live frame. Merged like
+    // `size`/`cost`: only replaced when the incoming turn actually reported one.
+    if !breakdown.is_empty() {
+        usage.insert(
+            "_meta".into(),
+            serde_json::json!({
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cached_read_tokens": breakdown.cached_read_tokens,
+                "cached_write_tokens": breakdown.cached_write_tokens,
+                "thought_tokens": breakdown.thought_tokens,
+            }),
+        );
     }
     let json = match serde_json::to_string(&usage) {
         Ok(j) => j,
@@ -2889,6 +2909,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             total_tokens,
             cost_usd,
             context_window,
+            breakdown,
         } => {
             // The frontend ContextUsageIndicator reads `used` (tokens consumed) and,
             // optionally, `size` (context window) + `cost` — the exact shape the ACP
@@ -2908,6 +2929,20 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             let mut usage = serde_json::json!({ "used": total_tokens });
             if let Some(size) = context_window {
                 usage["size"] = serde_json::json!(size);
+            }
+            // Per-turn detail line ("input · output · cache read · thinking").
+            // The renderer reads these five keys out of `_meta` (AionUi
+            // useAcpMessage.ts `BREAKDOWN_KEYS`) and drops the line when none are
+            // present — so a backend that reports nothing simply has no line,
+            // rather than a row of zeros.
+            if !breakdown.is_empty() {
+                usage["_meta"] = serde_json::json!({
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cached_read_tokens": breakdown.cached_read_tokens,
+                    "cached_write_tokens": breakdown.cached_write_tokens,
+                    "thought_tokens": breakdown.thought_tokens,
+                });
             }
             if let Some(cost) = cost_usd {
                 usage["cost"] = serde_json::json!({ "amount": cost, "currency": "USD" });
@@ -3416,6 +3451,7 @@ mod translate_tests {
                 total_tokens: total,
                 cost_usd: cost,
                 context_window: window,
+                breakdown: Default::default(),
             },
             "conv-1",
             false,
@@ -3436,6 +3472,44 @@ mod translate_tests {
         assert_eq!(v["size"], 1_000_000);
         assert_eq!(v["cost"]["amount"], 0.117);
         assert_eq!(v["cost"]["currency"], "USD");
+    }
+
+    /// The detail line rides `_meta` under the five key names the renderer reads
+    /// (AionUi `BREAKDOWN_KEYS`). A backend that reports nothing must emit NO
+    /// `_meta` at all, so the renderer omits the line instead of drawing zeros.
+    #[test]
+    fn breakdown_rides_meta_under_the_renderer_key_names() {
+        let with = translate_event(
+            SessionEvent::UsageDelta {
+                input_tokens: 1_100,
+                output_tokens: 194,
+                total_tokens: 18_400,
+                cost_usd: None,
+                context_window: Some(256_000),
+                breakdown: aionui_session::UsageBreakdown {
+                    cached_read_tokens: 16_900,
+                    cached_write_tokens: 79,
+                    thought_tokens: 242,
+                },
+            },
+            "conv-1",
+            false,
+        );
+        let v = match with.into_iter().next() {
+            Some(AgentStreamEvent::AcpContextUsage(v)) => v,
+            other => panic!("expected AcpContextUsage, got {other:?}"),
+        };
+        assert_eq!(v["_meta"]["input_tokens"], 1_100);
+        assert_eq!(v["_meta"]["output_tokens"], 194);
+        assert_eq!(v["_meta"]["cached_read_tokens"], 16_900);
+        assert_eq!(v["_meta"]["cached_write_tokens"], 79);
+        assert_eq!(v["_meta"]["thought_tokens"], 242);
+
+        let without = usage_frame(18_400, None, Some(256_000));
+        assert!(
+            without.get("_meta").is_none(),
+            "an empty breakdown must emit no `_meta`, got {without}"
+        );
     }
 
     /// No window reported (codex `modelContextWindow: null`) → NO `size` key at
@@ -3619,6 +3693,7 @@ mod translate_tests {
                 total_tokens: 30,
                 cost_usd: Some(0.5),
                 context_window: None,
+                breakdown: Default::default(),
             },
             "conv-1",
             false,
@@ -4030,6 +4105,7 @@ mod persist_tests {
             total_tokens: total,
             cost_usd: cost,
             context_window: window,
+            breakdown: Default::default(),
         }
     }
 
@@ -4172,11 +4248,11 @@ mod persist_tests {
     /// never be pushed to the UI without also being stored.
     #[test]
     fn informative_usage_gates_zero_reports_only() {
-        assert!(informative_usage(&usage(0, Some(1.0), Some(200_000))).is_none());
-        assert_eq!(
-            informative_usage(&usage(11_030, None, Some(258_400))),
-            Some((11_030, None, Some(258_400)))
+        assert!(
+            informative_usage(&usage(0, Some(1.0), Some(200_000))).is_none(),
+            "a zero-token report says nothing about occupancy"
         );
+        assert!(informative_usage(&usage(11_030, None, Some(258_400))).is_some());
     }
 
     /// Defect 3: after a conversation switch the task is rebuilt with no in-memory
