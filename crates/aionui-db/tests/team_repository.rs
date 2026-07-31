@@ -1144,9 +1144,15 @@ async fn paged_tasks_rejects_cross_user() {
 async fn list_tasks_by_ids_returns_only_requested() {
     let (repo, _db) = repo().await;
     repo.create_team(&make_team("t1", "Team")).await.unwrap();
-    repo.create_task(DEFAULT_USER_ID, &make_task("k1", "t1", "A")).await.unwrap();
-    repo.create_task(DEFAULT_USER_ID, &make_task("k2", "t1", "B")).await.unwrap();
-    repo.create_task(DEFAULT_USER_ID, &make_task("k3", "t1", "C")).await.unwrap();
+    repo.create_task(DEFAULT_USER_ID, &make_task("k1", "t1", "A"))
+        .await
+        .unwrap();
+    repo.create_task(DEFAULT_USER_ID, &make_task("k2", "t1", "B"))
+        .await
+        .unwrap();
+    repo.create_task(DEFAULT_USER_ID, &make_task("k3", "t1", "C"))
+        .await
+        .unwrap();
 
     let rows = repo
         .list_tasks_by_ids(DEFAULT_USER_ID, "t1", &["k1".into(), "k3".into()])
@@ -1162,10 +1168,17 @@ async fn list_tasks_by_ids_returns_only_requested() {
 async fn list_tasks_by_ids_empty_and_unknown_return_empty() {
     let (repo, _db) = repo().await;
     repo.create_team(&make_team("t1", "Team")).await.unwrap();
-    repo.create_task(DEFAULT_USER_ID, &make_task("k1", "t1", "A")).await.unwrap();
+    repo.create_task(DEFAULT_USER_ID, &make_task("k1", "t1", "A"))
+        .await
+        .unwrap();
 
     // Empty slice must not query and yields nothing.
-    assert!(repo.list_tasks_by_ids(DEFAULT_USER_ID, "t1", &[]).await.unwrap().is_empty());
+    assert!(
+        repo.list_tasks_by_ids(DEFAULT_USER_ID, "t1", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
     // Unknown ids are silently ignored, not an error.
     let rows = repo
         .list_tasks_by_ids(DEFAULT_USER_ID, "t1", &["nope".into()])
@@ -1178,13 +1191,14 @@ async fn list_tasks_by_ids_empty_and_unknown_return_empty() {
 async fn list_tasks_by_ids_enforces_owner_isolation() {
     let (repo, _db) = repo().await;
     // Team owned by user A, with a task.
-    repo.create_team(&make_team_for_user("t1", "user-a", "A team")).await.unwrap();
-    repo.create_task("user-a", &make_task("k1", "t1", "secret")).await.unwrap();
-
-    // User B asks for the same team/id -> nothing leaks.
-    let rows = repo
-        .list_tasks_by_ids("user-b", "t1", &["k1".into()])
+    repo.create_team(&make_team_for_user("t1", "user-a", "A team"))
         .await
         .unwrap();
+    repo.create_task("user-a", &make_task("k1", "t1", "secret"))
+        .await
+        .unwrap();
+
+    // User B asks for the same team/id -> nothing leaks.
+    let rows = repo.list_tasks_by_ids("user-b", "t1", &["k1".into()]).await.unwrap();
     assert!(rows.is_empty());
 }

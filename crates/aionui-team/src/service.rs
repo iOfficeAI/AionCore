@@ -373,7 +373,12 @@ impl TeamSessionService {
         let rows = self.repo.list_tasks_by_ids(user_id, team_id, capped).await?;
         let tasks: Vec<TeamTask> = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
         let responses: Vec<TeamTaskResponse> = tasks.iter().map(task_to_response).collect();
-        info!(kind = "team", team_id, count = responses.len(), "team tasks resolved by ids");
+        info!(
+            kind = "team",
+            team_id,
+            count = responses.len(),
+            "team tasks resolved by ids"
+        );
         Ok(responses)
     }
 
