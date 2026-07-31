@@ -90,7 +90,7 @@ impl AgentSendError {
                 },
             },
             AgentError::Internal(_) => Self::new(
-                "AionUI failed while sending the message",
+                "CSBU WorkMate failed while sending the message",
                 AgentErrorCode::AionuiInternalError,
                 AgentErrorOwnership::Aionui,
                 Some(detail),
@@ -102,7 +102,7 @@ impl AgentSendError {
                 ),
             ),
             AgentError::Forbidden(_) => Self::new(
-                "AionUI blocked the request before it reached the Agent",
+                "CSBU WorkMate blocked the request before it reached the Agent",
                 AgentErrorCode::AionuiPermissionError,
                 AgentErrorOwnership::Aionui,
                 Some(detail),
@@ -343,7 +343,7 @@ impl AgentSendError {
                 None,
             ),
             AcpError::NotConnected => Self::new(
-                "AionUI lost its Agent protocol connection",
+                "CSBU WorkMate lost its Agent protocol connection",
                 AgentErrorCode::UserAgentDisconnected,
                 AgentErrorOwnership::UserAgent,
                 Some(detail),

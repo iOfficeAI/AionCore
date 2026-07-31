@@ -68,7 +68,7 @@ fn doctor_registry_hydrate_error() -> CliBoundaryError {
 
 fn print_environment(merged_path: &str, data_dir: &Path) {
     let path_segments = merged_path.split(if cfg!(windows) { ';' } else { ':' }).count();
-    println!("AionUi backend doctor — agent CLI detection self-check");
+    println!("CSBU WorkMate backend doctor — agent CLI detection self-check");
     println!("  data-dir       : {}", data_dir.display());
     println!("  PATH segments  : {path_segments}");
     println!("  PATH length    : {}", merged_path.len());

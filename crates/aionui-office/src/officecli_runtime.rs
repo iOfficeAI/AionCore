@@ -5,17 +5,9 @@ use std::path::PathBuf;
 
 use aionui_runtime::resolve_command_path;
 
-// The mirror serves the same install scripts and release assets as GitHub
-// (install.sh itself already downloads assets mirror-first). Fetching the
-// script must follow the same order: raw.githubusercontent.com is unreachable
-// from many server deployments (aionui#3212 follow-up).
-pub(crate) const OFFICECLI_INSTALL_SH_MIRROR_URL: &str = "https://d.officecli.ai/install.sh";
-pub(crate) const OFFICECLI_INSTALL_PS1_MIRROR_URL: &str = "https://d.officecli.ai/install.ps1";
-pub(crate) const OFFICECLI_INSTALL_SH_URL: &str =
-    "https://raw.githubusercontent.com/iOfficeAI/OfficeCli/main/install.sh";
-pub(crate) const OFFICECLI_INSTALL_PS1_URL: &str =
-    "https://raw.githubusercontent.com/iOfficeAI/OfficeCli/main/install.ps1";
-pub(crate) const OFFICECLI_LATEST_RELEASE_URL: &str = "https://github.com/iOfficeAI/OfficeCli/releases/latest";
+pub(crate) const OFFICECLI_INSTALL_SH_URL: &str = "https://raw.githubusercontent.com/suoak/OfficeCLI/main/install.sh";
+pub(crate) const OFFICECLI_INSTALL_PS1_URL: &str = "https://raw.githubusercontent.com/suoak/OfficeCLI/main/install.ps1";
+pub(crate) const OFFICECLI_LATEST_RELEASE_URL: &str = "https://github.com/suoak/OfficeCLI/releases/latest";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OfficecliInstallPlatform {
@@ -51,7 +43,7 @@ pub(crate) fn install_command_for_platform(platform: OfficecliInstallPlatform) -
                 OsString::from("Bypass"),
                 OsString::from("-Command"),
                 OsString::from(format!(
-                    "$ErrorActionPreference='Stop'; try {{ $s = irm {OFFICECLI_INSTALL_PS1_MIRROR_URL} }} catch {{ $s = irm {OFFICECLI_INSTALL_PS1_URL} }}; iex $s"
+                    "$ErrorActionPreference='Stop'; irm {OFFICECLI_INSTALL_PS1_URL} | iex"
                 )),
             ],
         },
@@ -59,12 +51,7 @@ pub(crate) fn install_command_for_platform(platform: OfficecliInstallPlatform) -
             program: OsString::from("bash"),
             args: vec![
                 OsString::from("-lc"),
-                // Download to a temp file rather than piping: a connection
-                // dropped mid-stream would otherwise let the fallback output
-                // concatenate after a partial script.
-                OsString::from(format!(
-                    "f=$(mktemp) || exit 1; (curl -fsSL {OFFICECLI_INSTALL_SH_MIRROR_URL} -o \"$f\" || curl -fsSL {OFFICECLI_INSTALL_SH_URL} -o \"$f\") && bash \"$f\"; s=$?; rm -f \"$f\"; exit $s"
-                )),
+                OsString::from(format!("curl -fsSL {OFFICECLI_INSTALL_SH_URL} | bash")),
             ],
         },
     }
@@ -169,41 +156,15 @@ mod tests {
     }
 
     #[test]
-    fn official_installer_commands_use_official_officecli_channel() {
+    fn installer_commands_use_branded_officecli_fork() {
         let unix = install_command_for_test(OfficecliInstallPlatform::Unix);
         let windows = install_command_for_test(OfficecliInstallPlatform::Windows);
         let unix_text = format!("{:?} {:?}", unix.program, unix.args);
         let windows_text = format!("{:?} {:?}", windows.program, windows.args);
 
-        assert!(unix_text.contains("iOfficeAI/OfficeCli/main/install.sh"));
-        assert!(windows_text.contains("iOfficeAI/OfficeCli/main/install.ps1"));
-    }
-
-    // Servers that cannot reach raw.githubusercontent.com (the common case on
-    // mainland-China clouds, see aionui#3212 follow-up) must still be able to
-    // fetch the installer: the official mirror comes first, GitHub is the
-    // fallback.
-    #[test]
-    fn installer_commands_try_mirror_before_github() {
-        let unix = install_command_for_test(OfficecliInstallPlatform::Unix);
-        let windows = install_command_for_test(OfficecliInstallPlatform::Windows);
-        let unix_text = format!("{:?} {:?}", unix.program, unix.args);
-        let windows_text = format!("{:?} {:?}", windows.program, windows.args);
-
-        let unix_mirror = unix_text.find("https://d.officecli.ai/install.sh");
-        let unix_github = unix_text.find("iOfficeAI/OfficeCli/main/install.sh");
-        assert!(unix_mirror.is_some(), "unix installer must include the mirror URL");
-        assert!(unix_mirror < unix_github, "unix installer must try the mirror first");
-
-        let windows_mirror = windows_text.find("https://d.officecli.ai/install.ps1");
-        let windows_github = windows_text.find("iOfficeAI/OfficeCli/main/install.ps1");
-        assert!(
-            windows_mirror.is_some(),
-            "windows installer must include the mirror URL"
-        );
-        assert!(
-            windows_mirror < windows_github,
-            "windows installer must try the mirror first"
-        );
+        assert!(unix_text.contains("suoak/OfficeCLI/main/install.sh"));
+        assert!(windows_text.contains("suoak/OfficeCLI/main/install.ps1"));
+        assert!(!unix_text.contains("d.officecli.ai"));
+        assert!(!windows_text.contains("d.officecli.ai"));
     }
 }

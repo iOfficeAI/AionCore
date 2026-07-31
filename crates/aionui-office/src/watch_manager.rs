@@ -419,7 +419,7 @@ impl ProcessSpawner for DefaultProcessSpawner {
         let command = install_command();
         tracing::info!(
             platform = std::env::consts::OS,
-            "installing officecli via official iOfficeAI/OfficeCli installer"
+            "installing officecli via suoak/OfficeCLI installer"
         );
 
         let mut builder = CmdBuilder::clean_cli(&command.program);

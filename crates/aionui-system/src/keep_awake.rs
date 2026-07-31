@@ -87,7 +87,7 @@ fn spawn_keep_awake_process() -> Result<tokio::process::Child, SystemError> {
     command
         .args([
             "--what=sleep",
-            "--why=AionUi scheduled tasks keep-awake is enabled",
+            "--why=CSBU WorkMate scheduled tasks keep-awake is enabled",
             "--mode=block",
             "sleep",
             "infinity",

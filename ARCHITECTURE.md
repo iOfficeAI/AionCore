@@ -1,7 +1,7 @@
 # Architecture
 
-AionCore is the backend server for AionUi, built with Rust (Axum + Tokio + SQLite).
-It provides HTTP REST APIs and WebSocket real-time events for the AionUi desktop client.
+AionCore is the backend server for CSBU WorkMate, built with Rust (Axum + Tokio + SQLite).
+It provides HTTP REST APIs and WebSocket real-time events for the CSBU WorkMate desktop client.
 
 ## Tech Stack
 

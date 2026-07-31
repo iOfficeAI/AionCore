@@ -113,11 +113,11 @@ mod tests {
     fn test_update_check_request_with_options() {
         let raw = json!({
             "include_prerelease": true,
-            "repo": "iOfficeAI/AionUi"
+            "repo": "suoak/AionUi"
         });
         let req: UpdateCheckRequest = serde_json::from_value(raw).unwrap();
         assert!(req.include_prerelease);
-        assert_eq!(req.repo.as_deref(), Some("iOfficeAI/AionUi"));
+        assert_eq!(req.repo.as_deref(), Some("suoak/AionUi"));
     }
 
     // -- UpdateCheckResult --
@@ -145,7 +145,7 @@ mod tests {
                 version: "2.0.0".into(),
                 name: Some("Version 2.0.0".into()),
                 body: Some("Major release".into()),
-                html_url: "https://github.com/iOfficeAI/AionUi/releases/tag/v2.0.0".into(),
+                html_url: "https://github.com/suoak/AionUi/releases/tag/v2.0.0".into(),
                 published_at: Some("2026-04-01T00:00:00Z".into()),
                 prerelease: false,
                 draft: false,

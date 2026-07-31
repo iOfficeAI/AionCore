@@ -193,7 +193,12 @@ impl BuiltinAssistantRegistry {
     /// when the assistant has no declared rule or the file is missing.
     pub fn rule_bytes(&self, id: &str, locale: &str) -> Option<Vec<u8>> {
         let rel = self.assistants.get(id)?.rule_file.as_ref()?;
-        self.read_asset(&rel.replace("{locale}", locale))
+        let bytes = self.read_asset(&rel.replace("{locale}", locale))?;
+        Some(if matches!(&self.source, Source::Embedded) {
+            brand_asset_bytes(bytes)
+        } else {
+            bytes
+        })
     }
 
     /// Read the avatar asset for a built-in assistant along with its
@@ -236,11 +241,52 @@ impl Default for BuiltinAssistantRegistry {
 
 fn parse_manifest_bytes(bytes: &[u8]) -> HashMap<String, BuiltinAssistant> {
     match serde_json::from_slice::<Value>(bytes).and_then(parse_manifest_value) {
-        Ok(m) => m.assistants.into_iter().map(|a| (a.id.clone(), a)).collect(),
+        Ok(mut manifest) => {
+            manifest.assistants.iter_mut().for_each(brand_assistant);
+            manifest.assistants.into_iter().map(|a| (a.id.clone(), a)).collect()
+        }
         Err(e) => {
             error!("Embedded built-in manifest parse failed: {e}");
             HashMap::new()
         }
+    }
+}
+
+fn brand_text(value: &str) -> String {
+    value
+        .replace("AionUI", "CSBU WorkMate")
+        .replace("AionUi", "CSBU WorkMate")
+        .replace("Aion UI", "CSBU WorkMate")
+}
+
+fn brand_assistant(assistant: &mut BuiltinAssistant) {
+    assistant.name = brand_text(&assistant.name);
+    assistant
+        .name_i18n
+        .values_mut()
+        .for_each(|value| *value = brand_text(value));
+    if let Some(description) = &mut assistant.description {
+        *description = brand_text(description);
+    }
+    assistant
+        .description_i18n
+        .values_mut()
+        .for_each(|value| *value = brand_text(value));
+    assistant
+        .prompts
+        .iter_mut()
+        .for_each(|value| *value = brand_text(value));
+    assistant
+        .prompts_i18n
+        .values_mut()
+        .flatten()
+        .for_each(|value| *value = brand_text(value));
+}
+
+fn brand_asset_bytes(bytes: Vec<u8>) -> Vec<u8> {
+    match String::from_utf8(bytes) {
+        Ok(content) => brand_text(&content).into_bytes(),
+        Err(error) => error.into_bytes(),
     }
 }
 
@@ -309,6 +355,21 @@ mod tests {
         assert!(!bytes.is_empty());
         let text = std::str::from_utf8(&bytes).expect("rule file should be valid utf-8");
         assert!(text.len() > 100, "rule file should have real content");
+    }
+
+    #[test]
+    fn embedded_butler_uses_csbu_workmate_branding() {
+        let reg = BuiltinAssistantRegistry::load_embedded();
+        let butler = reg.get("aionui-assistant").expect("embedded butler should exist");
+        assert!(butler.name.contains("CSBU WorkMate"));
+        assert!(!butler.name.contains("AionUi"));
+
+        let rule = reg
+            .rule_bytes("aionui-assistant", "en-US")
+            .expect("embedded butler rule should exist");
+        let rule = String::from_utf8(rule).expect("embedded butler rule should be UTF-8");
+        assert!(rule.contains("CSBU WorkMate"));
+        assert!(!rule.contains("AionUi"));
     }
 
     #[test]

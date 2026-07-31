@@ -475,16 +475,16 @@ fn command_not_found_message(command: &str) -> String {
             "Command not found: {command}. AionCore usually provisions its managed Node runtime automatically. Retry the connection test, check backend logs if it still fails, or configure this MCP server to use an absolute command path."
         ),
         "bun" => format!(
-            "Command not found: {command}. Install Bun (which includes bun/bunx), then restart AionUI or configure this MCP server to use an absolute command path."
+            "Command not found: {command}. Install Bun (which includes bun/bunx), then restart CSBU WorkMate or configure this MCP server to use an absolute command path."
         ),
         "uv" => format!(
-            "Command not found: {command}. Install uv, then restart AionUI or configure this MCP server to use an absolute command path."
+            "Command not found: {command}. Install uv, then restart CSBU WorkMate or configure this MCP server to use an absolute command path."
         ),
         "python" => format!(
-            "Command not found: {command}. Install Python, then restart AionUI or configure this MCP server to use an absolute command path."
+            "Command not found: {command}. Install Python, then restart CSBU WorkMate or configure this MCP server to use an absolute command path."
         ),
         "deno" => format!(
-            "Command not found: {command}. Install Deno, then restart AionUI or configure this MCP server to use an absolute command path."
+            "Command not found: {command}. Install Deno, then restart CSBU WorkMate or configure this MCP server to use an absolute command path."
         ),
         _ => format!(
             "Command not found: {command}. Install the command or configure this MCP server to use an absolute command path."

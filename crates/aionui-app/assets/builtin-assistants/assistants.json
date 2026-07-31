@@ -1090,19 +1090,19 @@
       "id": "aionui-assistant",
       "sort_order": 0,
       "default_enabled": true,
-      "name": "AionUi Butler",
+      "name": "CSBU WorkMate Butler",
       "name_i18n": {
-        "en-US": "AionUi Butler",
-        "zh-CN": "AionUi管家",
-        "ru-RU": "Дворецкий AionUi",
-        "uk-UA": "Дворецький AionUi"
+        "en-US": "CSBU WorkMate Butler",
+        "zh-CN": "CSBU WorkMate 管家",
+        "ru-RU": "Дворецкий CSBU WorkMate",
+        "uk-UA": "Дворецький CSBU WorkMate"
       },
-      "description": "Your all-in-one AionUi butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach AionUi from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
+      "description": "Your all-in-one CSBU WorkMate butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach CSBU WorkMate from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
       "description_i18n": {
-        "en-US": "Your all-in-one AionUi butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach AionUi from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
-        "zh-CN": "你的 AionUi 全能管家：配置助手、技能、MCP 服务器与 LLM 模型；设置远程访问，让你在手机或外网也能打开 AionUi、生成分享链接；还能诊断卡住的会话、失败的模型调用，或定时任务为何没执行。",
-        "ru-RU": "Ваш универсальный дворецкий AionUi: настройка ассистентов, навыков, серверов MCP и провайдеров LLM; настройка удалённого доступа, чтобы открывать AionUi с телефона или делиться ссылкой; и диагностика проблем — зависших разговоров, сбоев моделей или почему не выполнилась запланированная задача.",
-        "uk-UA": "Ваш універсальний дворецький AionUi: налаштування асистентів, навичок, серверів MCP і провайдерів LLM; налаштування віддаленого доступу, щоб відкривати AionUi з телефона або ділитися посиланням; і діагностика проблем — зависань розмов, збоїв моделей або чому не виконалося заплановане завдання."
+        "en-US": "Your all-in-one CSBU WorkMate butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach CSBU WorkMate from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
+        "zh-CN": "你的 CSBU WorkMate 全能管家：配置助手、技能、MCP 服务器与 LLM 模型；设置远程访问，让你在手机或外网也能打开 CSBU WorkMate、生成分享链接；还能诊断卡住的会话、失败的模型调用，或定时任务为何没执行。",
+        "ru-RU": "Ваш универсальный дворецкий CSBU WorkMate: настройка ассистентов, навыков, серверов MCP и провайдеров LLM; настройка удалённого доступа, чтобы открывать CSBU WorkMate с телефона или делиться ссылкой; и диагностика проблем — зависших разговоров, сбоев моделей или почему не выполнилась запланированная задача.",
+        "uk-UA": "Ваш універсальний дворецький CSBU WorkMate: налаштування асистентів, навичок, серверів MCP і провайдерів LLM; налаштування віддаленого доступу, щоб відкривати CSBU WorkMate з телефона або ділитися посиланням; і діагностика проблем — зависань розмов, збоїв моделей або чому не виконалося заплановане завдання."
       },
       "avatar": "avatars/aionui-assistant.jpg",
       "agent_ref": "aionrs",
@@ -1116,32 +1116,32 @@
       "rule_file": "rules/aionui-assistant.{locale}.md",
       "prompts": [
         "Add a new LLM provider and API key, then set it as the default model",
-        "Set up remote access for me, so I can open AionUi from my phone when I'm out",
+        "Set up remote access for me, so I can open CSBU WorkMate from my phone when I'm out",
         "A conversation is stuck — please diagnose what's wrong",
         "Create a new assistant and attach a skill to it"
       ],
       "prompts_i18n": {
         "en-US": [
           "Add a new LLM provider and API key, then set it as the default model",
-          "Set up remote access for me, so I can open AionUi from my phone when I'm out",
+          "Set up remote access for me, so I can open CSBU WorkMate from my phone when I'm out",
           "A conversation is stuck — please diagnose what's wrong",
           "Create a new assistant and attach a skill to it"
         ],
         "zh-CN": [
           "添加一个新的 LLM 模型和 API Key，并设为默认模型",
-          "帮我配置远程访问，让我在外面用手机也能打开 AionUi",
+          "帮我配置远程访问，让我在外面用手机也能打开 CSBU WorkMate",
           "有个会话卡住了，帮我诊断哪里出了问题",
           "创建一个新助手，并给它绑定一个技能"
         ],
         "ru-RU": [
           "Добавь нового провайдера LLM и API-ключ, затем сделай его моделью по умолчанию",
-          "Настрой удалённый доступ, чтобы я мог открывать AionUi с телефона, когда меня нет",
+          "Настрой удалённый доступ, чтобы я мог открывать CSBU WorkMate с телефона, когда меня нет",
           "Разговор завис — пожалуйста, диагностируй, что не так",
           "Создай нового ассистента и подключи к нему навык"
         ],
         "uk-UA": [
           "Додай нового провайдера LLM та API-ключ, потім зроби його моделлю за замовчуванням",
-          "Налаштуй віддалений доступ, щоб я міг відкривати AionUi з телефона, коли мене немає",
+          "Налаштуй віддалений доступ, щоб я міг відкривати CSBU WorkMate з телефона, коли мене немає",
           "Розмова зависла — будь ласка, діагностуй, що не так",
           "Створи нового асистента й підключи до нього навичку"
         ]
