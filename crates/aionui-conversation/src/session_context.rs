@@ -202,6 +202,13 @@ impl<'a> SessionContextBuilder<'a> {
             AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(
                 row, extra, team, seed,
             )))),
+            // The Antigravity type exists (catalog + capability surface) but its
+            // runtime is not wired yet — `AgentSessionKind::Antigravity` and
+            // `factory::antigravity` land together in a follow-up. Reject
+            // explicitly rather than falling through to a wrong backend.
+            AgentType::Antigravity => Err(ConversationError::BadRequest {
+                reason: "Antigravity runtime is not wired yet".to_owned(),
+            }),
             AgentType::Gemini
             | AgentType::Codex
             | AgentType::OpenclawGateway

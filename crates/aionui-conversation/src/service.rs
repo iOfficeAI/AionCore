@@ -1031,7 +1031,9 @@ impl ConversationService {
             }
             if !snapshot.rules.content.trim().is_empty() {
                 match effective_type {
-                    AgentType::Acp => {
+                    // Antigravity joins ACP here: both carry rules through the
+                    // session-init `preset_context` surface.
+                    AgentType::Acp | AgentType::Antigravity => {
                         obj.insert(
                             "preset_context".to_owned(),
                             serde_json::Value::String(snapshot.rules.content.clone()),
