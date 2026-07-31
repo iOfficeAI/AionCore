@@ -866,7 +866,9 @@ impl ITeamRepository for FullMockTeamRepo {
         direction: PageDirection,
         limit: i64,
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-        self.inner.list_messages_by_team_paged(team_id, cursor, direction, limit).await
+        self.inner
+            .list_messages_by_team_paged(team_id, cursor, direction, limit)
+            .await
     }
     async fn list_messages_by_ids(&self, ids: &[String]) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
         self.inner.list_messages_by_ids(ids).await
@@ -906,7 +908,9 @@ impl ITeamRepository for FullMockTeamRepo {
         direction: PageDirection,
         limit: i64,
     ) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
-        self.inner.list_tasks_paged(user_id, team_id, cursor, direction, limit).await
+        self.inner
+            .list_tasks_paged(user_id, team_id, cursor, direction, limit)
+            .await
     }
     async fn append_to_blocks(
         &self,
@@ -7474,7 +7478,10 @@ async fn activity_all_merges_and_orders_desc_with_cursor() {
             .unwrap();
     }
     for (id, ts) in [("k1", 2000), ("k2", 4000)] {
-        team_repo.create_task("user1", &activity_task_row(id, "t1", ts)).await.unwrap();
+        team_repo
+            .create_task("user1", &activity_task_row(id, "t1", ts))
+            .await
+            .unwrap();
     }
 
     let page = svc
@@ -7501,7 +7508,10 @@ async fn activity_all_merges_and_orders_desc_with_cursor() {
         .list_team_activity(
             "user1",
             "t1",
-            Some(aionui_db::ActivityCursor { created_at: c.ts, id: c.id }),
+            Some(aionui_db::ActivityCursor {
+                created_at: c.ts,
+                id: c.id,
+            }),
             aionui_db::PageDirection::Desc,
             aionui_team::ActivityKind::All,
             3,
@@ -7523,7 +7533,10 @@ async fn activity_kind_task_only_paginates_tasks() {
         .write_message("user1", &activity_message_row("m1", "t1", 5000))
         .await
         .unwrap();
-    team_repo.create_task("user1", &activity_task_row("k1", "t1", 1000)).await.unwrap();
+    team_repo
+        .create_task("user1", &activity_task_row("k1", "t1", 1000))
+        .await
+        .unwrap();
 
     let page = svc
         .list_team_activity(

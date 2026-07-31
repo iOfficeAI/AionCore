@@ -133,12 +133,14 @@ impl ITeamRepository for MockTeamRepo {
         limit: i64,
     ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let state = self.state.lock().unwrap();
-        let mut msgs: Vec<MailboxMessageRow> =
-            state.messages.iter().filter(|m| m.team_id == team_id).cloned().collect();
+        let mut msgs: Vec<MailboxMessageRow> = state
+            .messages
+            .iter()
+            .filter(|m| m.team_id == team_id)
+            .cloned()
+            .collect();
         match direction {
-            PageDirection::Desc => {
-                msgs.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)))
-            }
+            PageDirection::Desc => msgs.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id))),
             PageDirection::Asc => msgs.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id))),
         }
         if let Some(c) = cursor {
@@ -235,9 +237,7 @@ impl ITeamRepository for MockTeamRepo {
         let state = self.state.lock().unwrap();
         let mut tasks: Vec<TeamTaskRow> = state.tasks.iter().filter(|t| t.team_id == team_id).cloned().collect();
         match direction {
-            PageDirection::Desc => {
-                tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)))
-            }
+            PageDirection::Desc => tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id))),
             PageDirection::Asc => tasks.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id))),
         }
         if let Some(c) = cursor {

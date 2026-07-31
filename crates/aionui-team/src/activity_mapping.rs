@@ -3,9 +3,7 @@
 //! Keeps the projection out of `aionui-api-types` (which must not depend on
 //! domain types) and out of the repository layer.
 
-use aionui_api_types::{
-    TeamActivityItemResponse, TeamActivityKind, TeamMailboxMessageResponse, TeamTaskResponse,
-};
+use aionui_api_types::{TeamActivityItemResponse, TeamActivityKind, TeamMailboxMessageResponse, TeamTaskResponse};
 use aionui_db::PageDirection;
 use aionui_db::models::{MailboxMessageRow, TeamTaskRow};
 use tracing::warn;
@@ -92,9 +90,7 @@ pub fn task_row_to_activity_item(row: &TeamTaskRow) -> Option<TeamActivityItemRe
 /// matching the repository `ORDER BY created_at, id` used by the paged queries.
 pub fn sort_activity_items(items: &mut [TeamActivityItemResponse], direction: PageDirection) {
     match direction {
-        PageDirection::Desc => {
-            items.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)))
-        }
+        PageDirection::Desc => items.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id))),
         PageDirection::Asc => items.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id))),
     }
 }

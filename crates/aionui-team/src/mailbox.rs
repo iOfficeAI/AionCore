@@ -223,7 +223,11 @@ mod tests {
 
     fn mailbox_with_events(repo: Arc<MockTeamRepo>) -> (Mailbox, Arc<RecordingBroadcaster>) {
         let bc = Arc::new(RecordingBroadcaster::new());
-        let emitter = Arc::new(TeamEventEmitter::new("t1".into(), "system_default_user".into(), bc.clone()));
+        let emitter = Arc::new(TeamEventEmitter::new(
+            "t1".into(),
+            "system_default_user".into(),
+            bc.clone(),
+        ));
         (Mailbox::new(repo).with_events(emitter), bc)
     }
 
@@ -284,7 +288,10 @@ mod tests {
             .write("t1", "a1", "a2", MailboxMessageType::Message, "m1", None)
             .await
             .unwrap();
-        mailbox.mark_read_batch("t1", &[m.id.clone()]).await.unwrap();
+        mailbox
+            .mark_read_batch("t1", std::slice::from_ref(&m.id))
+            .await
+            .unwrap();
 
         let read_changes: Vec<_> = mailbox_changes(&bc)
             .into_iter()
