@@ -47,6 +47,11 @@ pub struct ClaudeAdapter {
     /// first call of a captured four-call turn. Summed here because the breakdown
     /// is a PER-TURN figure; reset when the `result` frame consumes it.
     turn_thought_tokens: u64,
+    /// The model id claude last announced on `system{subtype:"init"}` — the
+    /// authoritative "what am I running now", re-emitted on model switch and after
+    /// a compaction. Spelled exactly like the `modelUsage` keys
+    /// (`"claude-opus-5"`), so it selects the right entry directly.
+    current_model: Option<String>,
 }
 
 /// Per-message streaming state for `--include-partial-messages`. Reset on each
@@ -310,9 +315,15 @@ impl ClaudeAdapter {
     /// system frames: `init` carries no state signal; `api_retry` and the
     /// compaction milestones normalize to the backend-neutral `Heartbeat`;
     /// anything else is opaque.
-    fn parse_system(&self, v: &Value) -> Vec<SessionEvent> {
+    fn parse_system(&mut self, v: &Value) -> Vec<SessionEvent> {
         match v.get("subtype").and_then(Value::as_str).unwrap_or("") {
-            "init" => Vec::new(),
+            "init" => {
+                // Carries the live model id; latch it for `result_context_window`.
+                if let Some(model) = v.get("model").and_then(Value::as_str) {
+                    self.current_model = Some(model.to_owned());
+                }
+                Vec::new()
+            }
             // network backoff + the no-chunk compaction window both = liveness.
             "api_retry" | "compact_boundary" | "compacting" => vec![SessionEvent::Heartbeat],
             other => vec![SessionEvent::AdapterSpecific {
@@ -595,6 +606,25 @@ impl ClaudeAdapter {
     /// Absent / non-integer → `None`, which renders as a counter with no percentage.
     fn result_context_window(&self, v: &Value) -> Option<u64> {
         let entries = v.get("modelUsage")?.as_object()?;
+        // Prefer the model claude says it is CURRENTLY running. `modelUsage` is
+        // session-CUMULATIVE (live-measured: `cacheReadInputTokens` 18_384 after
+        // turn 1, 44_791 after turn 2), so after a model switch the outgoing
+        // model's accumulated volume still dwarfs the new one's first turn — a
+        // volume ranking would pin the window to the old model forever. That is
+        // exactly the reported bug: switching opus -> haiku kept showing 1M
+        // instead of 200k. `system{subtype:"init"}` announces the live model and
+        // is re-emitted on a switch, spelled identically to these keys.
+        if let Some(current) = self.current_model.as_deref()
+            && let Some(window) = entries
+                .get(current)
+                .and_then(|m| m.get("contextWindow"))
+                .and_then(Value::as_u64)
+        {
+            return Some(window);
+        }
+        // Fallback for a session that never announced a model (or announced one
+        // absent from `modelUsage`): the heaviest entry, cache included, since the
+        // main conversation model is the one carrying the history as cache.
         entries
             .values()
             .filter_map(|m| {
@@ -2165,6 +2195,41 @@ mod tests {
         assert_eq!(total, 27_472);
     }
 
+    /// Switching models must move the window. `modelUsage` is session-CUMULATIVE
+    /// (live-measured: `cacheReadInputTokens` 18_384 after turn 1, 44_791 after
+    /// turn 2), so the model just switched AWAY from keeps the larger volume and a
+    /// volume ranking pins the window to it — the reported bug, where opus -> haiku
+    /// still displayed 1M instead of 200k. `system{subtype:"init"}` announces the
+    /// live model, so that selects the entry.
+    #[test]
+    fn model_switch_moves_the_window_despite_cumulative_model_usage() {
+        let result = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":10,"output_tokens":5},"#,
+            // opus carries the whole accumulated history; haiku has just started.
+            r#""modelUsage":{"claude-opus-5":{"inputTokens":4,"outputTokens":10,"#,
+            r#""cacheReadInputTokens":44791,"contextWindow":1000000},"#,
+            r#""claude-haiku-4-5":{"inputTokens":2,"outputTokens":5,"#,
+            r#""cacheReadInputTokens":120,"contextWindow":200000}}}"#,
+            "\n"
+        );
+        let window_after_init = |model: &str| {
+            let mut a = ClaudeAdapter::new();
+            let init = format!(r#"{{"type":"system","subtype":"init","model":"{model}"}}"#);
+            a.parse_chunk(format!("{init}\n").as_bytes());
+            a.parse_chunk(result.as_bytes()).into_iter().find_map(|e| match e {
+                SessionEvent::UsageDelta { context_window, .. } => Some(context_window),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            window_after_init("claude-haiku-4-5"),
+            Some(Some(200_000)),
+            "after switching to haiku the window must follow, not stay on opus's 1M"
+        );
+        assert_eq!(window_after_init("claude-opus-5"), Some(Some(1_000_000)));
+    }
+
     /// The dominant-model pick must weigh CACHE too. A `modelUsage` entry's
     /// in/out exclude cache, and the main model is the one holding the history as
     /// cache (live-captured: `inputTokens:10, outputTokens:34,
@@ -2397,8 +2462,8 @@ mod tests {
     /// this table pins every documented subtype + the unknown fallthrough.
     #[test]
     fn parse_system_subtypes_map_to_heartbeat_or_opaque() {
-        let a = ClaudeAdapter::new();
-        let sys = |subtype: &str| {
+        let mut a = ClaudeAdapter::new();
+        let mut sys = |subtype: &str| {
             let v = serde_json::json!({ "type": "system", "subtype": subtype });
             a.parse_system(&v)
         };
@@ -2425,7 +2490,7 @@ mod tests {
             }
             other => panic!("expected one AdapterSpecific, got {other:?}"),
         }
-        let no_subtype = a.parse_system(&serde_json::json!({ "type": "system" }));
+        let no_subtype = sys("");
         assert!(
             matches!(no_subtype.as_slice(), [SessionEvent::AdapterSpecific { tag, .. }] if tag == "system/"),
             "absent subtype → opaque `system/` (no panic), got {no_subtype:?}"
