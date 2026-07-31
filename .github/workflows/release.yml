@@ -29,25 +29,31 @@ env:
   CROSS_GIT_REV: "29d00c7803f221f1b3f35e561b03792368fb8339"
   LINUX_X64_GLIBC_MAX: "GLIBC_2.34"
   LINUX_ARM64_GLIBC_MAX: "GLIBC_2.30"
-  RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
-
 jobs:
   prepare-release:
     name: Prepare Release Metadata
     runs-on: ubuntu-latest
     outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
       version: ${{ steps.metadata.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
-
-      - name: Extract version from tag
+      - name: Normalize and validate release tag
         id: metadata
         shell: bash
+        env:
+          RAW_RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
         run: |
-          version="${RELEASE_TAG#v}"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          tag="$(printf '%s' "$RAW_RELEASE_TAG" | xargs)"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid release tag '$RAW_RELEASE_TAG'. Expected a value such as v0.1.55."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ steps.metadata.outputs.tag }}
 
   build:
     name: Build ${{ matrix.target }}
@@ -91,7 +97,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: refs/tags/${{ needs.prepare-release.outputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -198,7 +204,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
           REPOSITORY: ${{ github.repository }}
         run: |
           release_url="https://github.com/${REPOSITORY}/releases/tag/${RELEASE_TAG}"
