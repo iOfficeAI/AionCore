@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.56](https://github.com/iOfficeAI/AionCore/compare/v0.1.55...v0.1.56) (2026-07-31)
+
+
+### Features
+
+* **project:** hide OS-junk and VCS-internal noise from listings ([#727](https://github.com/iOfficeAI/AionCore/issues/727)) ([6197117](https://github.com/iOfficeAI/AionCore/commit/6197117ef09bc0797f5656d3d6c3ec2e40161c09))
+
+
+### Bug Fixes
+
+* **agents:** persist the catalog the availability probe already fetched ([#735](https://github.com/iOfficeAI/AionCore/issues/735)) ([2438095](https://github.com/iOfficeAI/AionCore/commit/24380952e133b38b2f0192d2be09bda1f5306d5a))
+* **ai-agent:** token usage for the direct-CLI backends (claude / codex) ([#733](https://github.com/iOfficeAI/AionCore/issues/733)) ([93a24f4](https://github.com/iOfficeAI/AionCore/commit/93a24f43fcd0f1ecc4528b690d34ba83153f4834))
+* **conversation:** request plaintext thinking from claude, drop blank thought cards ([#731](https://github.com/iOfficeAI/AionCore/issues/731)) ([9cd4fb9](https://github.com/iOfficeAI/AionCore/commit/9cd4fb99648c7d624fa3f897b6291fea51b7c034))
+* **project/monitor:** attribute watched-subdir events to parent so tree reflects dir delete/rename ([#734](https://github.com/iOfficeAI/AionCore/issues/734)) ([8494a1f](https://github.com/iOfficeAI/AionCore/commit/8494a1f95f7c8c08f85b1d30d2d39c99770325a5))
+* **session:** settle cancelled workflows and stop per-turn pump state leaking across turns ([#732](https://github.com/iOfficeAI/AionCore/issues/732)) ([b8a4a88](https://github.com/iOfficeAI/AionCore/commit/b8a4a882f50838d2e26211a2f3f8713a0eded1b9))
+* **team:** derive team capability from probed MCP transports, not a stored veto ([#725](https://github.com/iOfficeAI/AionCore/issues/725)) ([d60fc62](https://github.com/iOfficeAI/AionCore/commit/d60fc6297c3477658f4cdc635f6de7540230d28f))
+
 ## [0.1.55](https://github.com/iOfficeAI/AionCore/compare/v0.1.54...v0.1.55) (2026-07-30)
 
 
