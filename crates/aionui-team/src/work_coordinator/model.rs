@@ -26,6 +26,19 @@ pub(crate) enum RuntimeConstraint {
     SessionStopped,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeRestartGate {
+    pub(crate) operation_id: u64,
+    pub(crate) previous_constraint: RuntimeConstraint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeRestartRejection {
+    Busy,
+    Removing,
+    SessionStopped,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SlotPhase {
     Idle,

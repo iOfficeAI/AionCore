@@ -835,6 +835,63 @@ impl SlotWorkCoordinator {
         }
     }
 
+    /// Atomically blocks new work for a runtime restart.
+    ///
+    /// The active-work check and `Starting` transition share the coordinator
+    /// state lock with [`Self::next`]. Therefore either an existing batch wins
+    /// and the restart is rejected, or the restart gate wins and no new batch
+    /// can be claimed until the runtime becomes ready again.
+    pub(crate) fn begin_runtime_restart(&self, slot_id: &str) -> Result<RuntimeRestartGate, RuntimeRestartRejection> {
+        let mut state = self.lock_state();
+        let slot = state
+            .slots
+            .entry(slot_id.to_owned())
+            .or_insert_with(|| SlotState::new(TeamRunTargetRole::Teammate));
+        if slot.active.is_some() {
+            return Err(RuntimeRestartRejection::Busy);
+        }
+        match slot.runtime_constraint {
+            RuntimeConstraint::Removing { .. } => return Err(RuntimeRestartRejection::Removing),
+            RuntimeConstraint::SessionStopped => return Err(RuntimeRestartRejection::SessionStopped),
+            RuntimeConstraint::Ready | RuntimeConstraint::Starting { .. } | RuntimeConstraint::Failed { .. } => {}
+        }
+        let previous_constraint = slot.runtime_constraint.clone();
+        state.next_operation_id = state.next_operation_id.saturating_add(1);
+        let operation_id = state.next_operation_id;
+        state
+            .slots
+            .get_mut(slot_id)
+            .expect("restart-gated slot exists")
+            .runtime_constraint = RuntimeConstraint::Starting { operation_id };
+        let snapshot = Self::slot_snapshot_locked(&state, slot_id);
+        drop(state);
+        self.publish_slot_work_snapshot(snapshot);
+        Ok(RuntimeRestartGate {
+            operation_id,
+            previous_constraint,
+        })
+    }
+
+    /// Roll back an unused restart gate without overwriting a newer runtime
+    /// transition that may have taken ownership of the slot.
+    pub(crate) fn abort_runtime_restart(&self, slot_id: &str, gate: &RuntimeRestartGate) {
+        let mut state = self.lock_state();
+        let Some(slot) = state.slots.get_mut(slot_id) else {
+            return;
+        };
+        if slot.runtime_constraint
+            != (RuntimeConstraint::Starting {
+                operation_id: gate.operation_id,
+            })
+        {
+            return;
+        }
+        slot.runtime_constraint = gate.previous_constraint.clone();
+        let snapshot = Self::slot_snapshot_locked(&state, slot_id);
+        drop(state);
+        self.publish_slot_work_snapshot(snapshot);
+    }
+
     pub(crate) fn remove_slot(&self, slot_id: &str) -> RemoveWorkResult {
         let mut state = self.lock_state();
         let cancel_target = state

@@ -6396,6 +6396,37 @@ async fn warmup_injects_conversation_runtime_context() {
 }
 
 #[tokio::test]
+async fn warmup_keeps_existing_acp_session_anchor_in_build_options() {
+    let acp_session_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-existing"));
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_session_repo,
+    );
+    let mut request = make_create_req();
+    request.extra = serde_json::json!({
+        "teamId": "team-1",
+        "slot_id": "slot-1",
+        "role": "teammate",
+    });
+    let conv = svc.create("user_1", request).await.unwrap();
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new(&conv.id),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.warmup("user_1", &conv.id, &task_mgr_dyn).await.unwrap();
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 1);
+    match &options[0].context.kind {
+        AgentSessionKind::Acp(context) => {
+            assert_eq!(context.session_id.as_deref(), Some("sess-existing"));
+        }
+        AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+    }
+}
+
+#[tokio::test]
 async fn warmup_injects_runtime_token_for_mcp_team_conversation() {
     let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
     let svc = svc.with_runtime_token_service(Arc::new(RuntimeTokenService::new()));

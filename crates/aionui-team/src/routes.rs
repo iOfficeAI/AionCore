@@ -79,6 +79,20 @@ impl From<TeamError> for ApiError {
                     "reason": public_reason,
                 })),
             ),
+            TeamError::MemberBusy {
+                team_id,
+                slot_id,
+                conversation_id,
+            } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_MEMBER_BUSY",
+                "Team member is busy",
+                Some(serde_json::json!({
+                    "team_id": team_id,
+                    "slot_id": slot_id,
+                    "conversation_id": conversation_id,
+                })),
+            ),
             TeamError::WorkspacePathUnavailable(path) => ApiError::WorkspacePathUnavailable(path),
             TeamError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
             TeamError::Database(db_err) => db_error_to_api_error(db_err),
@@ -102,6 +116,10 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams/{id}/messages", post(send_message))
         .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
         .route("/api/teams/{id}/agents/{slot_id}/attach", post(attach_agent))
+        .route(
+            "/api/teams/{id}/agents/{slot_id}/runtime/restart",
+            post(restart_agent_runtime),
+        )
         .route(
             "/api/teams/{id}/conversations/{conversation_id}/config-options",
             get(get_conversation_config_options),
@@ -244,6 +262,18 @@ async fn attach_agent(
     state
         .service
         .attach_agent_runtime(&user.id, &params.id, &params.slot_id)
+        .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn restart_agent_runtime(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<AgentPathParams>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .restart_agent_runtime(&user.id, &params.id, &params.slot_id)
         .await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -507,6 +537,26 @@ mod tests {
             }))
         );
         assert!(!format!("{err:?}").contains("provider-secret"));
+    }
+
+    #[test]
+    fn member_busy_maps_to_coded_conflict() {
+        let err: ApiError = TeamError::MemberBusy {
+            team_id: "team-1".into(),
+            slot_id: "slot-2".into(),
+            conversation_id: "conv-2".into(),
+        }
+        .into();
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "TEAM_MEMBER_BUSY");
+        assert_eq!(
+            err.error_details(),
+            Some(json!({
+                "team_id": "team-1",
+                "slot_id": "slot-2",
+                "conversation_id": "conv-2",
+            }))
+        );
     }
 
     #[test]

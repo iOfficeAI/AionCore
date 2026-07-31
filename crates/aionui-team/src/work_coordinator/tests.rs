@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use aionui_api_types::TeamRunTargetRole;
 
@@ -279,6 +279,94 @@ fn runtime_starting_blocks_and_runtime_ready_releases_work() {
         panic!("ready runtime must release the queued intent");
     };
     assert_eq!(batch.mailbox_message_ids, vec!["m1"]);
+}
+
+#[test]
+fn runtime_restart_gate_atomically_rejects_active_work() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    let ReconcileDecision::Claim(_) = coordinator.next("lead-1") else {
+        panic!("message must be claimable");
+    };
+
+    assert_eq!(
+        coordinator.begin_runtime_restart("lead-1"),
+        Err(RuntimeRestartRejection::Busy)
+    );
+    assert!(matches!(
+        coordinator.slot_snapshot("lead-1").unwrap().runtime_constraint,
+        RuntimeConstraint::Ready
+    ));
+}
+
+#[test]
+fn runtime_restart_gate_blocks_new_claims_and_can_be_rolled_back() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+
+    let gate = coordinator.begin_runtime_restart("lead-1").unwrap();
+    assert_eq!(
+        coordinator.next("lead-1"),
+        ReconcileDecision::Blocked(RuntimeConstraint::Starting {
+            operation_id: gate.operation_id,
+        })
+    );
+    coordinator.abort_runtime_restart("lead-1", &gate);
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("rolling back the gate must release queued work");
+    };
+    assert_eq!(batch.mailbox_message_ids, vec!["m1"]);
+}
+
+#[test]
+fn runtime_restart_gate_and_batch_claim_have_one_atomic_winner() {
+    for _ in 0..64 {
+        let coordinator = Arc::new(coordinator());
+        coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+        enqueue(&coordinator, WorkSource::UserMessage, "m1");
+        let barrier = Arc::new(Barrier::new(3));
+
+        let gate_coordinator = Arc::clone(&coordinator);
+        let gate_barrier = Arc::clone(&barrier);
+        let gate_task = std::thread::spawn(move || {
+            gate_barrier.wait();
+            gate_coordinator.begin_runtime_restart("lead-1")
+        });
+        let claim_coordinator = Arc::clone(&coordinator);
+        let claim_barrier = Arc::clone(&barrier);
+        let claim_task = std::thread::spawn(move || {
+            claim_barrier.wait();
+            claim_coordinator.next("lead-1")
+        });
+        barrier.wait();
+
+        let gate = gate_task.join().unwrap();
+        let claim = claim_task.join().unwrap();
+        match (gate, claim) {
+            (Ok(gate), ReconcileDecision::Blocked(RuntimeConstraint::Starting { operation_id })) => {
+                assert_eq!(operation_id, gate.operation_id);
+            }
+            (Err(RuntimeRestartRejection::Busy), ReconcileDecision::Claim(_)) => {}
+            other => panic!("restart gate and batch claim must have one atomic winner, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn runtime_restart_gate_rejects_removing_and_stopped_slots() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Removing { operation_id: 7 });
+    assert_eq!(
+        coordinator.begin_runtime_restart("lead-1"),
+        Err(RuntimeRestartRejection::Removing)
+    );
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::SessionStopped);
+    assert_eq!(
+        coordinator.begin_runtime_restart("lead-1"),
+        Err(RuntimeRestartRejection::SessionStopped)
+    );
 }
 
 #[test]

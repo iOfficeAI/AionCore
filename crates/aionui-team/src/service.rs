@@ -46,6 +46,7 @@ use crate::runtime_tools::{
 use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
 use crate::team_run::TeamRunManager;
 use crate::types::{Team, TeamAgent, TeammateRole};
+use crate::work_coordinator::RuntimeRestartRejection;
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
 
@@ -1912,6 +1913,89 @@ impl TeamSessionService {
         Ok(())
     }
 
+    /// Force-rebuild one team member runtime while preserving its conversation
+    /// and resume anchor. This waits for the shared attach path to reach a
+    /// terminal outcome so callers only receive success once the runtime is
+    /// ready.
+    pub async fn restart_agent_runtime(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
+        let session = {
+            let entry = self
+                .sessions
+                .get(team_id)
+                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+            Arc::clone(&entry.session)
+        };
+        let agent = session.scheduler().get_agent(slot_id).await?;
+        let service = self
+            .self_ref
+            .upgrade()
+            .ok_or_else(|| TeamError::InvalidRequest("team service is shutting down".to_owned()))?;
+        let busy_error = || TeamError::MemberBusy {
+            team_id: team_id.to_owned(),
+            slot_id: slot_id.to_owned(),
+            conversation_id: agent.conversation_id.clone(),
+        };
+        let restart_gate = session
+            .work_coordinator()
+            .begin_runtime_restart(slot_id)
+            .map_err(|rejection| match rejection {
+                RuntimeRestartRejection::Busy => busy_error(),
+                RuntimeRestartRejection::Removing => {
+                    TeamError::InvalidRequest(format!("team member runtime is being removed: {slot_id}"))
+                }
+                RuntimeRestartRejection::SessionStopped => TeamError::SessionNotFound(team_id.to_owned()),
+            })?;
+
+        let lease = match session.member_runtimes().reserve_restart(slot_id) {
+            ReserveAttach::Start(lease) => lease,
+            ReserveAttach::Join(_) | ReserveAttach::AlreadyReady => {
+                session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+                return Err(busy_error());
+            }
+            ReserveAttach::Removing(_) => {
+                session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+                return Err(TeamError::InvalidRequest(format!(
+                    "team member runtime is being removed: {slot_id}"
+                )));
+            }
+            ReserveAttach::SessionStopped => {
+                session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+                return Err(TeamError::SessionNotFound(team_id.to_owned()));
+            }
+        };
+
+        self.broadcast_agent_runtime_status(user_id, team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
+        info!(
+            team_id,
+            slot_id,
+            conversation_id = agent.conversation_id,
+            "team member runtime restart requested"
+        );
+        match attach_member_runtime(
+            service,
+            Arc::clone(&session),
+            user_id.to_owned(),
+            agent.clone(),
+            self.task_manager.clone(),
+            lease,
+            false,
+        )
+        .await
+        {
+            AttachOutcome::Ready => Ok(()),
+            AttachOutcome::Failed(failure) => Err(TeamError::MemberRuntimeFailed {
+                team_id: team_id.to_owned(),
+                slot_id: slot_id.to_owned(),
+                conversation_id: agent.conversation_id,
+                public_reason: failure.public_reason,
+            }),
+            AttachOutcome::Removed => Err(TeamError::AgentNotFound(slot_id.to_owned())),
+            AttachOutcome::SessionStopped => Err(TeamError::SessionNotFound(team_id.to_owned())),
+        }
+    }
+
     pub async fn cancel_run(
         &self,
         user_id: &str,
@@ -2100,18 +2184,22 @@ mod tests {
         ActiveLeaseRegistry, AgentError, AgentInstance, AgentSendError, AgentStreamEvent, IAgentTask, IMockAgent,
         IWorkerTaskManager, IdleCleanupCoordinator,
     };
-    use aionui_api_types::{AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionResponse};
+    use aionui_api_types::{AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionResponse, TeamRunTargetRole};
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs, now_ms};
     use aionui_db::{IConversationRepository, ITeamRepository};
     use tokio::sync::broadcast;
 
     use super::TeamIdleCleanupCoordinator;
+    use crate::TeamError;
+    use crate::member_runtime::{MemberRuntimeFailure, ReserveAttach};
     use crate::test_utils::workspace_harness::{
         setup_with_factory_metadata_team_repo_and_conversation_repo,
         setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster,
         setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager,
         single_agent_team_request,
     };
+    use crate::work_coordinator::{CausalBinding, EnqueueRequest, ReconcileDecision, RuntimeConstraint};
+    use crate::work_source::WorkSource;
 
     struct ModeSettingAgent {
         conversation_id: String,
@@ -2527,6 +2615,182 @@ mod tests {
             .map(|event| event.data.get("status").and_then(serde_json::Value::as_str).unwrap())
             .collect();
         assert_eq!(worker_statuses, vec!["dormant"]);
+    }
+
+    #[tokio::test]
+    async fn restart_agent_runtime_forces_a_ready_member_through_the_attach_chain() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Runtime Restart Ready"))
+            .await
+            .unwrap();
+        let lead = created.assistants.first().unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        task_manager.insert_mode_agent(&lead.conversation_id);
+        task_manager.reset_kills();
+
+        svc.restart_agent_runtime("user-test", &created.id, &lead.slot_id)
+            .await
+            .unwrap();
+
+        assert_eq!(task_manager.kills(), vec![lead.conversation_id.clone()]);
+        let statuses = broadcaster
+            .events_by_name("team.agentRuntimeStatusChanged")
+            .into_iter()
+            .filter(|event| {
+                event.data.get("slot_id").and_then(serde_json::Value::as_str) == Some(lead.slot_id.as_str())
+            })
+            .filter_map(|event| {
+                event
+                    .data
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, vec!["pending", "ready", "pending", "ready"]);
+    }
+
+    #[tokio::test]
+    async fn restart_agent_runtime_allows_absent_and_failed_members() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Runtime Restart Dormant"))
+            .await
+            .unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let lead = created.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+        task_manager.insert_mode_agent(&lead.conversation_id);
+        task_manager.reset_kills();
+
+        svc.restart_agent_runtime("user-test", &created.id, &worker.slot_id)
+            .await
+            .unwrap();
+        assert_eq!(task_manager.kills(), vec![worker.conversation_id.clone()]);
+        task_manager.insert_mode_agent(&worker.conversation_id);
+
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        let failed_lease = match session.member_runtimes().reserve_restart(&worker.slot_id) {
+            ReserveAttach::Start(lease) => lease,
+            other => panic!("failed state seed must start, got {other:?}"),
+        };
+        assert!(session.member_runtimes().commit_failed(
+            &failed_lease,
+            MemberRuntimeFailure {
+                classification: "transport",
+                public_reason: "Agent runtime failed to start".to_owned(),
+            },
+        ));
+        session.work_coordinator().set_runtime_constraint(
+            &worker.slot_id,
+            RuntimeConstraint::Failed {
+                operation_id: failed_lease.operation_id(),
+                classification: "transport",
+            },
+        );
+        task_manager.reset_kills();
+
+        svc.restart_agent_runtime("user-test", &created.id, &worker.slot_id)
+            .await
+            .unwrap();
+        assert!(
+            task_manager
+                .kills()
+                .iter()
+                .all(|conversation_id| conversation_id == &worker.conversation_id),
+            "failed-member reconciliation and forced restart must only rebuild the requested member"
+        );
+        assert!(
+            !task_manager.kills().is_empty(),
+            "failed member must be rebuilt at least once"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_agent_runtime_rejects_active_work_without_killing_the_runtime() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Runtime Restart Busy"))
+            .await
+            .unwrap();
+        let lead = created.assistants.first().unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        task_manager.insert_mode_agent(&lead.conversation_id);
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        let lease = session
+            .work_coordinator()
+            .acquire_enqueue(EnqueueRequest {
+                slot_id: lead.slot_id.clone(),
+                role: TeamRunTargetRole::Lead,
+                source: WorkSource::UserMessage,
+                binding: CausalBinding::UserVisible,
+            })
+            .unwrap();
+        session
+            .work_coordinator()
+            .commit_enqueue(&lease, Some("message-1".to_owned()))
+            .unwrap();
+        assert!(matches!(
+            session.work_coordinator().next(&lead.slot_id),
+            ReconcileDecision::Claim(_)
+        ));
+        task_manager.reset_kills();
+
+        let error = svc
+            .restart_agent_runtime("user-test", &created.id, &lead.slot_id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TeamError::MemberBusy {
+                team_id,
+                slot_id,
+                conversation_id,
+            } if team_id == created.id
+                && slot_id == lead.slot_id
+                && conversation_id == lead.conversation_id
+        ));
+        assert!(task_manager.kills().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_agent_runtime_rejects_a_stopped_member_registry() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Runtime Restart Stopped"))
+            .await
+            .unwrap();
+        let lead = created.assistants.first().unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        task_manager.insert_mode_agent(&lead.conversation_id);
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        assert!(session.member_runtimes().stop());
+        task_manager.reset_kills();
+
+        let error = svc
+            .restart_agent_runtime("user-test", &created.id, &lead.slot_id)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, TeamError::InvalidRequest(ref message) if message.contains("session stopped")),
+            "unexpected stopped-member error: {error:?}"
+        );
+        assert!(task_manager.kills().is_empty());
     }
 
     #[tokio::test]

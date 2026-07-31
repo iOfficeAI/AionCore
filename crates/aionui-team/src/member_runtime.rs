@@ -220,6 +220,44 @@ impl MemberRuntimeRegistry {
         }
     }
 
+    /// Reserve a forced runtime rebuild.
+    ///
+    /// Unlike [`Self::reserve_attach`], a ready entry never short-circuits:
+    /// ready, failed, and absent entries all become a fresh attach operation.
+    pub(crate) fn reserve_restart(&self, agent_id: &str) -> ReserveAttach {
+        let mut entries = self.lock_entries();
+        if self.stopped.load(Ordering::Acquire) {
+            return ReserveAttach::SessionStopped;
+        }
+
+        match entries.get(agent_id) {
+            Some(MemberRuntimeEntry::Attaching {
+                operation_id,
+                outcome_tx,
+            }) => ReserveAttach::Join(waiter(*operation_id, outcome_tx.subscribe())),
+            Some(MemberRuntimeEntry::Removing {
+                operation_id,
+                outcome_tx,
+            }) => ReserveAttach::Removing(waiter(*operation_id, outcome_tx.subscribe())),
+            Some(MemberRuntimeEntry::Ready) | Some(MemberRuntimeEntry::Failed { .. }) | None => {
+                let operation_id = self.next_operation_id();
+                let (outcome_tx, outcome_rx) = watch::channel(AttachSignal::Pending);
+                entries.insert(
+                    agent_id.to_owned(),
+                    MemberRuntimeEntry::Attaching {
+                        operation_id,
+                        outcome_tx,
+                    },
+                );
+                ReserveAttach::Start(AttachLease {
+                    session_generation: self.session_generation.clone(),
+                    agent_id: agent_id.to_owned(),
+                    waiter: waiter(operation_id, outcome_rx),
+                })
+            }
+        }
+    }
+
     /// Atomically converts a previously-ready slot into a repair attach.
     ///
     /// This is only for reconciliation after the task manager confirms the
@@ -607,6 +645,59 @@ mod tests {
         );
         assert!(registry.commit_ready(&retry));
         assert_eq!(retry.waiter().wait().await, AttachOutcome::Ready);
+    }
+
+    #[test]
+    fn restart_reservation_forces_ready_failed_and_absent_entries_to_attach() {
+        let registry = MemberRuntimeRegistry::new(421);
+        assert!(registry.seed_ready("ready"));
+        let failed = match registry.reserve_attach("failed", false) {
+            ReserveAttach::Start(lease) => lease,
+            _ => panic!("failed seed attach must start"),
+        };
+        assert!(registry.commit_failed(&failed, failure("transport", "Agent connection failed")));
+
+        for slot_id in ["ready", "failed", "absent"] {
+            let lease = match registry.reserve_restart(slot_id) {
+                ReserveAttach::Start(lease) => lease,
+                other => panic!("restart for {slot_id} must start, got {other:?}"),
+            };
+            assert_eq!(
+                registry.snapshot(slot_id),
+                MemberRuntimeSnapshot::Attaching {
+                    operation_id: lease.operation_id(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn restart_reservation_rejects_attaching_removing_and_stopped_entries() {
+        let registry = MemberRuntimeRegistry::new(422);
+        let attaching = match registry.reserve_attach("attaching", false) {
+            ReserveAttach::Start(lease) => lease,
+            _ => panic!("attach must start"),
+        };
+        assert!(matches!(
+            registry.reserve_restart("attaching"),
+            ReserveAttach::Join(waiter) if waiter.operation_id() == attaching.operation_id()
+        ));
+
+        assert!(registry.seed_ready("removing"));
+        let removing = match registry.begin_remove("removing") {
+            BeginRemove::Start(lease) => lease,
+            _ => panic!("remove must start"),
+        };
+        assert!(matches!(
+            registry.reserve_restart("removing"),
+            ReserveAttach::Removing(waiter) if waiter.operation_id() == removing.operation_id()
+        ));
+
+        assert!(registry.stop());
+        assert!(matches!(
+            registry.reserve_restart("stopped"),
+            ReserveAttach::SessionStopped
+        ));
     }
 
     #[tokio::test]
