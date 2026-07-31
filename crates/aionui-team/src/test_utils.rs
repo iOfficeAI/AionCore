@@ -256,6 +256,25 @@ impl ITeamRepository for MockTeamRepo {
         Ok(tasks)
     }
 
+    async fn list_tasks_by_ids(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<TeamTaskRow>, DbError> {
+        let state = self.state.lock().unwrap();
+        if state.fail_task_lists {
+            return Err(DbError::Init("forced task list failure".into()));
+        }
+        let tasks = state
+            .tasks
+            .iter()
+            .filter(|t| t.team_id == team_id && ids.contains(&t.id))
+            .cloned()
+            .collect();
+        Ok(tasks)
+    }
+
     async fn list_tasks_paged(
         &self,
         _user_id: &str,
@@ -716,6 +735,15 @@ pub(crate) mod workspace_harness {
         }
 
         async fn list_tasks(&self, _user_id: &str, _team_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
+            Ok(vec![])
+        }
+
+        async fn list_tasks_by_ids(
+            &self,
+            _user_id: &str,
+            _team_id: &str,
+            _ids: &[String],
+        ) -> Result<Vec<TeamTaskRow>, DbError> {
             Ok(vec![])
         }
 

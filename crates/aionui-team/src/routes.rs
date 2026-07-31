@@ -175,6 +175,22 @@ async fn remove_team(
 struct ActivityQuery {
     #[serde(default)]
     limit: Option<i64>,
+    /// Comma-separated task ids. When present, `list_tasks` returns exactly
+    /// those tasks (dependency resolution) instead of the newest `limit`.
+    #[serde(default)]
+    ids: Option<String>,
+}
+
+/// Splits a comma-separated `ids` query value into trimmed, non-empty ids.
+fn parse_ids(raw: Option<&str>) -> Vec<String> {
+    raw.map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 async fn list_mailbox(
@@ -194,8 +210,13 @@ async fn list_tasks(
     Path(id): Path<String>,
     Query(query): Query<ActivityQuery>,
 ) -> Result<Json<ApiResponse<Vec<TeamTaskResponse>>>, ApiError> {
-    let limit = query.limit.unwrap_or(DEFAULT_ACTIVITY_LIMIT);
-    let tasks = state.service.list_team_tasks(&user.id, &id, limit).await?;
+    let ids = parse_ids(query.ids.as_deref());
+    let tasks = if ids.is_empty() {
+        let limit = query.limit.unwrap_or(DEFAULT_ACTIVITY_LIMIT);
+        state.service.list_team_tasks(&user.id, &id, limit).await?
+    } else {
+        state.service.list_team_tasks_by_ids(&user.id, &id, &ids).await?
+    };
     Ok(Json(ApiResponse::ok(tasks)))
 }
 
@@ -490,6 +511,16 @@ mod tests {
         assert!(build_cursor(Some(1000), Some("x".into())).is_some());
         assert!(build_cursor(Some(1000), None).is_none());
         assert!(build_cursor(None, Some("x".into())).is_none());
+    }
+
+    #[test]
+    fn parse_ids_splits_and_trims_nonempty() {
+        assert_eq!(parse_ids(None), Vec::<String>::new());
+        assert_eq!(parse_ids(Some("")), Vec::<String>::new());
+        assert_eq!(
+            parse_ids(Some("a, b ,,c")),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]

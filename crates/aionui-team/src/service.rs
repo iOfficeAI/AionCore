@@ -58,6 +58,9 @@ use crate::workspace::validate_create_workspace_path;
 pub const DEFAULT_ACTIVITY_LIMIT: i64 = 500;
 /// Hard upper bound for the activity `limit` query parameter.
 pub const MAX_ACTIVITY_LIMIT: i64 = 1000;
+/// Upper bound on how many task ids one dependency-resolution request may
+/// look up, to bound query size regardless of client input.
+pub const MAX_TASK_ID_LOOKUP: usize = 200;
 
 /// Which item kinds the unified activity feed returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +352,28 @@ impl TeamSessionService {
         tasks.truncate(clamped as usize);
         let responses: Vec<TeamTaskResponse> = tasks.iter().map(task_to_response).collect();
         info!(kind = "team", team_id, count = responses.len(), "team tasks listed");
+        Ok(responses)
+    }
+
+    /// Returns the team's tasks matching `ids` (newest first), for resolving
+    /// dependency (`blocked_by`) subjects that may lie outside the loaded
+    /// activity page. Ownership is enforced first; `ids` is clamped to
+    /// `MAX_TASK_ID_LOOKUP`. An empty `ids` yields an empty result.
+    pub async fn list_team_tasks_by_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<TeamTaskResponse>, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let capped = &ids[..ids.len().min(MAX_TASK_ID_LOOKUP)];
+        let rows = self.repo.list_tasks_by_ids(user_id, team_id, capped).await?;
+        let tasks: Vec<TeamTask> = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
+        let responses: Vec<TeamTaskResponse> = tasks.iter().map(task_to_response).collect();
+        info!(kind = "team", team_id, count = responses.len(), "team tasks resolved by ids");
         Ok(responses)
     }
 

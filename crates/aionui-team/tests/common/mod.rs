@@ -226,6 +226,22 @@ impl ITeamRepository for MockTeamRepo {
         Ok(tasks)
     }
 
+    async fn list_tasks_by_ids(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<TeamTaskRow>, DbError> {
+        let state = self.state.lock().unwrap();
+        let tasks = state
+            .tasks
+            .iter()
+            .filter(|t| t.team_id == team_id && ids.contains(&t.id))
+            .cloned()
+            .collect();
+        Ok(tasks)
+    }
+
     async fn list_tasks_paged(
         &self,
         _user_id: &str,
