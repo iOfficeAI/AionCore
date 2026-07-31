@@ -57,10 +57,35 @@ pub(crate) async fn probe_models(
     let Ok(proc) = spawner.spawn(spec, &[], owner_tag).await else {
         return Vec::new();
     };
-    let Some((_stdin, stdout)) = proc.take_stdio().await else {
+    let Some((stdin, stdout)) = proc.take_stdio().await else {
         return Vec::new();
     };
 
+    // `agy models` does NOT exit while its stdin is open — it prints the list
+    // and then keeps waiting, so stdout never reaches EOF and the read below
+    // would hang forever. Verified against agy 1.1.9: stdin left open = still
+    // running after 40 minutes; stdin closed = exits in ~3s. Dropping the
+    // handle closes the pipe and delivers the EOF that lets agy finish.
+    drop(stdin);
+
+    let text = match tokio::time::timeout(PROBE_TIMEOUT, read_to_end(stdout)).await {
+        Ok(text) => text,
+        Err(_) => {
+            // Never leave the child behind: this task is detached, so a hung
+            // agy would leak a process for the lifetime of the app.
+            tracing::warn!("antigravity: `agy models` did not finish in time; model list left empty");
+            let _ = proc.kill(std::time::Duration::from_secs(1)).await;
+            return Vec::new();
+        }
+    };
+    parse_agy_models(&text)
+}
+
+/// How long to wait for `agy models` before giving up on the model list.
+/// Generous: a cold agy takes ~3s, but a slow network sign-in check is slower.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn read_to_end(stdout: aionui_process::BoxedStdout) -> String {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(stdout).lines();
     let mut out = String::new();
@@ -68,7 +93,7 @@ pub(crate) async fn probe_models(
         out.push_str(&line);
         out.push('\n');
     }
-    parse_agy_models(&out)
+    out
 }
 
 #[cfg(test)]
@@ -125,5 +150,44 @@ mod tests {
     fn empty_output_is_not_an_error() {
         // Probing must never block session creation.
         assert!(parse_agy_models("").is_empty());
+    }
+
+    /// Build a stand-in for agy that mirrors the ONE behaviour this test is
+    /// about: print the model list, then stay alive until stdin reaches EOF.
+    #[cfg(unix)]
+    fn fake_agy_that_waits_on_stdin(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-agy");
+        std::fs::write(&script, "#!/bin/sh\necho gemini-3.6-flash-high\ncat > /dev/null\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probing_closes_stdin_so_agy_can_exit() {
+        // Regression: `agy models` prints its list and then waits on stdin.
+        // Holding the stdin handle open meant stdout never reached EOF, so the
+        // probe hung forever and the model picker stayed silently empty — the
+        // failure showed up only as `available_models: None`, with no error.
+        let tmp = tempfile::tempdir().unwrap();
+        let program = fake_agy_that_waits_on_stdin(tmp.path());
+        let spawner: Arc<dyn Spawner> = Arc::new(aionui_process::RealSpawner::new(
+            Arc::new(aionui_process::FileRegistryStore::new(tmp.path())),
+            uuid::Uuid::now_v7(),
+            "test-machine",
+        ));
+
+        let models = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            probe_models(&spawner, &program, "probe-test"),
+        )
+        .await
+        .expect("probe hung — stdin was left open, so stdout never reached EOF");
+
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["gemini-3.6-flash-high"]
+        );
     }
 }
