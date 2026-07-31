@@ -169,6 +169,18 @@ pub trait ITeamRepository: Send + Sync {
         limit: i64,
     ) -> Result<Vec<TeamTaskRow>, DbError>;
 
+    /// Returns the task rows with the given ids within a team (user-scoped),
+    /// ordered by `created_at` descending. Used to resolve dependency
+    /// (`blocked_by`) subjects for tasks that may lie outside the loaded
+    /// activity page. An empty `ids` slice yields an empty result without
+    /// querying. Unknown ids are silently ignored.
+    async fn list_tasks_by_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<TeamTaskRow>, DbError>;
+
     /// Appends `blocked_task_id` to the `blocks` JSON array of `task_id`.
     /// This is a transactional JSON array append operation.
     async fn append_to_blocks(

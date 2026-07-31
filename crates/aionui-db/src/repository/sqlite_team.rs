@@ -530,6 +530,36 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(rows)
     }
 
+    async fn list_tasks_by_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<TeamTaskRow>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // SQLite placeholder limit is 999; chunk defensively like
+        // `list_messages_by_ids` and merge the results.
+        let mut out = Vec::new();
+        for chunk in ids.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT * FROM team_tasks \
+                 WHERE team_id = ? \
+                   AND EXISTS (SELECT 1 FROM teams t WHERE t.id = team_tasks.team_id AND t.user_id = ?) \
+                   AND id IN ({placeholders}) \
+                 ORDER BY created_at DESC"
+            );
+            let mut q = sqlx::query_as::<_, TeamTaskRow>(&sql).bind(team_id).bind(user_id);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            out.extend(q.fetch_all(&self.pool).await?);
+        }
+        Ok(out)
+    }
+
     async fn list_tasks_paged(
         &self,
         user_id: &str,
