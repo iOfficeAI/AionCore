@@ -54,9 +54,7 @@ pub use provisioning::{
 };
 pub use routes::{TeamRouterState, team_routes};
 pub use runtime_tools::ResolvedTeamToolContext;
-pub use scheduler::{
-    SchedulerAction, TeammateManager, WAKE_TIMEOUT_MS, WakePayload, format_crash_testament, normalize_name,
-};
+pub use scheduler::{TeammateManager, WAKE_TIMEOUT_MS, WakePayload, format_crash_testament, normalize_name};
 pub use service::{ActivityKind, TeamIdleCleanupCoordinator, TeamSessionService};
 pub use session::{TeamSession, WakeInput};
 pub use task_board::{TaskBoard, TaskUpdate};

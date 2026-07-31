@@ -508,7 +508,7 @@ impl TeamSession {
             self.scheduler.set_status(&slot_id, TeammateStatus::Error).await?;
         }
 
-        let wake_target = self.scheduler.finalize_turn(&slot_id, &[]).await?;
+        let wake_target = self.scheduler.finalize_turn(&slot_id).await?;
 
         // Clear the dedup window unconditionally once finalize has run.
         self.scheduler.clear_finalized_turn(conversation_id);

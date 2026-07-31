@@ -1,7 +1,5 @@
 use serde::Deserialize;
-use serde_json::Value;
 
-use crate::scheduler::SchedulerAction;
 use crate::types::TeammateRole;
 
 pub use aionui_api_types::{
@@ -122,57 +120,6 @@ pub fn is_builtin_mcp_backend(backend: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Parse tool call into SchedulerAction
-// ---------------------------------------------------------------------------
-
-pub fn parse_tool_call(
-    tool_name: &str,
-    arguments: &Value,
-    _caller_role: TeammateRole,
-) -> Result<SchedulerAction, String> {
-    match tool_name {
-        "team_send_message" => {
-            let input: SendMessageInput = serde_json::from_value(arguments.clone())
-                .map_err(|e| format!("Invalid arguments for team_send_message: {e}"))?;
-            Ok(SchedulerAction::SendMessage {
-                to: input.to,
-                message: input.message,
-                files: input.files,
-            })
-        }
-        "team_spawn_agent" => Err("handled directly by server".into()),
-        "team_task_create" => {
-            let input: TaskCreateInput = serde_json::from_value(arguments.clone())
-                .map_err(|e| format!("Invalid arguments for team_task_create: {e}"))?;
-            Ok(SchedulerAction::TaskCreate {
-                subject: input.subject,
-                description: input.description,
-                owner: input.owner,
-                blocked_by: input.blocked_by.unwrap_or_default(),
-            })
-        }
-        "team_task_update" => {
-            let input: TaskUpdateInput = serde_json::from_value(arguments.clone())
-                .map_err(|e| format!("Invalid arguments for team_task_update: {e}"))?;
-            Ok(SchedulerAction::TaskUpdate {
-                task_id: input.task_id,
-                status: input.status,
-                description: input.description,
-                owner: input.owner,
-                blocked_by: input.blocked_by,
-            })
-        }
-        "team_task_list"
-        | "team_members"
-        | "team_rename_agent"
-        | "team_shutdown_agent"
-        | "team_list_assistants"
-        | "team_describe_assistant" => Err("handled directly by server".into()),
-        _ => Err(format!("Unknown tool: {tool_name}")),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -283,137 +230,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_send_message() {
-        let args = json!({
-            "to": "slot-1",
-            "message": "hello",
-            "files": ["/tmp/image.png"]
-        });
-        let action = parse_tool_call("team_send_message", &args, TeammateRole::Teammate).unwrap();
-        assert!(matches!(
-            action,
-            SchedulerAction::SendMessage { to, message, files }
-            if to == "slot-1"
-                && message == "hello"
-                && files == vec!["/tmp/image.png".to_owned()]
-        ));
-    }
-
-    #[test]
-    fn parse_spawn_agent_is_handled_directly_by_server() {
-        let args = json!({"name": "Helper", "assistant_id": "word-creator"});
-        let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("handled directly by server"));
-    }
-
-    #[test]
-    fn parse_spawn_agent_teammate_rejected() {
-        let args = json!({"name": "X", "assistant_id": "word-creator"});
-        let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Teammate);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("handled directly by server"));
-    }
-
-    #[test]
-    fn parse_spawn_agent_with_legacy_agent_type_is_handled_directly_by_server() {
-        let args = json!({"name": "X", "agent_type": "malicious"});
-        let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("handled directly by server"));
-    }
-
-    #[test]
-    fn parse_task_create() {
-        let args = json!({"subject": "Implement X", "owner": "slot-a"});
-        let action = parse_tool_call("team_task_create", &args, TeammateRole::Teammate).unwrap();
-        assert!(matches!(
-            action,
-            SchedulerAction::TaskCreate { subject, owner, .. }
-            if subject == "Implement X" && owner == Some("slot-a".into())
-        ));
-    }
-
-    #[test]
-    fn parse_task_update() {
-        let args = json!({"task_id": "tk-1", "status": "completed"});
-        let action = parse_tool_call("team_task_update", &args, TeammateRole::Teammate).unwrap();
-        assert!(matches!(
-            action,
-            SchedulerAction::TaskUpdate { task_id, status, .. }
-            if task_id == "tk-1" && status == Some("completed".into())
-        ));
-    }
-
-    #[test]
-    fn unknown_tool_errors() {
-        let result = parse_tool_call("unknown_tool", &json!({}), TeammateRole::Lead);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn builtin_mcp_backend_check() {
         assert!(is_builtin_mcp_backend("aionrs"));
         assert!(!is_builtin_mcp_backend("claude"));
         assert!(!is_builtin_mcp_backend("codex"));
         assert!(!is_builtin_mcp_backend("gpt"));
         assert!(!is_builtin_mcp_backend(""));
-    }
-
-    #[test]
-    fn parse_send_message_missing_field() {
-        let args = json!({"to": "slot-1"});
-        let result = parse_tool_call("team_send_message", &args, TeammateRole::Teammate);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_spawn_with_explicit_role_is_handled_directly_by_server() {
-        let args = json!({"name": "W", "role": "worker", "assistant_id": "word-creator"});
-        let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("handled directly by server"));
-    }
-
-    #[test]
-    fn task_create_with_blocked_by() {
-        let args = json!({"subject": "Test", "blocked_by": ["tk-a", "tk-b"]});
-        let action = parse_tool_call("team_task_create", &args, TeammateRole::Lead).unwrap();
-        assert!(matches!(
-            action,
-            SchedulerAction::TaskCreate { blocked_by, .. }
-            if blocked_by == vec!["tk-a", "tk-b"]
-        ));
-    }
-
-    #[test]
-    fn parse_task_list_handled_by_server() {
-        let result = parse_tool_call("team_task_list", &json!({}), TeammateRole::Teammate);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("handled directly by server"));
-    }
-
-    #[test]
-    fn parse_members_handled_by_server() {
-        let result = parse_tool_call("team_members", &json!({}), TeammateRole::Lead);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("handled directly by server"));
-    }
-
-    #[test]
-    fn parse_rename_agent_handled_by_server() {
-        let args = json!({"slot_id": "s1", "new_name": "X"});
-        let result = parse_tool_call("team_rename_agent", &args, TeammateRole::Lead);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("handled directly by server"));
-    }
-
-    #[test]
-    fn parse_shutdown_agent_handled_by_server() {
-        let args = json!({"slot_id": "s1"});
-        let result = parse_tool_call("team_shutdown_agent", &args, TeammateRole::Lead);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("handled directly by server"));
     }
 
     // ---- D4 descriptor text remains aligned with assistant-first MCP contract ----
