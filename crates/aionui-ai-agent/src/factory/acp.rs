@@ -10,11 +10,11 @@ use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
 use crate::session_context::AcpSessionBuildContext;
 use agent_client_protocol::schema::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
 use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
-use aionui_common::CommandSpec;
+use aionui_common::{CommandSpec, ProviderWithModel};
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
-use aionui_runtime::{ensure_runtime_command, ensure_runtime_command_with_reporter};
+use aionui_runtime::{ManagedCliLaunchPlan, ensure_runtime_command, ensure_runtime_command_with_reporter};
 use tracing::{info, warn};
 
 use crate::runtime_status::conversation_runtime_reporter;
@@ -22,6 +22,7 @@ use crate::runtime_status::conversation_runtime_reporter;
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AcpSessionBuildContext,
+    model: ProviderWithModel,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
     let mut config = build_context.config;
@@ -101,8 +102,28 @@ pub(super) async fn build(
         return Ok(instance);
     }
 
-    let mut command_spec =
-        resolve_agent_command_spec(&meta, &ctx.workspace, &ctx.conversation_id, deps.broadcaster.clone()).await?;
+    let (mut command_spec, hermes_launch_policy) = if is_builtin_hermes(&meta) {
+        let launch_plan = deps.agent_registry.launch_plan(&meta.id).await.ok_or_else(|| {
+            AgentError::bad_request(format!(
+                "Agent '{}' managed launch plan is unavailable; repair or reinstall its runtime",
+                meta.name
+            ))
+        })?;
+        let launch_policy = if launch_plan.source == aionui_runtime::ManagedCliLaunchSource::Managed {
+            super::hermes_session::HermesLaunchPolicy::Managed
+        } else {
+            super::hermes_session::HermesLaunchPolicy::External
+        };
+        (
+            command_spec_from_cached_launch_plan(launch_plan, &meta, &ctx.workspace),
+            launch_policy,
+        )
+    } else {
+        (
+            resolve_agent_command_spec(&meta, &ctx.workspace, &ctx.conversation_id, deps.broadcaster.clone()).await?,
+            super::hermes_session::HermesLaunchPolicy::NotHermes,
+        )
+    };
     apply_acp_launch_policy(
         &mut command_spec,
         AcpLaunchPolicyInput {
@@ -112,6 +133,16 @@ pub(super) async fn build(
             runtime_env: &ctx.runtime_env,
         },
     );
+    super::hermes_session::apply_if_hermes(
+        &mut command_spec,
+        hermes_launch_policy,
+        &model,
+        deps.provider_repo.as_ref(),
+        &deps.encryption_key,
+        &deps.data_dir,
+        &ctx.conversation_id,
+    )
+    .await?;
     let session_snapshot = build_context.session_snapshot;
 
     // Load user-configured MCP servers from the DB so they reach
@@ -216,6 +247,45 @@ pub(super) async fn build(
     deps.acp_agent_service.attach(ctx.conversation_id, domain_rx).await;
 
     Ok(instance)
+}
+
+fn is_builtin_hermes(meta: &aionui_api_types::AgentMetadata) -> bool {
+    meta.agent_source == aionui_api_types::AgentSource::Builtin && meta.backend.as_deref() == Some("hermes")
+}
+
+fn command_spec_from_cached_launch_plan(
+    launch_plan: ManagedCliLaunchPlan,
+    metadata: &aionui_api_types::AgentMetadata,
+    workspace: &str,
+) -> CommandSpec {
+    let resolved = launch_plan.command;
+    let mut env: Vec<aionui_common::EnvVar> = metadata
+        .env
+        .iter()
+        .map(|entry| aionui_common::EnvVar {
+            name: entry.name.clone(),
+            value: entry.value.clone(),
+        })
+        .collect();
+    for (name, value) in resolved.env {
+        let name = name.to_string_lossy().into_owned();
+        env.retain(|entry| !entry.name.eq_ignore_ascii_case(&name));
+        env.push(aionui_common::EnvVar {
+            name,
+            value: value.to_string_lossy().into_owned(),
+        });
+    }
+
+    CommandSpec {
+        command: resolved.program,
+        args: resolved
+            .args_prefix
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
+        env,
+        cwd: Some(workspace.to_owned()),
+    }
 }
 
 async fn resolve_agent_command_spec(
@@ -503,13 +573,15 @@ fn session_server_supported_by_capabilities(server: &SessionMcpServer, capabilit
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use aionui_realtime::BroadcastEventBus;
+    #[cfg(unix)]
     use aionui_runtime::{ManagedResourcesMode, init as init_runtime, set_managed_resources_mode};
+    use std::path::PathBuf;
+    #[cfg(unix)]
     use std::sync::OnceLock;
-    use std::{
-        mem,
-        path::{Path, PathBuf},
-    };
+    #[cfg(unix)]
+    use std::{mem, path::Path};
 
     fn make_row(
         name: &str,
@@ -549,11 +621,13 @@ mod tests {
         .to_string()
     }
 
+    #[cfg(unix)]
     fn path_test_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
+    #[cfg(unix)]
     fn is_npx_command_path(command: &str) -> bool {
         command == "npx" || command.ends_with("/npx") || command.ends_with("\\npx.cmd")
     }
@@ -641,6 +715,107 @@ mod tests {
             unsafe { std::env::remove_var("AIONUI_BUNDLED_MANAGED_RESOURCES") };
             set_managed_resources_mode(ManagedResourcesMode::Download);
         }
+    }
+
+    #[test]
+    fn cached_hermes_launch_plan_keeps_manifest_args_and_env_canonical() {
+        let metadata = aionui_api_types::AgentMetadata {
+            id: "hermes-agent".into(),
+            icon: None,
+            name: "Hermes".into(),
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("hermes".into()),
+            agent_type: aionui_common::AgentType::Acp,
+            agent_source: aionui_api_types::AgentSource::Builtin,
+            agent_source_info: aionui_api_types::AgentSourceInfo::default(),
+            enabled: true,
+            available: true,
+            command: Some("hermes".into()),
+            resolved_command: None,
+            args: vec!["acp".into(), "--must-not-be-appended".into()],
+            env: vec![
+                aionui_api_types::AgentEnvEntry {
+                    name: "STATIC_MODE".into(),
+                    value: "metadata-must-not-win".into(),
+                    description: None,
+                },
+                aionui_api_types::AgentEnvEntry {
+                    name: "hermes_git_bash_path".into(),
+                    value: "metadata-bash-must-not-win".into(),
+                    description: None,
+                },
+                aionui_api_types::AgentEnvEntry {
+                    name: "METADATA_ONLY".into(),
+                    value: "preserved".into(),
+                    description: None,
+                },
+            ],
+            native_skills_dirs: None,
+            behavior_policy: aionui_api_types::BehaviorPolicy::default(),
+            yolo_id: None,
+            sort_order: 0,
+            team_capable: false,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_error_details: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            handshake: aionui_api_types::AgentHandshake::default(),
+            has_command_override: false,
+            env_override_key_count: 0,
+        };
+        let launch_plan = ManagedCliLaunchPlan {
+            command: aionui_runtime::ResolvedCommand {
+                program: PathBuf::from(r"C:\Managed Hermes\python\python.exe"),
+                args_prefix: ["-m", "acp_adapter"].into_iter().map(Into::into).collect(),
+                env: vec![
+                    ("STATIC_MODE".into(), "offline".into()),
+                    (
+                        "HERMES_GIT_BASH_PATH".into(),
+                        r"C:\Managed Hermes\git\bin\bash.exe".into(),
+                    ),
+                ],
+            },
+            source: aionui_runtime::ManagedCliLaunchSource::Managed,
+            version: Some("1.0.0+aion.1".into()),
+        };
+
+        let spec = command_spec_from_cached_launch_plan(launch_plan, &metadata, r"C:\Workspace");
+
+        assert!(is_builtin_hermes(&metadata));
+        assert_eq!(spec.command, PathBuf::from(r"C:\Managed Hermes\python\python.exe"));
+        assert_eq!(spec.args, vec!["-m", "acp_adapter"]);
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|arg| arg == "acp" || arg == "--must-not-be-appended")
+        );
+        assert_eq!(spec.cwd.as_deref(), Some(r"C:\Workspace"));
+        for (name, expected) in [
+            ("STATIC_MODE", "offline"),
+            ("HERMES_GIT_BASH_PATH", r"C:\Managed Hermes\git\bin\bash.exe"),
+        ] {
+            let matching = spec
+                .env
+                .iter()
+                .filter(|entry| entry.name.eq_ignore_ascii_case(name))
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1, "{name} must not be duplicated");
+            assert_eq!(matching[0].value, expected);
+        }
+        assert!(
+            spec.env
+                .iter()
+                .any(|entry| entry.name == "METADATA_ONLY" && entry.value == "preserved")
+        );
     }
 
     #[cfg(unix)]

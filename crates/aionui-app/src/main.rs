@@ -40,7 +40,12 @@ fn run_main() -> Result<ExitCode, MainError> {
     // before performing managed-runtime and PATH probing.
     let needs_runtime = cli.command.as_ref().is_none_or(Command::need_runtime);
     if needs_runtime {
-        aionui_runtime::set_managed_resources_mode(cli.managed_resources_mode.into());
+        let adjacent_bundle_available =
+            aionui_runtime::managed_resources::bundled_root_candidate().is_some_and(|root| {
+                root.join(aionui_runtime::managed_resources_contract::MANAGED_RESOURCES_CONTRACT_FILE)
+                    .is_file()
+            });
+        aionui_runtime::set_managed_resources_mode(cli.managed_resources_mode.resolve(adjacent_bundle_available));
         aionui_runtime::init(&cli.data_dir);
     }
 

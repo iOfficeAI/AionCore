@@ -57,7 +57,8 @@ async fn probe_resolved_command_keeps_bridge_but_version_probe_targets_primary_c
 
     meta.available = true;
     meta.resolved_command = Some(resolved);
-    let (meta, reason, _outcome) = validate_cli_availability(meta, None, ProbePolicy::default()).await;
+    let (meta, reason, _outcome, _launch_plan) =
+        validate_cli_availability(meta, None, None, ProbePolicy::default()).await;
     assert!(reason.is_none());
     assert_eq!(meta.resolved_command, Some(PathBuf::from("npx")));
 

@@ -102,6 +102,8 @@ fn test_agent_row(id: &str, backend: Option<&str>, agent_type: AgentType, name: 
         available_commands: None,
         sort_order: 0,
         team_capable: true,
+        installation_status: aionui_api_types::AgentInstallationStatus::Installed,
+        configuration_status: aionui_api_types::AgentConfigurationStatus::Ready,
         status: AgentManagementStatus::Online,
         last_check_status: Some(AgentSnapshotCheckStatus::Online),
         last_check_kind: Some(AgentSnapshotCheckKind::Manual),

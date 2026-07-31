@@ -754,13 +754,17 @@ mod model_settings_test;
 mod tests {
     use super::*;
     use aionui_realtime::BroadcastEventBus;
+    #[cfg(unix)]
     use aionui_runtime::{ManagedResourcesMode, init as init_runtime, set_managed_resources_mode};
+    #[cfg(unix)]
     use std::sync::OnceLock;
+    #[cfg(unix)]
     use std::{
         mem,
         path::{Path, PathBuf},
     };
 
+    #[cfg(unix)]
     fn path_test_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))

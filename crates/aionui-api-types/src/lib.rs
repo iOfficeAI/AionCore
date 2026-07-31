@@ -44,8 +44,9 @@ pub use agent_build_extra::{
     SlashCommandCompletionBehavior, SlashCommandItem,
 };
 pub use agent_discovery::{
-    AgentEnvEntry, AgentHandshake, AgentLogoEntry, AgentManagementRow, AgentManagementStatus, AgentMetadata,
-    AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource, AgentSourceInfo, BehaviorPolicy,
+    AgentConfigurationStatus, AgentEnvEntry, AgentHandshake, AgentInstallationStatus, AgentLogoEntry,
+    AgentManagementRow, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus,
+    AgentSource, AgentSourceInfo, BehaviorPolicy,
 };
 pub use agent_error::{
     AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind, AgentErrorResolutionTarget,

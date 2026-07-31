@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aionui_api_types::{
-    AgentManagementRow, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource,
-    TryConnectCustomAgentResponse,
+    AgentConfigurationStatus, AgentManagementRow, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus,
+    AgentSource, TryConnectCustomAgentResponse,
 };
 use aionui_common::AgentType;
 use aionui_common::now_ms;
@@ -46,7 +46,20 @@ impl AgentAvailabilityService {
     }
 
     pub async fn list_management_rows(&self) -> Vec<AgentManagementRow> {
-        self.registry.list_management_rows().await
+        let mut rows = self.registry.list_management_rows().await;
+        let hermes_status = hermes_provider_readiness(&self.provider_repo).await;
+        for row in &mut rows {
+            let is_managed = if row.backend.as_deref() == Some("hermes") {
+                self.registry
+                    .launch_plan(&row.id)
+                    .await
+                    .is_some_and(|plan| plan.source == aionui_runtime::ManagedCliLaunchSource::Managed)
+            } else {
+                false
+            };
+            apply_hermes_configuration_status(row, hermes_status, is_managed);
+        }
+        rows
     }
 
     pub async fn run_manual_health_check(&self, id: &str) -> Result<AgentManagementRow, AgentError> {
@@ -100,7 +113,15 @@ impl AgentAvailabilityService {
     }
 
     pub async fn management_row_by_id(&self, id: &str) -> Option<AgentManagementRow> {
-        self.registry.management_row_by_id(id).await
+        let mut row = self.registry.management_row_by_id(id).await?;
+        let hermes_status = hermes_provider_readiness(&self.provider_repo).await;
+        let is_managed = self
+            .registry
+            .launch_plan(id)
+            .await
+            .is_some_and(|plan| plan.source == aionui_runtime::ManagedCliLaunchSource::Managed);
+        apply_hermes_configuration_status(&mut row, hermes_status, is_managed);
+        Some(row)
     }
 
     async fn persist_snapshot(&self, id: &str, snapshot: &AvailabilitySnapshot) -> Result<(), AgentError> {
@@ -145,7 +166,7 @@ impl AgentAvailabilityService {
 }
 
 async fn run_probe(
-    _registry: &Arc<AgentRegistry>,
+    registry: &Arc<AgentRegistry>,
     provider_repo: &Arc<dyn IProviderRepository>,
     meta: &AgentMetadata,
     kind: AgentSnapshotCheckKind,
@@ -153,74 +174,77 @@ async fn run_probe(
     let started_at = now_ms();
     let start = Instant::now();
 
-    let (status, error_code, error_message) = if meta.agent_source == AgentSource::Builtin
-        && matches!(meta.backend.as_deref(), Some("claude") | Some("codex"))
-    {
-        // Builtin claude/codex are direct CLIs that do not speak ACP, so
-        // their deep check is PATH + `--version` (integrity), never a
-        // session/new-style handshake (#675). Uses the wide recheck budget:
-        // the user is explicitly waiting and large Node CLIs load slowly.
-        match crate::cli_probe::validate_with_budget(meta, crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT).await {
-            Ok(_) => (AgentSnapshotCheckStatus::Online, None, None),
-            Err(failure) => (
-                AgentSnapshotCheckStatus::Offline,
-                Some(failure.error_code().to_owned()),
-                Some(failure.detail()),
-            ),
-        }
-    } else if let Some(command) = meta.command.as_deref() {
-        let env: HashMap<String, String> = meta
-            .env
-            .iter()
-            .map(|entry| (entry.name.clone(), entry.value.clone()))
-            .collect();
-        match explicit_probe_args(meta) {
-            Err(error) => (
-                AgentSnapshotCheckStatus::Offline,
-                Some("package_lock_invalid".to_owned()),
-                Some(error),
-            ),
-            Ok(args) => match custom_agent_probe::try_connect_custom_agent(command, &args, &env, None).await {
-                TryConnectCustomAgentResponse::Success => (AgentSnapshotCheckStatus::Online, None, None),
-                TryConnectCustomAgentResponse::FailCli { error } => (
+    let (status, error_code, error_message) =
+        if meta.agent_source == AgentSource::Builtin && meta.backend.as_deref() == Some("hermes") {
+            probe_hermes_with_cached_plan(registry, meta).await
+        } else if meta.agent_source == AgentSource::Builtin
+            && matches!(meta.backend.as_deref(), Some("claude") | Some("codex"))
+        {
+            // Builtin claude/codex are direct CLIs that do not speak ACP, so
+            // their deep check is PATH + `--version` (integrity), never a
+            // session/new-style handshake (#675). Uses the wide recheck budget:
+            // the user is explicitly waiting and large Node CLIs load slowly.
+            match crate::cli_probe::validate_with_budget(meta, crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT).await {
+                Ok(_) => (AgentSnapshotCheckStatus::Online, None, None),
+                Err(failure) => (
                     AgentSnapshotCheckStatus::Offline,
-                    Some("command_not_found".to_owned()),
+                    Some(failure.error_code().to_owned()),
+                    Some(failure.detail()),
+                ),
+            }
+        } else if let Some(command) = meta.command.as_deref() {
+            let env: HashMap<String, String> = meta
+                .env
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.value.clone()))
+                .collect();
+            match explicit_probe_args(meta) {
+                Err(error) => (
+                    AgentSnapshotCheckStatus::Offline,
+                    Some("package_lock_invalid".to_owned()),
                     Some(error),
                 ),
-                TryConnectCustomAgentResponse::FailAcp { error } => (
+                Ok(args) => match custom_agent_probe::try_connect_custom_agent(command, &args, &env, None).await {
+                    TryConnectCustomAgentResponse::Success => (AgentSnapshotCheckStatus::Online, None, None),
+                    TryConnectCustomAgentResponse::FailCli { error } => (
+                        AgentSnapshotCheckStatus::Offline,
+                        Some("command_not_found".to_owned()),
+                        Some(error),
+                    ),
+                    TryConnectCustomAgentResponse::FailAcp { error } => (
+                        AgentSnapshotCheckStatus::Offline,
+                        Some("acp_init_failed".to_owned()),
+                        Some(error),
+                    ),
+                    // Reachable but not authorized: still offline (unusable), but a
+                    // dedicated code lets the UI guide the user to log in.
+                    TryConnectCustomAgentResponse::FailAuth { error } => (
+                        AgentSnapshotCheckStatus::Offline,
+                        Some("auth_required".to_owned()),
+                        Some(error),
+                    ),
+                },
+            }
+        } else if meta.backend.is_some() {
+            // Commandless builtin fallback: same PATH + `--version` treatment as
+            // the direct CLIs — no PATH-only side door (#675).
+            match crate::cli_probe::validate_with_budget(meta, crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT).await {
+                Ok(_) => (AgentSnapshotCheckStatus::Online, None, None),
+                Err(failure) => (
                     AgentSnapshotCheckStatus::Offline,
-                    Some("acp_init_failed".to_owned()),
-                    Some(error),
+                    Some(failure.error_code().to_owned()),
+                    Some(failure.detail()),
                 ),
-                // Reachable but not authorized: still offline (unusable), but a
-                // dedicated code lets the UI guide the user to log in.
-                TryConnectCustomAgentResponse::FailAuth { error } => (
-                    AgentSnapshotCheckStatus::Offline,
-                    Some("auth_required".to_owned()),
-                    Some(error),
-                ),
-            },
-        }
-    } else if meta.backend.is_some() {
-        // Commandless builtin fallback: same PATH + `--version` treatment as
-        // the direct CLIs — no PATH-only side door (#675).
-        match crate::cli_probe::validate_with_budget(meta, crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT).await {
-            Ok(_) => (AgentSnapshotCheckStatus::Online, None, None),
-            Err(failure) => (
-                AgentSnapshotCheckStatus::Offline,
-                Some(failure.error_code().to_owned()),
-                Some(failure.detail()),
-            ),
-        }
-    } else if meta.agent_type == AgentType::Aionrs {
-        // aionrs is the built-in Rust agent: there is no external CLI to probe,
-        // so its usability hinges entirely on having a configured model. It is
-        // online only when at least one model provider is enabled — otherwise
-        // it cannot run a single turn.
-        probe_aionrs_provider_readiness(provider_repo).await
-    } else {
-        (AgentSnapshotCheckStatus::Online, None, None)
-    };
+            }
+        } else if meta.agent_type == AgentType::Aionrs {
+            // aionrs is the built-in Rust agent: there is no external CLI to probe,
+            // so its usability hinges entirely on having a configured model. It is
+            // online only when at least one model provider is enabled — otherwise
+            // it cannot run a single turn.
+            probe_aionrs_provider_readiness(provider_repo).await
+        } else {
+            (AgentSnapshotCheckStatus::Online, None, None)
+        };
 
     let latency_ms = start.elapsed().as_millis() as i64;
     let status = match status {
@@ -240,6 +264,99 @@ async fn run_probe(
         error_message,
         latency_ms,
         checked_at: started_at,
+    }
+}
+
+async fn probe_hermes_with_cached_plan(
+    registry: &Arc<AgentRegistry>,
+    meta: &AgentMetadata,
+) -> (AgentSnapshotCheckStatus, Option<String>, Option<String>) {
+    let Some(plan) = registry.launch_plan(&meta.id).await else {
+        let reason = registry.unavailable_reason(&meta.id).await;
+        let code = match reason {
+            Some(crate::registry::UnavailableReason::ManagedRuntimeBroken { .. }) => "managed_runtime_broken",
+            Some(crate::registry::UnavailableReason::CommandMissing { .. }) => "command_not_found",
+            _ => "managed_runtime_unavailable",
+        };
+        return (
+            AgentSnapshotCheckStatus::Offline,
+            Some(code.to_owned()),
+            reason.map(|reason| reason.to_string()),
+        );
+    };
+
+    let mut env: HashMap<String, String> = meta
+        .env
+        .iter()
+        .map(|entry| (entry.name.clone(), entry.value.clone()))
+        .collect();
+
+    let probe_home = match tempfile::tempdir() {
+        Ok(home) => home,
+        Err(error) => {
+            return (
+                AgentSnapshotCheckStatus::Offline,
+                Some("managed_runtime_broken".to_owned()),
+                Some(format!("failed to create isolated Hermes probe home: {error}")),
+            );
+        }
+    };
+    if let Err(error) = std::fs::write(
+        probe_home.path().join("config.yaml"),
+        b"security:\n  allow_lazy_installs: false\n\
+auxiliary:\n  title_generation:\n    enabled: false\n",
+    ) {
+        return (
+            AgentSnapshotCheckStatus::Offline,
+            Some("managed_runtime_broken".to_owned()),
+            Some(format!("failed to write isolated Hermes probe config: {error}")),
+        );
+    }
+    let Some(home_value) = probe_home.path().to_str() else {
+        return (
+            AgentSnapshotCheckStatus::Offline,
+            Some("managed_launch_invalid".to_owned()),
+            Some("isolated Hermes probe home is not valid Unicode".to_owned()),
+        );
+    };
+    env.retain(|name, _| {
+        !matches!(
+            name.to_ascii_uppercase().as_str(),
+            "OPENAI_BASE_URL" | "OPENAI_API_KEY" | "HERMES_INFERENCE_MODEL" | "HERMES_HOME"
+        )
+    });
+    env.insert("HERMES_HOME".to_owned(), home_value.to_owned());
+    env.insert(
+        crate::capability::cli_process::MANAGED_HERMES_ENV_ISOLATION_MARKER.to_owned(),
+        "1".to_owned(),
+    );
+
+    let managed = plan.source == aionui_runtime::ManagedCliLaunchSource::Managed;
+    let outcome = custom_agent_probe::try_initialize_resolved_agent(plan.command, &[], &env).await;
+    match outcome {
+        TryConnectCustomAgentResponse::Success => (AgentSnapshotCheckStatus::Online, None, None),
+        TryConnectCustomAgentResponse::FailCli { error } => (
+            AgentSnapshotCheckStatus::Offline,
+            Some(
+                if managed {
+                    "managed_runtime_broken"
+                } else {
+                    "command_not_found"
+                }
+                .to_owned(),
+            ),
+            Some(error),
+        ),
+        TryConnectCustomAgentResponse::FailAcp { error } => (
+            AgentSnapshotCheckStatus::Offline,
+            Some("acp_init_failed".to_owned()),
+            Some(error),
+        ),
+        TryConnectCustomAgentResponse::FailAuth { error } => (
+            AgentSnapshotCheckStatus::Offline,
+            Some("auth_required".to_owned()),
+            Some(error),
+        ),
     }
 }
 
@@ -279,6 +396,54 @@ async fn probe_aionrs_provider_readiness(
     }
 }
 
+async fn hermes_provider_readiness(provider_repo: &Arc<dyn IProviderRepository>) -> AgentConfigurationStatus {
+    let Ok(providers) = provider_repo.list().await else {
+        return AgentConfigurationStatus::NeedsModel;
+    };
+    let ready = providers.iter().any(|provider| {
+        if !provider.enabled || provider.is_full_url || provider.base_url.trim().is_empty() {
+            return false;
+        }
+        let Ok(models) = serde_json::from_str::<Vec<String>>(&provider.models) else {
+            return false;
+        };
+        let enabled = provider
+            .model_enabled
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<HashMap<String, bool>>(value).ok())
+            .unwrap_or_default();
+        models.into_iter().any(|model| {
+            enabled.get(&model).copied().unwrap_or(true)
+                && crate::factory::aionrs::map_aionrs_provider(
+                    &provider.platform,
+                    &model,
+                    provider.model_protocols.as_deref(),
+                )
+                .is_ok_and(|transport| transport == "openai")
+        })
+    });
+    if ready {
+        AgentConfigurationStatus::Ready
+    } else {
+        AgentConfigurationStatus::NeedsModel
+    }
+}
+
+fn apply_hermes_configuration_status(
+    row: &mut AgentManagementRow,
+    readiness: AgentConfigurationStatus,
+    is_managed: bool,
+) {
+    if row.backend.as_deref() != Some("hermes") || !is_managed {
+        return;
+    }
+    if readiness == AgentConfigurationStatus::NeedsModel
+        || row.configuration_status != AgentConfigurationStatus::AuthError
+    {
+        row.configuration_status = readiness;
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentAvailabilityFeedbackPort for AgentAvailabilityService {
     async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError> {
@@ -294,11 +459,14 @@ impl AgentAvailabilityFeedbackPort for AgentAvailabilityService {
 mod tests {
     use std::sync::Arc;
 
-    use super::{AgentAvailabilityService, explicit_probe_args, probe_aionrs_provider_readiness, run_probe};
+    use super::{
+        AgentAvailabilityService, explicit_probe_args, hermes_provider_readiness, probe_aionrs_provider_readiness,
+        run_probe,
+    };
     use crate::registry::AgentRegistry;
     use aionui_api_types::{
-        AgentHandshake, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus,
-        AgentSource, AgentSourceInfo, BehaviorPolicy,
+        AgentConfigurationStatus, AgentHandshake, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind,
+        AgentSnapshotCheckStatus, AgentSource, AgentSourceInfo, BehaviorPolicy,
     };
     use aionui_common::AgentType;
     use aionui_db::{
@@ -347,6 +515,32 @@ mod tests {
 
         assert_eq!(status, AgentSnapshotCheckStatus::Online);
         assert!(code.is_none());
+    }
+
+    #[tokio::test]
+    async fn hermes_readiness_requires_an_enabled_openai_compatible_model() {
+        let db = init_database_memory().await.unwrap();
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+
+        assert_eq!(
+            hermes_provider_readiness(&provider_repo).await,
+            AgentConfigurationStatus::NeedsModel
+        );
+
+        let mut unsupported = enabled_provider_params();
+        unsupported.platform = "anthropic";
+        unsupported.name = "Anthropic";
+        provider_repo.create(unsupported).await.unwrap();
+        assert_eq!(
+            hermes_provider_readiness(&provider_repo).await,
+            AgentConfigurationStatus::NeedsModel
+        );
+
+        provider_repo.create(enabled_provider_params()).await.unwrap();
+        assert_eq!(
+            hermes_provider_readiness(&provider_repo).await,
+            AgentConfigurationStatus::Ready
+        );
     }
 
     #[tokio::test]

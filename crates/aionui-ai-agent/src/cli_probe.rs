@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use aionui_api_types::AgentMetadata;
-use aionui_runtime::{Builder, resolve_command_path};
-#[cfg(test)]
+use aionui_runtime::{Builder, ResolvedCommand, resolve_command_path};
+#[cfg(all(test, unix))]
 use std::path::PathBuf;
 
 /// Inline (startup) `--version` budget. Bounds backend readiness; agents that
@@ -98,7 +98,20 @@ pub(crate) async fn validate_with_budget(meta: &AgentMetadata, budget: Duration)
     validate_version_with_timeout(&path, budget).await
 }
 
-#[cfg(test)]
+pub(crate) async fn validate_resolved_with_budget(
+    command: &ResolvedCommand,
+    budget: Duration,
+) -> Result<ProbeSuccess, ProbeFailure> {
+    let mut process = Builder::clean_cli(&command.program);
+    process.args(&command.args_prefix);
+    process.arg("--version");
+    for (name, value) in &command.env {
+        process.env(name, value);
+    }
+    validate_process_with_timeout(process, &command.program, budget).await
+}
+
+#[cfg(all(test, unix))]
 async fn resolve_and_validate_command(command: &str) -> Result<PathBuf, ProbeFailure> {
     let path = resolve_command_path(command).ok_or_else(|| ProbeFailure::CommandNotFound {
         command: command.to_owned(),
@@ -108,9 +121,16 @@ async fn resolve_and_validate_command(command: &str) -> Result<PathBuf, ProbeFai
 }
 
 async fn validate_version_with_timeout(path: &std::path::Path, budget: Duration) -> Result<ProbeSuccess, ProbeFailure> {
-    let mut command = Builder::clean_cli(path);
-    command.arg("--version");
+    let mut process = Builder::clean_cli(path);
+    process.arg("--version");
+    validate_process_with_timeout(process, path, budget).await
+}
 
+async fn validate_process_with_timeout(
+    command: Builder,
+    path: &std::path::Path,
+    budget: Duration,
+) -> Result<ProbeSuccess, ProbeFailure> {
     let started = std::time::Instant::now();
     let output = tokio::time::timeout(budget, command.output())
         .await

@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::{AgentRegistry, AgentService};
-use aionui_api_types::{AgentManagementStatus, AgentSnapshotCheckKind, AgentSnapshotCheckStatus};
+use aionui_api_types::{
+    AgentConfigurationStatus, AgentInstallationStatus, AgentManagementStatus, AgentSnapshotCheckKind,
+    AgentSnapshotCheckStatus,
+};
 use aionui_db::{
     IAgentMetadataRepository, IProviderRepository, SqliteAgentMetadataRepository, SqliteProviderRepository,
     UpdateAgentAvailabilitySnapshotParams, UpsertAgentMetadataParams, init_database_memory,
@@ -128,10 +131,13 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
 
     let missing = rows.iter().find(|row| row.id == "agent-missing").unwrap();
     assert_eq!(missing.status, AgentManagementStatus::Missing);
+    assert_eq!(missing.installation_status, AgentInstallationStatus::Missing);
     assert_eq!(missing.last_check_status, None);
 
     let unavailable = rows.iter().find(|row| row.id == "agent-unavailable").unwrap();
     assert_eq!(unavailable.status, AgentManagementStatus::Offline);
+    assert_eq!(unavailable.installation_status, AgentInstallationStatus::Installed);
+    assert_eq!(unavailable.configuration_status, AgentConfigurationStatus::AuthError);
     assert_eq!(unavailable.last_check_status, Some(AgentSnapshotCheckStatus::Offline));
     assert_eq!(unavailable.last_check_kind, Some(AgentSnapshotCheckKind::Manual));
     assert_eq!(unavailable.last_check_error_code.as_deref(), Some("auth_required"));
@@ -143,6 +149,8 @@ async fn management_rows_derive_missing_available_and_unavailable_statuses() {
 
     let available = rows.iter().find(|row| row.id == "agent-available").unwrap();
     assert_eq!(available.status, AgentManagementStatus::Online);
+    assert_eq!(available.installation_status, AgentInstallationStatus::Installed);
+    assert_eq!(available.configuration_status, AgentConfigurationStatus::Ready);
     assert_eq!(available.last_check_status, Some(AgentSnapshotCheckStatus::Online));
     assert_eq!(available.last_check_kind, Some(AgentSnapshotCheckKind::Scheduled));
     assert_eq!(available.last_check_latency_ms, Some(120));

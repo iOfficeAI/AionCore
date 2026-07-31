@@ -60,13 +60,50 @@ pub async fn try_connect_custom_agent(
     };
     debug!(program = %resolved.program.display(), "probe step 1 ok");
 
+    try_connect_resolved_agent(resolved, args, env).await
+}
+
+/// Probe an already-resolved ACP launch contract without parsing or resolving
+/// its program path again.
+///
+/// Managed launch plans can contain spaces and non-ASCII path components and
+/// have already passed manifest validation. Re-tokenizing their absolute path
+/// as a command string would corrupt the cached launch contract.
+pub async fn try_connect_resolved_agent(
+    resolved: ResolvedCommand,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> TryConnectCustomAgentResponse {
+    probe_resolved_agent(resolved, args, env, ProbeDepth::Session).await
+}
+
+/// Verify an already-resolved launch contract through ACP `initialize` only.
+///
+/// Runtime health checks use this narrower probe so missing provider
+/// credentials do not make a valid installation appear broken.
+pub async fn try_initialize_resolved_agent(
+    resolved: ResolvedCommand,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> TryConnectCustomAgentResponse {
+    probe_resolved_agent(resolved, args, env, ProbeDepth::InitializeOnly).await
+}
+
+async fn probe_resolved_agent(
+    resolved: ResolvedCommand,
+    args: &[String],
+    env: &HashMap<String, String>,
+    depth: ProbeDepth,
+) -> TryConnectCustomAgentResponse {
+    debug!(program = %resolved.program.display(), "probe using resolved launch contract");
+
     // ── Step 2 — spawn + ACP initialize ─────────────────────────────
     let proc = match spawn_probe_process(resolved, args, env).await {
         Ok(proc) => proc,
         Err(msg) => return TryConnectCustomAgentResponse::FailAcp { error: msg },
     };
 
-    let outcome = match tokio::time::timeout(STEP2_TIMEOUT, run_handshake(&proc)).await {
+    let outcome = match tokio::time::timeout(STEP2_TIMEOUT, run_handshake(&proc, depth)).await {
         Ok(outcome) => outcome.into_response(),
         Err(_) => TryConnectCustomAgentResponse::FailAcp {
             error: format!("ACP handshake did not complete within {}s", STEP2_TIMEOUT.as_secs()),
@@ -136,6 +173,12 @@ enum ProbeOutcome {
     Fail(String),
 }
 
+#[derive(Clone, Copy)]
+enum ProbeDepth {
+    InitializeOnly,
+    Session,
+}
+
 impl ProbeOutcome {
     fn into_response(self) -> TryConnectCustomAgentResponse {
         match self {
@@ -146,7 +189,7 @@ impl ProbeOutcome {
     }
 }
 
-async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
+async fn run_handshake(proc: &CliAgentProcess, depth: ProbeDepth) -> ProbeOutcome {
     let Some((stdin, stdout)) = proc.take_stdio().await else {
         return ProbeOutcome::Fail("stdio not available after spawn_for_sdk".to_string());
     };
@@ -183,6 +226,11 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
             };
         }
     };
+
+    if matches!(depth, ProbeDepth::InitializeOnly) {
+        drop(protocol);
+        return ProbeOutcome::Ok;
+    }
 
     // `initialize` only proves the agent speaks ACP, not that it is usable.
     // Open a real session (no prompt) so an auth-gated agent surfaces its
@@ -236,6 +284,20 @@ mod tests {
         assert!(
             matches!(resp, TryConnectCustomAgentResponse::FailAcp { .. }),
             "expected FailAcp, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_probe_does_not_retokenize_program_paths_with_spaces() {
+        let resolved = ResolvedCommand {
+            program: std::env::temp_dir().join("Aion Hermes 中文 path").join("missing-agent"),
+            args_prefix: Vec::new(),
+            env: Vec::new(),
+        };
+        let response = try_connect_resolved_agent(resolved, &[], &HashMap::new()).await;
+        assert!(
+            matches!(response, TryConnectCustomAgentResponse::FailAcp { .. }),
+            "an already-resolved program must reach the spawn stage instead of PATH tokenization: {response:?}"
         );
     }
 

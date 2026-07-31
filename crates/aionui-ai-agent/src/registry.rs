@@ -18,12 +18,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_api_types::{
-    AgentEnvEntry, AgentHandshake, AgentManagementRow, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind,
-    AgentSnapshotCheckStatus, AgentSource, AgentSourceInfo, BehaviorPolicy,
+    AgentConfigurationStatus, AgentEnvEntry, AgentHandshake, AgentInstallationStatus, AgentManagementRow,
+    AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource,
+    AgentSourceInfo, BehaviorPolicy,
 };
 use aionui_common::{AgentType, now_ms};
 use aionui_db::{AgentMetadataRow, IAgentMetadataRepository, UpdateAgentHandshakeParams};
-use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
+use aionui_runtime::{
+    ManagedCliLaunchError, ManagedCliLaunchPlan, ManagedCliLaunchSource, RuntimeCommandProbe,
+    probe_node_runtime_supported, probe_runtime_command, resolve_command_path, resolve_managed_cli_launch,
+};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::{RwLock, mpsc};
@@ -93,6 +97,10 @@ pub struct AgentRegistry {
     repo: Arc<dyn IAgentMetadataRepository>,
     by_id: RwLock<HashMap<String, AgentMetadata>>,
     unavailable_reasons: RwLock<HashMap<String, UnavailableReason>>,
+    /// Canonical launch contract for managed Hermes rows. Detection, version
+    /// probing, health checks, and session startup all consume this cached plan
+    /// instead of independently resolving PATH or the managed manifest.
+    launch_plans: RwLock<HashMap<String, ManagedCliLaunchPlan>>,
     /// MPSC sender shared with every forwarder in every `AcpAgentManager`.
     /// Draining happens in a single background task owned by this
     /// registry, so DB writes for the same (id, field) serialize.
@@ -115,6 +123,7 @@ impl AgentRegistry {
             repo,
             by_id: RwLock::new(HashMap::new()),
             unavailable_reasons: RwLock::new(HashMap::new()),
+            launch_plans: RwLock::new(HashMap::new()),
             catalog_tx: tx,
             probe_policy,
             pending_recheck: RwLock::new(Vec::new()),
@@ -248,15 +257,20 @@ impl AgentRegistry {
         let candidates: Vec<_> = rows
             .into_iter()
             .filter_map(|row| decode_row(row, AvailabilityProjection::Probe))
+            .map(|(meta, reason)| resolve_launch_candidate(meta, reason))
             .collect();
         let validated = validate_cli_candidates(candidates, self.probe_policy).await;
 
         let mut map = HashMap::with_capacity(validated.len());
         let mut reasons = HashMap::new();
+        let mut launch_plans = HashMap::new();
         let mut pending = Vec::new();
-        for (meta, reason, outcome) in validated {
+        for (meta, reason, outcome, launch_plan) in validated {
             if let Some(reason) = reason {
                 reasons.insert(meta.id.clone(), reason);
+            }
+            if let Some(launch_plan) = launch_plan {
+                launch_plans.insert(meta.id.clone(), launch_plan);
             }
             if outcome == InlineProbeOutcome::PendingRecheck {
                 pending.push(meta.id.clone());
@@ -270,6 +284,7 @@ impl AgentRegistry {
         log_availability_summary(map.values(), "AgentRegistry hydrated");
         *self.by_id.write().await = map;
         *self.unavailable_reasons.write().await = reasons;
+        *self.launch_plans.write().await = launch_plans;
         *self.pending_recheck.write().await = pending;
         Ok(())
     }
@@ -291,7 +306,9 @@ impl AgentRegistry {
             };
             let checked_at = now_ms();
             let started = std::time::Instant::now();
-            let outcome = crate::cli_probe::validate_with_budget(&meta, self.probe_policy.recheck_budget).await;
+            let launch_plan = self.launch_plans.read().await.get(&id).cloned();
+            let outcome =
+                validate_candidate_with_budget(&meta, launch_plan.as_ref(), self.probe_policy.recheck_budget).await;
             let latency_ms = started.elapsed().as_millis() as i64;
             let (status, error_code, error_message) = match &outcome {
                 Ok(_) => ("online", None, None),
@@ -330,6 +347,26 @@ impl AgentRegistry {
                     meta.last_failure_at = Some(checked_at);
                 }
             }
+            drop(guard);
+
+            if let (Some(plan), Err(failure)) = (launch_plan.as_ref(), &outcome)
+                && plan.source == ManagedCliLaunchSource::Managed
+                && matches!(failure, crate::cli_probe::ProbeFailure::VersionFailed { .. })
+            {
+                self.launch_plans.write().await.remove(&id);
+                self.unavailable_reasons.write().await.insert(
+                    id.clone(),
+                    UnavailableReason::ManagedRuntimeBroken {
+                        stage: "version_probe",
+                        code: failure.error_code().to_owned(),
+                        detail: failure.detail(),
+                    },
+                );
+                if let Some(meta) = self.by_id.write().await.get_mut(&id) {
+                    meta.available = false;
+                    meta.resolved_command = None;
+                }
+            }
         }
     }
 
@@ -349,21 +386,28 @@ impl AgentRegistry {
         let candidates: Vec<_> = snapshot
             .into_iter()
             .map(|mut meta| {
+                if is_managed_hermes_agent(&meta) {
+                    return resolve_launch_candidate(meta, None);
+                }
                 let (path, reason) = probe_with_reason(&meta);
                 meta.resolved_command = path;
                 meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(&meta);
                 let reason = if meta.available { None } else { reason };
-                (meta, reason)
+                (meta, reason, None)
             })
             .collect();
         let validated = validate_cli_candidates(candidates, self.probe_policy).await;
 
         let mut results = Vec::with_capacity(validated.len());
         let mut reasons = HashMap::new();
+        let mut launch_plans = HashMap::new();
         let mut pending = Vec::new();
-        for (meta, reason, outcome) in validated {
+        for (meta, reason, outcome, launch_plan) in validated {
             log_probe_result(&meta, &reason);
             results.push((meta.id.clone(), meta.available, meta.resolved_command.clone()));
+            if let Some(launch_plan) = launch_plan {
+                launch_plans.insert(meta.id.clone(), launch_plan);
+            }
             if outcome == InlineProbeOutcome::PendingRecheck {
                 pending.push(meta.id.clone());
             }
@@ -382,6 +426,7 @@ impl AgentRegistry {
         }
         log_availability_summary(guard.values(), "AgentRegistry refresh_availability complete");
         *self.unavailable_reasons.write().await = reasons;
+        *self.launch_plans.write().await = launch_plans;
     }
 
     /// Refetch and re-probe one row from the repository, leaving the rest of
@@ -395,25 +440,45 @@ impl AgentRegistry {
         let Some(row) = row else {
             self.by_id.write().await.remove(id);
             self.unavailable_reasons.write().await.remove(id);
+            self.launch_plans.write().await.remove(id);
             return Ok(None);
         };
         let Some((meta, reason)) = decode_row(row, AvailabilityProjection::Probe) else {
             self.by_id.write().await.remove(id);
             self.unavailable_reasons.write().await.remove(id);
+            self.launch_plans.write().await.remove(id);
             return Ok(None);
         };
+        let (meta, reason, launch_plan) = resolve_launch_candidate(meta, reason);
         // #675: reload is a cache refresh, not a probe — the version verdict
         // lives in the persisted snapshot columns. Re-running `--version` here
         // made every reload pay the probe cost and stomped fresher
         // manual/session snapshots with a startup-kind verdict.
         log_probe_result(&meta, &reason);
         self.update_cached_unavailable_reason(&meta.id, reason).await;
+        if let Some(launch_plan) = launch_plan {
+            self.launch_plans.write().await.insert(meta.id.clone(), launch_plan);
+        } else {
+            self.launch_plans.write().await.remove(&meta.id);
+        }
         self.by_id.write().await.insert(meta.id.clone(), meta.clone());
         Ok(Some(meta))
     }
 
     pub async fn get(&self, id: &str) -> Option<AgentMetadata> {
         self.by_id.read().await.get(id).cloned()
+    }
+
+    /// Return the canonical launch contract cached during hydrate/reload.
+    ///
+    /// The environment values stay server-internal and are never projected by
+    /// the management API.
+    pub async fn launch_plan(&self, id: &str) -> Option<ManagedCliLaunchPlan> {
+        self.launch_plans.read().await.get(id).cloned()
+    }
+
+    pub(crate) async fn unavailable_reason(&self, id: &str) -> Option<UnavailableReason> {
+        self.unavailable_reasons.read().await.get(id).cloned()
     }
 
     /// First row whose vendor label matches, among `agent_source = 'builtin'`.
@@ -473,6 +538,7 @@ impl AgentRegistry {
     /// official/custom rows even when unavailable.
     pub async fn list_management_rows(&self) -> Vec<AgentManagementRow> {
         let reasons = self.unavailable_reasons.read().await.clone();
+        let launch_plans = self.launch_plans.read().await.clone();
         let mut rows: Vec<AgentManagementRow> = self
             .by_id
             .read()
@@ -481,6 +547,9 @@ impl AgentRegistry {
             .cloned()
             .map(|meta| {
                 let reason = reasons.get(&meta.id);
+                let installation_status =
+                    derive_installation_status(&meta, reason, launch_plans.contains_key(&meta.id));
+                let configuration_status = derive_configuration_status(&meta);
                 let status = derive_management_status(&meta, reason);
                 let diagnostics = derive_management_diagnostics(&meta, status, reason);
                 let handshake = meta.handshake;
@@ -496,7 +565,7 @@ impl AgentRegistry {
                     agent_source: meta.agent_source,
                     agent_source_info: meta.agent_source_info,
                     enabled: meta.enabled,
-                    installed: meta.available,
+                    installed: !matches!(installation_status, AgentInstallationStatus::Missing),
                     command: meta.command,
                     args: meta.args,
                     env: Vec::new(),
@@ -509,6 +578,8 @@ impl AgentRegistry {
                     available_commands: handshake.available_commands.clone(),
                     sort_order: meta.sort_order,
                     team_capable: meta.team_capable,
+                    installation_status,
+                    configuration_status,
                     status,
                     last_check_status: meta.last_check_status,
                     last_check_kind: meta.last_check_kind,
@@ -531,7 +602,10 @@ impl AgentRegistry {
 
     pub async fn management_row_by_id(&self, id: &str) -> Option<AgentManagementRow> {
         let reason = self.unavailable_reasons.read().await.get(id).cloned();
+        let has_launch_plan = self.launch_plans.read().await.contains_key(id);
         let meta = self.by_id.read().await.get(id).cloned()?;
+        let installation_status = derive_installation_status(&meta, reason.as_ref(), has_launch_plan);
+        let configuration_status = derive_configuration_status(&meta);
         let status = derive_management_status(&meta, reason.as_ref());
         let diagnostics = derive_management_diagnostics(&meta, status, reason.as_ref());
         let handshake = meta.handshake.clone();
@@ -547,7 +621,7 @@ impl AgentRegistry {
             agent_source: meta.agent_source,
             agent_source_info: meta.agent_source_info,
             enabled: meta.enabled,
-            installed: meta.available,
+            installed: !matches!(installation_status, AgentInstallationStatus::Missing),
             command: meta.command,
             args: meta.args,
             env: Vec::new(),
@@ -560,6 +634,8 @@ impl AgentRegistry {
             available_commands: handshake.available_commands.clone(),
             sort_order: meta.sort_order,
             team_capable: meta.team_capable,
+            installation_status,
+            configuration_status,
             status,
             last_check_status: meta.last_check_status,
             last_check_kind: meta.last_check_kind,
@@ -779,7 +855,67 @@ fn is_internal_commandless_agent(meta: &AgentMetadata) -> bool {
     meta.enabled && meta.command.is_none() && meta.agent_source == AgentSource::Internal
 }
 
+fn is_managed_hermes_agent(meta: &AgentMetadata) -> bool {
+    meta.agent_source == AgentSource::Builtin && meta.backend.as_deref() == Some("hermes")
+}
+
+fn resolve_launch_candidate(
+    mut meta: AgentMetadata,
+    reason: Option<UnavailableReason>,
+) -> (AgentMetadata, Option<UnavailableReason>, Option<ManagedCliLaunchPlan>) {
+    if !is_managed_hermes_agent(&meta) {
+        return (meta, reason, None);
+    }
+
+    let configured_command = meta
+        .command
+        .as_deref()
+        .filter(|command| !command.is_empty())
+        .or(meta.agent_source_info.binary_name.as_deref())
+        .unwrap_or("hermes");
+    match resolve_managed_cli_launch("hermes", configured_command, &meta.args, meta.has_command_override) {
+        Ok(plan) => {
+            meta.resolved_command = Some(plan.command.program.clone());
+            if meta.enabled {
+                meta.available = true;
+                (meta, None, Some(plan))
+            } else {
+                meta.available = false;
+                (meta, Some(UnavailableReason::Disabled), Some(plan))
+            }
+        }
+        Err(ManagedCliLaunchError::Missing { command, .. }) => {
+            meta.available = false;
+            meta.resolved_command = None;
+            (meta, Some(UnavailableReason::CommandMissing { command }), None)
+        }
+        Err(ManagedCliLaunchError::Broken {
+            stage, code, detail, ..
+        }) => {
+            meta.available = false;
+            meta.resolved_command = None;
+            (
+                meta,
+                Some(UnavailableReason::ManagedRuntimeBroken {
+                    stage,
+                    code: code.to_owned(),
+                    detail,
+                }),
+                None,
+            )
+        }
+    }
+}
+
 fn apply_probe_availability(meta: &mut AgentMetadata) -> Option<UnavailableReason> {
+    if is_managed_hermes_agent(meta) {
+        // The caller resolves Hermes through `resolve_managed_cli_launch` and
+        // stores the resulting full plan. Do not perform an ambient PATH probe
+        // here, because a declared-but-broken managed runtime must fail closed.
+        meta.resolved_command = None;
+        meta.available = false;
+        return None;
+    }
     let (path, reason) = probe_with_reason(meta);
     meta.resolved_command = path;
     meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(meta);
@@ -804,37 +940,60 @@ fn has_slow_probe_history(meta: &AgentMetadata, policy: &ProbePolicy) -> bool {
 async fn validate_cli_availability(
     mut meta: AgentMetadata,
     reason: Option<UnavailableReason>,
+    launch_plan: Option<ManagedCliLaunchPlan>,
     policy: ProbePolicy,
-) -> (AgentMetadata, Option<UnavailableReason>, InlineProbeOutcome) {
+) -> (
+    AgentMetadata,
+    Option<UnavailableReason>,
+    InlineProbeOutcome,
+    Option<ManagedCliLaunchPlan>,
+) {
     if !meta.available || meta.agent_source != AgentSource::Builtin {
-        return (meta, reason, InlineProbeOutcome::NotProbed);
+        return (meta, reason, InlineProbeOutcome::NotProbed, launch_plan);
     }
 
     let Some(binary) = crate::cli_probe::command_name(&meta).map(str::to_owned) else {
-        return (meta, reason, InlineProbeOutcome::NotProbed);
+        return (meta, reason, InlineProbeOutcome::NotProbed, launch_plan);
     };
 
     if has_slow_probe_history(&meta, &policy) {
-        return (meta, None, InlineProbeOutcome::PendingRecheck);
+        return (meta, None, InlineProbeOutcome::PendingRecheck, launch_plan);
     }
 
-    match crate::cli_probe::validate_with_budget(&meta, policy.inline_budget).await {
-        Ok(_) => (meta, None, InlineProbeOutcome::Settled),
+    match validate_candidate_with_budget(&meta, launch_plan.as_ref(), policy.inline_budget).await {
+        Ok(_) => (meta, None, InlineProbeOutcome::Settled, launch_plan),
         Err(failure @ crate::cli_probe::ProbeFailure::VersionTimeout { .. }) => {
             // Slow load is not proof of corruption: keep the row installed,
             // let the persisted snapshot (if any) keep its word, and settle
             // via the background recheck.
             debug!(id = %meta.id, binary, detail = %failure.detail(), "inline version probe timed out; queued for recheck");
-            (meta, None, InlineProbeOutcome::PendingRecheck)
+            (meta, None, InlineProbeOutcome::PendingRecheck, launch_plan)
         }
         Err(failure @ crate::cli_probe::ProbeFailure::VersionFailed { .. }) => {
+            if launch_plan
+                .as_ref()
+                .is_some_and(|plan| plan.source == ManagedCliLaunchSource::Managed)
+            {
+                meta.available = false;
+                meta.resolved_command = None;
+                return (
+                    meta,
+                    Some(UnavailableReason::ManagedRuntimeBroken {
+                        stage: "version_probe",
+                        code: failure.error_code().to_owned(),
+                        detail: failure.detail(),
+                    }),
+                    InlineProbeOutcome::Settled,
+                    None,
+                );
+            }
             // The binary IS on PATH — a failing `--version` proves a
             // corrupted install, not a missing one: installed + Offline.
             meta.last_check_status = Some(AgentSnapshotCheckStatus::Offline);
             meta.last_check_kind = Some(AgentSnapshotCheckKind::Startup);
             meta.last_check_error_code = Some(failure.error_code().to_owned());
             meta.last_check_error_message = Some(failure.detail());
-            (meta, None, InlineProbeOutcome::Settled)
+            (meta, None, InlineProbeOutcome::Settled, launch_plan)
         }
         Err(failure) => {
             meta.available = false;
@@ -846,17 +1005,35 @@ async fn validate_cli_availability(
                     detail: failure.detail(),
                 }),
                 InlineProbeOutcome::Settled,
+                launch_plan,
             )
         }
     }
 }
 
+async fn validate_candidate_with_budget(
+    meta: &AgentMetadata,
+    launch_plan: Option<&ManagedCliLaunchPlan>,
+    budget: std::time::Duration,
+) -> Result<crate::cli_probe::ProbeSuccess, crate::cli_probe::ProbeFailure> {
+    if let Some(launch_plan) = launch_plan {
+        crate::cli_probe::validate_resolved_with_budget(&launch_plan.command, budget).await
+    } else {
+        crate::cli_probe::validate_with_budget(meta, budget).await
+    }
+}
+
 async fn validate_cli_candidates(
-    candidates: Vec<(AgentMetadata, Option<UnavailableReason>)>,
+    candidates: Vec<(AgentMetadata, Option<UnavailableReason>, Option<ManagedCliLaunchPlan>)>,
     policy: ProbePolicy,
-) -> Vec<(AgentMetadata, Option<UnavailableReason>, InlineProbeOutcome)> {
+) -> Vec<(
+    AgentMetadata,
+    Option<UnavailableReason>,
+    InlineProbeOutcome,
+    Option<ManagedCliLaunchPlan>,
+)> {
     futures_util::stream::iter(candidates)
-        .map(|(meta, reason)| validate_cli_availability(meta, reason, policy))
+        .map(|(meta, reason, launch_plan)| validate_cli_availability(meta, reason, launch_plan, policy))
         .buffer_unordered(CLI_PROBE_CONCURRENCY)
         .collect()
         .await
@@ -1076,8 +1253,35 @@ fn parse_last_check_kind(raw: Option<&str>) -> Option<AgentSnapshotCheckKind> {
     })
 }
 
+fn derive_installation_status(
+    meta: &AgentMetadata,
+    reason: Option<&UnavailableReason>,
+    has_launch_plan: bool,
+) -> AgentInstallationStatus {
+    if matches!(reason, Some(UnavailableReason::ManagedRuntimeBroken { .. })) {
+        return AgentInstallationStatus::Broken;
+    }
+    if has_launch_plan || meta.available || meta.resolved_command.is_some() || is_internal_commandless_agent(meta) {
+        AgentInstallationStatus::Installed
+    } else {
+        AgentInstallationStatus::Missing
+    }
+}
+
+fn derive_configuration_status(meta: &AgentMetadata) -> AgentConfigurationStatus {
+    match meta.last_check_error_code.as_deref() {
+        Some("auth_required" | "provider_auth_failed" | "invalid_api_key") => AgentConfigurationStatus::AuthError,
+        Some("no_provider" | "provider_required" | "model_required") => AgentConfigurationStatus::NeedsModel,
+        _ if is_managed_hermes_agent(meta) && meta.last_success_at.is_none() => AgentConfigurationStatus::NeedsModel,
+        _ => AgentConfigurationStatus::Ready,
+    }
+}
+
 fn derive_management_status(meta: &AgentMetadata, reason: Option<&UnavailableReason>) -> AgentManagementStatus {
     if !meta.available {
+        if matches!(reason, Some(UnavailableReason::ManagedRuntimeBroken { .. })) {
+            return AgentManagementStatus::Offline;
+        }
         if reason.is_some() || has_availability_snapshot(meta) {
             return AgentManagementStatus::Missing;
         }
@@ -1106,7 +1310,9 @@ fn derive_management_diagnostics(
     status: AgentManagementStatus,
     reason: Option<&UnavailableReason>,
 ) -> ManagementDiagnostics {
-    let derived_reason = if matches!(status, AgentManagementStatus::Missing) {
+    let derived_reason = if matches!(status, AgentManagementStatus::Missing)
+        || matches!(reason, Some(UnavailableReason::ManagedRuntimeBroken { .. }))
+    {
         reason.cloned()
     } else {
         None
@@ -1192,6 +1398,11 @@ fn diagnostic_details_for_unavailable_reason(reason: &UnavailableReason) -> Opti
             "code": "managed_runtime_unavailable",
             "resource": resource,
         })),
+        UnavailableReason::ManagedRuntimeBroken { stage, code, .. } => Some(json!({
+            "code": "managed_runtime_broken",
+            "stage": stage,
+            "reason_code": code,
+        })),
     }
 }
 
@@ -1204,6 +1415,7 @@ fn unavailable_reason_code(reason: &UnavailableReason) -> String {
         UnavailableReason::PrimaryUnusable { .. } => "primary_unusable",
         UnavailableReason::CommandMissing { .. } => "command_missing",
         UnavailableReason::ManagedRuntimeUnavailable { .. } => "managed_runtime_unavailable",
+        UnavailableReason::ManagedRuntimeBroken { .. } => "managed_runtime_broken",
     }
     .to_owned()
 }
@@ -1228,6 +1440,9 @@ fn guidance_for_unavailable_reason(reason: &UnavailableReason) -> String {
         }
         UnavailableReason::ManagedRuntimeUnavailable { resource, .. } => {
             format!("Repair or reinstall the managed `{resource}` runtime, then run Test Connection again.")
+        }
+        UnavailableReason::ManagedRuntimeBroken { .. } => {
+            "Repair or reinstall the managed Hermes runtime, then run Test Connection again.".to_owned()
         }
     }
 }
@@ -1364,6 +1579,14 @@ pub enum UnavailableReason {
     /// Managed runtime/tool support is unavailable even though the row
     /// itself is builtin and no ambient PATH lookup should be required.
     ManagedRuntimeUnavailable { resource: String, detail: String },
+    /// A managed manifest declared the runtime, but validation or execution
+    /// proved it unusable. This is deliberately distinct from an absent CLI:
+    /// a declared broken runtime must never silently fall back to PATH.
+    ManagedRuntimeBroken {
+        stage: &'static str,
+        code: String,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for UnavailableReason {
@@ -1379,6 +1602,9 @@ impl std::fmt::Display for UnavailableReason {
             Self::CommandMissing { command } => write!(f, "spawn command `{command}` not on $PATH"),
             Self::ManagedRuntimeUnavailable { resource, detail } => {
                 write!(f, "managed `{resource}` unavailable: {detail}")
+            }
+            Self::ManagedRuntimeBroken { stage, code, .. } => {
+                write!(f, "managed Hermes runtime is broken at {stage} ({code})")
             }
         }
     }
@@ -1713,6 +1939,88 @@ mod tests {
             .expect("aionrs seed row");
         assert!(aionrs.0.available);
         assert!(aionrs.1.is_none());
+    }
+
+    #[tokio::test]
+    async fn split_management_statuses_distinguish_missing_broken_and_model_readiness() {
+        let reg = registry().await;
+        let mut hermes = reg.find_builtin_by_backend("hermes").await.expect("Hermes seed row");
+        hermes.available = false;
+        hermes.resolved_command = None;
+        hermes.last_success_at = None;
+        hermes.last_check_error_code = None;
+
+        assert_eq!(
+            derive_installation_status(
+                &hermes,
+                Some(&UnavailableReason::CommandMissing {
+                    command: "hermes".to_owned(),
+                }),
+                false,
+            ),
+            AgentInstallationStatus::Missing
+        );
+        let broken = UnavailableReason::ManagedRuntimeBroken {
+            stage: "validate_cli",
+            code: "sha256_mismatch".to_owned(),
+            detail: "managed file hash did not match".to_owned(),
+        };
+        assert_eq!(
+            derive_installation_status(&hermes, Some(&broken), false),
+            AgentInstallationStatus::Broken
+        );
+        assert_eq!(
+            derive_management_status(&hermes, Some(&broken)),
+            AgentManagementStatus::Offline,
+            "legacy clients must see a broken installed runtime as offline, not uninstalled"
+        );
+        assert_eq!(
+            derive_configuration_status(&hermes),
+            AgentConfigurationStatus::NeedsModel
+        );
+
+        hermes.last_success_at = Some(42);
+        assert_eq!(derive_configuration_status(&hermes), AgentConfigurationStatus::Ready);
+        hermes.last_check_error_code = Some("auth_required".to_owned());
+        assert_eq!(
+            derive_configuration_status(&hermes),
+            AgentConfigurationStatus::AuthError
+        );
+    }
+
+    #[tokio::test]
+    async fn management_api_hides_cached_launch_environment_but_getter_preserves_full_plan() {
+        let reg = registry().await;
+        let hermes = reg.find_builtin_by_backend("hermes").await.expect("Hermes seed row");
+        let plan = ManagedCliLaunchPlan {
+            command: aionui_runtime::ResolvedCommand {
+                program: PathBuf::from("C:/managed/python/python.exe"),
+                args_prefix: vec!["-m".into(), "acp_adapter".into()],
+                env: vec![
+                    ("HERMES_ACP_TOOLSET".into(), "hermes-acp-lite".into()),
+                    ("OPENAI_API_KEY".into(), "must-not-leak".into()),
+                ],
+            },
+            source: ManagedCliLaunchSource::Managed,
+            version: Some("0.19.0+aion.1".to_owned()),
+        };
+        reg.launch_plans.write().await.insert(hermes.id.clone(), plan.clone());
+        {
+            let mut rows = reg.by_id.write().await;
+            let cached = rows.get_mut(&hermes.id).expect("cached Hermes");
+            cached.available = true;
+            cached.resolved_command = Some(plan.command.program.clone());
+        }
+
+        assert_eq!(reg.launch_plan(&hermes.id).await, Some(plan));
+        let row = reg.management_row_by_id(&hermes.id).await.expect("management row");
+        assert_eq!(row.installation_status, AgentInstallationStatus::Installed);
+        assert_eq!(row.configuration_status, AgentConfigurationStatus::NeedsModel);
+        assert!(row.env.is_empty());
+        assert!(
+            !serde_json::to_string(&row).unwrap().contains("must-not-leak"),
+            "management response must not serialize cached launch environment values"
+        );
     }
 
     /// An empty snapshot is a no-op — no column gets overwritten.

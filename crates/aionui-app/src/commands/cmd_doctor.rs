@@ -147,6 +147,9 @@ fn describe_reason(reason: &UnavailableReason) -> String {
         UnavailableReason::ManagedRuntimeUnavailable { resource, detail } => {
             format!("managed `{resource}` unavailable: {detail}")
         }
+        UnavailableReason::ManagedRuntimeBroken { stage, code, detail } => {
+            format!("managed Hermes runtime broken at {stage} ({code}): {detail}")
+        }
     }
 }
 

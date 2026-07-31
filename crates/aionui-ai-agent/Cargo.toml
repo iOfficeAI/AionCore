@@ -42,6 +42,7 @@ aion-protocol.workspace = true
 aion-config.workspace = true
 aion-mcp.workspace = true
 uuid.workspace = true
+tempfile.workspace = true
 agent-client-protocol = { version = "0.11.1", features = ["unstable_session_model", "unstable_session_close", "unstable_session_usage", "unstable_session_fork", "unstable_session_additional_directories", "unstable_session_resume"] }
 tokio-util = { version = "0.7", features = ["compat", "codec"] }
 rusqlite.workspace = true
@@ -56,7 +57,6 @@ libc.workspace = true
 test-support = []
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber.workspace = true
 aionui-common.workspace = true

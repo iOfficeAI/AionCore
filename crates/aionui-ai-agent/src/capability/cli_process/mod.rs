@@ -18,6 +18,11 @@ use stderr_monitor::force_kill;
 /// Maximum stderr ring-buffer size in bytes.
 pub(super) const STDERR_BUFFER_MAX: usize = 8192;
 
+/// One-shot factory-to-spawner signal for the restricted host environment used
+/// by Aion-managed Hermes. The spawner consumes this entry before creating the
+/// child process, so it is never exposed to the agent.
+pub(crate) const MANAGED_HERMES_ENV_ISOLATION_MARKER: &str = "AIONUI_INTERNAL_MANAGED_HERMES_ENV_ISOLATION";
+
 /// Trim `buf` from the front so it holds at most the last `max` bytes.
 ///
 /// The raw cut point can land inside a multi-byte UTF-8 character, where

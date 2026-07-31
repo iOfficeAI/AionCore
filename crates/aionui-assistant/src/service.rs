@@ -3384,6 +3384,8 @@ mod tests {
             available_commands: None,
             sort_order: 3100,
             team_capable: true,
+            installation_status: aionui_api_types::AgentInstallationStatus::Installed,
+            configuration_status: aionui_api_types::AgentConfigurationStatus::Ready,
             status,
             last_check_status: Some(aionui_api_types::AgentSnapshotCheckStatus::Online),
             last_check_kind: Some(aionui_api_types::AgentSnapshotCheckKind::Manual),

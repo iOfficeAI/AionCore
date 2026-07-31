@@ -4,6 +4,7 @@ mod acp;
 mod acp_launch_policy;
 pub(crate) mod aionrs;
 mod context;
+mod hermes_session;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,7 +68,7 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
     let ctx = FactoryContext::resolve(&context).await?;
     let model = context.model.clone();
     match context.kind {
-        AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx).await,
+        AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, model, ctx).await,
         AgentSessionKind::Aionrs(aionrs_context) => aionrs::build(deps, *aionrs_context, model, ctx).await,
     }
 }

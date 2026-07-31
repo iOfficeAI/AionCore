@@ -58,7 +58,7 @@ pub(crate) struct Cli {
     pub recover_corrupted_database: bool,
 
     /// Managed runtime resource source selection.
-    #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]
+    #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Auto)]
     pub managed_resources_mode: ManagedResourcesModeArg,
 
     #[command(subcommand)]
@@ -67,15 +67,18 @@ pub(crate) struct Cli {
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ManagedResourcesModeArg {
+    Auto,
     Bundled,
     Download,
 }
 
-impl From<ManagedResourcesModeArg> for aionui_runtime::ManagedResourcesMode {
-    fn from(value: ManagedResourcesModeArg) -> Self {
-        match value {
-            ManagedResourcesModeArg::Bundled => Self::Bundled,
-            ManagedResourcesModeArg::Download => Self::Download,
+impl ManagedResourcesModeArg {
+    pub(crate) const fn resolve(self, adjacent_bundle_available: bool) -> aionui_runtime::ManagedResourcesMode {
+        match self {
+            Self::Auto if adjacent_bundle_available => aionui_runtime::ManagedResourcesMode::Bundled,
+            Self::Auto => aionui_runtime::ManagedResourcesMode::Download,
+            Self::Bundled => aionui_runtime::ManagedResourcesMode::Bundled,
+            Self::Download => aionui_runtime::ManagedResourcesMode::Download,
         }
     }
 }
@@ -655,15 +658,37 @@ mod tests {
     }
 
     #[test]
-    fn managed_resources_mode_defaults_to_download() {
+    fn managed_resources_mode_defaults_to_auto() {
         let cli = Cli::parse_from(["aioncore"]);
-        assert_eq!(cli.managed_resources_mode, ManagedResourcesModeArg::Download);
+        assert_eq!(cli.managed_resources_mode, ManagedResourcesModeArg::Auto);
     }
 
     #[test]
-    fn managed_resources_mode_accepts_download() {
-        let cli = Cli::parse_from(["aioncore", "--managed-resources-mode", "download"]);
-        assert_eq!(cli.managed_resources_mode, ManagedResourcesModeArg::Download);
+    fn managed_resources_mode_accepts_all_explicit_values() {
+        for (value, expected) in [
+            ("auto", ManagedResourcesModeArg::Auto),
+            ("bundled", ManagedResourcesModeArg::Bundled),
+            ("download", ManagedResourcesModeArg::Download),
+        ] {
+            let cli = Cli::parse_from(["aioncore", "--managed-resources-mode", value]);
+            assert_eq!(cli.managed_resources_mode, expected);
+        }
+    }
+
+    #[test]
+    fn managed_resources_mode_resolves_auto_and_preserves_explicit_overrides() {
+        use aionui_runtime::ManagedResourcesMode;
+
+        for (requested, adjacent_bundle_available, expected) in [
+            (ManagedResourcesModeArg::Auto, true, ManagedResourcesMode::Bundled),
+            (ManagedResourcesModeArg::Auto, false, ManagedResourcesMode::Download),
+            (ManagedResourcesModeArg::Bundled, true, ManagedResourcesMode::Bundled),
+            (ManagedResourcesModeArg::Bundled, false, ManagedResourcesMode::Bundled),
+            (ManagedResourcesModeArg::Download, true, ManagedResourcesMode::Download),
+            (ManagedResourcesModeArg::Download, false, ManagedResourcesMode::Download),
+        ] {
+            assert_eq!(requested.resolve(adjacent_bundle_available), expected);
+        }
     }
 
     #[test]

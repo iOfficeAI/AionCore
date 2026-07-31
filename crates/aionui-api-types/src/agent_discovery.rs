@@ -124,6 +124,26 @@ pub enum AgentManagementStatus {
     Unchecked,
 }
 
+/// Whether the agent runtime is present independently of model/auth readiness.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInstallationStatus {
+    #[default]
+    Missing,
+    Installed,
+    Broken,
+}
+
+/// Whether an installed agent has enough model configuration to start a turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentConfigurationStatus {
+    #[default]
+    NeedsModel,
+    Ready,
+    AuthError,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentSnapshotCheckStatus {
@@ -298,6 +318,13 @@ pub struct AgentManagementRow {
     pub sort_order: i64,
     #[serde(default)]
     pub team_capable: bool,
+    /// Installation state, split from model/auth readiness. The legacy
+    /// `installed` and `status` fields remain populated for older clients.
+    #[serde(default)]
+    pub installation_status: AgentInstallationStatus,
+    /// Model/auth readiness, split from the runtime installation state.
+    #[serde(default)]
+    pub configuration_status: AgentConfigurationStatus,
     pub status: AgentManagementStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check_status: Option<AgentSnapshotCheckStatus>,
@@ -420,6 +447,23 @@ mod tests {
         assert_eq!(value, json!("offline"));
         let value = serde_json::to_value(AgentManagementStatus::Unchecked).unwrap();
         assert_eq!(value, json!("unchecked"));
+    }
+
+    #[test]
+    fn split_management_statuses_serialize_snake_case_and_have_safe_defaults() {
+        assert_eq!(
+            serde_json::to_value(AgentInstallationStatus::Broken).unwrap(),
+            json!("broken")
+        );
+        assert_eq!(
+            serde_json::to_value(AgentConfigurationStatus::AuthError).unwrap(),
+            json!("auth_error")
+        );
+        assert_eq!(AgentInstallationStatus::default(), AgentInstallationStatus::Missing);
+        assert_eq!(
+            AgentConfigurationStatus::default(),
+            AgentConfigurationStatus::NeedsModel
+        );
     }
 }
 
