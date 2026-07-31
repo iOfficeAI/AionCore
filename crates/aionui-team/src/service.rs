@@ -60,15 +60,16 @@ pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &
 }
 
 fn parse_leader_clear_command(content: &str) -> Option<Option<&str>> {
-    let mut parts = content.split_whitespace();
-    if parts.next()? != "/clear" {
+    let content = content.trim();
+    let remainder = content.strip_prefix("/clear")?;
+    if remainder.is_empty() {
+        return Some(None);
+    }
+    if !remainder.chars().next().is_some_and(char::is_whitespace) {
         return None;
     }
-    let target = parts.next();
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(target)
+    let target = remainder.trim();
+    Some((!target.is_empty()).then_some(target))
 }
 
 async fn resolve_session_agent(session: &TeamSession, target: &str) -> Result<TeamAgent, TeamError> {
@@ -2401,7 +2402,7 @@ mod tests {
     use aionui_db::{IConversationRepository, ITeamRepository};
     use tokio::sync::broadcast;
 
-    use super::TeamIdleCleanupCoordinator;
+    use super::{TeamIdleCleanupCoordinator, parse_leader_clear_command};
     use crate::TeamError;
     use crate::member_runtime::{MemberRuntimeFailure, ReserveAttach};
     use crate::test_utils::workspace_harness::{
@@ -2644,6 +2645,18 @@ mod tests {
             ],
             workspace: None,
         }
+    }
+
+    #[test]
+    fn leader_clear_parser_accepts_multi_word_targets_and_enforces_command_boundary() {
+        assert_eq!(parse_leader_clear_command("/clear My Worker"), Some(Some("My Worker")));
+        assert_eq!(
+            parse_leader_clear_command(" \t/clear\t  My Worker \t"),
+            Some(Some("My Worker"))
+        );
+        assert_eq!(parse_leader_clear_command("/clear"), Some(None));
+        assert_eq!(parse_leader_clear_command(" /clear \t"), Some(None));
+        assert_eq!(parse_leader_clear_command("/clearfoo"), None);
     }
 
     fn team_with_aionrs_worker_request(name: &str) -> aionui_api_types::CreateTeamRequest {
@@ -3154,10 +3167,9 @@ mod tests {
         let task_manager = Arc::new(MutableTaskManager::new());
         let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
             setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
-        let created = svc
-            .create_team("user-test", two_agent_team_request("Clear Slash"))
-            .await
-            .unwrap();
+        let mut request = two_agent_team_request("Clear Slash");
+        request.agents[1].name = "My Worker".into();
+        let created = svc.create_team("user-test", request).await.unwrap();
         let worker = created
             .assistants
             .iter()
@@ -3168,13 +3180,23 @@ mod tests {
         task_manager.insert_mode_agent(&lead.conversation_id);
         task_manager.reset_kills();
 
+        let usage_error = svc
+            .send_message("user-test", &created.id, "/clear", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            usage_error,
+            TeamError::InvalidRequest(ref message) if message == "leader usage: /clear <member name or slot_id>"
+        ));
+        assert!(task_manager.kills().is_empty());
+
         let member_ack = svc
             .send_message_to_agent("user-test", &created.id, &worker.slot_id, "/clear", None)
             .await
             .unwrap();
         task_manager.insert_mode_agent(&worker.conversation_id);
         let lead_ack = svc
-            .send_message("user-test", &created.id, "/clear Worker", None)
+            .send_message("user-test", &created.id, " \t/clear\t  My Worker \t", None)
             .await
             .unwrap();
 
@@ -3193,6 +3215,27 @@ mod tests {
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|text| text.contains("Context cleared"))
         }));
+    }
+
+    #[tokio::test]
+    async fn leader_clear_prefix_without_command_boundary_is_sent_as_an_ordinary_message() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Clear Prefix Boundary"))
+            .await
+            .unwrap();
+        let lead = created.assistants.first().unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        task_manager.insert_mode_agent(&lead.conversation_id);
+        task_manager.reset_kills();
+
+        svc.send_message("user-test", &created.id, "/clearfoo", None)
+            .await
+            .unwrap();
+
+        assert!(task_manager.kills().is_empty());
     }
 
     #[tokio::test]
