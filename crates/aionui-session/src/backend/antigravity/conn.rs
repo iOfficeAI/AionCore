@@ -28,6 +28,7 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use super::argv::{ArgvInput, build_argv};
 use super::mcp_config::write_mcp_config;
 use super::models::probe_models;
+use super::skills::scan_skill_commands;
 use super::translate::Translator;
 use super::wire::parse_line;
 use crate::backend::types::{
@@ -37,6 +38,7 @@ use crate::backend::types::{
 use crate::backend::{BackendConnection, SessionBackend, SessionConfig};
 use crate::capability::{
     BlockSet, Capabilities, CapabilityTier, CommandSet, ModeInfo, ModelInfo, PromptAcceptedSource, SignalSet,
+    SlashCommandInfo,
 };
 use crate::event::{PermissionKind, SessionEvent, TurnOutcome};
 
@@ -141,9 +143,16 @@ impl BackendConnection for AntigravityConnection {
             tracing::warn!(error = %e, "antigravity: could not write mcp_config.json; MCP tools will be unavailable");
         }
 
+        let slash_commands = config
+            .cwd
+            .as_deref()
+            .map(|cwd| scan_skill_commands(std::path::Path::new(cwd)))
+            .unwrap_or_default();
+
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let backend = Arc::new(AntigravitySessionBackend {
             session_id,
+            slash_commands,
             models: Arc::new(std::sync::RwLock::new(Vec::new())),
             config,
             spawner: Arc::clone(&self.spawner),
@@ -206,6 +215,9 @@ pub struct AntigravitySessionBackend {
     /// True while a turn's process is alive. agy has no way to accept input
     /// mid-turn, so a Send arriving now has to wait for the next process.
     in_flight: Arc<AtomicBool>,
+    /// Skills provisioned into this workspace, exposed as slash commands. agy
+    /// has no command-list interface, so this is read off the skill files.
+    slash_commands: Vec<SlashCommandInfo>,
     /// Handle to itself, so the reader task can start the next queued turn when
     /// this one ends. `dispatch` only has `&self` (trait signature), so the
     /// Arc cannot be threaded through the call.
@@ -531,6 +543,7 @@ impl SessionBackend for AntigravitySessionBackend {
             available_modes: antigravity_modes(),
             current_model: self.config.model.clone(),
             current_mode: self.config.mode.clone(),
+            slash_commands: self.slash_commands.clone(),
             ..antigravity_capabilities()
         }
     }
@@ -713,6 +726,7 @@ mod tests {
         Arc::new(AntigravitySessionBackend {
             session_id: "conv-1".into(),
             models: Arc::new(std::sync::RwLock::new(Vec::new())),
+            slash_commands: Vec::new(),
             config: config("/w"),
             spawner: Arc::new(FakeSpawner::new()),
             event_tx,
@@ -824,6 +838,7 @@ mod tests {
                 description: None,
                 reasoning_efforts: Vec::new(),
             }])),
+            slash_commands: Vec::new(),
             config: SessionConfig {
                 cwd: Some("/w".into()),
                 model: Some("gemini-3.1-pro-high".into()),

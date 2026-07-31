@@ -13,6 +13,7 @@ mod argv;
 mod conn;
 mod mcp_config;
 mod models;
+mod skills;
 mod translate;
 mod wire;
 
