@@ -1811,6 +1811,17 @@ fn team_mcp_server_spec(cfg: &aionui_api_types::TeamMcpStdioConfig) -> aionui_se
 /// Verbatim port of clean-slate `session_runtime::spawn_catalog_writeback`: wait
 /// for MODELS specifically before committing (codex answers modes before models),
 /// forwarding the best model-less partial only if the window elapses.
+/// How often the write-back re-reads `capabilities()`.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+/// When to publish modes/commands even though no models have shown up (5s).
+/// A backend that never reports models must not be held back by the longer
+/// window below.
+const INTERIM_PUBLISH_TICKS: usize = 100;
+/// How long to keep watching for a LATE model list (35s). agy discovers models
+/// by running `agy models` off the open path — ~3s cold and slower on a bad
+/// network, which the 5s deadline alone could not cover.
+const MODEL_WINDOW_TICKS: usize = 700;
+
 pub fn spawn_catalog_writeback(
     agent_id: String,
     user_id: String,
@@ -1819,7 +1830,8 @@ pub fn spawn_catalog_writeback(
 ) {
     tokio::spawn(async move {
         let mut best_partial = None;
-        for _ in 0..100 {
+        let mut interim_sent = false;
+        for tick in 0..MODEL_WINDOW_TICKS {
             let caps = backend.capabilities();
             if let Some(partial) = catalog_partial_from_caps(&caps) {
                 if !caps.available_models.is_empty() {
@@ -1830,9 +1842,18 @@ pub fn spawn_catalog_writeback(
                 // Modes/commands only so far — remember it, keep waiting for models.
                 best_partial = Some(partial);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Publish what we have at the original deadline so a backend that
+            // legitimately has no model list (claude/codex fill capabilities
+            // from the handshake) is not held back by the longer model window.
+            if tick + 1 == INTERIM_PUBLISH_TICKS
+                && let Some(partial) = best_partial.clone()
+            {
+                catalog_tx.send_partial(user_id.clone(), agent_id.clone(), partial);
+                interim_sent = true;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
-        if let Some(partial) = best_partial {
+        if !interim_sent && let Some(partial) = best_partial {
             catalog_tx.send_partial(user_id, agent_id, partial);
         }
     });
@@ -6987,5 +7008,128 @@ mod force_kill_tests {
             "non-UserCancel kill must not broadcast Finish/Error, got {terminal:?}"
         );
         assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Running));
+    }
+}
+
+#[cfg(test)]
+mod catalog_writeback_tests {
+    //! When a backend discovers models LATE. agy runs `agy models` off the open
+    //! path (~3s cold, slower on a bad network), so the write-back must keep
+    //! watching well past the point where modes are already known.
+    use super::*;
+    use aionui_session::{Admission, Capabilities, CommandReceipt, ModeInfo, ModelInfo};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `catalog_partial_from_caps` nests the list under its own key alongside
+    /// `current_*`, so reach through that wrapper rather than the outer value.
+    fn nested_len(field: Option<&serde_json::Value>, key: &str) -> usize {
+        field
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    }
+
+    /// Reports modes immediately and models only after `polls_before_models`
+    /// calls to `capabilities()` — the write-back polls every 50ms, so the
+    /// count sets how late discovery lands.
+    struct LateModelsBackend {
+        polls: AtomicUsize,
+        polls_before_models: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for LateModelsBackend {
+        async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::NoTurn,
+                turn_gen: 0,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            let n = self.polls.fetch_add(1, Ordering::SeqCst);
+            let available_models = if n >= self.polls_before_models {
+                vec![ModelInfo {
+                    id: "gemini-3.6-flash-high".into(),
+                    name: "gemini-3.6-flash-high".into(),
+                    description: None,
+                    reasoning_efforts: Vec::new(),
+                }]
+            } else {
+                Vec::new()
+            };
+            Capabilities {
+                available_modes: vec![ModeInfo {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    description: None,
+                }],
+                available_models,
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Drain the channel until a message carrying models arrives, or the
+    /// write-back gives up. Returns every message it saw.
+    async fn collect_until_models(
+        rx: &mut tokio::sync::mpsc::Receiver<crate::registry::CatalogSyncMessage>,
+    ) -> Vec<crate::registry::CatalogSyncMessage> {
+        let mut seen = Vec::new();
+        while let Some(msg) = rx.recv().await {
+            let has_models = nested_len(msg.handshake.available_models.as_ref(), "available_models") > 0;
+            seen.push(msg);
+            if has_models {
+                break;
+            }
+        }
+        seen
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn models_discovered_after_the_interim_publish_still_reach_the_catalog() {
+        // 200 polls ≈ 10s: past the interim publish, well inside the model
+        // window. Before this fix the write-back stopped at 5s and the model
+        // picker stayed empty for the whole session with no error anywhere.
+        let backend = Arc::new(LateModelsBackend {
+            polls: AtomicUsize::new(0),
+            polls_before_models: 200,
+        });
+        let (tx, mut rx) = crate::registry::catalog_channel_for_test(16);
+        spawn_catalog_writeback("agent-1".into(), "user-1".into(), backend, tx);
+
+        let seen = collect_until_models(&mut rx).await;
+        let last = seen.last().expect("write-back published nothing at all");
+        assert_eq!(
+            nested_len(last.handshake.available_models.as_ref(), "available_models"),
+            1,
+            "late-discovered models never reached the catalog; saw {} message(s)",
+            seen.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backend_that_never_reports_models_still_publishes_its_modes() {
+        // claude/codex fill capabilities from the handshake and may legitimately
+        // have no model list. Waiting for the longer model window must not stop
+        // their modes from landing.
+        let backend = Arc::new(LateModelsBackend {
+            polls: AtomicUsize::new(0),
+            polls_before_models: usize::MAX,
+        });
+        let (tx, mut rx) = crate::registry::catalog_channel_for_test(16);
+        spawn_catalog_writeback("agent-2".into(), "user-2".into(), backend, tx);
+
+        let msg = rx.recv().await.expect("modes were never published");
+        assert_eq!(msg.agent_metadata_id, "agent-2");
+        assert!(
+            nested_len(msg.handshake.available_modes.as_ref(), "available_modes") > 0,
+            "expected the modes-only partial to be published"
+        );
     }
 }
