@@ -2392,13 +2392,27 @@ async fn persist_side_effects(
 /// this, so a report can never be broadcast without being stored, or vice versa.
 ///
 /// A zero-token report is DISCARDED. claude ends a no-op turn with an all-zero
-/// `usage` object, most visibly after `/compact`: live-captured (2.1.220), the
-/// compaction turn returns `num_turns: 0` and
-/// `usage{input_tokens:0, cache_creation:0, cache_read:0, output_tokens:0}` while
-/// `total_cost_usd` stays put. Recording that overwrites a real occupancy figure
-/// with 0 — not merely stale but wrong, since a compaction leaves the context
-/// SMALLER, never empty. Dropping it keeps the last true reading until the next
-/// real turn reports the post-compaction size.
+/// `usage` object — live-captured (2.1.220) on all three variants:
+///
+/// | turn                | `usage`  | `total_cost_usd`      | `modelUsage` |
+/// |---------------------|----------|-----------------------|--------------|
+/// | `/compact` success  | all zero | 0.0131 (its own cost) | real numbers |
+/// | `/compact` rejected | all zero | 0                     | `{}`         |
+/// | `/clear`            | all zero | 0                     | `{}`         |
+///
+/// Note the successful compaction contradicts itself: `usage` reads zero while
+/// `modelUsage` reports what the compaction actually spent. Recording the zero
+/// overwrites a real occupancy figure — not merely stale but wrong, since a
+/// compaction leaves the context SMALLER, never empty. Dropping it keeps the last
+/// true reading until the next real turn reports the post-compaction size.
+///
+/// DO NOT be tempted by `system{subtype:"compact_boundary"}`, which carries
+/// `compact_metadata{pre_tokens, post_tokens, cumulative_dropped_tokens}`. Its
+/// `pre_tokens` matches our pre-compaction figure exactly (28_049 measured), which
+/// makes `post_tokens` look like the answer — but the next real turn reported
+/// 27_238, not `post_tokens`' 2_065. `post_tokens` counts only the compacted
+/// transcript while `usage` also carries the system prompt and tool definitions
+/// (~25k here). Different baselines; mixing them would understate occupancy ~13x.
 fn informative_usage(event: &SessionEvent) -> Option<(u64, Option<f64>, Option<u64>)> {
     match event {
         SessionEvent::UsageDelta {
@@ -2407,6 +2421,12 @@ fn informative_usage(event: &SessionEvent) -> Option<(u64, Option<f64>, Option<u
             context_window,
             ..
         } if *total_tokens > 0 => Some((*total_tokens, *cost_usd, *context_window)),
+        // Discarding is silent otherwise, which makes "the indicator is stuck on an
+        // old number" undiagnosable from logs. One line per no-op turn is cheap.
+        SessionEvent::UsageDelta { .. } => {
+            tracing::debug!("usage report carries zero tokens; keeping the previous reading");
+            None
+        }
         _ => None,
     }
 }
@@ -2420,6 +2440,13 @@ fn informative_usage(event: &SessionEvent) -> Option<(u64, Option<f64>, Option<u
 /// `msg_id`/`turn_id` are empty: a usage report is CONVERSATION-scoped state, and
 /// by the time claude's arrives its turn is already closed, so there is no message
 /// to attach it to. The indicator reads `data`, keyed by conversation.
+///
+/// Fires for every backend, which means codex/ACP — whose reports land mid-turn,
+/// while the relay is still forwarding — deliver TWO frames: the relay's catch-all
+/// (with a real `msg_id`) and this one. Accepted deliberately: the renderer's
+/// `setTokenUsage` replaces wholesale, so the duplicate is idempotent, and gating
+/// on backend here would trade a harmless repeat for a rule that silently rots the
+/// moment another backend starts reporting after its turn ends.
 fn broadcast_usage_frame(bus: &dyn EventBroadcaster, conversation_id: &str, user_id: &str, event: &SessionEvent) {
     let Some(frame) = translate_event(event.clone(), conversation_id, false)
         .into_iter()
@@ -4093,7 +4120,9 @@ mod persist_tests {
             &usage(26_420, Some(0.0133), Some(1_000_000)),
         )
         .await;
-        // The compaction turn: cost carries over unchanged, every token bucket 0.
+        // The compaction turn: every token bucket 0, while cost reports what the
+        // compaction itself spent (live-captured 0.0131 on a SUCCESSFUL compact; a
+        // rejected one and `/clear` both report 0 — see `informative_usage`).
         persist_side_effects(
             repo.as_ref(),
             "user-1",
