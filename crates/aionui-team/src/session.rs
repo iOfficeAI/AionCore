@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamMessageEnqueueStatus, TeamRunAckResponse, TeamRunStatus,
-    TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
+    TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamMessageEnqueueStatus, TeamRunAckResponse, TeamRunPayload,
+    TeamRunSource, TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
 };
 use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::ITeamRepository;
@@ -23,7 +23,8 @@ use crate::member_runtime::{
     ReserveAttach,
 };
 use crate::message_projection::{
-    TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
+    ProjectedTeamMessage, TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest,
+    TeamProjectionSource, teammate_dedupe_key,
 };
 use crate::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, NoopNativeSlashCommandPort,
@@ -751,6 +752,67 @@ impl TeamSession {
             },
             message_id: mailbox_message.id,
             run,
+        })
+    }
+
+    /// Project a locally handled team command and its result without placing
+    /// either message in the backend mailbox. This keeps `/clear` visible in
+    /// the initiating conversation while guaranteeing it is never forwarded
+    /// to the agent process.
+    pub(crate) async fn project_local_command_result(
+        &self,
+        initiating_slot_id: &str,
+        command: &str,
+        result: &str,
+    ) -> Result<TeamRunAckResponse, TeamError> {
+        let agent = self.scheduler.get_agent(initiating_slot_id).await?;
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
+        let command_projection = projection
+            .project(TeamProjectionRequest::user_visible(
+                &self.user_id,
+                &self.team.id,
+                initiating_slot_id,
+                &agent.conversation_id,
+                command,
+                Vec::new(),
+            ))
+            .await?;
+        let message_id = match command_projection {
+            ProjectedTeamMessage::Inserted { msg_id } | ProjectedTeamMessage::AlreadyProjected { msg_id } => msg_id,
+            ProjectedTeamMessage::Skipped => generate_id(),
+        };
+        projection
+            .project(TeamProjectionRequest::team_system_visible(
+                &self.user_id,
+                &self.team.id,
+                initiating_slot_id,
+                &agent.conversation_id,
+                result,
+                generate_id(),
+            ))
+            .await?;
+
+        let target_role = match agent.role {
+            TeammateRole::Lead => TeamRunTargetRole::Lead,
+            TeammateRole::Teammate => TeamRunTargetRole::Teammate,
+        };
+        Ok(TeamRunAckResponse {
+            enqueue_status: TeamMessageEnqueueStatus::Accepted,
+            message_id,
+            run: TeamRunPayload {
+                team_id: self.team.id.clone(),
+                team_run_id: generate_id(),
+                source: TeamRunSource::UserMessage,
+                has_user_intervention: true,
+                target_slot_id: initiating_slot_id.to_owned(),
+                target_role,
+                status: TeamRunStatus::Completed,
+                queued_intent_count: 0,
+                starting_batch_count: 0,
+                running_batch_count: 0,
+                active_enqueue_lease_count: 0,
+                slot_work: Vec::new(),
+            },
         })
     }
 
@@ -1645,10 +1707,11 @@ impl TeamSession {
         mcp_stdio_cfg: crate::mcp::TeamMcpStdioConfig,
         user_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
+        kill_existing: bool,
     ) -> Result<(), TeamError> {
         service
             .provisioner()
-            .attach_agent_process(user_id, agent, mcp_stdio_cfg, task_manager)
+            .attach_agent_process(user_id, agent, mcp_stdio_cfg, task_manager, kill_existing)
             .await
     }
 
@@ -1731,6 +1794,55 @@ pub(crate) async fn attach_member_runtime(
     lease: AttachLease,
     notify_leader_on_failure: bool,
 ) -> AttachOutcome {
+    attach_member_runtime_inner(
+        service,
+        session,
+        user_id,
+        agent,
+        task_manager,
+        lease,
+        notify_leader_on_failure,
+        true,
+    )
+    .await
+}
+
+/// Attach a member whose previous runtime has already been stopped by the
+/// caller. Used by context reset so clearing the resume anchor happens after
+/// the old process exits and before any replacement process can start.
+pub(crate) async fn attach_member_runtime_after_kill(
+    service: Arc<TeamSessionService>,
+    session: Arc<TeamSession>,
+    user_id: String,
+    agent: TeamAgent,
+    task_manager: Arc<dyn IWorkerTaskManager>,
+    lease: AttachLease,
+    notify_leader_on_failure: bool,
+) -> AttachOutcome {
+    attach_member_runtime_inner(
+        service,
+        session,
+        user_id,
+        agent,
+        task_manager,
+        lease,
+        notify_leader_on_failure,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn attach_member_runtime_inner(
+    service: Arc<TeamSessionService>,
+    session: Arc<TeamSession>,
+    user_id: String,
+    agent: TeamAgent,
+    task_manager: Arc<dyn IWorkerTaskManager>,
+    lease: AttachLease,
+    notify_leader_on_failure: bool,
+    kill_existing: bool,
+) -> AttachOutcome {
     let started_at = Instant::now();
     let operation_id = lease.operation_id();
     let generation = session.generation().to_owned();
@@ -1762,6 +1874,7 @@ pub(crate) async fn attach_member_runtime(
         session.mcp_stdio_config(&agent.slot_id),
         &user_id,
         &task_manager,
+        kill_existing,
     )
     .await;
     if let Err(error) = attach_result {

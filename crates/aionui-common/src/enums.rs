@@ -259,6 +259,9 @@ pub enum AgentKillReason {
     /// `team_mcp_stdio_config`. The conversation is preserved; only the
     /// in-memory ACP CLI is recycled.
     TeamMcpRebuild,
+    /// A Team member is being rebuilt after its persisted backend session
+    /// anchor was cleared. The conversation row and visible history remain.
+    TeamContextReset,
     /// Team is being deleted; every agent process under it must be torn
     /// down before the team's conversations / rows are removed.
     TeamDeleted,

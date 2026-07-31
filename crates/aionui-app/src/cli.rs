@@ -184,6 +184,7 @@ pub(crate) enum TeamCommand {
     DescribeAssistant,
     SpawnAgent,
     RenameAgent,
+    ClearAgentContext,
     ShutdownAgent,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
@@ -845,6 +846,7 @@ mod tests {
             &["aioncore", "team", "describe-assistant"],
             &["aioncore", "team", "spawn-agent"],
             &["aioncore", "team", "rename-agent"],
+            &["aioncore", "team", "clear-agent-context"],
             &["aioncore", "team", "shutdown-agent"],
         ];
 

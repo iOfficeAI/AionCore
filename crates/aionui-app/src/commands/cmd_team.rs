@@ -56,6 +56,7 @@ async fn run_team_inner(args: TeamArgs) -> Result<(), ExitCode> {
         TeamCommand::DescribeAssistant => call_tool(vec!["describe-assistant"]).await,
         TeamCommand::SpawnAgent => call_tool(vec!["spawn-agent"]).await,
         TeamCommand::RenameAgent => call_tool(vec!["rename-agent"]).await,
+        TeamCommand::ClearAgentContext => call_tool(vec!["clear-agent-context"]).await,
         TeamCommand::ShutdownAgent => call_tool(vec!["shutdown-agent"]).await,
         TeamCommand::Unknown(path) => Err(unknown_command("team", path, "unknown team command")),
     }

@@ -2285,6 +2285,51 @@ impl ConversationService {
         Ok(())
     }
 
+    /// Whether this owned conversation has the ACP session row required for
+    /// an in-place Fresh-session reset. AionRS conversations intentionally do
+    /// not create `acp_session` state and therefore return `false`.
+    pub async fn supports_acp_context_reset(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, ConversationError> {
+        let conversation = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if conversation.r#type != AgentType::Acp.serde_name() {
+            return Ok(false);
+        }
+        self.acp_session_repo
+            .get_for_user(user_id, conversation_id)
+            .await
+            .map(|row| row.is_some())
+            .map_err(|error| ConversationError::internal(format!("Failed to inspect ACP session anchor: {error}")))
+    }
+
+    /// Drop only the persisted backend resume anchor. Runtime mode/model and
+    /// the visible conversation history are preserved, so the next rebuilt
+    /// ACP runtime opens `SessionSpec::Fresh` with the same conversation id.
+    pub async fn clear_acp_context_anchor(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, ConversationError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        self.acp_session_repo
+            .clear_session_id_for_user(user_id, conversation_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to clear ACP session anchor: {error}")))
+    }
+
     /// Delete a conversation (messages cascade via FK).
     ///
     /// Broadcasts `conversation.listChanged(deleted)`.

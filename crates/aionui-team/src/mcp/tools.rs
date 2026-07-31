@@ -107,6 +107,11 @@ pub struct RenameAgentInput {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ClearAgentContextInput {
+    pub slot_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ShutdownAgentInput {
     pub slot_id: String,
     pub reason: Option<String>,
@@ -165,6 +170,7 @@ pub fn parse_tool_call(
         "team_task_list"
         | "team_members"
         | "team_rename_agent"
+        | "team_clear_agent_context"
         | "team_shutdown_agent"
         | "team_list_assistants"
         | "team_describe_assistant" => Err("handled directly by server".into()),
@@ -183,7 +189,7 @@ mod tests {
 
     #[test]
     fn all_descriptors_count() {
-        assert_eq!(all_tool_descriptors().len(), 10);
+        assert_eq!(all_tool_descriptors().len(), 11);
     }
 
     #[test]
@@ -192,7 +198,7 @@ mod tests {
         let mut names: Vec<&str> = descs.iter().map(|d| d.name.as_str()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
     }
 
     #[test]

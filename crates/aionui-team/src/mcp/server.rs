@@ -22,8 +22,8 @@ use super::protocol::{
     read_request, write_response,
 };
 use super::tools::{
-    RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskListInput,
-    TaskListStatusInput, TaskUpdateInput,
+    ClearAgentContextInput, RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput,
+    TaskListInput, TaskListStatusInput, TaskUpdateInput,
 };
 
 // ---------------------------------------------------------------------------
@@ -530,6 +530,7 @@ pub(crate) async fn dispatch_tool(
         "team_task_list" => exec_task_list(arguments, scheduler).await,
         "team_members" => exec_members(scheduler).await,
         "team_rename_agent" => exec_rename_agent(arguments, scheduler, service, team_id).await,
+        "team_clear_agent_context" => exec_clear_agent_context(arguments, scheduler, service, team_id).await,
         "team_shutdown_agent" => {
             exec_shutdown_agent(arguments, scheduler, service, team_id, caller_slot_id, caller_role).await
         }
@@ -992,6 +993,36 @@ async fn exec_rename_agent(
         "status": "ok",
         "action": "agent_renamed",
         "agent": agent_json(&agent),
+    }))
+}
+
+async fn exec_clear_agent_context(
+    args: &Value,
+    scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+) -> Result<String, ToolCallError> {
+    let input: ClearAgentContextInput = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+    let target_slot_id = resolve_agent_target(scheduler, &input.slot_id, false)
+        .await
+        .map_err(ToolCallError::from_message)?;
+    let service = service
+        .upgrade()
+        .ok_or_else(|| ToolCallError::from_message("Team service not available"))?;
+    let user_id = service
+        .team_owner_user_id(team_id)
+        .await
+        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+    service
+        .clear_agent_context_in_session(&user_id, team_id, &target_slot_id)
+        .await
+        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+
+    json_text(&json!({
+        "status": "ok",
+        "action": "agent_context_cleared",
+        "target_slot_id": target_slot_id,
     }))
 }
 

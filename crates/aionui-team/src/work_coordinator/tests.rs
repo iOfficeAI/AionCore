@@ -301,21 +301,17 @@ fn runtime_restart_gate_atomically_rejects_active_work() {
 }
 
 #[test]
-fn runtime_restart_gate_blocks_new_claims_and_can_be_rolled_back() {
+fn runtime_restart_gate_rejects_queued_work() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
     enqueue(&coordinator, WorkSource::UserMessage, "m1");
 
-    let gate = coordinator.begin_runtime_restart("lead-1").unwrap();
     assert_eq!(
-        coordinator.next("lead-1"),
-        ReconcileDecision::Blocked(RuntimeConstraint::Starting {
-            operation_id: gate.operation_id,
-        })
+        coordinator.begin_runtime_restart("lead-1"),
+        Err(RuntimeRestartRejection::Busy)
     );
-    coordinator.abort_runtime_restart("lead-1", &gate);
     let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
-        panic!("rolling back the gate must release queued work");
+        panic!("rejected restart must leave queued work claimable");
     };
     assert_eq!(batch.mailbox_message_ids, vec!["m1"]);
 }
@@ -344,13 +340,8 @@ fn runtime_restart_gate_and_batch_claim_have_one_atomic_winner() {
 
         let gate = gate_task.join().unwrap();
         let claim = claim_task.join().unwrap();
-        match (gate, claim) {
-            (Ok(gate), ReconcileDecision::Blocked(RuntimeConstraint::Starting { operation_id })) => {
-                assert_eq!(operation_id, gate.operation_id);
-            }
-            (Err(RuntimeRestartRejection::Busy), ReconcileDecision::Claim(_)) => {}
-            other => panic!("restart gate and batch claim must have one atomic winner, got {other:?}"),
-        }
+        assert!(matches!(gate, Err(RuntimeRestartRejection::Busy)));
+        assert!(matches!(claim, ReconcileDecision::Claim(_)));
     }
 }
 

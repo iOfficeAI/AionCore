@@ -57,6 +57,7 @@ impl CloseReason {
                 Some(AgentKillReason::IdleTimeout) => "Agent killed: idle timeout".to_owned(),
                 Some(AgentKillReason::AgentErrorRecovery) => "Agent killed: error recovery".to_owned(),
                 Some(AgentKillReason::TeamMcpRebuild) => "Agent killed: team MCP rebuild".to_owned(),
+                Some(AgentKillReason::TeamContextReset) => "Agent killed: team context reset".to_owned(),
                 Some(AgentKillReason::TeamDeleted) => "Agent killed: team deleted".to_owned(),
                 Some(AgentKillReason::ConversationDeleted) => "Agent killed: conversation deleted".to_owned(),
                 Some(AgentKillReason::UserCancelTimeout) => "Conversation cancelled; agent restarted".to_owned(),

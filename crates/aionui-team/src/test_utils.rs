@@ -676,12 +676,17 @@ pub(crate) mod workspace_harness {
                 });
             let mut extra = request.extra;
             extra["workspace"] = serde_json::Value::String(workspace.clone());
+            let agent_type = request.agent_type.unwrap_or(AgentType::Acp);
+            if agent_type == AgentType::Acp {
+                extra["mock_has_acp_session"] = serde_json::Value::Bool(true);
+                extra["mock_acp_session_id"] = serde_json::Value::String("anchor".to_owned());
+            }
             self.repo
                 .create(&ConversationRow {
                     id: id.clone(),
                     user_id: request.user_id,
                     name: request.name,
-                    r#type: request.agent_type.unwrap_or(AgentType::Acp).serde_name().to_owned(),
+                    r#type: agent_type.serde_name().to_owned(),
                     pinned: false,
                     pinned_at: None,
                     source: None,
@@ -809,6 +814,26 @@ pub(crate) mod workspace_harness {
                     }],
                 }],
             })
+        }
+
+        async fn supports_context_reset(&self, user_id: &str, conversation_id: &str) -> Result<bool, TeamError> {
+            let conversation = self.repo.get(user_id, conversation_id).await?;
+            Ok(conversation.is_some_and(|row| {
+                row.r#type == AgentType::Acp.serde_name()
+                    && serde_json::from_str::<serde_json::Value>(&row.extra)
+                        .ok()
+                        .and_then(|extra| extra.get("mock_has_acp_session").and_then(serde_json::Value::as_bool))
+                        .unwrap_or(false)
+            }))
+        }
+
+        async fn clear_context_anchor(&self, user_id: &str, conversation_id: &str) -> Result<bool, TeamError> {
+            if !self.supports_context_reset(user_id, conversation_id).await? {
+                return Ok(false);
+            }
+            self.patch_runtime_config(conversation_id, serde_json::json!({ "mock_acp_session_id": null }))
+                .await?;
+            Ok(true)
         }
 
         async fn warmup_agent_process(

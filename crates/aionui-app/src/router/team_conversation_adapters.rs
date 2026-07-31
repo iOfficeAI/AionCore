@@ -521,6 +521,20 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map_err(map_conversation_update_error)
     }
 
+    async fn supports_context_reset(&self, user_id: &str, conversation_id: &str) -> Result<bool, TeamError> {
+        self.conversation_service
+            .supports_acp_context_reset(user_id, conversation_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn clear_context_anchor(&self, user_id: &str, conversation_id: &str) -> Result<bool, TeamError> {
+        self.conversation_service
+            .clear_acp_context_anchor(user_id, conversation_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
     async fn warmup_agent_process(
         &self,
         user_id: &str,

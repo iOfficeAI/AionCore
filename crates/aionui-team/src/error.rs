@@ -50,6 +50,14 @@ pub enum TeamError {
         conversation_id: String,
     },
 
+    #[error("Team member does not support context reset: {slot_id}")]
+    MemberUnsupported {
+        team_id: String,
+        slot_id: String,
+        conversation_id: String,
+        backend: String,
+    },
+
     #[error("Workspace path is unavailable: {0}")]
     WorkspacePathUnavailable(String),
 

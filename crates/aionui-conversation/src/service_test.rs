@@ -1185,6 +1185,59 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
     }
 }
 
+#[tokio::test]
+async fn clear_acp_context_anchor_drops_only_the_resume_anchor() {
+    let runtime_state = PersistedSessionState {
+        current_mode_id: Some("full_auto".to_owned()),
+        current_model_id: Some("model-preserved".to_owned()),
+        ..Default::default()
+    };
+    let acp_session_repo = Arc::new(StubAcpSessionRepo {
+        create_calls: Mutex::new(Vec::new()),
+        runtime_state_saves: Mutex::new(Vec::new()),
+        session_id: Mutex::new(Some("session-to-clear".to_owned())),
+        runtime_state: Mutex::new(Some(runtime_state.clone())),
+    });
+    let (service, _broadcaster, _repo, _task_manager) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_session_repo.clone(),
+    );
+    let conversation = service.create("user_1", make_create_req()).await.unwrap();
+
+    assert!(
+        service
+            .supports_acp_context_reset("user_1", &conversation.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        service
+            .clear_acp_context_anchor("user_1", &conversation.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(*acp_session_repo.session_id.lock().unwrap(), None);
+    assert_eq!(*acp_session_repo.runtime_state.lock().unwrap(), Some(runtime_state));
+}
+
+#[tokio::test]
+async fn aionrs_conversation_does_not_support_acp_context_reset() {
+    let (service, _broadcaster, _repo, _task_manager) = make_service();
+    let request = serde_json::from_value(json!({
+        "type": "aionrs",
+        "extra": { "workspace": ensure_test_workspace_path() }
+    }))
+    .unwrap();
+    let conversation = service.create("user_1", request).await.unwrap();
+
+    assert!(
+        !service
+            .supports_acp_context_reset("user_1", &conversation.id)
+            .await
+            .unwrap()
+    );
+}
+
 fn make_service() -> (
     ConversationService,
     Arc<MockBroadcaster>,

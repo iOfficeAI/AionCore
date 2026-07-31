@@ -847,7 +847,7 @@ impl SlotWorkCoordinator {
             .slots
             .entry(slot_id.to_owned())
             .or_insert_with(|| SlotState::new(TeamRunTargetRole::Teammate));
-        if slot.active.is_some() {
+        if slot.active.is_some() || slot.queued_ids().next().is_some() {
             return Err(RuntimeRestartRejection::Busy);
         }
         match slot.runtime_constraint {

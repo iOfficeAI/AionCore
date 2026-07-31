@@ -95,6 +95,14 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 
     async fn get_config_options(&self, conversation_id: &str) -> Result<GetConfigOptionsResponse, TeamError>;
 
+    async fn supports_context_reset(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, TeamError> {
+        Ok(false)
+    }
+
+    async fn clear_context_anchor(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, TeamError> {
+        Ok(false)
+    }
+
     async fn warmup_agent_process(
         &self,
         user_id: &str,
@@ -375,19 +383,25 @@ impl TeamAgentProvisioner {
         agent: &TeamAgent,
         mcp_stdio_cfg: TeamMcpStdioConfig,
         task_manager: &Arc<dyn IWorkerTaskManager>,
+        kill_existing: bool,
     ) -> Result<(), TeamError> {
         let team_id = mcp_stdio_cfg.team_id.clone();
         let transport = self.team_tool_transport(user_id, agent).await?;
         match transport {
             TeamToolTransport::Mcp => {
-                self.write_team_mcp_runtime_config(user_id, agent, mcp_stdio_cfg)
+                self.write_team_mcp_runtime_config(user_id, agent, mcp_stdio_cfg, !kill_existing)
                     .await?
             }
-            TeamToolTransport::CliAssumed => self.write_team_cli_runtime_config(user_id, agent).await?,
+            TeamToolTransport::CliAssumed => {
+                self.write_team_cli_runtime_config(user_id, agent, !kill_existing)
+                    .await?
+            }
         }
-        task_manager
-            .kill_and_wait(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
-            .await;
+        if kill_existing {
+            task_manager
+                .kill_and_wait(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
+                .await;
+        }
         self.conversation_port
             .warmup_agent_process(user_id, &agent.conversation_id, task_manager)
             .await
@@ -462,14 +476,19 @@ impl TeamAgentProvisioner {
         user_id: &str,
         agent: &TeamAgent,
         mcp_stdio_cfg: TeamMcpStdioConfig,
+        preserve_session_mode: bool,
     ) -> Result<(), TeamError> {
         let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
         let agent_type = agent_type_for_backend(cli_metadata.as_ref(), &agent.backend)?;
         let session_mode = session_mode_for_backend(&agent.backend, agent_type, cli_metadata.as_ref());
-        let patch = serde_json::json!({
-            "team_mcp_stdio_config": mcp_stdio_cfg,
-            "session_mode": session_mode,
-        });
+        let patch = if preserve_session_mode {
+            serde_json::json!({ "team_mcp_stdio_config": mcp_stdio_cfg })
+        } else {
+            serde_json::json!({
+                "team_mcp_stdio_config": mcp_stdio_cfg,
+                "session_mode": session_mode,
+            })
+        };
         self.conversation_port
             .patch_runtime_config(&agent.conversation_id, patch)
             .await
@@ -485,14 +504,19 @@ impl TeamAgentProvisioner {
         &self,
         user_id: &str,
         agent: &TeamAgent,
+        preserve_session_mode: bool,
     ) -> Result<(), TeamError> {
         let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
         let agent_type = agent_type_for_backend(cli_metadata.as_ref(), &agent.backend)?;
         let session_mode = session_mode_for_backend(&agent.backend, agent_type, cli_metadata.as_ref());
-        let patch = serde_json::json!({
-            "team_mcp_stdio_config": null,
-            "session_mode": session_mode,
-        });
+        let patch = if preserve_session_mode {
+            serde_json::json!({ "team_mcp_stdio_config": null })
+        } else {
+            serde_json::json!({
+                "team_mcp_stdio_config": null,
+                "session_mode": session_mode,
+            })
+        };
         self.conversation_port
             .patch_runtime_config(&agent.conversation_id, patch)
             .await
@@ -1094,7 +1118,7 @@ mod tests {
         let provisioner = test_provisioner_with_patches(events, Arc::clone(&patches));
 
         provisioner
-            .write_team_cli_runtime_config("user-test", &test_agent())
+            .write_team_cli_runtime_config("user-test", &test_agent(), false)
             .await
             .unwrap();
 
@@ -1119,7 +1143,7 @@ mod tests {
 
         let attach = tokio::spawn(async move {
             provisioner
-                .attach_agent_process("user-1", &agent, test_mcp_config(), &task_manager)
+                .attach_agent_process("user-1", &agent, test_mcp_config(), &task_manager, true)
                 .await
         });
         while !*kill_started_rx.borrow() {
