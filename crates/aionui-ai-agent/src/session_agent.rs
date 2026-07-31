@@ -1315,6 +1315,28 @@ pub async fn build_session_instance(
         ..Default::default()
     };
 
+    // Ask claude for PLAINTEXT thinking. Current models resolve the thinking
+    // display to `omitted`, which streams signature-only thinking blocks whose
+    // text is empty — the reasoning then never reaches the UI at all. `summarized`
+    // is the only other value the CLI accepts (verified:
+    // @anthropic-ai/claude-agent-sdk 0.3.220 `sdk.d.ts` ThinkingEnabled /
+    // ThinkingAdaptive `display?: 'summarized' | 'omitted'`, serialized as
+    // `--thinking-display <value>`), and it yields a SUMMARY of the reasoning
+    // rather than raw chain-of-thought.
+    //
+    // Version-gated on the binary we actually resolved above: the flag is hidden
+    // (absent from `--help`) and older builds reject it at argument-parse time, so
+    // an ungated flag would make every session unspawnable. See `claude_flags`.
+    if backend_label == "claude"
+        && let Some(program) = session_config.cli_program.clone()
+        && crate::claude_flags::supports_thinking_display(&program).await
+    {
+        session_config
+            .extra_args
+            .extend(["--thinking-display".to_string(), "summarized".to_string()]);
+        tracing::info!(conv_id = %conversation_id, "claude: requesting summarized thinking display");
+    }
+
     // Spawn env (legacy spawn-surface parity, claude AND codex).
     session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
     if !session_config.spawn_env.is_empty() {

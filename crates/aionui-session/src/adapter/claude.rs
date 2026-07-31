@@ -350,10 +350,23 @@ impl ClaudeAdapter {
                     text: b.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
                 }),
                 "thinking" if streamed_thinking => {}
-                "thinking" => out.push(SessionEvent::ThoughtDelta {
-                    item_id: think_key.clone(),
-                    text: b.get("thinking").and_then(Value::as_str).unwrap_or("").to_string(),
-                }),
+                // A thinking block whose plaintext is absent carries only its
+                // encrypted `signature` — that is what the CLI emits whenever
+                // thinking display resolves to `omitted` (verified: claude 2.1.220,
+                // capture with/without `--thinking-display summarized`). An empty
+                // ThoughtDelta becomes a thinking card that expands to nothing, so
+                // drop it. The streaming path (parse_stream_event) already skips
+                // empty `thinking_delta`s; this mirrors that guard on the
+                // consolidated frame, which previously lacked it.
+                "thinking" => {
+                    let text = b.get("thinking").and_then(Value::as_str).unwrap_or("");
+                    if !text.is_empty() {
+                        out.push(SessionEvent::ThoughtDelta {
+                            item_id: think_key.clone(),
+                            text: text.to_string(),
+                        });
+                    }
+                }
                 "tool_use" => {
                     let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
                     // #486 (parity with aionrs output_sink): DROP a malformed empty-name
@@ -804,6 +817,14 @@ impl BackendAdapter for ClaudeAdapter {
             // later result TurnResult is absorbed by the reducer's I10.
             "--include-partial-messages".to_string(),
             "--replay-user-messages".to_string(),
+            // NOTE: `--thinking-display summarized` (ask for PLAINTEXT thinking —
+            // current models default the display to `omitted` and then stream
+            // signature-only thinking blocks) is NOT built here. It is version-gated
+            // and therefore supplied by the manager through `extra_args`
+            // (aionui-ai-agent `claude_flags`): the CLI rejects an unknown option at
+            // parse time, so passing it to an older PATH-resolved claude would kill
+            // the spawn outright. This crate is self-contained (aionui-process +
+            // aionui-common only) and cannot probe `--version` itself.
             // Feature 004 F3: enable the bidirectional control channel. With
             // `--permission-prompt-tool stdio`, claude emits a `control_request`
             // (subtype `can_use_tool`) on stdout and BLOCKS until the host writes
@@ -1769,6 +1790,114 @@ mod tests {
         });
         assert_eq!(think, Some(("msg_z:think".to_string(), "pondering".to_string())));
         assert_eq!(msg, Some(("msg_z:text".to_string(), "answer".to_string())));
+    }
+
+    /// A consolidated `thinking` block with NO plaintext (only its encrypted
+    /// `signature`) must emit NO ThoughtDelta. That is the exact shape the CLI
+    /// sends whenever thinking display resolves to `omitted` (live-probed on
+    /// claude 2.1.220: `thinking` is "" while `signature` is ~650 chars).
+    /// Emitting an empty delta produced a thinking card that expanded to nothing
+    /// — a whole column of them once the empty segments started being persisted.
+    /// The sibling text block must still come through untouched.
+    #[test]
+    fn consolidated_thinking_block_without_plaintext_emits_no_thought() {
+        let mut a = ClaudeAdapter::new();
+        let evs = a.parse_chunk(
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg_e","role":"assistant","content":[{"type":"thinking","thinking":"","signature":"ErUBCkYIBxgCKkC0"},{"type":"text","text":"answer"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        );
+        assert!(
+            !evs.iter().any(|e| matches!(e, SessionEvent::ThoughtDelta { .. })),
+            "an empty thinking block must not produce a ThoughtDelta, got: {evs:?}"
+        );
+        let msg = evs.iter().find_map(|e| match e {
+            SessionEvent::MessageDelta { item_id, text } => Some((item_id.clone(), text.clone())),
+            _ => None,
+        });
+        assert_eq!(msg, Some(("msg_e:text".to_string(), "answer".to_string())));
+    }
+
+    /// End-to-end on CAPTURED wire bytes: the frames a real `--thinking-display
+    /// summarized` turn emits must parse into a NON-empty ThoughtDelta. Frames are
+    /// verbatim from a live claude 2.1.220 capture (same flags the adapter spawns
+    /// with), trimmed to the thinking block. Guards the whole reason the flag is
+    /// passed — a parser that dropped this text would put us back to blank cards.
+    #[test]
+    fn captured_summarized_thinking_frames_yield_plaintext_thought() {
+        let mut a = ClaudeAdapter::new();
+        let evs = a.parse_chunk(
+            concat!(
+                r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_011CdZNE8pQQoWm1S5ytUj9a","role":"assistant"}}}"#,
+                "\n",
+                r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}}"#,
+                "\n",
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"17是质数，我只需检查它能","estimated_tokens":null}}}"#,
+                "\n",
+            )
+            .as_bytes(),
+        );
+        let think = evs.iter().find_map(|e| match e {
+            SessionEvent::ThoughtDelta { item_id, text } => Some((item_id.clone(), text.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            think,
+            Some((
+                "msg_011CdZNE8pQQoWm1S5ytUj9a:think".to_string(),
+                "17是质数，我只需检查它能".to_string()
+            ))
+        );
+        // The `content_block_start` carries an empty `thinking` too — it must not
+        // leak an extra blank delta ahead of the real text.
+        assert_eq!(
+            evs.iter()
+                .filter(|e| matches!(e, SessionEvent::ThoughtDelta { .. }))
+                .count(),
+            1
+        );
+    }
+
+    /// `--thinking-display` is version-gated and therefore manager-supplied, NOT
+    /// built here (an older PATH-resolved claude rejects it at parse time and the
+    /// spawn dies). Two things must hold: this crate never hardcodes it, and a
+    /// manager that DOES pass it gets it through to the wire verbatim.
+    #[tokio::test]
+    async fn thinking_display_is_manager_supplied_not_hardcoded() {
+        use crate::testing::FakeSpawner;
+
+        let spawn_with = |extra: Vec<String>| async move {
+            let spawner = FakeSpawner::new();
+            let adapter = ClaudeAdapter::new();
+            // FakeSpawner records the CommandSpec then Errs (it cannot make a real
+            // process) — the spec we assert on was already captured.
+            let _ = adapter
+                .start_turn(
+                    &spawner,
+                    &SessionSpec::Fresh("11111111-1111-4111-8111-111111111111".into()),
+                    None,
+                    &extra,
+                    &[],
+                    None,
+                )
+                .await;
+            spawner.last_command().await.expect("a spawn was recorded").args
+        };
+
+        let bare = spawn_with(Vec::new()).await;
+        assert!(
+            !bare.iter().any(|a| a == "--thinking-display"),
+            "the adapter must not hardcode a version-gated flag, got: {bare:?}"
+        );
+
+        let gated = spawn_with(vec!["--thinking-display".to_string(), "summarized".to_string()]).await;
+        let at = gated
+            .iter()
+            .position(|a| a == "--thinking-display")
+            .expect("a manager-supplied flag must reach the spawn");
+        assert_eq!(gated.get(at + 1).map(String::as_str), Some("summarized"));
     }
 
     /// H4 (design-vs-code gap audit, §5): `UsageDelta.total_tokens` MUST count the

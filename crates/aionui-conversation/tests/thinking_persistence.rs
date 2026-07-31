@@ -1,8 +1,9 @@
-//! Empty-thinking persistence: encrypted-thinking models (Opus 4.8+ / Claude 5
-//! family) emit thinking blocks with no plaintext. The segment must still be
-//! persisted (duration-only) and must round-trip through the real service read
-//! path (`list_messages`, i.e. GET /messages) so a reloaded conversation shows
-//! the same thinking cards and tool grouping the live WS stream did.
+//! Empty-thinking handling, end to end against a real SQLite DB: a thinking
+//! chunk that carries no text must be dropped by the relay, so it reaches
+//! neither the DB nor the real service read path (`list_messages`, i.e. GET
+//! /messages). Persisting such a segment is what filled a reloaded conversation
+//! with blank「思考完成 · 0秒」cards. Live and reload agree because NEITHER
+//! renders a card — the surrounding tool rows must survive untouched.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -103,7 +104,7 @@ fn tool_call(call_id: &str) -> AgentStreamEvent {
 }
 
 #[tokio::test]
-async fn empty_thinking_segment_round_trips_through_list_messages() {
+async fn empty_thinking_segment_is_dropped_before_persistence() {
     let db = init_database_memory().await.unwrap();
     let user_repo = SqliteUserRepository::new(db.pool().clone());
     let user = user_repo.create_user("user-1", "hash").await.unwrap();
@@ -140,8 +141,9 @@ async fn empty_thinking_segment_round_trips_through_list_messages() {
     );
     let rx = tx.subscribe();
 
-    // tool → encrypted (empty) thinking → tool: at runtime the thinking chip
-    // splits the two tool rows into separate groups.
+    // tool → contentless thinking → tool. The blank thought is dropped, so the
+    // two tool rows land in one group — the same grouping the live view shows,
+    // which is the parity that matters.
     tx.send(tool_call("tc-1")).unwrap();
     tx.send(AgentStreamEvent::Thinking(ThinkingEventData {
         content: String::new(),
@@ -177,12 +179,10 @@ async fn empty_thinking_segment_round_trips_through_list_messages() {
         .iter()
         .filter(|m| m.r#type == MessageType::Thinking)
         .collect();
-    assert_eq!(thinking.len(), 1, "empty thinking must survive the reload path");
-    assert_eq!(thinking[0].content["content"], "");
-    assert_eq!(thinking[0].content["status"], "done");
     assert!(
-        thinking[0].content["duration_ms"].is_u64(),
-        "duration must round-trip for the「思考完成 · N秒」card"
+        thinking.is_empty(),
+        "an empty thinking chunk must not reach the reload path at all — persisting \
+         it is what produced the column of blank「思考完成 · 0秒」cards; got: {thinking:?}"
     );
 
     let tool_rows = listed

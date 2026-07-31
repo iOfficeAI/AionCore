@@ -318,6 +318,25 @@ impl StreamRelay {
                                 continue;
                             }
 
+                            // POLICY — one place, every backend: a thinking chunk with no
+                            // text carries nothing to render, so it must never open a
+                            // segment. Letting it through mints a "thinking done · 0s" card
+                            // that expands to nothing, and once that segment is persisted the
+                            // user gets one such card per chunk on every reload.
+                            //
+                            // Backends manufacture empty thoughts from several INDEPENDENT
+                            // places — claude's consolidated `thinking` block, the ACP
+                            // `agent_thought_chunk` translate path, codex's `unwrap_or("")`
+                            // delta, aionrs `emit_thinking` — so guarding them one by one is
+                            // whack-a-mole. They all converge here.
+                            //
+                            // This also delivers the live/reload parity that
+                            // `persist_thinking_segment` used to chase by STORING the empty
+                            // row: both sides now agree, with no blank card on either.
+                            if data.content.is_empty() && data.subject.is_none() {
+                                continue;
+                            }
+
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
                             if !first_visible_output_logged && !data.content.is_empty() {
@@ -1748,11 +1767,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_persists_empty_thinking_segment_with_duration() {
-        // Encrypted-thinking models (Opus 4.8+ / Claude 5 family) emit thinking
-        // blocks with no plaintext. The empty segment must still land in the DB —
-        // it carries the duration and keeps reloaded tool groups split the same
-        // way the live WS stream showed them.
+    async fn run_drops_empty_thinking_segment_without_persisting() {
+        // A thinking chunk with no text must not open a segment at all: it has
+        // nothing to render, and persisting it is what produced the column of blank
+        // "thinking done · 0s" cards on reload. Live and reload agree because
+        // NEITHER shows a card — not because both show an empty one.
         use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 
         let repo = Arc::new(RecordingRepo::new());
@@ -1794,20 +1813,27 @@ mod tests {
 
         let inserts = repo.take_inserts();
         let thinking_msgs: Vec<_> = inserts.iter().filter(|msg| msg.r#type == "thinking").collect();
-        assert_eq!(thinking_msgs.len(), 1, "empty thinking segment must be persisted");
-        let content: serde_json::Value = serde_json::from_str(&thinking_msgs[0].content).unwrap();
-        assert_eq!(content["content"], "");
-        assert_eq!(content["status"], "done");
-        assert!(content["duration_ms"].is_u64(), "duration must be recorded");
+        assert!(
+            thinking_msgs.is_empty(),
+            "an empty thinking chunk must persist nothing, got: {thinking_msgs:?}"
+        );
+        // The tool row is untouched — dropping the blank thought must not swallow
+        // the real content that followed it.
+        assert_eq!(
+            inserts.iter().filter(|msg| msg.r#type == "tool_call").count(),
+            1,
+            "the tool row must still be persisted"
+        );
 
-        // The live stream still closes the card via a done frame.
-        let mut saw_done = false;
+        // Nothing thinking-shaped reaches the live stream either, so the reloaded
+        // view and the live view agree: no card on either side.
+        let mut thinking_frames = 0;
         while let Ok(evt) = ws_rx.try_recv() {
-            if evt.name == "message.stream" && evt.data["type"] == "thinking" && evt.data["data"]["status"] == "done" {
-                saw_done = true;
+            if evt.name == "message.stream" && evt.data["type"] == "thinking" {
+                thinking_frames += 1;
             }
         }
-        assert!(saw_done);
+        assert_eq!(thinking_frames, 0, "no thinking frame should reach the WebSocket");
     }
 
     #[tokio::test]

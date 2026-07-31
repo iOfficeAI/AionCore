@@ -379,12 +379,15 @@ impl StreamPersistenceAdapter {
 
     #[tracing::instrument(skip_all)]
     pub async fn persist_thinking_segment(&self, segment: ThinkingSegmentState, duration_ms: u64) {
-        // Deliberately persisted even when the buffer is empty: encrypted-thinking
-        // models (Opus 4.8+ / the Claude 5 family) return thinking blocks with no
-        // plaintext, so the segment's only payload is its duration. The empty row
-        // keeps GET /messages consistent with the live WS view — the thinking card
-        // (with duration) survives a reload, and consecutive tool rows stay split
-        // into the same groups the user saw while streaming.
+        // An empty segment should no longer be reachable: StreamRelay drops a
+        // thinking chunk that has no text before it can open one (see the POLICY
+        // note there). This stays as the second line of defense — persisting a
+        // contentless row is what put a column of blank "thinking done · 0s" cards
+        // into the reloaded view, so the storage layer refuses it too rather than
+        // trusting every future caller to have filtered upstream.
+        if segment.buffer.is_empty() {
+            return;
+        }
         if !self.allows_write(RuntimeWriteKind::AssistantThinkingFinalize) {
             return;
         }
