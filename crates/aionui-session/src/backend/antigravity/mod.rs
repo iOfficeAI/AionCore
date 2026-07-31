@@ -9,5 +9,9 @@
 //! Wire shapes here are verified against captured samples in
 //! `~/aion/protocols/samples/antigravity-cli/1.1.8/`.
 
+mod argv;
+mod conn;
 mod translate;
 mod wire;
+
+pub use conn::{AntigravityConnection, AntigravitySessionBackend, antigravity_capabilities};

@@ -8,9 +8,9 @@
 //! self-updates), and an unrecognised value must degrade — never abort the
 //! stream mid-turn.
 
-// The parsed types have no production consumer yet — the translator that turns
-// them into `SessionEvent`s lands next. Remove this once that translator (and
-// the connection built on it) reads these fields.
+// Fields with no consumer yet are kept deliberately: this module is the record
+// of agy's wire contract, and dropping a field would lose that documentation
+// the next time someone needs it.
 #![allow(dead_code)]
 
 use serde::Deserialize;

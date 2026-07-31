@@ -1,0 +1,471 @@
+//! `AntigravityConnection` / `AntigravitySessionBackend` — the direct-CLI
+//! backend for the `agy` CLI.
+//!
+//! Shape: ONE PROCESS PER TURN. Unlike the claude lane (a persistent process
+//! fed through a retained stdin FIFO), agy has no `--input-format`, so a turn
+//! is a complete `agy -p …` invocation that exits when the turn ends.
+//! Continuity across turns comes from `--conversation <id>`, which agy resumes
+//! from its own on-disk store; the id arrives in the `init` frame and is kept
+//! as this session's resume anchor.
+//!
+//! Consequences of that shape:
+//! - `open_session` spawns NOTHING. It only registers the session; the first
+//!   process appears on the first `Send`.
+//! - There is no mid-turn steering wire (agy ignores stdin once running —
+//!   verified), so `supported_commands.steer` is false.
+//! - `Cancel` kills the process; the turn's own `result` frame may never
+//!   arrive, so the reader synthesizes the terminal event on exit.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use aionui_common::CommandSpec;
+use aionui_process::Spawner;
+use futures_util::stream::BoxStream;
+use tokio::sync::{Mutex, broadcast};
+
+use super::argv::{ArgvInput, build_argv};
+use super::translate::Translator;
+use super::wire::parse_line;
+use crate::backend::types::{
+    Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, SessionEnvelope, SessionSpec,
+};
+use crate::backend::{BackendConnection, SessionBackend, SessionConfig};
+use crate::capability::{BlockSet, Capabilities, CapabilityTier, CommandSet, PromptAcceptedSource, SignalSet};
+use crate::event::{SessionEvent, TurnOutcome};
+
+/// Broadcast backlog for a session's event stream. Matches the other backends:
+/// large enough that a slow subscriber does not lose a turn's worth of frames.
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// agy's declared capability surface.
+pub fn antigravity_capabilities() -> Capabilities {
+    Capabilities {
+        tier: CapabilityTier::Parsed,
+        emits: SignalSet {
+            heartbeat: false,
+            tool_lifecycle: true,
+            terminal_result: true,
+        },
+        supported_commands: CommandSet {
+            // agy ignores stdin once a turn is running, so there is no wire to
+            // steer through. Queueing for the NEXT turn is a separate axis.
+            steer: false,
+            cancel_tool: false,
+            answer_permission: true,
+            answer_auth: false,
+            acknowledge: true,
+            set_mode: true,
+            set_model: true,
+            rewind: false,
+            list_checkpoints: false,
+            query_session_info: false,
+        },
+        prompt_blocks: BlockSet {
+            text: true,
+            // `agy -p` takes a text prompt only — it has no image input flag.
+            image: false,
+            audio: false,
+            resource: false,
+            at_mention: false,
+        },
+        // agy has no prompt-ack frame; the backend synthesizes one.
+        prompt_accepted: PromptAcceptedSource::Synthesized,
+        ..Default::default()
+    }
+}
+
+/// Connection-level factory. agy is 1:1 (one process per turn, one logical
+/// session per backend handle), so this only carries the injected spawner.
+pub struct AntigravityConnection {
+    spawner: Arc<dyn Spawner>,
+}
+
+impl AntigravityConnection {
+    pub fn new(spawner: Arc<dyn Spawner>) -> Self {
+        Self { spawner }
+    }
+}
+
+#[async_trait::async_trait]
+impl BackendConnection for AntigravityConnection {
+    async fn open_session(
+        &self,
+        spec: SessionSpec,
+        config: SessionConfig,
+    ) -> Result<Arc<dyn SessionBackend>, BackendError> {
+        // No process is spawned here: agy has nothing to keep alive between
+        // turns. Resume simply pre-seeds the anchor the next `Send` will pass
+        // through `--conversation`.
+        let (session_id, anchor) = match spec {
+            SessionSpec::Fresh { session_id } => (session_id, None),
+            SessionSpec::Resume {
+                session_id,
+                backend_session_id,
+            } => (session_id, backend_session_id),
+        };
+        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        Ok(Arc::new(AntigravitySessionBackend {
+            session_id,
+            config,
+            spawner: Arc::clone(&self.spawner),
+            event_tx,
+            turn_gen: AtomicU64::new(0),
+            anchor: Arc::new(Mutex::new(anchor)),
+            current: Arc::new(Mutex::new(None)),
+        }))
+    }
+
+    async fn close_session(&self, _session_id: &str) -> Result<(), BackendError> {
+        // Nothing to unbind: a session owns no transport between turns.
+        Ok(())
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        antigravity_capabilities()
+    }
+}
+
+pub struct AntigravitySessionBackend {
+    session_id: String,
+    config: SessionConfig,
+    spawner: Arc<dyn Spawner>,
+    event_tx: broadcast::Sender<SessionEnvelope>,
+    turn_gen: AtomicU64,
+    /// agy conversation id to resume with. Set from the first `init` frame and
+    /// kept for every later turn.
+    anchor: Arc<Mutex<Option<String>>>,
+    /// The in-flight turn's process, retained so `Cancel` / `terminate` can
+    /// reach it. `None` between turns — that is the normal resting state.
+    current: Arc<Mutex<Option<Arc<aionui_process::ManagedProcess>>>>,
+}
+
+impl AntigravitySessionBackend {
+    /// Flatten a prompt into the single text argument `agy -p` accepts.
+    /// Non-text blocks are dropped: `prompt_blocks` advertises text only, so
+    /// the conversation layer never sends them.
+    fn prompt_text(content: &[ContentBlock]) -> String {
+        content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn emit(&self, turn_gen: u64, event: SessionEvent) {
+        // A send error just means nobody is subscribed yet; the reducer is
+        // driven by whoever holds `events()`, so this is not fatal.
+        let _ = self.event_tx.send(SessionEnvelope {
+            session_id: self.session_id.clone(),
+            turn_gen,
+            event,
+        });
+    }
+
+    async fn start_turn(&self, content: Vec<ContentBlock>) -> Result<u64, BackendError> {
+        let turn_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let input = ArgvInput {
+            prompt: Self::prompt_text(&content),
+            resume_conversation_id: self.anchor.lock().await.clone(),
+            workspace: self.config.cwd.clone(),
+            model: self.config.model.clone(),
+            mode: self.config.mode.clone(),
+        };
+        let spec = CommandSpec {
+            command: self
+                .config
+                .cli_program
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("agy")),
+            args: build_argv(&input),
+            env: self.config.spawn_env.clone(),
+            cwd: self.config.cwd.clone(),
+        };
+
+        let proc = self
+            .spawner
+            .spawn(spec, &[], &self.session_id)
+            .await
+            .map_err(|e| BackendError::Transport(format!("spawn agy: {e}")))?;
+        *self.current.lock().await = Some(Arc::clone(&proc));
+
+        self.spawn_reader(Arc::clone(&proc), turn_gen);
+        Ok(turn_gen)
+    }
+
+    /// Drain the process's stdout, translating each NDJSON line, and close the
+    /// turn out when the process exits.
+    fn spawn_reader(&self, proc: Arc<aionui_process::ManagedProcess>, turn_gen: u64) {
+        let event_tx = self.event_tx.clone();
+        let session_id = self.session_id.clone();
+        // The SESSION's anchor, not a fresh one: the id agy reports in `init`
+        // is what the NEXT turn must pass through `--conversation`, so it has
+        // to outlive this reader task.
+        let anchor = Arc::clone(&self.anchor);
+        let current = Arc::clone(&self.current);
+
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+
+            let mut translator = Translator::default();
+            let mut saw_terminal = false;
+
+            if let Some((_stdin, stdout)) = proc.take_stdio().await {
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let Some(ev) = parse_line(&line) else { continue };
+                    for out in translator.translate(ev) {
+                        if matches!(out, SessionEvent::TurnResult { .. }) {
+                            saw_terminal = true;
+                        }
+                        let _ = event_tx.send(SessionEnvelope {
+                            session_id: session_id.clone(),
+                            turn_gen,
+                            event: out,
+                        });
+                    }
+                }
+            }
+
+            if let Some(id) = translator.backend_session_id() {
+                *anchor.lock().await = Some(id.to_owned());
+            }
+            if translator.model_fallback_detected() {
+                // agy drops an unusable `--model` silently: no error, no stderr
+                // line. Without this the user just gets answers from a model
+                // they did not choose.
+                tracing::warn!(
+                    session_id = %session_id,
+                    "agy ignored the requested model and fell back to its default"
+                );
+            } else if let Some(model) = translator.current_model() {
+                tracing::debug!(session_id = %session_id, model = %model, "agy turn model confirmed");
+            }
+
+            // A cancelled or crashed run exits without emitting `result`; the
+            // FSM still needs a terminal, so synthesize one from the exit.
+            if !saw_terminal {
+                let exit = proc.wait_for_exit().await;
+                let ok = exit.map(|s| s.success()).unwrap_or(false);
+                let _ = event_tx.send(SessionEnvelope {
+                    session_id: session_id.clone(),
+                    turn_gen,
+                    event: SessionEvent::TurnResult {
+                        is_error: !ok,
+                        api_error_status: None,
+                        result_text: if ok {
+                            String::new()
+                        } else {
+                            proc.peek_stderr_tail(20).await
+                        },
+                        epoch: 0,
+                        outcome: if ok { TurnOutcome::EndTurn } else { TurnOutcome::Failed },
+                    },
+                });
+            }
+            // The turn owns no process any more; leaving a dead handle here
+            // would make a later Cancel try to kill an exited pid.
+            let mut slot = current.lock().await;
+            if slot.as_ref().is_some_and(|p| Arc::ptr_eq(p, &proc)) {
+                *slot = None;
+            }
+        });
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionBackend for AntigravitySessionBackend {
+    async fn dispatch(&self, command: Command) -> Result<CommandReceipt, BackendError> {
+        match command {
+            Command::Send { content, .. } => {
+                let turn_gen = self.start_turn(content).await?;
+                // agy has no prompt-ack frame of its own.
+                self.emit(
+                    turn_gen,
+                    SessionEvent::PromptAccepted {
+                        client_msg_id: String::new(),
+                    },
+                );
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::Started,
+                    turn_gen,
+                })
+            }
+            Command::Cancel { target } => {
+                if matches!(target, CancelTarget::Tool { .. }) {
+                    return Err(BackendError::CommandNotSupported { command: "cancel_tool" });
+                }
+                self.terminate().await;
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::Started,
+                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                })
+            }
+            Command::Acknowledge { .. } => Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::Started,
+                turn_gen: self.turn_gen.load(Ordering::SeqCst),
+            }),
+            // Mode/model are spawn-time flags for agy: there is no live process
+            // to reconfigure, so the next turn simply picks up the new value.
+            Command::SetMode { .. } | Command::SetModel { .. } => Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::Started,
+                turn_gen: self.turn_gen.load(Ordering::SeqCst),
+            }),
+            Command::Steer { .. } => Err(BackendError::CommandNotSupported { command: "steer" }),
+            Command::Rewind { .. } => Err(BackendError::CommandNotSupported { command: "rewind" }),
+            Command::AnswerAuth { .. } => Err(BackendError::CommandNotSupported { command: "answer_auth" }),
+            _ => Err(BackendError::CommandNotSupported { command: "unsupported" }),
+        }
+    }
+
+    fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+        let rx = self.event_tx.subscribe();
+        Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(env) => return Some((env, rx)),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        }))
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        antigravity_capabilities()
+    }
+
+    async fn terminate(&self) {
+        if let Some(proc) = self.current.lock().await.take() {
+            let _ = proc.kill(std::time::Duration::from_secs(2)).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::types::CommandMeta;
+    use crate::testing::FakeSpawner;
+
+    fn config(cwd: &str) -> SessionConfig {
+        SessionConfig {
+            cwd: Some(cwd.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    async fn open(spawner: Arc<FakeSpawner>, spec: SessionSpec) -> Arc<dyn SessionBackend> {
+        AntigravityConnection::new(spawner)
+            .open_session(spec, config("/w"))
+            .await
+            .expect("open_session must not fail — agy spawns nothing until the first turn")
+    }
+
+    fn send(text: &str) -> Command {
+        Command::Send {
+            content: vec![ContentBlock::Text(text.to_owned())],
+            metadata: CommandMeta::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_session_spawns_nothing() {
+        // agy has no process to keep alive between turns; spawning at open
+        // time would burn a process (and ~6s of startup) for nothing.
+        let spawner = Arc::new(FakeSpawner::new());
+        let _backend = open(
+            Arc::clone(&spawner),
+            SessionSpec::Fresh {
+                session_id: "conv-1".into(),
+            },
+        )
+        .await;
+        assert_eq!(spawner.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn send_spawns_agy_through_the_injected_spawner() {
+        let spawner = Arc::new(FakeSpawner::new());
+        let backend = open(
+            Arc::clone(&spawner),
+            SessionSpec::Fresh {
+                session_id: "conv-1".into(),
+            },
+        )
+        .await;
+
+        // FakeSpawner records the CommandSpec then errors (it cannot produce a
+        // real process), so the dispatch surfaces Transport — the point of this
+        // test is that the spawn went through the INJECTED spawner at all.
+        let err = backend.dispatch(send("hello")).await.expect_err("fake spawner errors");
+        assert!(matches!(err, BackendError::Transport(_)));
+        assert_eq!(spawner.call_count(), 1);
+
+        let spec = spawner.last_command().await.expect("recorded");
+        assert_eq!(spec.command, std::path::PathBuf::from("agy"));
+        assert!(spec.args.contains(&"-p".to_string()));
+        assert!(spec.args.contains(&"hello".to_string()));
+        assert!(spec.args.contains(&"--dangerously-skip-permissions".to_string()));
+        assert_eq!(spec.cwd.as_deref(), Some("/w"));
+    }
+
+    #[tokio::test]
+    async fn resume_seeds_the_conversation_flag_on_the_next_turn() {
+        let spawner = Arc::new(FakeSpawner::new());
+        let backend = open(
+            Arc::clone(&spawner),
+            SessionSpec::Resume {
+                session_id: "conv-1".into(),
+                backend_session_id: Some("agy-conv-9".into()),
+            },
+        )
+        .await;
+
+        let _ = backend.dispatch(send("again")).await;
+        let spec = spawner.last_command().await.expect("recorded");
+        let idx = spec
+            .args
+            .iter()
+            .position(|a| a == "--conversation")
+            .expect("resume must pass --conversation");
+        assert_eq!(spec.args[idx + 1], "agy-conv-9");
+    }
+
+    #[tokio::test]
+    async fn steering_is_rejected_because_agy_ignores_stdin_mid_turn() {
+        let backend = open(
+            Arc::new(FakeSpawner::new()),
+            SessionSpec::Fresh {
+                session_id: "conv-1".into(),
+            },
+        )
+        .await;
+        let err = backend
+            .dispatch(Command::Steer {
+                content: vec![ContentBlock::Text("stop".into())],
+            })
+            .await
+            .expect_err("steer must not be silently accepted");
+        assert!(matches!(err, BackendError::CommandNotSupported { command: "steer" }));
+    }
+
+    #[test]
+    fn capabilities_reflect_the_one_process_per_turn_shape() {
+        let c = antigravity_capabilities();
+        assert!(!c.supported_commands.steer, "agy ignores stdin mid-turn");
+        assert!(c.supported_commands.answer_permission, "the hook bridge answers");
+        assert!(c.supported_commands.set_mode && c.supported_commands.set_model);
+        assert!(!c.supported_commands.rewind);
+        assert!(c.prompt_blocks.text);
+        assert!(!c.prompt_blocks.image, "`agy -p` has no image input");
+        assert_eq!(c.prompt_accepted, PromptAcceptedSource::Synthesized);
+    }
+}
