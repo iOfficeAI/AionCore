@@ -434,6 +434,9 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
             label,
             status,
             parent_ref,
+            // Container kind is a pump-side (suppression-roster) concern; the
+            // reducer's display roster tracks every subagent regardless of kind.
+            kind: _,
         } => {
             let mut to = state.clone();
             if let SessionState::Running { subagents, .. } = &mut to {
@@ -1787,6 +1790,7 @@ mod tests {
             label: None,
             status,
             parent_ref: parent.map(Into::into),
+            kind: None,
         }
     }
 
@@ -2193,6 +2197,7 @@ mod proptest_totality {
                 label: None,
                 status,
                 parent_ref: None,
+                kind: None,
             }),
             Just(SessionEvent::ItemStarted {
                 item_id: "i".into(),

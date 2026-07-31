@@ -152,9 +152,11 @@ async fn run_backend_parity(backend: &str, prompt: &str) {
                 terminal = Some(ftype.to_owned());
             }
             // Best-effort auto-approval so a permission request can't wedge the turn.
+            // call_id contract = `tool_call.tool_call_id` (see auto_confirm_permissions).
             if ftype.contains("permission") {
-                let call_id = f["data"]["data"]["call_id"]
+                let call_id = f["data"]["data"]["tool_call"]["tool_call_id"]
                     .as_str()
+                    .or_else(|| f["data"]["data"]["call_id"].as_str())
                     .or_else(|| f["data"]["data"]["request_id"].as_str())
                     .or_else(|| f["data"]["msg_id"].as_str())
                     .unwrap_or_default()
@@ -370,4 +372,395 @@ async fn live_claude_ws_http_parity() {
 #[ignore = "spawns the real codex CLI; needs credentials"]
 async fn live_codex_ws_http_parity() {
     run_backend_parity("codex", PROMPT).await;
+}
+
+/// The prompt shape the 2.1.220 interrupt probe proved launches a non-blocking
+/// background workflow whose launch turn ends while the workflow flies (RUN A,
+/// samples/claude-cli/2.1.220/_probe_workflow_interrupt.py) — exactly the state
+/// where the pump suppresses the launch Finish and holds the turn open.
+const WORKFLOW_PROMPT: &str = "用 Workflow 工具启动一个 workflow：一个 phase，一个 agent，\
+    单纯执行 sleep 90（睡 90 秒）。用后台方式启动（run_in_background），\
+    启动拿到 task id 后立刻回复我「已启动」，不要等待它完成。";
+
+/// Auto-approve every permission frame in `snapshot` not already confirmed —
+/// same best-effort logic as `run_backend_parity`, so a default-mode Workflow
+/// launch (or its Bash) can't wedge the flight phase.
+async fn auto_confirm_permissions(app: &LiveApp, conv_id: &str, snapshot: &[Value], confirmed: &mut BTreeSet<String>) {
+    for f in stream_frames_for(snapshot, conv_id) {
+        let ftype = f["data"]["type"].as_str().unwrap_or("");
+        if !ftype.contains("permission") {
+            continue;
+        }
+        // The confirm contract (MessageAcpPermission.tsx): call_id = the acp_permission
+        // frame's `tool_call.tool_call_id` — the claude control_request id the backend
+        // keyed the pending permission by. The msg_id fallback exists only for exotic
+        // frames; answering with it yields "no pending permission" and wedges the turn.
+        let call_id = f["data"]["data"]["tool_call"]["tool_call_id"]
+            .as_str()
+            .or_else(|| f["data"]["data"]["call_id"].as_str())
+            .or_else(|| f["data"]["data"]["request_id"].as_str())
+            .or_else(|| f["data"]["msg_id"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        if call_id.is_empty() || !confirmed.insert(call_id.clone()) {
+            continue;
+        }
+        let option = f["data"]["data"]["options"][0].clone();
+        println!("[wf-cancel] auto-confirming permission {call_id}: {option}");
+        let resp = http_json(
+            app,
+            "POST",
+            &format!("/api/conversations/{conv_id}/confirmations/{call_id}/confirm"),
+            json!({
+                "msg_id": f["data"]["msg_id"],
+                "data": option.get("optionId").cloned().unwrap_or(option),
+            }),
+        )
+        .await;
+        println!("[wf-cancel] confirm response: {resp}");
+    }
+}
+
+/// LIVE guard for the OTHER side of the cancel-drain settlement branch: a
+/// workflow left to complete NATURALLY must still deliver its completion
+/// message and terminal Finish (`Completed` drain waits for the CLI's real
+/// terminal result — settling there would break the relay before the
+/// completion message lands), and the conversation must answer a follow-up.
+/// Companion to `live_claude_workflow_cancel_recovers_conversation`.
+#[tokio::test]
+#[ignore = "spawns the real claude CLI; needs credentials"]
+async fn live_claude_workflow_natural_completion_still_finishes() {
+    // Pump-level diagnostics (suppression / roster / settlement) — the WS stream
+    // drops SubagentUpdate, so the roster story is only visible in tracing.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "aionui_ai_agent=debug,aionui_session=info",
+        ))
+        .try_init();
+    let app = start_live_app().await;
+
+    let ws_dir = std::env::temp_dir().join(format!("live-wf-natural-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/conversations",
+        json!({
+            "type": "acp",
+            "extra": {"workspace": ws_dir.to_string_lossy(), "backend": "claude"}
+        }),
+    )
+    .await;
+    let conv_id = created["data"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("conversation create failed: {created}"))
+        .to_owned();
+    println!("[wf-natural] conversation {conv_id} workspace {}", ws_dir.display());
+
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+
+    // Short sleep so natural completion lands well inside the pump window.
+    let sent = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "用 Workflow 工具启动一个 workflow：一个 phase，一个 agent，\
+            单纯执行 sleep 20（睡 20 秒）。用后台方式启动（run_in_background），\
+            启动拿到 task id 后立刻回复我「已启动」，不要等待它完成。"}),
+    )
+    .await;
+    assert!(sent["data"]["turn_id"].is_string(), "send failed: {sent}");
+
+    let mut confirmed: BTreeSet<String> = BTreeSet::new();
+
+    // Flight must establish first (suppression engaged): tool + text, no finish.
+    let started = Instant::now();
+    let (mut saw_text, mut saw_tool) = (false, false);
+    while started.elapsed() < Duration::from_secs(150) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        auto_confirm_permissions(&app, &conv_id, &snapshot, &mut confirmed).await;
+        for f in stream_frames_for(&snapshot, &conv_id) {
+            match f["data"]["type"].as_str().unwrap_or("") {
+                "text" | "content" => saw_text = true,
+                "tool_call" | "acp_tool_call" => saw_tool = true,
+                "finish" => panic!("[wf-natural] finish before flight established — suppression did not engage"),
+                _ => {}
+            }
+        }
+        if saw_text && saw_tool {
+            break;
+        }
+    }
+    assert!(
+        saw_text && saw_tool,
+        "[wf-natural] no workflow flight within 150s (text={saw_text} tool={saw_tool})"
+    );
+    let text_bytes_at_flight: usize = {
+        let snapshot = frames.lock().unwrap().clone();
+        stream_frames_for(&snapshot, &conv_id)
+            .iter()
+            .filter(|f| matches!(f["data"]["type"].as_str(), Some("text") | Some("content")))
+            .map(|f| f["data"]["data"]["content"].as_str().unwrap_or("").len())
+            .sum()
+    };
+    println!(
+        "[wf-natural] flight established after {:?}; waiting for NATURAL completion",
+        started.elapsed()
+    );
+
+    // No cancel: the workflow sleeps 20s, completes, and the CLI's terminal
+    // result must close the turn (2.1.176 invariant, unbroken by the fix).
+    let mut finished: Option<Duration> = None;
+    while started.elapsed() < Duration::from_secs(240) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        auto_confirm_permissions(&app, &conv_id, &snapshot, &mut confirmed).await;
+        if stream_frames_for(&snapshot, &conv_id)
+            .iter()
+            .any(|f| f["data"]["type"] == "finish")
+        {
+            finished = Some(started.elapsed());
+            break;
+        }
+    }
+    if finished.is_none() {
+        // Dump the full stream trace before failing so the wedge is diagnosable.
+        let snapshot = frames.lock().unwrap().clone();
+        for f in stream_frames_for(&snapshot, &conv_id) {
+            let d = &f["data"];
+            println!(
+                "  [{}] msg_id={} {}",
+                d["type"].as_str().unwrap_or("?"),
+                d["msg_id"].as_str().unwrap_or("?"),
+                d["data"].to_string().chars().take(160).collect::<String>()
+            );
+        }
+        panic!("[wf-natural] workflow turn never finished naturally within 240s");
+    }
+    let finished = finished.unwrap();
+    let text_bytes_at_end: usize = {
+        let snapshot = frames.lock().unwrap().clone();
+        stream_frames_for(&snapshot, &conv_id)
+            .iter()
+            .filter(|f| matches!(f["data"]["type"].as_str(), Some("text") | Some("content")))
+            .map(|f| f["data"]["data"]["content"].as_str().unwrap_or("").len())
+            .sum()
+    };
+    assert!(
+        text_bytes_at_end > text_bytes_at_flight,
+        "[wf-natural] no completion message streamed after the launch reply \
+         ({text_bytes_at_flight}B → {text_bytes_at_end}B) — the relay closed too early"
+    );
+    println!(
+        "[wf-natural] ✅ natural completion finished in {finished:?} (launch {text_bytes_at_flight}B → total {text_bytes_at_end}B)"
+    );
+
+    // Next turn must open normally (TurnStarted state reset is per-turn only).
+    let pre = frames.lock().unwrap().len();
+    let follow_at = Instant::now();
+    let sent2 = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "只回两个字：在的"}),
+    )
+    .await;
+    assert!(sent2["data"]["turn_id"].is_string(), "follow-up rejected: {sent2}");
+    let mut follow_done = false;
+    while follow_at.elapsed() < Duration::from_secs(90) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        if stream_frames_for(&snapshot[pre..], &conv_id)
+            .iter()
+            .any(|f| f["data"]["type"] == "finish")
+        {
+            follow_done = true;
+            break;
+        }
+    }
+    assert!(follow_done, "[wf-natural] follow-up turn did not finish within 90s");
+    println!("[wf-natural] ✅ follow-up turn finished in {:?}", follow_at.elapsed());
+}
+
+/// LIVE regression test for ELECTRON-3RP/3RW: cancelling a turn held open by an
+/// in-flight workflow must settle the suppressed launch Finish from the
+/// `Interrupted` drain (seconds), NOT via the 15s UserCancelTimeout watchdog —
+/// and the conversation must accept and answer a follow-up message afterwards.
+/// Drives the app exactly as the frontend does: REST send → WS stream → REST
+/// cancel (turn_id from the send response) → REST send again.
+#[tokio::test]
+#[ignore = "spawns the real claude CLI; needs credentials"]
+async fn live_claude_workflow_cancel_recovers_conversation() {
+    // Pump + backend diagnostics (suppression / roster / permission answers).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "aionui_ai_agent=debug,aionui_session=debug",
+        ))
+        .try_init();
+    let app = start_live_app().await;
+
+    let ws_dir = std::env::temp_dir().join(format!("live-wf-cancel-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/conversations",
+        json!({
+            "type": "acp",
+            "extra": {"workspace": ws_dir.to_string_lossy(), "backend": "claude"}
+        }),
+    )
+    .await;
+    let conv_id = created["data"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("conversation create failed: {created}"))
+        .to_owned();
+    println!("[wf-cancel] conversation {conv_id} workspace {}", ws_dir.display());
+
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+
+    let sent = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": WORKFLOW_PROMPT}),
+    )
+    .await;
+    let turn_id = sent["data"]["turn_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("send failed: {sent}"))
+        .to_owned();
+    println!("[wf-cancel] workflow prompt sent, turn {turn_id}");
+
+    let mut confirmed: BTreeSet<String> = BTreeSet::new();
+
+    // ---- Phase 1: wait until the workflow flight is established ----
+    // Evidence: a tool_call streamed (the Workflow launch) AND launch reply text
+    // streamed, with NO finish — the turn is being held open by the suppressed
+    // launch Finish. A finish here means no workflow launched (model variance /
+    // launch failure) and the scenario precondition is not met.
+    let started = Instant::now();
+    let (mut saw_text, mut saw_tool) = (false, false);
+    while started.elapsed() < Duration::from_secs(150) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        auto_confirm_permissions(&app, &conv_id, &snapshot, &mut confirmed).await;
+        for f in stream_frames_for(&snapshot, &conv_id) {
+            match f["data"]["type"].as_str().unwrap_or("") {
+                "text" | "content" => saw_text = true,
+                "tool_call" | "acp_tool_call" => saw_tool = true,
+                "finish" => panic!(
+                    "[wf-cancel] turn finished BEFORE cancel — the workflow did not hold the turn open \
+                     (launch failed or model declined); scenario precondition not met"
+                ),
+                _ => {}
+            }
+        }
+        if saw_text && saw_tool {
+            break;
+        }
+    }
+    assert!(
+        saw_text && saw_tool,
+        "[wf-cancel] no workflow flight within 150s (text={saw_text} tool={saw_tool})"
+    );
+    println!(
+        "[wf-cancel] flight established after {:?}; consolidating 8s",
+        started.elapsed()
+    );
+    // Let the workflow's sub-agent actually start (2.1.176: ~6s after the task),
+    // still asserting the turn stays open.
+    let consolidate = Instant::now();
+    while consolidate.elapsed() < Duration::from_secs(8) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        auto_confirm_permissions(&app, &conv_id, &snapshot, &mut confirmed).await;
+        if stream_frames_for(&snapshot, &conv_id)
+            .iter()
+            .any(|f| f["data"]["type"] == "finish")
+        {
+            panic!("[wf-cancel] turn finished during flight consolidation — precondition not met");
+        }
+    }
+
+    // ---- Phase 2: cancel, exactly as the frontend does ----
+    let pre_cancel = frames.lock().unwrap().len();
+    let cancel_at = Instant::now();
+    let resp = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/cancel"),
+        json!({"turn_id": turn_id}),
+    )
+    .await;
+    println!("[wf-cancel] cancel response: {resp}");
+    assert_eq!(resp["success"], json!(true), "cancel must be accepted: {resp}");
+
+    // The Interrupted drain must settle the owed Finish on the MAIN path. Before
+    // the fix this frame only arrived via the 15s UserCancelTimeout force-kill;
+    // the 12s deadline is deliberately INSIDE the watchdog window so a watchdog
+    // rescue cannot masquerade as a pass.
+    let mut settle: Option<Duration> = None;
+    while cancel_at.elapsed() < Duration::from_secs(12) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        if stream_frames_for(&snapshot[pre_cancel..], &conv_id)
+            .iter()
+            .any(|f| f["data"]["type"] == "finish")
+        {
+            settle = Some(cancel_at.elapsed());
+            break;
+        }
+    }
+    let settle = settle.unwrap_or_else(|| {
+        panic!("[wf-cancel] no finish within 12s of cancel — turn is wedged (watchdog would fire at 15s)")
+    });
+    println!("[wf-cancel] ✅ cancel settled the turn in {settle:?} (main path, not the 15s watchdog)");
+
+    // ---- Phase 3: the conversation must answer a follow-up ----
+    let pre_recovery = frames.lock().unwrap().len();
+    let recovery_at = Instant::now();
+    let sent2 = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "只回两个字：在的"}),
+    )
+    .await;
+    assert!(
+        sent2["data"]["turn_id"].is_string(),
+        "follow-up send must be admitted (gate recovered): {sent2}"
+    );
+    let mut reply_text = String::new();
+    let mut recovered: Option<Duration> = None;
+    while recovery_at.elapsed() < Duration::from_secs(90) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        let mut finished = false;
+        for f in stream_frames_for(&snapshot[pre_recovery..], &conv_id) {
+            match f["data"]["type"].as_str().unwrap_or("") {
+                "text" | "content" => reply_text.push_str(f["data"]["data"]["content"].as_str().unwrap_or("")),
+                "finish" => finished = true,
+                _ => {}
+            }
+        }
+        if finished {
+            recovered = Some(recovery_at.elapsed());
+            break;
+        }
+        reply_text.clear(); // re-aggregated from the snapshot each round
+    }
+    let recovered =
+        recovered.unwrap_or_else(|| panic!("[wf-cancel] follow-up turn did not finish within 90s — not recovered"));
+    assert!(
+        !reply_text.is_empty(),
+        "[wf-cancel] follow-up finished but streamed no reply text"
+    );
+    println!(
+        "[wf-cancel] ✅ follow-up answered in {recovered:?}: {:?}",
+        reply_text.chars().take(60).collect::<String>()
+    );
 }
