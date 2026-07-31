@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.56](https://github.com/suoak/AionCore/compare/v0.1.55...v0.1.56) (2026-07-31)
+
+
+### Bug Fixes
+
+* **ci:** normalize manual release tag input ([8f47633](https://github.com/suoak/AionCore/commit/8f47633dac734592539f8197abb3c63cb3ffb6b5))
+
 ## [0.1.55](https://github.com/iOfficeAI/AionCore/compare/v0.1.54...v0.1.55) (2026-07-30)
 
 
