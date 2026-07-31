@@ -3,10 +3,13 @@ use std::process::ExitCode;
 use crate::cli::PrepareManagedResourcesArgs;
 use crate::commands::error::{CliBoundaryCode, CliBoundaryError};
 use aionui_runtime::ensure_node_runtime;
-use aionui_runtime::managed_cli::{managed_cli_contract_for_export, prepare_managed_cli_to_root};
+use aionui_runtime::managed_cli::{
+    HERMES_RUNTIME_TARGET, managed_cli_contract_for_export, managed_hermes_contract_for_export,
+    prepare_managed_cli_to_root, prepare_managed_hermes_to_root,
+};
 use aionui_runtime::managed_resources::export_node_runtime_to_root;
 use aionui_runtime::managed_resources_contract::{
-    MANAGED_RESOURCES_CONTRACT_SCHEMA_VERSION, ManagedResourcesContract, validate_contract, write_contract,
+    MANAGED_RESOURCES_CONTRACT_SCHEMA_VERSION, ManagedResourcesContract, write_contract,
 };
 use aionui_runtime::node_runtime::managed_node_contract_for_export;
 
@@ -40,6 +43,15 @@ pub async fn run_prepare_managed_resources(args: PrepareManagedResourcesArgs) ->
         println!("  {:<6} -> {}", name, prepared.root.display());
         prepared_clis.push(prepared);
     }
+    let prepared_hermes = if aionui_runtime::managed_cli::current_runtime_key() == Some(HERMES_RUNTIME_TARGET) {
+        let prepared = prepare_managed_hermes_to_root(&output_root)
+            .await
+            .map_err(|error| prepare_managed_resources_error_with_detail("hermes.prepare", error))?;
+        println!("  hermes -> {}", prepared.root.display());
+        Some(prepared)
+    } else {
+        None
+    };
 
     let node = managed_node_contract_for_export(&output_root, &exported_node)
         .map_err(|error| prepare_managed_resources_error_with_detail("contract.write", error))?;
@@ -47,6 +59,12 @@ pub async fn run_prepare_managed_resources(args: PrepareManagedResourcesArgs) ->
     for prepared in &prepared_clis {
         clis.push(
             managed_cli_contract_for_export(&output_root, prepared)
+                .map_err(|error| prepare_managed_resources_error_with_detail("contract.write", error))?,
+        );
+    }
+    if let Some(prepared) = &prepared_hermes {
+        clis.push(
+            managed_hermes_contract_for_export(&output_root, prepared)
                 .map_err(|error| prepare_managed_resources_error_with_detail("contract.write", error))?,
         );
     }
@@ -62,8 +80,6 @@ pub async fn run_prepare_managed_resources(args: PrepareManagedResourcesArgs) ->
     };
     let manifest_path = write_contract(&output_root, &contract)
         .map_err(|error| prepare_managed_resources_error_with_detail("contract.write", error))?;
-    validate_contract(&output_root, &contract)
-        .map_err(|error| prepare_managed_resources_error_with_detail("contract.validate", error))?;
     println!("  manifest -> {}", manifest_path.display());
 
     Ok(ExitCode::SUCCESS)

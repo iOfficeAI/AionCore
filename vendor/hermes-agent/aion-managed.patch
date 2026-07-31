@@ -1,0 +1,147 @@
+diff --git a/acp_adapter/entry.py b/acp_adapter/entry.py
+index 5048b70..956aa46 100644
+--- a/acp_adapter/entry.py
++++ b/acp_adapter/entry.py
+@@ -32,6 +32,7 @@ else:
+ import argparse
+ import asyncio
+ import logging
++import os
+ import sys
+ from pathlib import Path
+ from hermes_constants import get_hermes_home
+@@ -251,11 +252,12 @@ def main(argv: list[str] | None = None) -> None:
+     # MCP servers dynamically via asyncio.to_thread inside the event
+     # loop; that path is unaffected.)  Moved from model_tools.py module
+     # scope to avoid freezing the gateway's loop on lazy import (#16856).
+-    try:
+-        from tools.mcp_tool import discover_mcp_tools
+-        discover_mcp_tools()
+-    except Exception:
+-        logger.debug("MCP tool discovery failed at ACP startup", exc_info=True)
++    if os.environ.get("HERMES_ACP_SKIP_CONFIGURED_MCP") != "1":
++        try:
++            from tools.mcp_tool import discover_mcp_tools
++            discover_mcp_tools()
++        except Exception:
++            logger.debug("MCP tool discovery failed at ACP startup", exc_info=True)
+ 
+     agent = HermesACPAgent()
+     try:
+diff --git a/acp_adapter/session.py b/acp_adapter/session.py
+index 6f1e17a..2915384 100644
+--- a/acp_adapter/session.py
++++ b/acp_adapter/session.py
+@@ -144,6 +144,28 @@ def _expand_acp_enabled_toolsets(
+     return expanded
+ 
+ 
++def _managed_acp_runtime(
++    *,
++    requested_provider: str | None,
++    config_provider: str | None,
++    selected_model: str,
++):
++    """Resolve an Aion-managed OpenAI-compatible runtime without persistence."""
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++
++    base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
++    if not base_url:
++        return resolve_runtime_provider(requested=requested_provider or config_provider)
++
++    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
++    return resolve_runtime_provider(
++        requested="custom",
++        explicit_api_key=api_key or None,
++        explicit_base_url=base_url,
++        target_model=selected_model or None,
++    )
++
++
+ def _clear_task_cwd(task_id: str) -> None:
+     """Remove task-specific cwd overrides for an ACP session."""
+     if not task_id:
+@@ -602,7 +624,6 @@ class SessionManager:
+ 
+         from run_agent import AIAgent
+         from hermes_cli.config import load_config
+-        from hermes_cli.runtime_provider import resolve_runtime_provider
+ 
+         config = load_config()
+         model_cfg = config.get("model")
+@@ -614,26 +635,43 @@ class SessionManager:
+         elif isinstance(model_cfg, str) and model_cfg.strip():
+             default_model = model_cfg.strip()
+ 
+-        configured_mcp_servers = [
+-            name
+-            for name, cfg in (config.get("mcp_servers") or {}).items()
+-            if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
+-        ]
++        if os.environ.get("HERMES_ACP_SKIP_CONFIGURED_MCP") == "1":
++            configured_mcp_servers = []
++        else:
++            configured_mcp_servers = [
++                name
++                for name, cfg in (config.get("mcp_servers") or {}).items()
++                if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
++            ]
++
++        selected_model = (
++            model
++            or os.environ.get("HERMES_INFERENCE_MODEL", "").strip()
++            or default_model
++        )
++        acp_toolset = (
++            os.environ.get("HERMES_ACP_TOOLSET", "").strip()
++            or "hermes-acp"
++        )
+ 
+         kwargs = {
+             "platform": "acp",
+             "enabled_toolsets": _expand_acp_enabled_toolsets(
+-                ["hermes-acp"],
++                [acp_toolset],
+                 mcp_server_names=configured_mcp_servers,
+             ),
+             "quiet_mode": True,
+             "session_id": session_id,
+             "session_db": self._get_db(),
+-            "model": model or default_model,
++            "model": selected_model,
+         }
+ 
+         try:
+-            runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
++            runtime = _managed_acp_runtime(
++                requested_provider=requested_provider,
++                config_provider=config_provider,
++                selected_model=selected_model,
++            )
+             kwargs.update(
+                 {
+                     "provider": runtime.get("provider"),
+diff --git a/toolsets.py b/toolsets.py
+index 1be6278..a480a16 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -396,6 +396,19 @@ TOOLSETS = {
+         "includes": []
+     },
+ 
++    "hermes-acp-lite": {
++        "description": "Managed editor integration with local coding, task, and memory tools",
++        "tools": [
++            "terminal", "process",
++            "read_file", "write_file", "patch", "search_files",
++            "skills_list", "skill_view", "skill_manage",
++            "todo", "memory",
++            "session_search",
++            "execute_code", "delegate_task",
++        ],
++        "includes": []
++    },
++
+     "hermes-api-server": {
+         "description": "OpenAI-compatible API server — full agent tools accessible via HTTP (no interactive UI tools like clarify or send_message)",
+         "tools": [

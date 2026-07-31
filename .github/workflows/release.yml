@@ -136,6 +136,34 @@ jobs:
             cargo build --release --target ${{ matrix.target }} -p aionui-app
           fi
 
+      - name: Install checksum-pinned uv for Windows x64 managed resources
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $runtimeLock = Get-Content -LiteralPath "vendor/hermes-agent/runtime-lock.json" -Raw | ConvertFrom-Json
+          $uvArchive = Join-Path $env:RUNNER_TEMP "uv-x86_64-pc-windows-msvc.zip"
+          $uvRoot = Join-Path $env:RUNNER_TEMP "aion-verified-uv"
+          Invoke-WebRequest `
+            -Uri $runtimeLock.uvArchive `
+            -OutFile $uvArchive `
+            -UseBasicParsing
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $uvArchive).Hash.ToLowerInvariant()
+          $expectedHash = $runtimeLock.uvSha256.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "uv Windows x64 archive checksum mismatch: expected $expectedHash, got $actualHash"
+          }
+
+          Expand-Archive -LiteralPath $uvArchive -DestinationPath $uvRoot -Force
+          $uvExecutable = Join-Path $uvRoot "uv.exe"
+          if (-not (Test-Path -LiteralPath $uvExecutable -PathType Leaf)) {
+            throw "verified uv archive is missing uv.exe"
+          }
+          $actualVersion = (& $uvExecutable --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualVersion -ne "uv $($runtimeLock.uvVersion)") {
+            throw "verified uv asset has an unexpected version: $actualVersion"
+          }
+          $uvRoot | Out-File -FilePath $env:GITHUB_PATH -Append
+
       - name: Verify Linux ARM64 GLIBC baseline
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
@@ -163,9 +191,70 @@ jobs:
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $stage = "dist/stage-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $sourceBinary = "target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+          Copy-Item -LiteralPath $sourceBinary -Destination (Join-Path $stage "${{ matrix.binary_name }}")
+
+          if ("${{ matrix.target }}" -eq "x86_64-pc-windows-msvc") {
+            $bundleOut = Join-Path $stage "managed-resources"
+            & $sourceBinary prepare-managed-resources --bundle-out $bundleOut
+            if ($LASTEXITCODE -ne 0) {
+              throw "prepare-managed-resources failed with exit code $LASTEXITCODE"
+            }
+          }
+
           $archive = "aioncore-v${env:VERSION}-${{ matrix.target }}.zip"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" -DestinationPath "dist/${archive}" -Force
+          $archivePath = "dist/${archive}"
+          Compress-Archive -Path "$stage/*" -DestinationPath $archivePath -Force
+
+          if ("${{ matrix.target }}" -eq "x86_64-pc-windows-msvc") {
+            $verifyRoot = "dist/verify-${{ matrix.target }}"
+            Expand-Archive -LiteralPath $archivePath -DestinationPath $verifyRoot -Force
+
+            $managedRoot = Join-Path $verifyRoot "managed-resources"
+            $manifestPath = Join-Path $managedRoot "manifest.json"
+            if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+              throw "Windows x64 archive is missing managed-resources/manifest.json"
+            }
+
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            $hermesEntries = @($manifest.clis | Where-Object { $_.name -eq "hermes" })
+            if ($hermesEntries.Count -ne 1) {
+              throw "Windows x64 manifest must contain exactly one Hermes entry"
+            }
+            $hermesRoot = Join-Path $managedRoot $hermesEntries[0].root
+            $python = Join-Path $hermesRoot "python/python.exe"
+            foreach ($requiredFile in @(
+              $python,
+              (Join-Path $hermesRoot "tools/git/bin/bash.exe"),
+              (Join-Path $hermesRoot "tools/rg/rg.exe"),
+              (Join-Path $hermesRoot "runtime.sha256")
+            )) {
+              if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+                throw "Windows x64 archive is missing required Hermes file: $requiredFile"
+              }
+            }
+
+            $env:PYTHONDONTWRITEBYTECODE = "1"
+            $env:PYTHONNOUSERSITE = "1"
+            $env:PYTHONSAFEPATH = "1"
+            $env:PYTHONUTF8 = "1"
+            $env:PYTHONIOENCODING = "utf-8"
+            & $python -m acp_adapter --version
+            if ($LASTEXITCODE -ne 0) {
+              throw "Bundled Hermes version check failed with exit code $LASTEXITCODE"
+            }
+            & $python -m acp_adapter --check
+            if ($LASTEXITCODE -ne 0) {
+              throw "Bundled Hermes self-check failed with exit code $LASTEXITCODE"
+            }
+            & $python scripts/hermes-runtime/smoke_e2e.py $hermesRoot
+            if ($LASTEXITCODE -ne 0) {
+              throw "Bundled Hermes ACP smoke test failed with exit code $LASTEXITCODE"
+            }
+          }
+
           "ARCHIVE=${archive}" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload release artifact

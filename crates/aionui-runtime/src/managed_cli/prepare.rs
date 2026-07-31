@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::managed_cli::{cli_version, current_runtime_key};
 use crate::managed_resources;
-use crate::managed_resources_contract::ManagedCliResourceContract;
+use crate::managed_resources_contract::{ManagedCliLaunchContract, ManagedCliResourceContract, collect_file_hashes};
 use crate::node_runtime::ensure_node_runtime;
 use crate::spawn::Builder;
 
@@ -21,10 +21,10 @@ use crate::spawn::Builder;
 pub struct ManagedCliError(String);
 
 impl ManagedCliError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(super) fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
-    fn io(error: std::io::Error) -> Self {
+    pub(super) fn io(error: std::io::Error) -> Self {
         Self(error.to_string())
     }
 }
@@ -206,6 +206,8 @@ pub fn managed_cli_contract_for_export(
         .map_err(|_| ManagedCliError::new("prepared CLI root escaped bundle root"))?
         .to_string_lossy()
         .replace('\\', "/");
+    let files = collect_file_hashes(&prepared.root)
+        .map_err(|error| ManagedCliError::new(format!("hash prepared CLI files: {error}")))?;
     Ok(ManagedCliResourceContract {
         name: prepared.name.clone(),
         version: prepared.version.clone(),
@@ -214,6 +216,14 @@ pub fn managed_cli_contract_for_export(
         executable: prepared.executable.clone(),
         required_files: Vec::new(),
         required_directories: prepared.required_directories.clone(),
+        launch: Some(ManagedCliLaunchContract {
+            program: prepared.executable.clone(),
+            args_prefix: Vec::new(),
+            env: Vec::new(),
+            path_entries: Vec::new(),
+        }),
+        files,
+        capabilities: Default::default(),
     })
 }
 
@@ -282,6 +292,7 @@ mod tests {
             .join("2.1.215")
             .join("darwin-arm64");
         std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("claude"), b"claude").unwrap();
         let prepared = PreparedCli {
             name: "claude".into(),
             version: "2.1.215".into(),
@@ -294,5 +305,7 @@ mod tests {
         assert_eq!(contract.root, "cli/claude/2.1.215/darwin-arm64");
         assert_eq!(contract.executable, "claude");
         assert_eq!(contract.platform_directory, "darwin-arm64");
+        assert_eq!(contract.launch.expect("launch").program, "claude");
+        assert_eq!(contract.files.len(), 1);
     }
 }
