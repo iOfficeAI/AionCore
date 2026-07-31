@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use aionui_api_types::TryConnectCustomAgentResponse;
+use aionui_api_types::{AgentHandshake, TryConnectCustomAgentResponse};
 use aionui_common::{CommandSpec, EnvVar};
 use aionui_runtime::{NodeRuntimeProgressReporter, ResolvedCommand, ensure_runtime_command_with_reporter};
 use tokio::sync::{broadcast, mpsc};
@@ -48,14 +48,35 @@ pub async fn try_connect_custom_agent(
     env: &HashMap<String, String>,
     reporter: Option<&dyn NodeRuntimeProgressReporter>,
 ) -> TryConnectCustomAgentResponse {
+    try_connect_custom_agent_with_catalog(command, args, env, reporter)
+        .await
+        .0
+}
+
+/// As [`try_connect_custom_agent`], plus the catalog the probe's `session/new`
+/// advertised. The probe already pays for a full spawn + `initialize` +
+/// `session/new`; callers that persist agent metadata use this variant so that
+/// data is stored instead of thrown away. The partial is `Some` only on a
+/// successful session whose agent advertised at least one of modes / models /
+/// config options — an auth-gated or failing probe yields `None`, never an
+/// empty write that would blank an existing catalog.
+pub async fn try_connect_custom_agent_with_catalog(
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+    reporter: Option<&dyn NodeRuntimeProgressReporter>,
+) -> (TryConnectCustomAgentResponse, Option<Box<AgentHandshake>>) {
     // ── Step 1 — which check ────────────────────────────────────────
     let head = first_token(command);
     let resolved = match ensure_runtime_command_with_reporter(head, reporter).await {
         Ok(resolved) => resolved,
         Err(error) => {
-            return TryConnectCustomAgentResponse::FailCli {
-                error: error.to_string(),
-            };
+            return (
+                TryConnectCustomAgentResponse::FailCli {
+                    error: error.to_string(),
+                },
+                None,
+            );
         }
     };
     debug!(program = %resolved.program.display(), "probe step 1 ok");
@@ -63,14 +84,23 @@ pub async fn try_connect_custom_agent(
     // ── Step 2 — spawn + ACP initialize ─────────────────────────────
     let proc = match spawn_probe_process(resolved, args, env).await {
         Ok(proc) => proc,
-        Err(msg) => return TryConnectCustomAgentResponse::FailAcp { error: msg },
+        Err(msg) => return (TryConnectCustomAgentResponse::FailAcp { error: msg }, None),
     };
 
     let outcome = match tokio::time::timeout(STEP2_TIMEOUT, run_handshake(&proc)).await {
-        Ok(outcome) => outcome.into_response(),
-        Err(_) => TryConnectCustomAgentResponse::FailAcp {
-            error: format!("ACP handshake did not complete within {}s", STEP2_TIMEOUT.as_secs()),
-        },
+        Ok(outcome) => {
+            let catalog = match &outcome {
+                ProbeOutcome::Ok(catalog) => catalog.clone(),
+                _ => None,
+            };
+            (outcome.into_response(), catalog)
+        }
+        Err(_) => (
+            TryConnectCustomAgentResponse::FailAcp {
+                error: format!("ACP handshake did not complete within {}s", STEP2_TIMEOUT.as_secs()),
+            },
+            None,
+        ),
     };
 
     // Always tear down the whole process group. `kill_on_drop(true)` only
@@ -131,7 +161,11 @@ async fn spawn_probe_process(
 /// alone returns `authMethods` even for already-authorized agents and cannot
 /// make this distinction.
 enum ProbeOutcome {
-    Ok,
+    /// Carries the catalog the successful `session/new` advertised (modes /
+    /// models / config options), already projected into the same shape the live
+    /// session path persists. `None` when the agent advertised nothing. Boxed to
+    /// keep the enum small: the success payload dwarfs the error strings.
+    Ok(Option<Box<AgentHandshake>>),
     Auth(String),
     Fail(String),
 }
@@ -139,7 +173,7 @@ enum ProbeOutcome {
 impl ProbeOutcome {
     fn into_response(self) -> TryConnectCustomAgentResponse {
         match self {
-            ProbeOutcome::Ok => TryConnectCustomAgentResponse::Success,
+            ProbeOutcome::Ok(_) => TryConnectCustomAgentResponse::Success,
             ProbeOutcome::Auth(error) => TryConnectCustomAgentResponse::FailAuth { error },
             ProbeOutcome::Fail(error) => TryConnectCustomAgentResponse::FailAcp { error },
         }
@@ -187,8 +221,26 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
     // `initialize` only proves the agent speaks ACP, not that it is usable.
     // Open a real session (no prompt) so an auth-gated agent surfaces its
     // `auth_required` error here instead of silently appearing "online".
+    // Keep the response: it carries the agent's advertised modes / models /
+    // config options, which the caller persists into `agent_metadata` so the
+    // picker is populated before the user ever opens a conversation. Discarding
+    // it meant a probed-online agent still showed an empty picker.
     let outcome = match protocol.new_session(NewSessionRequest::new(std::env::temp_dir())).await {
-        Ok(_) => ProbeOutcome::Ok,
+        Ok((response, legacy_models)) => {
+            // Same extraction the live session path performs (`agent_session_flow`):
+            // models ride beside the response because the SDK dropped the field.
+            let models = legacy_models
+                .as_ref()
+                .and_then(crate::manager::acp::legacy_session_model::LegacySessionModelState::from_state_value);
+            ProbeOutcome::Ok(
+                crate::manager::acp::catalog_forwarder::catalog_partial_from_session_new(
+                    response.modes.as_ref(),
+                    models.as_ref(),
+                    response.config_options.as_deref(),
+                )
+                .map(Box::new),
+            )
+        }
         Err(AcpError::AuthRequired) => {
             ProbeOutcome::Auth("Agent reachable but requires login/authorization".to_string())
         }
