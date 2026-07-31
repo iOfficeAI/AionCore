@@ -16,23 +16,25 @@
 //! - `Cancel` kills the process; the turn's own `result` frame may never
 //!   arrive, so the reader synthesizes the terminal event on exit.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aionui_common::CommandSpec;
 use aionui_process::Spawner;
 use futures_util::stream::BoxStream;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, oneshot};
 
 use super::argv::{ArgvInput, build_argv};
 use super::translate::Translator;
 use super::wire::parse_line;
 use crate::backend::types::{
-    Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, SessionEnvelope, SessionSpec,
+    Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
+    PermissionDecision, SessionEnvelope, SessionSpec,
 };
 use crate::backend::{BackendConnection, SessionBackend, SessionConfig};
 use crate::capability::{BlockSet, Capabilities, CapabilityTier, CommandSet, PromptAcceptedSource, SignalSet};
-use crate::event::{SessionEvent, TurnOutcome};
+use crate::event::{PermissionKind, SessionEvent, TurnOutcome};
 
 /// Broadcast backlog for a session's event stream. Matches the other backends:
 /// large enough that a slow subscriber does not lose a turn's worth of frames.
@@ -113,6 +115,8 @@ impl BackendConnection for AntigravityConnection {
             turn_gen: AtomicU64::new(0),
             anchor: Arc::new(Mutex::new(anchor)),
             current: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            permission_seq: AtomicU64::new(0),
         }))
     }
 
@@ -138,6 +142,20 @@ pub struct AntigravitySessionBackend {
     /// The in-flight turn's process, retained so `Cancel` / `terminate` can
     /// reach it. `None` between turns — that is the normal resting state.
     current: Arc<Mutex<Option<Arc<aionui_process::ManagedProcess>>>>,
+    /// Tool approvals raised by the PreToolUse hook and not yet answered.
+    ///
+    /// Each entry parks a hook process (which is holding agy's tool call open)
+    /// until the user answers in the UI. Everything that ends a turn must drain
+    /// this as `Denied` — a hook left waiting blocks agy until its
+    /// `--print-timeout`, which looks like a hang with no explanation.
+    pending: Arc<Mutex<HashMap<String, PendingPermission>>>,
+    /// Monotonic counter behind each permission's `request_id`.
+    permission_seq: AtomicU64,
+}
+
+struct PendingPermission {
+    tool_name: String,
+    answer: oneshot::Sender<PermissionDecision>,
 }
 
 impl AntigravitySessionBackend {
@@ -163,6 +181,27 @@ impl AntigravitySessionBackend {
             turn_gen,
             event,
         });
+    }
+
+    /// Answer every parked permission with `Denied`.
+    ///
+    /// Called whenever the turn stops being able to consume an answer (turn
+    /// ended, cancelled, process gone). Each parked entry is a hook process
+    /// holding one of agy's tool calls open; abandoning it would block agy
+    /// until `--print-timeout` (5m by default) with nothing to explain the
+    /// stall. Denying is also the safe reading of "the user never answered".
+    async fn deny_all_pending(&self) {
+        let drained: Vec<_> = self.pending.lock().await.drain().collect();
+        for (request_id, entry) in drained {
+            let _ = entry.answer.send(PermissionDecision::Denied);
+            self.emit(
+                self.turn_gen.load(Ordering::SeqCst),
+                SessionEvent::PermissionResolved {
+                    request_id,
+                    kind: PermissionKind::Tool,
+                },
+            );
+        }
     }
 
     async fn start_turn(&self, content: Vec<ContentBlock>) -> Result<u64, BackendError> {
@@ -295,6 +334,32 @@ impl SessionBackend for AntigravitySessionBackend {
                     turn_gen,
                 })
             }
+            Command::AnswerPermission {
+                request_id, decision, ..
+            } => {
+                let entry = self.pending.lock().await.remove(&request_id);
+                match entry {
+                    Some(p) => {
+                        let _ = p.answer.send(decision);
+                        self.emit(
+                            self.turn_gen.load(Ordering::SeqCst),
+                            SessionEvent::PermissionResolved {
+                                request_id,
+                                kind: PermissionKind::Tool,
+                            },
+                        );
+                    }
+                    // Already resolved (double click, or the turn ended and
+                    // drained it). Accept it so the caller does not surface an
+                    // error for a harmless race.
+                    None => tracing::debug!(request_id = %request_id, "antigravity: permission already resolved"),
+                }
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::Started,
+                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                })
+            }
             Command::Cancel { target } => {
                 if matches!(target, CancelTarget::Tool { .. }) {
                     return Err(BackendError::CommandNotSupported { command: "cancel_tool" });
@@ -342,9 +407,64 @@ impl SessionBackend for AntigravitySessionBackend {
         antigravity_capabilities()
     }
 
+    fn pending_permission_requests(&self) -> Vec<PendingPermissionView> {
+        // Lets the REST `/confirmations` recovery path rebuild permission cards
+        // after a page reload; without it a card raised before the client
+        // subscribed is lost and the hook waits until agy's timeout.
+        let Ok(pending) = self.pending.try_lock() else {
+            return Vec::new();
+        };
+        pending
+            .iter()
+            .map(|(request_id, entry)| PendingPermissionView {
+                request_id: request_id.clone(),
+                tool_name: entry.tool_name.clone(),
+                // agy has no AskUserQuestion equivalent: every hook request is a
+                // plain allow/deny on a tool.
+                questions: None,
+            })
+            .collect()
+    }
+
     async fn terminate(&self) {
         if let Some(proc) = self.current.lock().await.take() {
             let _ = proc.kill(std::time::Duration::from_secs(2)).await;
+        }
+        // The process that would have consumed these answers is gone.
+        self.deny_all_pending().await;
+    }
+
+    async fn request_external_permission(&self, tool_name: String, input: serde_json::Value) -> PermissionDecision {
+        let request_id = format!("agy-perm-{}", self.permission_seq.fetch_add(1, Ordering::SeqCst) + 1);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(
+            request_id.clone(),
+            PendingPermission {
+                tool_name: tool_name.clone(),
+                answer: tx,
+            },
+        );
+
+        self.emit(
+            self.turn_gen.load(Ordering::SeqCst),
+            SessionEvent::Permission {
+                request_id: request_id.clone(),
+                kind: PermissionKind::Tool,
+                metadata: None,
+                tool_name: Some(tool_name),
+                input: Some(input),
+            },
+        );
+
+        // No timeout here on purpose: a user may legitimately leave a permission
+        // card unanswered for a long time, and the turn is allowed to wait.
+        // Every path that ends the turn drains this table, so the wait always
+        // terminates on a real event rather than a clock.
+        match rx.await {
+            Ok(decision) => decision,
+            // Sender dropped without answering — treat as denial, never as
+            // silent approval.
+            Err(_) => PermissionDecision::Denied,
         }
     }
 }
@@ -354,6 +474,7 @@ mod tests {
     use super::*;
     use crate::backend::types::CommandMeta;
     use crate::testing::FakeSpawner;
+    use serde_json::json;
 
     fn config(cwd: &str) -> SessionConfig {
         SessionConfig {
@@ -455,6 +576,106 @@ mod tests {
             .await
             .expect_err("steer must not be silently accepted");
         assert!(matches!(err, BackendError::CommandNotSupported { command: "steer" }));
+    }
+
+    /// Concrete handle so the permission tests can reach the inherent methods
+    /// without going through `Arc<dyn SessionBackend>`.
+    async fn backend_for_permissions() -> Arc<AntigravitySessionBackend> {
+        let (event_tx, _) = broadcast::channel(16);
+        Arc::new(AntigravitySessionBackend {
+            session_id: "conv-1".into(),
+            config: config("/w"),
+            spawner: Arc::new(FakeSpawner::new()),
+            event_tx,
+            turn_gen: AtomicU64::new(1),
+            anchor: Arc::new(Mutex::new(None)),
+            current: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            permission_seq: AtomicU64::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_hook_request_parks_until_the_user_answers() {
+        let b = backend_for_permissions().await;
+        let asker = Arc::clone(&b);
+        let waiting =
+            tokio::spawn(async move { asker.request_external_permission("run_command".into(), json!({})).await });
+
+        // Wait for the request to register, then answer it as the UI would.
+        let request_id = loop {
+            if let Some(view) = b.pending_permission_requests().first() {
+                break view.request_id.clone();
+            }
+            tokio::task::yield_now().await;
+        };
+        b.dispatch(Command::AnswerPermission {
+            request_id,
+            decision: PermissionDecision::Approved,
+            selected: None,
+            answers: Vec::new(),
+        })
+        .await
+        .expect("answer accepted");
+
+        assert_eq!(waiting.await.unwrap(), PermissionDecision::Approved);
+        assert!(
+            b.pending_permission_requests().is_empty(),
+            "answered request must clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminate_denies_parked_requests_instead_of_stranding_them() {
+        // A stranded hook holds agy's tool call open until --print-timeout
+        // (5 min), which the user experiences as an unexplained hang.
+        let b = backend_for_permissions().await;
+        let asker = Arc::clone(&b);
+        let waiting =
+            tokio::spawn(async move { asker.request_external_permission("run_command".into(), json!({})).await });
+
+        while b.pending_permission_requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        b.terminate().await;
+
+        assert_eq!(waiting.await.unwrap(), PermissionDecision::Denied);
+        assert!(b.pending_permission_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn answering_an_unknown_request_is_not_an_error() {
+        // Double-click, or an answer racing the turn's own drain.
+        let b = backend_for_permissions().await;
+        b.dispatch(Command::AnswerPermission {
+            request_id: "agy-perm-does-not-exist".into(),
+            decision: PermissionDecision::Approved,
+            selected: None,
+            answers: Vec::new(),
+        })
+        .await
+        .expect("a resolved-twice answer must not surface an error");
+    }
+
+    #[tokio::test]
+    async fn other_backends_deny_externally_raised_permissions_by_default() {
+        // The trait default must never be "allow": a backend that does not
+        // implement this has no way to ask the user.
+        struct Bare;
+        #[async_trait::async_trait]
+        impl SessionBackend for Bare {
+            async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+                unreachable!()
+            }
+            fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+                Box::pin(futures_util::stream::empty())
+            }
+            fn capabilities(&self) -> Capabilities {
+                Capabilities::default()
+            }
+        }
+        let decision = Bare.request_external_permission("x".into(), json!({})).await;
+        assert_eq!(decision, PermissionDecision::Denied);
     }
 
     #[test]

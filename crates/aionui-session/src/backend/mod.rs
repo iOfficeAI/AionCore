@@ -107,6 +107,21 @@ pub trait SessionBackend: Send + Sync {
     /// purely Drop-driven (and every test double) are unchanged — only the
     /// direct-CLI claude/codex backends override this.
     async fn terminate(&self) {}
+
+    /// Raise a permission request that originated OUTSIDE this backend's own
+    /// wire, and block until the user answers it.
+    ///
+    /// Only Antigravity needs this. agy cannot prompt for tool permission in
+    /// headless mode, so AionUi registers itself as agy's `PreToolUse` hook;
+    /// the request therefore arrives over HTTP from a separate hook process
+    /// rather than up the backend's stream. Every other backend raises
+    /// permissions on its own wire and never calls this.
+    ///
+    /// Default is `Denied`, deliberately: a backend that does not implement
+    /// externally-raised permissions must not silently let the tool run.
+    async fn request_external_permission(&self, _tool_name: String, _input: serde_json::Value) -> PermissionDecision {
+        PermissionDecision::Denied
+    }
 }
 
 /// Connection-level factory (§C1): holds the transport singleton and mints many

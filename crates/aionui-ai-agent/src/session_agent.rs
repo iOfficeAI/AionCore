@@ -490,6 +490,21 @@ impl SessionAgentTask {
     /// live `AcpPermission` frame so a duplicate live+recovered pair de-dups. Options
     /// mirror the live translation: AskUserQuestion → its question options, else the
     /// generic allow/deny.
+    /// Raise a tool approval that came from OUTSIDE the backend's stream and
+    /// block until the user answers.
+    ///
+    /// Only Antigravity uses this: agy cannot prompt in headless mode, so its
+    /// `PreToolUse` hook calls AionUi over HTTP instead, and that request lands
+    /// here. Backends that raise permissions on their own wire return `Denied`
+    /// from the trait default and never reach this path.
+    pub async fn request_external_permission(
+        &self,
+        tool_name: String,
+        input: serde_json::Value,
+    ) -> aionui_session::PermissionDecision {
+        self.backend.request_external_permission(tool_name, input).await
+    }
+
     pub fn get_confirmations(&self) -> Vec<aionui_common::Confirmation> {
         self.backend
             .pending_permission_requests()

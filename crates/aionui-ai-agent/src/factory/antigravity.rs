@@ -28,6 +28,49 @@ pub(super) async fn build(
         config.backend.clone_from(&meta.backend);
     }
 
+    // Register AionUi as agy's PreToolUse gate for THIS workspace, and mint the
+    // token that authenticates the hook's callback. Without this the session
+    // still runs, but with agy's gate wide open and no per-call approval — so a
+    // failure here must be loud.
+    let hook_env = match deps.antigravity_hook_base_url.as_deref() {
+        Some(base_url) => {
+            let hook_binary = deps.backend_binary_path.as_path();
+            crate::antigravity_hook::write_hooks_json(std::path::Path::new(&ctx.workspace), hook_binary).map_err(
+                |e| {
+                    AgentError::internal(format!(
+                        "antigravity: could not register the permission hook in {}: {e}",
+                        ctx.workspace
+                    ))
+                },
+            )?;
+            // Minting here also invalidates any token left over from a prior
+            // build of this conversation, so a stale hook cannot answer for the
+            // new session.
+            let token = deps.antigravity_hook_tokens.issue(&ctx.conversation_id);
+            vec![
+                (
+                    aionui_api_types::AntigravityHookConfig::ENV_BASE_URL.to_owned(),
+                    base_url.to_owned(),
+                ),
+                (aionui_api_types::AntigravityHookConfig::ENV_TOKEN.to_owned(), token),
+                (
+                    aionui_api_types::AntigravityHookConfig::ENV_CONVERSATION_ID.to_owned(),
+                    ctx.conversation_id.clone(),
+                ),
+            ]
+        }
+        None => {
+            tracing::warn!(
+                conversation_id = %ctx.conversation_id,
+                "antigravity: no hook callback address configured — tools will run WITHOUT per-call approval"
+            );
+            Vec::new()
+        }
+    };
+
+    let mut runtime_env = ctx.runtime_env.clone();
+    runtime_env.extend(hook_env);
+
     let instance = crate::session_agent::build_antigravity_instance(
         crate::session_agent::SessionBuildInputs {
             conversation_id: ctx.conversation_id.clone(),
@@ -38,7 +81,7 @@ pub(super) async fn build(
             session_snapshot: build_context.session_snapshot.as_ref(),
             backend_session_id: build_context.session_id.clone(),
             mcp_server_repo: deps.mcp_server_repo.as_ref(),
-            runtime_env: &ctx.runtime_env,
+            runtime_env: &runtime_env,
             broadcaster: deps.broadcaster.clone(),
             // Keyed by the resolved catalog row so discovered models/modes
             // refresh the `/api/agents` picker.
