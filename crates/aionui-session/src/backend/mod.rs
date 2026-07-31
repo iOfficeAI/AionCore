@@ -9,6 +9,7 @@
 //! compile in parallel.
 
 mod acp_conn;
+mod antigravity;
 mod claude_conn;
 mod codex_conn;
 mod conversation_session;
