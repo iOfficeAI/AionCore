@@ -160,10 +160,7 @@ impl TeamEventEmitter {
             active_turn_id = ?payload.slot_work.active_turn_id,
             "team websocket event emitted"
         );
-        let event = WebSocketMessage::new(
-            TEAM_SLOT_WORK_CHANGED_EVENT,
-            serde_json::to_value(payload).expect("serialize team slot work payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_SLOT_WORK_CHANGED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -200,10 +197,7 @@ impl TeamEventEmitter {
             task,
             change,
         };
-        let event = WebSocketMessage::new(
-            TEAM_TASK_CHANGED_EVENT,
-            serde_json::to_value(payload).expect("serialize team task changed payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_TASK_CHANGED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -224,10 +218,7 @@ impl TeamEventEmitter {
             message,
             change,
         };
-        let event = WebSocketMessage::new(
-            TEAM_MAILBOX_CHANGED_EVENT,
-            serde_json::to_value(payload).expect("serialize team mailbox changed payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_MAILBOX_CHANGED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 }
@@ -476,6 +467,9 @@ mod tests {
         let events = bc.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "team.slotWorkChanged");
+        // Must carry user_id so the event-bus → WebSocket bridge delivers it to
+        // the owning user instead of dropping it (multi-account isolation #669).
+        assert_eq!(events[0].data["user_id"], "user-1");
 
         let payload: aionui_api_types::TeamSlotWorkChangedPayload =
             serde_json::from_value(events[0].data.clone()).unwrap();
@@ -507,6 +501,9 @@ mod tests {
         let events = bc.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "team.taskChanged");
+        // Must carry user_id so the event-bus → WebSocket bridge delivers it to
+        // the owning user instead of dropping it (multi-account isolation #669).
+        assert_eq!(events[0].data["user_id"], "user-1");
 
         let payload: TeamTaskChangedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(payload.team_id, "team-1");
@@ -536,6 +533,9 @@ mod tests {
         let events = bc.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "team.mailboxChanged");
+        // Must carry user_id so the event-bus → WebSocket bridge delivers it to
+        // the owning user instead of dropping it (multi-account isolation #669).
+        assert_eq!(events[0].data["user_id"], "user-1");
 
         let payload: TeamMailboxChangedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(payload.team_id, "team-1");
