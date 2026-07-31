@@ -715,6 +715,7 @@ fn classify_provider_text(lower: &str) -> Option<ClassifiedError> {
             "function calling is not enabled",
             "function calling disabled",
             "unsupported model",
+            "model is not supported when using",
         ],
     ) {
         return Some(provider_error(
@@ -1804,6 +1805,21 @@ mod tests {
     }
 
     #[test]
+    fn classifies_codex_chatgpt_unsupported_model_message() {
+        for detail in [
+            "The 'gpt-5.6-sol【神秘渠道】' model is not supported when using Codex with a ChatGPT account",
+            "THE 'GPT-5.6-SOL' MODEL IS NOT SUPPORTED WHEN USING CODEX WITH A CHATGPT ACCOUNT",
+        ] {
+            assert_classification(
+                detail,
+                AgentErrorCode::UserLlmProviderUnsupportedModel,
+                AgentErrorOwnership::UserLlmProvider,
+                AgentErrorResolutionKind::ChangeModel,
+            );
+        }
+    }
+
+    #[test]
     fn classifies_model_not_found_before_endpoint_404() {
         assert_classification(
             "API error 404: model not found for path /v1/chat/completions",
@@ -1831,6 +1847,7 @@ mod tests {
     fn classifies_generic_provider_invalid_requests() {
         for detail in [
             "API error 400: Invalid request: Invalid input",
+            "API error 400: Invalid request: response_format is not supported when using JSON mode",
             "API error 400: Invalid assistant message: content or tool calls must be set",
             "API error 400: content is required",
             "Provider error: API error 400: {\"type\":\"invalid_request_error\",\"message\":\"bad payload\"}",

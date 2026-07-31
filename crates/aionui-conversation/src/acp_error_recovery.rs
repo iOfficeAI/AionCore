@@ -12,14 +12,21 @@ use aionui_ai_agent::IWorkerTaskManager;
 
 use crate::runtime_persistence::RuntimeWriteKind;
 
+fn should_clear_persisted_model(error_code: Option<AgentErrorCode>) -> bool {
+    matches!(
+        error_code,
+        Some(AgentErrorCode::UserLlmProviderModelNotFound | AgentErrorCode::UserLlmProviderUnsupportedModel)
+    )
+}
+
 impl ConversationService {
-    async fn clear_conversation_model_seed_after_model_not_found(
+    async fn clear_conversation_model_seed_after_model_error(
         &self,
         user_id: &str,
         conversation_id: &str,
         error_code: Option<AgentErrorCode>,
     ) {
-        if error_code != Some(AgentErrorCode::UserLlmProviderModelNotFound) {
+        if !should_clear_persisted_model(error_code) {
             return;
         }
         if !self
@@ -114,7 +121,7 @@ impl ConversationService {
                 error = %err,
                 error_code = ?error_code,
                 reason = ?AgentKillReason::AgentErrorRecovery,
-                "Failed to clear conversation ACP model seed after model_not_found"
+                "Failed to clear conversation ACP model seed after provider model error"
             );
             return;
         }
@@ -129,17 +136,17 @@ impl ConversationService {
             ?previous_model_id,
             error_code = ?error_code,
             reason = ?AgentKillReason::AgentErrorRecovery,
-            "Conversation ACP model seed cleared after model_not_found"
+            "Conversation ACP model seed cleared after provider model error"
         );
     }
 
-    async fn clear_persisted_acp_model_after_model_not_found(
+    async fn clear_persisted_acp_model_after_model_error(
         &self,
         user_id: &str,
         conversation_id: &str,
         error_code: Option<AgentErrorCode>,
     ) {
-        if error_code != Some(AgentErrorCode::UserLlmProviderModelNotFound) {
+        if !should_clear_persisted_model(error_code) {
             return;
         }
         if !self
@@ -161,7 +168,7 @@ impl ConversationService {
                     user_id,
                     conversation_id,
                     error = %err,
-                    "Failed to load ACP persisted model before clearing after model_not_found"
+                    "Failed to load ACP persisted model before clearing after provider model error"
                 );
                 None
             }
@@ -183,7 +190,7 @@ impl ConversationService {
                     ?previous_model_id,
                     error_code = ?error_code,
                     reason = ?AgentKillReason::AgentErrorRecovery,
-                    "ACP persisted model cleared after model_not_found"
+                    "ACP persisted model cleared after provider model error"
                 );
             }
             Ok(false) => {
@@ -204,7 +211,7 @@ impl ConversationService {
                     error = %err,
                     error_code = ?error_code,
                     reason = ?AgentKillReason::AgentErrorRecovery,
-                    "Failed to clear ACP persisted model after model_not_found"
+                    "Failed to clear ACP persisted model after provider model error"
                 );
             }
         }
@@ -236,9 +243,9 @@ impl ConversationService {
         task_manager
             .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
             .await;
-        self.clear_persisted_acp_model_after_model_not_found(user_id, conversation_id, error_code)
+        self.clear_persisted_acp_model_after_model_error(user_id, conversation_id, error_code)
             .await;
-        self.clear_conversation_model_seed_after_model_not_found(user_id, conversation_id, error_code)
+        self.clear_conversation_model_seed_after_model_error(user_id, conversation_id, error_code)
             .await;
         info!(
             conversation_id,

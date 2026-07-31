@@ -39,8 +39,7 @@ async fn send_message_evicts_acp_task_after_terminal_error() {
     );
 }
 
-#[tokio::test]
-async fn send_message_clears_persisted_acp_model_after_model_not_found() {
+async fn assert_terminal_model_error_clears_persisted_acp_model(error_code: AgentErrorCode, error_label: &str) {
     let acp_session_repo = Arc::new(StubAcpSessionRepo::default());
     let (svc, _broadcaster, repo, _default_task_mgr) = make_service_with_resolver_and_acp_session_repo(
         Arc::new(FixedSkillResolver { names: vec![] }),
@@ -69,8 +68,8 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
     let scripted_agent = Arc::new(ScriptedAgent::new(
         &conv.id,
         vec![vec![AgentStreamEvent::Error(ErrorEventData::legacy(
-            "The configured model was not found by the provider.",
-            Some(AgentErrorCode::UserLlmProviderModelNotFound),
+            "The configured model cannot be used with the provider.",
+            Some(error_code),
         ))]],
     ));
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
@@ -93,7 +92,7 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
         }
     })
     .await
-    .expect("model_not_found should clear persisted ACP model");
+    .unwrap_or_else(|_| panic!("{error_label} should clear persisted ACP model"));
     wait_for_turn_released(&svc, &conv.id).await;
 
     assert_eq!(task_mgr.active_count(), 0);
@@ -112,8 +111,26 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
     assert!(extra.get("workspace").is_some());
     assert!(
         extra.get("current_model_id").is_none(),
-        "model_not_found must clear conversation.extra.current_model_id so rebuild cannot reseed stale desired model"
+        "{error_label} must clear conversation.extra.current_model_id so rebuild cannot reseed stale desired model"
     );
+}
+
+#[tokio::test]
+async fn send_message_clears_persisted_acp_model_after_model_not_found() {
+    assert_terminal_model_error_clears_persisted_acp_model(
+        AgentErrorCode::UserLlmProviderModelNotFound,
+        "model_not_found",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn send_message_clears_persisted_acp_model_after_unsupported_model() {
+    assert_terminal_model_error_clears_persisted_acp_model(
+        AgentErrorCode::UserLlmProviderUnsupportedModel,
+        "unsupported_model",
+    )
+    .await;
 }
 
 #[tokio::test]
