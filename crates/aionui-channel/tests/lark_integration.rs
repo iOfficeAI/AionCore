@@ -88,6 +88,7 @@ mod lark_tests {
                 app_secret: app_secret.map(String::from),
                 encrypt_key: None,
                 verification_token: None,
+                domain: None,
                 client_id: None,
                 client_secret: None,
                 account_id: None,

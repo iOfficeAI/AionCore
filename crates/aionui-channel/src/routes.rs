@@ -218,6 +218,8 @@ struct ChannelPluginStatusView {
     bot_username: Option<String>,
     active_users: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     is_extension: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     extension_meta: Option<ChannelExtensionMetaView>,
@@ -254,6 +256,7 @@ impl ChannelPluginStatusView {
             has_token: status.has_token,
             bot_username: status.bot_username,
             active_users: status.active_users,
+            domain: status.domain,
             is_extension: extension_meta.as_ref().map(|_| true),
             extension_meta,
         }
@@ -273,6 +276,7 @@ impl ChannelPluginStatusView {
             has_token: false,
             bot_username: None,
             active_users: 0,
+            domain: None,
             is_extension: Some(true),
             extension_meta: Some(ChannelExtensionMetaView::from(plugin)),
         }
@@ -292,6 +296,7 @@ impl ChannelPluginStatusView {
             has_token: false,
             bot_username: None,
             active_users: 0,
+            domain: None,
             is_extension: Some(false),
             extension_meta: None,
         }
@@ -724,6 +729,7 @@ fn build_test_config(req: &TestPluginRequest) -> PluginConfig {
         app_secret: None,
         encrypt_key: None,
         verification_token: None,
+        domain: None,
         client_id: None,
         client_secret: None,
         account_id: None,
@@ -736,6 +742,7 @@ fn build_test_config(req: &TestPluginRequest) -> PluginConfig {
             if let Some(ref extra) = req.extra_config {
                 credentials.app_id = extra.app_id.clone();
                 credentials.app_secret = extra.app_secret.clone();
+                credentials.domain = extra.domain.clone();
             }
             credentials.token = Some(req.token.clone());
         }
@@ -809,6 +816,7 @@ fn build_extension_config(
         app_secret: None,
         encrypt_key: None,
         verification_token: None,
+        domain: None,
         client_id: None,
         client_secret: None,
         account_id: None,
@@ -998,12 +1006,28 @@ mod tests {
             extra_config: Some(TestPluginExtraConfig {
                 app_id: Some("cli_abc".into()),
                 app_secret: Some("secret".into()),
+                domain: None,
             }),
         };
         let config = build_test_config(&req);
         assert_eq!(config.credentials.app_id.as_deref(), Some("cli_abc"));
         assert_eq!(config.credentials.app_secret.as_deref(), Some("secret"));
         assert_eq!(config.credentials.token.as_deref(), Some("xxx"));
+    }
+
+    #[test]
+    fn build_test_config_lark_maps_domain() {
+        let req = TestPluginRequest {
+            plugin_id: "lark".into(),
+            token: "xxx".into(),
+            extra_config: Some(TestPluginExtraConfig {
+                app_id: Some("cli_abc".into()),
+                app_secret: Some("secret".into()),
+                domain: Some("lark".into()),
+            }),
+        };
+        let config = build_test_config(&req);
+        assert_eq!(config.credentials.domain.as_deref(), Some("lark"));
     }
 
     #[test]
@@ -1014,6 +1038,7 @@ mod tests {
             extra_config: Some(TestPluginExtraConfig {
                 app_id: None,
                 app_secret: Some("client_secret_456".into()),
+                domain: None,
             }),
         };
         let config = build_test_config(&req);
@@ -1029,6 +1054,7 @@ mod tests {
             extra_config: Some(TestPluginExtraConfig {
                 app_id: Some("account_abc".into()),
                 app_secret: None,
+                domain: None,
             }),
         };
         let config = build_test_config(&req);

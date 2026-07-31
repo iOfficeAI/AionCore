@@ -90,6 +90,7 @@ mod telegram_tests {
                 app_secret: None,
                 encrypt_key: None,
                 verification_token: None,
+                domain: None,
                 client_id: None,
                 client_secret: None,
                 account_id: None,
