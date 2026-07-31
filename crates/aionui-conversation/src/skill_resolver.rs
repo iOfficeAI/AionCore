@@ -26,10 +26,21 @@ pub trait SkillResolver: Send + Sync {
     /// same search order as `materialize_skills_for_agent`.
     async fn resolve_skills(&self, names: &[String]) -> Vec<ResolvedAgentSkill>;
 
+    /// Resolve each skill name for a specific Core user.
+    async fn resolve_skills_for_user(&self, _user_id: &str, names: &[String]) -> Vec<ResolvedAgentSkill> {
+        self.resolve_skills(names).await
+    }
+
     /// Load full skill bodies for prompt-protocol agents that request
     /// `[LOAD_SKILL: name]` in their response.
     async fn load_skill_bodies(&self, names: &[String]) -> Vec<LoadedAgentSkill> {
         let resolved = self.resolve_skills(names).await;
+        load_resolved_skill_bodies(&resolved).await
+    }
+
+    /// Load full skill bodies for prompt-protocol agents under one Core user.
+    async fn load_skill_bodies_for_user(&self, user_id: &str, names: &[String]) -> Vec<LoadedAgentSkill> {
+        let resolved = self.resolve_skills_for_user(user_id, names).await;
         load_resolved_skill_bodies(&resolved).await
     }
 
@@ -119,14 +130,19 @@ impl SkillResolver for ExtensionSkillResolver {
     }
 
     async fn resolve_skills(&self, names: &[String]) -> Vec<ResolvedAgentSkill> {
+        self.resolve_skills_for_user("system_default_user", names).await
+    }
+
+    async fn resolve_skills_for_user(&self, user_id: &str, names: &[String]) -> Vec<ResolvedAgentSkill> {
         if names.is_empty() {
             return Vec::new();
         }
         // Conversation_id is validated upstream; we don't use a real one here
         // because this resolver is purely a path-resolution helper.
-        match aionui_extension::materialize_skills_for_agent_with_repo(
+        match aionui_extension::materialize_skills_for_agent_with_repo_for_user(
             &self.paths,
             self.skill_repo.as_ref(),
+            user_id,
             "workspace-link",
             names,
         )
@@ -190,7 +206,7 @@ impl SkillResolver for FixedSkillResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aionui_db::SqliteSkillRepository;
+    use aionui_db::{SqliteSkillRepository, UpsertSkillParams};
 
     fn write_skill(dir: &Path, name: &str, description: &str) {
         let skill_dir = dir.join(name);
@@ -237,5 +253,66 @@ mod tests {
         let resolver = ExtensionSkillResolver::new(paths, repo);
 
         assert_eq!(resolver.auto_inject_names().await, vec!["auto-cron".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn extension_resolver_resolves_user_scoped_skill_rows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Arc::new(aionui_extension::SkillPaths {
+            data_dir: tmp.path().to_path_buf(),
+            user_skills_dir: tmp.path().join("skills"),
+            cron_skills_dir: tmp.path().join("cron").join("skills"),
+            builtin_skills_dir: tmp.path().join("builtin-skills"),
+            builtin_rules_dir: tmp.path().join("builtin-rules"),
+            assistant_rules_dir: tmp.path().join("assistant-rules"),
+            assistant_skills_dir: tmp.path().join("assistant-skills"),
+        });
+        let user_a_skill = tmp.path().join("user-a-skill");
+        let user_b_skill = tmp.path().join("user-b-skill");
+        write_skill(&user_a_skill, "shared", "User A skill");
+        write_skill(&user_b_skill, "shared", "User B skill");
+
+        let db = aionui_db::init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES ('user_b', 'local', 'user_b', 'hash', 'active', 0, 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let repo = Arc::new(SqliteSkillRepository::new(db.pool().clone()));
+        let user_a_skill_path = user_a_skill.join("shared").to_string_lossy().into_owned();
+        let user_b_skill_path = user_b_skill.join("shared").to_string_lossy().into_owned();
+        repo.upsert_for_user(
+            "system_default_user",
+            UpsertSkillParams {
+                name: "shared",
+                description: Some("User A skill"),
+                path: &user_a_skill_path,
+                source: "user",
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        repo.upsert_for_user(
+            "user_b",
+            UpsertSkillParams {
+                name: "shared",
+                description: Some("User B skill"),
+                path: &user_b_skill_path,
+                source: "user",
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resolver = ExtensionSkillResolver::new(paths, repo);
+        let resolved = resolver.resolve_skills_for_user("user_b", &["shared".to_owned()]).await;
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].source_path, user_b_skill.join("shared"));
     }
 }

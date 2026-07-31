@@ -249,6 +249,9 @@ pub enum AgentKillReason {
     /// The requested runtime capabilities changed, so the in-memory task must
     /// be rebuilt before handling the next turn.
     RuntimeCapabilityChanged,
+    /// The owning user's Core session was revoked, so foreground runtime state
+    /// and agent processes for that user must be torn down.
+    SessionRevoked,
 }
 
 /// Preview content type for document preview history.

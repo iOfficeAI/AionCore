@@ -11,12 +11,13 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
     let pool = db.pool();
     sqlx::query(
         "INSERT INTO providers \
-            (id, platform, name, base_url, api_key_encrypted, models, enabled, \
+            (id, user_id, platform, name, base_url, api_key_encrypted, models, enabled, \
              capabilities, context_limit, model_protocols, model_enabled, model_health, \
              bedrock_config, is_full_url, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind("prov-secret")
+    .bind("system_default_user")
     .bind("openrouter")
     .bind("OpenRouter")
     .bind("https://sk-live-secret@example.invalid/v1/chat/completions?api_key=sk-query")
@@ -423,12 +424,13 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
 
     sqlx::query(
         "INSERT INTO agent_metadata \
-            (id, name, backend, agent_type, agent_source, enabled, command, args, env, \
+            (id, agent_id, name, backend, agent_type, agent_source, enabled, command, args, env, \
              native_skills_dirs, behavior_policy, available_modes, available_models, sort_order, \
              last_check_status, last_check_kind, last_check_error_code, last_check_error_message, \
              created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
+    .bind("opencode")
     .bind("opencode")
     .bind("OpenCode")
     .bind("opencode")
@@ -510,9 +512,10 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
     }
 
     sqlx::query(
-        "INSERT INTO client_preferences (key, value, updated_at) VALUES (?, ?, ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        "INSERT INTO client_preferences (user_id, key, value, updated_at) VALUES (?, ?, ?, ?) \
+         ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
     )
+    .bind("system_default_user")
     .bind("appearance.uiScale")
     .bind("1.25")
     .bind(ANCHOR_UPDATED_AT + 100)
@@ -522,9 +525,9 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
 
     sqlx::query(
         "INSERT INTO system_settings \
-            (id, language, notification_enabled, cron_notification_enabled, command_queue_enabled, save_upload_to_workspace, updated_at) \
-         VALUES (1, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(id) DO UPDATE SET \
+            (user_id, language, notification_enabled, cron_notification_enabled, command_queue_enabled, save_upload_to_workspace, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(user_id) DO UPDATE SET \
             language = excluded.language, \
             notification_enabled = excluded.notification_enabled, \
             cron_notification_enabled = excluded.cron_notification_enabled, \
@@ -532,6 +535,7 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
             save_upload_to_workspace = excluded.save_upload_to_workspace, \
             updated_at = excluded.updated_at",
     )
+    .bind("system_default_user")
     .bind("zh-CN")
     .bind(true)
     .bind(false)
@@ -612,11 +616,12 @@ async fn insert_mcp_feedback_fixture(db: &aionui_db::Database) {
 
     sqlx::query(
         "INSERT INTO mcp_servers \
-            (id, name, description, enabled, transport_type, transport_config, tools, \
+            (id, user_id, name, description, enabled, transport_type, transport_config, tools, \
              last_test_status, last_connected, original_json, builtin, deleted_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind("mcp-raw-config")
+    .bind("system_default_user")
     .bind("raw-config-mcp")
     .bind(None::<String>)
     .bind(true)
@@ -630,6 +635,58 @@ async fn insert_mcp_feedback_fixture(db: &aionui_db::Database) {
     .bind(None::<i64>)
     .bind(ANCHOR_CREATED_AT)
     .bind(ANCHOR_UPDATED_AT)
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+async fn insert_foreign_agent_metadata(db: &aionui_db::Database) {
+    sqlx::query(
+        "INSERT INTO users \
+            (id, user_type, external_user_id, username, email, password_hash, avatar_path, jwt_secret, \
+             status, session_generation, created_at, updated_at, last_login) \
+         VALUES (?, 'aionpro', ?, ?, ?, NULL, NULL, NULL, 'active', 0, ?, ?, NULL)",
+    )
+    .bind("user-b")
+    .bind("external-user-b")
+    .bind("User B")
+    .bind("user-b@example.invalid")
+    .bind(ANCHOR_CREATED_AT)
+    .bind(ANCHOR_UPDATED_AT)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO agent_metadata \
+            (id, agent_id, user_id, name, backend, agent_type, agent_source, enabled, command, args, env, \
+             native_skills_dirs, behavior_policy, available_modes, available_models, sort_order, \
+             last_check_status, last_check_kind, last_check_error_code, last_check_error_message, \
+             created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("foreign-agent")
+    .bind("foreign-agent")
+    .bind("user-b")
+    .bind("Foreign Agent")
+    .bind("foreign-backend")
+    .bind("acp")
+    .bind("custom")
+    .bind(true)
+    .bind("foreign-command")
+    .bind(json!(["run"]).to_string())
+    .bind(json!({}).to_string())
+    .bind(None::<String>)
+    .bind(None::<String>)
+    .bind(json!([{"id":"foreign-mode"}]).to_string())
+    .bind(json!([{"id":"foreign-model"}]).to_string())
+    .bind(1_i64)
+    .bind("ok")
+    .bind("session")
+    .bind(None::<String>)
+    .bind(None::<String>)
+    .bind(ANCHOR_CREATED_AT)
+    .bind(ANCHOR_UPDATED_AT + 10_000)
     .execute(db.pool())
     .await
     .unwrap();
@@ -830,9 +887,39 @@ async fn conversation_profile_is_scoped_to_current_user() {
 }
 
 #[tokio::test]
+async fn conversation_profile_rejects_foreign_context_agent_metadata() {
+    let db = init_database_memory().await.unwrap();
+    insert_feedback_fixture(&db).await;
+    insert_foreign_agent_metadata(&db).await;
+    let repo = SqliteFeedbackDiagnosticsRepository::new(db.pool().clone());
+
+    let result = repo
+        .collect_feedback_diagnostics(&FeedbackDiagnosticsRequest {
+            user_id: "system_default_user".to_owned(),
+            profiles: vec![FeedbackDiagnosticsProfile::ConversationSession],
+            context: FeedbackDiagnosticsDbContext {
+                conversation_id: Some("conv-auth".to_owned()),
+                agent_id: Some("foreign-agent".to_owned()),
+                ..FeedbackDiagnosticsDbContext::default()
+            },
+        })
+        .await
+        .unwrap();
+
+    let conversation = result
+        .profiles
+        .iter()
+        .find(|profile| profile.name == "conversation-session")
+        .expect("conversation profile should exist");
+    assert_eq!(conversation.mode, "detail");
+    assert!(conversation.data["agent_metadata"].is_null());
+}
+
+#[tokio::test]
 async fn global_summary_includes_recent_diagnostics_without_sensitive_payloads() {
     let db = init_database_memory().await.unwrap();
     insert_feedback_fixture(&db).await;
+    insert_foreign_agent_metadata(&db).await;
     let repo = SqliteFeedbackDiagnosticsRepository::new(db.pool().clone());
 
     let result = repo
@@ -875,6 +962,9 @@ async fn global_summary_includes_recent_diagnostics_without_sensitive_payloads()
     );
     assert_eq!(direct_conversations[0]["assistant_id"], "assistant-direct");
     assert_eq!(direct_conversations[0]["agent_id"], "opencode");
+    let global_json = serde_json::to_string(&global.data).expect("global summary should serialize");
+    assert!(!global_json.contains("foreign-agent"));
+    assert!(!global_json.contains("Foreign Agent"));
     assert_eq!(direct_conversations[0]["current_model_id"], "anthropic/claude-sonnet-4");
     assert_eq!(
         direct_conversations[0]["recent_errors"][0]["content"]["error"]["message"],

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -73,10 +73,12 @@ pub struct FileWatchService {
     broadcaster: Arc<dyn EventBroadcaster>,
     /// Shared watcher for all single-file watches.
     file_watcher: Mutex<RecommendedWatcher>,
-    /// Set of canonical paths being watched (shared with the event handler).
-    watched_files: Arc<DashMap<String, ()>>,
+    /// Canonical watched paths and the users subscribed to each path.
+    watched_files: Arc<DashMap<String, BTreeSet<String>>>,
     /// Per-workspace Office watchers, keyed by canonical workspace path.
     office_watchers: Mutex<HashMap<String, RecommendedWatcher>>,
+    /// Canonical Office workspaces and the users subscribed to each workspace.
+    office_watch_users: Arc<DashMap<String, BTreeSet<String>>>,
     /// Debounce timestamps shared with watcher callbacks.
     debounce: Arc<DashMap<String, Instant>>,
 }
@@ -84,7 +86,8 @@ pub struct FileWatchService {
 impl FileWatchService {
     /// Create a new watch service backed by the platform's recommended watcher.
     pub fn new(broadcaster: Arc<dyn EventBroadcaster>) -> Result<Self, FileError> {
-        let watched_files: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
+        let watched_files: Arc<DashMap<String, BTreeSet<String>>> = Arc::new(DashMap::new());
+        let office_watch_users: Arc<DashMap<String, BTreeSet<String>>> = Arc::new(DashMap::new());
         let debounce: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
 
         let bc = broadcaster.clone();
@@ -107,18 +110,21 @@ impl FileWatchService {
 
             for path in &event.paths {
                 let path_str = path.to_string_lossy().into_owned();
-                if !wf.contains_key(&path_str) {
+                let Some(users) = wf.get(&path_str).map(|entry| entry.clone()) else {
                     continue;
-                }
+                };
                 if !should_emit(&db, &path_str) {
                     continue;
                 }
-                let payload = FileWatchEvent {
-                    file_path: path_str,
-                    event_type: event_type.to_owned(),
-                };
-                let json = serde_json::to_value(&payload).unwrap_or_default();
-                bc.broadcast(WebSocketMessage::new("fileWatch.fileChanged", json));
+                for user_id in users {
+                    let payload = FileWatchEvent {
+                        file_path: path_str.clone(),
+                        event_type: event_type.to_owned(),
+                    };
+                    let mut json = serde_json::to_value(&payload).unwrap_or_default();
+                    json["user_id"] = serde_json::Value::String(user_id);
+                    bc.broadcast(WebSocketMessage::new("fileWatch.fileChanged", json));
+                }
             }
         })
         .map_err(|e| FileError::Internal(format!("failed to create file watcher: {e}")))?;
@@ -128,6 +134,7 @@ impl FileWatchService {
             file_watcher: Mutex::new(file_watcher),
             watched_files,
             office_watchers: Mutex::new(HashMap::new()),
+            office_watch_users,
             debounce,
         })
     }
@@ -136,12 +143,16 @@ impl FileWatchService {
 #[async_trait::async_trait]
 impl crate::traits::IFileWatchService for FileWatchService {
     async fn start_watch(&self, file_path: &str) -> Result<(), FileError> {
+        self.start_watch_for_user("system_default_user", file_path).await
+    }
+
+    async fn start_watch_for_user(&self, user_id: &str, file_path: &str) -> Result<(), FileError> {
         let canonical = std::fs::canonicalize(file_path)
             .map_err(|e| FileError::NotFound(format!("cannot resolve path {file_path}: {e}")))?;
         let key = canonical.to_string_lossy().into_owned();
 
-        // Idempotent: already watching → no-op.
-        if self.watched_files.contains_key(&key) {
+        if let Some(mut users) = self.watched_files.get_mut(&key) {
+            users.insert(user_id.to_owned());
             return Ok(());
         }
 
@@ -152,25 +163,36 @@ impl crate::traits::IFileWatchService for FileWatchService {
         watcher
             .watch(&canonical, RecursiveMode::NonRecursive)
             .map_err(|e| FileError::Internal(format!("failed to watch {file_path}: {e}")))?;
-        self.watched_files.insert(key, ());
+        self.watched_files.insert(key, BTreeSet::from([user_id.to_owned()]));
         Ok(())
     }
 
     async fn stop_watch(&self, file_path: &str) -> Result<(), FileError> {
+        self.stop_watch_for_user("system_default_user", file_path).await
+    }
+
+    async fn stop_watch_for_user(&self, user_id: &str, file_path: &str) -> Result<(), FileError> {
         let canonical = std::fs::canonicalize(file_path).unwrap_or_else(|_| file_path.into());
         let key = canonical.to_string_lossy().into_owned();
 
-        if self.watched_files.remove(&key).is_none() {
-            return Ok(());
+        let should_unwatch = if let Some(mut users) = self.watched_files.get_mut(&key) {
+            users.remove(user_id);
+            users.is_empty()
+        } else {
+            false
+        };
+
+        if should_unwatch {
+            self.watched_files.remove(&key);
+            let mut watcher = self
+                .file_watcher
+                .lock()
+                .map_err(|e| FileError::Internal(format!("file watcher lock poisoned: {e}")))?;
+            // Ignore unwatch errors because the file may have been deleted.
+            let _ = watcher.unwatch(&canonical);
+            self.debounce.remove(&key);
         }
 
-        let mut watcher = self
-            .file_watcher
-            .lock()
-            .map_err(|e| FileError::Internal(format!("file watcher lock poisoned: {e}")))?;
-        // Ignore unwatch errors — the file may have been deleted.
-        let _ = watcher.unwatch(&canonical);
-        self.debounce.remove(&key);
         Ok(())
     }
 
@@ -190,7 +212,19 @@ impl crate::traits::IFileWatchService for FileWatchService {
         Ok(())
     }
 
+    async fn stop_all_watches_for_user(&self, user_id: &str) -> Result<(), FileError> {
+        let keys: Vec<String> = self.watched_files.iter().map(|entry| entry.key().clone()).collect();
+        for key in keys {
+            self.stop_watch_for_user(user_id, &key).await?;
+        }
+        Ok(())
+    }
+
     async fn start_office_watch(&self, workspace: &str) -> Result<(), FileError> {
+        self.start_office_watch_for_user("system_default_user", workspace).await
+    }
+
+    async fn start_office_watch_for_user(&self, user_id: &str, workspace: &str) -> Result<(), FileError> {
         let canonical = std::fs::canonicalize(workspace)
             .map_err(|e| FileError::NotFound(format!("cannot resolve workspace {workspace}: {e}")))?;
         let key = canonical.to_string_lossy().into_owned();
@@ -201,6 +235,10 @@ impl crate::traits::IFileWatchService for FileWatchService {
                 .lock()
                 .map_err(|e| FileError::Internal(format!("office watcher lock poisoned: {e}")))?;
             if watchers.contains_key(&key) {
+                self.office_watch_users
+                    .entry(key)
+                    .or_default()
+                    .insert(user_id.to_owned());
                 return Ok(());
             }
         }
@@ -208,6 +246,7 @@ impl crate::traits::IFileWatchService for FileWatchService {
         let bc = self.broadcaster.clone();
         let db = self.debounce.clone();
         let ws = key.clone();
+        let office_users = self.office_watch_users.clone();
 
         let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             let event = match res {
@@ -228,15 +267,21 @@ impl crate::traits::IFileWatchService for FileWatchService {
                 }
                 let path_str = path.to_string_lossy().into_owned();
                 let debounce_key = format!("office:{path_str}");
+                let Some(users) = office_users.get(&ws).map(|entry| entry.clone()) else {
+                    continue;
+                };
                 if !should_emit(&db, &debounce_key) {
                     continue;
                 }
-                let payload = OfficeFileAddedEvent {
-                    file_path: path_str,
-                    workspace: ws.clone(),
-                };
-                let json = serde_json::to_value(&payload).unwrap_or_default();
-                bc.broadcast(WebSocketMessage::new("workspaceOfficeWatch.fileAdded", json));
+                for user_id in users {
+                    let payload = OfficeFileAddedEvent {
+                        file_path: path_str.clone(),
+                        workspace: ws.clone(),
+                    };
+                    let mut json = serde_json::to_value(&payload).unwrap_or_default();
+                    json["user_id"] = serde_json::Value::String(user_id);
+                    bc.broadcast(WebSocketMessage::new("workspaceOfficeWatch.fileAdded", json));
+                }
             }
         })
         .map_err(|e| FileError::Internal(format!("failed to create office watcher: {e}")))?;
@@ -249,20 +294,50 @@ impl crate::traits::IFileWatchService for FileWatchService {
             .office_watchers
             .lock()
             .map_err(|e| FileError::Internal(format!("office watcher lock poisoned: {e}")))?;
-        watchers.insert(key, watcher);
+        watchers.insert(key.clone(), watcher);
+        self.office_watch_users
+            .insert(key, BTreeSet::from([user_id.to_owned()]));
         Ok(())
     }
 
     async fn stop_office_watch(&self, workspace: &str) -> Result<(), FileError> {
+        self.stop_office_watch_for_user("system_default_user", workspace).await
+    }
+
+    async fn stop_office_watch_for_user(&self, user_id: &str, workspace: &str) -> Result<(), FileError> {
         let canonical = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.into());
         let key = canonical.to_string_lossy().into_owned();
 
+        let should_stop = if let Some(mut users) = self.office_watch_users.get_mut(&key) {
+            users.remove(user_id);
+            users.is_empty()
+        } else {
+            false
+        };
+
+        if !should_stop {
+            return Ok(());
+        }
+
+        self.office_watch_users.remove(&key);
         let mut watchers = self
             .office_watchers
             .lock()
             .map_err(|e| FileError::Internal(format!("office watcher lock poisoned: {e}")))?;
         // Dropping the watcher stops watching.
         watchers.remove(&key);
+        Ok(())
+    }
+
+    async fn stop_all_office_watches_for_user(&self, user_id: &str) -> Result<(), FileError> {
+        let keys: Vec<String> = self
+            .office_watch_users
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in keys {
+            self.stop_office_watch_for_user(user_id, &key).await?;
+        }
         Ok(())
     }
 }

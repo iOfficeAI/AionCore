@@ -39,6 +39,7 @@ use crate::manager::acp::config_option_catalog::{
 /// before producers start to back off.
 const CATALOG_SYNC_CHANNEL_CAPACITY: usize = 256;
 const CLI_PROBE_CONCURRENCY: usize = 8;
+const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
 
 /// Budgets for the CLI version probe (#675). A probe that exceeds
 /// `inline_budget` is NOT condemned — it is queued for a background recheck
@@ -77,6 +78,7 @@ enum InlineProbeOutcome {
 /// One unit of work submitted to the catalog sync consumer task.
 #[derive(Debug)]
 struct CatalogSyncMessage {
+    user_id: String,
     agent_metadata_id: String,
     handshake: AgentHandshake,
 }
@@ -131,8 +133,12 @@ impl AgentRegistry {
     fn spawn_catalog_consumer(self: Arc<Self>, mut rx: mpsc::Receiver<CatalogSyncMessage>) {
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                if let Err(err) = self.apply_handshake_inner(&msg.agent_metadata_id, &msg.handshake).await {
+                if let Err(err) = self
+                    .apply_handshake_inner(&msg.user_id, &msg.agent_metadata_id, &msg.handshake)
+                    .await
+                {
                     warn!(
+                        user_id = %msg.user_id,
                         agent_metadata_id = %msg.agent_metadata_id,
                         error = %err,
                         "Catalog sync: apply_handshake failed"
@@ -150,13 +156,15 @@ impl AgentRegistry {
     /// tests and the consumer itself.
     ///
     /// `None` fields are left untouched (partial update).
-    async fn apply_handshake_inner(&self, id: &str, snapshot: &AgentHandshake) -> Result<(), AgentError> {
+    async fn apply_handshake_inner(
+        &self,
+        user_id: &str,
+        id: &str,
+        snapshot: &AgentHandshake,
+    ) -> Result<(), AgentError> {
         let mut snapshot = snapshot.clone();
         if let Some(incoming_config_options) = snapshot.config_options.as_ref() {
-            let existing_config_options = {
-                let guard = self.by_id.read().await;
-                guard.get(id).and_then(|meta| meta.handshake.config_options.clone())
-            };
+            let existing_config_options = self.existing_config_options_for_user(user_id, id).await?;
             if let Some(merged_config_options) =
                 merge_config_option_values(existing_config_options.as_ref(), incoming_config_options)
             {
@@ -181,16 +189,16 @@ impl AgentRegistry {
             available_commands: available_commands.as_deref().map(Some),
         };
 
-        let Some(row) = self
-            .repo
-            .apply_handshake(id, &params)
-            .await
-            .map_err(|e| AgentError::internal(format!("apply_handshake: {e}")))?
-        else {
+        // Handshake capabilities are machine-level (they come from the agent
+        // CLI's own login, shared by every user), so the write always targets
+        // the single catalog row regardless of the acting user.
+        let row = self.repo.apply_handshake(id, &params).await;
+        let Some(row) = row.map_err(|e| AgentError::internal(format!("apply_handshake: {e}")))? else {
             return Ok(());
         };
 
-        if let Some((mut meta, reason)) = decode_row(row, AvailabilityProjection::Cached) {
+        let can_update_global_cache = row.user_id.is_none() || row.user_id.as_deref() == Some(SYSTEM_DEFAULT_USER_ID);
+        if can_update_global_cache && let Some((mut meta, reason)) = decode_row(row, AvailabilityProjection::Cached) {
             let existing_availability = self
                 .by_id
                 .read()
@@ -212,6 +220,18 @@ impl AgentRegistry {
             self.by_id.write().await.insert(meta.id.clone(), meta);
         }
         Ok(())
+    }
+
+    async fn existing_config_options_for_user(&self, user_id: &str, id: &str) -> Result<Option<Value>, AgentError> {
+        let row = if user_id == SYSTEM_DEFAULT_USER_ID {
+            self.repo.get(id).await
+        } else {
+            self.repo.get_for_user(user_id, id).await
+        }
+        .map_err(|e| AgentError::internal(format!("load agent_metadata '{id}' for handshake merge: {e}")))?;
+        Ok(row
+            .and_then(|row| decode_row(row, AvailabilityProjection::Cached))
+            .and_then(|(meta, _)| meta.handshake.config_options))
     }
 
     async fn update_cached_unavailable_reason(&self, id: &str, reason: Option<UnavailableReason>) {
@@ -426,6 +446,17 @@ impl AgentRegistry {
             .cloned()
     }
 
+    /// User-scoped builtin lookup for runtime paths that must honor per-user
+    /// agent overrides while still seeing global builtin rows.
+    pub async fn find_builtin_by_backend_for_user(&self, user_id: &str, vendor: &str) -> Option<AgentMetadata> {
+        let row = self
+            .repo
+            .find_builtin_by_backend_for_user(user_id, vendor)
+            .await
+            .ok()??;
+        decode_row(row, AvailabilityProjection::Cached).map(|(meta, _)| meta)
+    }
+
     /// Every enabled, installed row whose `agent_type` matches,
     /// sorted by `sort_order`. See [`Self::list_all`] for the filter
     /// semantics.
@@ -480,100 +511,96 @@ impl AgentRegistry {
             .values()
             .cloned()
             .map(|meta| {
-                let reason = reasons.get(&meta.id);
-                let status = derive_management_status(&meta, reason);
-                let diagnostics = derive_management_diagnostics(&meta, status, reason);
-                let handshake = meta.handshake;
-                AgentManagementRow {
-                    id: meta.id,
-                    icon: meta.icon,
-                    name: meta.name,
-                    name_i18n: meta.name_i18n,
-                    description: meta.description,
-                    description_i18n: meta.description_i18n,
-                    backend: meta.backend,
-                    agent_type: meta.agent_type,
-                    agent_source: meta.agent_source,
-                    agent_source_info: meta.agent_source_info,
-                    enabled: meta.enabled,
-                    installed: meta.available,
-                    command: meta.command,
-                    args: meta.args,
-                    env: Vec::new(),
-                    native_skills_dirs: meta.native_skills_dirs,
-                    behavior_policy: meta.behavior_policy,
-                    yolo_id: meta.yolo_id,
-                    config_options: handshake.config_options.clone(),
-                    available_modes: handshake.available_modes.clone(),
-                    available_models: handshake.available_models.clone(),
-                    available_commands: handshake.available_commands.clone(),
-                    sort_order: meta.sort_order,
-                    team_capable: meta.team_capable,
-                    status,
-                    last_check_status: meta.last_check_status,
-                    last_check_kind: meta.last_check_kind,
-                    last_check_error_code: diagnostics.error_code,
-                    last_check_error_message: diagnostics.error_message,
-                    last_check_error_details: diagnostics.details,
-                    last_check_guidance: diagnostics.guidance,
-                    last_check_latency_ms: meta.last_check_latency_ms,
-                    last_check_at: meta.last_check_at,
-                    last_success_at: meta.last_success_at,
-                    last_failure_at: meta.last_failure_at,
-                    has_command_override: meta.has_command_override,
-                    env_override_key_count: meta.env_override_key_count,
-                }
+                let reason = reasons.get(&meta.id).cloned();
+                agent_management_row(meta, reason.as_ref())
             })
             .collect();
         rows.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then_with(|| a.name.cmp(&b.name)));
         rows
     }
 
+    pub async fn list_management_rows_for_user(&self, user_id: &str) -> Result<Vec<AgentManagementRow>, AgentError> {
+        let rows = self
+            .repo
+            .list_all_for_user(user_id)
+            .await
+            .map_err(|e| AgentError::internal(format!("load agent_metadata for user: {e}")))?;
+        let cached_rows = self.by_id.read().await.clone();
+        let cached_reasons = self.unavailable_reasons.read().await.clone();
+        let mut rows: Vec<AgentManagementRow> = rows
+            .into_iter()
+            .filter_map(|row| {
+                let can_use_global_cache =
+                    row.user_id.is_none() || row.user_id.as_deref() == Some(SYSTEM_DEFAULT_USER_ID);
+                decode_row(row, AvailabilityProjection::Cached).map(|decoded| (decoded, can_use_global_cache))
+            })
+            .map(|((mut meta, mut reason), can_use_global_cache)| {
+                let cached_meta = can_use_global_cache.then(|| cached_rows.get(&meta.id)).flatten();
+                let cached_reason = can_use_global_cache.then(|| cached_reasons.get(&meta.id)).flatten();
+                if cached_meta.is_some() {
+                    (meta, reason) = overlay_hydrated_availability(meta, reason, cached_meta, cached_reason);
+                } else if !has_availability_snapshot(&meta) {
+                    reason = apply_probe_availability(&mut meta);
+                }
+                agent_management_row(meta, reason.as_ref())
+            })
+            .collect();
+        rows.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then_with(|| a.name.cmp(&b.name)));
+        Ok(rows)
+    }
+
     pub async fn management_row_by_id(&self, id: &str) -> Option<AgentManagementRow> {
         let reason = self.unavailable_reasons.read().await.get(id).cloned();
         let meta = self.by_id.read().await.get(id).cloned()?;
-        let status = derive_management_status(&meta, reason.as_ref());
-        let diagnostics = derive_management_diagnostics(&meta, status, reason.as_ref());
-        let handshake = meta.handshake.clone();
-        Some(AgentManagementRow {
-            id: meta.id,
-            icon: meta.icon,
-            name: meta.name,
-            name_i18n: meta.name_i18n,
-            description: meta.description,
-            description_i18n: meta.description_i18n,
-            backend: meta.backend,
-            agent_type: meta.agent_type,
-            agent_source: meta.agent_source,
-            agent_source_info: meta.agent_source_info,
-            enabled: meta.enabled,
-            installed: meta.available,
-            command: meta.command,
-            args: meta.args,
-            env: Vec::new(),
-            native_skills_dirs: meta.native_skills_dirs,
-            behavior_policy: meta.behavior_policy,
-            yolo_id: meta.yolo_id,
-            config_options: handshake.config_options.clone(),
-            available_modes: handshake.available_modes.clone(),
-            available_models: handshake.available_models.clone(),
-            available_commands: handshake.available_commands.clone(),
-            sort_order: meta.sort_order,
-            team_capable: meta.team_capable,
-            status,
-            last_check_status: meta.last_check_status,
-            last_check_kind: meta.last_check_kind,
-            last_check_error_code: diagnostics.error_code,
-            last_check_error_message: diagnostics.error_message,
-            last_check_error_details: diagnostics.details,
-            last_check_guidance: diagnostics.guidance,
-            last_check_latency_ms: meta.last_check_latency_ms,
-            last_check_at: meta.last_check_at,
-            last_success_at: meta.last_success_at,
-            last_failure_at: meta.last_failure_at,
-            has_command_override: meta.has_command_override,
-            env_override_key_count: meta.env_override_key_count,
-        })
+        Some(agent_management_row(meta, reason.as_ref()))
+    }
+
+    pub async fn get_for_user(&self, user_id: &str, id: &str) -> Result<Option<AgentMetadata>, AgentError> {
+        let row = self
+            .repo
+            .get_for_user(user_id, id)
+            .await
+            .map_err(|e| AgentError::internal(format!("load agent_metadata '{id}' for user: {e}")))?;
+        let Some((meta, _)) = row.and_then(|row| decode_row(row, AvailabilityProjection::Probe)) else {
+            return Ok(None);
+        };
+        let (meta, _, _) = validate_cli_availability(meta, None, self.probe_policy).await;
+        Ok(Some(meta))
+    }
+
+    pub async fn management_row_by_id_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<Option<AgentManagementRow>, AgentError> {
+        let row = self
+            .repo
+            .get_for_user(user_id, id)
+            .await
+            .map_err(|e| AgentError::internal(format!("load agent_metadata '{id}' for user: {e}")))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let can_use_global_cache = row.user_id.is_none() || row.user_id.as_deref() == Some(SYSTEM_DEFAULT_USER_ID);
+        let Some((mut meta, mut reason)) = decode_row(row, AvailabilityProjection::Cached) else {
+            return Ok(None);
+        };
+        let cached_meta = if can_use_global_cache {
+            self.by_id.read().await.get(&meta.id).cloned()
+        } else {
+            None
+        };
+        let cached_reason = if can_use_global_cache {
+            self.unavailable_reasons.read().await.get(&meta.id).cloned()
+        } else {
+            None
+        };
+        if cached_meta.is_some() {
+            (meta, reason) = overlay_hydrated_availability(meta, reason, cached_meta.as_ref(), cached_reason.as_ref());
+        } else if !has_availability_snapshot(&meta) {
+            reason = apply_probe_availability(&mut meta);
+        }
+        Ok(Some(agent_management_row(meta, reason.as_ref())))
     }
 
     /// Like [`Self::list_all_including_hidden`] but pairs every row
@@ -619,6 +646,91 @@ impl AgentRegistry {
 /// ACP/session admission out of visible legacy catalog reads.
 fn is_visible(meta: &AgentMetadata) -> bool {
     meta.enabled && matches!(derive_management_status(meta, None), AgentManagementStatus::Online)
+}
+
+fn agent_management_row(meta: AgentMetadata, reason: Option<&UnavailableReason>) -> AgentManagementRow {
+    let status = derive_management_status(&meta, reason);
+    let diagnostics = derive_management_diagnostics(&meta, status, reason);
+    let handshake = meta.handshake;
+    AgentManagementRow {
+        id: meta.id,
+        icon: meta.icon,
+        name: meta.name,
+        name_i18n: meta.name_i18n,
+        description: meta.description,
+        description_i18n: meta.description_i18n,
+        backend: meta.backend,
+        agent_type: meta.agent_type,
+        agent_source: meta.agent_source,
+        agent_source_info: meta.agent_source_info,
+        enabled: meta.enabled,
+        installed: meta.available,
+        command: meta.command,
+        args: meta.args,
+        env: Vec::new(),
+        native_skills_dirs: meta.native_skills_dirs,
+        behavior_policy: meta.behavior_policy,
+        yolo_id: meta.yolo_id,
+        config_options: handshake.config_options.clone(),
+        available_modes: handshake.available_modes.clone(),
+        available_models: handshake.available_models.clone(),
+        available_commands: handshake.available_commands.clone(),
+        sort_order: meta.sort_order,
+        team_capable: meta.team_capable,
+        status,
+        last_check_status: meta.last_check_status,
+        last_check_kind: meta.last_check_kind,
+        last_check_error_code: diagnostics.error_code,
+        last_check_error_message: diagnostics.error_message,
+        last_check_error_details: diagnostics.details,
+        last_check_guidance: diagnostics.guidance,
+        last_check_latency_ms: meta.last_check_latency_ms,
+        last_check_at: meta.last_check_at,
+        last_success_at: meta.last_success_at,
+        last_failure_at: meta.last_failure_at,
+        has_command_override: meta.has_command_override,
+        env_override_key_count: meta.env_override_key_count,
+    }
+}
+
+fn overlay_hydrated_availability(
+    mut meta: AgentMetadata,
+    reason: Option<UnavailableReason>,
+    cached_meta: Option<&AgentMetadata>,
+    cached_reason: Option<&UnavailableReason>,
+) -> (AgentMetadata, Option<UnavailableReason>) {
+    let Some(cached_meta) = cached_meta else {
+        return (meta, reason);
+    };
+    if has_availability_snapshot(&meta) || !same_runtime_availability_inputs(&meta, cached_meta) {
+        return (meta, reason);
+    }
+
+    meta.available = cached_meta.available;
+    meta.resolved_command = cached_meta.resolved_command.clone();
+    let reason = if meta.available {
+        None
+    } else {
+        cached_reason.cloned().or(reason)
+    };
+    (meta, reason)
+}
+
+fn same_runtime_availability_inputs(a: &AgentMetadata, b: &AgentMetadata) -> bool {
+    a.enabled == b.enabled
+        && a.agent_source == b.agent_source
+        && a.agent_type == b.agent_type
+        && a.backend == b.backend
+        && a.command == b.command
+        && a.args == b.args
+        && json_values_equal(&a.env, &b.env)
+        && a.native_skills_dirs == b.native_skills_dirs
+        && json_values_equal(&a.behavior_policy, &b.behavior_policy)
+        && a.yolo_id == b.yolo_id
+}
+
+fn json_values_equal<T: serde::Serialize>(a: &T, b: &T) -> bool {
+    serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
 }
 
 /// Extract and trim a command override, filtering out empty strings.
@@ -679,9 +791,19 @@ fn decode_row(
     };
 
     let backend_str = row.backend.as_deref().unwrap_or("");
-    let inferred_team_capable = behavior_policy.supports_team
+    // Team MEMBERSHIP (may this agent be picked into a team) — distinct from the
+    // team TRANSPORT chosen later at provisioning time, which reads capabilities
+    // only. Whitelist first, inference second:
+    //   - `supports_team` is the known-good opt-in (migration 014). It carries
+    //     agents whose `agent_capabilities` are still NULL because they have never
+    //     handshaken on this machine (claude/codex/gemini on a fresh install), and
+    //     aionrs, whose NULL backend the inference cannot judge at all.
+    //   - otherwise infer from the advertised MCP transports / CLI eligibility.
+    // There is deliberately no veto flag on this path: a stored "false" could not
+    // be lifted once an agent proved itself, since builtin rows reject metadata
+    // edits through the agent API.
+    let team_capable = behavior_policy.supports_team
         || aionui_common::constants::is_team_capable(backend_str, handshake.agent_capabilities.as_ref());
-    let team_capable = behavior_policy.team_capable_override.unwrap_or(inferred_team_capable);
 
     let mut meta = AgentMetadata {
         id: row.id,
@@ -1315,8 +1437,9 @@ impl CatalogSender {
     /// Submit a partial handshake update. Returns without error when the
     /// channel is closed (only happens at shutdown) or full — callers do
     /// not need to care because the consumer is best-effort.
-    pub fn send_partial(&self, agent_metadata_id: String, handshake: AgentHandshake) {
+    pub fn send_partial(&self, user_id: String, agent_metadata_id: String, handshake: AgentHandshake) {
         let msg = CatalogSyncMessage {
+            user_id,
             agent_metadata_id,
             handshake,
         };
@@ -1451,7 +1574,7 @@ fn probe_command_candidate(command: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aionui_db::{SqliteAgentMetadataRepository, init_database_memory};
+    use aionui_db::{IAgentMetadataRepository, SqliteAgentMetadataRepository, init_database_memory};
 
     async fn registry() -> Arc<AgentRegistry> {
         let db = init_database_memory().await.unwrap();
@@ -1468,7 +1591,7 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 41);
+        assert_eq!(all.len(), 42);
     }
 
     #[tokio::test]
@@ -1518,7 +1641,13 @@ mod tests {
         assert_eq!(pi.agent_source_info.binary_name.as_deref(), Some("pi"));
         assert_eq!(pi.agent_source_info.bridge_binary.as_deref(), Some("npx"));
         assert_eq!(pi.native_skills_dirs.as_deref(), Some(&[".pi/skills".to_owned()][..]));
-        assert!(!pi.team_capable);
+        // Team-capable through the CLI transport. pi advertises no optional MCP
+        // transport and LIVE-probed does not load a stdio MCP server, so Team
+        // gives it the `$AIONUI_HELPER_BIN team ...` command surface instead of
+        // MCP tools — but that surface works, so the picker must not block it.
+        // (This asserted `false` while builtin rows carried a hard veto flag; the
+        // flag is gone, and blocking a CLI-coordinating agent was never right.)
+        assert!(pi.team_capable);
         assert_eq!(pi.yolo_id, None);
         assert_eq!(
             pi.handshake
@@ -1544,7 +1673,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("missing release lock for {backend}: {error}"));
             locked += 1;
         }
-        assert_eq!(locked, 12);
+        assert_eq!(locked, 13);
     }
 
     /// On a host that has *none* of the seeded CLIs installed, the
@@ -1579,7 +1708,7 @@ mod tests {
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
         let count = |t: AgentType| all.iter().filter(|m| m.agent_type == t).count();
-        assert_eq!(count(AgentType::Acp), 38);
+        assert_eq!(count(AgentType::Acp), 39);
         assert_eq!(count(AgentType::Nanobot), 1);
         assert_eq!(count(AgentType::OpenclawGateway), 1);
         assert_eq!(count(AgentType::Aionrs), 1);
@@ -1610,11 +1739,110 @@ mod tests {
             ])),
             ..Default::default()
         };
-        reg.apply_handshake_inner(&claude.id, &snapshot).await.unwrap();
+        reg.apply_handshake_inner(SYSTEM_DEFAULT_USER_ID, &claude.id, &snapshot)
+            .await
+            .unwrap();
 
         let refreshed = reg.get(&claude.id).await.unwrap();
         let methods = refreshed.handshake.auth_methods.unwrap();
         assert_eq!(methods.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_handshake_is_machine_level_shared_by_all_users() {
+        // Handshake capabilities come from the agent CLI's own login and are
+        // machine-level: every user's handshake lands on the single catalog
+        // row, and every user reads the same merged result. There is no
+        // per-user handshake divergence.
+        let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES ('user-b', 'local', 'user-b', 'hash', 'active', 0, 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let repo = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+
+        let reg = AgentRegistry::new(repo.clone());
+        reg.apply_handshake_inner(
+            SYSTEM_DEFAULT_USER_ID,
+            "2d23ff1c",
+            &AgentHandshake {
+                config_options: Some(serde_json::json!({
+                    "config_options": [
+                        {
+                            "id": "mode",
+                            "name": "Mode",
+                            "type": "select",
+                            "category": "mode",
+                            "current_value": "default-mode",
+                            "options": [{"value": "default-mode", "name": "Default Mode"}]
+                        }
+                    ]
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A different user's handshake targets the SAME catalog row.
+        reg.apply_handshake_inner(
+            "user-b",
+            "2d23ff1c",
+            &AgentHandshake {
+                auth_methods: Some(serde_json::json!([{"type":"agent","id":"oauth"}])),
+                config_options: Some(serde_json::json!({
+                    "config_options": [
+                        {
+                            "id": "model",
+                            "name": "Model",
+                            "type": "select",
+                            "category": "model",
+                            "current_value": "user-b-model",
+                            "options": [{"value": "user-b-model", "name": "User B Model"}]
+                        }
+                    ]
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let default_row = repo
+            .get_for_user(SYSTEM_DEFAULT_USER_ID, "2d23ff1c")
+            .await
+            .unwrap()
+            .unwrap();
+        let user_b_row = repo.get_for_user("user-b", "2d23ff1c").await.unwrap().unwrap();
+
+        // Machine-level: both users see identical handshake state.
+        assert_eq!(default_row.auth_methods, user_b_row.auth_methods);
+        assert_eq!(default_row.config_options, user_b_row.config_options);
+
+        // The second (user-b) handshake landed on the catalog: auth_methods is
+        // present, and its config option merged in alongside the first.
+        // Key order follows the SDK's internally-tagged AuthMethod enum
+        // (tag key first); consumers parse this column as JSON, so ordering
+        // is not part of the contract.
+        assert_eq!(
+            default_row.auth_methods.as_deref(),
+            Some(r#"[{"type":"agent","id":"oauth"}]"#)
+        );
+        assert!(
+            default_row
+                .config_options
+                .as_deref()
+                .is_some_and(|value| value.contains(r#""id":"model""#))
+        );
+
+        // Everything lives on the single catalog row — no row was duplicated.
+        let catalog_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_metadata WHERE agent_id = '2d23ff1c'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(catalog_rows, 1, "handshake must not duplicate the catalog row");
     }
 
     /// Partial updates must leave unrelated columns untouched.
@@ -1633,6 +1861,7 @@ mod tests {
 
         // Write #1: agent_capabilities only.
         reg.apply_handshake_inner(
+            SYSTEM_DEFAULT_USER_ID,
             &claude.id,
             &AgentHandshake {
                 agent_capabilities: Some(serde_json::json!({"load_session": true})),
@@ -1644,6 +1873,7 @@ mod tests {
 
         // Write #2: auth_methods only. Capabilities must survive.
         reg.apply_handshake_inner(
+            SYSTEM_DEFAULT_USER_ID,
             &claude.id,
             &AgentHandshake {
                 auth_methods: Some(serde_json::json!([{"type": "agent", "id": "oauth"}])),
@@ -1655,6 +1885,7 @@ mod tests {
 
         // Write #3: available_modes only. Capabilities + auth_methods must survive.
         reg.apply_handshake_inner(
+            SYSTEM_DEFAULT_USER_ID,
             &claude.id,
             &AgentHandshake {
                 available_modes: Some(serde_json::json!([{"id": "code", "name": "Code"}])),
@@ -1689,7 +1920,7 @@ mod tests {
     async fn diagnostic_snapshot_pairs_rows_with_reasons() {
         let reg = registry().await;
         let snapshot = reg.diagnostic_snapshot().await;
-        assert_eq!(snapshot.len(), 41, "every row appears once");
+        assert_eq!(snapshot.len(), 42, "every row appears once");
 
         for (meta, reason) in &snapshot {
             match (meta.available, reason) {
@@ -1722,6 +1953,7 @@ mod tests {
         let claude = reg.find_builtin_by_backend("claude").await.unwrap();
 
         reg.apply_handshake_inner(
+            SYSTEM_DEFAULT_USER_ID,
             &claude.id,
             &AgentHandshake {
                 agent_capabilities: Some(serde_json::json!({"x": 1})),
@@ -1731,7 +1963,7 @@ mod tests {
         .await
         .unwrap();
 
-        reg.apply_handshake_inner(&claude.id, &AgentHandshake::default())
+        reg.apply_handshake_inner(SYSTEM_DEFAULT_USER_ID, &claude.id, &AgentHandshake::default())
             .await
             .unwrap();
 
@@ -1767,6 +1999,7 @@ mod tests {
         use aionui_db::AgentMetadataRow;
         let row = AgentMetadataRow {
             id: "test-agent".to_string(),
+            user_id: None,
             icon: None,
             name: "Test Agent".to_string(),
             name_i18n: None,
@@ -1813,6 +2046,7 @@ mod tests {
         use aionui_db::AgentMetadataRow;
         let row = AgentMetadataRow {
             id: "632f31d2".to_string(),
+            user_id: None,
             icon: None,
             name: "Aion CLI".to_string(),
             name_i18n: None,
@@ -1868,6 +2102,7 @@ mod tests {
         use aionui_db::AgentMetadataRow;
         let row = AgentMetadataRow {
             id: "test-agent-2".to_string(),
+            user_id: None,
             icon: None,
             name: "Test Agent 2".to_string(),
             name_i18n: None,

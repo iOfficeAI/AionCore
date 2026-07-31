@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+const TEST_USER_ID: &str = "system_default_user";
+
 use aionui_common::McpServerStatus;
 use aionui_db::models::McpServerRow;
 use aionui_mcp::{McpServer, McpServerTransport, McpTool};
@@ -15,6 +17,7 @@ use aionui_mcp::{McpServer, McpServerTransport, McpTool};
 
 fn row(transport_type: &str, transport_config: &str, tools: Option<&str>, status: &str) -> McpServerRow {
     McpServerRow {
+        user_id: TEST_USER_ID.to_string(),
         id: "mcp_integration".into(),
         name: "integration-test".into(),
         description: Some("Integration test server".into()),

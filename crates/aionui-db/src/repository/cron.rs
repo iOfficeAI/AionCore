@@ -70,28 +70,38 @@ pub trait ICronRepository: Send + Sync {
     /// Inserts a new cron job row.
     async fn insert(&self, row: &CronJobRow) -> Result<(), DbError>;
 
-    /// Updates a cron job by ID with the provided fields.
-    /// Returns `DbError::NotFound` if absent.
-    async fn update(&self, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError>;
+    /// Updates a cron job whose conversation is owned by `user_id`.
+    async fn update_for_user(&self, user_id: &str, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError>;
 
-    /// Deletes a cron job by ID. Returns `DbError::NotFound` if absent.
-    async fn delete(&self, id: &str) -> Result<(), DbError>;
+    /// Deletes a cron job whose conversation is owned by `user_id`.
+    async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<(), DbError>;
 
-    /// Returns a single cron job by ID, or `None` if not found.
-    async fn get_by_id(&self, id: &str) -> Result<Option<CronJobRow>, DbError>;
+    /// System-only lookup path for scheduler/recovery code. User-facing code
+    /// must use `get_by_id_for_user`.
+    async fn get_by_id_system(&self, id: &str) -> Result<Option<CronJobRow>, DbError>;
 
-    /// Returns all cron jobs ordered by creation time ascending.
-    async fn list_all(&self) -> Result<Vec<CronJobRow>, DbError>;
+    /// Returns a single cron job whose conversation is owned by `user_id`.
+    async fn get_by_id_for_user(&self, user_id: &str, id: &str) -> Result<Option<CronJobRow>, DbError>;
 
-    /// Returns all enabled cron jobs.
-    async fn list_enabled(&self) -> Result<Vec<CronJobRow>, DbError>;
+    /// System-only full scan. User-facing code must use `list_all_for_user`.
+    async fn list_all_system(&self) -> Result<Vec<CronJobRow>, DbError>;
 
-    /// Returns all cron jobs for a given conversation.
-    async fn list_by_conversation(&self, conversation_id: &str) -> Result<Vec<CronJobRow>, DbError>;
+    /// Returns all cron jobs whose conversations are owned by `user_id`.
+    async fn list_all_for_user(&self, user_id: &str) -> Result<Vec<CronJobRow>, DbError>;
 
-    /// Deletes all cron jobs associated with a conversation.
-    /// Returns the number of deleted rows.
-    async fn delete_by_conversation(&self, conversation_id: &str) -> Result<u64, DbError>;
+    /// System-only enabled-job scan used by the scheduler.
+    async fn list_enabled_system(&self) -> Result<Vec<CronJobRow>, DbError>;
+
+    /// System-only conversation lookup. User-facing code must use
+    /// `list_by_conversation_for_user`.
+    async fn list_by_conversation_system(&self, conversation_id: &str) -> Result<Vec<CronJobRow>, DbError>;
+
+    /// Returns all cron jobs for a given conversation owned by `user_id`.
+    async fn list_by_conversation_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<CronJobRow>, DbError>;
 
     /// Atomically claims one scheduled occurrence across all backend processes.
     async fn claim_run(&self, params: &ClaimCronRunParams<'_>) -> Result<CronRunClaimResult, DbError>;

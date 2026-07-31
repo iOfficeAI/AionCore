@@ -7,9 +7,12 @@ use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
 use crate::factory::acp_launch_policy::{AcpLaunchPolicyInput, apply_acp_launch_policy};
 use crate::factory::context::FactoryContext;
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
+use crate::registry::AgentRegistry;
 use crate::session_context::AcpSessionBuildContext;
-use agent_client_protocol::schema::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
-use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
+use agent_client_protocol::schema::v1::{
+    EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
+};
+use aionui_api_types::{AgentMetadata, SessionMcpServer, SessionMcpTransport};
 use aionui_common::CommandSpec;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
@@ -28,14 +31,7 @@ pub(super) async fn build(
 
     // Resolve the catalog row — prefer explicit agent_id, fall
     // back to a vendor-label match for legacy payloads.
-    let meta = if let Some(ref agent_id) = config.agent_id {
-        deps.agent_registry.get(agent_id).await
-    } else if let Some(ref vendor) = config.backend {
-        deps.agent_registry.find_builtin_by_backend(vendor).await
-    } else {
-        None
-    }
-    .ok_or_else(|| AgentError::bad_request("ACP agent requires either agent_id or backend in extra"))?;
+    let meta = resolve_catalog_metadata(&deps.agent_registry, &config, &ctx.user_id).await?;
 
     // Trust the catalog row over the client-supplied `backend` when an
     // `agent_id` was provided. The frontend collapses row-scoped rows
@@ -60,6 +56,7 @@ pub(super) async fn build(
             backend_label,
             crate::session_agent::SessionBuildInputs {
                 conversation_id: ctx.conversation_id.clone(),
+                user_id: ctx.user_id.clone(),
                 workspace: ctx.workspace.clone(),
                 config: &config,
                 metadata: &meta,
@@ -101,8 +98,14 @@ pub(super) async fn build(
         return Ok(instance);
     }
 
-    let mut command_spec =
-        resolve_agent_command_spec(&meta, &ctx.workspace, &ctx.conversation_id, deps.broadcaster.clone()).await?;
+    let mut command_spec = resolve_agent_command_spec(
+        &meta,
+        &ctx.user_id,
+        &ctx.workspace,
+        &ctx.conversation_id,
+        deps.broadcaster.clone(),
+    )
+    .await?;
     apply_acp_launch_policy(
         &mut command_spec,
         AcpLaunchPolicyInput {
@@ -130,6 +133,7 @@ pub(super) async fn build(
             load_user_mcp_servers(
                 repo.as_ref(),
                 config.mcp_server_ids.as_deref(),
+                &ctx.user_id,
                 &ctx.conversation_id,
                 &mcp_capabilities,
             )
@@ -165,6 +169,7 @@ pub(super) async fn build(
     let params = Arc::new(
         assemble_acp_params(
             ctx.conversation_id.clone(),
+            ctx.user_id.clone(),
             WorkspaceInfo {
                 path: ctx.workspace,
                 is_custom: ctx.is_custom_workspace,
@@ -189,6 +194,7 @@ pub(super) async fn build(
     arc.start_permission_handler();
     arc.start_session_event_tracker(notification_rx);
     CatalogForwarder::spawn(
+        ctx.user_id.clone(),
         arc.agent_id().to_owned(),
         crate::IAgentTask::subscribe(arc.as_ref()),
         catalog_tx,
@@ -213,13 +219,40 @@ pub(super) async fn build(
     // Hand the service the domain event receiver so it can
     // persist user intent changes without reverse-engineering
     // them from CLI observations.
-    deps.acp_agent_service.attach(ctx.conversation_id, domain_rx).await;
+    deps.acp_agent_service
+        .attach(ctx.user_id, ctx.conversation_id, domain_rx)
+        .await;
 
     Ok(instance)
 }
 
+async fn resolve_catalog_metadata(
+    registry: &Arc<AgentRegistry>,
+    config: &aionui_api_types::AcpBuildExtra,
+    user_id: &str,
+) -> Result<AgentMetadata, AgentError> {
+    if let Some(ref agent_id) = config.agent_id {
+        return registry
+            .get_for_user(user_id, agent_id)
+            .await?
+            .ok_or_else(|| AgentError::bad_request("ACP agent_id is not available for this user"));
+    }
+
+    if let Some(ref vendor) = config.backend {
+        return registry
+            .find_builtin_by_backend_for_user(user_id, vendor)
+            .await
+            .ok_or_else(|| AgentError::bad_request("ACP backend is not available for this user"));
+    }
+
+    Err(AgentError::bad_request(
+        "ACP agent requires either agent_id or backend in extra",
+    ))
+}
+
 async fn resolve_agent_command_spec(
     meta: &aionui_api_types::AgentMetadata,
+    user_id: &str,
     workspace: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
@@ -229,7 +262,7 @@ async fn resolve_agent_command_spec(
         .as_deref()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AgentError::bad_request(format!("Agent '{}' has no spawn command configured", meta.name)))?;
-    let reporter = conversation_runtime_reporter(broadcaster, conversation_id.to_owned());
+    let reporter = conversation_runtime_reporter(broadcaster, user_id.to_owned(), conversation_id.to_owned());
     let resolved = ensure_runtime_command_with_reporter(command, Some(reporter.as_ref()))
         .await
         .map_err(|error| AgentError::bad_request(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
@@ -283,12 +316,13 @@ async fn resolve_agent_command_spec(
 async fn load_user_mcp_servers(
     repo: &dyn IMcpServerRepository,
     selected_ids: Option<&[String]>,
+    user_id: &str,
     conversation_id: &str,
     capabilities: &AcpMcpCapabilities,
 ) -> Vec<McpServer> {
     let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(ids).await,
-        None => repo.list().await,
+        Some(ids) => repo.list_by_ids_any(user_id, ids).await,
+        None => repo.list(user_id).await,
     };
     let rows = match rows_result {
         Ok(r) => r,
@@ -503,6 +537,10 @@ fn session_server_supported_by_capabilities(server: &SessionMcpServer, capabilit
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_api_types::AcpBuildExtra;
+    use aionui_db::{
+        IAgentMetadataRepository, SqliteAgentMetadataRepository, UpsertAgentMetadataParams, init_database_memory,
+    };
     use aionui_realtime::BroadcastEventBus;
     use aionui_runtime::{ManagedResourcesMode, init as init_runtime, set_managed_resources_mode};
     use std::sync::OnceLock;
@@ -510,6 +548,8 @@ mod tests {
         mem,
         path::{Path, PathBuf},
     };
+
+    const TEST_USER_ID: &str = "user-1";
 
     fn make_row(
         name: &str,
@@ -520,6 +560,7 @@ mod tests {
     ) -> McpServerRow {
         McpServerRow {
             id: format!("mcp_{name}"),
+            user_id: TEST_USER_ID.to_owned(),
             name: name.to_owned(),
             description: None,
             enabled,
@@ -556,6 +597,84 @@ mod tests {
 
     fn is_npx_command_path(command: &str) -> bool {
         command == "npx" || command.ends_with("/npx") || command.ends_with("\\npx.cmd")
+    }
+
+    async fn seed_user(pool: &sqlx::SqlitePool, user_id: &str) {
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, 'hash', 'active', 0, 0, 0)",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn custom_agent_params<'a>(id: &'a str, name: &'a str, command: &'a str) -> UpsertAgentMetadataParams<'a> {
+        UpsertAgentMetadataParams {
+            id,
+            icon: None,
+            name,
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("custom"),
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some(r#"{"binary_name":"custom"}"#),
+            enabled: true,
+            command: Some(command),
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_catalog_metadata_rejects_other_users_custom_agent_id() {
+        let db = init_database_memory().await.unwrap();
+        seed_user(db.pool(), "user-a").await;
+        seed_user(db.pool(), "user-b").await;
+
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
+        repo.upsert_for_user(
+            "user-b",
+            &custom_agent_params("custom-agent-b", "User B Agent", &command),
+        )
+        .await
+        .unwrap();
+
+        let registry = AgentRegistry::new(repo);
+        registry.hydrate().await.unwrap();
+        let config = AcpBuildExtra {
+            agent_id: Some("custom-agent-b".to_owned()),
+            ..Default::default()
+        };
+
+        let err = resolve_catalog_metadata(&registry, &config, "user-a")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not available for this user"),
+            "unexpected error: {err}"
+        );
+
+        let meta = resolve_catalog_metadata(&registry, &config, "user-b").await.unwrap();
+        assert_eq!(meta.id, "custom-agent-b");
     }
 
     #[cfg(unix)]
@@ -722,6 +841,7 @@ mod tests {
 
         let spec = resolve_agent_command_spec(
             &meta,
+            "user-acp",
             "/tmp/workspace",
             "conv-acp",
             Arc::new(BroadcastEventBus::new(16)),
@@ -743,6 +863,7 @@ mod tests {
         meta.args = vec!["-y".into(), "pi-acp".into()];
         let spec = resolve_agent_command_spec(
             &meta,
+            "user-acp",
             "/tmp/workspace",
             "conv-acp",
             Arc::new(BroadcastEventBus::new(16)),
@@ -838,26 +959,35 @@ mod tests {
 
     #[async_trait]
     impl IMcpServerRepository for MockRepo {
-        async fn list(&self) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+        async fn list(&self, user_id: &str) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
             if self.fail {
                 Err(aionui_db::DbError::Init("simulated".into()))
             } else {
-                Ok(self.rows.clone())
+                Ok(self.rows.iter().filter(|row| row.user_id == user_id).cloned().collect())
             }
         }
-        async fn find_by_id(&self, _id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+        async fn find_by_id(&self, _user_id: &str, _id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
             unimplemented!()
         }
-        async fn find_by_name(&self, _name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+        async fn find_by_name(&self, _user_id: &str, _name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
             unimplemented!()
         }
-        async fn list_by_ids_any(&self, ids: &[String]) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+        async fn list_by_ids_any(
+            &self,
+            user_id: &str,
+            ids: &[String],
+        ) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
             if self.fail {
                 return Err(aionui_db::DbError::Init("simulated".into()));
             }
             Ok(ids
                 .iter()
-                .filter_map(|id| self.rows.iter().find(|row| row.id == *id).cloned())
+                .filter_map(|id| {
+                    self.rows
+                        .iter()
+                        .find(|row| row.user_id == user_id && row.id == *id)
+                        .cloned()
+                })
                 .collect())
         }
         async fn create(
@@ -868,29 +998,37 @@ mod tests {
         }
         async fn update(
             &self,
+            _user_id: &str,
             _id: &str,
             _params: aionui_db::UpdateMcpServerParams<'_>,
         ) -> Result<McpServerRow, aionui_db::DbError> {
             unimplemented!()
         }
-        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
             unimplemented!()
         }
         async fn batch_upsert(
             &self,
+            _user_id: &str,
             _servers: &[aionui_db::CreateMcpServerParams<'_>],
         ) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
             unimplemented!()
         }
         async fn update_status(
             &self,
+            _user_id: &str,
             _id: &str,
             _status: &str,
             _last_connected: Option<aionui_common::TimestampMs>,
         ) -> Result<(), aionui_db::DbError> {
             unimplemented!()
         }
-        async fn update_tools(&self, _id: &str, _tools: Option<&str>) -> Result<(), aionui_db::DbError> {
+        async fn update_tools(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _tools: Option<&str>,
+        ) -> Result<(), aionui_db::DbError> {
             unimplemented!()
         }
     }
@@ -917,7 +1055,7 @@ mod tests {
             ],
             fail: false,
         });
-        let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
         assert_eq!(servers.len(), 1);
         match &servers[0] {
             McpServer::Stdio(s) => assert_eq!(s.name, "user-enabled"),
@@ -936,7 +1074,7 @@ mod tests {
             rows: vec![],
             fail: true,
         });
-        let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
         assert!(servers.is_empty());
     }
 
@@ -955,7 +1093,7 @@ mod tests {
             ],
             fail: false,
         });
-        let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
         assert_eq!(servers.len(), 1);
         match &servers[0] {
             McpServer::Stdio(s) => assert_eq!(s.name, "good"),
@@ -980,7 +1118,7 @@ mod tests {
         });
 
         let selected = vec!["mcp_disabled-picked".to_owned()];
-        let servers = load_user_mcp_servers(repo.as_ref(), Some(&selected), "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), Some(&selected), TEST_USER_ID, "conv-1", &caps).await;
 
         assert_eq!(servers.len(), 1);
         match &servers[0] {
@@ -1007,7 +1145,7 @@ mod tests {
             fail: false,
         });
 
-        let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
         assert!(servers.is_empty());
     }
 }

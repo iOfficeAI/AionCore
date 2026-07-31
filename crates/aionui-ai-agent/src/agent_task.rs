@@ -459,22 +459,22 @@ impl AgentInstance {
     }
 }
 
-/// Map the raw ACP SDK model state into the public API payload.
+/// Map the legacy ACP model state into the public API payload.
 ///
 /// Kept private to this module: the only caller is
 /// [`AgentInstance::get_model`]. Mirrors the helper formerly living in
 /// `services/agent.rs`; do not duplicate — if the shape of
 /// `ModelInfoPayload` changes, update it here.
-fn map_sdk_model_to_payload(m: agent_client_protocol::schema::SessionModelState) -> ModelInfoPayload {
+fn map_sdk_model_to_payload(m: crate::manager::acp::legacy_session_model::LegacySessionModelState) -> ModelInfoPayload {
     let available: Vec<ModelInfoEntry> = m
         .available_models
         .iter()
         .map(|am| ModelInfoEntry {
-            id: am.model_id.to_string(),
+            id: am.model_id.clone(),
             label: am.name.clone(),
         })
         .collect();
-    let current_id = m.current_model_id.to_string();
+    let current_id = m.current_model_id;
     let current_label = available
         .iter()
         .find(|e| e.id == current_id)

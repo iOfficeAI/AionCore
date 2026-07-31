@@ -2,7 +2,7 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, Path, State};
+use axum::extract::{Extension, Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -12,6 +12,7 @@ use aionui_api_types::{
     McpConnectionTestErrorCode, McpServerResponse, OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse,
     OAuthLogoutRequest, OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 
 use crate::connection_test::McpConnectionTestService;
@@ -87,40 +88,56 @@ pub fn mcp_routes(state: McpRouterState) -> Router {
 /// `GET /api/mcp/servers` — list all MCP servers.
 async fn list_servers(
     State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<McpServerResponse>>>, ApiError> {
-    let servers = state.config_service.list_servers().await.map_err(ApiError::from)?;
+    let servers = state
+        .config_service
+        .list_servers(&user.id)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(servers)))
 }
 
 /// `GET /api/mcp/servers/:id` — get a single MCP server.
 async fn get_server(
     State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<McpServerResponse>>, ApiError> {
-    let server = state.config_service.get_server(&id).await.map_err(ApiError::from)?;
+    let server = state
+        .config_service
+        .get_server(&user.id, &id)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(server)))
 }
 
 /// `POST /api/mcp/servers` — create (or upsert by name) an MCP server.
 async fn add_server(
     State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateMcpServerRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<McpServerResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let server = state.config_service.add_server(req).await.map_err(ApiError::from)?;
+    let server = state
+        .config_service
+        .add_server(&user.id, req)
+        .await
+        .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(server))))
 }
 
 /// `PUT /api/mcp/servers/:id` — partial update an MCP server.
 async fn edit_server(
     State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<UpdateMcpServerRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<McpServerResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let server = state
         .config_service
-        .edit_server(&id, req)
+        .edit_server(&user.id, &id, req)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(server)))
@@ -129,28 +146,43 @@ async fn edit_server(
 /// `DELETE /api/mcp/servers/:id` — delete an MCP server.
 async fn delete_server(
     State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state.config_service.delete_server(&id).await.map_err(ApiError::from)?;
+    state
+        .config_service
+        .delete_server(&user.id, &id)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
 /// `POST /api/mcp/servers/:id/toggle` — toggle enabled state.
 async fn toggle_server(
     State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<McpServerResponse>>, ApiError> {
-    let server = state.config_service.toggle_server(&id).await.map_err(ApiError::from)?;
+    let server = state
+        .config_service
+        .toggle_server(&user.id, &id)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(server)))
 }
 
 /// `POST /api/mcp/servers/import` — batch import MCP servers.
 async fn batch_import(
     State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<BatchImportMcpServersRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<McpServerResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let servers = state.config_service.batch_import(req).await.map_err(ApiError::from)?;
+    let servers = state
+        .config_service
+        .batch_import(&user.id, req)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(servers)))
 }
 
@@ -163,6 +195,7 @@ async fn batch_import(
 /// Creates a temporary MCP client, connects, lists tools, and closes.
 async fn test_connection(
     State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<TestMcpConnectionRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -172,13 +205,14 @@ async fn test_connection(
         .test_connection_with_runtime_scope(
             &req.name,
             &transport,
+            Some(&user.id),
             req.runtime_scope_id.as_deref().or(req.id.as_deref()),
         )
         .await;
     if let Some(server_id) = req.id.as_deref() {
         state
             .config_service
-            .persist_test_result(server_id, &result)
+            .persist_test_result(&user.id, server_id, &result)
             .await
             .map_err(ApiError::from)?;
     }
@@ -227,8 +261,13 @@ fn connection_test_failure_status(code: McpConnectionTestErrorCode) -> StatusCod
 /// and return their current MCP server configurations.
 async fn get_agent_configs(
     State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<DetectedMcpServerResponse>>>, ApiError> {
-    let configs = state.sync_service.get_agent_configs().await.map_err(ApiError::from)?;
+    let configs = state
+        .sync_service
+        .get_agent_configs(&user.id)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(configs)))
 }
 
@@ -239,12 +278,13 @@ async fn get_agent_configs(
 /// `POST /api/mcp/oauth/check-status` — check OAuth authentication status.
 async fn oauth_check_status(
     State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<OAuthCheckStatusRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<OAuthStatusResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let status = state
         .oauth_service
-        .check_oauth_status(&req.server_url)
+        .check_oauth_status(&user.id, &req.server_url)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(status)))
@@ -256,12 +296,13 @@ async fn oauth_check_status(
 /// the callback, and exchanges the code for tokens.
 async fn oauth_login(
     State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<OAuthLoginRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<OAuthLoginResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .oauth_service
-        .login(&req.server_url)
+        .login(&user.id, &req.server_url)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
@@ -270,22 +311,26 @@ async fn oauth_login(
 /// `POST /api/mcp/oauth/logout` — delete stored OAuth token.
 async fn oauth_logout(
     State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<OAuthLogoutRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     state
         .oauth_service
-        .logout(&req.server_url)
+        .logout(&user.id, &req.server_url)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
 /// `GET /api/mcp/oauth/authenticated` — list server URLs with stored tokens.
-async fn oauth_authenticated(State(state): State<McpRouterState>) -> Result<Json<ApiResponse<Vec<String>>>, ApiError> {
+async fn oauth_authenticated(
+    State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<Vec<String>>>, ApiError> {
     let urls = state
         .oauth_service
-        .get_authenticated_servers()
+        .get_authenticated_servers(&user.id)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(urls)))

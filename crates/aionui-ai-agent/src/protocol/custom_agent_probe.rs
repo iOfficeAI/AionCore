@@ -25,7 +25,7 @@ use crate::capability::cli_process::CliAgentProcess;
 use crate::protocol::acp::AcpProtocol;
 use crate::protocol::error::AcpError;
 
-use agent_client_protocol::schema::NewSessionRequest;
+use agent_client_protocol::schema::v1::NewSessionRequest;
 
 /// Step 2 overall timeout. Belt-and-suspenders: `AcpProtocol::connect`
 /// already caps the initialize RPC at 30 s, but a CLI that hangs

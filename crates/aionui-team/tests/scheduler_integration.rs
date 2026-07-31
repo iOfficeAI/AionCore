@@ -71,6 +71,7 @@ fn setup_team(agents: &[TeamAgent]) -> TestHarness {
     let broadcaster = Arc::new(RecordingBroadcaster::new());
     let mgr = TeammateManager::new(
         "team-1".into(),
+        "user-1".into(),
         agents,
         mailbox.clone(),
         task_board.clone(),

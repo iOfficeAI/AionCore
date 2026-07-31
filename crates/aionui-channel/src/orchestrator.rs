@@ -67,6 +67,10 @@ impl ChannelOrchestrator {
         let chat_id = msg.chat_id.clone();
         let plugin_id = platform.to_string();
         let text = msg.content.text.clone();
+        let message_owner_user_id = msg
+            .owner_user_id
+            .clone()
+            .or_else(|| self.action_executor.owner_user_id().map(ToOwned::to_owned));
 
         let executor = Arc::clone(&self.action_executor);
         let msg_svc = Arc::clone(&self.message_service);
@@ -76,9 +80,14 @@ impl ChannelOrchestrator {
         tokio::spawn(async move {
             match executor.handle_incoming_message(&msg).await {
                 Ok(MessageResult::Action(response)) => {
-                    send_action_response(&sender, &plugin_id, &chat_id, &response).await;
+                    if let Some(owner_user_id) = message_owner_user_id.as_deref() {
+                        send_action_response(&sender, owner_user_id, &plugin_id, &chat_id, &response).await;
+                    } else {
+                        warn!("dropping channel action response without owner user");
+                    }
                 }
                 Ok(MessageResult::Dispatched {
+                    owner_user_id,
                     session_id,
                     conversation_id,
                 }) => {
@@ -86,6 +95,7 @@ impl ChannelOrchestrator {
                         &msg_svc,
                         &session_mgr,
                         &sender,
+                        &owner_user_id,
                         &session_id,
                         conversation_id.as_deref(),
                         &text,
@@ -108,6 +118,7 @@ impl ChannelOrchestrator {
 
 async fn send_action_response(
     sender: &Arc<dyn ChannelSender>,
+    owner_user_id: &str,
     plugin_id: &str,
     chat_id: &str,
     response: &crate::types::ActionResponse,
@@ -130,11 +141,13 @@ async fn send_action_response(
         match response.behavior {
             ActionBehavior::Edit => {
                 if let Some(ref edit_id) = response.edit_message_id {
-                    let _ = sender.edit_message(plugin_id, chat_id, edit_id, outgoing).await;
+                    let _ = sender
+                        .edit_message(owner_user_id, plugin_id, chat_id, edit_id, outgoing)
+                        .await;
                 }
             }
             _ => {
-                let _ = sender.send_message(plugin_id, chat_id, outgoing).await;
+                let _ = sender.send_message(owner_user_id, plugin_id, chat_id, outgoing).await;
             }
         }
     }
@@ -145,6 +158,7 @@ async fn handle_dispatched(
     msg_svc: &Arc<ChannelMessageService>,
     session_mgr: &Arc<SessionManager>,
     sender: &Arc<dyn ChannelSender>,
+    owner_user_id: &str,
     session_id: &str,
     conversation_id: Option<&str>,
     text: &str,
@@ -152,7 +166,7 @@ async fn handle_dispatched(
     plugin_id: &str,
     chat_id: &str,
 ) {
-    let session = match session_mgr.get_session_by_id(session_id).await {
+    let session = match session_mgr.get_session_by_id(owner_user_id, session_id).await {
         Ok(Some(s)) => s,
         Ok(None) => {
             warn!(session_id = %session_id, "session not found after dispatch");
@@ -164,7 +178,7 @@ async fn handle_dispatched(
         }
     };
 
-    let send_result = match msg_svc.send_to_agent(&session, text, platform).await {
+    let send_result = match msg_svc.send_to_agent(owner_user_id, &session, text, platform).await {
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "failed to send to agent");
@@ -181,7 +195,7 @@ async fn handle_dispatched(
                 reply_to_message_id: None,
                 silent: None,
             };
-            let _ = sender.send_message(plugin_id, chat_id, err_msg).await;
+            let _ = sender.send_message(owner_user_id, plugin_id, chat_id, err_msg).await;
             return;
         }
     };
@@ -189,7 +203,7 @@ async fn handle_dispatched(
     // Bind conversation to session if newly created
     if conversation_id.is_none()
         && let Err(e) = session_mgr
-            .bind_conversation(session_id, &send_result.conversation_id)
+            .bind_conversation(owner_user_id, session_id, &send_result.conversation_id)
             .await
     {
         warn!(error = %e, "failed to bind conversation to session");
@@ -198,6 +212,7 @@ async fn handle_dispatched(
     // Spawn stream relay if we got a subscription
     if let Some(rx) = send_result.stream_rx {
         let relay_config = RelayConfig {
+            owner_user_id: owner_user_id.to_owned(),
             platform,
             plugin_id: plugin_id.to_owned(),
             chat_id: chat_id.to_owned(),

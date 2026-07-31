@@ -22,6 +22,7 @@ impl PreSendHook for SessionNewPreludeHook {
 
         let metadata = &ctx.params.metadata;
         let config = InjectionConfig {
+            user_id: &ctx.params.user_id,
             preset_context: ctx.params.preset_context.as_deref(),
             skills: &ctx.params.config.skills,
             native_skill_support: metadata

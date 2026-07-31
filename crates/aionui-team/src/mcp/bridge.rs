@@ -3,14 +3,14 @@
 //! Flow: `TeamSessionService::ensure_session` builds a `TeamMcpStdioServerSpec`
 //! per agent and writes its config triple into `conversation.extra`. When
 //! the ACP session is created, the spec is converted via `into_sdk()` to the
-//! wire-level `agent_client_protocol::schema::McpServer::Stdio` variant and
+//! wire-level `agent_client_protocol::schema::v1::McpServer::Stdio` variant and
 //! sent to the agent CLI, which then spawns `<backend> mcp-bridge` with the
 //! three `TEAM_MCP_*` env keys so it can proxy stdio↔TCP to the in-process
 //! team MCP server.
 
 use std::path::PathBuf;
 
-use agent_client_protocol::schema::{EnvVariable, McpServer, McpServerStdio};
+use agent_client_protocol::schema::v1::{EnvVariable, McpServer, McpServerStdio};
 
 pub use aionui_api_types::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 

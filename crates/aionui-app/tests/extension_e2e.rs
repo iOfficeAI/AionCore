@@ -1,6 +1,7 @@
 mod common;
 
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -617,22 +618,27 @@ async fn eq19_channel_status_merges_extension_meta_for_persisted_row() {
     let ext_root = write_legacy_extension_fixture(&tmp);
     let (mut app, services) = build_app_with_extension_root(&ext_root).await;
     let repo = SqliteChannelRepository::new(services.database.pool().clone());
+    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let owner_user_id = services.user_repo.find_by_username("user1").await.unwrap().unwrap().id;
     let now = now_ms();
-    repo.upsert_plugin(&aionui_db::models::ChannelPluginRow {
-        id: "legacy-channel".to_string(),
-        r#type: "legacy-channel".to_string(),
-        name: "Legacy Channel Persisted".to_string(),
-        enabled: true,
-        config: "{\"token\":\"secret\"}".to_string(),
-        status: Some("running".to_string()),
-        last_connected: Some(now),
-        created_at: now,
-        updated_at: now,
-    })
+    repo.upsert_plugin(
+        &owner_user_id,
+        &aionui_db::models::ChannelPluginRow {
+            id: "legacy-channel".to_string(),
+            owner_user_id: owner_user_id.clone(),
+            r#type: "legacy-channel".to_string(),
+            name: "Legacy Channel Persisted".to_string(),
+            enabled: true,
+            config: "{\"token\":\"secret\"}".to_string(),
+            status: Some("running".to_string()),
+            last_connected: Some(now),
+            created_at: now,
+            updated_at: now,
+        },
+    )
     .await
     .unwrap();
 
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
     let resp = app
         .oneshot(get_with_token("/api/channel/plugins", &token))
         .await
@@ -664,6 +670,7 @@ async fn eq20_enable_extension_channel_persists_config_and_exposes_status() {
     let (mut app, services) = build_app_with_extension_root(&ext_root).await;
     let repo = SqliteChannelRepository::new(services.database.pool().clone());
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let owner_user_id = services.user_repo.find_by_username("user1").await.unwrap().unwrap().id;
 
     let enable_resp = app
         .clone()
@@ -686,7 +693,11 @@ async fn eq20_enable_extension_channel_persists_config_and_exposes_status() {
     let enable_json = body_json(enable_resp).await;
     assert_eq!(enable_json["data"]["success"], true);
 
-    let row = repo.get_plugin("legacy-channel").await.unwrap().unwrap();
+    let row = repo
+        .get_plugin(&owner_user_id, "legacy-channel")
+        .await
+        .unwrap()
+        .unwrap();
     assert!(row.enabled);
     assert_eq!(row.r#type, "legacy-channel");
     assert_eq!(row.status.as_deref(), Some("stopped"));
@@ -809,6 +820,108 @@ async fn em4_disable_nonexistent_returns_not_found() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn extension_enablement_and_contributions_are_isolated_by_user() {
+    let tmp = TempDir::new().unwrap();
+    let ext_root = write_legacy_extension_fixture(&tmp);
+    let (mut app, services) = build_app_with_extension_root(&ext_root).await;
+    let (token_a, csrf_a) = setup_and_login(&mut app, &services, "extension-user-a", "pass-a").await;
+    let (token_b, csrf_b) = setup_and_login(&mut app, &services, "extension-user-b", "pass-b").await;
+
+    let missing_csrf = Request::builder()
+        .method("POST")
+        .uri("/api/extensions/disable")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token_a}"))
+        .body(Body::from(r#"{"name":"legacy-suite"}"#))
+        .unwrap();
+    let response = app.clone().oneshot(missing_csrf).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "CSRF_INVALID");
+
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/extensions/disable",
+            json!({"name": "legacy-suite"}),
+            &token_a,
+            &csrf_a,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let extensions_a = body_json(
+        app.clone()
+            .oneshot(get_with_token("/api/extensions", &token_a))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let extensions_b = body_json(
+        app.clone()
+            .oneshot(get_with_token("/api/extensions", &token_b))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(extensions_a["data"][0]["enabled"], false);
+    assert_eq!(extensions_b["data"][0]["enabled"], true);
+
+    let skills_a = body_json(
+        app.clone()
+            .oneshot(get_with_token("/api/extensions/skills", &token_a))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let skills_b = body_json(
+        app.clone()
+            .oneshot(get_with_token("/api/extensions/skills", &token_b))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(skills_a["data"], json!([]));
+    assert_eq!(skills_b["data"].as_array().unwrap().len(), 1);
+
+    let asset_a = app
+        .clone()
+        .oneshot(get_with_token(
+            "/api/extensions/legacy-suite/assets/assets/channel.png",
+            &token_a,
+        ))
+        .await
+        .unwrap();
+    let asset_b = app
+        .clone()
+        .oneshot(get_with_token(
+            "/api/extensions/legacy-suite/assets/assets/channel.png",
+            &token_b,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(asset_a.status(), StatusCode::NOT_FOUND);
+    assert_eq!(asset_b.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/extensions/enable",
+            json!({"name": "legacy-suite"}),
+            &token_b,
+            &csrf_b,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let extensions_a = body_json(app.oneshot(get_with_token("/api/extensions", &token_a)).await.unwrap()).await;
+    assert_eq!(extensions_a["data"][0]["enabled"], false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1303,8 +1416,33 @@ async fn skill_batch_import_reports_partial_failures_without_rolling_back_succes
             "limit_bytes": 50 * 1024 * 1024
         }])
     );
-    assert!(paths.user_skills_dir.join("sample-alpha").join("SKILL.md").exists());
+    // Imported skills for a real (non-default) user land in that user's
+    // scoped storage under `users/{dir}/`, never in the legacy shared root.
+    let user = services
+        .user_repo
+        .find_by_username("user1")
+        .await
+        .unwrap()
+        .expect("test user should exist");
+    let skill_repo = aionui_db::SqliteSkillRepository::new(services.database.pool().clone());
+    let alpha_row = aionui_db::ISkillRepository::find_by_name_for_user(&skill_repo, &user.id, "sample-alpha")
+        .await
+        .unwrap()
+        .expect("imported skill row should exist for the importing user");
+    assert!(
+        alpha_row.path.contains("/skills/users/"),
+        "import must use user-scoped storage: {}",
+        alpha_row.path
+    );
+    assert!(std::path::Path::new(&alpha_row.path).join("SKILL.md").exists());
+    assert!(!paths.user_skills_dir.join("sample-alpha").exists());
     assert!(!paths.user_skills_dir.join("sample-beta").exists());
+    assert!(
+        aionui_db::ISkillRepository::find_by_name_for_user(&skill_repo, &user.id, "sample-beta")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let resp = app
         .oneshot(get_with_token("/api/skills/import-history", &token))
@@ -1341,12 +1479,28 @@ fn write_skill(dir: &std::path::Path, name: &str, description: &str) {
 async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
     let tmp = TempDir::new().unwrap();
     let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
     let builtin_dir = paths.builtin_skills_dir.clone();
     write_skill(&builtin_dir, "review", "Built-in review skill");
-    write_skill(&paths.user_skills_dir, "my-skill", "A user-imported skill");
-    sync_skill_catalog_for_test(&services, &paths).await;
+    sync_skill_catalog_for_test(&services, &paths, "user1").await;
+
+    // Real users get custom skills through the import API, which stores
+    // files under the user's scoped storage (never the legacy shared root).
+    let source_dir = tmp.path().join("import-src");
+    write_skill(&source_dir, "my-skill", "A user-imported skill");
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/import",
+            json!({ "skill_path": source_dir.join("my-skill").to_str().unwrap() }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = app.oneshot(get_with_token("/api/skills", &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1380,12 +1534,35 @@ async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
 async fn sl2_list_skills_user_custom_overrides_builtin() {
     let tmp = TempDir::new().unwrap();
     let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
     let builtin_dir = paths.builtin_skills_dir.clone();
     write_skill(&builtin_dir, "review", "Built-in review");
-    write_skill(&paths.user_skills_dir, "review", "Custom review override");
-    sync_skill_catalog_for_test(&services, &paths).await;
+    sync_skill_catalog_for_test(&services, &paths, "user1").await;
+
+    // A user-imported skill with the same name shadows the builtin row in
+    // the user's listing. The source dir name differs; the skill NAME in
+    // the frontmatter is what collides.
+    let source_dir = tmp.path().join("import-src");
+    let override_dir = source_dir.join("review-override");
+    std::fs::create_dir_all(&override_dir).unwrap();
+    std::fs::write(
+        override_dir.join("SKILL.md"),
+        "---\nname: review\ndescription: Custom review override\n---\nBody",
+    )
+    .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/import",
+            json!({ "skill_path": override_dir.to_str().unwrap() }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = app.oneshot(get_with_token("/api/skills", &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1427,7 +1604,7 @@ async fn ba1_unified_skill_list_includes_auto_inject_builtin_entries() {
     write_skill(&auto_dir, "skill-creator", "Scaffold a new skill");
     // A top-level builtin that must NOT appear in the auto list.
     write_skill(&builtin_dir, "review", "Top-level");
-    sync_skill_catalog_for_test(&services, &paths).await;
+    sync_skill_catalog_for_test(&services, &paths, "user1").await;
 
     let resp = app.oneshot(get_with_token("/api/skills", &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

@@ -1,10 +1,12 @@
-use agent_client_protocol::schema::{
-    ModelInfo, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigSelectOptions, SessionMode, SessionModeState, SessionModelState,
+use agent_client_protocol::schema::v1::{
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigSelectOptions, SessionMode, SessionModeState,
 };
 use aionui_api_types::{AgentHandshake, ModelInfoEntry, ModelInfoPayload};
 use aionui_common::normalize_keys_to_snake_case;
 use serde_json::{Map, Value};
+
+use super::legacy_session_model::{LegacyModelEntry, LegacySessionModelState};
 
 pub(crate) fn derive_modes_from_config_options(options: &[SessionConfigOption]) -> Option<SessionModeState> {
     let select = find_select(options, &["mode", "modes"], &SessionConfigOptionCategory::Mode)?;
@@ -23,7 +25,7 @@ pub(crate) fn derive_modes_from_config_options(options: &[SessionConfigOption]) 
     Some(SessionModeState::new(current_mode_id, available_modes))
 }
 
-pub(crate) fn derive_models_from_config_options(options: &[SessionConfigOption]) -> Option<SessionModelState> {
+pub(crate) fn derive_models_from_config_options(options: &[SessionConfigOption]) -> Option<LegacySessionModelState> {
     let select = find_select(options, &["model", "models"], &SessionConfigOptionCategory::Model)?;
     let model_options = flatten_select_options(&select.options);
 
@@ -31,18 +33,15 @@ pub(crate) fn derive_models_from_config_options(options: &[SessionConfigOption])
         return None;
     }
 
-    let available_models: Vec<ModelInfo> = model_options
+    let available_models: Vec<LegacyModelEntry> = model_options
         .into_iter()
         .map(|option| {
-            ModelInfo::new(option.value.to_string(), option.name.clone()).description(option.description.clone())
+            LegacyModelEntry::new(option.value.to_string(), option.name.clone()).description(option.description.clone())
         })
         .collect();
 
-    let current_model_id = non_empty_or_first(
-        select.current_value.to_string(),
-        &available_models[0].model_id.to_string(),
-    );
-    Some(SessionModelState::new(current_model_id, available_models))
+    let current_model_id = non_empty_or_first(select.current_value.to_string(), &available_models[0].model_id);
+    Some(LegacySessionModelState::new(current_model_id, available_models))
 }
 
 pub(crate) fn merge_config_options(
@@ -137,19 +136,15 @@ pub(crate) fn extract_modes_from_value(value: &Value) -> Option<SessionModeState
         .filter(|modes: &SessionModeState| !modes.available_modes.is_empty())
 }
 
-pub(crate) fn extract_models_from_value(value: &Value) -> Option<SessionModelState> {
-    serde_json::from_value(value.clone())
-        .ok()
-        .or_else(|| serde_json::from_value(keys_to_camel_case(value.clone())).ok())
-        .filter(|models: &SessionModelState| !models.available_models.is_empty())
-        .or_else(|| model_payload_to_state(value))
+pub(crate) fn extract_models_from_value(value: &Value) -> Option<LegacySessionModelState> {
+    LegacySessionModelState::from_catalog_value(value)
 }
 
 fn find_select<'a>(
     options: &'a [SessionConfigOption],
     ids: &[&str],
     category: &SessionConfigOptionCategory,
-) -> Option<&'a agent_client_protocol::schema::SessionConfigSelect> {
+) -> Option<&'a agent_client_protocol::schema::v1::SessionConfigSelect> {
     options
         .iter()
         .find_map(|option| {
@@ -169,7 +164,7 @@ fn find_select<'a>(
         })
 }
 
-fn select_from_kind(kind: &SessionConfigKind) -> Option<&agent_client_protocol::schema::SessionConfigSelect> {
+fn select_from_kind(kind: &SessionConfigKind) -> Option<&agent_client_protocol::schema::v1::SessionConfigSelect> {
     match kind {
         SessionConfigKind::Select(select) => Some(select),
         _ => None,
@@ -190,53 +185,22 @@ fn decode_config_options(value: &Value) -> Option<Vec<SessionConfigOption>> {
         .or_else(|| serde_json::from_value(keys_to_camel_case(value.clone())).ok())
 }
 
-fn model_payload_to_state(value: &Value) -> Option<SessionModelState> {
-    let object = value.as_object()?;
-    let models_value = object
-        .get("available_models")
-        .or_else(|| object.get("availableModels"))?;
-    let models = models_value.as_array()?;
-    let available_models: Vec<ModelInfo> = models
-        .iter()
-        .filter_map(|entry| {
-            let object = entry.as_object()?;
-            let id = object.get("id")?.as_str()?;
-            let label = object
-                .get("label")
-                .or_else(|| object.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or(id);
-            Some(ModelInfo::new(id.to_owned(), label.to_owned()))
-        })
-        .collect();
-    if available_models.is_empty() {
-        return None;
-    }
-    let current_model_id = object
-        .get("current_model_id")
-        .or_else(|| object.get("currentModelId"))
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .unwrap_or_else(|| available_models[0].model_id.0.as_ref());
-    Some(SessionModelState::new(current_model_id.to_owned(), available_models))
-}
-
 fn mode_state_to_snake_value(modes: &SessionModeState) -> Option<Value> {
     let mut value = serde_json::to_value(modes).ok()?;
     normalize_keys_to_snake_case(&mut value);
     Some(value)
 }
 
-fn model_state_to_payload_value(models: &SessionModelState) -> Option<Value> {
+fn model_state_to_payload_value(models: &LegacySessionModelState) -> Option<Value> {
     let available_models: Vec<ModelInfoEntry> = models
         .available_models
         .iter()
         .map(|model| ModelInfoEntry {
-            id: model.model_id.to_string(),
+            id: model.model_id.clone(),
             label: model.name.clone(),
         })
         .collect();
-    let current_model_id = models.current_model_id.to_string();
+    let current_model_id = models.current_model_id.clone();
     let current_model_label = available_models
         .iter()
         .find(|model| model.id == current_model_id)
@@ -294,7 +258,7 @@ fn non_empty_or_first(current: String, first: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption, SessionMode,
     };
     use serde_json::json;

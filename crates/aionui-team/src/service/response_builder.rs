@@ -1,10 +1,10 @@
 use super::*;
 
 impl TeamSessionService {
-    pub(super) async fn build_team_response(&self, team: &Team) -> Result<TeamResponse, TeamError> {
+    pub(super) async fn build_team_response(&self, user_id: &str, team: &Team) -> Result<TeamResponse, TeamError> {
         let mut agents = Vec::with_capacity(team.agents.len());
         for agent in &team.agents {
-            agents.push(self.build_agent_response(agent).await?);
+            agents.push(self.build_agent_response(user_id, agent).await?);
         }
 
         Ok(TeamResponse {
@@ -20,9 +20,10 @@ impl TeamSessionService {
 
     pub(super) async fn build_agent_response(
         &self,
+        user_id: &str,
         agent: &TeamAgent,
     ) -> Result<aionui_api_types::TeamAgentResponse, TeamError> {
-        let icon = self.resolve_agent_icon(agent).await?;
+        let icon = self.resolve_agent_icon(user_id, agent).await?;
         let mut response = agent.to_response_with_icon(icon);
         response.pending_confirmations = self.pending_confirmation_count(&agent.conversation_id);
         Ok(response)
@@ -35,9 +36,12 @@ impl TeamSessionService {
             .unwrap_or(0)
     }
 
-    async fn resolve_agent_icon(&self, agent: &TeamAgent) -> Result<Option<String>, TeamError> {
+    async fn resolve_agent_icon(&self, user_id: &str, agent: &TeamAgent) -> Result<Option<String>, TeamError> {
         if let Some(assistant_id) = agent.assistant_id.as_deref()
-            && let Some(definition) = self.assistant_definition_repo.get_by_assistant_id(assistant_id).await?
+            && let Some(definition) = self
+                .assistant_definition_repo
+                .get_by_assistant_id_for_user(user_id, assistant_id)
+                .await?
             && let Some(icon) = assistant_icon(
                 definition.assistant_id.as_str(),
                 &definition.avatar_type,
@@ -49,7 +53,7 @@ impl TeamSessionService {
 
         if let Some(row) = self
             .agent_metadata_repo
-            .find_builtin_by_backend(agent.backend.as_str())
+            .find_builtin_by_backend_for_user(user_id, agent.backend.as_str())
             .await?
             && row.icon.is_some()
         {
@@ -59,7 +63,7 @@ impl TeamSessionService {
         if agent.backend == "acp"
             && let Some(row) = self
                 .agent_metadata_repo
-                .find_builtin_by_backend(agent.model.as_str())
+                .find_builtin_by_backend_for_user(user_id, agent.model.as_str())
                 .await?
         {
             return Ok(row.icon);

@@ -50,6 +50,7 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let workspace = ensure_test_workspace_path();
     repo.update(
+        "user_1",
         &conv.id,
         &ConversationRowUpdate {
             extra: Some(
@@ -106,7 +107,7 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
         }]
     );
 
-    let row = repo.get(&conv.id).await.unwrap().unwrap();
+    let row = repo.get("user_1", &conv.id).await.unwrap().unwrap();
     let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
     assert!(extra.get("workspace").is_some());
     assert!(

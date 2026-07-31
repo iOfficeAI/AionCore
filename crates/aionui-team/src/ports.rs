@@ -104,14 +104,16 @@ impl NativeSlashCommandPort for NoopNativeSlashCommandPort {
 
 #[async_trait]
 pub trait TeamAssistantCatalogPort: Send + Sync {
-    async fn list_team_selectable_assistants(&self) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError>;
+    async fn list_team_selectable_assistants(&self, user_id: &str)
+    -> Result<Vec<TeamAssistantCatalogEntry>, TeamError>;
 
     async fn resolve_team_selectable_assistant(
         &self,
+        user_id: &str,
         assistant_id: &str,
     ) -> Result<Option<TeamAssistantCatalogEntry>, TeamError> {
         Ok(self
-            .list_team_selectable_assistants()
+            .list_team_selectable_assistants(user_id)
             .await?
             .into_iter()
             .find(|assistant| assistant.assistant_id == assistant_id))

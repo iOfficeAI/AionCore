@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::{future::Future, pin::Pin};
 
 use aionui_api_types::WebSocketMessage;
 use axum::extract::WebSocketUpgrade;
@@ -20,12 +21,16 @@ use crate::types::{ConnectionId, PER_CONNECTION_BUFFER, RealtimeError, WebSocket
 /// so that `aionui-realtime` does not depend on `aionui-auth` directly.
 pub type TokenExtractor = Arc<dyn Fn(&HeaderMap) -> Option<String> + Send + Sync>;
 
+/// Resolves a verified JWT token to the active internal user ID it represents.
+pub type TokenUserResolver = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
+
 /// Shared state required by the WebSocket upgrade handler.
 #[derive(Clone)]
 pub struct WsHandlerState {
     pub manager: Arc<WebSocketManager>,
     pub router: Arc<dyn MessageRouter>,
     pub token_validator: TokenValidator,
+    pub token_user_resolver: TokenUserResolver,
     pub token_extractor: TokenExtractor,
 }
 
@@ -75,20 +80,27 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
         return;
     }
 
-    let (tx, rx) = mpsc::channel::<WsOutbound>(PER_CONNECTION_BUFFER);
-    let conn_id = state.manager.add_client(token, tx);
+    let Some(user_id) = (state.token_user_resolver)(token.clone()).await else {
+        send_realtime_error_and_close(socket, RealtimeError::AuthExpired, "authentication failed").await;
+        return;
+    };
 
-    info!(%conn_id, "websocket connection established");
+    let (tx, rx) = mpsc::channel::<WsOutbound>(PER_CONNECTION_BUFFER);
+    let conn_id = state.manager.add_client_for_user(user_id.clone(), token, tx);
+
+    info!(%conn_id, user_id = %user_id, "websocket connection established");
 
     let (ws_sender, ws_receiver) = socket.split();
 
     let send_handle = tokio::spawn(send_loop(conn_id, rx, ws_sender));
-    recv_loop(conn_id, ws_receiver, &state).await;
+    recv_loop(conn_id, &user_id, ws_receiver, &state).await;
 
     // Recv loop exited — client disconnected or errored.
     send_handle.abort();
     state.manager.remove_client(conn_id);
-    info!(%conn_id, "websocket connection closed");
+    // Let stateful routers release per-connection state (e.g. fs subscriptions).
+    state.router.on_disconnect(conn_id);
+    info!(%conn_id, user_id = %user_id, "websocket connection closed");
 }
 
 /// Send a realtime boundary error event, then close with 1008.
@@ -146,6 +158,7 @@ async fn send_loop(
 /// Reads messages from the WebSocket stream, parses JSON, routes.
 async fn recv_loop(
     conn_id: ConnectionId,
+    user_id: &str,
     mut receiver: futures_util::stream::SplitStream<WebSocket>,
     state: &WsHandlerState,
 ) {
@@ -160,7 +173,7 @@ async fn recv_loop(
 
         match msg {
             Message::Text(text) => {
-                handle_text_message(conn_id, &text, state);
+                handle_text_message(conn_id, user_id, &text, state);
             }
             Message::Close(_) => {
                 debug!(%conn_id, "received close frame");
@@ -174,7 +187,7 @@ async fn recv_loop(
 }
 
 /// Process a text message: parse JSON, dispatch to built-in or router.
-fn handle_text_message(conn_id: ConnectionId, text: &str, state: &WsHandlerState) {
+fn handle_text_message(conn_id: ConnectionId, user_id: &str, text: &str, state: &WsHandlerState) {
     let parsed: Result<WebSocketMessage<Value>, _> = serde_json::from_str(text);
 
     let msg = match parsed {
@@ -198,7 +211,7 @@ fn handle_text_message(conn_id: ConnectionId, text: &str, state: &WsHandlerState
             handle_subscribe_show_open(state, conn_id, msg.data);
         }
         name => {
-            if !state.router.route(conn_id, name, msg.data) {
+            if !state.router.route(conn_id, user_id, name, msg.data) {
                 send_realtime_error(state, conn_id, RealtimeError::UnsupportedMessage);
             }
         }
@@ -260,6 +273,7 @@ mod tests {
             manager,
             router: Arc::new(crate::router::NoopMessageRouter),
             token_validator: Arc::new(|_| true),
+            token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".into()) })),
             token_extractor: Arc::new(|_| None),
         }
     }
@@ -422,7 +436,7 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        handle_text_message(conn_id, r#"{"name":"pong","data":{}}"#, &state);
+        handle_text_message(conn_id, "user-1", r#"{"name":"pong","data":{}}"#, &state);
         // No panic = success (update_last_ping was called)
     }
 
@@ -433,7 +447,7 @@ mod tests {
         let conn_id = manager.add_client("tok".into(), tx);
         let state = test_state(manager);
 
-        handle_text_message(conn_id, "not json", &state);
+        handle_text_message(conn_id, "user-1", "not json", &state);
 
         let msg = rx.try_recv().unwrap();
         match msg {
@@ -451,7 +465,7 @@ mod tests {
         let conn_id = manager.add_client("tok".into(), tx);
         let state = test_state(manager);
 
-        handle_text_message(conn_id, r#"{"foo":"bar"}"#, &state);
+        handle_text_message(conn_id, "user-1", r#"{"foo":"bar"}"#, &state);
 
         let msg = rx.try_recv().unwrap();
         match msg {
@@ -469,7 +483,7 @@ mod tests {
         let conn_id = manager.add_client("tok".into(), tx);
         let state = test_state(manager);
 
-        handle_text_message(conn_id, r#"{"name":"","data":{}}"#, &state);
+        handle_text_message(conn_id, "user-1", r#"{"name":"","data":{}}"#, &state);
 
         let msg = rx.try_recv().unwrap();
         match msg {
@@ -488,7 +502,7 @@ mod tests {
             called: AtomicBool,
         }
         impl MessageRouter for TestRouter {
-            fn route(&self, _conn_id: ConnectionId, _name: &str, _data: Value) -> bool {
+            fn route(&self, _conn_id: ConnectionId, _user_id: &str, _name: &str, _data: Value) -> bool {
                 self.called.store(true, Ordering::Relaxed);
                 true
             }
@@ -505,11 +519,13 @@ mod tests {
             manager,
             router: router.clone(),
             token_validator: Arc::new(|_| true),
+            token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".into()) })),
             token_extractor: Arc::new(|_| None),
         };
 
         handle_text_message(
             conn_id,
+            "user-1",
             r#"{"name":"conversation.send-message","data":{"text":"hi"}}"#,
             &state,
         );
@@ -526,6 +542,7 @@ mod tests {
 
         handle_text_message(
             conn_id,
+            "user-1",
             r#"{"name":"conversation.send-message","data":{"text":"hi"}}"#,
             &state,
         );

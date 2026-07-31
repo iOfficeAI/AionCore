@@ -7,6 +7,7 @@ use crate::session_context::AgentSessionContext;
 
 pub(super) struct FactoryContext {
     pub conversation_id: String,
+    pub user_id: String,
     pub workspace: String,
     pub is_custom_workspace: bool,
     pub runtime_env: Vec<(String, String)>,
@@ -16,6 +17,7 @@ impl FactoryContext {
     pub async fn resolve(context: &AgentSessionContext) -> Result<Self, AgentError> {
         Ok(Self {
             conversation_id: context.conversation.conversation_id.clone(),
+            user_id: context.conversation.user_id.clone(),
             workspace: context.workspace.path.clone(),
             is_custom_workspace: context.workspace.is_custom,
             runtime_env: context.runtime_env.clone(),

@@ -5,6 +5,7 @@ use aionui_common::{
 use serde::{Deserialize, Serialize};
 
 use crate::acp::AcpConfigOptionDto;
+use crate::chat_file::ChatFileRef;
 
 /// Per-MCP snapshot status stored in `conversation.extra`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,7 +95,7 @@ pub struct CloneConversationRequest {
 pub struct SendMessageRequest {
     pub content: String,
     #[serde(default)]
-    pub files: Vec<String>,
+    pub files: Vec<ChatFileRef>,
     #[serde(default)]
     pub inject_skills: Vec<String>,
     #[serde(default)]
@@ -227,6 +228,8 @@ pub struct ConversationResponse {
     pub channel_chat_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant: Option<ConversationAssistantIdentityResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub created_at: TimestampMs,
     pub modified_at: TimestampMs,
     pub extra: serde_json::Value,
@@ -585,6 +588,7 @@ mod tests {
             pinned_at: None,
             channel_chat_id: None,
             assistant: None,
+            project_id: None,
             created_at: 1712345678000,
             modified_at: 1712345678000,
             extra: json!({ "workspace": "/project" }),
@@ -623,6 +627,7 @@ mod tests {
             pinned_at: None,
             channel_chat_id: None,
             assistant: None,
+            project_id: None,
             created_at: 1,
             modified_at: 1,
             extra: json!({}),
@@ -655,6 +660,7 @@ mod tests {
             pinned_at: Some(1712345678000),
             channel_chat_id: Some("group:42".into()),
             assistant: None,
+            project_id: None,
             created_at: 1000,
             modified_at: 2000,
             extra: json!({}),
@@ -739,6 +745,7 @@ mod tests {
                 pinned_at: None,
                 channel_chat_id: None,
                 assistant: None,
+                project_id: None,
                 created_at: 1712345678000,
                 modified_at: 1712345678000,
                 extra: json!({}),
@@ -776,6 +783,7 @@ mod tests {
                 pinned_at: None,
                 channel_chat_id: None,
                 assistant: None,
+                project_id: None,
                 created_at: 9000,
                 modified_at: 9000,
                 extra: json!({}),
@@ -795,13 +803,31 @@ mod tests {
     fn deserialize_send_message_full() {
         let raw = json!({
             "content": "Review this code",
-            "files": ["/tmp/a.rs"],
+            "files": [
+                { "kind": "project", "pe_id": "pe1", "relative_path": "src/a.rs" },
+                { "kind": "upload", "path": "/tmp/a.rs" },
+                { "kind": "local", "path": "/Users/me/notes.txt" }
+            ],
             "inject_skills": ["security-review"],
             "hidden": true
         });
         let req: SendMessageRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.content, "Review this code");
-        assert_eq!(req.files, vec!["/tmp/a.rs"]);
+        assert_eq!(
+            req.files,
+            vec![
+                ChatFileRef::Project {
+                    pe_id: "pe1".into(),
+                    relative_path: "src/a.rs".into()
+                },
+                ChatFileRef::Upload {
+                    path: "/tmp/a.rs".into()
+                },
+                ChatFileRef::Local {
+                    path: "/Users/me/notes.txt".into()
+                },
+            ]
+        );
         assert_eq!(req.inject_skills, vec!["security-review"]);
         assert!(req.hidden);
     }
@@ -847,6 +873,7 @@ mod tests {
                 pinned_at: None,
                 channel_chat_id: None,
                 assistant: None,
+                project_id: None,
                 created_at: 1000,
                 modified_at: 1000,
                 extra: json!({}),
@@ -899,6 +926,7 @@ mod tests {
                     pinned_at: None,
                     channel_chat_id: None,
                     assistant: None,
+                    project_id: None,
                     created_at: 5000,
                     modified_at: 5000,
                     extra: json!({}),

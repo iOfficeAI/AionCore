@@ -1561,6 +1561,14 @@ async fn handle_reverse_rpc(
                     pending_perm_options.lock().await.insert(id.to_string(), parsed);
                 }
             }
+            // Carry the raised toolCall's `title` and `rawInput` so the permission
+            // card can show the approver WHAT they are approving (AionUi issue
+            // #3779 — a title-less card read as a bare "Permission request" and the
+            // user approved blind). Same wire fields `parse_permission_metadata`
+            // already reads (`toolCall.title` / `toolCall.rawInput`, ACP
+            // session/request_permission params). Display-to-the-approver, not
+            // logging — TIO-13 still applies to log output.
+            let perm_tool_call = frame.get("params").and_then(|p| p.get("toolCall"));
             emit(
                 event_tx,
                 session_id,
@@ -1569,10 +1577,11 @@ async fn handle_reverse_rpc(
                     request_id: id.to_string(),
                     kind: PermissionKind::Tool,
                     metadata,
-                    // AskUserQuestion projection is claude-direct only; ACP permission
-                    // requests carry MCP context via `metadata`, not a question payload.
-                    tool_name: None,
-                    input: None,
+                    tool_name: perm_tool_call
+                        .and_then(|tc| tc.get("title"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    input: perm_tool_call.and_then(|tc| tc.get("rawInput")).cloned(),
                 },
             );
         }
@@ -3447,7 +3456,7 @@ mod tests {
             r#"{"optionId":"ok","kind":"allow_once","name":"Allow"},"#,
             r#"{"optionId":"ok_always","kind":"allow_always","name":"Always Allow"},"#,
             r#"{"optionId":"no","kind":"reject_once","name":"Reject"}],"#,
-            r#""toolCall":{"title":"Bash","rawInput":{}}}}"#,
+            r#""toolCall":{"title":"Bash","rawInput":{"command":"rm -rf /"}}}}"#,
             "\n",
         )
         .as_bytes()
@@ -3461,10 +3470,16 @@ mod tests {
 
         // Wait for the Permission event so its request_id (the wire "501") is surfaced
         // and the offered options are stashed.
-        let req_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (req_id, perm_tool_name, perm_input) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(env) = events.next().await {
-                if let SessionEvent::Permission { request_id, .. } = env.event {
-                    return Some(request_id);
+                if let SessionEvent::Permission {
+                    request_id,
+                    tool_name,
+                    input,
+                    ..
+                } = env.event
+                {
+                    return Some((request_id, tool_name, input));
                 }
             }
             None
@@ -3472,6 +3487,15 @@ mod tests {
         .await
         .expect("must not hang")
         .expect("Permission surfaced");
+        // AionUi issue #3779: the card must show what is being approved — the
+        // toolCall's title and rawInput ride on the Permission event.
+        assert_eq!(
+            perm_tool_name.as_deref(),
+            Some("Bash"),
+            "toolCall.title rides as tool_name"
+        );
+        let perm_input = perm_input.expect("toolCall.rawInput rides as input");
+        assert_eq!(perm_input["command"], "rm -rf /", "rawInput reaches the card verbatim");
 
         // AllowAlways → must echo the real allow_always optionId "ok_always".
         backend

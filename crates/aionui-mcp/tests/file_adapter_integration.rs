@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+const TEST_USER_ID: &str = "system_default_user";
+
 use aionui_common::McpSource;
 use aionui_mcp::{AionuiAdapter, McpAgentAdapter, McpServerTransport};
 
@@ -35,36 +37,65 @@ mod aionui {
 
     #[async_trait::async_trait]
     impl IMcpServerRepository for MockRepo {
-        async fn list(&self) -> Result<Vec<McpServerRow>, DbError> {
-            Ok(self.servers.lock().await.clone())
+        async fn list(&self, user_id: &str) -> Result<Vec<McpServerRow>, DbError> {
+            Ok(self
+                .servers
+                .lock()
+                .await
+                .iter()
+                .filter(|server| server.user_id == user_id)
+                .cloned()
+                .collect())
         }
 
-        async fn find_by_id(&self, id: &str) -> Result<Option<McpServerRow>, DbError> {
-            Ok(self.servers.lock().await.iter().find(|s| s.id == id).cloned())
+        async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<McpServerRow>, DbError> {
+            Ok(self
+                .servers
+                .lock()
+                .await
+                .iter()
+                .find(|s| s.user_id == user_id && s.id == id)
+                .cloned())
         }
 
-        async fn find_by_name(&self, name: &str) -> Result<Option<McpServerRow>, DbError> {
-            Ok(self.servers.lock().await.iter().find(|s| s.name == name).cloned())
+        async fn find_by_name(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, DbError> {
+            Ok(self
+                .servers
+                .lock()
+                .await
+                .iter()
+                .find(|s| s.user_id == user_id && s.name == name)
+                .cloned())
         }
 
         async fn create(&self, _p: CreateMcpServerParams<'_>) -> Result<McpServerRow, DbError> {
             unimplemented!()
         }
 
-        async fn update(&self, _id: &str, _p: UpdateMcpServerParams<'_>) -> Result<McpServerRow, DbError> {
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _p: UpdateMcpServerParams<'_>,
+        ) -> Result<McpServerRow, DbError> {
             unimplemented!()
         }
 
-        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
             unimplemented!()
         }
 
-        async fn batch_upsert(&self, _s: &[CreateMcpServerParams<'_>]) -> Result<Vec<McpServerRow>, DbError> {
+        async fn batch_upsert(
+            &self,
+            _user_id: &str,
+            _s: &[CreateMcpServerParams<'_>],
+        ) -> Result<Vec<McpServerRow>, DbError> {
             unimplemented!()
         }
 
         async fn update_status(
             &self,
+            _user_id: &str,
             _id: &str,
             _s: &str,
             _lc: Option<aionui_common::TimestampMs>,
@@ -72,13 +103,14 @@ mod aionui {
             unimplemented!()
         }
 
-        async fn update_tools(&self, _id: &str, _t: Option<&str>) -> Result<(), DbError> {
+        async fn update_tools(&self, _user_id: &str, _id: &str, _t: Option<&str>) -> Result<(), DbError> {
             unimplemented!()
         }
     }
 
     fn make_row(name: &str, t_type: &str, t_config: &str) -> McpServerRow {
         McpServerRow {
+            user_id: TEST_USER_ID.to_string(),
             id: format!("mcp_{name}"),
             name: name.to_owned(),
             description: None,
@@ -120,7 +152,7 @@ mod aionui {
         let repo = Arc::new(MockRepo::new(rows));
         let adapter = AionuiAdapter::new(repo);
 
-        let servers = adapter.detect_existing().await.unwrap();
+        let servers = adapter.detect_existing(TEST_USER_ID).await.unwrap();
         assert_eq!(servers.len(), 3);
         assert_eq!(servers[0].name, "stdio-srv");
         assert_eq!(servers[1].name, "http-srv");
@@ -135,7 +167,7 @@ mod aionui {
     async fn detect_empty_db_returns_empty() {
         let repo = Arc::new(MockRepo::new(vec![]));
         let adapter = AionuiAdapter::new(repo);
-        let servers = adapter.detect_existing().await.unwrap();
+        let servers = adapter.detect_existing(TEST_USER_ID).await.unwrap();
         assert!(servers.is_empty());
     }
 
@@ -152,7 +184,7 @@ mod aionui {
         adapter.install_server("test", &transport).await.unwrap();
 
         // DB should still be empty since install is a no-op
-        let servers = adapter.detect_existing().await.unwrap();
+        let servers = adapter.detect_existing(TEST_USER_ID).await.unwrap();
         assert!(servers.is_empty());
     }
 
@@ -165,7 +197,7 @@ mod aionui {
         adapter.remove_server("srv").await.unwrap();
 
         // Server should still be in DB since remove is a no-op
-        let servers = adapter.detect_existing().await.unwrap();
+        let servers = adapter.detect_existing(TEST_USER_ID).await.unwrap();
         assert_eq!(servers.len(), 1);
     }
 

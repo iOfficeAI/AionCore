@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.1.55](https://github.com/iOfficeAI/AionCore/compare/v0.1.54...v0.1.55) (2026-07-30)
+
+
+### Features
+
+* **agents:** add omp (Oh My Pi) builtin ACP agent ([#717](https://github.com/iOfficeAI/AionCore/issues/717)) ([91f375d](https://github.com/iOfficeAI/AionCore/commit/91f375db0ba355c011309484382f4d5ab90ccbb2))
+* **project:** fs/search filename search vertical ([#720](https://github.com/iOfficeAI/AionCore/issues/720)) ([b64ab4f](https://github.com/iOfficeAI/AionCore/commit/b64ab4fd6eef74812360d2a901aa39d8c946c033))
+
+
+### Bug Fixes
+
+* **auth:** make AionUi-&gt;AionPro data adoption a one-shot event ([#716](https://github.com/iOfficeAI/AionCore/issues/716)) ([c9f6f79](https://github.com/iOfficeAI/AionCore/commit/c9f6f79fa1a15df177e15a8ff990dcb571d2fe4c))
+* **db:** pre-migration repair for migration-030 startup-blocking CHECK failures ([#724](https://github.com/iOfficeAI/AionCore/issues/724)) ([859ed7e](https://github.com/iOfficeAI/AionCore/commit/859ed7e5bdd2da5664b0f1d2df4e2b9cd92aaf3b))
+* prevent silent encryption-key rotation on migration upgrade (ELECTRON-3T0) ([#722](https://github.com/iOfficeAI/AionCore/issues/722)) ([4993fe8](https://github.com/iOfficeAI/AionCore/commit/4993fe858c531f6b2ca471ad59612d46e97d9de9))
+* **project:** add temporary fs/resolve command for preview file paths ([#723](https://github.com/iOfficeAI/AionCore/issues/723)) ([575feac](https://github.com/iOfficeAI/AionCore/commit/575feacd9e5aef7b7948a882bdb9ce27050e2829))
+* **session:** carry tool input on permission events so the approval card shows what is being approved ([#715](https://github.com/iOfficeAI/AionCore/issues/715)) ([bdbb11c](https://github.com/iOfficeAI/AionCore/commit/bdbb11c7f32547996fe6e33b0a4d8b833cb7279b))
+
+## [0.1.54](https://github.com/iOfficeAI/AionCore/compare/v0.1.53...v0.1.54) (2026-07-29)
+
+
+### Features
+
+* multi-account user scope isolation ([#669](https://github.com/iOfficeAI/AionCore/issues/669)) ([7f8ed6c](https://github.com/iOfficeAI/AionCore/commit/7f8ed6c5d5a899984e23b1ae130640bdeaffd6dc))
+* **project:** Project Explorer backend (runtime, WS monitor, HTTP) ([#701](https://github.com/iOfficeAI/AionCore/issues/701)) ([0a79100](https://github.com/iOfficeAI/AionCore/commit/0a791002b0b43f0ac883a4b58b76336830041da0))
+* **scripts:** carry aionrs changelog into the bump PR ([#703](https://github.com/iOfficeAI/AionCore/issues/703)) ([f34cfb6](https://github.com/iOfficeAI/AionCore/commit/f34cfb61ba58266dfe8100cebc678925c9d67806))
+
+
+### Code Refactoring
+
+* **acp:** upgrade agent-client-protocol SDK 0.11.1 -&gt; 2.0.0 ([#708](https://github.com/iOfficeAI/AionCore/issues/708)) ([9e185f0](https://github.com/iOfficeAI/AionCore/commit/9e185f0b196e6945b4d716553968150cb162c7ba))
+
 ## [0.1.53](https://github.com/iOfficeAI/AionCore/compare/v0.1.52...v0.1.53) (2026-07-28)
 
 

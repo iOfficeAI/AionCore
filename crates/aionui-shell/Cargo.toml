@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 aionui-common.workspace = true
 aionui-api-types.workspace = true
+aionui-auth.workspace = true
 aionui-system.workspace = true
 aionui-runtime.workspace = true
 async-trait.workspace = true

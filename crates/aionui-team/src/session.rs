@@ -174,12 +174,16 @@ impl TeamSession {
         service: Weak<TeamSessionService>,
         prompt_dump: TeamPromptDumpConfig,
     ) -> Result<Self, TeamError> {
-        let mailbox = Arc::new(Mailbox::new(repo.clone()));
-        let task_board = Arc::new(TaskBoard::new(repo));
+        let mailbox = Arc::new(Mailbox::new_for_user(repo.clone(), user_id.clone()));
+        let task_board = Arc::new(TaskBoard::new_for_user(repo, user_id.clone()));
         let member_runtimes = Arc::new(MemberRuntimeRegistry::new(generate_id()));
         let team_run_manager = Arc::new(TeamRunManager::new(
             team.id.clone(),
-            Arc::new(TeamEventEmitter::new(team.id.clone(), broadcaster.clone())),
+            Arc::new(TeamEventEmitter::new(
+                team.id.clone(),
+                user_id.clone(),
+                broadcaster.clone(),
+            )),
         ));
         let work_coordinator = Arc::new(SlotWorkCoordinator::new(
             team.id.clone(),
@@ -189,6 +193,7 @@ impl TeamSession {
 
         let scheduler = Arc::new(TeammateManager::new(
             team.id.clone(),
+            user_id.clone(),
             &team.agents,
             mailbox.clone(),
             task_board.clone(),
@@ -281,7 +286,11 @@ impl TeamSession {
     }
 
     pub(crate) fn team_event_emitter(&self) -> Arc<TeamEventEmitter> {
-        Arc::new(TeamEventEmitter::new(self.team.id.clone(), self.broadcaster.clone()))
+        Arc::new(TeamEventEmitter::new(
+            self.team.id.clone(),
+            self.user_id.clone(),
+            self.broadcaster.clone(),
+        ))
     }
 
     pub fn team_run_manager(&self) -> &Arc<TeamRunManager> {
@@ -314,7 +323,7 @@ impl TeamSession {
         let Some(service) = self.service.upgrade() else {
             return Ok(TeamToolTransport::Mcp);
         };
-        service.provisioner().team_tool_transport(agent).await
+        service.provisioner().team_tool_transport(&self.user_id, agent).await
     }
 
     pub(crate) async fn prepare_next_batch(&self, slot_id: &str) -> Result<PrepareBatchResult, TeamError> {
@@ -335,7 +344,9 @@ impl TeamSession {
             .work_coordinator
             .set_runtime_constraint(slot_id, runtime_constraint);
         if !update.terminal_message_ids.is_empty() {
-            self.mailbox.mark_read_batch(&update.terminal_message_ids).await?;
+            self.mailbox
+                .mark_read_batch(&self.team.id, &update.terminal_message_ids)
+                .await?;
         }
 
         let unread = self
@@ -574,7 +585,13 @@ impl TeamSession {
         let reservation = self.member_runtimes.reserve_attach(slot_id, false);
         if matches!(reservation, ReserveAttach::Start(_)) {
             let agent = self.scheduler.get_agent(slot_id).await?;
-            service.broadcast_agent_runtime_status(&self.team.id, &agent, TeamAgentRuntimeStatus::Pending, None);
+            service.broadcast_agent_runtime_status(
+                self.user_id(),
+                &self.team.id,
+                &agent,
+                TeamAgentRuntimeStatus::Pending,
+                None,
+            );
             info!(
                 team_id = %self.team.id,
                 slot_id,
@@ -700,6 +717,7 @@ impl TeamSession {
 
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest::user_visible(
+            &self.user_id,
             &self.team.id,
             slot_id,
             &agent.conversation_id,
@@ -751,7 +769,9 @@ impl TeamSession {
         };
         let update = self.work_coordinator.set_runtime_constraint(slot_id, constraint);
         if !update.terminal_message_ids.is_empty() {
-            self.mailbox.mark_read_batch(&update.terminal_message_ids).await?;
+            self.mailbox
+                .mark_read_batch(&self.team.id, &update.terminal_message_ids)
+                .await?;
         }
         Ok(())
     }
@@ -799,6 +819,7 @@ impl TeamSession {
 
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest {
+            user_id: self.user_id.clone(),
             team_id: self.team.id.clone(),
             slot_id: to_slot_id.to_owned(),
             conversation_id: to_agent.conversation_id.clone(),
@@ -948,7 +969,7 @@ impl TeamSession {
                 self.work_coordinator.abort_enqueue(lease, "enqueue_commit_failed");
                 if let Err(mark_read_error) = self
                     .mailbox
-                    .mark_read_batch(std::slice::from_ref(&mailbox_message_id))
+                    .mark_read_batch(&self.team.id, std::slice::from_ref(&mailbox_message_id))
                     .await
                 {
                     warn!(
@@ -1060,6 +1081,7 @@ impl TeamSession {
                 msg.content.clone()
             };
             let request = TeamProjectionRequest {
+                user_id: self.user_id.clone(),
                 team_id: self.team.id.clone(),
                 slot_id: msg.to_agent_id.clone(),
                 conversation_id: input.conversation_id.clone(),
@@ -1100,7 +1122,9 @@ impl TeamSession {
         self.team_run_manager.begin_cancel(team_run_id, reason)?;
         let result = self.work_coordinator.cancel_run(team_run_id);
         if !result.terminal_message_ids.is_empty() {
-            self.mailbox.mark_read_batch(&result.terminal_message_ids).await?;
+            self.mailbox
+                .mark_read_batch(&self.team.id, &result.terminal_message_ids)
+                .await?;
         }
         for target in result.cancel_targets {
             let Some(turn_id) = target.turn_id else {
@@ -1399,6 +1423,7 @@ impl TeamSession {
     ) {
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest::team_system_visible(
+            &self.user_id,
             &self.team.id,
             slot_id,
             conversation_id,
@@ -1435,7 +1460,9 @@ impl TeamSession {
         }
         let work = self.work_coordinator.remove_slot(slot_id);
         if !work.terminal_message_ids.is_empty() {
-            self.mailbox.mark_read_batch(&work.terminal_message_ids).await?;
+            self.mailbox
+                .mark_read_batch(&self.team.id, &work.terminal_message_ids)
+                .await?;
         }
         if let Some(target) = work.cancel_target
             && let Some(turn_id) = target.turn_id
@@ -1516,7 +1543,13 @@ impl TeamSession {
         // capability checks. Assistant spawns derive backend from the preset
         // identity rather than inheriting the caller backend.
         let (backend, model) = service
-            .resolve_spawn_backend_and_model(Some(assistant_id), None, caller.backend.as_str(), caller.model.as_str())
+            .resolve_spawn_backend_and_model(
+                &self.user_id,
+                Some(assistant_id),
+                None,
+                caller.backend.as_str(),
+                caller.model.as_str(),
+            )
             .await?;
 
         // Step 4: DB side-effects (new conversation + persisted agent slot).
@@ -1754,6 +1787,7 @@ pub(crate) async fn attach_member_runtime(
         );
         if session.member_runtimes.commit_failed(&lease, failure.clone()) {
             service.broadcast_agent_runtime_status(
+                session.user_id(),
                 session.team_id(),
                 &agent,
                 TeamAgentRuntimeStatus::Failed,
@@ -2985,7 +3019,7 @@ mod tests {
     #[test]
     fn session_replacement_rejects_old_generation_batch_and_attach_completion() {
         let old_broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-        let old_emitter = Arc::new(TeamEventEmitter::new("t1".into(), old_broadcaster));
+        let old_emitter = Arc::new(TeamEventEmitter::new("t1".into(), "user-1".into(), old_broadcaster));
         let old_runs = Arc::new(TeamRunManager::new("t1".into(), old_emitter));
         let old_coordinator = SlotWorkCoordinator::new("t1".into(), "old-generation".into(), old_runs);
         old_coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
@@ -3003,7 +3037,7 @@ mod tests {
         };
 
         let new_broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-        let new_emitter = Arc::new(TeamEventEmitter::new("t1".into(), new_broadcaster));
+        let new_emitter = Arc::new(TeamEventEmitter::new("t1".into(), "user-1".into(), new_broadcaster));
         let new_runs = Arc::new(TeamRunManager::new("t1".into(), new_emitter));
         let new_coordinator = SlotWorkCoordinator::new("t1".into(), "new-generation".into(), new_runs);
         new_coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);

@@ -6,12 +6,17 @@
 
 use std::path::Path;
 
+use aionui_db::{
+    ISkillRepository, IUserRepository, SqliteSkillRepository, SqliteUserRepository, UpsertSkillParams,
+    init_database_memory,
+};
 use aionui_extension::external_paths::ExternalPathsManager;
 use aionui_extension::skill_service::{
     NamedPath, SkillPaths, delete_assistant_rule, delete_assistant_skill, delete_skill,
-    detect_and_count_external_skills, export_skill_with_symlink, import_skill, list_available_skills,
-    read_assistant_rule, read_assistant_skill, read_builtin_rule, read_builtin_skill, read_skill_info,
-    resolve_skill_paths, scan_for_skills, write_assistant_rule, write_assistant_skill,
+    detect_and_count_external_skills, export_skill_with_symlink, import_skill, import_skill_with_repo_for_user,
+    list_available_skills, materialize_skills_for_agent_with_repo_for_user, read_assistant_rule, read_assistant_skill,
+    read_builtin_rule, read_builtin_skill, read_skill_info, resolve_skill_paths, scan_for_skills, write_assistant_rule,
+    write_assistant_skill,
 };
 use tempfile::TempDir;
 
@@ -20,6 +25,9 @@ use tempfile::TempDir;
 // ---------------------------------------------------------------------------
 
 const SKILL_MD: &str = "SKILL.md";
+/// Mirrors the private `skill_service::DEFAULT_USER_ID` constant; kept in
+/// sync manually since it isn't part of the crate's public API.
+const DEFAULT_USER_ID: &str = "system_default_user";
 
 fn make_paths(base: &Path) -> SkillPaths {
     SkillPaths {
@@ -45,6 +53,24 @@ fn create_skill(base: &Path, name: &str, desc: &str) {
         format!("---\nname: {name}\ndescription: {desc}\n---\nBody of {name}."),
     )
     .unwrap();
+}
+
+fn create_skill_with_body(base: &Path, dir_name: &str, skill_name: &str, desc: &str, body: &str) {
+    let dir = base.join(dir_name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(SKILL_MD),
+        format!("---\nname: {skill_name}\ndescription: {desc}\n---\n{body}"),
+    )
+    .unwrap();
+}
+
+async fn create_test_user(db: &aionui_db::Database, username: &str) -> String {
+    SqliteUserRepository::new(db.pool().clone())
+        .create_user(username, "hash")
+        .await
+        .unwrap()
+        .id
 }
 
 fn create_builtin_rule(base: &Path, name: &str, content: &str) {
@@ -134,8 +160,13 @@ async fn sm3_import_skill_copy() {
     let name = import_skill(&paths, &source).await.unwrap();
     assert_eq!(name, "ext-tool");
 
-    // Verify files were copied
-    let imported = paths.user_skills_dir.join("ext-tool");
+    // Verify files were copied under the default user's type-first root
+    // (skills/users/{user_dir}/), not the flat legacy root.
+    let imported = paths
+        .user_skills_dir
+        .join("users")
+        .join(DEFAULT_USER_ID)
+        .join("ext-tool");
     assert!(imported.join(SKILL_MD).exists());
     assert!(imported.join("helper.py").exists());
 }
@@ -166,10 +197,124 @@ async fn sm4_import_skill_replaces_existing_copy() {
     let name = import_skill(&paths, &source).await.unwrap();
     assert_eq!(name, "linked");
 
-    let imported = paths.user_skills_dir.join("linked");
+    let imported = paths.user_skills_dir.join("users").join(DEFAULT_USER_ID).join("linked");
     assert!(!imported.is_symlink());
     let content = std::fs::read_to_string(imported.join(SKILL_MD)).unwrap();
     assert!(content.contains("Updated body"));
+}
+
+#[tokio::test]
+async fn user_scoped_materialize_does_not_backfill_shared_legacy_skill() {
+    let tmp = TempDir::new().unwrap();
+    let paths = make_paths(tmp.path());
+    create_skill(&paths.user_skills_dir, "legacy-only", "Legacy default skill");
+
+    let db = init_database_memory().await.unwrap();
+    let user_a = create_test_user(&db, "user_a").await;
+    let repo = SqliteSkillRepository::new(db.pool().clone());
+
+    let resolved =
+        materialize_skills_for_agent_with_repo_for_user(&paths, &repo, &user_a, "conv-1", &["legacy-only".to_owned()])
+            .await
+            .unwrap();
+    assert!(resolved.is_empty());
+    assert!(
+        repo.find_by_name_for_user(&user_a, "legacy-only")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let default_resolved = materialize_skills_for_agent_with_repo_for_user(
+        &paths,
+        &repo,
+        "system_default_user",
+        "conv-1",
+        &["legacy-only".to_owned()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(default_resolved.len(), 1);
+}
+
+#[tokio::test]
+async fn user_scoped_imports_with_same_name_use_distinct_storage() {
+    let tmp = TempDir::new().unwrap();
+    let paths = make_paths(tmp.path());
+
+    let source_a = tmp.path().join("source-a");
+    create_skill_with_body(&source_a, "shared-a", "shared", "User A skill", "body-a");
+    let source_b = tmp.path().join("source-b");
+    create_skill_with_body(&source_b, "shared-b", "shared", "User B skill", "body-b");
+
+    let db = init_database_memory().await.unwrap();
+    let user_a = create_test_user(&db, "user_a").await;
+    let user_b = create_test_user(&db, "user_b").await;
+    let repo = SqliteSkillRepository::new(db.pool().clone());
+
+    import_skill_with_repo_for_user(&paths, &repo, &user_a, &source_a.join("shared-a"))
+        .await
+        .unwrap();
+    import_skill_with_repo_for_user(&paths, &repo, &user_b, &source_b.join("shared-b"))
+        .await
+        .unwrap();
+
+    let row_a = repo.find_by_name_for_user(&user_a, "shared").await.unwrap().unwrap();
+    let row_b = repo.find_by_name_for_user(&user_b, "shared").await.unwrap().unwrap();
+    assert_ne!(row_a.path, row_b.path);
+
+    let content_a = std::fs::read_to_string(Path::new(&row_a.path).join(SKILL_MD)).unwrap();
+    let content_b = std::fs::read_to_string(Path::new(&row_b.path).join(SKILL_MD)).unwrap();
+    assert!(content_a.contains("body-a"));
+    assert!(content_b.contains("body-b"));
+
+    let resolved_a =
+        materialize_skills_for_agent_with_repo_for_user(&paths, &repo, &user_a, "conv-1", &["shared".to_owned()])
+            .await
+            .unwrap();
+    let resolved_b =
+        materialize_skills_for_agent_with_repo_for_user(&paths, &repo, &user_b, "conv-1", &["shared".to_owned()])
+            .await
+            .unwrap();
+    assert_eq!(resolved_a[0].source_path, Path::new(&row_a.path));
+    assert_eq!(resolved_b[0].source_path, Path::new(&row_b.path));
+}
+
+#[tokio::test]
+async fn user_skill_override_wins_over_builtin_during_materialization() {
+    let tmp = TempDir::new().unwrap();
+    let paths = make_paths(tmp.path());
+    create_skill(&paths.builtin_skills_dir, "shared", "Builtin skill");
+
+    let source = tmp.path().join("source-user");
+    create_skill_with_body(&source, "shared-user", "shared", "User skill", "user-body");
+
+    let db = init_database_memory().await.unwrap();
+    let user_id = create_test_user(&db, "user_override").await;
+    let repo = SqliteSkillRepository::new(db.pool().clone());
+    let builtin_path = paths.builtin_skills_dir.join("shared");
+    repo.upsert_global(UpsertSkillParams {
+        name: "shared",
+        description: Some("Builtin skill"),
+        path: builtin_path.to_string_lossy().as_ref(),
+        source: "builtin",
+        enabled: true,
+    })
+    .await
+    .unwrap();
+
+    import_skill_with_repo_for_user(&paths, &repo, &user_id, &source.join("shared-user"))
+        .await
+        .unwrap();
+    let user_row = repo.find_by_name_for_user(&user_id, "shared").await.unwrap().unwrap();
+
+    let resolved =
+        materialize_skills_for_agent_with_repo_for_user(&paths, &repo, &user_id, "conv-1", &["shared".to_owned()])
+            .await
+            .unwrap();
+
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].source_path, Path::new(&user_row.path));
 }
 
 /// SM-5: Export skill (symlink).

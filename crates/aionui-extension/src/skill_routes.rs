@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, Path as AxumPath, State};
+use axum::extract::{Extension, Json, Path as AxumPath, State};
 use axum::routing::{delete, get, post};
 use tracing::warn;
 
@@ -17,6 +17,7 @@ use aionui_api_types::{
     ScannedSkillResponse, SkillImportLimitsResponse, SkillImportRecordResponse, SkillListItemResponse,
     SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_db::ISkillRepository;
 
@@ -111,8 +112,14 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
 /// `GET /api/skills` — list all available skills.
 async fn list_skills(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<SkillListItemResponse>>>, ApiError> {
-    let items = skill_service::list_available_skills_with_repo(&state.skill_paths, state.skill_repo.as_ref()).await?;
+    let items = skill_service::list_available_skills_with_repo_for_user(
+        &state.skill_paths,
+        state.skill_repo.as_ref(),
+        &current_user.id,
+    )
+    .await?;
     let resp: Vec<SkillListItemResponse> = items
         .into_iter()
         .map(|s| SkillListItemResponse {
@@ -164,12 +171,14 @@ async fn get_import_limits() -> Result<Json<ApiResponse<SkillImportLimitsRespons
 /// `POST /api/skills/import` — import skill directories or zip packages by copying.
 async fn import_skill(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<ImportSkillRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportSkillResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let outcome = match skill_service::import_skills_with_repo(
+    let outcome = match skill_service::import_skills_with_repo_for_user(
         &state.skill_paths,
         state.skill_repo.as_ref(),
+        &current_user.id,
         Path::new(&req.skill_path),
     )
     .await
@@ -227,19 +236,27 @@ async fn export_skill_symlink(
 /// `DELETE /api/skills/:name` — delete a user-custom skill.
 async fn delete_skill(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    skill_service::delete_skill_with_repo(&state.skill_paths, state.skill_repo.as_ref(), &name).await?;
+    skill_service::delete_skill_with_repo_for_user(
+        &state.skill_paths,
+        state.skill_repo.as_ref(),
+        &current_user.id,
+        &name,
+    )
+    .await?;
     Ok(Json(ApiResponse::success()))
 }
 
 /// `GET /api/skills/import-history` — list recent skill import records.
 async fn list_import_history(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<SkillImportRecordResponse>>>, ApiError> {
     let records = state
         .skill_repo
-        .list_import_records(100)
+        .list_import_records_for_user(&current_user.id, 100)
         .await
         .map_err(ExtensionError::from)?;
     let resp = records
@@ -358,15 +375,17 @@ async fn read_builtin_skill(
 /// backend no longer copies any files per-conversation.
 async fn materialize_for_agent(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<MaterializeSkillsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<MaterializeSkillsResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     if req.conversation_id.trim().is_empty() {
         return Err(ApiError::BadRequest("conversationId must not be empty".into()));
     }
-    let resolved = skill_service::materialize_skills_for_agent_with_repo(
+    let resolved = skill_service::materialize_skills_for_agent_with_repo_for_user(
         &state.skill_paths,
         state.skill_repo.as_ref(),
+        &current_user.id,
         &req.conversation_id,
         &req.skills,
     )
@@ -391,13 +410,20 @@ async fn materialize_for_agent(
 /// back to user-directory-only legacy behavior otherwise.
 async fn read_assistant_rule(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<ReadAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
-        let content = dispatcher.read_rule(&req.assistant_id, req.locale.as_deref()).await?;
+        let content = dispatcher
+            .read_rule(&current_user.id, &req.assistant_id, req.locale.as_deref())
+            .await?;
         return Ok(Json(ApiResponse::ok(content)));
     }
+    tracing::warn!(
+        assistant_id = %req.assistant_id,
+        "assistant_dispatcher not configured; using unscoped legacy assistant-rule read fallback (must not happen in production)"
+    );
     let content =
         skill_service::read_assistant_rule(&state.skill_paths, &req.assistant_id, req.locale.as_deref()).await?;
     Ok(Json(ApiResponse::ok(content)))
@@ -408,15 +434,20 @@ async fn read_assistant_rule(
 /// Dispatches by source: builtin / extension ids reject with 400.
 async fn write_assistant_rule(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<WriteAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
         dispatcher
-            .write_rule(&req.assistant_id, req.locale.as_deref(), &req.content)
+            .write_rule(&current_user.id, &req.assistant_id, req.locale.as_deref(), &req.content)
             .await?;
         return Ok(Json(ApiResponse::ok(true)));
     }
+    tracing::warn!(
+        assistant_id = %req.assistant_id,
+        "assistant_dispatcher not configured; using unscoped legacy assistant-rule write fallback (must not happen in production)"
+    );
     let ok = skill_service::write_assistant_rule(
         &state.skill_paths,
         &req.assistant_id,
@@ -430,12 +461,17 @@ async fn write_assistant_rule(
 /// `DELETE /api/skills/assistant-rule/:id` — delete all locale versions.
 async fn delete_assistant_rule(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     if let Some(dispatcher) = &state.assistant_dispatcher {
-        let ok = dispatcher.delete_rule(&id).await?;
+        let ok = dispatcher.delete_rule(&current_user.id, &id).await?;
         return Ok(Json(ApiResponse::ok(ok)));
     }
+    tracing::warn!(
+        assistant_id = %id,
+        "assistant_dispatcher not configured; using unscoped legacy assistant-rule delete fallback (must not happen in production)"
+    );
     let ok = skill_service::delete_assistant_rule(&state.skill_paths, &id).await?;
     Ok(Json(ApiResponse::ok(ok)))
 }
@@ -449,13 +485,20 @@ async fn delete_assistant_rule(
 /// Dispatches by source via [`AssistantRuleDispatcher`] when wired.
 async fn read_assistant_skill(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<ReadAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
-        let content = dispatcher.read_skill(&req.assistant_id, req.locale.as_deref()).await?;
+        let content = dispatcher
+            .read_skill(&current_user.id, &req.assistant_id, req.locale.as_deref())
+            .await?;
         return Ok(Json(ApiResponse::ok(content)));
     }
+    tracing::warn!(
+        assistant_id = %req.assistant_id,
+        "assistant_dispatcher not configured; using unscoped legacy assistant-skill read fallback (must not happen in production)"
+    );
     let content =
         skill_service::read_assistant_skill(&state.skill_paths, &req.assistant_id, req.locale.as_deref()).await?;
     Ok(Json(ApiResponse::ok(content)))
@@ -466,15 +509,20 @@ async fn read_assistant_skill(
 /// Dispatches by source: builtin / extension ids reject with 400.
 async fn write_assistant_skill(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<WriteAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
         dispatcher
-            .write_skill(&req.assistant_id, req.locale.as_deref(), &req.content)
+            .write_skill(&current_user.id, &req.assistant_id, req.locale.as_deref(), &req.content)
             .await?;
         return Ok(Json(ApiResponse::ok(true)));
     }
+    tracing::warn!(
+        assistant_id = %req.assistant_id,
+        "assistant_dispatcher not configured; using unscoped legacy assistant-skill write fallback (must not happen in production)"
+    );
     let ok = skill_service::write_assistant_skill(
         &state.skill_paths,
         &req.assistant_id,
@@ -488,12 +536,17 @@ async fn write_assistant_skill(
 /// `DELETE /api/skills/assistant-skill/:id` — delete all locale versions.
 async fn delete_assistant_skill(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     if let Some(dispatcher) = &state.assistant_dispatcher {
-        let ok = dispatcher.delete_skill(&id).await?;
+        let ok = dispatcher.delete_skill(&current_user.id, &id).await?;
         return Ok(Json(ApiResponse::ok(ok)));
     }
+    tracing::warn!(
+        assistant_id = %id,
+        "assistant_dispatcher not configured; using unscoped legacy assistant-skill delete fallback (must not happen in production)"
+    );
     let ok = skill_service::delete_assistant_skill(&state.skill_paths, &id).await?;
     Ok(Json(ApiResponse::ok(ok)))
 }

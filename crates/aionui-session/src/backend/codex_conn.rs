@@ -2225,9 +2225,14 @@ async fn handle_reverse_rpc(
                     // G3 auto-approval is ACP-only (acp_conn). The native codex
                     // app-server command/file approval is not a team-MCP path.
                     metadata: None,
-                    // AskUserQuestion projection is claude-direct only.
-                    tool_name: None,
-                    input: None,
+                    // The approval class as the card title, and the request `params`
+                    // as an UNPARSED passthrough so the card can show the approver
+                    // what they are approving (AionUi issue #3779 — approving blind).
+                    // No shape is asserted: the frontend reads `command` when present
+                    // and falls back to the title otherwise, so an unprobed params
+                    // shape degrades to the previous title-only card.
+                    tool_name: Some(title.to_string()),
+                    input: frame.get("params").cloned(),
                 },
             );
         }
@@ -4145,25 +4150,33 @@ mod tests {
     #[tokio::test]
     async fn approval_reverse_rpc_surfaces_as_permission() {
         // commandExecution/fileChange approval ServerRequests (response = {decision},
-        // which is what AnswerPermission writes) → user-facing Permission (Tool).
-        for m in [
-            "item/commandExecution/requestApproval",
-            "item/fileChange/requestApproval",
+        // which is what AnswerPermission writes) → user-facing Permission (Tool),
+        // carrying the approval class as `tool_name` and the wire `params` verbatim
+        // as `input` (unparsed passthrough) so the permission card can show the
+        // approver what they are approving (AionUi issue #3779).
+        for (m, title) in [
+            ("item/commandExecution/requestApproval", "CommandExecution"),
+            ("item/fileChange/requestApproval", "FileChange"),
         ] {
             let events = drive_codex(&[&format!(
                 r#"{{"jsonrpc":"2.0","id":7,"method":"{m}","params":{{"command":"rm -rf /"}}}}"#
             )])
             .await;
-            assert!(
-                events.iter().any(|e| matches!(
-                    e,
+            let perm = events
+                .iter()
+                .find_map(|e| match e {
                     SessionEvent::Permission {
                         kind: PermissionKind::Tool,
+                        tool_name,
+                        input,
                         ..
-                    }
-                )),
-                "{m} surfaces as Permission(Tool), got {events:?}"
-            );
+                    } => Some((tool_name.clone(), input.clone())),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{m} surfaces as Permission(Tool), got {events:?}"));
+            assert_eq!(perm.0.as_deref(), Some(title), "{m} carries the approval class");
+            let input = perm.1.expect("params ride as input for the card");
+            assert_eq!(input["command"], "rm -rf /", "{m} passes the wire params through");
         }
     }
 

@@ -8,19 +8,19 @@ use crate::models::Provider;
 #[async_trait::async_trait]
 pub trait IProviderRepository: Send + Sync {
     /// Returns all providers, ordered by creation time ascending.
-    async fn list(&self) -> Result<Vec<Provider>, DbError>;
+    async fn list(&self, user_id: &str) -> Result<Vec<Provider>, DbError>;
 
     /// Finds a provider by ID, or `None` if not found.
-    async fn find_by_id(&self, id: &str) -> Result<Option<Provider>, DbError>;
+    async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<Provider>, DbError>;
 
     /// Creates a new provider and returns the inserted row.
     async fn create(&self, params: CreateProviderParams<'_>) -> Result<Provider, DbError>;
 
     /// Updates an existing provider. Returns `DbError::NotFound` if the ID doesn't exist.
-    async fn update(&self, id: &str, params: UpdateProviderParams<'_>) -> Result<Provider, DbError>;
+    async fn update(&self, user_id: &str, id: &str, params: UpdateProviderParams<'_>) -> Result<Provider, DbError>;
 
     /// Deletes a provider by ID. Returns `DbError::NotFound` if the ID doesn't exist.
-    async fn delete(&self, id: &str) -> Result<(), DbError>;
+    async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError>;
 }
 
 /// Parameters for creating a new provider.
@@ -28,6 +28,7 @@ pub trait IProviderRepository: Send + Sync {
 pub struct CreateProviderParams<'a> {
     /// Optional caller-supplied id. When `None`, the repository generates one.
     pub id: Option<&'a str>,
+    pub user_id: &'a str,
     pub platform: &'a str,
     pub name: &'a str,
     pub base_url: &'a str,

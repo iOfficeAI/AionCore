@@ -57,35 +57,49 @@ impl IProjectStore for SqliteProjectStore {
         Ok(row)
     }
 
-    async fn get_project(&self, project_id: &str) -> Result<Option<ProjectRow>, DbError> {
-        let row = sqlx::query_as::<_, ProjectRow>(&format!("SELECT {PROJECT_COLS} FROM projects WHERE project_id = ?"))
-            .bind(project_id)
-            .fetch_optional(&self.pool)
-            .await?;
+    async fn get_project(&self, user_id: &str, project_id: &str) -> Result<Option<ProjectRow>, DbError> {
+        let row = sqlx::query_as::<_, ProjectRow>(&format!(
+            "SELECT {PROJECT_COLS} FROM projects WHERE project_id = ? AND user_id = ?"
+        ))
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row)
     }
 
-    async fn select_workspace_entry_by_folder(&self, folder_id: &str) -> Result<Option<ProjectExplorerRow>, DbError> {
+    async fn select_workspace_entry_by_folder(
+        &self,
+        user_id: &str,
+        folder_id: &str,
+    ) -> Result<Option<ProjectExplorerRow>, DbError> {
         let row = sqlx::query_as::<_, ProjectExplorerRow>(&format!(
-            "SELECT {ENTRY_COLS} FROM project_explorer WHERE folder_id = ? AND role = 'workspace'"
+            "SELECT {ENTRY_COLS} FROM project_explorer \
+             WHERE folder_id = ? AND role = 'workspace' AND owner_user_id = ?"
         ))
         .bind(folder_id)
+        .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
     }
 
-    async fn get_entry(&self, pe_id: &str) -> Result<Option<ProjectExplorerRow>, DbError> {
+    async fn get_entry(&self, user_id: &str, pe_id: &str) -> Result<Option<ProjectExplorerRow>, DbError> {
         let row = sqlx::query_as::<_, ProjectExplorerRow>(&format!(
-            "SELECT {ENTRY_COLS} FROM project_explorer WHERE pe_id = ?"
+            "SELECT {ENTRY_COLS} FROM project_explorer WHERE pe_id = ? AND owner_user_id = ?"
         ))
         .bind(pe_id)
+        .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
     }
 
-    async fn list_entries(&self, project_id: &str) -> Result<Vec<(ProjectExplorerRow, FolderRow)>, DbError> {
+    async fn list_entries(
+        &self,
+        user_id: &str,
+        project_id: &str,
+    ) -> Result<Vec<(ProjectExplorerRow, FolderRow)>, DbError> {
         // Manual join projection: project_explorer and folders share column
         // names (folder_id / created_at / updated_at), so folder columns are
         // aliased and rows are mapped by name rather than via a tuple FromRow.
@@ -96,10 +110,11 @@ impl IProjectStore for SqliteProjectStore {
                     f.created_at AS f_created_at, f.updated_at AS f_updated_at \
              FROM project_explorer pe \
              JOIN folders f ON f.folder_id = pe.folder_id \
-             WHERE pe.project_id = ? \
+             WHERE pe.project_id = ? AND pe.owner_user_id = ? \
              ORDER BY pe.order_index ASC, pe.created_at ASC",
         )
         .bind(project_id)
+        .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
 
@@ -130,6 +145,7 @@ impl IProjectStore for SqliteProjectStore {
 
     async fn create_project_with_workspace_entry(
         &self,
+        user_id: &str,
         folder_id: &str,
         name: &str,
         kind: ProjectKind,
@@ -139,22 +155,26 @@ impl IProjectStore for SqliteProjectStore {
         let pe_id = generate_prefixed_id("pe");
 
         let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT INTO projects (project_id, name, kind, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
-            .bind(&project_id)
-            .bind(name)
-            .bind(kind.as_str())
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO projects (project_id, user_id, name, kind, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&project_id)
+        .bind(user_id)
+        .bind(name)
+        .bind(kind.as_str())
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
 
         let entry_insert = sqlx::query(
             "INSERT INTO project_explorer \
-                 (pe_id, project_id, folder_id, role, display_name, order_index, created_at, updated_at) \
-             VALUES (?, ?, ?, 'workspace', NULL, 0, ?, ?)",
+                 (pe_id, project_id, owner_user_id, folder_id, role, display_name, order_index, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, 'workspace', NULL, 0, ?, ?)",
         )
         .bind(&pe_id)
         .bind(&project_id)
+        .bind(user_id)
         .bind(folder_id)
         .bind(now)
         .bind(now)
@@ -165,11 +185,11 @@ impl IProjectStore for SqliteProjectStore {
             Ok(_) => {
                 tx.commit().await?;
                 let project = self
-                    .get_project(&project_id)
+                    .get_project(user_id, &project_id)
                     .await?
                     .ok_or_else(|| DbError::NotFound(format!("project {project_id} after insert")))?;
                 let entry = self
-                    .get_entry(&pe_id)
+                    .get_entry(user_id, &pe_id)
                     .await?
                     .ok_or_else(|| DbError::NotFound(format!("project_explorer {pe_id} after insert")))?;
                 Ok((project, entry))
@@ -178,13 +198,13 @@ impl IProjectStore for SqliteProjectStore {
                 tx.rollback().await?;
                 let db_err = DbError::from(err);
                 if db_err.is_unique_violation() {
-                    // A workspace project already exists for this folder — return it.
+                    // This owner already has a workspace project for this folder — return it.
                     let entry = self
-                        .select_workspace_entry_by_folder(folder_id)
+                        .select_workspace_entry_by_folder(user_id, folder_id)
                         .await?
                         .ok_or_else(|| DbError::Conflict(format!("workspace entry for folder {folder_id}")))?;
                     let project = self
-                        .get_project(&entry.project_id)
+                        .get_project(user_id, &entry.project_id)
                         .await?
                         .ok_or_else(|| DbError::NotFound(format!("project {}", entry.project_id)))?;
                     Ok((project, entry))
@@ -197,6 +217,7 @@ impl IProjectStore for SqliteProjectStore {
 
     async fn insert_attached_entry(
         &self,
+        user_id: &str,
         project_id: &str,
         folder_id: &str,
         display_name: Option<&str>,
@@ -206,11 +227,12 @@ impl IProjectStore for SqliteProjectStore {
         let pe_id = generate_prefixed_id("pe");
         sqlx::query(
             "INSERT INTO project_explorer \
-                 (pe_id, project_id, folder_id, role, display_name, order_index, created_at, updated_at) \
-             VALUES (?, ?, ?, 'attached', ?, ?, ?, ?)",
+                 (pe_id, project_id, owner_user_id, folder_id, role, display_name, order_index, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, 'attached', ?, ?, ?, ?)",
         )
         .bind(&pe_id)
         .bind(project_id)
+        .bind(user_id)
         .bind(folder_id)
         .bind(display_name)
         .bind(order_index)
@@ -218,30 +240,33 @@ impl IProjectStore for SqliteProjectStore {
         .bind(now)
         .execute(&self.pool)
         .await?;
-        self.get_entry(&pe_id)
+        self.get_entry(user_id, &pe_id)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("project_explorer {pe_id} after insert")))
     }
 
-    async fn remove_entry(&self, pe_id: &str) -> Result<(), DbError> {
-        sqlx::query("DELETE FROM project_explorer WHERE pe_id = ?")
+    async fn remove_entry(&self, user_id: &str, pe_id: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM project_explorer WHERE pe_id = ? AND owner_user_id = ?")
             .bind(pe_id)
+            .bind(user_id)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    async fn reorder(&self, project_id: &str, ordered_pe_ids: &[String]) -> Result<(), DbError> {
+    async fn reorder(&self, user_id: &str, project_id: &str, ordered_pe_ids: &[String]) -> Result<(), DbError> {
         let now = now_ms();
         let mut tx = self.pool.begin().await?;
         for (position, pe_id) in ordered_pe_ids.iter().enumerate() {
             sqlx::query(
-                "UPDATE project_explorer SET order_index = ?, updated_at = ? WHERE pe_id = ? AND project_id = ?",
+                "UPDATE project_explorer SET order_index = ?, updated_at = ? \
+                 WHERE pe_id = ? AND project_id = ? AND owner_user_id = ?",
             )
             .bind(position as i64)
             .bind(now)
             .bind(pe_id)
             .bind(project_id)
+            .bind(user_id)
             .execute(&mut *tx)
             .await?;
         }
@@ -249,18 +274,26 @@ impl IProjectStore for SqliteProjectStore {
         Ok(())
     }
 
-    async fn rename_entry(&self, pe_id: &str, display_name: Option<&str>) -> Result<ProjectExplorerRow, DbError> {
+    async fn rename_entry(
+        &self,
+        user_id: &str,
+        pe_id: &str,
+        display_name: Option<&str>,
+    ) -> Result<ProjectExplorerRow, DbError> {
         let now = now_ms();
-        let result = sqlx::query("UPDATE project_explorer SET display_name = ?, updated_at = ? WHERE pe_id = ?")
-            .bind(display_name)
-            .bind(now)
-            .bind(pe_id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE project_explorer SET display_name = ?, updated_at = ? WHERE pe_id = ? AND owner_user_id = ?",
+        )
+        .bind(display_name)
+        .bind(now)
+        .bind(pe_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("project_explorer {pe_id}")));
         }
-        self.get_entry(pe_id)
+        self.get_entry(user_id, pe_id)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("project_explorer {pe_id}")))
     }

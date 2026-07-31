@@ -52,6 +52,20 @@ pub trait IFileService: Send + Sync {
     /// `fileStream.contentUpdate` event with `operation = write`.
     async fn write_file(&self, path: &str, data: &[u8], workspace: &str) -> Result<bool, FileError>;
 
+    /// User-scoped variant of [`write_file`](Self::write_file), used by
+    /// authenticated routes so WebSocket events are delivered only to the
+    /// initiating user.
+    async fn write_file_for_user(
+        &self,
+        user_id: &str,
+        path: &str,
+        data: &[u8],
+        workspace: &str,
+    ) -> Result<bool, FileError> {
+        let _ = user_id;
+        self.write_file(path, data, workspace).await
+    }
+
     // -- File management --
 
     /// Copy files into `workspace`, preserving directory structure relative to
@@ -66,6 +80,12 @@ pub trait IFileService: Send + Sync {
     /// Remove a file or directory (recursively). On success, emits a
     /// `fileStream.contentUpdate` event with `operation = delete`.
     async fn remove_entry(&self, path: &str, workspace: &str) -> Result<(), FileError>;
+
+    /// User-scoped variant of [`remove_entry`](Self::remove_entry).
+    async fn remove_entry_for_user(&self, user_id: &str, path: &str, workspace: &str) -> Result<(), FileError> {
+        let _ = user_id;
+        self.remove_entry(path, workspace).await
+    }
 
     /// Rename a file or directory. Returns the new absolute path.
     async fn rename_entry(&self, path: &str, new_name: &str) -> Result<String, FileError>;
@@ -149,19 +169,55 @@ pub trait IFileWatchService: Send + Sync {
     /// Emits `fileWatch.fileChanged` events on the broadcast channel.
     async fn start_watch(&self, file_path: &str) -> Result<(), FileError>;
 
+    /// Start watching a single file for one WebUI user.
+    async fn start_watch_for_user(&self, user_id: &str, file_path: &str) -> Result<(), FileError> {
+        let _ = user_id;
+        self.start_watch(file_path).await
+    }
+
     /// Stop watching a previously registered file.
     async fn stop_watch(&self, file_path: &str) -> Result<(), FileError>;
 
+    /// Stop watching a file for one WebUI user.
+    async fn stop_watch_for_user(&self, user_id: &str, file_path: &str) -> Result<(), FileError> {
+        let _ = user_id;
+        self.stop_watch(file_path).await
+    }
+
     /// Stop all active file watches.
     async fn stop_all_watches(&self) -> Result<(), FileError>;
+
+    /// Stop all active file watches for one WebUI user.
+    async fn stop_all_watches_for_user(&self, user_id: &str) -> Result<(), FileError> {
+        let _ = user_id;
+        self.stop_all_watches().await
+    }
 
     /// Start watching a workspace directory for new Office files
     /// (.pptx, .docx, .xlsx).
     /// Emits `workspaceOfficeWatch.fileAdded` events.
     async fn start_office_watch(&self, workspace: &str) -> Result<(), FileError>;
 
+    /// Start watching a workspace for one WebUI user.
+    async fn start_office_watch_for_user(&self, user_id: &str, workspace: &str) -> Result<(), FileError> {
+        let _ = user_id;
+        self.start_office_watch(workspace).await
+    }
+
     /// Stop watching a workspace directory for Office files.
     async fn stop_office_watch(&self, workspace: &str) -> Result<(), FileError>;
+
+    /// Stop watching a workspace for one WebUI user.
+    async fn stop_office_watch_for_user(&self, user_id: &str, workspace: &str) -> Result<(), FileError> {
+        let _ = user_id;
+        self.stop_office_watch(workspace).await
+    }
+
+    /// Stop all active Office workspace watches for one WebUI user.
+    async fn stop_all_office_watches_for_user(&self, user_id: &str) -> Result<(), FileError> {
+        let _ = user_id;
+        Ok(())
+    }
 }
 
 /// Git-based workspace snapshot system for tracking file changes.

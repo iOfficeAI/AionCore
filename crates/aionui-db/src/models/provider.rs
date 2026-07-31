@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Provider {
     pub id: String,
+    pub user_id: String,
     pub platform: String,
     pub name: String,
     pub base_url: String,

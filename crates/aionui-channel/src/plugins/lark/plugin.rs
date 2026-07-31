@@ -576,6 +576,7 @@ async fn handle_message_event(event_data: serde_json::Value, message_tx: &mpsc::
         .unwrap_or_else(chrono_now);
 
     let unified = UnifiedIncomingMessage {
+        owner_user_id: None,
         id: evt.message.message_id.clone(),
         platform: PluginType::Lark,
         chat_id: evt.message.chat_id.clone(),
@@ -663,6 +664,7 @@ async fn handle_card_action(
     });
 
     let msg = UnifiedIncomingMessage {
+        owner_user_id: None,
         id: format!("card_{}", chrono_now()),
         platform: PluginType::Lark,
         chat_id,
@@ -699,6 +701,7 @@ async fn handle_bot_menu_event(event_data: serde_json::Value, message_tx: &mpsc:
     };
 
     let msg = UnifiedIncomingMessage {
+        owner_user_id: None,
         id: format!("menu_{}", chrono_now()),
         platform: PluginType::Lark,
         chat_id: evt.operator.operator_id.open_id.clone(),

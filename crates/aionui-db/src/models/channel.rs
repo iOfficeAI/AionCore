@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ChannelPluginRow {
     pub id: String,
+    pub owner_user_id: String,
     /// Platform type (telegram, lark, dingtalk, weixin, slack, discord).
     #[sqlx(rename = "type")]
     pub r#type: String,
@@ -24,10 +25,11 @@ pub struct ChannelPluginRow {
 /// Row mapping for the `assistant_users` table.
 ///
 /// Represents an IM user authorized to chat with the assistant.
-/// UNIQUE constraint on (platform_user_id, platform_type).
+/// UNIQUE constraint on (owner_user_id, platform_user_id, platform_type).
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AssistantUserRow {
     pub id: String,
+    pub owner_user_id: String,
     pub platform_user_id: String,
     pub platform_type: String,
     pub display_name: Option<String>,
@@ -60,6 +62,7 @@ pub struct AssistantSessionRow {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PairingCodeRow {
     pub code: String,
+    pub owner_user_id: String,
     pub platform_user_id: String,
     pub platform_type: String,
     pub display_name: Option<String>,

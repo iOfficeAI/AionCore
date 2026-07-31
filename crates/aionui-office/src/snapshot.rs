@@ -10,6 +10,7 @@ use crate::error::OfficeError;
 const MAX_SNAPSHOTS: usize = 50;
 const SNAPSHOT_EXT: &str = ".md";
 const INDEX_FILE: &str = "index.json";
+const DEFAULT_USER_ID: &str = "system_default_user";
 
 pub struct SnapshotService {
     base_dir: PathBuf,
@@ -23,7 +24,15 @@ impl SnapshotService {
     }
 
     pub async fn list(&self, target: &PreviewHistoryTargetDto) -> Result<Vec<PreviewSnapshotInfoDto>, OfficeError> {
-        let dir = self.target_dir(target);
+        self.list_for_user(DEFAULT_USER_ID, target).await
+    }
+
+    pub async fn list_for_user(
+        &self,
+        user_id: &str,
+        target: &PreviewHistoryTargetDto,
+    ) -> Result<Vec<PreviewSnapshotInfoDto>, OfficeError> {
+        let dir = self.target_dir_for_user(user_id, target);
         let index_path = dir.join(INDEX_FILE);
 
         if !index_path.exists() {
@@ -41,7 +50,16 @@ impl SnapshotService {
         target: &PreviewHistoryTargetDto,
         content: &str,
     ) -> Result<PreviewSnapshotInfoDto, OfficeError> {
-        let dir = self.target_dir(target);
+        self.save_for_user(DEFAULT_USER_ID, target, content).await
+    }
+
+    pub async fn save_for_user(
+        &self,
+        user_id: &str,
+        target: &PreviewHistoryTargetDto,
+        content: &str,
+    ) -> Result<PreviewSnapshotInfoDto, OfficeError> {
+        let dir = self.target_dir_for_user(user_id, target);
         tokio::fs::create_dir_all(&dir).await?;
 
         let now_ms = current_timestamp_ms();
@@ -76,7 +94,16 @@ impl SnapshotService {
         target: &PreviewHistoryTargetDto,
         snapshot_id: &str,
     ) -> Result<Option<SnapshotContentResponse>, OfficeError> {
-        let dir = self.target_dir(target);
+        self.get_content_for_user(DEFAULT_USER_ID, target, snapshot_id).await
+    }
+
+    pub async fn get_content_for_user(
+        &self,
+        user_id: &str,
+        target: &PreviewHistoryTargetDto,
+        snapshot_id: &str,
+    ) -> Result<Option<SnapshotContentResponse>, OfficeError> {
+        let dir = self.target_dir_for_user(user_id, target);
         let snapshots: Vec<PreviewSnapshotInfoDto> = self.read_index(&dir).await;
 
         let Some(info) = snapshots.into_iter().find(|s| s.id == snapshot_id) else {
@@ -95,8 +122,8 @@ impl SnapshotService {
         }))
     }
 
-    fn target_dir(&self, target: &PreviewHistoryTargetDto) -> PathBuf {
-        let hash = compute_target_hash(target);
+    fn target_dir_for_user(&self, user_id: &str, target: &PreviewHistoryTargetDto) -> PathBuf {
+        let hash = compute_target_hash_for_user(user_id, target);
         self.base_dir.join(hash)
     }
 
@@ -132,8 +159,16 @@ impl SnapshotService {
     }
 }
 
+#[cfg(test)]
 fn compute_target_hash(target: &PreviewHistoryTargetDto) -> String {
+    compute_target_hash_for_user(DEFAULT_USER_ID, target)
+}
+
+fn compute_target_hash_for_user(user_id: &str, target: &PreviewHistoryTargetDto) -> String {
     let mut hasher = Sha1::new();
+
+    hasher.update(user_id.as_bytes());
+    hasher.update(b"\0");
 
     hasher.update(
         serde_json::to_value(target.content_type)
@@ -442,6 +477,36 @@ mod tests {
         let list2 = svc.list(&t2).await.unwrap();
         assert_eq!(list1.len(), 1);
         assert_eq!(list2.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn service_same_target_isolated_by_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = SnapshotService::new(tmp.path());
+        let target = make_target(PreviewContentType::Markdown, Some("/a.md"));
+
+        let user_a = svc.save_for_user("user-a", &target, "content-a").await.unwrap();
+        let user_b = svc.save_for_user("user-b", &target, "content-b").await.unwrap();
+
+        let list_a = svc.list_for_user("user-a", &target).await.unwrap();
+        let list_b = svc.list_for_user("user-b", &target).await.unwrap();
+        assert_eq!(list_a.len(), 1);
+        assert_eq!(list_b.len(), 1);
+        assert_eq!(list_a[0].id, user_a.id);
+        assert_eq!(list_b[0].id, user_b.id);
+
+        assert!(
+            svc.get_content_for_user("user-a", &target, &user_b.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            svc.get_content_for_user("user-b", &target, &user_a.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn make_target(content_type: PreviewContentType, file_path: Option<&str>) -> PreviewHistoryTargetDto {

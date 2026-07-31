@@ -1,6 +1,8 @@
 use crate::manager::acp::{AcpAgentManager, AcpSession};
 use crate::protocol::events::AgentStreamEvent;
-use agent_client_protocol::schema::{SessionModeState, SessionModelState, SessionNotification, UsageUpdate};
+use agent_client_protocol::schema::v1::{SessionModeState, SessionNotification, UsageUpdate};
+
+use super::legacy_session_model::LegacySessionModelState;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -103,7 +105,7 @@ impl AcpAgentManager {
                 }
             }
             AgentStreamEvent::AcpModelInfo(value) => {
-                if let Ok(update) = serde_json::from_value::<SessionModelState>(value.clone()) {
+                if let Some(update) = LegacySessionModelState::from_state_value(value) {
                     let mut s = self.session.write().await;
                     s.apply_advertised_models(update);
                     self.commit_session_changes(&mut s).await;
@@ -153,7 +155,7 @@ mod tests {
     use crate::manager::acp::agent_event_tracker::AcpSessionEvent;
     use crate::manager::acp::session::AcpSession;
     use crate::shared_kernel::{ModeId, ModelId};
-    use agent_client_protocol::schema::SessionModeState;
+    use agent_client_protocol::schema::v1::SessionModeState;
 
     #[test]
     fn event_equality() {

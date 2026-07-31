@@ -38,11 +38,23 @@ impl AssistantClassifier for DefaultUserClassifier {
 /// `/api/skills/assistant-skill/*` endpoints dispatch per source.
 #[async_trait::async_trait]
 pub trait AssistantRuleDispatcher: Send + Sync {
-    async fn read_rule(&self, id: &str, locale: Option<&str>) -> Result<String, ExtensionError>;
-    async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ExtensionError>;
-    async fn delete_rule(&self, id: &str) -> Result<bool, ExtensionError>;
+    async fn read_rule(&self, user_id: &str, id: &str, locale: Option<&str>) -> Result<String, ExtensionError>;
+    async fn write_rule(
+        &self,
+        user_id: &str,
+        id: &str,
+        locale: Option<&str>,
+        content: &str,
+    ) -> Result<(), ExtensionError>;
+    async fn delete_rule(&self, user_id: &str, id: &str) -> Result<bool, ExtensionError>;
 
-    async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, ExtensionError>;
-    async fn write_skill(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ExtensionError>;
-    async fn delete_skill(&self, id: &str) -> Result<bool, ExtensionError>;
+    async fn read_skill(&self, user_id: &str, id: &str, locale: Option<&str>) -> Result<String, ExtensionError>;
+    async fn write_skill(
+        &self,
+        user_id: &str,
+        id: &str,
+        locale: Option<&str>,
+        content: &str,
+    ) -> Result<(), ExtensionError>;
+    async fn delete_skill(&self, user_id: &str, id: &str) -> Result<bool, ExtensionError>;
 }

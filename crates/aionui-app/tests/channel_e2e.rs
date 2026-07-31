@@ -14,6 +14,8 @@ use tower::ServiceExt;
 
 use common::{body_json, build_app, get_with_token, json_with_token, setup_and_login};
 
+const OWNER_ID: &str = "system_default_user";
+
 // ===========================================================================
 // §1 Plugin management
 // ===========================================================================
@@ -415,15 +417,19 @@ async fn put_channel_assistant_setting_clears_active_sessions() {
         std::sync::Arc::new(SqliteChannelRepository::new(services.database.pool().clone()));
 
     let now = now_ms();
-    repo.create_user(&AssistantUserRow {
-        id: "user-channel-assistant".to_owned(),
-        platform_user_id: "user-channel-assistant".to_owned(),
-        platform_type: "lark".to_owned(),
-        display_name: Some("Channel Assistant User".to_owned()),
-        authorized_at: now,
-        last_active: Some(now),
-        session_id: None,
-    })
+    repo.create_user(
+        OWNER_ID,
+        &AssistantUserRow {
+            id: "user-channel-assistant".to_owned(),
+            owner_user_id: OWNER_ID.to_owned(),
+            platform_user_id: "user-channel-assistant".to_owned(),
+            platform_type: "lark".to_owned(),
+            display_name: Some("Channel Assistant User".to_owned()),
+            authorized_at: now,
+            last_active: Some(now),
+            session_id: None,
+        },
+    )
     .await
     .unwrap();
     let new_session = AssistantSessionRow {
@@ -436,10 +442,15 @@ async fn put_channel_assistant_setting_clears_active_sessions() {
         created_at: now,
         last_activity: now,
     };
-    repo.get_or_create_session("user-channel-assistant", "chat-channel-assistant", &new_session)
-        .await
-        .unwrap();
-    assert_eq!(repo.get_all_sessions().await.unwrap().len(), 1);
+    repo.get_or_create_session(
+        OWNER_ID,
+        "user-channel-assistant",
+        "chat-channel-assistant",
+        &new_session,
+    )
+    .await
+    .unwrap();
+    assert_eq!(repo.get_all_sessions(OWNER_ID).await.unwrap().len(), 1);
 
     let req = json_with_token(
         "PUT",
@@ -453,7 +464,7 @@ async fn put_channel_assistant_setting_clears_active_sessions() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    assert!(repo.get_all_sessions().await.unwrap().is_empty());
+    assert!(repo.get_all_sessions(OWNER_ID).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -464,15 +475,19 @@ async fn put_channel_default_model_setting_clears_active_sessions() {
         std::sync::Arc::new(SqliteChannelRepository::new(services.database.pool().clone()));
 
     let now = now_ms();
-    repo.create_user(&AssistantUserRow {
-        id: "user-channel-model".to_owned(),
-        platform_user_id: "user-channel-model".to_owned(),
-        platform_type: "lark".to_owned(),
-        display_name: Some("Channel Model User".to_owned()),
-        authorized_at: now,
-        last_active: Some(now),
-        session_id: None,
-    })
+    repo.create_user(
+        OWNER_ID,
+        &AssistantUserRow {
+            id: "user-channel-model".to_owned(),
+            owner_user_id: OWNER_ID.to_owned(),
+            platform_user_id: "user-channel-model".to_owned(),
+            platform_type: "lark".to_owned(),
+            display_name: Some("Channel Model User".to_owned()),
+            authorized_at: now,
+            last_active: Some(now),
+            session_id: None,
+        },
+    )
     .await
     .unwrap();
     let new_session = AssistantSessionRow {
@@ -485,10 +500,10 @@ async fn put_channel_default_model_setting_clears_active_sessions() {
         created_at: now,
         last_activity: now,
     };
-    repo.get_or_create_session("user-channel-model", "chat-channel-model", &new_session)
+    repo.get_or_create_session(OWNER_ID, "user-channel-model", "chat-channel-model", &new_session)
         .await
         .unwrap();
-    assert_eq!(repo.get_all_sessions().await.unwrap().len(), 1);
+    assert_eq!(repo.get_all_sessions(OWNER_ID).await.unwrap().len(), 1);
 
     let req = json_with_token(
         "PUT",
@@ -503,7 +518,7 @@ async fn put_channel_default_model_setting_clears_active_sessions() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    assert!(repo.get_all_sessions().await.unwrap().is_empty());
+    assert!(repo.get_all_sessions(OWNER_ID).await.unwrap().is_empty());
 }
 
 // SS-1: Sync valid platform clears sessions
@@ -573,7 +588,7 @@ async fn pairing_approve_creates_user() {
     let pairing_svc = aionui_channel::pairing::PairingService::new(repo.clone(), services.event_bus.clone());
 
     let code = pairing_svc
-        .request_pairing("tg_user_42", "telegram", Some("Alice"))
+        .request_pairing(OWNER_ID, "tg_user_42", "telegram", Some("Alice"))
         .await
         .unwrap();
 
@@ -664,7 +679,7 @@ async fn pairing_reject_removes_from_pending() {
     let pairing_svc = aionui_channel::pairing::PairingService::new(repo.clone(), services.event_bus.clone());
 
     let code = pairing_svc
-        .request_pairing("tg_user_99", "telegram", None)
+        .request_pairing(OWNER_ID, "tg_user_99", "telegram", None)
         .await
         .unwrap();
 

@@ -5,7 +5,7 @@
 use axum::Router;
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, Path, Query, State};
+use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, patch, post};
@@ -14,6 +14,7 @@ use aionui_api_types::{
     ApiResponse, AssistantDetailResponse, AssistantResponse, CreateAssistantRequest, ImportAssistantsRequest,
     ImportAssistantsResult, SetAssistantStateRequest, UpdateAssistantRequest,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 
 use crate::error::AssistantError;
@@ -53,73 +54,87 @@ impl From<AssistantError> for ApiError {
 
 async fn list(
     State(state): State<AssistantRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<AssistantResponse>>>, ApiError> {
-    let items = state.service.list().await?;
+    let items = state.service.list_for_user(&current_user.id).await?;
     Ok(Json(ApiResponse::ok(items)))
 }
 
 async fn create(
     State(state): State<AssistantRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<CreateAssistantRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<AssistantResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let created = state.service.create(req).await?;
+    let created = state.service.create_for_user(&current_user.id, req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(created))))
 }
 
 async fn get_one(
     State(state): State<AssistantRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
     Query(query): Query<GetAssistantDetailQuery>,
 ) -> Result<Json<ApiResponse<AssistantDetailResponse>>, ApiError> {
-    let detail = state.service.get_detail(&id, query.locale.as_deref()).await?;
+    let detail = state
+        .service
+        .get_detail_for_user(&current_user.id, &id, query.locale.as_deref())
+        .await?;
     Ok(Json(ApiResponse::ok(detail)))
 }
 
 async fn update(
     State(state): State<AssistantRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<UpdateAssistantRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let updated = state.service.update(&id, req).await?;
+    let updated = state.service.update_for_user(&current_user.id, &id, req).await?;
     Ok(Json(ApiResponse::ok(updated)))
 }
 
 async fn delete_one(
     State(state): State<AssistantRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state.service.delete(&id).await?;
+    state.service.delete_for_user(&current_user.id, &id).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn set_state(
     State(state): State<AssistantRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SetAssistantStateRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let resp = state.service.set_state(&id, req).await?;
+    let resp = state.service.set_state_for_user(&current_user.id, &id, req).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
 
 async fn import(
     State(state): State<AssistantRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<ImportAssistantsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportAssistantsResult>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let result = state.service.import(req).await?;
+    let result = state.service.import_for_user(&current_user.id, req).await?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
 /// Serve the raw avatar bytes for an assistant. Content-Type inferred from the
 /// file extension (png/jpg/svg default). Extensions return 404 — the frontend
 /// serves those via `aion-asset://`.
-async fn get_avatar(State(state): State<AssistantRouterState>, Path(id): Path<String>) -> Result<Response, ApiError> {
+async fn get_avatar(
+    State(state): State<AssistantRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
     let asset = state
         .service
-        .avatar_asset(&id)
+        .avatar_asset_for_user(&current_user.id, &id)
         .await
         .ok_or_else(|| ApiError::NotFound(format!("avatar '{id}' not found")))?;
 

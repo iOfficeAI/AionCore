@@ -533,13 +533,17 @@ pub(crate) async fn dispatch_tool(
         "team_shutdown_agent" => {
             exec_shutdown_agent(arguments, scheduler, service, team_id, caller_slot_id, caller_role).await
         }
-        "team_list_assistants" => exec_list_assistants(arguments, service).await,
-        "team_describe_assistant" => exec_describe_assistant(arguments, service).await,
+        "team_list_assistants" => exec_list_assistants(arguments, service, team_id).await,
+        "team_describe_assistant" => exec_describe_assistant(arguments, service, team_id).await,
         _ => Err(ToolCallError::from_message(format!("Unknown tool: {tool_name}"))),
     }
 }
 
-async fn exec_list_assistants(args: &Value, service: &Weak<TeamSessionService>) -> Result<String, ToolCallError> {
+async fn exec_list_assistants(
+    args: &Value,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+) -> Result<String, ToolCallError> {
     let props = args.as_object().cloned().unwrap_or_default();
     if !props.is_empty() {
         return Err(ToolCallError::from_message(
@@ -549,12 +553,20 @@ async fn exec_list_assistants(args: &Value, service: &Weak<TeamSessionService>) 
     let service = service
         .upgrade()
         .ok_or_else(|| ToolCallError::from_message("Team service not available"))?;
-    let assistants = service.list_team_selectable_assistants().await;
+    let user_id = service
+        .team_owner_user_id(team_id)
+        .await
+        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+    let assistants = service.list_team_selectable_assistants(&user_id).await;
     let value = json!({ "assistants": assistants });
     serde_json::to_string_pretty(&value).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
 }
 
-async fn exec_describe_assistant(args: &Value, service: &Weak<TeamSessionService>) -> Result<String, ToolCallError> {
+async fn exec_describe_assistant(
+    args: &Value,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+) -> Result<String, ToolCallError> {
     if args.get("custom_agent_id").is_some() {
         return Err(ToolCallError::from_message(
             "custom_agent_id is no longer accepted; use assistant_id",
@@ -570,9 +582,13 @@ async fn exec_describe_assistant(args: &Value, service: &Weak<TeamSessionService
     let service = service
         .upgrade()
         .ok_or_else(|| ToolCallError::from_message("Team service not available"))?;
+    let user_id = service
+        .team_owner_user_id(team_id)
+        .await
+        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
 
     service
-        .describe_assistant(assistant_id, locale)
+        .describe_assistant(&user_id, assistant_id, locale)
         .await
         .map_err(|error| ToolCallError::from_message(error.to_string()))
 }
@@ -1338,7 +1354,7 @@ mod tests {
     #[tokio::test]
     async fn exec_list_assistants_reports_service_unavailable_when_weak_dead() {
         let service: Weak<TeamSessionService> = Weak::new();
-        let result = exec_list_assistants(&json!({}), &service).await;
+        let result = exec_list_assistants(&json!({}), &service, "team-1").await;
         let err = result.expect_err("dead service should be surfaced");
         assert!(
             err.message.contains("Team service not available"),

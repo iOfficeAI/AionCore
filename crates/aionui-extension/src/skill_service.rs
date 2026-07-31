@@ -29,6 +29,7 @@ pub const BUILTIN_SKILLS_ENV_VAR: &str = "AIONUI_BUILTIN_SKILLS_PATH";
 const MAX_SKILL_IMPORT_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_SKILL_IMPORT_TOTAL_BYTES: u64 = 200 * 1024 * 1024;
 const IMPORT_STAGING_PREFIX: &str = ".import-staging-";
+const DEFAULT_USER_ID: &str = "system_default_user";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SkillImportLimits {
@@ -332,7 +333,16 @@ pub async fn list_available_skills_with_repo(
     paths: &SkillPaths,
     repo: &dyn ISkillRepository,
 ) -> Result<Vec<SkillListItem>, ExtensionError> {
-    list_skills_from_repo(paths, repo).await
+    list_available_skills_with_repo_for_user(paths, repo, DEFAULT_USER_ID).await
+}
+
+/// List available global and user-owned skills using the database state source.
+pub async fn list_available_skills_with_repo_for_user(
+    paths: &SkillPaths,
+    repo: &dyn ISkillRepository,
+    user_id: &str,
+) -> Result<Vec<SkillListItem>, ExtensionError> {
+    list_skills_from_repo(paths, repo, user_id).await
 }
 
 /// Emit a [`SkillListItem`] for every built-in skill (both auto-inject
@@ -513,16 +523,29 @@ pub async fn import_skill_with_repo(
     repo: &dyn ISkillRepository,
     skill_path: &Path,
 ) -> Result<ImportedSkill, ExtensionError> {
-    let copied = copy_skill_into_user_dir(paths, skill_path).await?;
-    let overwritten = repo.find_by_name(&copied.name).await?.is_some();
+    import_skill_with_repo_for_user(paths, repo, DEFAULT_USER_ID, skill_path).await
+}
+
+/// Import a user-owned skill and persist its management metadata in the database.
+pub async fn import_skill_with_repo_for_user(
+    paths: &SkillPaths,
+    repo: &dyn ISkillRepository,
+    user_id: &str,
+    skill_path: &Path,
+) -> Result<ImportedSkill, ExtensionError> {
+    let copied = copy_skill_into_user_dir_for_user(paths, user_id, skill_path).await?;
+    let overwritten = repo.find_by_name_for_user(user_id, &copied.name).await?.is_some();
     let row = repo
-        .upsert(UpsertSkillParams {
-            name: &copied.name,
-            description: Some(&copied.description),
-            path: copied.target_dir.to_string_lossy().as_ref(),
-            source: "user",
-            enabled: true,
-        })
+        .upsert_for_user(
+            user_id,
+            UpsertSkillParams {
+                name: &copied.name,
+                description: Some(&copied.description),
+                path: copied.target_dir.to_string_lossy().as_ref(),
+                source: "user",
+                enabled: true,
+            },
+        )
         .await?;
 
     debug!(
@@ -547,13 +570,22 @@ struct CopiedSkill {
 }
 
 async fn copy_skill_into_user_dir(paths: &SkillPaths, skill_path: &Path) -> Result<CopiedSkill, ExtensionError> {
+    copy_skill_into_user_dir_for_user(paths, DEFAULT_USER_ID, skill_path).await
+}
+
+async fn copy_skill_into_user_dir_for_user(
+    paths: &SkillPaths,
+    user_id: &str,
+    skill_path: &Path,
+) -> Result<CopiedSkill, ExtensionError> {
     let (name, description) = read_skill_info(skill_path).await?;
     validate_filename(&name)?;
 
-    let target_dir = paths.user_skills_dir.join(&name);
-    tokio::fs::create_dir_all(&paths.user_skills_dir).await?;
+    let user_skill_root = user_skill_root_for_user(paths, user_id);
+    let target_dir = user_skill_root.join(&name);
+    tokio::fs::create_dir_all(&user_skill_root).await?;
 
-    let staging_dir = import_staging_dir(paths, &name);
+    let staging_dir = import_staging_dir(&user_skill_root, &name);
     replace_existing_path(&staging_dir).await?;
     let mut budget = SkillImportBudget::default();
     if let Err(err) = copy_skill_dir_for_import(skill_path, &staging_dir, skill_path, &mut budget).await {
@@ -653,6 +685,16 @@ pub async fn import_skills_with_repo(
     repo: &dyn ISkillRepository,
     source_path: &Path,
 ) -> Result<SkillImportOutcome, ExtensionError> {
+    import_skills_with_repo_for_user(paths, repo, DEFAULT_USER_ID, source_path).await
+}
+
+/// Import one or more user-owned skills and persist import history for `user_id`.
+pub async fn import_skills_with_repo_for_user(
+    paths: &SkillPaths,
+    repo: &dyn ISkillRepository,
+    user_id: &str,
+    source_path: &Path,
+) -> Result<SkillImportOutcome, ExtensionError> {
     let operation_id = aionui_common::generate_prefixed_id("skill_import_op");
     let source_label = import_source_label(source_path);
     let source_path_text = source_path.to_string_lossy().into_owned();
@@ -692,6 +734,7 @@ pub async fn import_skills_with_repo(
             import_skill_dirs_batch_with_repo(
                 paths,
                 repo,
+                user_id,
                 skill_dirs,
                 &operation_id,
                 &source_label,
@@ -715,6 +758,7 @@ pub async fn import_skills_with_repo(
             return import_skill_dirs_batch_with_repo(
                 paths,
                 repo,
+                user_id,
                 vec![source_path],
                 &operation_id,
                 &source_label,
@@ -733,6 +777,7 @@ pub async fn import_skills_with_repo(
         return import_skill_dirs_batch_with_repo(
             paths,
             repo,
+            user_id,
             skills.into_iter().map(|skill| PathBuf::from(skill.path)).collect(),
             &operation_id,
             &source_label,
@@ -826,6 +871,7 @@ async fn import_skill_dirs_batch(
 async fn import_skill_dirs_batch_with_repo(
     paths: &SkillPaths,
     repo: &dyn ISkillRepository,
+    user_id: &str,
     skill_dirs: Vec<PathBuf>,
     operation_id: &str,
     source_label: &str,
@@ -836,43 +882,49 @@ async fn import_skill_dirs_batch_with_repo(
 
     for skill_dir in skill_dirs {
         let source_name = import_source_name(&skill_dir);
-        match import_skill_with_repo(paths, repo, &skill_dir).await {
+        match import_skill_with_repo_for_user(paths, repo, user_id, &skill_dir).await {
             Ok(skill) => {
-                repo.create_import_record(CreateSkillImportRecordParams {
-                    operation_id,
-                    source_label,
-                    source_path,
-                    source_name: &source_name,
-                    skill_id: skill.skill_id.as_deref(),
-                    skill_name: Some(&skill.name),
-                    status: if skill.overwritten { "overwritten" } else { "imported" },
-                    error_code: None,
-                    error_path: None,
-                    actual_bytes: Some(u64_to_i64(skill.copied_bytes)),
-                    limit_bytes: None,
-                    line: None,
-                    column: None,
-                })
+                repo.create_import_record_for_user(
+                    user_id,
+                    CreateSkillImportRecordParams {
+                        operation_id,
+                        source_label,
+                        source_path,
+                        source_name: &source_name,
+                        skill_id: skill.skill_id.as_deref(),
+                        skill_name: Some(&skill.name),
+                        status: if skill.overwritten { "overwritten" } else { "imported" },
+                        error_code: None,
+                        error_path: None,
+                        actual_bytes: Some(u64_to_i64(skill.copied_bytes)),
+                        limit_bytes: None,
+                        line: None,
+                        column: None,
+                    },
+                )
                 .await?;
                 imported.push(skill.name);
             }
             Err(err) => {
                 let failure = skill_import_failure_from_error(&source_name, &err);
-                repo.create_import_record(CreateSkillImportRecordParams {
-                    operation_id,
-                    source_label,
-                    source_path,
-                    source_name: &source_name,
-                    skill_id: None,
-                    skill_name: None,
-                    status: "failed",
-                    error_code: Some(&failure.code),
-                    error_path: failure.error_path.as_deref(),
-                    actual_bytes: failure.actual_bytes,
-                    limit_bytes: failure.limit_bytes,
-                    line: failure.line,
-                    column: failure.column,
-                })
+                repo.create_import_record_for_user(
+                    user_id,
+                    CreateSkillImportRecordParams {
+                        operation_id,
+                        source_label,
+                        source_path,
+                        source_name: &source_name,
+                        skill_id: None,
+                        skill_name: None,
+                        status: "failed",
+                        error_code: Some(&failure.code),
+                        error_path: failure.error_path.as_deref(),
+                        actual_bytes: failure.actual_bytes,
+                        limit_bytes: failure.limit_bytes,
+                        line: failure.line,
+                        column: failure.column,
+                    },
+                )
                 .await?;
                 failed.push(failure);
             }
@@ -1007,12 +1059,19 @@ async fn replace_existing_path(path: &Path) -> Result<(), ExtensionError> {
     Ok(())
 }
 
-fn import_staging_dir(paths: &SkillPaths, skill_name: &str) -> PathBuf {
+fn user_skill_root_for_user(paths: &SkillPaths, user_id: &str) -> PathBuf {
+    // Type-first per-user root: skills/users/{user_dir}/ for every user,
+    // including the default user (no more flat-root special case).
+    let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
+    paths.user_skills_dir.join("users").join(dir)
+}
+
+fn import_staging_dir(user_skill_root: &Path, skill_name: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    paths.user_skills_dir.join(format!(
+    user_skill_root.join(format!(
         "{IMPORT_STAGING_PREFIX}{skill_name}-{}-{nonce}",
         std::process::id()
     ))
@@ -1154,12 +1213,22 @@ pub async fn delete_skill_with_repo(
     repo: &dyn ISkillRepository,
     skill_name: &str,
 ) -> Result<(), ExtensionError> {
+    delete_skill_with_repo_for_user(paths, repo, DEFAULT_USER_ID, skill_name).await
+}
+
+/// Soft-delete a user-owned skill through the database state source.
+pub async fn delete_skill_with_repo_for_user(
+    paths: &SkillPaths,
+    repo: &dyn ISkillRepository,
+    user_id: &str,
+    skill_name: &str,
+) -> Result<(), ExtensionError> {
     validate_filename(skill_name)?;
     if builtin_skill_exists(paths, skill_name) {
         return Err(ExtensionError::BuiltinSkillDeletion(skill_name.to_string()));
     }
 
-    let Some(row) = repo.find_by_name(skill_name).await? else {
+    let Some(row) = repo.find_by_name_for_user(user_id, skill_name).await? else {
         return Err(ExtensionError::SkillNotFound(skill_name.to_string()));
     };
     if !PathBuf::from(&row.path).is_dir() {
@@ -1170,7 +1239,7 @@ pub async fn delete_skill_with_repo(
         );
     }
 
-    repo.delete_by_name(skill_name).await?;
+    repo.delete_by_name_for_user(user_id, skill_name).await?;
     debug!(skill = %skill_name, "skill marked deleted");
     Ok(())
 }
@@ -1209,7 +1278,9 @@ pub struct ResolvedAgentSkill {
 /// 1. `{builtin_skills_dir}/{name}/` — top-level opt-in builtin.
 /// 2. `{builtin_skills_dir}/auto-inject/{name}/` — auto-inject builtin.
 /// 3. `{user_skills_dir}/{name}/` — user-created custom skill.
-/// 4. `{cron_skills_dir}/{name}/` — per-job cron skill.
+///
+/// Per-job cron skill dirs hold user content and are never probed by
+/// name; they resolve only through the owning user's repo row.
 ///
 /// No files are copied and no per-conversation directory is created —
 /// the backend just hands the absolute source paths back to the caller,
@@ -1261,8 +1332,19 @@ pub async fn materialize_skills_for_agent_with_repo(
     conversation_id: &str,
     skills: &[String],
 ) -> Result<Vec<ResolvedAgentSkill>, ExtensionError> {
+    materialize_skills_for_agent_with_repo_for_user(paths, repo, DEFAULT_USER_ID, conversation_id, skills).await
+}
+
+/// Resolve requested skill names using global and user-owned database state.
+pub async fn materialize_skills_for_agent_with_repo_for_user(
+    paths: &SkillPaths,
+    repo: &dyn ISkillRepository,
+    user_id: &str,
+    conversation_id: &str,
+    skills: &[String],
+) -> Result<Vec<ResolvedAgentSkill>, ExtensionError> {
     validate_filename(conversation_id)?;
-    sync_disk_user_skills_into_repo(paths, repo).await?;
+    sync_disk_user_skills_into_repo_for_user(paths, repo, user_id).await?;
 
     let mut resolved = Vec::with_capacity(skills.len());
     for name in skills {
@@ -1273,7 +1355,7 @@ pub async fn materialize_skills_for_agent_with_repo(
             warn!(skill = %name, "skipping skill with invalid name");
             continue;
         }
-        match resolve_skill_source_path_with_repo(paths, repo, name).await? {
+        match resolve_skill_source_path_with_repo_for_user(paths, repo, user_id, name).await? {
             Some(source_path) => resolved.push(ResolvedAgentSkill {
                 name: name.clone(),
                 source_path,
@@ -1394,27 +1476,18 @@ async fn resolve_skill_source_path(paths: &SkillPaths, name: &str) -> Result<Opt
     if user.is_dir() {
         return Ok(Some(user));
     }
-    let cron = paths.cron_skills_dir.join(name);
-    if cron.is_dir() {
-        return Ok(Some(cron));
-    }
+    // Per-job cron skill dirs are intentionally NOT probed: they hold
+    // user content and resolve only through an owned repo row.
     Ok(None)
 }
 
-async fn resolve_skill_source_path_with_repo(
+async fn resolve_skill_source_path_with_repo_for_user(
     paths: &SkillPaths,
     repo: &dyn ISkillRepository,
+    user_id: &str,
     name: &str,
 ) -> Result<Option<PathBuf>, ExtensionError> {
-    let top = paths.builtin_skills_dir.join(name);
-    if top.is_dir() {
-        return Ok(Some(top));
-    }
-    let auto = paths.builtin_skills_dir.join(BUILTIN_AUTO_SKILLS_SUBDIR).join(name);
-    if auto.is_dir() {
-        return Ok(Some(auto));
-    }
-    if let Some(row) = repo.find_by_name_any(name).await? {
+    if let Some(row) = repo.find_by_name_any_for_user(user_id, name).await? {
         let path = PathBuf::from(&row.path);
         if path.is_dir() {
             return Ok(Some(path));
@@ -1425,12 +1498,21 @@ async fn resolve_skill_source_path_with_repo(
             deleted = row.deleted_at.is_some(),
             "skill row points at a missing directory"
         );
-        return Ok(None);
+        if row.user_id.is_some() {
+            return Ok(None);
+        }
     }
-    let cron = paths.cron_skills_dir.join(name);
-    if cron.is_dir() {
-        return Ok(Some(cron));
+    let top = paths.builtin_skills_dir.join(name);
+    if top.is_dir() {
+        return Ok(Some(top));
     }
+    let auto = paths.builtin_skills_dir.join(BUILTIN_AUTO_SKILLS_SUBDIR).join(name);
+    if auto.is_dir() {
+        return Ok(Some(auto));
+    }
+    // Per-job cron skill dirs are intentionally NOT probed as a fallback:
+    // they hold user content (job prompts) and must resolve only through
+    // a repo row owned by the requesting user.
     Ok(None)
 }
 
@@ -1554,13 +1636,30 @@ pub fn get_skill_paths(paths: &SkillPaths) -> (String, String) {
 async fn list_skills_from_repo(
     paths: &SkillPaths,
     repo: &dyn ISkillRepository,
+    user_id: &str,
 ) -> Result<Vec<SkillListItem>, ExtensionError> {
     let mut items = Vec::new();
-    for row in repo.list().await? {
+    for row in dedupe_user_visible_skill_rows(repo.list_for_user(user_id).await?) {
         let description = row.description.clone().unwrap_or_default();
         items.push(skill_row_to_list_item(paths, row, description));
     }
     Ok(items)
+}
+
+fn dedupe_user_visible_skill_rows(rows: Vec<SkillRow>) -> Vec<SkillRow> {
+    let mut merged: Vec<SkillRow> = Vec::new();
+
+    for row in rows {
+        if let Some(index) = merged.iter().position(|existing| existing.name == row.name) {
+            if merged[index].user_id.is_none() && row.user_id.is_some() {
+                merged[index] = row;
+            }
+        } else {
+            merged.push(row);
+        }
+    }
+
+    merged
 }
 
 /// Synchronize filesystem-backed skill catalogs into the database.
@@ -1572,7 +1671,33 @@ pub async fn sync_skill_catalog_into_repo(
     paths: &SkillPaths,
     repo: &dyn ISkillRepository,
 ) -> Result<(), ExtensionError> {
-    sync_disk_user_skills_into_repo(paths, repo).await?;
+    sync_skill_catalog_into_repo_for_user(paths, repo, DEFAULT_USER_ID).await
+}
+
+/// Startup sync for AionPro machines: built-in skills only.
+///
+/// The legacy shared-directory backfill cannot attribute on-disk files to a
+/// real account (that information never existed on disk), so ingesting them
+/// would only mint rows for the never-logged-in local default user. Real
+/// users' skills live in per-user storage and enter the catalog through the
+/// import APIs.
+pub async fn sync_builtin_skill_catalog_into_repo(
+    paths: &SkillPaths,
+    repo: &dyn ISkillRepository,
+) -> Result<(), ExtensionError> {
+    sync_builtin_skills_into_repo(paths, repo).await
+}
+
+/// Synchronize filesystem-backed skill catalogs for a specific user.
+///
+/// Built-in skills are global. Disk-backed custom skills are attributed to
+/// `user_id`, matching the user-scoped catalog exposed by `/api/skills`.
+pub async fn sync_skill_catalog_into_repo_for_user(
+    paths: &SkillPaths,
+    repo: &dyn ISkillRepository,
+    user_id: &str,
+) -> Result<(), ExtensionError> {
+    sync_disk_user_skills_into_repo_for_user(paths, repo, user_id).await?;
     sync_builtin_skills_into_repo(paths, repo).await?;
     Ok(())
 }
@@ -1583,40 +1708,30 @@ async fn sync_builtin_skills_into_repo(paths: &SkillPaths, repo: &dyn ISkillRepo
             if skill.name == BUILTIN_AUTO_SKILLS_SUBDIR {
                 continue;
             }
-            sync_managed_skill_into_repo(repo, &skill, "builtin").await?;
+            sync_global_skill_into_repo(repo, &skill, "builtin").await?;
         }
     }
 
     let auto_inject_dir = paths.builtin_skills_dir.join(BUILTIN_AUTO_SKILLS_SUBDIR);
     if let Ok(skills) = scan_skill_dirs(&auto_inject_dir).await {
         for skill in skills {
-            sync_managed_skill_into_repo(repo, &skill, "builtin").await?;
+            sync_global_skill_into_repo(repo, &skill, "builtin").await?;
         }
     }
 
-    if let Ok(skills) = scan_skill_dirs(&paths.cron_skills_dir).await {
-        for skill in skills {
-            sync_managed_skill_into_repo(repo, &skill, "cron").await?;
-        }
-    }
+    // Per-job cron skills are user content (job prompts); their rows are
+    // owned by the job owner and maintained by aionui-cron, never synced
+    // here as global rows.
 
     Ok(())
 }
 
-async fn sync_managed_skill_into_repo(
+async fn sync_global_skill_into_repo(
     repo: &dyn ISkillRepository,
     skill: &ScannedSkill,
     source: &str,
 ) -> Result<(), ExtensionError> {
-    if let Some(existing) = repo.find_by_name_any(&skill.name).await?
-        && existing.source == "user"
-        && existing.deleted_at.is_none()
-        && existing.enabled
-    {
-        return Ok(());
-    }
-
-    repo.upsert(UpsertSkillParams {
+    repo.upsert_global(UpsertSkillParams {
         name: &skill.name,
         description: Some(&skill.description),
         path: &skill.path,
@@ -1627,14 +1742,22 @@ async fn sync_managed_skill_into_repo(
     Ok(())
 }
 
-async fn sync_disk_user_skills_into_repo(
+async fn sync_disk_user_skills_into_repo_for_user(
     paths: &SkillPaths,
     repo: &dyn ISkillRepository,
+    user_id: &str,
 ) -> Result<(), ExtensionError> {
+    if user_id != DEFAULT_USER_ID {
+        return Ok(());
+    }
+
     let scanned = scan_skill_dirs(&paths.user_skills_dir).await?;
     let mut backfilled = 0usize;
 
     for skill in scanned {
+        if is_user_scoped_skill_storage_path(Path::new(&skill.path)) {
+            continue;
+        }
         if let Err(err) = validate_filename(&skill.name) {
             warn!(
                 skill = %skill.name,
@@ -1643,17 +1766,20 @@ async fn sync_disk_user_skills_into_repo(
             );
             continue;
         }
-        if repo.find_by_name_any(&skill.name).await?.is_some() {
+        if repo.find_by_name_any_for_user(user_id, &skill.name).await?.is_some() {
             continue;
         }
 
-        repo.upsert(UpsertSkillParams {
-            name: &skill.name,
-            description: Some(&skill.description),
-            path: &skill.path,
-            source: "user",
-            enabled: true,
-        })
+        repo.upsert_for_user(
+            user_id,
+            UpsertSkillParams {
+                name: &skill.name,
+                description: Some(&skill.description),
+                path: &skill.path,
+                source: "user",
+                enabled: true,
+            },
+        )
         .await?;
         backfilled += 1;
     }
@@ -1666,6 +1792,15 @@ async fn sync_disk_user_skills_into_repo(
     }
 
     Ok(())
+}
+
+fn is_user_scoped_skill_storage_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(name) if name == std::ffi::OsStr::new("users")
+        )
+    })
 }
 
 fn skill_row_to_list_item(paths: &SkillPaths, row: SkillRow, description: String) -> SkillListItem {
@@ -2626,8 +2761,8 @@ mod tests {
         let name = import_skill(&paths, &source_dir).await.unwrap();
         assert_eq!(name, "imported");
 
-        // Verify the skill was copied
-        let imported_dir = paths.user_skills_dir.join("imported");
+        // Verify the skill was copied under the default user's type-first root.
+        let imported_dir = default_user_skill_root(&paths).join("imported");
         assert!(imported_dir.join(SKILL_MANIFEST_FILE).exists());
         assert!(imported_dir.join("extra.txt").exists());
     }
@@ -2651,7 +2786,7 @@ mod tests {
         assert_eq!(outcome.imported, vec!["selected-manifest"]);
         assert!(outcome.failed.is_empty());
 
-        let imported_path = paths.user_skills_dir.join("selected-manifest");
+        let imported_path = default_user_skill_root(&paths).join("selected-manifest");
         assert!(!imported_path.is_symlink());
         assert!(imported_path.join(SKILL_MANIFEST_FILE).exists());
 
@@ -2671,10 +2806,11 @@ mod tests {
         let outcome = import_skills(&paths, &source_dir).await.unwrap();
         assert_eq!(outcome.imported, vec!["alpha", "beta"]);
         assert!(outcome.failed.is_empty());
-        assert!(!paths.user_skills_dir.join("alpha").is_symlink());
-        assert!(!paths.user_skills_dir.join("beta").is_symlink());
-        assert!(paths.user_skills_dir.join("alpha").join(SKILL_MANIFEST_FILE).exists());
-        assert!(paths.user_skills_dir.join("beta").join(SKILL_MANIFEST_FILE).exists());
+        let user_root = default_user_skill_root(&paths);
+        assert!(!user_root.join("alpha").is_symlink());
+        assert!(!user_root.join("beta").is_symlink());
+        assert!(user_root.join("alpha").join(SKILL_MANIFEST_FILE).exists());
+        assert!(user_root.join("beta").join(SKILL_MANIFEST_FILE).exists());
     }
 
     #[tokio::test]
@@ -2694,12 +2830,13 @@ mod tests {
 
         assert_eq!(outcome.imported, vec!["alpha", "beta"]);
         assert!(outcome.failed.is_empty());
-        assert!(!paths.user_skills_dir.join("mixed-import-root").exists());
-        assert!(!paths.user_skills_dir.join("README.md").exists());
-        assert!(!paths.user_skills_dir.join(".DS_Store").exists());
-        assert!(!paths.user_skills_dir.join("skills.zip").exists());
-        assert!(paths.user_skills_dir.join("alpha").join(SKILL_MANIFEST_FILE).exists());
-        assert!(paths.user_skills_dir.join("beta").join(SKILL_MANIFEST_FILE).exists());
+        let user_root = default_user_skill_root(&paths);
+        assert!(!user_root.join("mixed-import-root").exists());
+        assert!(!user_root.join("README.md").exists());
+        assert!(!user_root.join(".DS_Store").exists());
+        assert!(!user_root.join("skills.zip").exists());
+        assert!(user_root.join("alpha").join(SKILL_MANIFEST_FILE).exists());
+        assert!(user_root.join("beta").join(SKILL_MANIFEST_FILE).exists());
     }
 
     #[tokio::test]
@@ -2721,7 +2858,7 @@ mod tests {
         let name = import_skill(&paths, &source_dir).await.unwrap();
 
         assert_eq!(name, "small-files");
-        let imported = paths.user_skills_dir.join("small-files");
+        let imported = default_user_skill_root(&paths).join("small-files");
         assert!(imported.join(SKILL_MANIFEST_FILE).exists());
         assert!(imported.join(".DS_Store").exists());
         assert!(imported.join(".git/config").exists());
@@ -2745,8 +2882,9 @@ mod tests {
         let result = import_skill(&paths, &source_dir).await;
 
         assert!(matches!(result, Err(ExtensionError::SkillImportFileTooLarge { .. })));
-        assert!(!paths.user_skills_dir.join("too-large").exists());
-        assert!(!has_import_staging_dirs(&paths.user_skills_dir));
+        let user_root = default_user_skill_root(&paths);
+        assert!(!user_root.join("too-large").exists());
+        assert!(!has_import_staging_dirs(&user_root));
     }
 
     #[tokio::test]
@@ -2757,8 +2895,9 @@ mod tests {
         let stale_source = tmp.path().join("stale-source");
         create_skill_in_dir(&stale_source, "dangling", "Stale source");
         let stale_skill_dir = stale_source.join("dangling");
-        let target = paths.user_skills_dir.join("dangling");
-        tokio::fs::create_dir_all(&paths.user_skills_dir).await.unwrap();
+        let user_root = default_user_skill_root(&paths);
+        let target = user_root.join("dangling");
+        tokio::fs::create_dir_all(&user_root).await.unwrap();
         create_symlink(&stale_skill_dir, &target).await.unwrap();
         std::fs::remove_dir_all(&stale_source).unwrap();
 
@@ -2863,7 +3002,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_available_skills_with_repo_syncs_builtin_auto_inject_and_cron_sources_into_repo() {
+    async fn list_available_skills_with_repo_syncs_builtin_sources_but_never_cron_dirs() {
         let tmp = TempDir::new().unwrap();
         let paths = make_disk_builtin_paths(tmp.path());
         let repo = make_test_skill_repo().await;
@@ -2892,11 +3031,10 @@ mod tests {
         let auto_cron_row = repo.find_by_name("cron").await.unwrap().unwrap();
         assert_eq!(auto_cron_row.source, "builtin");
 
-        let scheduled = skills.iter().find(|skill| skill.name == "scheduled-task").unwrap();
-        assert_eq!(scheduled.source, SkillSource::Cron);
-        assert_eq!(scheduled.relative_location, None);
-        let scheduled_row = repo.find_by_name("scheduled-task").await.unwrap().unwrap();
-        assert_eq!(scheduled_row.source, "cron");
+        // Per-job cron skills hold user content; the machine-level catalog
+        // sync must not ingest them as global rows or list them.
+        assert!(skills.iter().all(|skill| skill.name != "scheduled-task"));
+        assert!(repo.find_by_name_any("scheduled-task").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2923,10 +3061,11 @@ mod tests {
         let outcome = import_skills(&paths, &zip_path).await.unwrap();
         assert_eq!(outcome.imported, vec!["zip-one", "zip-two"]);
         assert!(outcome.failed.is_empty());
-        assert!(paths.user_skills_dir.join("zip-one").join(SKILL_MANIFEST_FILE).exists());
-        assert!(paths.user_skills_dir.join("zip-one").join("data.txt").exists());
-        assert!(!paths.user_skills_dir.join("zip-one").is_symlink());
-        assert!(!paths.user_skills_dir.join(".import-tmp").join("skills.zip").exists());
+        let user_root = default_user_skill_root(&paths);
+        assert!(user_root.join("zip-one").join(SKILL_MANIFEST_FILE).exists());
+        assert!(user_root.join("zip-one").join("data.txt").exists());
+        assert!(!user_root.join("zip-one").is_symlink());
+        assert!(!user_root.join(".import-tmp").join("skills.zip").exists());
     }
 
     #[tokio::test]
@@ -2992,7 +3131,7 @@ mod tests {
 
         let result = import_skills(&paths, &source_dir).await;
         assert!(matches!(result, Err(ExtensionError::SkillInvalidFrontmatter(_))));
-        assert!(!paths.user_skills_dir.join("invalid-frontmatter").exists());
+        assert!(!default_user_skill_root(&paths).join("invalid-frontmatter").exists());
     }
 
     #[tokio::test]
@@ -3020,8 +3159,7 @@ mod tests {
         delete_skill_with_repo(&paths, &repo, "historical").await.unwrap();
 
         assert!(
-            paths
-                .user_skills_dir
+            default_user_skill_root(&paths)
                 .join("historical")
                 .join(SKILL_MANIFEST_FILE)
                 .exists()
@@ -3035,7 +3173,10 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].source_path, paths.user_skills_dir.join("historical"));
+        assert_eq!(
+            resolved[0].source_path,
+            default_user_skill_root(&paths).join("historical")
+        );
     }
 
     #[tokio::test]
@@ -3123,8 +3264,31 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Per-user skill storage root
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn user_skill_root_is_type_first_for_all_users() {
+        let paths = make_test_paths(std::path::Path::new("/data"));
+        assert_eq!(
+            user_skill_root_for_user(&paths, "system_default_user"),
+            std::path::Path::new("/data/skills/users/system_default_user")
+        );
+        assert_eq!(
+            user_skill_root_for_user(&paths, "user_019f8de8-3537-7c73-8d92-3bfde17eb1ee"),
+            std::path::Path::new("/data/skills/users/019f8de8-3537-7c73-8d92-3bfde17eb1ee")
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
+
+    /// The on-disk root where the default user's skills now live:
+    /// `{user_skills_dir}/users/{DEFAULT_USER_ID}/`.
+    fn default_user_skill_root(paths: &SkillPaths) -> PathBuf {
+        user_skill_root_for_user(paths, DEFAULT_USER_ID)
+    }
 
     fn make_test_paths(base: &Path) -> SkillPaths {
         // Hand out an empty on-disk builtin-skills dir. Tests that need

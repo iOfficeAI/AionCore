@@ -8,6 +8,8 @@ use aionui_db::{
 };
 use aionui_realtime::EventBroadcaster;
 
+const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
+
 struct NoopBroadcaster;
 
 impl EventBroadcaster for NoopBroadcaster {
@@ -281,7 +283,7 @@ async fn management_list_keeps_hydrated_installation_without_reprobing_path() {
     std::fs::remove_file(&command_path).unwrap();
 
     let service = agent_service(registry, provider_repo, temp.path().to_path_buf());
-    let rows = service.list_management_agents().await.unwrap();
+    let rows = service.list_management_agents(SYSTEM_DEFAULT_USER_ID).await.unwrap();
     let cached = rows.iter().find(|row| row.id == "agent-cached").unwrap();
 
     assert_eq!(cached.status, AgentManagementStatus::Unchecked);
@@ -321,7 +323,10 @@ async fn manual_health_check_does_not_refresh_unrelated_agents() {
     std::fs::remove_file(&unrelated_path).unwrap();
 
     let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf());
-    service.health_check_agent_by_id("agent-target-missing").await.unwrap();
+    service
+        .health_check_agent_by_id(SYSTEM_DEFAULT_USER_ID, "agent-target-missing")
+        .await
+        .unwrap();
 
     let rows = registry.list_management_rows().await;
     let unrelated = rows.iter().find(|row| row.id == "agent-unrelated").unwrap();
@@ -366,7 +371,10 @@ async fn custom_enabled_toggle_does_not_refresh_unrelated_agents() {
     std::fs::remove_file(&unrelated_path).unwrap();
 
     let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf());
-    service.set_agent_enabled("agent-target-toggle", false).await.unwrap();
+    service
+        .set_agent_enabled(SYSTEM_DEFAULT_USER_ID, "agent-target-toggle", false)
+        .await
+        .unwrap();
 
     let rows = registry.list_management_rows().await;
     let unrelated = rows.iter().find(|row| row.id == "agent-unrelated").unwrap();
@@ -411,7 +419,10 @@ async fn custom_delete_does_not_refresh_unrelated_agents() {
     std::fs::remove_file(&unrelated_path).unwrap();
 
     let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf());
-    service.delete_custom_agent("agent-target-delete").await.unwrap();
+    service
+        .delete_custom_agent(SYSTEM_DEFAULT_USER_ID, "agent-target-delete")
+        .await
+        .unwrap();
 
     let rows = registry.list_management_rows().await;
     let unrelated = rows.iter().find(|row| row.id == "agent-unrelated").unwrap();

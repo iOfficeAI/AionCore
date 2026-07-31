@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::{AppConfig, derive_encryption_key};
+use crate::config::{AppConfig, IdentityMode, derive_encryption_key};
 use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
     RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
@@ -52,6 +52,8 @@ pub struct AppServices {
     pub work_dir: PathBuf,
     /// When `true`, skip JWT authentication and use a fixed default user.
     pub local: bool,
+    pub identity_mode: IdentityMode,
+    pub bootstrap_secret: Option<Arc<str>>,
     pub app_version: String,
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
@@ -97,7 +99,8 @@ impl AppServices {
     pub async fn from_config(database: Database, config: &AppConfig) -> anyhow::Result<Self> {
         let data_dir = config.data_dir.clone();
         let work_dir = config.work_dir.clone();
-        let local = config.local;
+        let identity_mode = config.effective_identity_mode();
+        let local = identity_mode.is_local();
         let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
@@ -115,6 +118,26 @@ impl AppServices {
             .filter(|s| !s.is_empty());
 
         let (secret, is_new) = resolve_jwt_secret(env_secret.as_deref(), db_secret);
+
+        // Defense-in-depth for the encryption key: generating a NEW secret is
+        // only legitimate on a genuinely fresh install. If the read path
+        // claimed "no system user" while the row actually exists (as happened
+        // when a stale post-migration connection mis-decoded the users table,
+        // ELECTRON-3T0), deriving a fresh key would silently break decryption
+        // of every stored credential. Verify absence with an independent
+        // query and fail startup instead of corrupting.
+        if is_new
+            && system_user.is_none()
+            && user_repo
+                .find_by_id("system_default_user")
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to verify system user absence: {e}"))?
+                .is_some()
+        {
+            anyhow::bail!(
+                "system user row exists but could not be read; refusing to generate a new                  JWT secret (would break decryption of stored credentials)"
+            );
+        }
 
         // Persist newly generated secret to database
         if is_new && let Some(user) = &system_user {
@@ -169,9 +192,18 @@ impl AppServices {
             .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let skill_paths = Arc::new(aionui_extension::resolve_skill_paths(&app_resource_dir, &data_dir));
-        aionui_extension::sync_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
+        if identity_mode.is_local() {
+            aionui_extension::sync_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
+        } else {
+            // AionPro: never ingest the legacy shared skill directory — its
+            // files carry no account attribution and would only create rows
+            // for the never-logged-in local default user.
+            aionui_extension::sync_builtin_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
+        }
 
         // Absolute path to this process's binary. Reused as the `command` for
         // the stdio MCP bridge spawned by ACP CLIs when a team session is
@@ -259,6 +291,8 @@ impl AppServices {
             dump_prompts,
             work_dir,
             local,
+            identity_mode,
+            bootstrap_secret: config.bootstrap_secret.clone().map(Arc::<str>::from),
             app_version,
             skill_paths,
             skill_repo,

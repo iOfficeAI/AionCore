@@ -35,13 +35,14 @@ use tracing::{info, warn};
 /// reporting) and reserved for that use.
 pub async fn resolve_session_mcp_servers(
     repo: &dyn IMcpServerRepository,
+    user_id: &str,
     selected_ids: Option<&[String]>,
     conversation_id: &str,
     _broadcaster: Arc<dyn EventBroadcaster>,
 ) -> Vec<SessionMcpServer> {
     let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(ids).await,
-        None => repo.list().await,
+        Some(ids) => repo.list_by_ids_any(user_id, ids).await,
+        None => repo.list(user_id).await,
     };
     let rows = match rows_result {
         Ok(r) => r,

@@ -68,13 +68,15 @@ impl McpConnectionTestService {
     /// Dispatches to the appropriate transport handler.  Always returns
     /// a result (never errors) -- failures are encoded in the struct.
     pub async fn test_connection(&self, name: &str, transport: &McpServerTransport) -> McpConnectionTestResult {
-        self.test_connection_with_runtime_scope(name, transport, None).await
+        self.test_connection_with_runtime_scope(name, transport, None, None)
+            .await
     }
 
     pub async fn test_connection_with_runtime_scope(
         &self,
         name: &str,
         transport: &McpServerTransport,
+        user_id: Option<&str>,
         runtime_scope_id: Option<&str>,
     ) -> McpConnectionTestResult {
         debug!(name, ?transport, "starting MCP connection test");
@@ -83,7 +85,7 @@ impl McpConnectionTestService {
         log_mcp_transport_start(mcp_server_id, transport_type);
         let result = match transport {
             McpServerTransport::Stdio { command, args, env } => {
-                self.test_stdio(command, args, env, runtime_scope_id).await
+                self.test_stdio(command, args, env, user_id, runtime_scope_id).await
             }
             McpServerTransport::Http { url, headers } => self.test_http(url, headers).await,
             McpServerTransport::Sse { url, headers } => self.test_sse(url, headers).await,
@@ -99,9 +101,11 @@ impl McpConnectionTestService {
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
+        user_id: Option<&str>,
         runtime_scope_id: Option<&str>,
     ) -> McpConnectionTestResult {
-        self.test_stdio_inner(command, args, env, runtime_scope_id).await
+        self.test_stdio_inner(command, args, env, user_id, runtime_scope_id)
+            .await
     }
 
     async fn test_stdio_inner(
@@ -109,9 +113,11 @@ impl McpConnectionTestService {
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
+        user_id: Option<&str>,
         runtime_scope_id: Option<&str>,
     ) -> McpConnectionTestResult {
-        let reporter = runtime_scope_id.map(|scope_id| self.runtime_reporter(scope_id.to_owned()));
+        let reporter =
+            runtime_scope_id.map(|scope_id| self.runtime_reporter(user_id.map(str::to_owned), scope_id.to_owned()));
         let mut cmd = match probe_runtime_command(command) {
             RuntimeCommandProbe::NodeTool { .. } => {
                 let resolved = match ensure_runtime_command_with_reporter(command, reporter.as_deref()).await {
@@ -407,10 +413,11 @@ impl McpConnectionTestService {
 }
 
 impl McpConnectionTestService {
-    fn runtime_reporter(&self, scope_id: String) -> Arc<dyn NodeRuntimeProgressReporter> {
+    fn runtime_reporter(&self, user_id: Option<String>, scope_id: String) -> Arc<dyn NodeRuntimeProgressReporter> {
         let broadcaster = self.broadcaster.clone();
         Arc::new(move |update: NodeRuntimeProgress| {
             let payload = RuntimeStatusPayload {
+                user_id: user_id.clone(),
                 resource: RuntimeResourceKind::Node,
                 resource_id: None,
                 scope: RuntimeStatusScope {
@@ -532,7 +539,10 @@ struct HttpMcpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_api_types::WebSocketMessage;
     use aionui_realtime::BroadcastEventBus;
+    use aionui_realtime::EventBroadcaster;
+    use aionui_runtime::{NodeRuntimeProgress, NodeRuntimeProgressPhase};
     use std::io::Write;
     use std::sync::Mutex;
     use tracing::Level;
@@ -549,6 +559,28 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    struct RecordingBroadcaster {
+        events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
+    }
+
+    impl RecordingBroadcaster {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<WebSocketMessage<serde_json::Value>> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl EventBroadcaster for RecordingBroadcaster {
+        fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+            self.events.lock().unwrap().push(event);
         }
     }
 
@@ -579,6 +611,26 @@ mod tests {
         let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)))
             .with_timeout(Duration::from_secs(5));
         assert_eq!(svc.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn runtime_reporter_scopes_event_to_user() {
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let svc = McpConnectionTestService::new(reqwest::Client::new(), broadcaster.clone());
+        let reporter = svc.runtime_reporter(Some("user-1".to_owned()), "mcp-1".to_owned());
+
+        reporter.report(NodeRuntimeProgress {
+            phase: NodeRuntimeProgressPhase::Ready,
+            failure_kind: None,
+            message: None,
+            status_code: None,
+        });
+
+        let events = broadcaster.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "runtime.statusChanged");
+        assert_eq!(events[0].data["user_id"], "user-1");
+        assert_eq!(events[0].data["scope"]["id"], "mcp-1");
     }
 
     #[test]

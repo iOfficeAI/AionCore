@@ -98,6 +98,7 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
     let params = Arc::new(
         assemble_acp_params(
             "test-conv-1".into(),
+            "user-acp-test".into(),
             WorkspaceInfo {
                 path: "/tmp".into(),
                 is_custom: true,

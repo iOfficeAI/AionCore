@@ -42,6 +42,16 @@ impl TeamConversationAdapters {
             task_manager,
         }
     }
+
+    async fn owner_user_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
+        Ok(self.conversation_repo.owner_user_id(conversation_id).await?)
+    }
+
+    async fn require_owner_user_id(&self, conversation_id: &str) -> Result<String, TeamError> {
+        self.owner_user_id(conversation_id)
+            .await?
+            .ok_or_else(|| TeamError::InvalidRequest(format!("conversation {conversation_id} not found")))
+    }
 }
 
 #[async_trait]
@@ -248,10 +258,28 @@ impl TeamConversationAdapters {
     /// assistant snapshot's `agent_id`, then `extra.agent_id`, then the builtin
     /// row for `extra.backend`. Any failure yields `None` (→ catalog unavailable).
     async fn resolve_agent_metadata(&self, conversation_id: &str) -> Option<AgentMetadataRow> {
+        // User-scoped repo reads need the conversation's owner; best-effort like
+        // the rest of this path — an unresolvable owner yields `None`.
+        let user_id = match self.owner_user_id(conversation_id).await {
+            Ok(Some(user_id)) => user_id,
+            Ok(None) => return None,
+            Err(error) => {
+                debug!(
+                    conversation_id = %conversation_id, %error,
+                    reason = "owner_lookup_failed",
+                    "conversation owner lookup failed while resolving agent_metadata"
+                );
+                return None;
+            }
+        };
         // A genuine repo `Err` (not `Ok(None)` — "not found" is the normal case
         // for many conversations and must stay silent) is logged at `debug`: it is
         // a development-detail fault on a best-effort path, not a production signal.
-        match self.conversation_repo.get_assistant_snapshot(conversation_id).await {
+        match self
+            .conversation_repo
+            .get_assistant_snapshot(&user_id, conversation_id)
+            .await
+        {
             Ok(Some(snapshot)) => {
                 let agent_id = snapshot.agent_id.trim();
                 if !agent_id.is_empty() {
@@ -274,7 +302,7 @@ impl TeamConversationAdapters {
             ),
         }
 
-        let row = match self.conversation_repo.get(conversation_id).await {
+        let row = match self.conversation_repo.get(&user_id, conversation_id).await {
             Ok(Some(row)) => row,
             Ok(None) => return None,
             Err(error) => {
@@ -359,13 +387,18 @@ impl TeamProjectionMessageStore for TeamConversationAdapters {
     ) -> Result<Option<MessageRow>, TeamError> {
         Ok(self
             .conversation_repo
-            .get_message_by_msg_id(conversation_id, msg_id, msg_type)
+            .get_message_by_msg_id(
+                &self.require_owner_user_id(conversation_id).await?,
+                conversation_id,
+                msg_id,
+                msg_type,
+            )
             .await?)
     }
 
     async fn insert_projected_message(&self, row: &MessageRow) -> Result<(), TeamError> {
         self.conversation_service
-            .insert_raw_message(row)
+            .insert_raw_message(&self.require_owner_user_id(&row.conversation_id).await?, row)
             .await
             .map_err(map_conversation_update_error)
     }
@@ -411,7 +444,10 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
     }
 
     async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
-        let Some(row) = self.conversation_repo.get(conversation_id).await? else {
+        let Some(user_id) = self.owner_user_id(conversation_id).await? else {
+            return Ok(None);
+        };
+        let Some(row) = self.conversation_repo.get(&user_id, conversation_id).await? else {
             return Ok(None);
         };
         let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
@@ -424,14 +460,21 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
     }
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
-        if let Some(snapshot) = self.conversation_repo.get_assistant_snapshot(conversation_id).await? {
+        let Some(user_id) = self.owner_user_id(conversation_id).await? else {
+            return Ok(None);
+        };
+        if let Some(snapshot) = self
+            .conversation_repo
+            .get_assistant_snapshot(&user_id, conversation_id)
+            .await?
+        {
             let assistant_id = snapshot.assistant_id.trim();
             if !assistant_id.is_empty() {
                 return Ok(Some(assistant_id.to_owned()));
             }
         }
 
-        let Some(row) = self.conversation_repo.get(conversation_id).await? else {
+        let Some(row) = self.conversation_repo.get(&user_id, conversation_id).await? else {
             return Ok(None);
         };
 
@@ -445,29 +488,35 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map(str::to_owned))
     }
 
-    async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, TeamError> {
+    async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError> {
         self.conversation_service
-            .create_team_temp_workspace(team_id)
+            .create_team_temp_workspace(user_id, team_id)
             .map_err(map_conversation_update_error)
     }
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError> {
         self.conversation_service
-            .update_extra(conversation_id, patch)
+            .update_extra(
+                &self.require_owner_user_id(conversation_id).await?,
+                conversation_id,
+                patch,
+            )
             .await
             .map_err(map_conversation_update_error)
     }
 
     async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError> {
+        let user_id = self.require_owner_user_id(conversation_id).await?;
         self.conversation_service
-            .save_acp_runtime_mode(conversation_id, mode)
+            .save_acp_runtime_mode(&user_id, conversation_id, mode)
             .await
             .map_err(map_conversation_update_error)
     }
 
     async fn get_config_options(&self, conversation_id: &str) -> Result<GetConfigOptionsResponse, TeamError> {
+        let user_id = self.require_owner_user_id(conversation_id).await?;
         self.conversation_service
-            .get_config_options(conversation_id)
+            .get_config_options(&user_id, conversation_id)
             .await
             .map_err(map_conversation_update_error)
     }
@@ -495,7 +544,10 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
         &self,
         conversation_id: &str,
     ) -> Result<Option<TeamConversationBindingLookup>, TeamError> {
-        let Some(row) = self.conversation_repo.get(conversation_id).await? else {
+        let Some(user_id) = self.owner_user_id(conversation_id).await? else {
+            return Ok(None);
+        };
+        let Some(row) = self.conversation_repo.get(&user_id, conversation_id).await? else {
             return Ok(None);
         };
         let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);

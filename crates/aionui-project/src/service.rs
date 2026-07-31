@@ -29,16 +29,17 @@ impl ProjectService {
     // ── creation / backfill ────────────────────────────────────────────
 
     /// User-selected existing directory → `kind = standard`.
-    pub async fn create_standard(&self, uri: String) -> Result<ResolveOutput, ProjectError> {
+    pub async fn create_standard(&self, user_id: &str, uri: String) -> Result<ResolveOutput, ProjectError> {
         let canonical = canonical::canonicalize(&uri)?;
         self.ensure_accessible(&canonical)?;
-        self.resolve_core(canonical, uri, ProjectKind::Standard, None).await
+        self.resolve_core(user_id, canonical, uri, ProjectKind::Standard, None)
+            .await
     }
 
     /// Create a temp session directory (path owned here) → `kind = temp`.
     /// A caller-supplied `basename` that collides with an existing directory
     /// surfaces `temp_dir_exists`; an auto `short_uuid` collision is retried.
-    pub async fn create_temp(&self, basename: Option<String>) -> Result<ResolveOutput, ProjectError> {
+    pub async fn create_temp(&self, user_id: &str, basename: Option<String>) -> Result<ResolveOutput, ProjectError> {
         let dir = match basename.as_deref() {
             Some(name) if !name.is_empty() => self.make_temp_dir(name)?,
             _ => loop {
@@ -52,12 +53,13 @@ impl ProjectService {
         let leaf = leaf_of(&dir);
         let uri = canonical::to_file_uri(&dir)?;
         let canonical = canonical::canonicalize(&uri)?;
-        self.resolve_core(canonical, uri, ProjectKind::Temp, Some(leaf)).await
+        self.resolve_core(user_id, canonical, uri, ProjectKind::Temp, Some(leaf))
+            .await
     }
 
     /// Lazy backfill of an existing path. Does not create directories; `kind`
     /// is decided here (under `temp_root` ⇒ temp, otherwise standard).
-    pub async fn resolve_existing(&self, uri: String) -> Result<ResolveOutput, ProjectError> {
+    pub async fn resolve_existing(&self, user_id: &str, uri: String) -> Result<ResolveOutput, ProjectError> {
         let canonical = canonical::canonicalize(&uri)?;
         self.ensure_accessible(&canonical)?;
         let kind = if self.is_under_temp_root(&canonical) {
@@ -65,13 +67,14 @@ impl ProjectService {
         } else {
             ProjectKind::Standard
         };
-        self.resolve_core(canonical, uri, kind, None).await
+        self.resolve_core(user_id, canonical, uri, kind, None).await
     }
 
     /// Shared core: upsert folder → (standard) reuse workspace project if any →
     /// otherwise atomically create project + workspace entry.
     async fn resolve_core(
         &self,
+        user_id: &str,
         canonical: Canonical,
         uri: String,
         kind: ProjectKind,
@@ -80,13 +83,18 @@ impl ProjectService {
         let folder = self.store.upsert_folder(canonical.as_str(), &uri).await?;
 
         if kind == ProjectKind::Standard
-            && let Some(entry) = self.store.select_workspace_entry_by_folder(&folder.folder_id).await?
+            && let Some(entry) = self
+                .store
+                .select_workspace_entry_by_folder(user_id, &folder.folder_id)
+                .await?
         {
-            let project = self.store.get_project(&entry.project_id).await?.ok_or_else(|| {
-                ProjectError::StandardProjectConflict {
+            let project = self
+                .store
+                .get_project(user_id, &entry.project_id)
+                .await?
+                .ok_or_else(|| ProjectError::StandardProjectConflict {
                     folder_id: folder.folder_id.clone(),
-                }
-            })?;
+                })?;
             return Ok(ResolveOutput {
                 project,
                 folder,
@@ -100,7 +108,7 @@ impl ProjectService {
         };
         let (project, entry) = self
             .store
-            .create_project_with_workspace_entry(&folder.folder_id, &name, kind)
+            .create_project_with_workspace_entry(user_id, &folder.folder_id, &name, kind)
             .await?;
         Ok(ResolveOutput {
             project,
@@ -113,12 +121,20 @@ impl ProjectService {
 
     /// Attach a non-workspace folder. Rejects duplicates and parent-overlap;
     /// a child of an existing entry returns that entry (focus-in-place).
-    pub async fn attach_folder(&self, input: AttachInput) -> Result<ProjectExplorerRow, ProjectError> {
+    pub async fn attach_folder(&self, user_id: &str, input: AttachInput) -> Result<ProjectExplorerRow, ProjectError> {
+        // Ownership gate: without it a caller could hang entries off another
+        // user's project_id (their scoped entry list would just look empty).
+        self.store
+            .get_project(user_id, &input.project_id)
+            .await?
+            .ok_or_else(|| ProjectError::ProjectNotFound {
+                project_id: input.project_id.clone(),
+            })?;
         let canonical = canonical::canonicalize(&input.uri)?;
         self.ensure_accessible(&canonical)?;
         let folder = self.store.upsert_folder(canonical.as_str(), &input.uri).await?;
 
-        let entries = self.store.list_entries(&input.project_id).await?;
+        let entries = self.store.list_entries(user_id, &input.project_id).await?;
         if entries.iter().any(|(entry, _)| entry.folder_id == folder.folder_id) {
             return Err(ProjectError::ProjectExplorerDuplicate {
                 project_id: input.project_id,
@@ -145,6 +161,7 @@ impl ProjectService {
         let order_index = entries.len() as i64;
         self.store
             .insert_attached_entry(
+                user_id,
                 &input.project_id,
                 &folder.folder_id,
                 input.display_name.as_deref(),
@@ -155,53 +172,64 @@ impl ProjectService {
     }
 
     /// Remove an attached entry. The workspace entry cannot be removed here.
-    pub async fn remove_attached(&self, pe_id: &str) -> Result<(), ProjectError> {
-        let entry = self
-            .store
-            .get_entry(pe_id)
-            .await?
-            .ok_or_else(|| ProjectError::ProjectExplorerNotFound {
-                pe_id: pe_id.to_owned(),
-            })?;
+    pub async fn remove_attached(&self, user_id: &str, pe_id: &str) -> Result<(), ProjectError> {
+        let entry =
+            self.store
+                .get_entry(user_id, pe_id)
+                .await?
+                .ok_or_else(|| ProjectError::ProjectExplorerNotFound {
+                    pe_id: pe_id.to_owned(),
+                })?;
         if entry.role == Role::Workspace.as_str() {
             return Err(ProjectError::WorkspaceEntryImmutable {
                 pe_id: pe_id.to_owned(),
             });
         }
-        self.store.remove_entry(pe_id).await?;
+        self.store.remove_entry(user_id, pe_id).await?;
         Ok(())
     }
 
-    pub async fn reorder(&self, project_id: &str, ordered_pe_ids: &[String]) -> Result<(), ProjectError> {
-        self.store.reorder(project_id, ordered_pe_ids).await?;
+    pub async fn reorder(
+        &self,
+        user_id: &str,
+        project_id: &str,
+        ordered_pe_ids: &[String],
+    ) -> Result<(), ProjectError> {
+        self.store.reorder(user_id, project_id, ordered_pe_ids).await?;
         Ok(())
     }
 
     pub async fn rename_entry(
         &self,
+        user_id: &str,
         pe_id: &str,
         display_name: Option<String>,
     ) -> Result<ProjectExplorerRow, ProjectError> {
-        self.store
-            .rename_entry(pe_id, display_name.as_deref())
-            .await
-            .map_err(Into::into)
+        match self.store.rename_entry(user_id, pe_id, display_name.as_deref()).await {
+            Ok(row) => Ok(row),
+            // A row this owner cannot see (missing or another user's) is the
+            // same "not found" to the caller — never leak internal_db_error.
+            Err(aionui_db::DbError::NotFound(_)) => Err(ProjectError::ProjectExplorerNotFound {
+                pe_id: pe_id.to_owned(),
+            }),
+            Err(err) => Err(err.into()),
+        }
     }
 
     // ── reads ──────────────────────────────────────────────────────────
 
-    pub async fn get_project(&self, project_id: &str) -> Result<ProjectDetail, ProjectError> {
-        let project = self
-            .store
-            .get_project(project_id)
-            .await?
-            .ok_or_else(|| ProjectError::ProjectNotFound {
-                project_id: project_id.to_owned(),
-            })?;
+    pub async fn get_project(&self, user_id: &str, project_id: &str) -> Result<ProjectDetail, ProjectError> {
+        let project =
+            self.store
+                .get_project(user_id, project_id)
+                .await?
+                .ok_or_else(|| ProjectError::ProjectNotFound {
+                    project_id: project_id.to_owned(),
+                })?;
 
         let mut workspace_pe_id = String::new();
         let mut entries = Vec::new();
-        for (entry, folder) in self.store.list_entries(project_id).await? {
+        for (entry, folder) in self.store.list_entries(user_id, project_id).await? {
             if entry.role == Role::Workspace.as_str() {
                 workspace_pe_id = entry.pe_id.clone();
             }
@@ -232,14 +260,16 @@ impl ProjectService {
 
     // ── resource resolution (identity + containment, no IO) ─────────────
 
-    pub async fn resolve_reference(&self, input: ReferenceInput) -> Result<ResolvedResource, ProjectError> {
-        let entry = self
-            .store
-            .get_entry(&input.pe_id)
-            .await?
-            .ok_or_else(|| ProjectError::ProjectExplorerNotFound {
+    pub async fn resolve_reference(
+        &self,
+        user_id: &str,
+        input: ReferenceInput,
+    ) -> Result<ResolvedResource, ProjectError> {
+        let entry = self.store.get_entry(user_id, &input.pe_id).await?.ok_or_else(|| {
+            ProjectError::ProjectExplorerNotFound {
                 pe_id: input.pe_id.clone(),
-            })?;
+            }
+        })?;
         let folder = self
             .store
             .get_folder(&entry.folder_id)
@@ -263,10 +293,15 @@ impl ProjectService {
 
     // ── owner binding validation (does not touch owner tables) ──────────
 
-    pub async fn validate_workspace_match(&self, project_id: &str, folder_id: &str) -> Result<(), ProjectError> {
+    pub async fn validate_workspace_match(
+        &self,
+        user_id: &str,
+        project_id: &str,
+        folder_id: &str,
+    ) -> Result<(), ProjectError> {
         let workspace = self
             .store
-            .list_entries(project_id)
+            .list_entries(user_id, project_id)
             .await?
             .into_iter()
             .find(|(entry, _)| entry.role == Role::Workspace.as_str());

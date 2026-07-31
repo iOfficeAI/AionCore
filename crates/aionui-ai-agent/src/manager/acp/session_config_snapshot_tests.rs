@@ -1,11 +1,11 @@
 //! Unit tests for partial real ACP config option snapshots and set-path routing.
 
-use agent_client_protocol::schema::{
-    ModelInfo, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode,
-    SessionModeState, SessionModelState,
+use agent_client_protocol::schema::v1::{
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode, SessionModeState,
 };
 
 use super::super::config_options::{ConfigSetPath, resolve_set_path};
+use super::super::legacy_session_model::LegacyModelEntry;
 use super::*;
 
 fn snapshot_option<'a>(snapshot: &'a ConfigSnapshot, option_id: &str) -> &'a aionui_api_types::AcpConfigOptionDto {
@@ -142,11 +142,11 @@ fn persisted_preload_keeps_catalogs_preloaded_from_metadata() {
                 SessionMode::new("full-access", "Full Access"),
             ],
         )),
-        Some(SessionModelState::new(
+        Some(LegacySessionModelState::new(
             "gpt-5.4",
             vec![
-                ModelInfo::new("gpt-5.4", "GPT-5.4"),
-                ModelInfo::new("gpt-5.5", "GPT-5.5"),
+                LegacyModelEntry::new("gpt-5.4", "GPT-5.4"),
+                LegacyModelEntry::new("gpt-5.5", "GPT-5.5"),
             ],
         )),
     );
@@ -184,16 +184,16 @@ fn config_snapshot_keeps_preloaded_model_catalog_when_resume_load_advertises_emp
     });
     session.preload_advertised_catalogs(
         None,
-        Some(SessionModelState::new(
+        Some(LegacySessionModelState::new(
             "gpt-5.4",
             vec![
-                ModelInfo::new("gpt-5.4", "GPT-5.4"),
-                ModelInfo::new("gpt-5.5", "GPT-5.5"),
+                LegacyModelEntry::new("gpt-5.4", "GPT-5.4"),
+                LegacyModelEntry::new("gpt-5.5", "GPT-5.5"),
             ],
         )),
     );
 
-    session.apply_advertised_models(SessionModelState::new("gpt-5.5", Vec::new()));
+    session.apply_advertised_models(LegacySessionModelState::new("gpt-5.5", Vec::new()));
     session.apply_advertised_config_options(vec![
         SessionConfigOption::select(
             "reasoning_effort",
@@ -227,11 +227,11 @@ fn preload_advertised_catalogs_reports_seeded_catalog_counts() {
                 SessionMode::new("full-access", "Full Access"),
             ],
         )),
-        Some(SessionModelState::new(
+        Some(LegacySessionModelState::new(
             "gpt-5.5",
             vec![
-                ModelInfo::new("gpt-5.5", "GPT-5.5"),
-                ModelInfo::new("gpt-5.4", "GPT-5.4"),
+                LegacyModelEntry::new("gpt-5.5", "GPT-5.5"),
+                LegacyModelEntry::new("gpt-5.4", "GPT-5.4"),
             ],
         )),
     );
@@ -246,9 +246,12 @@ fn preload_advertised_catalogs_reports_seeded_catalog_counts() {
 #[test]
 fn config_snapshot_supplements_missing_model_from_non_empty_runtime_catalog() {
     let mut session = AcpSession::new(None, None, HashMap::new());
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "gpt-5",
-        vec![ModelInfo::new("gpt-5", "GPT-5"), ModelInfo::new("gpt-4.1", "GPT-4.1")],
+        vec![
+            LegacyModelEntry::new("gpt-5", "GPT-5"),
+            LegacyModelEntry::new("gpt-4.1", "GPT-4.1"),
+        ],
     ));
     session.drain_events();
 
@@ -308,11 +311,11 @@ fn config_snapshot_keeps_real_mode_option_without_runtime_merge() {
 #[test]
 fn config_snapshot_keeps_real_model_option_without_runtime_merge() {
     let mut session = AcpSession::new(None, None, HashMap::new());
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "runtime-model",
         vec![
-            ModelInfo::new("runtime-model", "Runtime Model"),
-            ModelInfo::new("runtime-extra", "Runtime Extra"),
+            LegacyModelEntry::new("runtime-model", "Runtime Model"),
+            LegacyModelEntry::new("runtime-extra", "Runtime Extra"),
         ],
     ));
     session.drain_events();
@@ -359,7 +362,7 @@ fn config_snapshot_does_not_supplement_mode_from_empty_runtime_catalog() {
 #[test]
 fn config_snapshot_does_not_supplement_model_from_empty_runtime_catalog() {
     let mut session = AcpSession::new(None, None, HashMap::new());
-    session.apply_advertised_models(SessionModelState::new("gpt-5", Vec::new()));
+    session.apply_advertised_models(LegacySessionModelState::new("gpt-5", Vec::new()));
     session.drain_events();
 
     session.apply_advertised_config_options(vec![
@@ -381,7 +384,10 @@ fn config_snapshot_does_not_supplement_model_from_empty_runtime_catalog() {
 fn config_snapshot_does_not_supplement_thought_level() {
     let mut session = AcpSession::new(None, None, HashMap::new());
     session.apply_advertised_modes(SessionModeState::new("build", vec![SessionMode::new("build", "Build")]));
-    session.apply_advertised_models(SessionModelState::new("gpt-5", vec![ModelInfo::new("gpt-5", "GPT-5")]));
+    session.apply_advertised_models(LegacySessionModelState::new(
+        "gpt-5",
+        vec![LegacyModelEntry::new("gpt-5", "GPT-5")],
+    ));
     session.drain_events();
 
     session.apply_advertised_config_options(vec![SessionConfigOption::select(
@@ -430,9 +436,12 @@ fn config_snapshot_synthetic_mode_resolves_to_legacy_set_mode() {
 #[test]
 fn config_snapshot_synthetic_model_resolves_to_legacy_set_model() {
     let mut session = AcpSession::new(None, None, HashMap::new());
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "gpt-4.1",
-        vec![ModelInfo::new("gpt-4.1", "GPT-4.1"), ModelInfo::new("gpt-5", "GPT-5")],
+        vec![
+            LegacyModelEntry::new("gpt-4.1", "GPT-4.1"),
+            LegacyModelEntry::new("gpt-5", "GPT-5"),
+        ],
     ));
     session.drain_events();
 
@@ -460,9 +469,9 @@ fn config_snapshot_real_mode_and_model_resolve_to_set_config_option() {
         "runtime-build",
         vec![SessionMode::new("runtime-build", "Runtime Build")],
     ));
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "runtime-model",
-        vec![ModelInfo::new("runtime-model", "Runtime Model")],
+        vec![LegacyModelEntry::new("runtime-model", "Runtime Model")],
     ));
     session.drain_events();
 

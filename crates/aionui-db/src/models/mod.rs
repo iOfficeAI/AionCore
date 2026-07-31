@@ -40,4 +40,4 @@ pub use remote_agent::RemoteAgentRow;
 pub use skill::{SkillImportRecordRow, SkillRow};
 pub use system_settings::SystemSettings;
 pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};
-pub use user::User;
+pub use user::{ExternalUserProjection, User, UserStatus, UserType};

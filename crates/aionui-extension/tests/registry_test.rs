@@ -170,9 +170,8 @@ async fn em1_enable_extension_broadcasts_state_changed() {
     registry.enable_extension("my-ext").await.unwrap();
 
     // Verify the extension is now enabled.
-    let ext = registry.get_extension_by_name("my-ext").await.unwrap();
-    assert!(ext.state.enabled);
-    assert!(ext.state.last_activated_at.is_some());
+    let extensions = registry.get_loaded_extensions().await;
+    assert!(extensions[0].enabled);
 
     // Verify stateChanged event was broadcast.
     let msg = rx.recv().await.unwrap();
@@ -198,8 +197,8 @@ async fn em2_disable_extension_broadcasts_state_changed() {
         .unwrap();
 
     // Verify the extension is now disabled.
-    let ext = registry.get_extension_by_name("my-ext").await.unwrap();
-    assert!(!ext.state.enabled);
+    let extensions = registry.get_loaded_extensions().await;
+    assert!(!extensions[0].enabled);
 
     // Verify stateChanged event was broadcast.
     let msg = rx.recv().await.unwrap();
@@ -228,6 +227,32 @@ async fn em4_disable_nonexistent_returns_error() {
     let (registry, _, _tmp) = seeded_registry(vec![]).await;
     let result = registry.disable_extension("nonexistent", None).await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn extension_enablement_is_isolated_by_user() {
+    let extensions = vec![make_ext("my-ext", "1.0.0", true)];
+    let (registry, bus, _tmp) = seeded_registry(extensions).await;
+    let mut rx = bus.subscribe();
+
+    registry
+        .disable_extension_for_user("user-a", "my-ext", None)
+        .await
+        .unwrap();
+
+    let user_a = registry.get_loaded_extensions_for_user("user-a").await;
+    let user_b = registry.get_loaded_extensions_for_user("user-b").await;
+    assert!(!user_a[0].enabled);
+    assert!(user_b[0].enabled);
+
+    let event = rx.recv().await.unwrap();
+    assert_eq!(event.name, "extensions.state-changed");
+    assert_eq!(event.data["user_id"], "user-a");
+    assert_eq!(event.data["enabled"], false);
+
+    registry.enable_extension_for_user("user-b", "my-ext").await.unwrap();
+    let user_a = registry.get_loaded_extensions_for_user("user-a").await;
+    assert!(!user_a[0].enabled, "user B must not change user A's state");
 }
 
 // ---------------------------------------------------------------------------
@@ -328,9 +353,11 @@ async fn sp_enable_disable_persists_through_reload() {
     // Flush to disk.
     store.flush().await.unwrap();
 
-    // Verify persisted state (SP-1).
-    let loaded = aionui_extension::load_states_from_file(&state_path).unwrap();
-    assert!(!loaded["ext-a"].enabled);
+    // Verify the default user's override, not the machine-level install state.
+    assert_eq!(
+        store.get_user_enabled("system_default_user", "ext-a").await,
+        Some(false)
+    );
 
     // Re-initialize (simulate restart) — should restore disabled state (SP-2).
     let store2 = ExtensionStateStore::new(state_path);

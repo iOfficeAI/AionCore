@@ -36,7 +36,8 @@ use aionui_mcp::{
 use aionui_office::{
     ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
 };
-use aionui_realtime::{NoopMessageRouter, WsHandlerState};
+use aionui_project::ProjectRouterState;
+use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
 use aionui_shell::ShellRouterState;
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
@@ -49,7 +50,7 @@ use aionui_team::{
     TeamSessionService,
 };
 
-use crate::config::derive_encryption_key;
+use crate::config::{IdentityMode, derive_encryption_key};
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
 
@@ -129,6 +130,7 @@ pub struct ModuleStates {
 
     pub connection_test: ConnectionTestRouterState,
     pub file: FileRouterState,
+    pub project: ProjectRouterState,
     pub mcp: McpRouterState,
     pub extension: ExtensionRouterState,
     pub hub: HubRouterState,
@@ -186,6 +188,7 @@ pub struct ChannelOrchestratorComponents {
     pub confirm_rx: tokio::sync::mpsc::Receiver<(String, String)>,
     pub manager: Arc<aionui_channel::manager::ChannelManager>,
     pub plugin_factory: Arc<aionui_channel::manager::PluginFactory>,
+    pub owner_user_id: Option<String>,
 }
 
 /// Build all default `ModuleStates` from application services.
@@ -216,11 +219,19 @@ pub async fn build_module_states(
     );
 
     let assistant = build_assistant_state(services);
-    assistant
-        .service
-        .bootstrap_assistant_storage()
-        .await
-        .map_err(assistant_bootstrap_build_error)?;
+    if services.identity_mode.is_local() {
+        assistant
+            .service
+            .bootstrap_assistant_storage()
+            .await
+            .map_err(assistant_bootstrap_build_error)?;
+    } else {
+        assistant
+            .service
+            .bootstrap_assistant_storage_external()
+            .await
+            .map_err(assistant_bootstrap_build_error)?;
+    }
     let cron = build_cron_state(services);
     // Cron builds its own ConversationService (not a clone of the shared one),
     // so wire the assistant rule dispatcher here — otherwise scheduled runs
@@ -240,7 +251,17 @@ pub async fn build_module_states(
     let dispatcher: Arc<dyn AssistantRuleDispatcher> = assistant.service.clone();
     skill_state.assistant_dispatcher = Some(dispatcher);
 
-    let (channel_state, channel_components) = build_channel_state(services, ext_state.registry.clone()).await;
+    let generated_assistant_materializer: Arc<
+        dyn aionui_channel::channel_settings::ChannelGeneratedAssistantMaterializer,
+    > = Arc::new(GeneratedAssistantMaterializerAdapter {
+        assistant: assistant.service.clone(),
+    });
+    let (channel_state, channel_components) = build_channel_state(
+        services,
+        ext_state.registry.clone(),
+        Some(generated_assistant_materializer),
+    )
+    .await;
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: channel state built");
 
     let backend_binary_path = Arc::new(
@@ -289,6 +310,7 @@ pub async fn build_module_states(
         }),
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
+        project: build_module_state_phase(&boot, "project", || build_project_state(services)),
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
         hub: hub_state,
@@ -329,8 +351,14 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
 
     #[async_trait::async_trait]
     impl AssistantAgentCatalogPort for RegistryAssistantAgentCatalog {
-        async fn list_management_agents(&self) -> Result<Vec<aionui_api_types::AgentManagementRow>, AssistantError> {
-            Ok(self.registry.list_management_rows().await)
+        async fn list_management_agents(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<aionui_api_types::AgentManagementRow>, AssistantError> {
+            self.registry
+                .list_management_rows_for_user(user_id)
+                .await
+                .map_err(|error| AssistantError::Internal(format!("agent catalog unavailable: {error}")))
         }
     }
 
@@ -380,12 +408,17 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
     let provider_repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let http_client = reqwest::Client::new();
 
+    let client_pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
+    let keep_awake_controller = Arc::new(aionui_system::SystemKeepAwakeController::new());
+    let client_pref_service = if services.identity_mode.is_local() {
+        ClientPrefService::with_keep_awake_controller(client_pref_repo, keep_awake_controller, "system_default_user")
+    } else {
+        ClientPrefService::with_keep_awake_controller_without_restore(client_pref_repo, keep_awake_controller)
+    };
+
     SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),
-        client_pref_service: ClientPrefService::with_keep_awake_controller(
-            Arc::new(SqliteClientPreferenceRepository::new(pool.clone())),
-            Arc::new(aionui_system::SystemKeepAwakeController::new()),
-        ),
+        client_pref_service,
         provider_service: ProviderService::new(provider_repo.clone(), encryption_key),
         model_fetch_service: ModelFetchService::new(provider_repo, encryption_key, http_client.clone()),
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
@@ -446,6 +479,7 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         file_service,
         watch_service,
         snapshot_service,
+        project: Arc::new(services.project_service.clone()),
         allowed_roots,
         browse_roots,
     })
@@ -453,6 +487,13 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
 
 fn file_watch_init_error(error: aionui_file::FileError) -> RouterBuildError {
     RouterBuildError::new("router.file_watch", "failed to initialize file watch service").with_source(error)
+}
+
+/// Build the project control-plane router state from application services.
+pub fn build_project_state(services: &AppServices) -> ProjectRouterState {
+    ProjectRouterState {
+        project: Arc::new(services.project_service.clone()),
+    }
 }
 
 /// Build the default `McpRouterState` from application services.
@@ -484,30 +525,64 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
     }
 }
 
+/// Adapter exposing the assistant service's lazy generated-assistant
+/// materialization to the channel settings service (avoids a channel→assistant
+/// crate dependency; the binding happens here in the composition layer).
+struct GeneratedAssistantMaterializerAdapter {
+    assistant: Arc<aionui_assistant::AssistantService>,
+}
+
+#[async_trait::async_trait]
+impl aionui_channel::channel_settings::ChannelGeneratedAssistantMaterializer for GeneratedAssistantMaterializerAdapter {
+    async fn ensure_generated_assistants(&self, user_id: &str) {
+        // list_for_user runs the per-user generated reconcile as a side effect.
+        if let Err(error) = self.assistant.list_for_user(user_id).await {
+            tracing::warn!(user_id, error = %error, "channel default: generated assistant materialization failed");
+        }
+    }
+}
+
 fn build_channel_settings_service(
     services: &AppServices,
+    generated_assistant_materializer: Option<
+        Arc<dyn aionui_channel::channel_settings::ChannelGeneratedAssistantMaterializer>,
+    >,
 ) -> Arc<aionui_channel::channel_settings::ChannelSettingsService> {
     let pref_repo: Arc<dyn aionui_db::IClientPreferenceRepository> =
         Arc::new(SqliteClientPreferenceRepository::new(services.database.pool().clone()));
 
-    Arc::new(
-        aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo)
-            .with_agent_metadata_repo(Arc::new(SqliteAgentMetadataRepository::new(
+    let mut service = aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo)
+        .with_agent_metadata_repo(Arc::new(SqliteAgentMetadataRepository::new(
+            services.database.pool().clone(),
+        )))
+        .with_assistant_repos(
+            Arc::new(SqliteAssistantDefinitionRepository::new(
                 services.database.pool().clone(),
-            )))
-            .with_assistant_repos(
-                Arc::new(SqliteAssistantDefinitionRepository::new(
-                    services.database.pool().clone(),
-                )),
-                Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone())),
-            ),
-    )
+            )),
+            Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone())),
+        );
+    if let Some(materializer) = generated_assistant_materializer {
+        service = service.with_generated_assistant_materializer(materializer);
+    }
+    Arc::new(service)
 }
 
 async fn build_channel_message_service(
     services: &AppServices,
     channel_settings: Arc<aionui_channel::channel_settings::ChannelSettingsService>,
 ) -> Arc<aionui_channel::message_service::ChannelMessageService> {
+    Arc::new(aionui_channel::message_service::ChannelMessageService::new(
+        Arc::new(services.conversation_service.clone()),
+        services.worker_task_manager.clone(),
+        channel_settings,
+    ))
+}
+
+async fn startup_channel_owner_user_id(services: &AppServices) -> Option<String> {
+    if services.identity_mode == IdentityMode::AionPro {
+        return None;
+    }
+
     let owner_user_id = services
         .user_repo
         .get_primary_webui_user()
@@ -516,19 +591,16 @@ async fn build_channel_message_service(
         .flatten()
         .map(|u| u.id)
         .unwrap_or_else(|| "system_default_user".to_string());
-
-    Arc::new(aionui_channel::message_service::ChannelMessageService::new(
-        Arc::new(services.conversation_service.clone()),
-        services.worker_task_manager.clone(),
-        channel_settings,
-        owner_user_id,
-    ))
+    Some(owner_user_id)
 }
 
 /// Build the default `ChannelRouterState` and orchestrator components.
 pub async fn build_channel_state(
     services: &AppServices,
     extension_registry: ExtensionRegistry,
+    generated_assistant_materializer: Option<
+        Arc<dyn aionui_channel::channel_settings::ChannelGeneratedAssistantMaterializer>,
+    >,
 ) -> (ChannelRouterState, ChannelOrchestratorComponents) {
     let pool = services.database.pool().clone();
     let repo: Arc<dyn aionui_db::IChannelRepository> = Arc::new(aionui_db::SqliteChannelRepository::new(pool));
@@ -556,13 +628,15 @@ pub async fn build_channel_state(
         Arc::new(Box::new(aionui_channel::plugins::create_plugin));
 
     // Build channel settings service for per-plugin agent/model configuration.
-    let channel_settings = build_channel_settings_service(services);
+    let channel_settings = build_channel_settings_service(services, generated_assistant_materializer);
+    let startup_owner_user_id = startup_channel_owner_user_id(services).await;
 
     // Build orchestrator dependencies
     let action_executor = Arc::new(aionui_channel::action::ActionExecutor::new(
         Arc::clone(&pairing_service),
         Arc::clone(&session_manager),
         Arc::clone(&channel_settings),
+        startup_owner_user_id.clone(),
     ));
 
     let message_service = build_channel_message_service(services, Arc::clone(&channel_settings)).await;
@@ -590,6 +664,7 @@ pub async fn build_channel_state(
         confirm_rx,
         manager,
         plugin_factory,
+        owner_user_id: startup_owner_user_id,
     };
 
     (state, components)
@@ -615,8 +690,9 @@ pub fn build_team_state(
     impl TeamAssistantCatalogPort for AssistantServiceTeamCatalog {
         async fn list_team_selectable_assistants(
             &self,
+            user_id: &str,
         ) -> Result<Vec<TeamAssistantCatalogEntry>, aionui_team::TeamError> {
-            let assistants = self.assistant_service.list().await.map_err(|error| {
+            let assistants = self.assistant_service.list_for_user(user_id).await.map_err(|error| {
                 aionui_team::TeamError::InvalidRequest(format!("assistant catalog unavailable: {error}"))
             })?;
 
@@ -757,6 +833,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         agent_metadata_repo,
         assistant_definition_repo,
         assistant_overlay_repo,
+        skill_repo: services.skill_repo.clone(),
         scheduler,
         executor,
         emitter,
@@ -848,26 +925,45 @@ pub async fn build_extension_states(
     (ext_state, hub_state, skill_state)
 }
 
-/// Build the default `WsHandlerState` from application services.
-pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
+/// Build the `WsHandlerState` from application services with an explicit inbound
+/// `router`. Callers supply the filesystem-monitor router in production and a
+/// no-op router for router-only/test assembly.
+pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) -> WsHandlerState {
     if services.local {
         return WsHandlerState {
             manager: services.ws_manager.clone(),
-            router: Arc::new(NoopMessageRouter),
+            router,
             token_validator: Arc::new(|_| true),
+            token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".to_owned()) })),
             token_extractor: Arc::new(|_| Some("local".into())),
         };
     }
 
     let jwt_service = services.jwt_service.clone();
     let token_validator = Arc::new(move |token: &str| jwt_service.verify(token).is_ok());
+    let jwt_service = services.jwt_service.clone();
+    let user_repo = services.user_repo.clone();
+    let identity_mode = services.identity_mode;
+    let token_user_resolver: TokenUserResolver = Arc::new(move |token: String| {
+        let jwt_service = jwt_service.clone();
+        let user_repo = user_repo.clone();
+        Box::pin(async move {
+            let payload = jwt_service.verify(&token).ok()?;
+            let user = user_repo.find_active_by_id(&payload.user_id).await.ok()??;
+            if identity_mode == IdentityMode::AionPro && user.user_type != aionui_db::UserType::Aionpro {
+                return None;
+            }
+            (payload.session_generation == user.session_generation).then_some(user.id)
+        })
+    });
 
     let token_extractor = Arc::new(|headers: &axum::http::HeaderMap| extract_token_from_ws_headers(headers));
 
     WsHandlerState {
         manager: services.ws_manager.clone(),
-        router: Arc::new(NoopMessageRouter),
+        router,
         token_validator,
+        token_user_resolver,
         token_extractor,
     }
 }
@@ -954,6 +1050,8 @@ mod tests {
 
     impl IMockAgent for ChannelStateNoopAgent {}
 
+    type CapturedRuntimeEnv = Arc<Mutex<Vec<Vec<(String, String)>>>>;
+
     fn mock_worker_task_manager() -> Arc<dyn IWorkerTaskManager> {
         let factory = Arc::new(|opts: BuildTaskOptions| {
             Box::pin(async move {
@@ -966,8 +1064,8 @@ mod tests {
 
         Arc::new(WorkerTaskManagerImpl::new(factory))
     }
-    type CapturedEnv = Vec<Vec<(String, String)>>;
-    fn capturing_worker_task_manager(captured_env: Arc<Mutex<CapturedEnv>>) -> Arc<dyn IWorkerTaskManager> {
+
+    fn capturing_worker_task_manager(captured_env: CapturedRuntimeEnv) -> Arc<dyn IWorkerTaskManager> {
         let factory = Arc::new(move |opts: BuildTaskOptions| {
             let captured_env = captured_env.clone();
             Box::pin(async move {
@@ -984,7 +1082,7 @@ mod tests {
         Arc::new(WorkerTaskManagerImpl::new(factory))
     }
 
-    async fn wait_for_captured_env(captured_env: &Arc<Mutex<CapturedEnv>>) -> Vec<(String, String)> {
+    async fn wait_for_captured_env(captured_env: &CapturedRuntimeEnv) -> Vec<(String, String)> {
         for _ in 0..50 {
             if let Some(env) = captured_env.lock().unwrap().first().cloned() {
                 return env;
@@ -1035,6 +1133,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_ws_state_rejects_stale_session_generation() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+        let ws_state = build_ws_state(&services, std::sync::Arc::new(aionui_realtime::NoopMessageRouter));
+        let token = services
+            .jwt_service
+            .sign_with_session_generation("system_default_user", "admin", 0)
+            .unwrap();
+
+        let resolved = (ws_state.token_user_resolver)(token.clone()).await;
+        assert_eq!(resolved.as_deref(), Some("system_default_user"));
+
+        services
+            .user_repo
+            .increment_session_generation("system_default_user")
+            .await
+            .unwrap();
+
+        let resolved = (ws_state.token_user_resolver)(token).await;
+        assert_eq!(resolved, None);
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_ws_state_aionpro_rejects_local_user_token() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let config = AppConfig {
+            identity_mode: IdentityMode::AionPro,
+            bootstrap_secret: Some("bootstrap-secret".to_owned()),
+            ..AppConfig::default()
+        };
+        let services = AppServices::from_config(db, &config).await.unwrap();
+        let ws_state = build_ws_state(&services, std::sync::Arc::new(aionui_realtime::NoopMessageRouter));
+        let token = services
+            .jwt_service
+            .sign_with_session_generation("system_default_user", "admin", 0)
+            .unwrap();
+
+        let resolved = (ws_state.token_user_resolver)(token).await;
+        assert_eq!(resolved, None);
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
     async fn build_channel_message_service_uses_app_conversation_service_for_assistant_bindings() {
         let db = aionui_db::init_database_memory().await.unwrap();
         let services = AppServices::from_config(db, &AppConfig::default())
@@ -1051,14 +1195,17 @@ mod tests {
 
         let pref_repo = SqliteClientPreferenceRepository::new(pool.clone());
         pref_repo
-            .upsert_batch(&[(
-                "assistant.weixin.agent",
-                r#"{"assistant_id":"bare-channel-aionrs","name":"Weixin Aionrs"}"#,
-            )])
+            .upsert_batch(
+                "system_default_user",
+                &[(
+                    "assistant.weixin.agent",
+                    r#"{"assistant_id":"bare-channel-aionrs","name":"Weixin Aionrs"}"#,
+                )],
+            )
             .await
             .unwrap();
 
-        let settings = build_channel_settings_service(&services);
+        let settings = build_channel_settings_service(&services, None);
         let message_service = build_channel_message_service(&services, settings).await;
         let session = AssistantSessionRow {
             id: "session-channel-state".to_owned(),
@@ -1072,18 +1219,23 @@ mod tests {
         };
 
         let first = message_service
-            .send_to_agent(&session, "hello", PluginType::Weixin)
+            .send_to_agent("system_default_user", &session, "hello", PluginType::Weixin)
             .await
             .unwrap();
 
         let conversation_repo = SqliteConversationRepository::new(pool);
+        let user_id = conversation_repo
+            .owner_user_id(&first.conversation_id)
+            .await
+            .unwrap()
+            .expect("channel-created conversation should have an owner");
         let snapshot = conversation_repo
-            .get_assistant_snapshot(&first.conversation_id)
+            .get_assistant_snapshot(&user_id, &first.conversation_id)
             .await
             .unwrap()
             .expect("channel-created conversation should persist assistant snapshot");
         let conversation = conversation_repo
-            .get(&first.conversation_id)
+            .get(&user_id, &first.conversation_id)
             .await
             .unwrap()
             .expect("channel-created conversation should be persisted");
@@ -1098,7 +1250,7 @@ mod tests {
             ..session
         };
         let second = message_service
-            .send_to_agent(&second_session, "again", PluginType::Weixin)
+            .send_to_agent("system_default_user", &second_session, "again", PluginType::Weixin)
             .await
             .unwrap();
         assert_eq!(second.conversation_id, first.conversation_id);

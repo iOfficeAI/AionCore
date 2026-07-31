@@ -14,7 +14,7 @@ use tower::ServiceExt;
 
 use aionui_db::{
     SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteSettingsRepository, init_database_memory,
+    SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
 };
 
 const TEST_ENCRYPTION_KEY: [u8; 32] = [0x42; 32];
@@ -132,6 +132,8 @@ fn diagnostics_request(uri: &str) -> Request<Body> {
     req.extensions_mut().insert(CurrentUser {
         id: "system_default_user".to_owned(),
         username: "system_default_user".to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
     });
     req
 }

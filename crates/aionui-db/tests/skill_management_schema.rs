@@ -14,6 +14,7 @@ async fn migration_creates_skill_management_tables() {
         skill_columns,
         vec![
             "id",
+            "user_id",
             "name",
             "description",
             "path",
@@ -49,6 +50,7 @@ async fn migration_creates_skill_management_tables() {
             "line",
             "column",
             "created_at",
+            "user_id",
         ]
     );
 }
@@ -59,11 +61,17 @@ async fn migration_allows_known_skill_sources_and_rejects_unknown_sources() {
     let pool = db.pool();
 
     for source in ["user", "builtin", "extension", "cron"] {
+        let user_id = if source == "builtin" || source == "cron" {
+            None
+        } else {
+            Some("system_default_user")
+        };
         sqlx::query(
-            "INSERT INTO skills (id, name, description, path, source, enabled, created_at, updated_at)
-             VALUES (?, ?, NULL, ?, ?, 1, 1, 1)",
+            "INSERT INTO skills (id, user_id, name, description, path, source, enabled, created_at, updated_at)
+             VALUES (?, ?, ?, NULL, ?, ?, 1, 1, 1)",
         )
         .bind(format!("skill-{source}"))
+        .bind(user_id)
         .bind(format!("skill-{source}"))
         .bind(format!("/tmp/{source}"))
         .bind(source)
@@ -80,4 +88,42 @@ async fn migration_allows_known_skill_sources_and_rejects_unknown_sources() {
     .await;
 
     assert!(rejected.is_err());
+}
+
+#[tokio::test]
+async fn skill_names_are_unique_within_scope() {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool();
+
+    sqlx::query(
+        "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at)
+         VALUES ('user_b', 'local', 'user_b', 'hash', 'active', 0, 1, 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO skills (id, user_id, name, description, path, source, enabled, created_at, updated_at)
+         VALUES ('skill-a', 'system_default_user', 'shared-name', NULL, '/tmp/a', 'user', 1, 1, 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO skills (id, user_id, name, description, path, source, enabled, created_at, updated_at)
+         VALUES ('skill-b', 'user_b', 'shared-name', NULL, '/tmp/b', 'user', 1, 1, 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let duplicate = sqlx::query(
+        "INSERT INTO skills (id, user_id, name, description, path, source, enabled, created_at, updated_at)
+         VALUES ('skill-c', 'user_b', 'shared-name', NULL, '/tmp/c', 'user', 1, 1, 1)",
+    )
+    .execute(pool)
+    .await;
+    assert!(duplicate.is_err());
 }

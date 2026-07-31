@@ -18,8 +18,9 @@ impl SqliteOAuthTokenRepository {
 
 #[async_trait::async_trait]
 impl IOAuthTokenRepository for SqliteOAuthTokenRepository {
-    async fn get_by_url(&self, server_url: &str) -> Result<Option<OAuthTokenRow>, DbError> {
-        let row = sqlx::query_as::<_, OAuthTokenRow>("SELECT * FROM oauth_tokens WHERE server_url = ?")
+    async fn get_by_url(&self, user_id: &str, server_url: &str) -> Result<Option<OAuthTokenRow>, DbError> {
+        let row = sqlx::query_as::<_, OAuthTokenRow>("SELECT * FROM oauth_tokens WHERE user_id = ? AND server_url = ?")
+            .bind(user_id)
             .bind(server_url)
             .fetch_optional(&self.pool)
             .await?;
@@ -32,16 +33,17 @@ impl IOAuthTokenRepository for SqliteOAuthTokenRepository {
 
         sqlx::query(
             "INSERT INTO oauth_tokens \
-                (server_url, access_token, refresh_token, token_type, \
+                (user_id, server_url, access_token, refresh_token, token_type, \
                  expires_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(server_url) DO UPDATE SET \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(user_id, server_url) DO UPDATE SET \
                 access_token = excluded.access_token, \
                 refresh_token = excluded.refresh_token, \
                 token_type = excluded.token_type, \
                 expires_at = excluded.expires_at, \
                 updated_at = excluded.updated_at",
         )
+        .bind(params.user_id)
         .bind(params.server_url)
         .bind(params.access_token)
         .bind(params.refresh_token)
@@ -54,15 +56,16 @@ impl IOAuthTokenRepository for SqliteOAuthTokenRepository {
 
         // Fetch the row to get the correct created_at (preserved on conflict).
         let row = self
-            .get_by_url(params.server_url)
+            .get_by_url(params.user_id, params.server_url)
             .await?
             .ok_or_else(|| DbError::Init("Upsert succeeded but row not found".to_string()))?;
 
         Ok(row)
     }
 
-    async fn delete(&self, server_url: &str) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM oauth_tokens WHERE server_url = ?")
+    async fn delete(&self, user_id: &str, server_url: &str) -> Result<(), DbError> {
+        let result = sqlx::query("DELETE FROM oauth_tokens WHERE user_id = ? AND server_url = ?")
+            .bind(user_id)
             .bind(server_url)
             .execute(&self.pool)
             .await?;
@@ -74,10 +77,12 @@ impl IOAuthTokenRepository for SqliteOAuthTokenRepository {
         Ok(())
     }
 
-    async fn list_authenticated_urls(&self) -> Result<Vec<String>, DbError> {
-        let rows: Vec<(String,)> = sqlx::query_as("SELECT server_url FROM oauth_tokens ORDER BY created_at ASC")
-            .fetch_all(&self.pool)
-            .await?;
+    async fn list_authenticated_urls(&self, user_id: &str) -> Result<Vec<String>, DbError> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT server_url FROM oauth_tokens WHERE user_id = ? ORDER BY created_at ASC")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
 
         Ok(rows.into_iter().map(|(url,)| url).collect())
     }
@@ -88,14 +93,27 @@ mod tests {
     use super::*;
     use crate::init_database_memory;
 
+    const USER_A: &str = "system_default_user";
+    const USER_B: &str = "user_b";
+
     async fn setup() -> (SqliteOAuthTokenRepository, crate::Database) {
         let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, 'hash', 'active', 0, 1, 1)",
+        )
+        .bind(USER_B)
+        .bind(USER_B)
+        .execute(db.pool())
+        .await
+        .unwrap();
         let repo = SqliteOAuthTokenRepository::new(db.pool().clone());
         (repo, db)
     }
 
     fn sample_params() -> UpsertOAuthTokenParams<'static> {
         UpsertOAuthTokenParams {
+            user_id: USER_A,
             server_url: "https://mcp.example.com",
             access_token: "enc_access_token_123",
             refresh_token: Some("enc_refresh_token_456"),
@@ -107,7 +125,7 @@ mod tests {
     #[tokio::test]
     async fn get_by_url_nonexistent() {
         let (repo, _db) = setup().await;
-        assert!(repo.get_by_url("https://nope.com").await.unwrap().is_none());
+        assert!(repo.get_by_url(USER_A, "https://nope.com").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -131,6 +149,7 @@ mod tests {
 
         let updated = repo
             .upsert(UpsertOAuthTokenParams {
+                user_id: USER_A,
                 server_url: "https://mcp.example.com",
                 access_token: "new_access_token",
                 refresh_token: None,
@@ -153,7 +172,11 @@ mod tests {
         let (repo, _db) = setup().await;
         repo.upsert(sample_params()).await.unwrap();
 
-        let found = repo.get_by_url("https://mcp.example.com").await.unwrap().unwrap();
+        let found = repo
+            .get_by_url(USER_A, "https://mcp.example.com")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.access_token, "enc_access_token_123");
     }
 
@@ -162,21 +185,26 @@ mod tests {
         let (repo, _db) = setup().await;
         repo.upsert(sample_params()).await.unwrap();
 
-        repo.delete("https://mcp.example.com").await.unwrap();
-        assert!(repo.get_by_url("https://mcp.example.com").await.unwrap().is_none());
+        repo.delete(USER_A, "https://mcp.example.com").await.unwrap();
+        assert!(
+            repo.get_by_url(USER_A, "https://mcp.example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn delete_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.delete("https://nope.com").await.unwrap_err();
+        let err = repo.delete(USER_A, "https://nope.com").await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
     #[tokio::test]
     async fn list_authenticated_urls_empty() {
         let (repo, _db) = setup().await;
-        let urls = repo.list_authenticated_urls().await.unwrap();
+        let urls = repo.list_authenticated_urls(USER_A).await.unwrap();
         assert!(urls.is_empty());
     }
 
@@ -185,6 +213,7 @@ mod tests {
         let (repo, _db) = setup().await;
         repo.upsert(sample_params()).await.unwrap();
         repo.upsert(UpsertOAuthTokenParams {
+            user_id: USER_A,
             server_url: "https://other.example.com",
             access_token: "token2",
             refresh_token: None,
@@ -194,9 +223,54 @@ mod tests {
         .await
         .unwrap();
 
-        let urls = repo.list_authenticated_urls().await.unwrap();
+        let urls = repo.list_authenticated_urls(USER_A).await.unwrap();
         assert_eq!(urls.len(), 2);
         assert!(urls.contains(&"https://mcp.example.com".to_string()));
         assert!(urls.contains(&"https://other.example.com".to_string()));
+    }
+
+    #[tokio::test]
+    async fn oauth_tokens_are_scoped_by_user() {
+        let (repo, _db) = setup().await;
+        repo.upsert(sample_params()).await.unwrap();
+        repo.upsert(UpsertOAuthTokenParams {
+            user_id: USER_B,
+            access_token: "user_b_token",
+            refresh_token: None,
+            ..sample_params()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.get_by_url(USER_A, "https://mcp.example.com")
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "enc_access_token_123"
+        );
+        assert_eq!(
+            repo.get_by_url(USER_B, "https://mcp.example.com")
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "user_b_token"
+        );
+
+        repo.delete(USER_B, "https://mcp.example.com").await.unwrap();
+        assert!(
+            repo.get_by_url(USER_B, "https://mcp.example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.get_by_url(USER_A, "https://mcp.example.com")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

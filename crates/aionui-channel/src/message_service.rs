@@ -27,7 +27,6 @@ pub struct ChannelMessageService {
     conversation_svc: Arc<ConversationService>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     settings: Arc<ChannelSettingsService>,
-    owner_user_id: String,
 }
 
 impl ChannelMessageService {
@@ -35,13 +34,11 @@ impl ChannelMessageService {
         conversation_svc: Arc<ConversationService>,
         task_manager: Arc<dyn IWorkerTaskManager>,
         settings: Arc<ChannelSettingsService>,
-        owner_user_id: String,
     ) -> Self {
         Self {
             conversation_svc,
             task_manager,
             settings,
-            owner_user_id,
         }
     }
 
@@ -56,6 +53,7 @@ impl ChannelMessageService {
     /// relaying them to the IM platform.
     pub async fn send_to_agent(
         &self,
+        owner_user_id: &str,
         session: &AssistantSessionRow,
         text: &str,
         platform: PluginType,
@@ -63,7 +61,10 @@ impl ChannelMessageService {
         // Ensure conversation exists
         let conversation_id = match &session.conversation_id {
             Some(cid) => cid.clone(),
-            None => self.create_conversation_for_session(session, platform).await?,
+            None => {
+                self.create_conversation_for_session(owner_user_id, session, platform)
+                    .await?
+            }
         };
 
         // Send message through ConversationService. `msg_id` is now
@@ -77,7 +78,7 @@ impl ChannelMessageService {
             hidden: false,
         };
 
-        let user_id = &self.owner_user_id;
+        let user_id = owner_user_id;
         // Channel relays need a stream subscription before the agent starts
         // emitting. `ConversationService::send_message` returns immediately
         // and builds cold agents in the background, so warm the conversation
@@ -121,16 +122,17 @@ impl ChannelMessageService {
     /// for per-chat isolation.
     async fn create_conversation_for_session(
         &self,
+        owner_user_id: &str,
         session: &AssistantSessionRow,
         platform: PluginType,
     ) -> Result<String, ChannelError> {
         let source = platform_to_source(platform);
         let agent_config = self
             .settings
-            .get_agent_config(platform)
+            .get_agent_config(owner_user_id, platform)
             .await
             .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
-        let assistant_setting = self.settings.get_assistant_setting(platform).await?;
+        let assistant_setting = self.settings.get_assistant_setting(owner_user_id, platform).await?;
         let assistant_id = assistant_setting
             .as_ref()
             .and_then(|setting| setting.assistant_id.as_deref())
@@ -141,7 +143,7 @@ impl ChannelMessageService {
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .map(ToOwned::to_owned);
-        let model_config = self.settings.get_model_config(platform).await?;
+        let model_config = self.settings.get_model_config(owner_user_id, platform).await?;
         let agent_type = parse_agent_type(&agent_config.agent_type)?;
         let model = resolved_model_to_provider(model_config.as_ref());
         let mut extra = Self::build_channel_extra(if assistant_id.is_some() {
@@ -182,7 +184,7 @@ impl ChannelMessageService {
 
         let response = self
             .conversation_svc
-            .create(&self.owner_user_id, req)
+            .create(owner_user_id, req)
             .await
             .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
 

@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use tracing::info;
 
-use aionui_app::AppConfig;
+use aionui_app::{AppConfig, IdentityMode};
 use aionui_db::Database;
 
 use crate::cli::Cli;
@@ -42,26 +42,57 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         std::env::set_var("AIONUI_WORK_DIR", &work_dir);
     }
 
+    let mut identity_mode: IdentityMode = cli.identity_mode.into();
+    if cli.local {
+        identity_mode = IdentityMode::Local;
+    }
+    let bootstrap_secret = std::env::var("AIONCORE_BOOTSTRAP_SECRET")
+        .ok()
+        .filter(|secret| !secret.is_empty());
+    validate_identity_environment(identity_mode, bootstrap_secret.as_deref())?;
+
     let config = AppConfig {
         host: cli.host.clone(),
         port: cli.port,
         data_dir: cli.data_dir.clone(),
         work_dir,
         app_version: cli.app_version.clone(),
-        local: cli.local,
+        local: cli.local || identity_mode.is_local(),
+        identity_mode,
+        bootstrap_secret,
         dump_prompts: cli.dump_prompts,
         recover_corrupted_database: cli.recover_corrupted_database,
     };
     info!(
-        "Running in {} mode — authentication is {}",
-        if config.local { "local" } else { "remote" },
-        if config.local { "disabled" } else { "enabled" }
+        identity_mode = config.identity_mode.auth_label(),
+        auth = if config.identity_mode.is_local() {
+            "disabled"
+        } else {
+            "enabled"
+        },
+        bootstrap_secret_configured = config.bootstrap_secret.is_some(),
+        "startup: identity mode resolved"
     );
 
     Ok(ServerEnvironment {
         _log_guard: log_guard,
         config,
     })
+}
+
+fn validate_identity_environment(
+    identity_mode: IdentityMode,
+    bootstrap_secret: Option<&str>,
+) -> Result<(), BootstrapError> {
+    if identity_mode == IdentityMode::AionPro && bootstrap_secret.is_none() {
+        return Err(BootstrapError::new(
+            BootstrapErrorCode::ConfigInvalid,
+            "config.identity_mode",
+            "AionPro identity mode requires AIONCORE_BOOTSTRAP_SECRET",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Layer 2: Materialize builtin skills + initialize the database.
@@ -120,6 +151,8 @@ pub async fn init_data_layer(config: &AppConfig) -> Result<Database, BootstrapEr
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn database_stage_comes_from_db_boundary_error() {
         let err = aionui_db::DatabaseInitError::new(
@@ -151,5 +184,28 @@ mod tests {
         );
 
         assert_eq!(err.stage(), "database.recoverable_corruption");
+    }
+
+    #[test]
+    fn aionpro_identity_requires_bootstrap_secret() {
+        let err = validate_identity_environment(IdentityMode::AionPro, None)
+            .expect_err("AionPro startup must require bootstrap secret");
+
+        assert_eq!(err.code(), BootstrapErrorCode::ConfigInvalid);
+        assert_eq!(err.stage(), "config.identity_mode");
+    }
+
+    #[test]
+    fn aionpro_identity_accepts_bootstrap_secret() {
+        validate_identity_environment(IdentityMode::AionPro, Some("secret"))
+            .expect("AionPro startup should accept configured bootstrap secret");
+    }
+
+    #[test]
+    fn non_aionpro_identity_does_not_require_bootstrap_secret() {
+        validate_identity_environment(IdentityMode::WebUi, None)
+            .expect("WebUI startup should not require bootstrap secret");
+        validate_identity_environment(IdentityMode::Local, None)
+            .expect("local startup should not require bootstrap secret");
     }
 }

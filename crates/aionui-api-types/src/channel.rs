@@ -254,6 +254,7 @@ pub struct ChannelSessionResponse {
 /// pairing authorization flow.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PairingRequestedPayload {
+    pub user_id: String,
     pub code: String,
     pub platform_user_id: String,
     pub platform_type: String,
@@ -267,6 +268,7 @@ pub struct PairingRequestedPayload {
 /// Pushed when a plugin starts, stops, or encounters an error.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PluginStatusChangedPayload {
+    pub user_id: String,
     pub plugin_id: String,
     pub status: PluginStatusResponse,
 }
@@ -276,6 +278,7 @@ pub struct PluginStatusChangedPayload {
 /// Pushed after a pairing code is approved and the user record is created.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UserAuthorizedPayload {
+    pub user_id: String,
     pub id: String,
     pub platform_user_id: String,
     pub platform_type: String,
@@ -684,6 +687,7 @@ mod tests {
     #[test]
     fn test_pairing_requested_payload_serde() {
         let payload = PairingRequestedPayload {
+            user_id: "user-1".into(),
             code: "123456".into(),
             platform_user_id: "tg_42".into(),
             platform_type: "telegram".into(),
@@ -691,6 +695,7 @@ mod tests {
             expires_at: 1700000600000,
         };
         let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["user_id"], "user-1");
         assert_eq!(json["code"], "123456");
         assert_eq!(json["platform_user_id"], "tg_42");
         assert_eq!(json["platform_type"], "telegram");
@@ -701,6 +706,7 @@ mod tests {
     #[test]
     fn test_pairing_requested_payload_no_display_name() {
         let payload = PairingRequestedPayload {
+            user_id: "user-1".into(),
             code: "000001".into(),
             platform_user_id: "u1".into(),
             platform_type: "dingtalk".into(),
@@ -714,6 +720,7 @@ mod tests {
     #[test]
     fn test_plugin_status_changed_payload_serde() {
         let payload = PluginStatusChangedPayload {
+            user_id: "user-1".into(),
             plugin_id: "telegram".into(),
             status: PluginStatusResponse {
                 plugin_id: "telegram".into(),
@@ -731,6 +738,7 @@ mod tests {
             },
         };
         let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["user_id"], "user-1");
         assert_eq!(json["plugin_id"], "telegram");
         assert_eq!(json["status"]["type"], "telegram");
         assert_eq!(json["status"]["status"], "running");
@@ -740,12 +748,14 @@ mod tests {
     #[test]
     fn test_user_authorized_payload_serde() {
         let payload = UserAuthorizedPayload {
+            user_id: "user-1".into(),
             id: "usr_1".into(),
             platform_user_id: "tg_42".into(),
             platform_type: "telegram".into(),
             display_name: Some("Alice".into()),
         };
         let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["user_id"], "user-1");
         assert_eq!(json["id"], "usr_1");
         assert_eq!(json["platform_user_id"], "tg_42");
         assert_eq!(json["platform_type"], "telegram");
@@ -755,6 +765,7 @@ mod tests {
     #[test]
     fn test_user_authorized_payload_no_display_name() {
         let payload = UserAuthorizedPayload {
+            user_id: "user-1".into(),
             id: "usr_2".into(),
             platform_user_id: "lk_1".into(),
             platform_type: "lark".into(),

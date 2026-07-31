@@ -9,21 +9,25 @@ use aionui_db::models::AssistantDefinitionRow;
 impl TeamSessionService {
     pub(crate) async fn describe_assistant(
         &self,
+        user_id: &str,
         assistant_id: &str,
         locale: Option<&str>,
     ) -> Result<String, TeamError> {
         let definition = self
             .assistant_definition_repo
-            .get_by_assistant_id(assistant_id)
+            .get_by_assistant_id_for_user(user_id, assistant_id)
             .await?
             .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_id}")))?;
-        let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
+        let overlay = self
+            .assistant_overlay_repo
+            .get_for_user(user_id, &definition.id)
+            .await?;
         let effective_agent_id = overlay
             .as_ref()
             .and_then(|row| row.agent_id_override.as_deref())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(definition.agent_id.as_str());
-        let effective_backend = resolve_runtime_backend(&self.agent_metadata_repo, effective_agent_id).await?;
+        let effective_backend = resolve_runtime_backend(&self.agent_metadata_repo, user_id, effective_agent_id).await?;
 
         Ok(render_assistant_description_json(
             &definition,

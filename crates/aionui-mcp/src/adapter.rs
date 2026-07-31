@@ -59,7 +59,7 @@ pub trait McpAgentAdapter: Send + Sync {
     ///
     /// Returns an empty vec if the CLI is installed but has no MCP servers.
     /// Returns `McpError::AgentNotInstalled` if the CLI is not available.
-    async fn detect_existing(&self) -> Result<Vec<DetectedServer>, McpError>;
+    async fn detect_existing(&self, _user_id: &str) -> Result<Vec<DetectedServer>, McpError>;
 
     /// Installs (or updates) an MCP server configuration in this Agent CLI.
     ///
@@ -79,6 +79,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    const TEST_USER_ID: &str = "user-1";
 
     /// In-memory mock adapter for testing the trait interface.
     struct MockAdapter {
@@ -107,7 +109,7 @@ mod tests {
             Ok(self.installed)
         }
 
-        async fn detect_existing(&self) -> Result<Vec<DetectedServer>, McpError> {
+        async fn detect_existing(&self, _user_id: &str) -> Result<Vec<DetectedServer>, McpError> {
             if !self.installed {
                 return Err(McpError::AgentNotInstalled(format!("{:?}", self.source)));
             }
@@ -166,7 +168,7 @@ mod tests {
 
         adapter.install_server("test-mcp", &transport).await.unwrap();
 
-        let detected = adapter.detect_existing().await.unwrap();
+        let detected = adapter.detect_existing(TEST_USER_ID).await.unwrap();
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].name, "test-mcp");
         assert_eq!(detected[0].transport, transport);
@@ -189,7 +191,7 @@ mod tests {
         adapter.install_server("test-mcp", &t1).await.unwrap();
         adapter.install_server("test-mcp", &t2).await.unwrap();
 
-        let detected = adapter.detect_existing().await.unwrap();
+        let detected = adapter.detect_existing(TEST_USER_ID).await.unwrap();
         assert_eq!(detected.len(), 1);
         match &detected[0].transport {
             McpServerTransport::Stdio { command, .. } => assert_eq!(command, "new"),
@@ -207,7 +209,7 @@ mod tests {
         adapter.install_server("srv", &transport).await.unwrap();
         adapter.remove_server("srv").await.unwrap();
 
-        let detected = adapter.detect_existing().await.unwrap();
+        let detected = adapter.detect_existing(TEST_USER_ID).await.unwrap();
         assert!(detected.is_empty());
     }
 
@@ -221,7 +223,7 @@ mod tests {
     #[tokio::test]
     async fn not_installed_detect_fails() {
         let adapter = MockAdapter::new(McpSource::Qwen, false);
-        let result = adapter.detect_existing().await;
+        let result = adapter.detect_existing(TEST_USER_ID).await;
         assert!(matches!(result, Err(McpError::AgentNotInstalled(_))));
     }
 

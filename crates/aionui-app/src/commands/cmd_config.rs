@@ -21,6 +21,7 @@ use crate::commands::config_capabilities;
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
 const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
 const ENV_USER_ID: &str = "AIONUI_USER_ID";
+const ENV_RUNTIME_TOKEN: &str = "AIONUI_RUNTIME_TOKEN";
 
 pub async fn run_config(args: ConfigArgs) -> ExitCode {
     match run(args).await {
@@ -1241,6 +1242,10 @@ struct ConfigEnv {
     base_url: String,
     conversation_id: String,
     user_id: String,
+    /// Conversation-helper credential minted by the backend. Optional so the
+    /// CLI stays usable against runtimes that predate token injection; the
+    /// backend rejects tokenless requests in AionPro mode.
+    runtime_token: Option<String>,
 }
 
 impl ConfigEnv {
@@ -1249,8 +1254,16 @@ impl ConfigEnv {
             base_url: required_env(command, ENV_BASE_URL)?.trim_end_matches('/').to_owned(),
             conversation_id: required_env(command, ENV_CONVERSATION_ID)?,
             user_id: required_env(command, ENV_USER_ID)?,
+            runtime_token: optional_env(ENV_RUNTIME_TOKEN),
         })
     }
+}
+
+fn optional_env(name: &'static str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn required_env(command: &str, name: &'static str) -> Result<String, ConfigError> {
@@ -1318,7 +1331,7 @@ async fn resolve_top_level_selectors(
         object.insert("conversation_id".into(), Value::String(env.conversation_id.clone()));
         selectors.insert("conversation_id", env.conversation_id.clone());
     }
-    if is_current_selector(object.get("user_id")) {
+    if object.contains_key("user_id") {
         object.insert("user_id".into(), Value::String(env.user_id.clone()));
         selectors.insert("user_id", env.user_id.clone());
     }
@@ -1385,6 +1398,9 @@ async fn request_json(
         .header("content-type", "application/json")
         .header("x-aionui-conversation-id", &env.conversation_id)
         .header("x-aionui-user-id", &env.user_id);
+    if let Some(runtime_token) = &env.runtime_token {
+        request = request.header("x-aionui-runtime-token", runtime_token);
+    }
     if let Some(body) = body {
         request = request.json(&body);
     }
@@ -1798,5 +1814,28 @@ mod tests {
     #[test]
     fn path_segments_are_percent_encoded() {
         assert_eq!(encode_path_segment("a/b c"), "a%2Fb%20c");
+    }
+
+    #[tokio::test]
+    async fn top_level_user_id_is_always_bound_to_config_env() {
+        let client = reqwest::Client::new();
+        let env = ConfigEnv {
+            base_url: "http://127.0.0.1".into(),
+            conversation_id: "conv-current".into(),
+            user_id: "user-current".into(),
+            runtime_token: None,
+        };
+        let mut payload = json!({
+            "user_id": "user-other",
+            "name": "Task"
+        });
+        let mut selectors = SelectorMeta::default();
+
+        resolve_top_level_selectors(&client, &env, "config cron jobs update", &mut payload, &mut selectors)
+            .await
+            .unwrap();
+
+        assert_eq!(payload["user_id"], "user-current");
+        assert_eq!(selectors.into_map()["resolved_selectors"]["user_id"], "user-current");
     }
 }

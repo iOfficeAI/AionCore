@@ -14,6 +14,7 @@ use crate::types::{OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
 /// Configuration for a stream relay session.
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
+    pub owner_user_id: String,
     pub platform: PluginType,
     pub plugin_id: String,
     pub chat_id: String,
@@ -27,6 +28,7 @@ pub struct RelayConfig {
 pub trait ChannelSender: Send + Sync {
     async fn send_message(
         &self,
+        owner_user_id: &str,
         plugin_id: &str,
         chat_id: &str,
         message: UnifiedOutgoingMessage,
@@ -34,6 +36,7 @@ pub trait ChannelSender: Send + Sync {
 
     async fn edit_message(
         &self,
+        owner_user_id: &str,
         plugin_id: &str,
         chat_id: &str,
         message_id: &str,
@@ -85,7 +88,12 @@ impl ChannelStreamRelay {
                         let flush_msg = ChannelMessageService::build_streaming_message(&formatted);
                         let _ = self
                             .sender
-                            .send_message(&self.config.plugin_id, &self.config.chat_id, flush_msg)
+                            .send_message(
+                                &self.config.owner_user_id,
+                                &self.config.plugin_id,
+                                &self.config.chat_id,
+                                flush_msg,
+                            )
                             .await;
                         text_buffer.clear();
                         has_content = false;
@@ -97,7 +105,12 @@ impl ChannelStreamRelay {
                             let final_msg = ChannelMessageService::build_final_message(&formatted);
                             let _ = self
                                 .sender
-                                .send_message(&self.config.plugin_id, &self.config.chat_id, final_msg)
+                                .send_message(
+                                    &self.config.owner_user_id,
+                                    &self.config.plugin_id,
+                                    &self.config.chat_id,
+                                    final_msg,
+                                )
                                 .await;
                         }
                         info!(
@@ -124,7 +137,12 @@ impl ChannelStreamRelay {
                         };
                         let _ = self
                             .sender
-                            .send_message(&self.config.plugin_id, &self.config.chat_id, error_msg)
+                            .send_message(
+                                &self.config.owner_user_id,
+                                &self.config.plugin_id,
+                                &self.config.chat_id,
+                                error_msg,
+                            )
                             .await;
                         break;
                     }
@@ -136,7 +154,12 @@ impl ChannelStreamRelay {
                         let final_msg = ChannelMessageService::build_final_message(&formatted);
                         let _ = self
                             .sender
-                            .send_message(&self.config.plugin_id, &self.config.chat_id, final_msg)
+                            .send_message(
+                                &self.config.owner_user_id,
+                                &self.config.plugin_id,
+                                &self.config.chat_id,
+                                final_msg,
+                            )
                             .await;
                     }
                     break;
@@ -161,7 +184,12 @@ impl ChannelStreamRelay {
         let thinking_msg = ChannelMessageService::build_thinking_message();
         let thinking_msg_id = match self
             .sender
-            .send_message(&self.config.plugin_id, &self.config.chat_id, thinking_msg)
+            .send_message(
+                &self.config.owner_user_id,
+                &self.config.plugin_id,
+                &self.config.chat_id,
+                thinking_msg,
+            )
             .await
         {
             Ok(id) => id,
@@ -186,7 +214,13 @@ impl ChannelStreamRelay {
                             let msg = ChannelMessageService::build_streaming_message(&formatted);
                             let _ = self
                                 .sender
-                                .edit_message(&self.config.plugin_id, &self.config.chat_id, &thinking_msg_id, msg)
+                                .edit_message(
+                                    &self.config.owner_user_id,
+                                    &self.config.plugin_id,
+                                    &self.config.chat_id,
+                                    &thinking_msg_id,
+                                    msg,
+                                )
                                 .await;
                             last_edit = Instant::now();
                         }
@@ -196,7 +230,13 @@ impl ChannelStreamRelay {
                         let msg = ChannelMessageService::build_streaming_message(&format!("\u{23f3} {name}..."));
                         let _ = self
                             .sender
-                            .edit_message(&self.config.plugin_id, &self.config.chat_id, &thinking_msg_id, msg)
+                            .edit_message(
+                                &self.config.owner_user_id,
+                                &self.config.plugin_id,
+                                &self.config.chat_id,
+                                &thinking_msg_id,
+                                msg,
+                            )
                             .await;
                     }
                     Some(StreamAction::Finish) => {
@@ -226,6 +266,7 @@ impl ChannelStreamRelay {
                         let _ = self
                             .sender
                             .edit_message(
+                                &self.config.owner_user_id,
                                 &self.config.plugin_id,
                                 &self.config.chat_id,
                                 &thinking_msg_id,
@@ -260,7 +301,13 @@ impl ChannelStreamRelay {
             let final_msg = ChannelMessageService::build_final_message(&formatted);
             let _ = self
                 .sender
-                .edit_message(&self.config.plugin_id, &self.config.chat_id, msg_id, final_msg)
+                .edit_message(
+                    &self.config.owner_user_id,
+                    &self.config.plugin_id,
+                    &self.config.chat_id,
+                    msg_id,
+                    final_msg,
+                )
                 .await;
         }
     }
@@ -309,6 +356,7 @@ impl Default for MessageRecorder {
 impl ChannelSender for MessageRecorder {
     async fn send_message(
         &self,
+        _owner_user_id: &str,
         _plugin_id: &str,
         _chat_id: &str,
         message: UnifiedOutgoingMessage,
@@ -319,6 +367,7 @@ impl ChannelSender for MessageRecorder {
 
     async fn edit_message(
         &self,
+        _owner_user_id: &str,
         _plugin_id: &str,
         _chat_id: &str,
         _message_id: &str,

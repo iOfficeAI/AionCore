@@ -62,7 +62,10 @@ impl TeamWorkspaceResolver {
             return Ok(leader_workspace);
         }
 
-        let workspace = self.conversation_port.create_team_temp_workspace(&row.id).await?;
+        let workspace = self
+            .conversation_port
+            .create_team_temp_workspace(&row.user_id, &row.id)
+            .await?;
         let workspace = validate_runtime_workspace_path(&workspace)?;
         self.write_team_workspace(&row.id, &workspace).await?;
         self.patch_leader_workspace_best_effort(&row.id, team, &workspace).await;
@@ -94,8 +97,14 @@ impl TeamWorkspaceResolver {
     }
 
     async fn write_team_workspace(&self, team_id: &str, workspace: &str) -> Result<(), TeamError> {
+        let row = self
+            .repo
+            .get_team_for_restore(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
         self.repo
             .update_team(
+                &row.user_id,
                 team_id,
                 &UpdateTeamParams {
                     workspace: Some(workspace.to_owned()),

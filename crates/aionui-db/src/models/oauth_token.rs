@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 /// encrypted; callers handle encryption/decryption.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct OAuthTokenRow {
+    pub user_id: String,
     /// MCP server URL (primary key).
     pub server_url: String,
     /// Encrypted OAuth access token.

@@ -691,6 +691,17 @@ impl crate::traits::IFileService for FileService {
     }
 
     async fn write_file(&self, path: &str, data: &[u8], workspace: &str) -> Result<bool, FileError> {
+        self.write_file_for_user("system_default_user", path, data, workspace)
+            .await
+    }
+
+    async fn write_file_for_user(
+        &self,
+        user_id: &str,
+        path: &str,
+        data: &[u8],
+        workspace: &str,
+    ) -> Result<bool, FileError> {
         if has_traversal(path) {
             return Err(FileError::BadRequest(format!(
                 "path '{}' contains invalid traversal patterns",
@@ -724,7 +735,8 @@ impl crate::traits::IFileService for FileService {
             relative_path,
             operation: ContentUpdateOperation::Write,
         };
-        let payload = serde_json::to_value(&event).unwrap_or_default();
+        let mut payload = serde_json::to_value(&event).unwrap_or_default();
+        payload["user_id"] = serde_json::Value::String(user_id.to_owned());
         let msg = WebSocketMessage::new("fileStream.contentUpdate", payload);
         self.broadcaster.broadcast(msg);
 
@@ -765,12 +777,24 @@ impl crate::traits::IFileService for FileService {
             let mut copied = Vec::new();
             let mut failed = Vec::new();
 
+            let mut fail = |fp: &str, reason: &str| {
+                failed.push(aionui_api_types::CopyFailure {
+                    path: fp.to_owned(),
+                    reason: reason.to_owned(),
+                });
+            };
+
             for fp in &file_paths_owned {
                 let source_extra = source_root_owned.as_deref().or_else(|| Path::new(fp).parent());
                 let src = match validate_path_with_extra_root(fp, &roots_refs, source_extra) {
                     Ok(p) if p.is_file() => p,
-                    _ => {
-                        failed.push(fp.clone());
+                    Ok(_) => {
+                        // Directories are not copied this round (files-only).
+                        fail(fp, "not a file (directories are not supported yet)");
+                        continue;
+                    }
+                    Err(_) => {
+                        fail(fp, "source is not accessible or outside the allowed roots");
                         continue;
                     }
                 };
@@ -784,9 +808,14 @@ impl crate::traits::IFileService for FileService {
                 };
 
                 let dest = ws_canonical.join(&relative);
+                // Never silently overwrite: a name collision is a reported failure.
+                if dest.exists() {
+                    fail(fp, "a file with the same name already exists at the destination");
+                    continue;
+                }
                 match copy_single_file_sync(&src, &dest) {
                     Ok(()) => copied.push(fp.clone()),
-                    Err(_) => failed.push(fp.clone()),
+                    Err(_) => fail(fp, "copy failed"),
                 }
             }
 
@@ -800,6 +829,10 @@ impl crate::traits::IFileService for FileService {
     }
 
     async fn remove_entry(&self, path: &str, workspace: &str) -> Result<(), FileError> {
+        self.remove_entry_for_user("system_default_user", path, workspace).await
+    }
+
+    async fn remove_entry_for_user(&self, user_id: &str, path: &str, workspace: &str) -> Result<(), FileError> {
         if has_traversal(path) {
             return Err(FileError::BadRequest(format!(
                 "path '{}' contains invalid traversal patterns",
@@ -831,7 +864,8 @@ impl crate::traits::IFileService for FileService {
             relative_path,
             operation: ContentUpdateOperation::Delete,
         };
-        let payload = serde_json::to_value(&event).unwrap_or_default();
+        let mut payload = serde_json::to_value(&event).unwrap_or_default();
+        payload["user_id"] = serde_json::Value::String(user_id.to_owned());
         let msg = WebSocketMessage::new("fileStream.contentUpdate", payload);
         self.broadcaster.broadcast(msg);
 

@@ -34,6 +34,9 @@ pub struct TokenPayload {
     pub iss: String,
     /// Audience (standard JWT claim).
     pub aud: String,
+    /// User session generation at token issuance time.
+    #[serde(default)]
+    pub session_generation: i64,
 }
 
 /// JWT service for signing, verification, and token blacklisting.
@@ -59,6 +62,16 @@ impl JwtService {
 
     /// Sign a new JWT for the given user. The token expires after 24 hours.
     pub fn sign(&self, user_id: &str, username: &str) -> Result<String, AuthError> {
+        self.sign_with_session_generation(user_id, username, 0)
+    }
+
+    /// Sign a new JWT bound to the user's current session generation.
+    pub fn sign_with_session_generation(
+        &self,
+        user_id: &str,
+        username: &str,
+        session_generation: i64,
+    ) -> Result<String, AuthError> {
         let now = now_secs()?;
         let exp = now + TOKEN_EXPIRY.as_secs();
 
@@ -69,6 +82,7 @@ impl JwtService {
             exp,
             iss: JWT_ISSUER.to_owned(),
             aud: JWT_AUDIENCE.to_owned(),
+            session_generation,
         };
 
         let secret = self
@@ -228,9 +242,19 @@ mod tests {
         let payload = service.verify(&token).unwrap();
         assert_eq!(payload.user_id, "user_1");
         assert_eq!(payload.username, "admin");
+        assert_eq!(payload.session_generation, 0);
         assert_eq!(payload.iss, JWT_ISSUER);
         assert_eq!(payload.aud, JWT_AUDIENCE);
         assert!(payload.exp > payload.iat);
+    }
+
+    #[test]
+    fn sign_with_session_generation_roundtrip() {
+        let service = test_service();
+        let token = service.sign_with_session_generation("user_1", "admin", 7).unwrap();
+        let payload = service.verify(&token).unwrap();
+        assert_eq!(payload.user_id, "user_1");
+        assert_eq!(payload.session_generation, 7);
     }
 
     #[test]
@@ -261,6 +285,7 @@ mod tests {
             exp: 1001,
             iss: JWT_ISSUER.into(),
             aud: JWT_AUDIENCE.into(),
+            session_generation: 0,
         };
         let token = encode(
             &Header::default(),
@@ -342,6 +367,7 @@ mod tests {
             exp: 1001,
             iss: JWT_ISSUER.into(),
             aud: JWT_AUDIENCE.into(),
+            session_generation: 0,
         };
         let token = encode(
             &Header::default(),

@@ -130,7 +130,7 @@ async fn copy_files_partial_failure() {
 
     assert_eq!(result.copied_files.len(), 1);
     assert_eq!(result.failed_files.len(), 1);
-    assert!(result.failed_files[0].contains("missing.txt"));
+    assert!(result.failed_files[0].path.contains("missing.txt"));
 }
 
 #[tokio::test]

@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+const TEST_USER_ID: &str = "system_default_user";
+
 use aionui_common::McpSource;
 use aionui_mcp::{DetectedServer, McpAgentAdapter, McpError, McpServerTransport};
 
@@ -39,7 +41,7 @@ impl McpAgentAdapter for InMemoryAdapter {
         Ok(self.installed)
     }
 
-    async fn detect_existing(&self) -> Result<Vec<DetectedServer>, McpError> {
+    async fn detect_existing(&self, _user_id: &str) -> Result<Vec<DetectedServer>, McpError> {
         if !self.installed {
             return Err(McpError::AgentNotInstalled(format!("{:?}", self.source)));
         }
@@ -81,7 +83,7 @@ async fn trait_object_safety_with_arc() {
 
     assert_eq!(adapter.source(), McpSource::Claude);
     assert!(adapter.is_installed().await.unwrap());
-    assert!(adapter.detect_existing().await.unwrap().is_empty());
+    assert!(adapter.detect_existing(TEST_USER_ID).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -103,7 +105,7 @@ async fn full_lifecycle_install_detect_remove() {
     adapter.install_server("server-b", &t2).await.unwrap();
 
     // Detect both
-    let detected = adapter.detect_existing().await.unwrap();
+    let detected = adapter.detect_existing(TEST_USER_ID).await.unwrap();
     assert_eq!(detected.len(), 2);
 
     let names: Vec<&str> = detected.iter().map(|s| s.name.as_str()).collect();
@@ -112,13 +114,13 @@ async fn full_lifecycle_install_detect_remove() {
 
     // Remove one
     adapter.remove_server("server-a").await.unwrap();
-    let detected = adapter.detect_existing().await.unwrap();
+    let detected = adapter.detect_existing(TEST_USER_ID).await.unwrap();
     assert_eq!(detected.len(), 1);
     assert_eq!(detected[0].name, "server-b");
 
     // Remove the other
     adapter.remove_server("server-b").await.unwrap();
-    let detected = adapter.detect_existing().await.unwrap();
+    let detected = adapter.detect_existing(TEST_USER_ID).await.unwrap();
     assert!(detected.is_empty());
 }
 
@@ -140,7 +142,7 @@ async fn install_replaces_existing_by_name() {
     adapter.install_server("my-server", &t1).await.unwrap();
     adapter.install_server("my-server", &t2).await.unwrap();
 
-    let detected = adapter.detect_existing().await.unwrap();
+    let detected = adapter.detect_existing(TEST_USER_ID).await.unwrap();
     assert_eq!(detected.len(), 1);
     assert_eq!(detected[0].transport, t2);
 }
@@ -158,7 +160,7 @@ async fn not_installed_errors() {
 
     assert!(!adapter.is_installed().await.unwrap());
 
-    let err = adapter.detect_existing().await.unwrap_err();
+    let err = adapter.detect_existing(TEST_USER_ID).await.unwrap_err();
     assert!(matches!(err, McpError::AgentNotInstalled(_)));
 
     let transport = McpServerTransport::Stdio {
@@ -187,6 +189,6 @@ async fn multiple_adapters_independent() {
     claude.install_server("shared-server", &transport).await.unwrap();
 
     // Claude has the server, Gemini does not
-    assert_eq!(claude.detect_existing().await.unwrap().len(), 1);
-    assert!(gemini.detect_existing().await.unwrap().is_empty());
+    assert_eq!(claude.detect_existing(TEST_USER_ID).await.unwrap().len(), 1);
+    assert!(gemini.detect_existing(TEST_USER_ID).await.unwrap().is_empty());
 }

@@ -66,7 +66,7 @@ async fn seed_stt_prefs(app: &TestApp, config: Value) {
     let service = aionui_system::ClientPrefService::new(repo);
     let mut req = aionui_api_types::UpdateClientPreferencesRequest::new();
     req.insert("tools.speechToText".to_owned(), config);
-    service.update_preferences(req).await.unwrap();
+    service.update_preferences("system_default_user", req).await.unwrap();
 }
 
 type ClientWs = WebSocketStream<MaybeTlsStream<TcpStream>>;

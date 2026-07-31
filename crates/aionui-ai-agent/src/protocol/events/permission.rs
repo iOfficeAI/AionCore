@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::Meta as SdkMeta;
+use agent_client_protocol::schema::v1::Meta as SdkMeta;
 use aionui_common::{Confirmation, ConfirmationOption};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -7,6 +7,11 @@ use super::tool_call::{AcpToolCallContentItem, AcpToolCallKind, AcpToolCallLocat
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+// The Request variant grew past clippy's size threshold with SDK 2.0's larger
+// Meta type. Boxing it would ripple into every construction/match site
+// (including session_agent.rs) for a transient event value that is not stored
+// in bulk, so the size difference is accepted instead.
+#[allow(clippy::large_enum_variant)]
 pub enum AcpPermissionEventData {
     Request(AcpPermissionRequestData),
     Confirmation(Confirmation),

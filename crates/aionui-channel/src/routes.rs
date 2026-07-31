@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, Path, State};
+use axum::extract::{Extension, Json, Path, State};
+use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 use tracing::warn;
 
@@ -14,6 +15,7 @@ use aionui_api_types::{
     EnablePluginRequest, PairingRequestResponse, PluginStatusResponse, RejectPairingRequest, RevokeUserRequest,
     SyncChannelSettingsRequest, TestPluginRequest, TestPluginResponse,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_db::{DbError, IChannelRepository};
 use aionui_extension::{ExtensionRegistry, ResolvedChannelPlugin};
@@ -47,6 +49,9 @@ pub struct ChannelRouterState {
 fn db_error_to_api_error(err: DbError) -> ApiError {
     match err {
         DbError::NotFound(msg) => ApiError::NotFound(msg),
+        DbError::Conflict(msg) if msg.starts_with("CROSS_ACCOUNT_REFERENCE:") => {
+            ApiError::coded(StatusCode::CONFLICT, "CROSS_ACCOUNT_REFERENCE", msg, None)
+        }
         DbError::Conflict(msg) => ApiError::Conflict(msg),
         DbError::Query(e) => ApiError::Internal(format!("Database error: {e}")),
         DbError::Migration(e) => ApiError::Internal(format!("Migration error: {e}")),
@@ -132,9 +137,10 @@ pub fn weixin_login_route(state: ChannelRouterState) -> Router {
 /// `GET /api/channel/plugins` — get status of all registered plugins.
 async fn get_plugin_status(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<ChannelPluginStatusView>>>, ApiError> {
-    let statuses = state.manager.get_plugin_status().await?;
-    let extension_plugins = state.extension_registry.get_channel_plugins().await;
+    let statuses = state.manager.get_plugin_status(&user.id).await?;
+    let extension_plugins = state.extension_registry.get_channel_plugins_for_user(&user.id).await;
 
     let extension_map: HashMap<String, ResolvedChannelPlugin> = extension_plugins
         .into_iter()
@@ -307,15 +313,16 @@ impl From<&ResolvedChannelPlugin> for ChannelExtensionMetaView {
 /// `POST /api/channel/plugins/enable` — enable a plugin with config.
 async fn enable_plugin(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<EnablePluginRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    if let Some(extension_plugin) = resolve_extension_channel_plugin(&state, &req.plugin_id).await {
+    if let Some(extension_plugin) = resolve_extension_channel_plugin(&state, &user.id, &req.plugin_id).await {
         let config = build_extension_config(&extension_plugin, &req.config)?;
         match state
             .manager
-            .enable_extension_plugin(&req.plugin_id, &extension_plugin.name, &config)
+            .enable_extension_plugin(&user.id, &req.plugin_id, &extension_plugin.name, &config)
             .await
         {
             Ok(()) => {
@@ -338,7 +345,7 @@ async fn enable_plugin(
 
     match state
         .manager
-        .enable_plugin(&req.plugin_id, &req.config, state.plugin_factory.as_ref())
+        .enable_plugin(&user.id, &req.plugin_id, &req.config, state.plugin_factory.as_ref())
         .await
     {
         Ok(()) => Ok(Json(ApiResponse::ok(BridgeResponse {
@@ -360,14 +367,17 @@ async fn enable_plugin(
 /// `POST /api/channel/plugins/disable` — disable a plugin.
 async fn disable_plugin(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<DisablePluginRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    if resolve_extension_channel_plugin(&state, &req.plugin_id).await.is_some()
+    if resolve_extension_channel_plugin(&state, &user.id, &req.plugin_id)
+        .await
+        .is_some()
         && state
             .repo
-            .get_plugin(&req.plugin_id)
+            .get_plugin(&user.id, &req.plugin_id)
             .await
             .map_err(db_error_to_api_error)?
             .is_none()
@@ -379,7 +389,7 @@ async fn disable_plugin(
         })));
     }
 
-    match state.manager.disable_plugin(&req.plugin_id).await {
+    match state.manager.disable_plugin(&user.id, &req.plugin_id).await {
         Ok(()) => Ok(Json(ApiResponse::ok(BridgeResponse {
             success: true,
             message: Some("Plugin disabled".into()),
@@ -399,11 +409,12 @@ async fn disable_plugin(
 /// `POST /api/channel/plugins/test` — test plugin credentials.
 async fn test_plugin(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<TestPluginRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TestPluginResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    if let Some(extension_plugin) = resolve_extension_channel_plugin(&state, &req.plugin_id).await {
+    if let Some(extension_plugin) = resolve_extension_channel_plugin(&state, &user.id, &req.plugin_id).await {
         let _config = build_extension_test_config(&extension_plugin, &req)?;
         return Ok(Json(ApiResponse::ok(TestPluginResponse {
             success: true,
@@ -439,8 +450,9 @@ async fn test_plugin(
 /// `GET /api/channel/pairings` — get all pending pairing requests.
 async fn get_pending_pairings(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<PairingRequestResponse>>>, ApiError> {
-    let rows = state.pairing_service.get_pending_pairings().await?;
+    let rows = state.pairing_service.get_pending_pairings(&user.id).await?;
     let responses: Vec<PairingRequestResponse> = rows
         .into_iter()
         .map(|r| PairingRequestResponse {
@@ -458,11 +470,12 @@ async fn get_pending_pairings(
 /// `POST /api/channel/pairings/approve` — approve a pairing request.
 async fn approve_pairing(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ApprovePairingRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    state.pairing_service.approve_pairing(&req.code).await?;
+    state.pairing_service.approve_pairing(&user.id, &req.code).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -474,11 +487,12 @@ async fn approve_pairing(
 /// `POST /api/channel/pairings/reject` — reject a pairing request.
 async fn reject_pairing(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<RejectPairingRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    state.pairing_service.reject_pairing(&req.code).await?;
+    state.pairing_service.reject_pairing(&user.id, &req.code).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -494,8 +508,13 @@ async fn reject_pairing(
 /// `GET /api/channel/users` — get all authorized users.
 async fn get_authorized_users(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<ChannelUserResponse>>>, ApiError> {
-    let rows = state.repo.get_all_users().await.map_err(db_error_to_api_error)?;
+    let rows = state
+        .repo
+        .get_all_users(&user.id)
+        .await
+        .map_err(db_error_to_api_error)?;
     let responses: Vec<ChannelUserResponse> = rows
         .into_iter()
         .map(|r| ChannelUserResponse {
@@ -515,17 +534,21 @@ async fn get_authorized_users(
 /// Also cleans up the user's sessions.
 async fn revoke_user(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<RevokeUserRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
     // Clean up sessions first
-    state.session_manager.cleanup_user_sessions(&req.user_id).await?;
+    state
+        .session_manager
+        .cleanup_user_sessions(&user.id, &req.user_id)
+        .await?;
 
     // Delete user record
     state
         .repo
-        .delete_user(&req.user_id)
+        .delete_user(&user.id, &req.user_id)
         .await
         .map_err(db_error_to_api_error)?;
 
@@ -543,8 +566,9 @@ async fn revoke_user(
 /// `GET /api/channel/sessions` — get all active sessions.
 async fn get_active_sessions(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<ChannelSessionResponse>>>, ApiError> {
-    let rows = state.session_manager.get_active_sessions().await?;
+    let rows = state.session_manager.get_active_sessions(&user.id).await?;
     let responses: Vec<ChannelSessionResponse> = rows
         .into_iter()
         .map(|r| ChannelSessionResponse {
@@ -568,18 +592,20 @@ async fn get_active_sessions(
 /// `GET /api/channel/settings/:platform` — return backend-owned channel settings.
 async fn get_channel_settings(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(platform): Path<String>,
 ) -> Result<Json<ApiResponse<ChannelPlatformSettingsResponse>>, ApiError> {
     let platform = PluginType::from_str_opt(&platform)
         .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;
 
-    let settings = state.settings_service.get_platform_settings(platform).await?;
+    let settings = state.settings_service.get_platform_settings(&user.id, platform).await?;
     Ok(Json(ApiResponse::ok(settings)))
 }
 
 /// `PUT /api/channel/settings/:platform/assistant` — persist assistant binding for a platform.
 async fn set_channel_assistant_setting(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(platform): Path<String>,
     body: Result<Json<ChannelAssistantSettingRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
@@ -587,8 +613,11 @@ async fn set_channel_assistant_setting(
         .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;
     let Json(req) = body.map_err(ApiError::from)?;
 
-    state.settings_service.set_assistant_setting(platform, &req).await?;
-    state.session_manager.clear_all_sessions().await?;
+    state
+        .settings_service
+        .set_assistant_setting(&user.id, platform, &req)
+        .await?;
+    state.session_manager.clear_all_sessions(&user.id).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -600,6 +629,7 @@ async fn set_channel_assistant_setting(
 /// `PUT /api/channel/settings/:platform/default-model` — persist default model for a platform.
 async fn set_channel_default_model_setting(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(platform): Path<String>,
     body: Result<Json<ChannelDefaultModelSetting>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
@@ -607,8 +637,11 @@ async fn set_channel_default_model_setting(
         .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;
     let Json(req) = body.map_err(ApiError::from)?;
 
-    state.settings_service.set_model_setting(platform, &req).await?;
-    state.session_manager.clear_all_sessions().await?;
+    state
+        .settings_service
+        .set_model_setting(&user.id, platform, &req)
+        .await?;
+    state.session_manager.clear_all_sessions(&user.id).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -628,6 +661,7 @@ async fn set_channel_default_model_setting(
 /// Agent/model config is persisted separately via `PUT /api/settings/client`.
 async fn sync_channel_settings(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SyncChannelSettingsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -635,7 +669,7 @@ async fn sync_channel_settings(
     let _platform = PluginType::from_str_opt(&req.platform)
         .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", req.platform)))?;
 
-    state.session_manager.clear_all_sessions().await?;
+    state.session_manager.clear_all_sessions(&user.id).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -731,11 +765,12 @@ fn build_test_config(req: &TestPluginRequest) -> PluginConfig {
 
 async fn resolve_extension_channel_plugin(
     state: &ChannelRouterState,
+    user_id: &str,
     plugin_id: &str,
 ) -> Option<ResolvedChannelPlugin> {
     state
         .extension_registry
-        .get_channel_plugins()
+        .get_channel_plugins_for_user(user_id)
         .await
         .into_iter()
         .find(|plugin| plugin.id == plugin_id)
@@ -853,6 +888,16 @@ mod tests {
     fn plugin_already_running_maps_to_conflict() {
         let err = ApiError::from(ChannelError::PluginAlreadyRunning("telegram".into()));
         assert!(matches!(err, ApiError::Conflict(_)));
+    }
+
+    #[test]
+    fn cross_account_db_conflict_maps_to_stable_code() {
+        let err = db_error_to_api_error(DbError::Conflict(
+            "CROSS_ACCOUNT_REFERENCE: channel session conversation belongs to another user".into(),
+        ));
+
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "CROSS_ACCOUNT_REFERENCE");
     }
 
     #[test]

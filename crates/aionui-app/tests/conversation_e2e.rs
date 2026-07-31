@@ -257,8 +257,13 @@ async fn t1_3b_create_persists_available_locale_fallback_rule_in_assistant_snaps
             .any(|skill| skill == "override-skill")
     );
 
+    let user_id = conversation_repo
+        .owner_user_id(data["id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
     let snapshot = conversation_repo
-        .get_assistant_snapshot(data["id"].as_str().unwrap())
+        .get_assistant_snapshot(&user_id, data["id"].as_str().unwrap())
         .await
         .unwrap()
         .unwrap();
@@ -884,7 +889,8 @@ async fn t7_1_reset_conversation() {
         hidden: false,
         created_at: 1000,
     };
-    aionui_db::IConversationRepository::insert_message(&repo, &msg)
+    let user_id = repo.owner_user_id(&id).await.unwrap().unwrap();
+    aionui_db::IConversationRepository::insert_message(&repo, &user_id, &msg)
         .await
         .unwrap();
 
@@ -975,7 +981,8 @@ async fn team_owned_conversation_rejects_ordinary_send_but_allows_history_reads(
         hidden: false,
         created_at: 1000,
     };
-    aionui_db::IConversationRepository::insert_message(&repo, &msg)
+    let user_id = repo.owner_user_id(&id).await.unwrap().unwrap();
+    aionui_db::IConversationRepository::insert_message(&repo, &user_id, &msg)
         .await
         .unwrap();
 
@@ -1211,4 +1218,66 @@ async fn full_conversation_lifecycle() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── Two-user filesystem isolation: auto-workspace roots ───────────────
+
+/// Conversations auto-provisioned for two different Core Users must get
+/// workspace directories under DIFFERENT per-user roots
+/// (`conversations/users/{dir}/…`), and both must exist on disk.
+#[tokio::test]
+async fn auto_workspaces_of_two_users_live_under_distinct_user_roots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, services, _paths) = common::build_app_with_skill_paths(tmp.path()).await;
+
+    let (token_a, csrf_a) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token_b, csrf_b) = setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
+
+    let mut workspaces = Vec::new();
+    for (name, token, csrf) in [("A Conv", &token_a, &csrf_a), ("B Conv", &token_b, &csrf_b)] {
+        let req = json_with_token("POST", "/api/conversations", create_body(name), token, csrf);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_json(resp).await;
+        let ws = json["data"]["extra"]["workspace"]
+            .as_str()
+            .expect("auto-provisioned workspace path")
+            .to_owned();
+        workspaces.push(ws);
+    }
+
+    let user_a = services
+        .user_repo
+        .find_by_username("admin")
+        .await
+        .unwrap()
+        .expect("admin exists");
+    let user_b = services
+        .user_repo
+        .find_by_username("bob")
+        .await
+        .unwrap()
+        .expect("bob exists");
+    let dir_a = aionui_common::user_dir_name(&user_a.id).unwrap();
+    let dir_b = aionui_common::user_dir_name(&user_b.id).unwrap();
+    assert_ne!(dir_a, dir_b);
+
+    let seg_a = format!("conversations/users/{dir_a}/");
+    let seg_b = format!("conversations/users/{dir_b}/");
+    assert!(
+        workspaces[0].contains(&seg_a),
+        "A's workspace must live under its user root: {} (expected segment {seg_a})",
+        workspaces[0]
+    );
+    assert!(
+        workspaces[1].contains(&seg_b),
+        "B's workspace must live under its user root: {} (expected segment {seg_b})",
+        workspaces[1]
+    );
+    // Neither leaks into the other user's root, and both dirs exist on disk.
+    assert!(!workspaces[0].contains(&seg_b));
+    assert!(!workspaces[1].contains(&seg_a));
+    for ws in &workspaces {
+        assert!(std::path::Path::new(ws).is_dir(), "workspace dir missing: {ws}");
+    }
 }

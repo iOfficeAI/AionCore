@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RemoteAgentRow {
     pub id: String,
+    pub user_id: String,
     pub name: String,
     /// One of: "openClaw", "zeroClaw", "acp".
     pub protocol: String,

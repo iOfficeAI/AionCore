@@ -54,11 +54,23 @@ pub struct WriteFileRequest {
     pub workspace: Option<String>,
 }
 
-/// Request body for `POST /api/fs/copy` — copy files to workspace.
+/// Copy destination, addressed by explorer identity (a project folder + a
+/// relative subdirectory). The backend resolves it to an absolute directory
+/// via `resolve_reference`; device file paths are copied into it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CopyTarget {
+    pub pe_id: String,
+    /// Relative directory under the pe's folder root (`""` = the root itself).
+    pub relative_path: String,
+}
+
+/// Request body for `POST /api/fs/copy` — copy device files into a project
+/// folder (add-to-chat "paste into workspace", pe-addressed).
 #[derive(Debug, Deserialize)]
 pub struct CopyFilesRequest {
+    /// Absolute device paths of external OS files to copy in.
     pub file_paths: Vec<String>,
-    pub workspace: String,
+    pub target: CopyTarget,
     #[serde(default)]
     pub source_root: Option<String>,
 }
@@ -227,11 +239,19 @@ pub struct FileMetadataResponse {
     pub is_directory: Option<bool>,
 }
 
+/// One file that could not be copied, with a human-readable reason
+/// (e.g. name collision — the backend never silently overwrites).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopyFailure {
+    pub path: String,
+    pub reason: String,
+}
+
 /// Result of a batch copy operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CopyFilesResponse {
     pub copied_files: Vec<String>,
-    pub failed_files: Vec<String>,
+    pub failed_files: Vec<CopyFailure>,
 }
 
 /// Result of a rename operation.
@@ -352,12 +372,13 @@ mod tests {
     fn copy_files_request_snake_case() {
         let raw = json!({
             "file_paths": ["/a.txt", "/b.txt"],
-            "workspace": "/ws",
+            "target": { "pe_id": "pe1", "relative_path": "sub" },
             "source_root": "/src"
         });
         let req: CopyFilesRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.file_paths, vec!["/a.txt", "/b.txt"]);
-        assert_eq!(req.workspace, "/ws");
+        assert_eq!(req.target.pe_id, "pe1");
+        assert_eq!(req.target.relative_path, "sub");
         assert_eq!(req.source_root.as_deref(), Some("/src"));
     }
 
@@ -365,7 +386,7 @@ mod tests {
     fn copy_files_request_optional_source_root() {
         let raw = json!({
             "file_paths": ["/a.txt"],
-            "workspace": "/ws"
+            "target": { "pe_id": "pe1", "relative_path": "" }
         });
         let req: CopyFilesRequest = serde_json::from_value(raw).unwrap();
         assert!(req.source_root.is_none());
@@ -526,11 +547,15 @@ mod tests {
     fn copy_files_response_serialization() {
         let resp = CopyFilesResponse {
             copied_files: vec!["/ws/a.txt".into()],
-            failed_files: vec!["/missing.txt".into()],
+            failed_files: vec![CopyFailure {
+                path: "/missing.txt".into(),
+                reason: "not a file".into(),
+            }],
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["copied_files"][0], "/ws/a.txt");
-        assert_eq!(json["failed_files"][0], "/missing.txt");
+        assert_eq!(json["failed_files"][0]["path"], "/missing.txt");
+        assert_eq!(json["failed_files"][0]["reason"], "not a file");
     }
 
     #[test]

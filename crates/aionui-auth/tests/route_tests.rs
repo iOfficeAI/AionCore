@@ -4,7 +4,7 @@
 //! T7 (current user), T8 (change password), T9 (refresh token),
 //! T10 (ws token), T11 (QR login).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::Body;
@@ -12,8 +12,11 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use aionui_auth::{AuthRouterState, CookieConfig, JwtService, QrTokenStore, auth_routes, hash_password};
-use aionui_db::{IUserRepository, SqliteUserRepository, init_database_memory};
+use aionui_auth::{
+    AuthIdentityMode, AuthRouterState, CookieConfig, JwtService, QrTokenStore, SessionRevokedHook, auth_routes,
+    hash_password,
+};
+use aionui_db::{IUserRepository, SqliteUserRepository, UserStatus, init_database_memory};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -25,6 +28,19 @@ async fn test_app() -> (Router, TestContext) {
 }
 
 async fn test_app_with_local(local: bool) -> (Router, TestContext) {
+    test_app_with_options(local, None).await
+}
+
+async fn test_app_with_options(local: bool, bootstrap_secret: Option<&str>) -> (Router, TestContext) {
+    test_app_with_options_and_hook(local, bootstrap_secret, false, None).await
+}
+
+async fn test_app_with_options_and_hook(
+    local: bool,
+    bootstrap_secret: Option<&str>,
+    aionpro_mode: bool,
+    session_revoked_hook: Option<Arc<SessionRevokedHook>>,
+) -> (Router, TestContext) {
     let db = init_database_memory().await.unwrap();
     let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
     let jwt_service = Arc::new(JwtService::new("test_secret_for_routes".into()));
@@ -37,9 +53,20 @@ async fn test_app_with_local(local: bool) -> (Router, TestContext) {
     let state = AuthRouterState {
         jwt_service: jwt_service.clone(),
         user_repo: user_repo.clone(),
+        fs_adopter: None,
         cookie_config,
         qr_token_store: qr_token_store.clone(),
+        identity_mode: if local {
+            AuthIdentityMode::Local
+        } else if aionpro_mode {
+            AuthIdentityMode::AionPro
+        } else {
+            AuthIdentityMode::UserSession
+        },
+        bootstrap_secret: bootstrap_secret.map(Arc::<str>::from),
+        session_revoked_hook,
         local,
+        aionpro_mode,
     };
 
     let app = auth_routes(state);
@@ -88,6 +115,35 @@ fn json_post(uri: &str, body: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn json_post_with_bootstrap_secret(uri: &str, body: &str, secret: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-aioncore-bootstrap-secret", secret)
+        .body(Body::from(body.to_owned()))
+        .unwrap()
+}
+
+fn json_put_with_bootstrap_secret(uri: &str, body: &str, secret: &str) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-aioncore-bootstrap-secret", secret)
+        .body(Body::from(body.to_owned()))
+        .unwrap()
+}
+
+fn json_put_anonymous(uri: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_owned()))
+        .unwrap()
+}
+
 /// Helper: perform a JSON POST request with auth token.
 fn json_post_with_token(uri: &str, body: &str, token: &str) -> Request<Body> {
     Request::builder()
@@ -118,6 +174,21 @@ fn get_anonymous(uri: &str) -> Request<Body> {
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+fn extract_session_token(resp: &axum::response::Response) -> Option<String> {
+    resp.headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|cookie| {
+            cookie
+                .split(',')
+                .find(|part| part.trim_start().starts_with("aionui-session="))
+                .and_then(|part| part.trim_start().strip_prefix("aionui-session="))
+                .and_then(|value| value.split(';').next())
+                .map(str::to_owned)
+        })
 }
 
 /// Helper: login and return (token, user_id).
@@ -213,6 +284,21 @@ async fn t4_4_login_missing_fields() {
     let req = json_post("/login", r#"{}"#);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn login_rejects_aionpro_mode() {
+    let (app, ctx) = test_app_with_options_and_hook(false, Some("bootstrap-secret"), true, None).await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+
+    let resp = app
+        .oneshot(json_post("/login", r#"{"username":"admin","password":"StrongP@ss1"}"#))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "USER_CONTEXT_REQUIRED");
 }
 
 #[tokio::test]
@@ -579,6 +665,22 @@ async fn t9_3_refresh_missing_token() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn refresh_rejects_local_user_token_in_aionpro_mode() {
+    let (app, ctx) = test_app_with_options_and_hook(false, Some("bootstrap-secret"), true, None).await;
+    let token = ctx
+        .jwt_service
+        .sign_with_session_generation("system_default_user", "system_default_user", 0)
+        .unwrap();
+
+    let body = format!(r#"{{"token":"{token}"}}"#);
+    let resp = app.oneshot(json_post("/api/auth/refresh", &body)).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "USER_CONTEXT_REQUIRED");
+}
+
 // ===========================================================================
 // T10. WebSocket Token (GET /api/ws-token)
 // ===========================================================================
@@ -697,6 +799,19 @@ async fn t11_5_qr_login_missing_token() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn qr_login_rejects_aionpro_mode() {
+    let (app, ctx) = test_app_with_options_and_hook(false, Some("bootstrap-secret"), true, None).await;
+    let qr_token = ctx.qr_token_store.generate();
+
+    let body = format!(r#"{{"qr_token":"{qr_token}"}}"#);
+    let resp = app.oneshot(json_post("/api/auth/qr-login", &body)).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "USER_CONTEXT_REQUIRED");
+}
+
 // ===========================================================================
 // QR Login Page (GET /qr-login)
 // ===========================================================================
@@ -711,6 +826,224 @@ async fn qr_login_page_returns_html() {
     assert_eq!(resp.status(), StatusCode::OK);
     let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap();
     assert!(content_type.contains("text/html"));
+}
+
+// ===========================================================================
+// Internal external user provision and session exchange
+// ===========================================================================
+
+#[tokio::test]
+async fn external_user_provision_requires_bootstrap_secret() {
+    let (app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+
+    let resp = app
+        .oneshot(json_put_anonymous(
+            "/api/auth/internal/external-users/pro-1",
+            r#"{"user_type":"aionpro","username":"Pro User"}"#,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "BOOTSTRAP_SECRET_REQUIRED");
+}
+
+#[tokio::test]
+async fn external_user_provision_rejects_wrong_bootstrap_secret() {
+    let (app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+
+    let resp = app
+        .oneshot(json_put_with_bootstrap_secret(
+            "/api/auth/internal/external-users/pro-1",
+            r#"{"user_type":"aionpro","username":"Pro User"}"#,
+            "wrong-secret",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "INVALID_BOOTSTRAP_SECRET");
+}
+
+#[tokio::test]
+async fn external_user_provision_is_idempotent() {
+    let (app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+    let body = r#"{"user_type":"aionpro","username":"Pro User","email":"pro@example.com"}"#;
+
+    let first = app
+        .clone()
+        .oneshot(json_put_with_bootstrap_secret(
+            "/api/auth/internal/external-users/pro-1",
+            body,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_json = body_json(first).await;
+    let user_id = first_json["data"]["user_id"].as_str().unwrap().to_owned();
+    assert_eq!(first_json["data"]["user_type"], "aionpro");
+    assert_eq!(first_json["data"]["external_user_id"], "pro-1");
+
+    let second = app
+        .oneshot(json_put_with_bootstrap_secret(
+            "/api/auth/internal/external-users/pro-1",
+            r#"{"user_type":"aionpro","username":"Ignored"}"#,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_json = body_json(second).await;
+    assert_eq!(second_json["data"]["user_id"], user_id);
+}
+
+#[tokio::test]
+async fn external_session_exchange_returns_cookie_without_json_token() {
+    let (app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+
+    let provision = app
+        .clone()
+        .oneshot(json_put_with_bootstrap_secret(
+            "/api/auth/internal/external-users/pro-session",
+            r#"{"user_type":"aionpro","username":"Pro User"}"#,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(provision.status(), StatusCode::OK);
+
+    let session = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            r#"{"user_type":"aionpro","external_user_id":"pro-session"}"#,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(session.status(), StatusCode::OK);
+    assert!(session.headers().get(header::SET_COOKIE).is_some());
+    let token = extract_session_token(&session).unwrap();
+    let json = body_json(session).await;
+    assert!(json["data"].get("token").is_none());
+    assert_eq!(json["data"]["user"]["username"], "Pro User");
+
+    let user_resp = app.oneshot(get_with_token("/api/auth/user", &token)).await.unwrap();
+    assert_eq!(user_resp.status(), StatusCode::OK);
+    let user_json = body_json(user_resp).await;
+    assert_eq!(user_json["user"]["username"], "Pro User");
+}
+
+#[tokio::test]
+async fn external_session_exchange_rejects_unprovisioned_user() {
+    let (app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+
+    let resp = app
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            r#"{"user_type":"aionpro","external_user_id":"missing"}"#,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "USER_CONTEXT_REQUIRED");
+}
+
+#[tokio::test]
+async fn external_session_revoke_invalidates_existing_token() {
+    let revoked_users = Arc::new(Mutex::new(Vec::new()));
+    let hook_users = revoked_users.clone();
+    let (app, _ctx) = test_app_with_options_and_hook(
+        false,
+        Some("bootstrap-secret"),
+        false,
+        Some(Arc::new(move |user_id: &str| {
+            hook_users.lock().unwrap().push(user_id.to_owned());
+        })),
+    )
+    .await;
+
+    let provision = app
+        .clone()
+        .oneshot(json_put_with_bootstrap_secret(
+            "/api/auth/internal/external-users/pro-revoke",
+            r#"{"user_type":"aionpro","username":"Pro User"}"#,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(provision.status(), StatusCode::OK);
+
+    let session = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            r#"{"user_type":"aionpro","external_user_id":"pro-revoke"}"#,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(session.status(), StatusCode::OK);
+    let token = extract_session_token(&session).unwrap();
+    let session_json = body_json(session).await;
+    assert_eq!(session_json["data"]["session_generation"], 0);
+    assert!(session_json["data"].get("token").is_none());
+
+    let revoke = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions/revoke",
+            r#"{"user_type":"aionpro","external_user_id":"pro-revoke"}"#,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::OK);
+    let revoke_json = body_json(revoke).await;
+    assert_eq!(revoke_json["data"]["session_generation"], 1);
+    assert_eq!(
+        revoked_users.lock().unwrap().as_slice(),
+        &[revoke_json["data"]["user_id"].as_str().unwrap().to_owned()]
+    );
+
+    let user_resp = app.oneshot(get_with_token("/api/auth/user", &token)).await.unwrap();
+    assert_eq!(user_resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn external_session_exchange_rejects_disabled_user() {
+    let (app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+    let provision = app
+        .clone()
+        .oneshot(json_put_with_bootstrap_secret(
+            "/api/auth/internal/external-users/pro-disabled",
+            r#"{"user_type":"aionpro","username":"Disabled"}"#,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    let provision_json = body_json(provision).await;
+    let user_id = provision_json["data"]["user_id"].as_str().unwrap();
+    ctx.user_repo.set_status(user_id, UserStatus::Disabled).await.unwrap();
+
+    let resp = app
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            r#"{"user_type":"aionpro","external_user_id":"pro-disabled"}"#,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "USER_DISABLED");
 }
 
 // ===========================================================================
@@ -742,6 +1075,8 @@ async fn t12_2_internal_user_routes_work_in_local_mode() {
     assert_eq!(system_resp.status(), StatusCode::OK);
     let system_json = body_json(system_resp).await;
     assert_eq!(system_json["data"]["id"], "system_default_user");
+    assert!(system_json["data"].get("password_hash").is_none());
+    assert!(system_json["data"].get("jwt_secret").is_none());
 
     let user_resp = app
         .clone()
@@ -750,6 +1085,8 @@ async fn t12_2_internal_user_routes_work_in_local_mode() {
         .unwrap();
     assert_eq!(user_resp.status(), StatusCode::OK);
     let user_json = body_json(user_resp).await;
+    assert!(user_json["data"].get("password_hash").is_none());
+    assert!(user_json["data"].get("jwt_secret").is_none());
     let user_id = user_json["data"]["id"].as_str().unwrap().to_owned();
 
     let update_resp = app

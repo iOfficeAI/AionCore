@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// Public user info returned in API responses.
 ///
 /// Contains only the fields safe to expose to clients.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PublicUser {
     pub id: String,
     pub username: String,
@@ -84,6 +84,74 @@ pub struct WsTokenResponse {
     pub success: bool,
     pub ws_token: String,
     pub expires_in: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Internal AionPro user provisioning endpoints
+// ---------------------------------------------------------------------------
+
+/// Request body for `PUT /api/auth/internal/external-users/{external_user_id}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureExternalUserRequest {
+    pub user_type: ExternalUserType,
+    pub username: Option<String>,
+    pub email: Option<String>,
+    pub avatar_path: Option<String>,
+}
+
+/// Supported external identity projection sources.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExternalUserType {
+    Aionpro,
+}
+
+/// Response for successful internal external-user provisioning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureExternalUserResponse {
+    pub user_id: String,
+    pub user_type: ExternalUserType,
+    pub external_user_id: String,
+    pub session_generation: i64,
+}
+
+/// Request body for `POST /api/auth/internal/external-sessions`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureExternalSessionRequest {
+    pub user_type: ExternalUserType,
+    pub external_user_id: String,
+}
+
+/// Response for successful internal external-session exchange.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureExternalSessionResponse {
+    pub user: PublicUser,
+    pub session_generation: i64,
+}
+
+/// Request body for `POST /api/auth/internal/external-sessions/revoke`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevokeExternalSessionRequest {
+    pub user_type: ExternalUserType,
+    pub external_user_id: String,
+}
+
+/// Response for successful internal external-session revocation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevokeExternalSessionResponse {
+    pub user_id: String,
+    pub session_generation: i64,
+}
+
+/// Stable internal auth error codes for AionPro/Core session exchange.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum InternalAuthErrorCode {
+    BootstrapSecretRequired,
+    InvalidBootstrapSecret,
+    UserContextRequired,
+    UserDisabled,
+    ExternalUserConflict,
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +258,55 @@ mod tests {
         assert_eq!(json["user"]["id"], "auth_123");
         assert_eq!(json["user"]["username"], "admin");
         assert_eq!(json["token"], "eyJhbGciOi");
+    }
+
+    #[test]
+    fn test_internal_external_user_contract_serialization() {
+        let req = EnsureExternalUserRequest {
+            user_type: ExternalUserType::Aionpro,
+            username: Some("Pro User".into()),
+            email: Some("pro@example.com".into()),
+            avatar_path: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["user_type"], "aionpro");
+        assert_eq!(json["username"], "Pro User");
+        assert_eq!(json["email"], "pro@example.com");
+        assert_eq!(json["avatar_path"], serde_json::Value::Null);
+
+        let resp = EnsureExternalUserResponse {
+            user_id: "user_123".into(),
+            user_type: ExternalUserType::Aionpro,
+            external_user_id: "external_123".into(),
+            session_generation: 2,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["user_id"], "user_123");
+        assert_eq!(json["user_type"], "aionpro");
+        assert_eq!(json["external_user_id"], "external_123");
+        assert_eq!(json["session_generation"], 2);
+
+        let code = serde_json::to_value(InternalAuthErrorCode::UserContextRequired).unwrap();
+        assert_eq!(code, "USER_CONTEXT_REQUIRED");
+    }
+
+    #[test]
+    fn test_internal_external_session_revoke_contract_serialization() {
+        let req = RevokeExternalSessionRequest {
+            user_type: ExternalUserType::Aionpro,
+            external_user_id: "external_123".into(),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["user_type"], "aionpro");
+        assert_eq!(json["external_user_id"], "external_123");
+
+        let resp = RevokeExternalSessionResponse {
+            user_id: "user_123".into(),
+            session_generation: 3,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["user_id"], "user_123");
+        assert_eq!(json["session_generation"], 3);
     }
 
     #[test]

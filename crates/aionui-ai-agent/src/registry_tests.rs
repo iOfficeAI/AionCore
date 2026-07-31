@@ -361,7 +361,7 @@ async fn management_rows_mark_installed_agents_without_health_check_unchecked() 
 #[tokio::test]
 async fn hydrate_continues_when_agent_metadata_config_options_has_invalid_utf8() {
     let db = init_database_memory().await.unwrap();
-    sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE id = ?")
+    sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE agent_id = ?")
         .bind("2d23ff1c")
         .execute(db.pool())
         .await
@@ -382,7 +382,7 @@ async fn hydrate_continues_when_agent_metadata_config_options_has_invalid_utf8()
 #[tokio::test]
 async fn hydrate_keeps_valid_utf8_invalid_json_config_options_non_fatal() {
     let db = init_database_memory().await.unwrap();
-    sqlx::query("UPDATE agent_metadata SET config_options = ? WHERE id = ?")
+    sqlx::query("UPDATE agent_metadata SET config_options = ? WHERE agent_id = ?")
         .bind("not json")
         .bind("2d23ff1c")
         .execute(db.pool())

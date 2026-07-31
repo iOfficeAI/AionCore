@@ -10,6 +10,8 @@ use aionui_db::{
     init_database_memory,
 };
 
+const USER_ID: &str = "system_default_user";
+
 async fn repo() -> (Arc<dyn IRemoteAgentRepository>, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
     let r = Arc::new(SqliteRemoteAgentRepository::new(db.pool().clone()));
@@ -18,6 +20,7 @@ async fn repo() -> (Arc<dyn IRemoteAgentRepository>, aionui_db::Database) {
 
 fn bearer_params() -> CreateRemoteAgentParams<'static> {
     CreateRemoteAgentParams {
+        user_id: USER_ID,
         name: "Remote Server",
         protocol: "acp",
         url: "wss://remote.example.com",
@@ -35,6 +38,7 @@ fn bearer_params() -> CreateRemoteAgentParams<'static> {
 
 fn openclaw_params() -> CreateRemoteAgentParams<'static> {
     CreateRemoteAgentParams {
+        user_id: USER_ID,
         name: "OpenClaw Agent",
         protocol: "openClaw",
         url: "wss://openclaw.example.com",
@@ -87,7 +91,7 @@ async fn create_openclaw_agent_includes_device_fields() {
 #[tokio::test]
 async fn list_empty_returns_empty_vec() {
     let (r, _db) = repo().await;
-    let agents = r.list().await.unwrap();
+    let agents = r.list(USER_ID).await.unwrap();
     assert!(agents.is_empty());
 }
 
@@ -97,7 +101,7 @@ async fn list_returns_all_agents_ordered() {
     let a1 = r.create(bearer_params()).await.unwrap();
     let a2 = r.create(openclaw_params()).await.unwrap();
 
-    let all = r.list().await.unwrap();
+    let all = r.list(USER_ID).await.unwrap();
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].id, a1.id);
     assert_eq!(all[1].id, a2.id);
@@ -110,7 +114,7 @@ async fn find_by_id_returns_full_record() {
     let (r, _db) = repo().await;
     let created = r.create(bearer_params()).await.unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
     assert_eq!(found.id, created.id);
     assert_eq!(found.name, "Remote Server");
     assert_eq!(found.auth_token.as_deref(), Some("encrypted_bearer_token"));
@@ -120,7 +124,7 @@ async fn find_by_id_returns_full_record() {
 #[tokio::test]
 async fn find_by_id_nonexistent_returns_none() {
     let (r, _db) = repo().await;
-    let result = r.find_by_id("nonexistent-uuid").await.unwrap();
+    let result = r.find_by_id(USER_ID, "nonexistent-uuid").await.unwrap();
     assert!(result.is_none());
 }
 
@@ -133,6 +137,7 @@ async fn update_name_only_preserves_other_fields() {
 
     let updated = r
         .update(
+            USER_ID,
             &created.id,
             UpdateRemoteAgentParams {
                 name: Some("New Name"),
@@ -157,6 +162,7 @@ async fn update_multiple_fields() {
 
     let updated = r
         .update(
+            USER_ID,
             &created.id,
             UpdateRemoteAgentParams {
                 name: Some("Updated"),
@@ -177,7 +183,7 @@ async fn update_multiple_fields() {
 async fn update_nonexistent_returns_not_found() {
     let (r, _db) = repo().await;
     let err = r
-        .update("nonexistent-uuid", UpdateRemoteAgentParams::default())
+        .update(USER_ID, "nonexistent-uuid", UpdateRemoteAgentParams::default())
         .await
         .unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
@@ -192,6 +198,7 @@ async fn update_can_clear_optional_fields() {
 
     let updated = r
         .update(
+            USER_ID,
             &created.id,
             UpdateRemoteAgentParams {
                 description: Some(None),
@@ -212,6 +219,7 @@ async fn update_persists_to_database() {
     let created = r.create(bearer_params()).await.unwrap();
 
     r.update(
+        USER_ID,
         &created.id,
         UpdateRemoteAgentParams {
             name: Some("Persisted Name"),
@@ -221,7 +229,7 @@ async fn update_persists_to_database() {
     .await
     .unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
     assert_eq!(found.name, "Persisted Name");
 }
 
@@ -232,16 +240,16 @@ async fn delete_existing_removes_record() {
     let (r, _db) = repo().await;
     let created = r.create(bearer_params()).await.unwrap();
 
-    r.delete(&created.id).await.unwrap();
+    r.delete(USER_ID, &created.id).await.unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap();
+    let found = r.find_by_id(USER_ID, &created.id).await.unwrap();
     assert!(found.is_none());
 }
 
 #[tokio::test]
 async fn delete_nonexistent_returns_not_found() {
     let (r, _db) = repo().await;
-    let err = r.delete("nonexistent-uuid").await.unwrap_err();
+    let err = r.delete(USER_ID, "nonexistent-uuid").await.unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
 }
 
@@ -251,9 +259,9 @@ async fn delete_one_does_not_affect_others() {
     let a1 = r.create(bearer_params()).await.unwrap();
     let a2 = r.create(openclaw_params()).await.unwrap();
 
-    r.delete(&a1.id).await.unwrap();
+    r.delete(USER_ID, &a1.id).await.unwrap();
 
-    let remaining = r.list().await.unwrap();
+    let remaining = r.list(USER_ID).await.unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].id, a2.id);
 }
@@ -266,9 +274,11 @@ async fn update_status_to_connected_with_timestamp() {
     let created = r.create(bearer_params()).await.unwrap();
 
     let ts = aionui_common::now_ms();
-    r.update_status(&created.id, "connected", Some(ts)).await.unwrap();
+    r.update_status(USER_ID, &created.id, "connected", Some(ts))
+        .await
+        .unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
     assert_eq!(found.status, "connected");
     assert_eq!(found.last_connected_at, Some(ts));
 }
@@ -278,9 +288,9 @@ async fn update_status_to_error_without_timestamp() {
     let (r, _db) = repo().await;
     let created = r.create(bearer_params()).await.unwrap();
 
-    r.update_status(&created.id, "error", None).await.unwrap();
+    r.update_status(USER_ID, &created.id, "error", None).await.unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
     assert_eq!(found.status, "error");
     assert!(found.last_connected_at.is_none());
 }
@@ -289,7 +299,7 @@ async fn update_status_to_error_without_timestamp() {
 async fn update_status_nonexistent_returns_not_found() {
     let (r, _db) = repo().await;
     let err = r
-        .update_status("nonexistent-uuid", "connected", None)
+        .update_status(USER_ID, "nonexistent-uuid", "connected", None)
         .await
         .unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
@@ -306,12 +316,13 @@ async fn full_crud_lifecycle() {
     assert_eq!(created.name, "Remote Server");
 
     // Read
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
     assert_eq!(found.id, created.id);
 
     // Update
     let updated = r
         .update(
+            USER_ID,
             &created.id,
             UpdateRemoteAgentParams {
                 name: Some("Renamed Server"),
@@ -325,16 +336,16 @@ async fn full_crud_lifecycle() {
     assert_eq!(updated.description.as_deref(), Some("Updated desc"));
 
     // Update status
-    r.update_status(&created.id, "connected", Some(aionui_common::now_ms()))
+    r.update_status(USER_ID, &created.id, "connected", Some(aionui_common::now_ms()))
         .await
         .unwrap();
-    let after_status = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let after_status = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
     assert_eq!(after_status.status, "connected");
 
     // Delete
-    r.delete(&created.id).await.unwrap();
-    assert!(r.find_by_id(&created.id).await.unwrap().is_none());
+    r.delete(USER_ID, &created.id).await.unwrap();
+    assert!(r.find_by_id(USER_ID, &created.id).await.unwrap().is_none());
 
     // List should be empty
-    assert!(r.list().await.unwrap().is_empty());
+    assert!(r.list(USER_ID).await.unwrap().is_empty());
 }

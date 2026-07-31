@@ -10,6 +10,8 @@ use aionui_db::{
     init_database_memory,
 };
 
+const USER_ID: &str = "system_default_user";
+
 async fn repo() -> (Arc<dyn IMcpServerRepository>, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
     let r = Arc::new(SqliteMcpServerRepository::new(db.pool().clone()));
@@ -18,6 +20,7 @@ async fn repo() -> (Arc<dyn IMcpServerRepository>, aionui_db::Database) {
 
 fn stdio_params() -> CreateMcpServerParams<'static> {
     CreateMcpServerParams {
+        user_id: USER_ID,
         name: "test-mcp",
         description: Some("A test MCP server"),
         enabled: false,
@@ -31,6 +34,7 @@ fn stdio_params() -> CreateMcpServerParams<'static> {
 
 fn http_params() -> CreateMcpServerParams<'static> {
     CreateMcpServerParams {
+        user_id: USER_ID,
         name: "http-mcp",
         description: None,
         enabled: true,
@@ -44,6 +48,7 @@ fn http_params() -> CreateMcpServerParams<'static> {
 
 fn sse_params() -> CreateMcpServerParams<'static> {
     CreateMcpServerParams {
+        user_id: USER_ID,
         name: "sse-mcp",
         description: Some("SSE transport server"),
         enabled: false,
@@ -112,7 +117,7 @@ async fn find_by_id_returns_full_record() {
     let (r, _db) = repo().await;
     let created = r.create(stdio_params()).await.unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
     assert_eq!(found.id, created.id);
     assert_eq!(found.name, "test-mcp");
     assert_eq!(found.transport_type, "stdio");
@@ -122,7 +127,7 @@ async fn find_by_id_returns_full_record() {
 #[tokio::test]
 async fn find_by_id_nonexistent_returns_none() {
     let (r, _db) = repo().await;
-    assert!(r.find_by_id("nonexistent").await.unwrap().is_none());
+    assert!(r.find_by_id(USER_ID, "nonexistent").await.unwrap().is_none());
 }
 
 // -- Find by name --
@@ -132,14 +137,14 @@ async fn find_by_name_returns_matching_record() {
     let (r, _db) = repo().await;
     let created = r.create(stdio_params()).await.unwrap();
 
-    let found = r.find_by_name("test-mcp").await.unwrap().unwrap();
+    let found = r.find_by_name(USER_ID, "test-mcp").await.unwrap().unwrap();
     assert_eq!(found.id, created.id);
 }
 
 #[tokio::test]
 async fn find_by_name_nonexistent_returns_none() {
     let (r, _db) = repo().await;
-    assert!(r.find_by_name("nope").await.unwrap().is_none());
+    assert!(r.find_by_name(USER_ID, "nope").await.unwrap().is_none());
 }
 
 // -- R-3/R-4: List servers --
@@ -147,7 +152,7 @@ async fn find_by_name_nonexistent_returns_none() {
 #[tokio::test]
 async fn list_empty_returns_empty_vec() {
     let (r, _db) = repo().await;
-    let servers = r.list().await.unwrap();
+    let servers = r.list(USER_ID).await.unwrap();
     assert!(servers.is_empty());
 }
 
@@ -158,7 +163,7 @@ async fn list_returns_all_ordered_by_created_at() {
     let s2 = r.create(http_params()).await.unwrap();
     let s3 = r.create(sse_params()).await.unwrap();
 
-    let all = r.list().await.unwrap();
+    let all = r.list(USER_ID).await.unwrap();
     assert_eq!(all.len(), 3);
     assert_eq!(all[0].id, s1.id);
     assert_eq!(all[1].id, s2.id);
@@ -174,6 +179,7 @@ async fn update_name_only_preserves_other_fields() {
 
     let updated = r
         .update(
+            USER_ID,
             &created.id,
             UpdateMcpServerParams {
                 name: Some("renamed-mcp"),
@@ -197,6 +203,7 @@ async fn update_transport_type_and_config() {
 
     let updated = r
         .update(
+            USER_ID,
             &created.id,
             UpdateMcpServerParams {
                 transport_type: Some("http"),
@@ -218,6 +225,7 @@ async fn update_description() {
 
     let updated = r
         .update(
+            USER_ID,
             &created.id,
             UpdateMcpServerParams {
                 description: Some(Some("new desc")),
@@ -236,7 +244,7 @@ async fn update_description() {
 async fn update_nonexistent_returns_not_found() {
     let (r, _db) = repo().await;
     let err = r
-        .update("nonexistent", UpdateMcpServerParams::default())
+        .update(USER_ID, "nonexistent", UpdateMcpServerParams::default())
         .await
         .unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
@@ -252,6 +260,7 @@ async fn update_name_to_existing_name_returns_conflict() {
 
     let err = r
         .update(
+            USER_ID,
             &s2.id,
             UpdateMcpServerParams {
                 name: Some("test-mcp"),
@@ -274,6 +283,7 @@ async fn update_can_clear_optional_fields() {
 
     let updated = r
         .update(
+            USER_ID,
             &created.id,
             UpdateMcpServerParams {
                 description: Some(None),
@@ -296,6 +306,7 @@ async fn update_persists_to_database() {
     let created = r.create(stdio_params()).await.unwrap();
 
     r.update(
+        USER_ID,
         &created.id,
         UpdateMcpServerParams {
             enabled: Some(true),
@@ -305,7 +316,7 @@ async fn update_persists_to_database() {
     .await
     .unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
     assert!(found.enabled);
 }
 
@@ -316,9 +327,9 @@ async fn delete_existing_removes_record() {
     let (r, _db) = repo().await;
     let created = r.create(stdio_params()).await.unwrap();
 
-    r.delete(&created.id).await.unwrap();
-    assert!(r.find_by_id(&created.id).await.unwrap().is_none());
-    let deleted = r.find_by_id_any(&created.id).await.unwrap().unwrap();
+    r.delete(USER_ID, &created.id).await.unwrap();
+    assert!(r.find_by_id(USER_ID, &created.id).await.unwrap().is_none());
+    let deleted = r.find_by_id_any(USER_ID, &created.id).await.unwrap().unwrap();
     assert!(deleted.deleted_at.is_some());
     assert!(!deleted.enabled);
 }
@@ -326,7 +337,7 @@ async fn delete_existing_removes_record() {
 #[tokio::test]
 async fn delete_nonexistent_returns_not_found() {
     let (r, _db) = repo().await;
-    let err = r.delete("nonexistent").await.unwrap_err();
+    let err = r.delete(USER_ID, "nonexistent").await.unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
 }
 
@@ -336,9 +347,9 @@ async fn delete_one_does_not_affect_others() {
     let s1 = r.create(stdio_params()).await.unwrap();
     let s2 = r.create(http_params()).await.unwrap();
 
-    r.delete(&s1.id).await.unwrap();
+    r.delete(USER_ID, &s1.id).await.unwrap();
 
-    let remaining = r.list().await.unwrap();
+    let remaining = r.list(USER_ID).await.unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].id, s2.id);
 }
@@ -348,10 +359,10 @@ async fn list_by_ids_any_includes_soft_deleted_rows() {
     let (r, _db) = repo().await;
     let active = r.create(stdio_params()).await.unwrap();
     let deleted = r.create(http_params()).await.unwrap();
-    r.delete(&deleted.id).await.unwrap();
+    r.delete(USER_ID, &deleted.id).await.unwrap();
 
     let rows = r
-        .list_by_ids_any(&[deleted.id.clone(), active.id.clone()])
+        .list_by_ids_any(USER_ID, &[deleted.id.clone(), active.id.clone()])
         .await
         .unwrap();
 
@@ -369,7 +380,7 @@ async fn batch_upsert_creates_new_servers() {
     let (r, _db) = repo().await;
 
     let results = r
-        .batch_upsert(&[stdio_params(), http_params(), sse_params()])
+        .batch_upsert(USER_ID, &[stdio_params(), http_params(), sse_params()])
         .await
         .unwrap();
 
@@ -378,7 +389,7 @@ async fn batch_upsert_creates_new_servers() {
     assert_eq!(results[1].name, "http-mcp");
     assert_eq!(results[2].name, "sse-mcp");
 
-    let all = r.list().await.unwrap();
+    let all = r.list(USER_ID).await.unwrap();
     assert_eq!(all.len(), 3);
 }
 
@@ -389,14 +400,17 @@ async fn batch_upsert_updates_existing_by_name() {
     assert!(!existing.enabled);
 
     let results = r
-        .batch_upsert(&[
-            CreateMcpServerParams {
-                enabled: true,
-                description: Some("Updated via batch"),
-                ..stdio_params()
-            },
-            http_params(),
-        ])
+        .batch_upsert(
+            USER_ID,
+            &[
+                CreateMcpServerParams {
+                    enabled: true,
+                    description: Some("Updated via batch"),
+                    ..stdio_params()
+                },
+                http_params(),
+            ],
+        )
         .await
         .unwrap();
 
@@ -412,7 +426,7 @@ async fn batch_upsert_updates_existing_by_name() {
 #[tokio::test]
 async fn batch_upsert_empty_list() {
     let (r, _db) = repo().await;
-    let results = r.batch_upsert(&[]).await.unwrap();
+    let results = r.batch_upsert(USER_ID, &[]).await.unwrap();
     assert!(results.is_empty());
 }
 
@@ -424,9 +438,11 @@ async fn update_status_with_timestamp() {
     let created = r.create(stdio_params()).await.unwrap();
 
     let ts = aionui_common::now_ms();
-    r.update_status(&created.id, "connected", Some(ts)).await.unwrap();
+    r.update_status(USER_ID, &created.id, "connected", Some(ts))
+        .await
+        .unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
     assert_eq!(found.last_test_status, "connected");
     assert_eq!(found.last_connected, Some(ts));
 }
@@ -437,11 +453,13 @@ async fn update_status_without_timestamp_preserves_existing() {
     let created = r.create(stdio_params()).await.unwrap();
 
     let ts = aionui_common::now_ms();
-    r.update_status(&created.id, "connected", Some(ts)).await.unwrap();
+    r.update_status(USER_ID, &created.id, "connected", Some(ts))
+        .await
+        .unwrap();
 
-    r.update_status(&created.id, "error", None).await.unwrap();
+    r.update_status(USER_ID, &created.id, "error", None).await.unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
     assert_eq!(found.last_test_status, "error");
     assert_eq!(found.last_connected, Some(ts));
 }
@@ -449,7 +467,10 @@ async fn update_status_without_timestamp_preserves_existing() {
 #[tokio::test]
 async fn update_status_nonexistent_returns_not_found() {
     let (r, _db) = repo().await;
-    let err = r.update_status("nonexistent", "connected", None).await.unwrap_err();
+    let err = r
+        .update_status(USER_ID, "nonexistent", "connected", None)
+        .await
+        .unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
 }
 
@@ -461,9 +482,9 @@ async fn update_tools_sets_json() {
     let created = r.create(stdio_params()).await.unwrap();
 
     let tools_json = r#"[{"name":"read_file","description":"Read a file"}]"#;
-    r.update_tools(&created.id, Some(tools_json)).await.unwrap();
+    r.update_tools(USER_ID, &created.id, Some(tools_json)).await.unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
     assert_eq!(found.tools.as_deref(), Some(tools_json));
 }
 
@@ -479,16 +500,16 @@ async fn update_tools_clears_to_null() {
         .unwrap();
     assert!(created.tools.is_some());
 
-    r.update_tools(&created.id, None).await.unwrap();
+    r.update_tools(USER_ID, &created.id, None).await.unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
     assert!(found.tools.is_none());
 }
 
 #[tokio::test]
 async fn update_tools_nonexistent_returns_not_found() {
     let (r, _db) = repo().await;
-    let err = r.update_tools("nonexistent", Some("[]")).await.unwrap_err();
+    let err = r.update_tools(USER_ID, "nonexistent", Some("[]")).await.unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
 }
 
@@ -503,12 +524,13 @@ async fn full_crud_lifecycle() {
     assert_eq!(created.name, "test-mcp");
 
     // Read
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
     assert_eq!(found.id, created.id);
 
     // Update
     let updated = r
         .update(
+            USER_ID,
             &created.id,
             UpdateMcpServerParams {
                 name: Some("renamed-mcp"),
@@ -522,20 +544,20 @@ async fn full_crud_lifecycle() {
     assert!(updated.enabled);
 
     // Find by new name
-    let by_name = r.find_by_name("renamed-mcp").await.unwrap().unwrap();
+    let by_name = r.find_by_name(USER_ID, "renamed-mcp").await.unwrap().unwrap();
     assert_eq!(by_name.id, created.id);
 
     // Update status
-    r.update_status(&created.id, "connected", Some(aionui_common::now_ms()))
+    r.update_status(USER_ID, &created.id, "connected", Some(aionui_common::now_ms()))
         .await
         .unwrap();
-    let after_status = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let after_status = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
     assert_eq!(after_status.last_test_status, "connected");
 
     // Delete
-    r.delete(&created.id).await.unwrap();
-    assert!(r.find_by_id(&created.id).await.unwrap().is_none());
-    assert!(r.list().await.unwrap().is_empty());
+    r.delete(USER_ID, &created.id).await.unwrap();
+    assert!(r.find_by_id(USER_ID, &created.id).await.unwrap().is_none());
+    assert!(r.list(USER_ID).await.unwrap().is_empty());
 }
 
 // -- Builtin server --

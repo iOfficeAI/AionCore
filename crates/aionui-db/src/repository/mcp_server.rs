@@ -12,29 +12,29 @@ use crate::models::McpServerRow;
 #[async_trait::async_trait]
 pub trait IMcpServerRepository: Send + Sync {
     /// Returns all MCP servers, ordered by creation time ascending.
-    async fn list(&self) -> Result<Vec<McpServerRow>, DbError>;
+    async fn list(&self, user_id: &str) -> Result<Vec<McpServerRow>, DbError>;
 
     /// Finds an MCP server by ID, or `None` if not found.
-    async fn find_by_id(&self, id: &str) -> Result<Option<McpServerRow>, DbError>;
+    async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<McpServerRow>, DbError>;
 
     /// Finds an MCP server by name, or `None` if not found.
-    async fn find_by_name(&self, name: &str) -> Result<Option<McpServerRow>, DbError>;
+    async fn find_by_name(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, DbError>;
 
     /// Finds an MCP server by ID, including soft-deleted rows.
-    async fn find_by_id_any(&self, id: &str) -> Result<Option<McpServerRow>, DbError> {
-        self.find_by_id(id).await
+    async fn find_by_id_any(&self, user_id: &str, id: &str) -> Result<Option<McpServerRow>, DbError> {
+        self.find_by_id(user_id, id).await
     }
 
     /// Finds an MCP server by name, including soft-deleted rows.
-    async fn find_by_name_any(&self, name: &str) -> Result<Option<McpServerRow>, DbError> {
-        self.find_by_name(name).await
+    async fn find_by_name_any(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, DbError> {
+        self.find_by_name(user_id, name).await
     }
 
     /// Finds a set of MCP servers by ID, including soft-deleted rows.
-    async fn list_by_ids_any(&self, ids: &[String]) -> Result<Vec<McpServerRow>, DbError> {
+    async fn list_by_ids_any(&self, user_id: &str, ids: &[String]) -> Result<Vec<McpServerRow>, DbError> {
         let mut rows = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(row) = self.find_by_id_any(id).await? {
+            if let Some(row) = self.find_by_id_any(user_id, id).await? {
                 rows.push(row);
             }
         }
@@ -47,21 +47,27 @@ pub trait IMcpServerRepository: Send + Sync {
 
     /// Updates an existing MCP server. Returns `DbError::NotFound` if the ID
     /// doesn't exist, `DbError::Conflict` if the new name collides with another.
-    async fn update(&self, id: &str, params: UpdateMcpServerParams<'_>) -> Result<McpServerRow, DbError>;
+    async fn update(&self, user_id: &str, id: &str, params: UpdateMcpServerParams<'_>)
+    -> Result<McpServerRow, DbError>;
 
     /// Soft-deletes an MCP server by ID. Returns `DbError::NotFound` if the ID
     /// doesn't exist.
-    async fn delete(&self, id: &str) -> Result<(), DbError>;
+    async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError>;
 
     /// Upserts multiple servers by name: existing names are updated,
     /// new names are inserted. Returns the count of affected rows.
-    async fn batch_upsert(&self, servers: &[CreateMcpServerParams<'_>]) -> Result<Vec<McpServerRow>, DbError>;
+    async fn batch_upsert(
+        &self,
+        user_id: &str,
+        servers: &[CreateMcpServerParams<'_>],
+    ) -> Result<Vec<McpServerRow>, DbError>;
 
     /// Updates only the latest connection-test result status
     /// (and optionally `last_connected`).
     /// Returns `DbError::NotFound` if the ID doesn't exist.
     async fn update_status(
         &self,
+        user_id: &str,
         id: &str,
         status: &str,
         last_connected: Option<aionui_common::TimestampMs>,
@@ -69,12 +75,13 @@ pub trait IMcpServerRepository: Send + Sync {
 
     /// Updates only the tools JSON for a server.
     /// Returns `DbError::NotFound` if the ID doesn't exist.
-    async fn update_tools(&self, id: &str, tools: Option<&str>) -> Result<(), DbError>;
+    async fn update_tools(&self, user_id: &str, id: &str, tools: Option<&str>) -> Result<(), DbError>;
 }
 
 /// Parameters for creating a new MCP server.
 #[derive(Debug, Clone)]
 pub struct CreateMcpServerParams<'a> {
+    pub user_id: &'a str,
     pub name: &'a str,
     pub description: Option<&'a str>,
     pub enabled: bool,

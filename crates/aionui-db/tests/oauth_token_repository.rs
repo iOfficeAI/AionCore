@@ -9,6 +9,8 @@ use aionui_db::{
     DbError, IOAuthTokenRepository, SqliteOAuthTokenRepository, UpsertOAuthTokenParams, init_database_memory,
 };
 
+const USER_ID: &str = "system_default_user";
+
 async fn repo() -> (Arc<dyn IOAuthTokenRepository>, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
     let r = Arc::new(SqliteOAuthTokenRepository::new(db.pool().clone()));
@@ -17,6 +19,7 @@ async fn repo() -> (Arc<dyn IOAuthTokenRepository>, aionui_db::Database) {
 
 fn sample_params() -> UpsertOAuthTokenParams<'static> {
     UpsertOAuthTokenParams {
+        user_id: USER_ID,
         server_url: "https://mcp.example.com",
         access_token: "enc_access_token_123",
         refresh_token: Some("enc_refresh_token_456"),
@@ -30,7 +33,7 @@ fn sample_params() -> UpsertOAuthTokenParams<'static> {
 #[tokio::test]
 async fn get_by_url_nonexistent_returns_none() {
     let (r, _db) = repo().await;
-    assert!(r.get_by_url("https://nope.com").await.unwrap().is_none());
+    assert!(r.get_by_url(USER_ID, "https://nope.com").await.unwrap().is_none());
 }
 
 // -- OA-2: Insert and retrieve --
@@ -47,7 +50,7 @@ async fn upsert_insert_then_get_returns_token() {
     assert_eq!(inserted.expires_at, Some(1700000000000));
     assert!(inserted.created_at > 0);
 
-    let found = r.get_by_url("https://mcp.example.com").await.unwrap().unwrap();
+    let found = r.get_by_url(USER_ID, "https://mcp.example.com").await.unwrap().unwrap();
     assert_eq!(found.access_token, "enc_access_token_123");
 }
 
@@ -60,6 +63,7 @@ async fn upsert_updates_existing_token() {
 
     let updated = r
         .upsert(UpsertOAuthTokenParams {
+            user_id: USER_ID,
             server_url: "https://mcp.example.com",
             access_token: "new_access_token",
             refresh_token: None,
@@ -84,6 +88,7 @@ async fn upsert_without_refresh_token_or_expires_at() {
     let (r, _db) = repo().await;
     let token = r
         .upsert(UpsertOAuthTokenParams {
+            user_id: USER_ID,
             server_url: "https://simple.example.com",
             access_token: "simple_token",
             refresh_token: None,
@@ -104,8 +109,13 @@ async fn delete_existing_token() {
     let (r, _db) = repo().await;
     r.upsert(sample_params()).await.unwrap();
 
-    r.delete("https://mcp.example.com").await.unwrap();
-    assert!(r.get_by_url("https://mcp.example.com").await.unwrap().is_none());
+    r.delete(USER_ID, "https://mcp.example.com").await.unwrap();
+    assert!(
+        r.get_by_url(USER_ID, "https://mcp.example.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 // -- OA-7: Delete idempotency (returns NotFound for nonexistent) --
@@ -113,7 +123,7 @@ async fn delete_existing_token() {
 #[tokio::test]
 async fn delete_nonexistent_returns_not_found() {
     let (r, _db) = repo().await;
-    let err = r.delete("https://nope.com").await.unwrap_err();
+    let err = r.delete(USER_ID, "https://nope.com").await.unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
 }
 
@@ -122,7 +132,7 @@ async fn delete_nonexistent_returns_not_found() {
 #[tokio::test]
 async fn list_authenticated_urls_empty() {
     let (r, _db) = repo().await;
-    let urls = r.list_authenticated_urls().await.unwrap();
+    let urls = r.list_authenticated_urls(USER_ID).await.unwrap();
     assert!(urls.is_empty());
 }
 
@@ -131,6 +141,7 @@ async fn list_authenticated_urls_returns_all() {
     let (r, _db) = repo().await;
     r.upsert(sample_params()).await.unwrap();
     r.upsert(UpsertOAuthTokenParams {
+        user_id: USER_ID,
         server_url: "https://other.example.com",
         access_token: "token2",
         refresh_token: None,
@@ -140,7 +151,7 @@ async fn list_authenticated_urls_returns_all() {
     .await
     .unwrap();
 
-    let urls = r.list_authenticated_urls().await.unwrap();
+    let urls = r.list_authenticated_urls(USER_ID).await.unwrap();
     assert_eq!(urls.len(), 2);
     assert!(urls.contains(&"https://mcp.example.com".to_string()));
     assert!(urls.contains(&"https://other.example.com".to_string()));
@@ -153,6 +164,7 @@ async fn delete_one_does_not_affect_others() {
     let (r, _db) = repo().await;
     r.upsert(sample_params()).await.unwrap();
     r.upsert(UpsertOAuthTokenParams {
+        user_id: USER_ID,
         server_url: "https://other.example.com",
         access_token: "token2",
         refresh_token: None,
@@ -162,9 +174,9 @@ async fn delete_one_does_not_affect_others() {
     .await
     .unwrap();
 
-    r.delete("https://mcp.example.com").await.unwrap();
+    r.delete(USER_ID, "https://mcp.example.com").await.unwrap();
 
-    let urls = r.list_authenticated_urls().await.unwrap();
+    let urls = r.list_authenticated_urls(USER_ID).await.unwrap();
     assert_eq!(urls.len(), 1);
     assert_eq!(urls[0], "https://other.example.com");
 }
@@ -176,20 +188,26 @@ async fn full_oauth_lifecycle() {
     let (r, _db) = repo().await;
 
     // Initially no tokens
-    assert!(r.list_authenticated_urls().await.unwrap().is_empty());
-    assert!(r.get_by_url("https://mcp.example.com").await.unwrap().is_none());
+    assert!(r.list_authenticated_urls(USER_ID).await.unwrap().is_empty());
+    assert!(
+        r.get_by_url(USER_ID, "https://mcp.example.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Store token
     let token = r.upsert(sample_params()).await.unwrap();
     assert_eq!(token.access_token, "enc_access_token_123");
 
     // Verify stored
-    let urls = r.list_authenticated_urls().await.unwrap();
+    let urls = r.list_authenticated_urls(USER_ID).await.unwrap();
     assert_eq!(urls.len(), 1);
 
     // Update token (refresh)
     let refreshed = r
         .upsert(UpsertOAuthTokenParams {
+            user_id: USER_ID,
             server_url: "https://mcp.example.com",
             access_token: "refreshed_token",
             refresh_token: Some("new_refresh"),
@@ -202,6 +220,6 @@ async fn full_oauth_lifecycle() {
     assert_eq!(refreshed.created_at, token.created_at);
 
     // Logout (delete)
-    r.delete("https://mcp.example.com").await.unwrap();
-    assert!(r.list_authenticated_urls().await.unwrap().is_empty());
+    r.delete(USER_ID, "https://mcp.example.com").await.unwrap();
+    assert!(r.list_authenticated_urls(USER_ID).await.unwrap().is_empty());
 }

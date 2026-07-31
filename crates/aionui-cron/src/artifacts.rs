@@ -80,10 +80,12 @@ pub(crate) fn artifact_response_from_row(
 
 pub(crate) fn broadcast_artifact(
     broadcaster: &Arc<dyn EventBroadcaster>,
+    user_id: &str,
     row: &ConversationArtifactRow,
 ) -> Result<(), CronError> {
-    let payload = serde_json::to_value(artifact_response_from_row(row)?)
+    let mut payload = serde_json::to_value(artifact_response_from_row(row)?)
         .map_err(|e| CronError::Scheduler(format!("failed to serialize artifact event: {e}")))?;
+    payload["user_id"] = serde_json::Value::String(user_id.to_owned());
     broadcaster.broadcast(WebSocketMessage::new("conversation.artifact", payload));
     Ok(())
 }
@@ -101,6 +103,7 @@ mod tests {
     fn sample_job() -> CronJob {
         CronJob {
             id: "cron_1".into(),
+            user_id: "user1".into(),
             name: "Daily Report".into(),
             enabled: true,
             schedule: CronSchedule::Every {
