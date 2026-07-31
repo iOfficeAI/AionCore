@@ -24,7 +24,7 @@
     "dirac": {
       "registry_json_id": "dirac",
       "package": "dirac-cli",
-      "version": "0.4.29"
+      "version": "0.4.31"
     },
     "glm-acp-agent": {
       "registry_json_id": "glm-acp-agent",
@@ -34,7 +34,7 @@
     "grok": {
       "registry_json_id": "grok-build",
       "package": "@xai-official/grok",
-      "version": "0.2.116"
+      "version": "0.2.117"
     },
     "kilo": {
       "registry_json_id": "kilo",
@@ -48,7 +48,7 @@
     "nova": {
       "registry_json_id": "nova",
       "package": "@compass-ai/nova",
-      "version": "1.1.29"
+      "version": "1.1.30"
     },
     "omp": {
       "package": "@oh-my-pi/pi-coding-agent",
@@ -57,7 +57,7 @@
     "pi": {
       "registry_json_id": "pi-acp",
       "package": "pi-acp",
-      "version": "0.0.32"
+      "version": "0.0.33"
     },
     "sigit": {
       "registry_json_id": "sigit",
