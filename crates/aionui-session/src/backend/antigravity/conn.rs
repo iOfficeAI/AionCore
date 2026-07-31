@@ -26,6 +26,7 @@ use futures_util::stream::BoxStream;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
 use super::argv::{ArgvInput, build_argv};
+use super::models::probe_models;
 use super::translate::Translator;
 use super::wire::parse_line;
 use crate::backend::types::{
@@ -33,7 +34,9 @@ use crate::backend::types::{
     PermissionDecision, SessionEnvelope, SessionSpec,
 };
 use crate::backend::{BackendConnection, SessionBackend, SessionConfig};
-use crate::capability::{BlockSet, Capabilities, CapabilityTier, CommandSet, PromptAcceptedSource, SignalSet};
+use crate::capability::{
+    BlockSet, Capabilities, CapabilityTier, CommandSet, ModeInfo, ModelInfo, PromptAcceptedSource, SignalSet,
+};
 use crate::event::{PermissionKind, SessionEvent, TurnOutcome};
 
 /// Broadcast backlog for a session's event stream. Matches the other backends:
@@ -77,6 +80,23 @@ pub fn antigravity_capabilities() -> Capabilities {
     }
 }
 
+/// agy's fixed mode axis (`--mode`). Unlike models this never depends on the
+/// account, so it needs no probe.
+pub fn antigravity_modes() -> Vec<ModeInfo> {
+    ["default", "accept-edits", "plan"]
+        .into_iter()
+        .map(|id| ModeInfo {
+            id: id.to_owned(),
+            name: match id {
+                "accept-edits" => "Accept Edits".to_owned(),
+                "plan" => "Plan".to_owned(),
+                _ => "Default".to_owned(),
+            },
+            description: None,
+        })
+        .collect()
+}
+
 /// Connection-level factory. agy is 1:1 (one process per turn, one logical
 /// session per backend handle), so this only carries the injected spawner.
 pub struct AntigravityConnection {
@@ -107,8 +127,9 @@ impl BackendConnection for AntigravityConnection {
             } => (session_id, backend_session_id),
         };
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        Ok(Arc::new(AntigravitySessionBackend {
+        let backend = Arc::new(AntigravitySessionBackend {
             session_id,
+            models: Arc::new(std::sync::RwLock::new(Vec::new())),
             config,
             spawner: Arc::clone(&self.spawner),
             event_tx,
@@ -117,7 +138,15 @@ impl BackendConnection for AntigravityConnection {
             current: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
-        }))
+        });
+
+        // Discover models OFF the open path. `agy models` costs a process
+        // launch, and blocking here would add that latency to every session
+        // open for a list that only the picker needs. The catalog write-back
+        // already polls `capabilities()` for late discovery, so it picks this
+        // up when it lands.
+        backend.spawn_model_probe();
+        Ok(backend)
     }
 
     async fn close_session(&self, _session_id: &str) -> Result<(), BackendError> {
@@ -132,6 +161,10 @@ impl BackendConnection for AntigravityConnection {
 
 pub struct AntigravitySessionBackend {
     session_id: String,
+    /// Models discovered from `agy models`, surfaced through `capabilities()`
+    /// so the catalog write-back can populate the picker. Filled in by a
+    /// background probe, hence the lock.
+    models: Arc<std::sync::RwLock<Vec<ModelInfo>>>,
     config: SessionConfig,
     spawner: Arc<dyn Spawner>,
     event_tx: broadcast::Sender<SessionEnvelope>,
@@ -171,6 +204,35 @@ impl AntigravitySessionBackend {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Kick off `agy models` in the background and store whatever it reports.
+    ///
+    /// Best-effort: a signed-out or missing agy simply leaves the list empty,
+    /// which shows up as an empty picker rather than a failed session.
+    fn spawn_model_probe(self: &Arc<Self>) {
+        let spawner = Arc::clone(&self.spawner);
+        let slot = Arc::clone(&self.models);
+        let session_id = self.session_id.clone();
+        let program = self
+            .config
+            .cli_program
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("agy"));
+        tokio::spawn(async move {
+            let found = probe_models(&spawner, &program, &session_id).await;
+            if found.is_empty() {
+                tracing::info!(
+                    session_id = %session_id,
+                    "antigravity: `agy models` returned nothing (not signed in?); the model picker stays empty"
+                );
+            } else {
+                tracing::debug!(session_id = %session_id, count = found.len(), "antigravity: models discovered");
+            }
+            if let Ok(mut guard) = slot.write() {
+                *guard = found;
+            }
+        });
     }
 
     fn emit(&self, turn_gen: u64, event: SessionEvent) {
@@ -404,7 +466,13 @@ impl SessionBackend for AntigravitySessionBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        antigravity_capabilities()
+        Capabilities {
+            available_models: self.models.read().map(|m| m.clone()).unwrap_or_default(),
+            available_modes: antigravity_modes(),
+            current_model: self.config.model.clone(),
+            current_mode: self.config.mode.clone(),
+            ..antigravity_capabilities()
+        }
     }
 
     fn pending_permission_requests(&self) -> Vec<PendingPermissionView> {
@@ -584,6 +652,7 @@ mod tests {
         let (event_tx, _) = broadcast::channel(16);
         Arc::new(AntigravitySessionBackend {
             session_id: "conv-1".into(),
+            models: Arc::new(std::sync::RwLock::new(Vec::new())),
             config: config("/w"),
             spawner: Arc::new(FakeSpawner::new()),
             event_tx,
@@ -676,6 +745,56 @@ mod tests {
         }
         let decision = Bare.request_external_permission("x".into(), json!({})).await;
         assert_eq!(decision, PermissionDecision::Denied);
+    }
+
+    #[tokio::test]
+    async fn capabilities_carry_the_discovered_models_and_fixed_modes() {
+        // The catalog write-back reads capabilities() to populate the pickers;
+        // if the discovered models never reach it, the model picker stays empty
+        // and the user silently gets agy's default model.
+        let (event_tx, _) = broadcast::channel(16);
+        let backend = AntigravitySessionBackend {
+            session_id: "conv-1".into(),
+            models: Arc::new(std::sync::RwLock::new(vec![ModelInfo {
+                id: "gemini-3.1-pro-high".into(),
+                name: "gemini-3.1-pro-high".into(),
+                description: None,
+                reasoning_efforts: Vec::new(),
+            }])),
+            config: SessionConfig {
+                cwd: Some("/w".into()),
+                model: Some("gemini-3.1-pro-high".into()),
+                mode: Some("plan".into()),
+                ..Default::default()
+            },
+            spawner: Arc::new(FakeSpawner::new()),
+            event_tx,
+            turn_gen: AtomicU64::new(0),
+            anchor: Arc::new(Mutex::new(None)),
+            current: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            permission_seq: AtomicU64::new(0),
+        };
+
+        let caps = backend.capabilities();
+        assert_eq!(
+            caps.available_models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["gemini-3.1-pro-high"]
+        );
+        assert_eq!(caps.current_model.as_deref(), Some("gemini-3.1-pro-high"));
+        assert_eq!(
+            caps.available_modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["default", "accept-edits", "plan"]
+        );
+        assert_eq!(caps.current_mode.as_deref(), Some("plan"));
+    }
+
+    #[test]
+    fn modes_are_agys_three_and_carry_display_names() {
+        let modes = antigravity_modes();
+        assert_eq!(modes.len(), 3);
+        assert_eq!(modes[1].id, "accept-edits");
+        assert_eq!(modes[1].name, "Accept Edits");
     }
 
     #[test]

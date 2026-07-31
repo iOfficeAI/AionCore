@@ -11,6 +11,7 @@
 
 mod argv;
 mod conn;
+mod models;
 mod translate;
 mod wire;
 
