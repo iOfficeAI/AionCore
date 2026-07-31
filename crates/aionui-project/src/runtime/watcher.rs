@@ -41,23 +41,27 @@ pub trait Watcher: Send + Sync {
 }
 
 /// Translate one `notify` event into zero or more [`RawEvent`]s, attributing
-/// each affected path to a watched canonical via `resolve`.
+/// each affected path to the watched canonical(s) via `resolve`.
 ///
-/// `resolve(path)` returns the watched canonical that owns `path` (an OS event
-/// path is a child of a watched directory, or the directory itself), or `None`
-/// if no watched directory owns it. Pure and deterministic — the concurrency-
-/// free core of event mapping, unit-tested without a real filesystem.
-pub fn map_event(event: &notify::Event, resolve: &dyn Fn(&Path) -> Option<String>) -> Vec<RawEvent> {
+/// `resolve(path)` returns every watched canonical that owns `path`. A path can
+/// have more than one owner: the directory whose *listing* contains it (its
+/// parent) and — when the path is itself a watched directory — that directory
+/// too. Both must reconcile, so a create/delete/rename of a watched subdir emits
+/// a change on its parent (fixing stale listings) as well as on itself. Returns
+/// an empty vec when no watched directory owns the path. Pure and deterministic
+/// — the concurrency-free core of event mapping, unit-tested without a real
+/// filesystem.
+pub fn map_event(event: &notify::Event, resolve: &dyn Fn(&Path) -> Vec<String>) -> Vec<RawEvent> {
     // Kernel dropped events (inotify IN_Q_OVERFLOW / RDCW buffer / FSEvents
     // must-rescan): the node's facts are stale → one Overflow per affected
     // canonical, deduped and order-stable.
     if event.need_rescan() {
         let mut seen: Vec<String> = Vec::new();
         for path in &event.paths {
-            if let Some(c) = resolve(path)
-                && !seen.contains(&c)
-            {
-                seen.push(c);
+            for c in resolve(path) {
+                if !seen.contains(&c) {
+                    seen.push(c);
+                }
             }
         }
         return seen
@@ -66,15 +70,17 @@ pub fn map_event(event: &notify::Event, resolve: &dyn Fn(&Path) -> Option<String
             .collect();
     }
 
-    // Group changed paths under their owning canonical, preserving first-seen
-    // canonical order and per-canonical path order.
+    // Group changed paths under each owning canonical, preserving first-seen
+    // canonical order and per-canonical path order. A path owned by both its
+    // parent and itself is added to both groups.
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for path in &event.paths {
-        let Some(canonical) = resolve(path) else { continue };
         let path_str = path.to_string_lossy().into_owned();
-        match groups.iter_mut().find(|(c, _)| *c == canonical) {
-            Some((_, paths)) => paths.push(path_str),
-            None => groups.push((canonical, vec![path_str])),
+        for canonical in resolve(path) {
+            match groups.iter_mut().find(|(c, _)| *c == canonical) {
+                Some((_, paths)) => paths.push(path_str.clone()),
+                None => groups.push((canonical, vec![path_str.clone()])),
+            }
         }
     }
     groups

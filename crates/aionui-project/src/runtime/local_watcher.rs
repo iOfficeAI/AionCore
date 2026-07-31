@@ -58,18 +58,31 @@ fn canonical_of(path: &Path) -> Option<String> {
     canonical::canonicalize(&uri).ok().map(|c| c.as_str().to_owned())
 }
 
-/// Attribute an event path to a watched directory's lexical canonical: the path
-/// itself (event on the directory) or its parent (event on a child), matched by
-/// reported canonical against the watched keys.
-fn resolve_owner(watched: &HashMap<String, WatchEntry>, path: &Path) -> Option<String> {
+/// Attribute an event path to the watched directories that must reconcile it,
+/// as lexical canonicals. A create/delete/rename of an entry changes the listing
+/// of its **parent** directory, so the parent (when watched) is always an owner.
+/// When the path is **itself** a watched directory (an event on the directory
+/// entry), that directory is an owner too. Both are returned so a removed/renamed
+/// watched subdir emits a change on its parent — not only on itself — which is
+/// what keeps the parent's listing from going stale. Matched by reported
+/// canonical against the watched keys; the returned order is self-then-parent.
+fn resolve_owner(watched: &HashMap<String, WatchEntry>, path: &Path) -> Vec<String> {
+    let mut owners = Vec::new();
+    // The path itself, when it is a watched directory.
     if let Some(c) = canonical_of(path)
         && let Some(entry) = watched.get(&c)
     {
-        return Some(entry.lexical.clone());
+        owners.push(entry.lexical.clone());
     }
-    let parent = path.parent()?;
-    let c = canonical_of(parent)?;
-    watched.get(&c).map(|entry| entry.lexical.clone())
+    // The path's parent — the directory whose listing contains this entry.
+    if let Some(parent) = path.parent()
+        && let Some(c) = canonical_of(parent)
+        && let Some(entry) = watched.get(&c)
+        && !owners.contains(&entry.lexical)
+    {
+        owners.push(entry.lexical.clone());
+    }
+    owners
 }
 
 impl LocalWatcher {
