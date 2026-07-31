@@ -5521,6 +5521,122 @@ mod pump_tests {
         );
     }
 
+    // Cross-gen guard for the empty-turn Tip. The interrupt-vs-completion race can
+    // leave a trailing real `TurnResult{is_error:false}` on the OLD gen AFTER the
+    // synthetic settlement — with `saw_visible_output` already reset to false, that
+    // terminal arms `pending_empty_turn_tip`, and the swallow guard `continue`s past
+    // its Finish without draining it. This asserts that a Some(tip) so armed on gen 1
+    // can never surface on the NEXT (real, output-bearing) turn's Finish as a spurious
+    // ACP_EMPTY_TURN. The guarantee is structural: `pending_empty_turn_tip` is a
+    // per-iteration binding (dropped at the end of each envelope), so it cannot cross
+    // the gen boundary — this test pins that invariant against future refactors that
+    // might hoist the binding out of the loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_turn_tip_armed_on_trailing_result_does_not_leak_to_next_turn() {
+        use aionui_session::SubagentStatus;
+        let script = vec![
+            env_gen(
+                1,
+                SessionEvent::SubagentUpdate {
+                    r#ref: "task-wf".into(),
+                    label: Some("wf".into()),
+                    status: SubagentStatus::Running,
+                    parent_ref: None,
+                    kind: Some(aionui_session::SubagentTaskKind::WorkflowContainer),
+                },
+            ),
+            env_gen(
+                1,
+                SessionEvent::MessageDelta {
+                    item_id: "m1".into(),
+                    text: "launching workflow".into(),
+                },
+            ),
+            // Launch result — suppressed while the workflow is in flight.
+            env_gen(
+                1,
+                SessionEvent::TurnResult {
+                    is_error: false,
+                    api_error_status: None,
+                    result_text: String::new(),
+                    epoch: 0,
+                    outcome: aionui_session::TurnOutcome::EndTurn,
+                },
+            ),
+            // User cancel → kill drain → synthetic settlement Finish. Arms the swallow
+            // guard AND resets `saw_visible_output` to false.
+            env_gen(
+                1,
+                SessionEvent::SubagentUpdate {
+                    r#ref: "task-wf".into(),
+                    label: Some("wf".into()),
+                    status: SubagentStatus::Interrupted,
+                    parent_ref: None,
+                    kind: None,
+                },
+            ),
+            // Trailing real terminal (the race): with `saw_visible_output` false this
+            // ARMS `pending_empty_turn_tip`, but the guard swallows its Finish — so the
+            // tip is never drained on THIS turn. It must be dropped, not carried over.
+            env_gen(
+                1,
+                SessionEvent::TurnResult {
+                    is_error: false,
+                    api_error_status: None,
+                    result_text: String::new(),
+                    epoch: 0,
+                    outcome: aionui_session::TurnOutcome::EndTurn,
+                },
+            ),
+            // ── Follow-up turn on the NEXT gen: it DOES produce visible output, so it
+            // must never receive an empty-turn Tip. ──
+            env_gen(
+                2,
+                SessionEvent::PromptAccepted {
+                    client_msg_id: "u-2".into(),
+                },
+            ),
+            env_gen(
+                2,
+                SessionEvent::MessageDelta {
+                    item_id: "m2".into(),
+                    text: "follow-up answer".into(),
+                },
+            ),
+            env_gen(
+                2,
+                SessionEvent::TurnResult {
+                    is_error: false,
+                    api_error_status: None,
+                    result_text: String::new(),
+                    epoch: 0,
+                    outcome: aionui_session::TurnOutcome::EndTurn,
+                },
+            ),
+        ];
+        let frames = drain_script(script).await;
+        let seq: Vec<&str> = frames.iter().map(frame_name).collect();
+        assert!(
+            !frames.iter().any(|f| matches!(f, AgentStreamEvent::Tips(_))),
+            "an empty-turn Tip armed on the trailing gen-1 result must not leak onto \
+             the output-bearing gen-2 turn's Finish, got {seq:?}"
+        );
+        // Sanity: the follow-up turn's real Finish still flows after its content, so
+        // the assertion above is testing a turn that actually reached a terminal.
+        let last_content = seq
+            .iter()
+            .rposition(|f| *f == "content")
+            .expect("follow-up turn text present");
+        let last_finish = seq
+            .iter()
+            .rposition(|f| *f == "finish")
+            .expect("follow-up turn Finish present");
+        assert!(
+            last_finish > last_content,
+            "follow-up turn's Finish must flow after its content, got {seq:?}"
+        );
+    }
+
     /// Backend that reports one scripted pending permission — models a permission
     /// raised before the client subscribed, which the REST /confirmations recovery
     /// path must be able to rebuild.
