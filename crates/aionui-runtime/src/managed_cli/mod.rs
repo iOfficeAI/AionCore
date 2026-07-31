@@ -11,7 +11,14 @@ use std::path::{Path, PathBuf};
 
 use crate::managed_resources::{self, ManagedResourcesMode};
 
+mod hermes_prepare;
+mod launch;
 mod prepare;
+pub use hermes_prepare::{
+    HERMES_AGENT_COMMIT, HERMES_AGENT_RELEASE_TAG, HERMES_AGENT_VERSION, HERMES_MANAGED_VERSION, HERMES_RUNTIME_TARGET,
+    PreparedHermesRuntime, managed_hermes_contract_for_export, prepare_managed_hermes_to_root,
+};
+pub use launch::{ManagedCliLaunchError, ManagedCliLaunchPlan, ManagedCliLaunchSource, resolve_managed_cli_launch};
 pub use prepare::{ManagedCliError, PreparedCli, managed_cli_contract_for_export, prepare_managed_cli_to_root};
 
 /// Pinned CLI versions — the single source of truth. Bumping a CLI = change the
