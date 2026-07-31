@@ -44,7 +44,7 @@ fn cache() -> &'static Mutex<HashMap<PathBuf, bool>> {
 /// (e.g. `"2.1.220 (Claude Code)"`). Returns `None` on any shape we do not
 /// recognise, which the caller treats as unsupported.
 fn parse_version(raw: &str) -> Option<(u32, u32, u32)> {
-    let token = raw.trim().split_whitespace().next()?;
+    let token = raw.split_whitespace().next()?;
     let mut parts = token.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
