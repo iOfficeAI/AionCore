@@ -160,6 +160,16 @@ impl TaskBoard {
                 unblocked = %downstream_id,
                 "dependency unblocked"
             );
+            // Broadcast the downstream task's changed dependency set so the
+            // activity board and the downstream-owner wake path both observe it
+            // is now (potentially) actionable. Non-fatal: a missing row or parse
+            // failure must not abort the completing task's own update.
+            if let Some(events) = &self.events
+                && let Ok(Some(row)) = self.repo.find_task_by_id(&self.user_id, team_id, downstream_id).await
+                && let Ok(task) = TeamTask::from_row(&row)
+            {
+                events.broadcast_task_changed(task_to_response(&task), TeamTaskChange::Updated);
+            }
         }
         Ok(())
     }
@@ -196,7 +206,11 @@ mod tests {
 
     fn board_with_events(repo: Arc<MockTeamRepo>) -> (TaskBoard, Arc<RecordingBroadcaster>) {
         let bc = Arc::new(RecordingBroadcaster::new());
-        let emitter = Arc::new(TeamEventEmitter::new("t1".into(), "system_default_user".into(), bc.clone()));
+        let emitter = Arc::new(TeamEventEmitter::new(
+            "t1".into(),
+            "system_default_user".into(),
+            bc.clone(),
+        ));
         (TaskBoard::new(repo).with_events(emitter), bc)
     }
 
@@ -247,6 +261,42 @@ mod tests {
         assert_eq!(updated.len(), 1);
         assert_eq!(updated[0].task.id, task.id);
         assert_eq!(updated[0].task.status, "deleted");
+    }
+
+    #[tokio::test]
+    async fn complete_task_broadcasts_downstream_unblock() {
+        let repo = Arc::new(MockTeamRepo::new());
+        let (board, bc) = board_with_events(repo);
+
+        let a = board.create_task("t1", "A", None, None, &[]).await.unwrap();
+        let b = board
+            .create_task("t1", "B", None, None, std::slice::from_ref(&a.id))
+            .await
+            .unwrap();
+
+        board
+            .update_task(
+                "t1",
+                &a.id,
+                &TaskUpdate {
+                    status: Some(TaskStatus::Completed),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Completing A must broadcast B's unblock so the board/feed and the
+        // downstream-owner wake path both observe B is now actionable.
+        let b_updates: Vec<_> = task_changes(&bc)
+            .into_iter()
+            .filter(|c| c.task.id == b.id && c.change == TeamTaskChange::Updated)
+            .collect();
+        assert_eq!(b_updates.len(), 1, "completing A must broadcast B's unblock");
+        assert!(
+            b_updates[0].task.blocked_by.is_empty(),
+            "B.blocked_by should be empty after A completes"
+        );
     }
 
     #[tokio::test]
