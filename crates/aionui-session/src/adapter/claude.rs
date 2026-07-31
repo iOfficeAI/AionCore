@@ -324,8 +324,30 @@ impl ClaudeAdapter {
                 }
                 Vec::new()
             }
+            "compact_boundary" => {
+                // A compaction rewrites the context, so the occupancy latched off
+                // the last API call is now stale — and the compaction turn itself
+                // streams NO `message_delta` to refresh it (live-captured: five
+                // turns climbing to 27_349, then `compact_boundary{pre:27349,
+                // post:3158}` followed by a `result` with `num_turns:0` and a zero
+                // aggregate, then the next real turn reporting 23_779).
+                //
+                // Without this reset the stale 27_349 would survive the fallback
+                // and sail past the zero-usage guard, re-publishing a
+                // pre-compaction figure as if it were current. Dropping it lets the
+                // compaction's zero aggregate be discarded as intended, so the
+                // indicator holds its previous reading until the next real turn
+                // measures the new context.
+                //
+                // The boundary's own `post_tokens` cannot substitute: it counts the
+                // compacted transcript only (3_158 here) while occupancy also
+                // carries the system prompt and tools — the next turn measured
+                // 23_779, ~20k higher. Different baselines.
+                self.last_call_tokens = None;
+                vec![SessionEvent::Heartbeat]
+            }
             // network backoff + the no-chunk compaction window both = liveness.
-            "api_retry" | "compact_boundary" | "compacting" => vec![SessionEvent::Heartbeat],
+            "api_retry" | "compacting" => vec![SessionEvent::Heartbeat],
             other => vec![SessionEvent::AdapterSpecific {
                 tag: format!("system/{other}"),
                 payload: v.clone(),
@@ -2193,6 +2215,59 @@ mod tests {
             })
             .expect("result emits a UsageDelta");
         assert_eq!(total, 27_472);
+    }
+
+    /// Replays a live-captured compaction: five turns climbing to 27_349, the
+    /// boundary, the compaction's own `result` (`num_turns:0`, zero aggregate, and
+    /// crucially NO `message_delta`), then the next real turn at 23_779.
+    ///
+    /// The compaction must publish NOTHING. Its turn cannot measure the new
+    /// context, and the latched pre-compaction figure would otherwise slip past
+    /// the zero-usage guard and be re-published as current — the reported "used
+    /// tokens never update after a compaction".
+    #[test]
+    fn compaction_invalidates_the_latched_occupancy() {
+        let mut a = ClaudeAdapter::new();
+        let occupancy_of = |evs: Vec<SessionEvent>| {
+            evs.into_iter().find_map(|e| match e {
+                SessionEvent::UsageDelta { total_tokens, .. } => Some(total_tokens),
+                _ => None,
+            })
+        };
+        let delta = |cr: u64| {
+            format!(
+                r#"{{"type":"stream_event","event":{{"type":"message_delta","delta":{{"stop_reason":"end_turn"}},"usage":{{"input_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":{cr},"output_tokens":0}}}}}}"#
+            )
+        };
+        let result_with = |agg: u64| {
+            format!(
+                r#"{{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{{"input_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":{agg},"output_tokens":0}}}}"#
+            )
+        };
+
+        // A normal turn establishes the latch.
+        a.parse_chunk(format!("{}\n", delta(27_347)).as_bytes());
+        assert_eq!(
+            occupancy_of(a.parse_chunk(format!("{}\n", result_with(27_347)).as_bytes())),
+            Some(27_349)
+        );
+
+        // The compaction: boundary, then a zero-aggregate result with no delta.
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":27349,"post_tokens":3158}}"#;
+        a.parse_chunk(format!("{boundary}\n").as_bytes());
+        let zero_result = r#"{"type":"result","subtype":"success","is_error":false,"result":"","usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}"#;
+        assert_eq!(
+            occupancy_of(a.parse_chunk(format!("{zero_result}\n").as_bytes())),
+            Some(0),
+            "the compaction must report zero (dropped downstream), NOT the stale 27_349"
+        );
+
+        // The next real turn measures the compacted context.
+        a.parse_chunk(format!("{}\n", delta(23_777)).as_bytes());
+        assert_eq!(
+            occupancy_of(a.parse_chunk(format!("{}\n", result_with(23_777)).as_bytes())),
+            Some(23_779)
+        );
     }
 
     /// Switching models must move the window. `modelUsage` is session-CUMULATIVE
