@@ -26,6 +26,7 @@ use futures_util::stream::BoxStream;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
 use super::argv::{ArgvInput, build_argv};
+use super::mcp_config::write_mcp_config;
 use super::models::probe_models;
 use super::translate::Translator;
 use super::wire::parse_line;
@@ -126,6 +127,16 @@ impl BackendConnection for AntigravityConnection {
                 backend_session_id,
             } => (session_id, backend_session_id),
         };
+        // agy reads MCP servers from files only — there is no per-run flag — so
+        // the session's servers (team coordination first, then the user's) have
+        // to land in the workspace before the first turn spawns.
+        if let Some(cwd) = config.cwd.as_deref()
+            && let Err(e) = write_mcp_config(std::path::Path::new(cwd), &config.init.mcp_servers)
+        {
+            // Not fatal: the session still runs, just without MCP tools.
+            tracing::warn!(error = %e, "antigravity: could not write mcp_config.json; MCP tools will be unavailable");
+        }
+
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let backend = Arc::new(AntigravitySessionBackend {
             session_id,

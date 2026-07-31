@@ -72,6 +72,27 @@ pub struct AntigravityHookToolCall {
     pub args: serde_json::Value,
 }
 
+impl AntigravityHookToolCall {
+    /// Name to show the user on the permission card.
+    ///
+    /// agy routes every MCP tool through the single `call_mcp_tool` tool and
+    /// puts the real target in the arguments, so a team conversation would
+    /// otherwise ask "allow call_mcp_tool?" for every distinct action.
+    pub fn display_name(&self) -> String {
+        if self.name != "call_mcp_tool" {
+            return self.name.clone();
+        }
+        match (
+            self.args.get("ServerName").and_then(|v| v.as_str()),
+            self.args.get("ToolName").and_then(|v| v.as_str()),
+        ) {
+            (Some(server), Some(tool)) => format!("{server}/{tool}"),
+            (None, Some(tool)) => tool.to_owned(),
+            _ => self.name.clone(),
+        }
+    }
+}
+
 /// What the hook writes to stdout to gate the call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AntigravityHookOutput {
@@ -142,6 +163,27 @@ mod tests {
         let raw = r#"{"conversationId":"c1","toolCall":{"name":"view_file","args":{}},"brandNewKey":42}"#;
         let input: AntigravityHookInput = serde_json::from_str(raw).expect("parse");
         assert_eq!(input.tool_call.name, "view_file");
+    }
+
+    #[test]
+    fn an_mcp_call_is_shown_as_server_slash_tool() {
+        let raw = r#"{"conversationId":"c1","toolCall":{"name":"call_mcp_tool","args":{"ServerName":"aionui-team","ToolName":"aionui_team_ping"}}}"#;
+        let input: AntigravityHookInput = serde_json::from_str(raw).unwrap();
+        assert_eq!(input.tool_call.display_name(), "aionui-team/aionui_team_ping");
+    }
+
+    #[test]
+    fn a_plain_tool_keeps_its_own_name() {
+        let raw = r#"{"conversationId":"c1","toolCall":{"name":"run_command","args":{"CommandLine":"ls"}}}"#;
+        let input: AntigravityHookInput = serde_json::from_str(raw).unwrap();
+        assert_eq!(input.tool_call.display_name(), "run_command");
+    }
+
+    #[test]
+    fn a_malformed_mcp_call_falls_back_to_the_raw_name() {
+        let raw = r#"{"conversationId":"c1","toolCall":{"name":"call_mcp_tool","args":{}}}"#;
+        let input: AntigravityHookInput = serde_json::from_str(raw).unwrap();
+        assert_eq!(input.tool_call.display_name(), "call_mcp_tool");
     }
 
     #[test]

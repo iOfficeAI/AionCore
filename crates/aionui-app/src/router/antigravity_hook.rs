@@ -52,10 +52,11 @@ async fn handle_hook(
         ));
     }
 
-    let tool_name = if input.tool_call.name.is_empty() {
-        "unknown tool".to_owned()
-    } else {
-        input.tool_call.name.clone()
+    // Expanded so an MCP call names its real target instead of the generic
+    // `call_mcp_tool` wrapper agy routes them all through.
+    let tool_name = match input.tool_call.display_name() {
+        n if n.is_empty() => "unknown tool".to_owned(),
+        n => n,
     };
 
     let Some(AgentInstance::Session(task)) = state.task_manager.get_task(&conversation_id) else {

@@ -85,6 +85,27 @@ impl Translator {
         }
     }
 
+    /// agy routes EVERY MCP tool through the single `call_mcp_tool` tool and
+    /// puts the real target in the parameters. Left as-is, a team conversation
+    /// renders as a run of identical `call_mcp_tool` steps with no indication
+    /// of what the agent actually did.
+    fn display_tool_name(name: &str, params: Option<&serde_json::Value>) -> String {
+        if name != "call_mcp_tool" {
+            return name.to_owned();
+        }
+        let Some(p) = params else {
+            return name.to_owned();
+        };
+        match (
+            p.get("ServerName").and_then(|v| v.as_str()),
+            p.get("ToolName").and_then(|v| v.as_str()),
+        ) {
+            (Some(server), Some(tool)) => format!("{server}/{tool}"),
+            (None, Some(tool)) => tool.to_owned(),
+            _ => name.to_owned(),
+        }
+    }
+
     fn translate_step(&mut self, su: AgyStepUpdate) -> Vec<SessionEvent> {
         let id = format!("step-{}", su.step_index);
         let mut out = Vec::new();
@@ -100,12 +121,13 @@ impl Translator {
             }
             AgyStepType::Tool => {
                 let info = su.tool_info;
-                let name = info
+                let raw_name = info
                     .as_ref()
                     .map(|i| i.name.clone())
                     .filter(|n| !n.is_empty())
                     .or(su.tool_name)
                     .unwrap_or_default();
+                let name = Self::display_tool_name(&raw_name, info.as_ref().and_then(|i| i.parameters.as_ref()));
                 match su.state {
                     AgyState::Active => out.push(SessionEvent::ToolCall {
                         tool_use_id: id,
@@ -255,6 +277,41 @@ mod tests {
                 assert!(!is_error);
                 assert!(matches!(content.first(), Some(ToolResultContent::Text(t)) if t == "hi\n"));
             }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_calls_are_displayed_as_server_slash_tool() {
+        // Otherwise every team step reads as a bare "call_mcp_tool".
+        let (_, evs) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":6,"state":"ACTIVE","step_type":"tool","tool_name":"call_mcp_tool","tool_info":{"name":"call_mcp_tool","parameters":{"ServerName":"aionui-team","ToolName":"aionui_team_ping","Arguments":{}}}}}"#,
+        ]);
+        match &evs[0] {
+            SessionEvent::ToolCall { name, .. } => assert_eq!(name, "aionui-team/aionui_team_ping"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_non_mcp_tool_name_is_left_alone() {
+        let (_, evs) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hi"}}}}"#,
+        ]);
+        match &evs[0] {
+            SessionEvent::ToolCall { name, .. } => assert_eq!(name, "run_command"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_mcp_call_degrades_to_the_raw_name() {
+        // Missing ServerName/ToolName must not panic or produce "/"-junk.
+        let (_, evs) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":7,"state":"ACTIVE","step_type":"tool","tool_name":"call_mcp_tool","tool_info":{"name":"call_mcp_tool","parameters":{}}}}"#,
+        ]);
+        match &evs[0] {
+            SessionEvent::ToolCall { name, .. } => assert_eq!(name, "call_mcp_tool"),
             other => panic!("unexpected {other:?}"),
         }
     }
