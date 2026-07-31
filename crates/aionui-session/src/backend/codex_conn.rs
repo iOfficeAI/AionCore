@@ -2805,6 +2805,18 @@ fn item_kind_for(item_type: &str) -> crate::event::ItemKind {
 /// thread/tokenUsage/updated → UsageDelta. codex gives BOTH total (cumulative)
 /// and last (per-turn); we use `.last` directly (G6: native per-turn, no
 /// subtraction, no double-count on reconnect — measured 2026-06-10).
+///
+/// `.last` is also the right figure for the usage indicator's CURRENT CONTEXT
+/// OCCUPANCY, which is why it feeds `used`. Live two-turn probe (0.145.0,
+/// window 258400): turn 2 reported `last{inputTokens:11024, cachedInputTokens:
+/// 11006, outputTokens:6, totalTokens:11030}` while `total.totalTokens` had
+/// already reached 22043. `last.inputTokens` INCLUDES the cached part, so
+/// `last.totalTokens` == the request carrying the whole history + its reply —
+/// the occupancy. `total.*` accumulates across turns and would exceed the window
+/// on a long session; it must never feed `used`.
+///
+/// `modelContextWindow` is the indicator's denominator and is nullable in the
+/// schema (verified: `codex app-server generate-json-schema` → ThreadTokenUsage).
 fn map_usage(params: &Value) -> Vec<SessionEvent> {
     let usage = params.get("tokenUsage").unwrap_or(&Value::Null);
     let last = usage.get("last").unwrap_or(&Value::Null);
@@ -2814,7 +2826,68 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
         output_tokens: g("outputTokens"),
         total_tokens: g("totalTokens"),
         cost_usd: None,
+        context_window: usage.get("modelContextWindow").and_then(Value::as_u64),
     }]
+}
+
+#[cfg(test)]
+mod usage_window_tests {
+    use super::*;
+
+    /// Verbatim `tokenUsage` from a live two-turn probe (codex-cli 0.145.0,
+    /// `gpt-5.6-sol`): turn 2, window 258400. `used` must stay on `last`
+    /// (11030 = the request carrying the whole history + its reply), NOT on the
+    /// cumulative `total` (22043) which would blow past the window on a long
+    /// session. The window itself becomes the indicator's denominator.
+    #[test]
+    fn live_token_usage_maps_last_as_occupancy_plus_window() {
+        let params: Value = serde_json::from_str(
+            r#"{"threadId":"th1","turnId":"t1","tokenUsage":{
+                 "modelContextWindow":258400,
+                 "last":{"totalTokens":11030,"inputTokens":11024,"cachedInputTokens":11006,
+                         "cacheWriteInputTokens":16,"outputTokens":6,"reasoningOutputTokens":0},
+                 "total":{"totalTokens":22043,"inputTokens":22032,"cachedInputTokens":11006,
+                          "cacheWriteInputTokens":11022,"outputTokens":11,"reasoningOutputTokens":0}}}"#,
+        )
+        .unwrap();
+        let events = map_usage(&params);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::UsageDelta {
+                    input_tokens: 11024,
+                    output_tokens: 6,
+                    total_tokens: 11030,
+                    context_window: Some(258_400),
+                    cost_usd: None,
+                }]
+            ),
+            "expected last-based occupancy + window, got {events:?}"
+        );
+    }
+
+    /// `modelContextWindow` is `int|null` in the schema — a null (or absent) field
+    /// must degrade to `None`, never to 0, which would render a 0-sized bar.
+    #[test]
+    fn null_or_absent_context_window_is_none() {
+        for raw in [
+            r#"{"tokenUsage":{"modelContextWindow":null,"last":{"totalTokens":5,"inputTokens":4,"outputTokens":1}}}"#,
+            r#"{"tokenUsage":{"last":{"totalTokens":5,"inputTokens":4,"outputTokens":1}}}"#,
+        ] {
+            let params: Value = serde_json::from_str(raw).unwrap();
+            assert!(
+                matches!(
+                    map_usage(&params).as_slice(),
+                    [SessionEvent::UsageDelta {
+                        context_window: None,
+                        total_tokens: 5,
+                        ..
+                    }]
+                ),
+                "expected no window for {raw}"
+            );
+        }
+    }
 }
 
 /// LC-8a: codex `turn/plan/updated` params → `SessionEvent::Plan`. `plan` is an
@@ -4787,6 +4860,16 @@ mod tests {
                 }
             )),
             "tokenUsage.last → UsageDelta (G6: native per-turn, no subtraction)"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SessionEvent::UsageDelta {
+                    context_window: None,
+                    ..
+                }
+            )),
+            "a tokenUsage without modelContextWindow yields no window (nullable in schema)"
         );
         assert!(
             events.iter().any(|e| matches!(

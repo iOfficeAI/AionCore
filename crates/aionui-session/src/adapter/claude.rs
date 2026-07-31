@@ -539,9 +539,34 @@ impl ClaudeAdapter {
                 output_tokens,
                 total_tokens,
                 cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
+                context_window: Self::result_context_window(v),
             });
         }
         out
+    }
+
+    /// The model's total context window from a `result` frame, for the usage
+    /// indicator's denominator. It rides `modelUsage.<model>.contextWindow`
+    /// (live-captured, claude 2.1.220: `{"claude-opus-5":{…,"contextWindow":1000000}}`).
+    ///
+    /// The entry cannot be selected by model id — the frame's own `model` field is
+    /// `null` on the wire. One entry (the observed shape) is used directly; when a
+    /// turn touched several models (a subagent on a different one) the DOMINANT
+    /// entry by `inputTokens + outputTokens` wins, i.e. the main conversation model.
+    /// That tie-break is a heuristic: only the single-entry shape has been captured.
+    /// Absent / non-integer → `None`, which renders as a counter with no percentage.
+    fn result_context_window(v: &Value) -> Option<u64> {
+        let entries = v.get("modelUsage")?.as_object()?;
+        entries
+            .values()
+            .filter_map(|m| {
+                let window = m.get("contextWindow").and_then(Value::as_u64)?;
+                let volume = m.get("inputTokens").and_then(Value::as_u64).unwrap_or(0)
+                    + m.get("outputTokens").and_then(Value::as_u64).unwrap_or(0);
+                Some((volume, window))
+            })
+            .max_by_key(|(volume, _)| *volume)
+            .map(|(_, window)| window)
     }
 
     /// C-1: map a claude result frame's `terminal_reason` (preferred, 12-value) or
@@ -1900,6 +1925,67 @@ mod tests {
         assert_eq!(gated.get(at + 1).map(String::as_str), Some("summarized"));
     }
 
+    /// Helper: drive one `result` NDJSON line through the adapter and return the
+    /// `context_window` the emitted `UsageDelta` carries.
+    #[cfg(test)]
+    fn window_of(line: &str) -> Option<Option<u64>> {
+        let mut a = ClaudeAdapter::new();
+        a.parse_chunk(format!("{line}\n").as_bytes())
+            .into_iter()
+            .find_map(|e| match e {
+                SessionEvent::UsageDelta { context_window, .. } => Some(context_window),
+                _ => None,
+            })
+    }
+
+    /// The context-window size the usage indicator renders as `size` rides
+    /// `result.modelUsage.<model>.contextWindow`. Verbatim shape from a live
+    /// claude 2.1.220 turn (model `claude-opus-5`, window 1_000_000).
+    #[test]
+    fn result_carries_context_window_from_single_model_usage_entry() {
+        let line = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":2,"cache_creation_input_tokens":10920,"#,
+            r#""cache_read_input_tokens":15493,"output_tokens":5},"model":null,"#,
+            r#""modelUsage":{"claude-opus-5":{"inputTokens":2,"outputTokens":5,"#,
+            r#""contextWindow":1000000,"maxOutputTokens":64000}}}"#
+        );
+        assert_eq!(window_of(line), Some(Some(1_000_000)));
+    }
+
+    /// `result.model` is null on the wire, so the entry cannot be picked by model
+    /// id. With several entries (a subagent ran on a different model) take the
+    /// DOMINANT one by token volume — the main conversation model. Heuristic: only
+    /// the single-entry shape has been captured live.
+    #[test]
+    fn multi_entry_model_usage_picks_the_dominant_model() {
+        let line = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":10,"output_tokens":5},"#,
+            r#""modelUsage":{"claude-haiku-4-5":{"inputTokens":12,"outputTokens":3,"contextWindow":200000},"#,
+            r#""claude-opus-5":{"inputTokens":900,"outputTokens":100,"contextWindow":1000000}}}"#
+        );
+        assert_eq!(window_of(line), Some(Some(1_000_000)));
+    }
+
+    /// A usage-bearing result with no `modelUsage` (or an unparseable one) must
+    /// still emit the UsageDelta — just without a window. The frontend guards on
+    /// `size > 0`, so `None` degrades to "counter without a percentage".
+    #[test]
+    fn missing_or_malformed_model_usage_yields_no_window() {
+        let bare = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":10,"output_tokens":5}}"#
+        );
+        assert_eq!(window_of(bare), Some(None));
+
+        let malformed = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":10,"output_tokens":5},"modelUsage":{"m":{"contextWindow":"big"}}}"#
+        );
+        assert_eq!(window_of(malformed), Some(None));
+    }
+
     /// H4 (design-vs-code gap audit, §5): `UsageDelta.total_tokens` MUST count the
     /// cache buckets (`cache_read_input_tokens` + `cache_creation_input_tokens`),
     /// which ARE billed input tokens — omitting them under-reported a cache-heavy
@@ -1930,6 +2016,7 @@ mod tests {
                     output_tokens,
                     total_tokens,
                     cost_usd,
+                    ..
                 } => Some((input_tokens, output_tokens, total_tokens, cost_usd)),
                 _ => None,
             })

@@ -275,6 +275,11 @@ pub enum SessionEvent {
         output_tokens: u64,
         total_tokens: u64,
         cost_usd: Option<f64>,
+        /// The model's total context window, when the backend reports one
+        /// (claude `result.modelUsage.<model>.contextWindow`; codex
+        /// `tokenUsage.modelContextWindow`, which is nullable). Renders as the
+        /// denominator of the usage indicator; `None` leaves it a bare counter.
+        context_window: Option<u64>,
     },
 
     /// MCP / tool provisioning as a LIVE event (Addendum 5 / U16). Reducer no-op.
@@ -1123,6 +1128,7 @@ mod additive_tests {
                     output_tokens: 1,
                     total_tokens: 2,
                     cost_usd: None,
+                    context_window: None,
                 },
                 BackendProduced,
                 Display,
@@ -1386,6 +1392,7 @@ mod additive_tests {
                 output_tokens: 50,
                 total_tokens: 150,
                 cost_usd: Some(0.0021),
+                context_window: None,
             },
             SessionEvent::Provisioning {
                 phase: ProvisioningPhase::ToolsWaiting,
