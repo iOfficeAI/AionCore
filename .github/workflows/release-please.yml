@@ -13,7 +13,7 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    if: "startsWith(github.event.head_commit.message, 'chore: release') || startsWith(github.event.head_commit.message, 'chore(main): release')"
+    if: "github.repository == 'iOfficeAI/AionCore' && (startsWith(github.event.head_commit.message, 'chore: release') || startsWith(github.event.head_commit.message, 'chore(main): release'))"
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
@@ -38,7 +38,7 @@ jobs:
 
   update-pr:
     runs-on: ubuntu-latest
-    if: "!startsWith(github.event.head_commit.message, 'chore: release') && !startsWith(github.event.head_commit.message, 'chore(main): release')"
+    if: "github.repository == 'iOfficeAI/AionCore' && !startsWith(github.event.head_commit.message, 'chore: release') && !startsWith(github.event.head_commit.message, 'chore(main): release')"
     steps:
       - uses: googleapis/release-please-action@v5
         id: release-please
