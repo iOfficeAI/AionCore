@@ -352,6 +352,9 @@ impl SessionAgentTask {
             session_repo,
             CatalogPreload::default(),
             None,
+            // No broadcaster: this ctor is the test/simple path, which has no
+            // conversation WebSocket to push a late usage frame to.
+            None,
         )
     }
 
@@ -370,6 +373,7 @@ impl SessionAgentTask {
         session_repo: Option<Arc<dyn IAcpSessionRepository>>,
         handshake: &aionui_api_types::AgentHandshake,
         prompt_dump: Option<SessionPromptDump>,
+        broadcaster: Option<Arc<dyn EventBroadcaster>>,
     ) -> Arc<Self> {
         Self::build(
             agent_type,
@@ -380,6 +384,7 @@ impl SessionAgentTask {
             session_repo,
             CatalogPreload::from_handshake(handshake),
             prompt_dump,
+            broadcaster,
         )
     }
 
@@ -393,6 +398,7 @@ impl SessionAgentTask {
         session_repo: Option<Arc<dyn IAcpSessionRepository>>,
         catalog_preload: CatalogPreload,
         prompt_dump: Option<SessionPromptDump>,
+        broadcaster: Option<Arc<dyn EventBroadcaster>>,
     ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let runtime = Arc::new(SessionRuntime {
@@ -414,6 +420,7 @@ impl SessionAgentTask {
             conversation_id.clone(),
             user_id.clone(),
             session_repo.clone(),
+            broadcaster,
         );
         Arc::new(Self {
             agent_type,
@@ -903,10 +910,25 @@ impl SessionAgentTask {
         }
     }
 
-    /// Session usage snapshot. Not tracked on the capabilities snapshot yet;
-    /// usage rides the `UsageDelta` stream event. Return None for now.
+    /// Session usage snapshot, served from the persisted `context_usage` runtime
+    /// state that the event pump writes on every `UsageDelta`.
+    ///
+    /// Reading through the repo (rather than an in-memory field) is what makes the
+    /// figure survive a conversation switch: the task is dropped when the session
+    /// is reaped, so anything held only in memory would be gone and the indicator
+    /// would sit blank until the next turn produced fresh usage. Without a repo
+    /// (tests) or with no row yet, `None` — the indicator simply stays empty.
     pub async fn get_usage(&self) -> Result<Option<serde_json::Value>, AgentError> {
-        Ok(None)
+        let Some(repo) = self.session_repo.as_ref() else {
+            return Ok(None);
+        };
+        let state = repo
+            .load_runtime_state_for_user(&self.user_id, &self.conversation_id)
+            .await
+            .map_err(|e| AgentError::internal(format!("Failed to load usage state: {e}")))?;
+        Ok(state
+            .and_then(|s| s.context_usage_json)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()))
     }
 
     /// Slash commands from the live capabilities snapshot.
@@ -1270,7 +1292,7 @@ pub async fn build_session_instance(
                 &user_id,
                 config.mcp_server_ids.as_deref(),
                 &conversation_id,
-                broadcaster,
+                broadcaster.clone(),
             )
             .await
         }
@@ -1488,6 +1510,9 @@ pub async fn build_session_instance(
         acp_session_repo,
         &metadata.handshake,
         prompt_dump,
+        // Lets the pump push a usage frame that arrives after the turn's relay has
+        // already stopped listening — the claude case (usage rides `result`).
+        Some(broadcaster),
     );
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
 }
@@ -1849,6 +1874,7 @@ fn spawn_event_pump(
     conversation_id: String,
     user_id: String,
     session_repo: Option<Arc<dyn IAcpSessionRepository>>,
+    broadcaster: Option<Arc<dyn EventBroadcaster>>,
 ) {
     use futures_util::StreamExt as _;
     // The pump owns ONLY the event stream (a broadcast `Receiver` handle — see
@@ -2188,6 +2214,14 @@ fn spawn_event_pump(
             if let Some(repo) = session_repo.as_ref() {
                 persist_side_effects(repo.as_ref(), &user_id, &conversation_id, &env.event).await;
             }
+            // Usage must ALSO reach the live view directly. claude reports it on the
+            // `result` frame, which lands after the relay has already broken on
+            // Finish, so the translated frame below would be shouted into an empty
+            // room. Broadcasting straight from the pump (session-scoped, still alive)
+            // is what turns claude's indicator on without waiting for a reload.
+            if let (Some(bus), SessionEvent::UsageDelta { .. }) = (broadcaster.as_ref(), &env.event) {
+                broadcast_usage_frame(bus.as_ref(), &conversation_id, &user_id, &env.event);
+            }
             for mut ev in translate_event(env.event, &conversation_id, terminal_result_seen) {
                 // Keep the tool name alive across a call's multi-frame lifecycle (see
                 // `stamp_tool_name`): the terminal ToolResult frame leaves the name
@@ -2232,14 +2266,14 @@ fn spawn_event_pump(
                 // which sends Finish{session_id}. The resume anchor rides it to the
                 // frontend. (Start is emitted by send_message, already stamped.)
                 //
-                // KNOWN DIVERGENCE (accepted, additive gap): claude emits its per-turn
-                // `UsageDelta` a few ms AFTER `TurnResult`, and origin's relay stops
-                // forwarding a turn once it sees this Finish — so the trailing
-                // AcpContextUsage frame does not reach the frontend and the context
-                // indicator stays blank. The ACP path avoids this only because its SDK
-                // blocks prompt() until usage is collected. Matching that needs an
-                // end-of-turn "collect usage" barrier (or wiring get_context_usage) and
-                // is deferred; the core turn flow is otherwise frame-equivalent.
+                // NOTE: claude emits its `UsageDelta` a few ms AFTER `TurnResult`
+                // (it rides the `result` frame), and the relay stops forwarding a
+                // turn the moment it sees this Finish — so the translated
+                // AcpContextUsage below is shouted into an empty room and used to
+                // leave the context indicator blank. That gap is now closed WITHOUT
+                // an end-of-turn barrier: the pump persists every UsageDelta to
+                // `context_usage` and broadcasts it directly (see the UsageDelta
+                // handling above), both of which outlive the turn.
                 if let AgentStreamEvent::Finish(data) = &mut ev
                     && data.session_id.is_none()
                 {
@@ -2341,7 +2375,125 @@ async fn persist_side_effects(
                 tracing::warn!(conversation_id, error = %err, "session-sync: save_runtime_state failed");
             }
         }
+        // Token usage → the `context_usage` runtime snapshot the usage indicator
+        // reads back. This is the ONLY durable sink for direct-CLI usage: the pump
+        // is session-scoped and outlives the per-turn `StreamRelay`, so it still
+        // sees claude's `UsageDelta` — which rides the `result` frame that lands
+        // AFTER the relay has already broken on Finish.
+        // Token usage -> the `context_usage` runtime snapshot the usage indicator
+        // reads back. This is the ONLY durable sink for direct-CLI usage: the pump
+        // is session-scoped and outlives the per-turn `StreamRelay`, so it still
+        // sees claude's `UsageDelta` — which rides the `result` frame that lands
+        // AFTER the relay has already broken on Finish.
+        SessionEvent::UsageDelta {
+            total_tokens,
+            cost_usd,
+            context_window,
+            ..
+        } => {
+            persist_context_usage(
+                repo,
+                user_id,
+                conversation_id,
+                *total_tokens,
+                *cost_usd,
+                *context_window,
+            )
+            .await;
+        }
         _ => {}
+    }
+}
+
+/// Broadcast a `UsageDelta` to the conversation's live stream.
+///
+/// Mirrors `StreamRelay::forward_to_websocket_with_msg_id` exactly — same
+/// `message.stream` envelope, same snake_case normalisation — so the frame is
+/// indistinguishable from the one the relay emits mid-turn.
+///
+/// `msg_id`/`turn_id` are empty: a usage report is CONVERSATION-scoped state, and
+/// by the time claude's arrives its turn is already closed, so there is no message
+/// to attach it to. The indicator reads `data`, keyed by conversation.
+fn broadcast_usage_frame(bus: &dyn EventBroadcaster, conversation_id: &str, user_id: &str, event: &SessionEvent) {
+    let Some(frame) = translate_event(event.clone(), conversation_id, false)
+        .into_iter()
+        .next()
+    else {
+        return;
+    };
+    let mut event_data = match serde_json::to_value(&frame) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(conversation_id, error = %err, "usage broadcast: serialize failed");
+            return;
+        }
+    };
+    aionui_common::normalize_keys_to_snake_case(&mut event_data);
+    let payload = serde_json::json!({
+        "conversation_id": conversation_id,
+        "user_id": user_id,
+        "msg_id": "",
+        "turn_id": "",
+        "type": event_data.get("type").cloned().unwrap_or(serde_json::json!("usage")),
+        "data": event_data.get("data").cloned().unwrap_or(serde_json::json!({})),
+        "hidden": false,
+    });
+    bus.broadcast(aionui_api_types::WebSocketMessage::new("message.stream", payload));
+}
+
+/// Merge one usage report into `acp_session.session_config.runtime.context_usage`.
+///
+/// Shape is the ACP `UsageUpdate` the frontend already consumes:
+/// `{used, size, cost:{amount, currency}}`.
+///
+/// MERGE, not replace (mirrors the ACP path): `used` always takes the newer value,
+/// while `size`/`cost` are only overwritten when the incoming report carries them.
+/// codex sends no cost at all and may send `modelContextWindow: null`, so a blind
+/// replace would blank a window the previous turn had already established.
+async fn persist_context_usage(
+    repo: &dyn IAcpSessionRepository,
+    user_id: &str,
+    conversation_id: &str,
+    used: u64,
+    cost_usd: Option<f64>,
+    context_window: Option<u64>,
+) {
+    let mut usage = match repo.load_runtime_state_for_user(user_id, conversation_id).await {
+        Ok(Some(state)) => state
+            .context_usage_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default(),
+        Ok(None) => serde_json::Map::new(),
+        Err(err) => {
+            tracing::warn!(conversation_id, error = %err, "session-sync: load_runtime_state failed; skipping usage persist");
+            return;
+        }
+    };
+    usage.insert("used".into(), serde_json::json!(used));
+    if let Some(size) = context_window {
+        usage.insert("size".into(), serde_json::json!(size));
+    }
+    if let Some(cost) = cost_usd {
+        usage.insert("cost".into(), serde_json::json!({ "amount": cost, "currency": "USD" }));
+    }
+    let json = match serde_json::to_string(&usage) {
+        Ok(j) => j,
+        Err(err) => {
+            tracing::warn!(conversation_id, error = %err, "session-sync: encode context_usage failed");
+            return;
+        }
+    };
+    let params = SaveRuntimeStateParams {
+        context_usage_json: Some(Some(&json)),
+        ..Default::default()
+    };
+    if let Err(err) = repo
+        .save_runtime_state_for_user(user_id, conversation_id, &params)
+        .await
+    {
+        tracing::warn!(conversation_id, error = %err, "session-sync: save context_usage failed");
     }
 }
 
@@ -2703,17 +2855,27 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             output_tokens,
             total_tokens,
             cost_usd,
+            context_window,
         } => {
             // The frontend ContextUsageIndicator reads `used` (tokens consumed) and,
             // optionally, `size` (context window) + `cost` — the exact shape the ACP
             // path forwards (the claude-agent-acp SDK's UsageUpdate: {used, size,
             // cost:{amount,currency}}). Emitting the raw {input_tokens,…} shape left
-            // the indicator blank (no `used` key). `size` is omitted: UsageDelta
-            // carries no context-window figure (that rides the separate
-            // get_context_usage control probe, not wired here), and the frontend
-            // guards `if size>0` so its absence is safe. `used` = total_tokens (the
-            // genuine cumulative total the adapter already computed, incl. cache).
+            // the indicator blank (no `used` key).
+            //
+            // `used` = total_tokens, which BOTH direct backends compute as current
+            // context occupancy, not a per-turn delta: codex reports `last.totalTokens`
+            // (its `inputTokens` already includes the cached part) and claude's
+            // adapter sums input + output + both cache buckets. The cumulative
+            // counters (codex `total.*`) are deliberately NOT used — they outgrow the
+            // window on a long session.
+            //
+            // `size` is emitted only when the backend reported a window; the frontend
+            // guards `if size>0`, so `None` degrades to a counter with no percentage.
             let mut usage = serde_json::json!({ "used": total_tokens });
+            if let Some(size) = context_window {
+                usage["size"] = serde_json::json!(size);
+            }
             if let Some(cost) = cost_usd {
                 usage["cost"] = serde_json::json!({ "amount": cost, "currency": "USD" });
             }
@@ -3213,6 +3375,47 @@ mod translate_tests {
     use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
     use aionui_session::PermissionKind;
 
+    fn usage_frame(total: u64, cost: Option<f64>, window: Option<u64>) -> serde_json::Value {
+        let events = translate_event(
+            SessionEvent::UsageDelta {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: total,
+                cost_usd: cost,
+                context_window: window,
+            },
+            "conv-1",
+            false,
+        );
+        match events.into_iter().next() {
+            Some(AgentStreamEvent::AcpContextUsage(v)) => v,
+            other => panic!("expected AcpContextUsage, got {other:?}"),
+        }
+    }
+
+    /// The indicator needs a denominator: when the backend reports a context
+    /// window it MUST ride the frame as `size`, alongside `used`. Values are the
+    /// live-captured claude figures (occupancy 26_420 of a 1M window).
+    #[test]
+    fn context_window_rides_the_usage_frame_as_size() {
+        let v = usage_frame(26_420, Some(0.117), Some(1_000_000));
+        assert_eq!(v["used"], 26_420);
+        assert_eq!(v["size"], 1_000_000);
+        assert_eq!(v["cost"]["amount"], 0.117);
+        assert_eq!(v["cost"]["currency"], "USD");
+    }
+
+    /// No window reported (codex `modelContextWindow: null`) → NO `size` key at
+    /// all. Emitting `size: 0` would render a zero-width bar; the frontend guards
+    /// on the key's absence instead.
+    #[test]
+    fn absent_context_window_emits_no_size_key() {
+        let v = usage_frame(11_030, None, None);
+        assert_eq!(v["used"], 11_030);
+        assert!(v.get("size").is_none(), "no window → no `size` key, got {v}");
+        assert!(v.get("cost").is_none(), "no cost → no `cost` key, got {v}");
+    }
+
     fn tool_call(call_id: &str, name: &str, status: ToolCallStatus) -> AgentStreamEvent {
         AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id: call_id.into(),
@@ -3382,6 +3585,7 @@ mod translate_tests {
                 output_tokens: 20,
                 total_tokens: 30,
                 cost_usd: Some(0.5),
+                context_window: None,
             },
             "conv-1",
             false,
@@ -3784,6 +3988,117 @@ mod persist_tests {
         .await
         .unwrap();
         (repo, db)
+    }
+
+    fn usage(total: u64, cost: Option<f64>, window: Option<u64>) -> SessionEvent {
+        SessionEvent::UsageDelta {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: total,
+            cost_usd: cost,
+            context_window: window,
+        }
+    }
+
+    async fn stored_usage(repo: &dyn IAcpSessionRepository) -> serde_json::Value {
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .expect("runtime state exists");
+        serde_json::from_str(state.context_usage_json.as_deref().expect("context_usage written")).unwrap()
+    }
+
+    /// Defect 1: claude reports usage on the `result` frame, which lands AFTER the
+    /// turn's relay has broken on Finish. The pump is session-scoped and still
+    /// running, so the write must land regardless of turn lifecycle. The event
+    /// ORDER matters — a test that persisted a lone UsageDelta would not exercise
+    /// the bug at all.
+    #[tokio::test]
+    async fn usage_arriving_after_the_turn_ended_is_still_persisted() {
+        let (repo, _db) = seeded_repo().await;
+        // The turn terminates first...
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            },
+        )
+        .await;
+        // ...and only then does claude's usage arrive.
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &usage(26_420, Some(0.117), Some(1_000_000)),
+        )
+        .await;
+
+        let stored = stored_usage(repo.as_ref()).await;
+        assert_eq!(stored["used"], 26_420, "late usage must still reach the snapshot");
+        assert_eq!(stored["size"], 1_000_000, "the context window rides along as `size`");
+        assert_eq!(stored["cost"]["amount"], 0.117);
+        assert_eq!(stored["cost"]["currency"], "USD");
+    }
+
+    /// Writes MERGE. codex reports no cost at all and can report
+    /// `modelContextWindow: null`, so a later sizeless/costless report must not
+    /// blank a window the previous one established — that would make the indicator
+    /// lose its denominator mid-conversation.
+    #[tokio::test]
+    async fn sizeless_costless_update_keeps_the_known_window_and_cost() {
+        let (repo, _db) = seeded_repo().await;
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &usage(11_013, Some(0.5), Some(258_400)),
+        )
+        .await;
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &usage(11_030, None, None)).await;
+
+        let stored = stored_usage(repo.as_ref()).await;
+        assert_eq!(stored["used"], 11_030, "`used` always takes the newer value");
+        assert_eq!(stored["size"], 258_400, "a sizeless update must not blank the window");
+        assert_eq!(
+            stored["cost"]["amount"], 0.5,
+            "a costless update must not blank the cost"
+        );
+    }
+
+    /// The live frame must match what the renderer actually switches on.
+    /// `useAcpMessage.ts` handles `case 'acp_context_usage'`, reads `data.used`
+    /// into the indicator and `data.size` into `context_limit` (only when > 0), so
+    /// the tag and both key names are a hard contract — a rename silently blanks
+    /// the indicator rather than failing anything.
+    #[test]
+    fn broadcast_frame_matches_the_renderer_contract() {
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<aionui_api_types::WebSocketMessage<serde_json::Value>>>);
+        impl EventBroadcaster for Recorder {
+            fn broadcast(&self, event: aionui_api_types::WebSocketMessage<serde_json::Value>) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+
+        let bus = Recorder::default();
+        broadcast_usage_frame(&bus, "conv-1", "user-1", &usage(26_420, Some(0.117), Some(1_000_000)));
+        let sent = bus.0.lock().unwrap();
+        let msg = sent.first().expect("one frame broadcast");
+        assert_eq!(msg.name, "message.stream");
+        assert_eq!(
+            msg.data["type"], "acp_context_usage",
+            "renderer switches on this exact tag"
+        );
+        assert_eq!(msg.data["data"]["used"], 26_420);
+        assert_eq!(msg.data["data"]["size"], 1_000_000, "drives context_limit");
+        assert_eq!(msg.data["conversation_id"], "conv-1");
     }
 
     #[tokio::test]
@@ -4776,6 +5091,7 @@ mod pump_tests {
                 dir: tmp.path().to_path_buf(),
                 backend: "claude",
             }),
+            None,
         );
         crate::agent_task::IAgentTask::send_message(
             task.as_ref(),
@@ -4818,6 +5134,7 @@ mod pump_tests {
                 dir: tmp.path().to_path_buf(),
                 backend: "codex",
             }),
+            None,
         );
         // Inject an image directly onto the task's dump path via a content slice
         // containing an Image block.
@@ -4852,6 +5169,7 @@ mod pump_tests {
             backend,
             None,
             CatalogPreload::default(),
+            None,
             None,
         );
         crate::agent_task::IAgentTask::send_message(
@@ -5396,6 +5714,7 @@ mod pump_tests {
             None,
             &handshake_with_catalog(),
             None,
+            None,
         );
 
         // get_model serves the preloaded catalog + persisted current model.
@@ -5455,6 +5774,7 @@ mod pump_tests {
             None,
             &stale,
             None,
+            None,
         );
         let m = task.get_model().await.unwrap().model_info.expect("model_info");
         assert_eq!(
@@ -5509,6 +5829,7 @@ mod pump_tests {
             backend,
             None,
             &handshake_with_catalog(),
+            None,
             None,
         );
 
