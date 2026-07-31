@@ -5813,7 +5813,9 @@ async fn auto_replay_rebuild_keeps_existing_acp_session_id_in_build_options() {
             AgentSessionKind::Acp(ctx) => {
                 assert_eq!(ctx.session_id.as_deref(), Some("sess-existing"));
             }
-            AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+            AgentSessionKind::Aionrs(_) | AgentSessionKind::Antigravity(_) => {
+                panic!("test conversation should build ACP options")
+            }
         }
     }
 }
@@ -7177,7 +7179,9 @@ async fn assistant_backed_acp_build_options_include_snapshot_rule_as_preset_cont
         AgentSessionKind::Acp(ctx) => {
             assert_eq!(ctx.config.preset_context.as_deref(), Some("assistant rule body"));
         }
-        AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+        AgentSessionKind::Aionrs(_) | AgentSessionKind::Antigravity(_) => {
+            panic!("test conversation should build ACP options")
+        }
     }
 }
 
@@ -7216,7 +7220,9 @@ async fn assistant_backed_aionrs_build_options_include_snapshot_rule_as_preset_r
     let options = svc.build_task_options(&row).await.unwrap();
 
     match options.context.kind {
-        AgentSessionKind::Acp(_) => panic!("test conversation should build Aionrs options"),
+        AgentSessionKind::Acp(_) | AgentSessionKind::Antigravity(_) => {
+            panic!("test conversation should build Aionrs options")
+        }
         AgentSessionKind::Aionrs(ctx) => {
             assert_eq!(ctx.config.preset_rules.as_deref(), Some("assistant rule body"));
         }
@@ -8038,7 +8044,7 @@ async fn seed_aionrs_conversation_with_snapshot(
 fn aionrs_session_mode(options: &BuildTaskOptions) -> Option<String> {
     match &options.context.kind {
         AgentSessionKind::Aionrs(ctx) => ctx.config.session_mode.clone(),
-        AgentSessionKind::Acp(_) => panic!("expected Aionrs build options"),
+        AgentSessionKind::Acp(_) | AgentSessionKind::Antigravity(_) => panic!("expected Aionrs build options"),
     }
 }
 

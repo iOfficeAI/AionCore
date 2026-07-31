@@ -226,7 +226,7 @@ pub(super) async fn build(
     Ok(instance)
 }
 
-async fn resolve_catalog_metadata(
+pub(super) async fn resolve_catalog_metadata(
     registry: &Arc<AgentRegistry>,
     config: &aionui_api_types::AcpBuildExtra,
     user_id: &str,

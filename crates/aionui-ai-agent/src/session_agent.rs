@@ -1262,6 +1262,114 @@ fn spec_mode_model(
 /// assembly (`crates/aionui-app/src/session_runtime/mod.rs`): it resolves the
 /// resume spec, the mode/model precedence, the MCP + preset + skills init surface,
 /// the claude cc-switch provider env, and the codex sandbox/approval policy — so a
+/// Build an Antigravity (`agy` CLI) `SessionAgentTask`.
+///
+/// Deliberately SEPARATE from [`build_session_instance`]: that function carries
+/// claude/codex-private assembly — cc-switch provider env, the codex
+/// sandbox/approval derivation, persisted-effort replay, and a binary
+/// `if claude { "claude" } else { "codex" }` label that would silently
+/// mislabel any third backend. Antigravity needs none of it, so it shares this
+/// module's helpers (`spec_mode_model`, the MCP fold, `assemble_spawn_env`,
+/// `spawn_catalog_writeback`) without entering that path.
+pub async fn build_antigravity_instance(
+    inputs: SessionBuildInputs<'_>,
+    spawner: Arc<dyn aionui_process::Spawner>,
+) -> Result<crate::agent_task::AgentInstance, AgentError> {
+    use aionui_session::{AntigravityConnection, BackendConnection, McpServerSpec, SessionConfig, SessionInit};
+
+    let SessionBuildInputs {
+        conversation_id,
+        user_id,
+        workspace,
+        config,
+        metadata,
+        session_snapshot,
+        backend_session_id,
+        mcp_server_repo,
+        runtime_env,
+        broadcaster,
+        catalog_writeback,
+        acp_session_repo,
+        // agy has no prompt-dump lane yet (the dev dump is keyed by a
+        // claude/codex label); skip it rather than mislabel the dump.
+        prompt_dump_dir: _,
+    } = inputs;
+
+    let (spec, mode, model) = spec_mode_model(&conversation_id, backend_session_id, config, session_snapshot, metadata);
+
+    // Same MCP init surface and ordering as the claude/codex path: user servers
+    // resolved from the repo, plus the inline snapshot, with the team
+    // coordination server PREPENDED.
+    let mut neutral = match mcp_server_repo {
+        Some(repo) => {
+            crate::mcp_resolve::resolve_session_mcp_servers(
+                repo.as_ref(),
+                &user_id,
+                config.mcp_server_ids.as_deref(),
+                &conversation_id,
+                broadcaster.clone(),
+            )
+            .await
+        }
+        None => Vec::new(),
+    };
+    neutral.extend(config.session_mcp_servers.iter().cloned());
+    let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
+    if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
+        let mut coordination = vec![team_mcp_server_spec(cfg)];
+        coordination.append(&mut mcp_servers);
+        mcp_servers = coordination;
+    }
+
+    let init = SessionInit {
+        mcp_servers,
+        skills: config.skills.clone(),
+        preset_context: config.preset_context.clone(),
+        session_snapshot: None,
+        resume: matches!(spec, aionui_session::SessionSpec::Resume { .. }),
+    };
+
+    let mut session_config = SessionConfig {
+        cwd: Some(workspace.clone()),
+        model,
+        mode,
+        init,
+        // agy is NOT shipped with the app: it is a large native binary the user
+        // installs themselves, so there is no bundled path to resolve and the
+        // backend always spawns the `agy` on PATH.
+        cli_program: None,
+        ..Default::default()
+    };
+    session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
+
+    let backend = AntigravityConnection::new(spawner)
+        .open_session(spec, session_config)
+        .await
+        .map_err(|e| match e {
+            aionui_session::BackendError::WorkspaceUnavailable(path) => {
+                AgentError::workspace_path_runtime_unavailable(path)
+            }
+            e => AgentError::bad_gateway(format!("open antigravity session: {e}")),
+        })?;
+
+    if let Some((agent_id, catalog_tx)) = catalog_writeback {
+        spawn_catalog_writeback(agent_id, user_id.clone(), backend.clone(), catalog_tx);
+    }
+
+    let task = SessionAgentTask::new_with_preload(
+        AgentType::Antigravity,
+        conversation_id,
+        user_id,
+        workspace,
+        backend,
+        acp_session_repo,
+        &metadata.handshake,
+        None,
+        Some(broadcaster),
+    );
+    Ok(crate::agent_task::AgentInstance::Session(task))
+}
+
 /// claude/codex session started through the ACP factory is byte-equivalent to one
 /// started through the clean-slate registry.
 pub async fn build_session_instance(

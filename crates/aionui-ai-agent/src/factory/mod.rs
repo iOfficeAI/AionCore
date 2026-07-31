@@ -3,6 +3,7 @@ pub mod acp_assembler;
 mod acp;
 mod acp_launch_policy;
 pub(crate) mod aionrs;
+mod antigravity;
 mod context;
 
 use std::path::PathBuf;
@@ -69,6 +70,7 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
     match context.kind {
         AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx).await,
         AgentSessionKind::Aionrs(aionrs_context) => aionrs::build(deps, *aionrs_context, model, ctx).await,
+        AgentSessionKind::Antigravity(agy_context) => antigravity::build(deps, *agy_context, ctx).await,
     }
 }
 

@@ -4003,6 +4003,7 @@ fn context_backend_value(context: &AgentSessionContext) -> Option<serde_json::Va
 fn build_options_backend(options: &BuildTaskOptions) -> Option<&str> {
     match &options.context.kind {
         AgentSessionKind::Acp(ctx) => ctx.config.backend.as_deref(),
+        AgentSessionKind::Antigravity(ctx) => ctx.config.backend.as_deref(),
         AgentSessionKind::Aionrs(_) => None,
     }
 }
@@ -4051,6 +4052,16 @@ impl ConversationService {
         match agent_type {
             AgentType::Acp => resolve_acp_mcp_support_policy(&self.agent_metadata_repo, user_id, extra).await,
             AgentType::Aionrs => Ok(McpSupportPolicy::AIONRS),
+            // agy supports exactly two MCP transports: stdio (local command)
+            // and SSE (remote `serverUrl`). Letting it fall through to the
+            // all-true default would let users configure HTTP-transport servers
+            // that write cleanly into agy's config and then never connect.
+            AgentType::Antigravity => Ok(McpSupportPolicy {
+                stdio: true,
+                sse: true,
+                http: false,
+                streamable_http: false,
+            }),
             _ => Ok(McpSupportPolicy::AIONRS),
         }
     }
