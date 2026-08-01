@@ -255,6 +255,14 @@ struct DescribeAssistantParams {
 #[tool_router]
 impl TeamStdioServer {
     #[tool(
+        name = "team_read_messages",
+        description = "Peek at your own unread team mailbox messages without marking them read. Returns at most the most recent 50 messages in FIFO order; long content is truncated."
+    )]
+    async fn read_messages(&self) -> CallToolResult {
+        self.forward_to_tcp("team_read_messages", &serde_json::json!({})).await
+    }
+
+    #[tool(
         name = "team_send_message",
         description = "Send a message to a teammate or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files."
     )]

@@ -283,6 +283,7 @@ mod tests {
         assert!(prompt.contains("team_members"));
         assert!(prompt.contains("team_task_list"));
         assert!(prompt.contains("team_rename_agent"));
+        assert!(prompt.contains("call `team_read_messages` to check for queued messages"));
     }
 
     #[test]
@@ -355,6 +356,7 @@ mod tests {
         assert!(prompt.contains("You MUST use the `team_*` MCP tools for ALL team coordination."));
         assert!(prompt.contains("team_send_message"));
         assert!(prompt.contains("team_task_update"));
+        assert!(prompt.contains("call\n`team_read_messages` to check for queued messages"));
         assert!(prompt.contains("shutdown_request"));
         assert!(prompt.contains("shutdown_approved"));
         assert!(prompt.contains("STOP GENERATING"));

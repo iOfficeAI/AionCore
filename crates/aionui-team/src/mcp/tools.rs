@@ -169,6 +169,7 @@ pub fn parse_tool_call(
         }
         "team_task_list"
         | "team_members"
+        | "team_read_messages"
         | "team_rename_agent"
         | "team_clear_agent_context"
         | "team_shutdown_agent"
@@ -189,7 +190,7 @@ mod tests {
 
     #[test]
     fn all_descriptors_count() {
-        assert_eq!(all_tool_descriptors().len(), 11);
+        assert_eq!(all_tool_descriptors().len(), 12);
     }
 
     #[test]
@@ -198,7 +199,7 @@ mod tests {
         let mut names: Vec<&str> = descs.iter().map(|d| d.name.as_str()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 12);
     }
 
     #[test]

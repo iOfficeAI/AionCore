@@ -37,7 +37,7 @@ use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
 use crate::task_board::TaskBoard;
 use crate::team_run::{TeamRunManager, target_role_for};
-use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
+use crate::types::{MailboxMessage, MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::work_coordinator::{
     CausalBinding, CommitResult, EnqueueCommit, EnqueueDisposition, EnqueueLease, EnqueueRequest, ReconcileDecision,
     RuntimeConstraint, SlotWorkCoordinator, WorkBatch,
@@ -1761,6 +1761,17 @@ impl TeamSession {
         &self.mailbox
     }
 
+    pub(crate) async fn peek_agent_messages(&self, slot_id: &str) -> Result<Vec<MailboxMessage>, TeamError> {
+        self.scheduler.get_agent(slot_id).await?;
+        Ok(self
+            .mailbox
+            .peek_unread(&self.team.id, slot_id)
+            .await?
+            .into_iter()
+            .filter(|message| message.from_agent_id != slot_id)
+            .collect())
+    }
+
     pub fn task_board(&self) -> &Arc<TaskBoard> {
         &self.task_board
     }
@@ -2994,6 +3005,61 @@ mod tests {
         assert_eq!(slot.state, SlotPhase::Queued);
         assert!(slot.active_batch.is_none());
         assert_eq!(slot.queued_foreground_count, 1);
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn peek_agent_messages_is_read_only_and_preserves_normal_claim() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
+        let session = Arc::new(session);
+        let first = session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "first", None)
+            .await
+            .unwrap();
+        let self_message = session
+            .mailbox
+            .write("t1", "lead-1", "lead-1", MailboxMessageType::Message, "self", None)
+            .await
+            .unwrap();
+        let second = session
+            .mailbox
+            .write_with_files(
+                "t1",
+                "lead-1",
+                "worker-1",
+                MailboxMessageType::Message,
+                "second",
+                None,
+                Some(&["C:\\work\\note.txt".into()]),
+            )
+            .await
+            .unwrap();
+
+        let peeked = session.peek_agent_messages("lead-1").await.unwrap();
+        assert_eq!(
+            peeked.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(),
+            vec![first.id.as_str(), second.id.as_str()],
+            "the inbox peek is FIFO and excludes messages sent by the caller to itself"
+        );
+        assert!(peeked.iter().all(|message| !message.read));
+        let still_unread = session.mailbox.peek_unread("t1", "lead-1").await.unwrap();
+        assert_eq!(still_unread.len(), 3, "peeking must not mark any mailbox row read");
+        assert!(still_unread.iter().any(|message| message.id == self_message.id));
+
+        register_test_event_loop(&session, "lead-1");
+        let PrepareBatchResult::Execute { batch, input } = session.prepare_next_batch("lead-1").await.unwrap() else {
+            panic!("peeked messages must remain available to the normal claim path");
+        };
+        assert_eq!(batch.mailbox_message_ids, vec![first.id, second.id]);
+        assert_eq!(
+            input
+                .unread
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
         session.stop();
     }
 

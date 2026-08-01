@@ -864,9 +864,10 @@ async fn s1a_mcp_server_starts_and_tools_available() {
     let resp = tcp_recv(&mut stream).await;
 
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 11, "expected exactly 11 MCP tools, got {}", tools.len());
+    assert_eq!(tools.len(), 12, "expected exactly 12 MCP tools, got {}", tools.len());
 
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"team_read_messages"), "missing team_read_messages");
     assert!(names.contains(&"team_send_message"), "missing team_send_message");
     assert!(names.contains(&"team_members"), "missing team_members");
     assert!(names.contains(&"team_task_create"), "missing team_task_create");

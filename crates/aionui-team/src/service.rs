@@ -1913,6 +1913,14 @@ impl TeamSessionService {
             .ok_or_else(|| TeamError::SessionNotFound(team_id.to_owned()))
     }
 
+    pub(crate) async fn peek_agent_messages(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+    ) -> Result<Vec<crate::types::MailboxMessage>, TeamError> {
+        self.published_session(team_id)?.peek_agent_messages(slot_id).await
+    }
+
     /// Resolve a send's attachments to absolute paths and re-inline them into
     /// the content (`[[AION_FILES]]` form) at the team send boundary. Atomic;
     /// empty/absent `files` is a no-op needing no project service.

@@ -14,7 +14,7 @@ use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
 use crate::session::{AgentMessageQueueResult, SpawnAgentRequest};
 use crate::tool_executor::{TeamToolContext, TeamToolExecutor, team_tool_call_from_name};
-use crate::types::{TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus};
+use crate::types::{MailboxMessage, TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus};
 use crate::work_source::WorkSource;
 
 use super::protocol::{
@@ -523,6 +523,7 @@ pub(crate) async fn dispatch_tool(
     super::tools::authorize_tool(caller_role, tool_name).map_err(ToolCallError::from_message)?;
 
     match tool_name {
+        "team_read_messages" => exec_read_messages(arguments, service, team_id, caller_slot_id).await,
         "team_send_message" => exec_send_message(arguments, scheduler, service, team_id, caller_slot_id).await,
         "team_spawn_agent" => exec_spawn_agent(arguments, service, team_id, caller_slot_id, caller_role).await,
         "team_task_create" => exec_task_create(arguments, scheduler).await,
@@ -597,6 +598,69 @@ async fn exec_describe_assistant(
 // ---------------------------------------------------------------------------
 // Individual tool handlers
 // ---------------------------------------------------------------------------
+
+const MAX_INBOX_MESSAGES: usize = 50;
+const MAX_INBOX_CONTENT_CHARS: usize = 4_000;
+const INBOX_TRUNCATION_MARKER: &str = "\n[truncated]";
+
+async fn exec_read_messages(
+    args: &Value,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    caller_slot_id: &str,
+) -> Result<String, ToolCallError> {
+    let props = args.as_object().cloned().unwrap_or_default();
+    if !props.is_empty() {
+        return Err(ToolCallError::from_message(
+            "team_read_messages does not accept arguments",
+        ));
+    }
+    let service = service
+        .upgrade()
+        .ok_or_else(|| ToolCallError::from_message("Team service not available"))?;
+    let messages = service
+        .peek_agent_messages(team_id, caller_slot_id)
+        .await
+        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+    json_text(&read_messages_json(messages))
+}
+
+fn read_messages_json(messages: Vec<MailboxMessage>) -> Value {
+    let total_unread_count = messages.len();
+    let omitted_count = total_unread_count.saturating_sub(MAX_INBOX_MESSAGES);
+    let messages = messages
+        .into_iter()
+        .skip(omitted_count)
+        .map(|message| {
+            let (content, content_truncated) = truncate_inbox_content(&message.content);
+            json!({
+                "from_slot": message.from_agent_id,
+                "type": message.msg_type,
+                "content": content,
+                "content_truncated": content_truncated,
+                "files": message.files.unwrap_or_default(),
+                "created_at": message.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let returned_count = messages.len();
+    json!({
+        "messages": messages,
+        "returned_count": returned_count,
+        "total_unread_count": total_unread_count,
+        "has_more": omitted_count > 0,
+    })
+}
+
+fn truncate_inbox_content(content: &str) -> (String, bool) {
+    let mut chars = content.chars();
+    let truncated = chars.by_ref().take(MAX_INBOX_CONTENT_CHARS).collect::<String>();
+    if chars.next().is_none() {
+        (truncated, false)
+    } else {
+        (format!("{truncated}{INBOX_TRUNCATION_MARKER}"), true)
+    }
+}
 
 async fn resolve_agent_target(
     scheduler: &TeammateManager,
@@ -1247,7 +1311,63 @@ fn http_bearer_token(request: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::MailboxMessageType;
     use aionui_api_types::{TeamRunTargetRole, TeamSlotWorkPayload, TeamSlotWorkState};
+
+    fn inbox_message(index: usize, content: impl Into<String>) -> MailboxMessage {
+        MailboxMessage {
+            id: format!("message-{index:02}"),
+            team_id: "team-1".into(),
+            to_agent_id: "lead-1".into(),
+            from_agent_id: format!("worker-{index:02}"),
+            msg_type: MailboxMessageType::Message,
+            content: content.into(),
+            summary: None,
+            files: Some(vec![format!("C:\\work\\file-{index:02}.txt")]),
+            read: false,
+            created_at: index as i64,
+        }
+    }
+
+    #[test]
+    fn read_messages_json_returns_fifo_messages_and_an_explicit_empty_list() {
+        let value = read_messages_json(vec![inbox_message(1, "first"), inbox_message(2, "second")]);
+        assert_eq!(value["returned_count"], 2);
+        assert_eq!(value["total_unread_count"], 2);
+        assert_eq!(value["has_more"], false);
+        assert_eq!(value["messages"][0]["from_slot"], "worker-01");
+        assert_eq!(value["messages"][0]["type"], "message");
+        assert_eq!(value["messages"][0]["content"], "first");
+        assert_eq!(value["messages"][0]["content_truncated"], false);
+        assert_eq!(value["messages"][0]["files"][0], "C:\\work\\file-01.txt");
+        assert_eq!(value["messages"][0]["created_at"], 1);
+        assert_eq!(value["messages"][1]["content"], "second");
+
+        let empty = read_messages_json(Vec::new());
+        assert_eq!(empty["messages"], json!([]));
+        assert_eq!(empty["returned_count"], 0);
+        assert_eq!(empty["total_unread_count"], 0);
+        assert_eq!(empty["has_more"], false);
+    }
+
+    #[test]
+    fn read_messages_json_keeps_the_recent_fifty_and_truncates_long_content() {
+        let long_content = "x".repeat(MAX_INBOX_CONTENT_CHARS + 1);
+        let mut messages = (0..MAX_INBOX_MESSAGES)
+            .map(|index| inbox_message(index, format!("message {index}")))
+            .collect::<Vec<_>>();
+        messages.push(inbox_message(MAX_INBOX_MESSAGES, long_content));
+
+        let value = read_messages_json(messages);
+        assert_eq!(value["returned_count"], MAX_INBOX_MESSAGES);
+        assert_eq!(value["total_unread_count"], MAX_INBOX_MESSAGES + 1);
+        assert_eq!(value["has_more"], true);
+        assert_eq!(value["messages"][0]["from_slot"], "worker-01");
+        let last = &value["messages"][MAX_INBOX_MESSAGES - 1];
+        assert_eq!(last["from_slot"], "worker-50");
+        assert_eq!(last["content_truncated"], true);
+        assert!(last["content"].as_str().unwrap().ends_with(INBOX_TRUNCATION_MARKER));
+    }
 
     #[test]
     fn build_send_message_queued_response_serializes_json_contract() {
