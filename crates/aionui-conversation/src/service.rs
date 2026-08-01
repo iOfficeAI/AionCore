@@ -1016,7 +1016,9 @@ impl ConversationService {
             }
             if let Some(permission) = snapshot.resolved_defaults.permission.as_ref() {
                 obj.insert("session_mode".to_owned(), serde_json::Value::String(permission.clone()));
-                if matches!(effective_type, AgentType::Acp) {
+                // Antigravity carries the same mode axis (agy's `--mode`), so it
+                // needs the seeded current value too or the picker opens blank.
+                if matches!(effective_type, AgentType::Acp | AgentType::Antigravity) {
                     obj.insert(
                         "current_mode_id".to_owned(),
                         serde_json::Value::String(permission.clone()),
@@ -1338,7 +1340,13 @@ impl ConversationService {
         // ACP conversations own one `acp_session` row (1:1 by
         // conversation_id). Other agent types have no session-level
         // state so we only create it for ACP.
-        if effective_type == AgentType::Acp {
+        //
+        // Antigravity is included because it has exactly that state: a resume
+        // anchor (agy's own conversation id), the observed mode/model, and the
+        // context-usage snapshot the indicator reads back. Without the row those
+        // writes have nowhere to land — the usage indicator stays at zero and a
+        // reopened conversation cannot resume agy's session.
+        if matches!(effective_type, AgentType::Acp | AgentType::Antigravity) {
             self.create_acp_session_row(user_id, &id, &extra, assistant_snapshot.as_ref())
                 .await?;
         }

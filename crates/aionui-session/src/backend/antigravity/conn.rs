@@ -46,6 +46,36 @@ use crate::event::{PermissionKind, SessionEvent, TurnOutcome};
 /// large enough that a slow subscriber does not lose a turn's worth of frames.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Model list shared by every Antigravity session in this process.
+///
+/// The list belongs to the signed-in agy account, not to a conversation, and
+/// discovering it costs a process launch. Caching it keeps the second and later
+/// sessions from opening with an empty model picker.
+///
+/// Only non-empty lists are stored: an empty result means "not signed in" or
+/// "probe failed", which must not be cached as though it were the answer.
+static MODEL_CACHE: std::sync::OnceLock<std::sync::RwLock<Vec<ModelInfo>>> = std::sync::OnceLock::new();
+
+fn model_cache() -> &'static std::sync::RwLock<Vec<ModelInfo>> {
+    MODEL_CACHE.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+}
+
+fn cached_models() -> Option<Vec<ModelInfo>> {
+    let guard = model_cache().read().ok()?;
+    (!guard.is_empty()).then(|| guard.clone())
+}
+
+fn store_models(models: &[ModelInfo]) {
+    // Guard here rather than at the call site: caching "not signed in" would
+    // pin an empty picker for the rest of the process.
+    if models.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = model_cache().write() {
+        *guard = models.to_vec();
+    }
+}
+
 /// Which text represents the turn's reply, given agy's terminal frame.
 ///
 /// agy's `result.response` is the SAME reply the deltas carried, but assembled
@@ -280,8 +310,25 @@ impl AntigravitySessionBackend {
             .cli_program
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from("agy"));
+
+        // Serve a list an earlier session already paid for. agy's models are a
+        // property of the signed-in account, not of the conversation, so
+        // re-running `agy models` per session buys nothing and costs ~3s during
+        // which `get_config_options` reports no models at all — and the frontend
+        // fetches those options once, so an empty first answer leaves the picker
+        // stuck on its loading state for the whole session.
+        if let Some(cached) = cached_models()
+            && let Ok(mut guard) = slot.write()
+        {
+            *guard = cached;
+            return;
+        }
+
         tokio::spawn(async move {
             let found = probe_models(&spawner, &program, &session_id).await;
+            if !found.is_empty() {
+                store_models(&found);
+            }
             if found.is_empty() {
                 tracing::info!(
                     session_id = %session_id,
@@ -1129,5 +1176,27 @@ mod tests {
         // A tool-only turn must not produce an empty assistant bubble.
         assert_eq!(final_turn_text(false, "", ""), None);
         assert_eq!(final_turn_text(true, "", ""), None);
+    }
+
+    #[test]
+    fn an_empty_probe_result_is_never_cached() {
+        // "not signed in" must not be pinned as the answer for the rest of the
+        // process — the next session has to be free to probe again.
+        store_models(&[]);
+        assert!(cached_models().is_none() || !cached_models().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_discovered_list_is_shared_with_later_sessions() {
+        // agy's models belong to the signed-in account, so re-probing per
+        // session only delays the picker.
+        store_models(&[ModelInfo {
+            id: "gemini-3.1-pro-low".into(),
+            name: "gemini-3.1-pro-low".into(),
+            description: None,
+            reasoning_efforts: Vec::new(),
+        }]);
+        let cached = cached_models().expect("a non-empty list must be cached");
+        assert!(cached.iter().any(|m| m.id == "gemini-3.1-pro-low"));
     }
 }
