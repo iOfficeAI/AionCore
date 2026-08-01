@@ -559,23 +559,30 @@ fn chrono_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Build a TLS connector with ALPN `http/1.1` only (WebSocket upgrade).
+/// Build a TLS connector for WebSocket connections.
+///
+/// Matches Lark/DingTalk: explicit CryptoProvider + ALPN `http/1.1` only
+/// (WebSocket upgrade is incompatible with h2).
 fn build_ws_tls_connector() -> Result<tokio_tungstenite::Connector, ChannelError> {
-    use rustls::ClientConfig;
-    use std::sync::Arc as StdArc;
+    use std::sync::Arc;
     use tokio_tungstenite::Connector;
 
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().certs {
-        let _ = roots.add(cert);
-    }
+    let certs = rustls_native_certs::load_native_certs();
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.add_parsable_certificates(certs.certs);
 
-    let mut config = ClientConfig::builder()
-        .with_root_certificates(roots)
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| ChannelError::ConnectionFailed(format!("TLS config error: {e}")))?
+        .with_root_certificates(root_store)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
-    Ok(Connector::Rustls(StdArc::new(config)))
+    Ok(Connector::Rustls(Arc::new(config)))
 }
 
 #[cfg(test)]
