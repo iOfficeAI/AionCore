@@ -61,6 +61,20 @@ const AGENTS_DIR: &str = ".agents";
 /// Subcommand that turns our own binary into agy's hook process.
 const HOOK_SUBCOMMAND: &str = "antigravity-hook";
 
+/// Remove a `hooks.json` this workspace may carry from an earlier build.
+///
+/// Needed when a conversation becomes a teammate: a hook left behind would keep
+/// calling back for approval nobody is there to give, stalling the team. Absence
+/// is the success case, so a missing file is not an error.
+pub fn remove_hooks_json(workspace: &Path) {
+    let path = workspace.join(AGENTS_DIR).join("hooks.json");
+    match std::fs::remove_file(&path) {
+        Ok(()) => tracing::debug!(path = %path.display(), "antigravity: removed the approval hook"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(path = %path.display(), error = %e, "antigravity: could not remove hooks.json"),
+    }
+}
+
 /// Write `<workspace>/.agents/hooks.json` registering `hook_binary` as the
 /// PreToolUse gate for every tool.
 ///
@@ -180,5 +194,25 @@ mod tests {
         write_hooks_json(dir.path(), Path::new("/opt/aionui/backend")).unwrap();
         let raw = std::fs::read_to_string(dir.path().join(".agents/hooks.json")).unwrap();
         assert!(!raw.contains("\"old\""), "a stale hook must not survive");
+    }
+
+    #[test]
+    fn removing_the_hook_clears_a_previous_install() {
+        // A conversation that becomes a teammate must not keep calling back for
+        // approval nobody is there to give.
+        let dir = tempfile::tempdir().unwrap();
+        write_hooks_json(dir.path(), std::path::Path::new("/opt/aionui/aioncore")).unwrap();
+        assert!(dir.path().join(".agents/hooks.json").exists());
+
+        remove_hooks_json(dir.path());
+        assert!(!dir.path().join(".agents/hooks.json").exists());
+    }
+
+    #[test]
+    fn removing_an_absent_hook_is_not_an_error() {
+        // Absence IS the desired state, so a workspace that never had one is fine.
+        let dir = tempfile::tempdir().unwrap();
+        remove_hooks_json(dir.path());
+        assert!(!dir.path().join(".agents/hooks.json").exists());
     }
 }

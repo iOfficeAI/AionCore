@@ -1,5 +1,10 @@
 //! Command-line construction for one agy turn. Pure: no IO, no spawning.
 
+/// AionUi's sentinel mode id meaning "run without approval prompts".
+///
+/// Not one of agy's modes (default / accept-edits / plan) and never sent to it.
+pub(crate) const FULL_AUTO_SENTINEL: &str = "yolo";
+
 /// Everything one `agy` invocation needs. There is deliberately no `effort`
 /// field: agy's model ids already carry the effort suffix (see `model`).
 #[derive(Debug, Clone, Default)]
@@ -44,7 +49,16 @@ pub(crate) fn build_argv(input: &ArgvInput) -> Vec<String> {
     }
     // No `--effort`: effort lives inside the model id, and a stripped id is
     // silently ignored by agy.
-    for (flag, value) in [("--model", &input.model), ("--mode", &input.mode)] {
+    // `yolo` is AionUi's sentinel for "no approval prompts", not one of agy's
+    // modes (default / accept-edits / plan). agy tolerates unknown values
+    // silently, so forwarding it would look fine and quietly leave the session
+    // on whatever mode agy defaults to.
+    let mode = input
+        .mode
+        .as_deref()
+        .filter(|m| !m.eq_ignore_ascii_case(FULL_AUTO_SENTINEL));
+    let mode = mode.map(str::to_owned);
+    for (flag, value) in [("--model", &input.model), ("--mode", &mode)] {
         if let Some(v) = non_blank(value) {
             a.push(flag.into());
             a.push(v.to_owned());
@@ -78,6 +92,30 @@ mod tests {
         assert!(a.contains(&"hello".to_string()));
         assert_eq!(flag_value(&a, "--output-format"), Some("stream-json"));
         assert!(!a.contains(&"--conversation".to_string()));
+    }
+
+    #[test]
+    fn the_full_auto_sentinel_is_never_sent_as_agys_mode() {
+        // `yolo` is AionUi's marker, not one of agy's modes. agy accepts unknown
+        // --mode values silently (verified: `--mode default` exits 0 even though
+        // --help lists only accept-edits/plan), so forwarding it would look fine
+        // and quietly leave the session on agy's default.
+        let mut i = base();
+        i.mode = Some("yolo".to_owned());
+        let a = build_argv(&i);
+        assert!(!a.contains(&"--mode".to_string()), "argv={a:?}");
+        assert!(!a.iter().any(|x| x == "yolo"), "argv={a:?}");
+    }
+
+    #[test]
+    fn agys_real_modes_are_forwarded() {
+        for mode in ["default", "accept-edits", "plan"] {
+            let mut i = base();
+            i.mode = Some(mode.to_owned());
+            let a = build_argv(&i);
+            let at = a.iter().position(|x| x == "--mode").expect("mode flag missing");
+            assert_eq!(a[at + 1], mode);
+        }
     }
 
     #[test]

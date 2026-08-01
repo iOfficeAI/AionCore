@@ -15,6 +15,7 @@ mod mcp_config;
 mod models;
 mod skills;
 mod translate;
+mod version;
 mod wire;
 
 pub use conn::{AntigravityConnection, AntigravitySessionBackend, antigravity_capabilities};

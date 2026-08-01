@@ -27,9 +27,10 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 
 use super::argv::{ArgvInput, build_argv};
 use super::mcp_config::write_mcp_config;
-use super::models::probe_models;
+use super::models::{probe_models, probe_version};
 use super::skills::scan_skill_commands;
 use super::translate::Translator;
+use super::version::drift_notice;
 use super::wire::parse_line;
 use crate::backend::types::{
     Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
@@ -75,6 +76,25 @@ fn store_models(models: &[ModelInfo]) {
         *guard = models.to_vec();
     }
 }
+
+/// Whether the agy version has already been reported in this process.
+///
+/// The installed binary cannot change under a running app, so repeating the
+/// notice on every session would just be noise.
+static VERSION_REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn version_already_reported() -> bool {
+    VERSION_REPORTED.swap(true, Ordering::SeqCst)
+}
+
+/// How long a permission card may stay unanswered before we answer `deny` for
+/// the user.
+///
+/// agy abandons a PreToolUse hook after ~30s and then runs the tool regardless
+/// (measured against 1.1.9: a hook that blocked for 180s saw the tool execute
+/// at 29.5s / 30.0s while it was still blocked). Deciding before that keeps the
+/// refusal ours; leaving it to agy would mean silent approval.
+const PERMISSION_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Which text represents the turn's reply, given agy's terminal frame.
 ///
@@ -137,18 +157,32 @@ pub fn antigravity_capabilities() -> Capabilities {
 /// agy's fixed mode axis (`--mode`). Unlike models this never depends on the
 /// account, so it needs no probe.
 pub fn antigravity_modes() -> Vec<ModeInfo> {
-    ["default", "accept-edits", "plan"]
-        .into_iter()
-        .map(|id| ModeInfo {
-            id: id.to_owned(),
-            name: match id {
-                "accept-edits" => "Accept Edits".to_owned(),
-                "plan" => "Plan".to_owned(),
-                _ => "Default".to_owned(),
-            },
-            description: None,
-        })
-        .collect()
+    // `yolo` is NOT one of agy's modes — it is AionUi's sentinel for "run
+    // without asking", offered here so a user can pick full auto deliberately
+    // and so a teammate / scheduled run carries the same value. The backend
+    // answers it by not installing its approval hook and never forwards it as
+    // agy's `--mode`.
+    [
+        ("default", "Default", None),
+        (
+            "accept-edits",
+            "Accept Edits",
+            Some("File edits are auto-approved; commands still ask."),
+        ),
+        ("plan", "Plan", Some("Research and plan only.")),
+        (
+            "yolo",
+            "Full Auto",
+            Some("Every tool runs without asking. Used automatically by teams and scheduled runs."),
+        ),
+    ]
+    .into_iter()
+    .map(|(id, name, description)| ModeInfo {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        description: description.map(str::to_owned),
+    })
+    .collect()
 }
 
 /// Connection-level factory. agy is 1:1 (one process per turn, one logical
@@ -221,6 +255,7 @@ impl BackendConnection for AntigravityConnection {
         // up when it lands.
         let _ = backend.weak_self.set(Arc::downgrade(&backend));
         backend.spawn_model_probe();
+        backend.spawn_version_check();
         Ok(backend)
     }
 
@@ -339,6 +374,48 @@ impl AntigravitySessionBackend {
             }
             if let Ok(mut guard) = slot.write() {
                 *guard = found;
+            }
+        });
+    }
+
+    /// Tell the user once when the installed agy is not the release this
+    /// integration was verified against.
+    ///
+    /// agy ships outside the app (a 157 MB binary Google distributes itself),
+    /// so unlike the pinned claude/codex CLIs its version is whatever the user
+    /// installed. Every wire contract here — the `stream-json` shapes, the hook
+    /// protocol, `--conversation` resume — was verified against one release, and
+    /// a drifting install should say so up front rather than fail in some
+    /// unexplained way mid-turn.
+    ///
+    /// Reported once per process: the answer cannot change while agy's binary
+    /// stays put, and repeating it on every session would be noise.
+    fn spawn_version_check(self: &Arc<Self>) {
+        if version_already_reported() {
+            return;
+        }
+        let spawner = Arc::clone(&self.spawner);
+        let session_id = self.session_id.clone();
+        let program = self
+            .config
+            .cli_program
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("agy"));
+        let weak = self.weak_self.get().cloned();
+        tokio::spawn(async move {
+            let Some(reported) = probe_version(&spawner, &program, &session_id).await else {
+                return;
+            };
+            tracing::info!(session_id = %session_id, version = %reported, "antigravity: agy version detected");
+            let Some((level, message)) = drift_notice(&reported) else {
+                return;
+            };
+            tracing::warn!(session_id = %session_id, version = %reported, "antigravity: agy version drift");
+            if let Some(backend) = weak.and_then(|w| w.upgrade()) {
+                backend.emit(
+                    backend.turn_gen.load(Ordering::SeqCst),
+                    SessionEvent::Notice { level, message },
+                );
             }
         });
     }
@@ -734,20 +811,46 @@ impl SessionBackend for AntigravitySessionBackend {
                 request_id: request_id.clone(),
                 kind: PermissionKind::Tool,
                 metadata: None,
-                tool_name: Some(tool_name),
+                tool_name: Some(tool_name.clone()),
                 input: Some(input),
             },
         );
 
-        // No timeout here on purpose: a user may legitimately leave a permission
-        // card unanswered for a long time, and the turn is allowed to wait.
-        // Every path that ends the turn drains this table, so the wait always
-        // terminates on a real event rather than a clock.
-        match rx.await {
-            Ok(decision) => decision,
+        // agy does NOT wait indefinitely for its hook, and what it does on
+        // expiry is the whole reason this deadline exists: measured against
+        // 1.1.9, it abandons a PreToolUse hook after ~30s and then RUNS THE
+        // TOOL ANYWAY. So an unanswered card is not a safe "still waiting" —
+        // past that point the tool has already run while the card is still on
+        // screen, and whatever the user clicks next changes nothing.
+        //
+        // Answering just before agy gives up turns its fail-open into
+        // fail-closed: a user who is too slow gets a refused tool they can
+        // retry, never one that silently executed behind a pending prompt.
+        match tokio::time::timeout(PERMISSION_ANSWER_DEADLINE, rx).await {
+            Ok(Ok(decision)) => decision,
             // Sender dropped without answering — treat as denial, never as
             // silent approval.
-            Err(_) => PermissionDecision::Denied,
+            Ok(Err(_)) => PermissionDecision::Denied,
+            Err(_) => {
+                // Retract the card too. Leaving it up would invite an answer
+                // that no longer reaches agy, which reads as "my click did
+                // nothing" — worse than the prompt disappearing.
+                self.pending.lock().await.remove(&request_id);
+                self.emit(
+                    self.turn_gen.load(Ordering::SeqCst),
+                    SessionEvent::PermissionResolved {
+                        request_id: request_id.clone(),
+                        kind: PermissionKind::Tool,
+                    },
+                );
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    request_id = %request_id,
+                    tool = %tool_name,
+                    "antigravity: denied a tool because agy was about to stop waiting for approval"
+                );
+                PermissionDecision::Denied
+            }
         }
     }
 }
@@ -931,6 +1034,61 @@ mod tests {
         assert!(b.pending_permission_requests().is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_card_is_denied_before_agy_stops_waiting() {
+        // agy abandons its PreToolUse hook after ~30s and then runs the tool
+        // regardless (measured on 1.1.9: 29.5 / 29.7 / 29.8 / 30.0s across four
+        // runs with a hook that never answered). Waiting past that point would
+        // leave a card on screen for a tool that already ran, so we answer
+        // `deny` first and the refusal stays ours.
+        let b = backend_for_permissions().await;
+        let decision = b.request_external_permission("run_command".into(), json!({})).await;
+        assert_eq!(decision, PermissionDecision::Denied);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_card_is_retracted_not_left_hanging() {
+        // A card that outlives its answer window must disappear: clicking it
+        // would change nothing, which reads as "my click did nothing".
+        let b = backend_for_permissions().await;
+        let _ = b.request_external_permission("run_command".into(), json!({})).await;
+        assert!(
+            b.pending.lock().await.is_empty(),
+            "the pending entry must be dropped when the deadline passes"
+        );
+        assert!(
+            b.pending_permission_requests().is_empty(),
+            "the card must no longer be advertised to the UI"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_within_the_window_still_wins() {
+        // The deadline must not steal a decision the user did make in time.
+        let b = backend_for_permissions().await;
+        let b2 = Arc::clone(&b);
+        let answer = tokio::spawn(async move {
+            for _ in 0..50 {
+                let id = b2.pending_permission_requests().first().map(|p| p.request_id.clone());
+                if let Some(id) = id {
+                    let _ = b2
+                        .dispatch(Command::AnswerPermission {
+                            request_id: id,
+                            decision: PermissionDecision::Approved,
+                            selected: None,
+                            answers: Vec::new(),
+                        })
+                        .await;
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        let decision = b.request_external_permission("run_command".into(), json!({})).await;
+        let _ = answer.await;
+        assert_eq!(decision, PermissionDecision::Approved);
+    }
+
     #[tokio::test]
     async fn answering_an_unknown_request_is_not_an_error() {
         // Double-click, or an answer racing the turn's own drain.
@@ -1007,17 +1165,29 @@ mod tests {
         assert_eq!(caps.current_model.as_deref(), Some("gemini-3.1-pro-high"));
         assert_eq!(
             caps.available_modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["default", "accept-edits", "plan"]
+            vec!["default", "accept-edits", "plan", "yolo"]
         );
         assert_eq!(caps.current_mode.as_deref(), Some("plan"));
     }
 
     #[test]
-    fn modes_are_agys_three_and_carry_display_names() {
+    fn modes_are_agys_three_plus_the_full_auto_sentinel() {
+        // agy's own axis is default / accept-edits / plan. `yolo` is AionUi's
+        // sentinel for "no approval prompts" — offered as a choice so a user can
+        // pick full auto deliberately, and carried by teams / scheduled runs.
         let modes = antigravity_modes();
-        assert_eq!(modes.len(), 3);
-        assert_eq!(modes[1].id, "accept-edits");
+        assert_eq!(
+            modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["default", "accept-edits", "plan", "yolo"]
+        );
         assert_eq!(modes[1].name, "Accept Edits");
+
+        // The two agy explains itself, in agy's own words, plus the sentinel:
+        // a mode whose consequence is invisible must say what it does.
+        for id in ["accept-edits", "plan", "yolo"] {
+            let m = modes.iter().find(|m| m.id == id).unwrap();
+            assert!(m.description.is_some(), "{id} needs a description");
+        }
     }
 
     #[tokio::test]

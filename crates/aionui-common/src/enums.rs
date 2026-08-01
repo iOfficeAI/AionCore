@@ -126,11 +126,19 @@ impl AgentType {
                 Some("cursor") => "agent",
                 _ => "yolo",
             },
-            // agy's full-auto is the `--dangerously-skip-permissions` flag, not
-            // a mode id; its mode axis is `default` / `accept-edits` / `plan`.
-            // AionUi opens that gate itself and gates each tool in its own hook
-            // bridge, so the neutral `default` is the right mode to sit on.
-            AgentType::Antigravity => "default",
+            // agy has NO full-auto mode: measured against 1.1.9, all three of
+            // its modes (default / accept-edits / plan) are refused the
+            // "command" permission without `--dangerously-skip-permissions` and
+            // all three run commands with it. `accept-edits` only auto-approves
+            // file edits (agy's own wording); `plan` is "research & plan only".
+            //
+            // `yolo` is therefore a SENTINEL, not one of agy's modes. It lets a
+            // caller say "run unattended" through the same channel every other
+            // agent uses; the backend answers it by not installing its approval
+            // hook, and never forwards it as agy's `--mode`. Returning the
+            // neutral `default` here instead would be indistinguishable from a
+            // user who simply picked the default mode.
+            AgentType::Antigravity => "yolo",
             AgentType::Aionrs
             | AgentType::Gemini
             | AgentType::Codex
@@ -516,11 +524,18 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_full_auto_is_a_flag_not_a_mode_id() {
-        // agy exposes full-auto through `--dangerously-skip-permissions`, not a
-        // mode id, so the mode axis must stay on its real modes. Returning the
-        // default arm's "yolo" would hand agy a mode it does not have.
-        assert_eq!(AgentType::Antigravity.full_auto_mode_id(None), "default");
+    fn antigravity_full_auto_is_a_sentinel_not_one_of_agys_modes() {
+        // Measured on agy 1.1.9: default / accept-edits / plan behave IDENTICALLY
+        // on permissions (all refused the "command" permission without
+        // `--dangerously-skip-permissions`, all run commands with it), so agy has
+        // no full-auto mode to name here.
+        //
+        // `yolo` is therefore a sentinel that callers meaning "run unattended"
+        // (team, cron) pass through the normal channel; the backend answers it by
+        // not installing its approval hook and never forwards it as `--mode`.
+        // Returning the neutral "default" instead was indistinguishable from a
+        // user who simply picked the default mode.
+        assert_eq!(AgentType::Antigravity.full_auto_mode_id(None), "yolo");
     }
 
     #[test]
