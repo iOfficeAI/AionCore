@@ -368,6 +368,18 @@ pub enum SessionEvent {
         label: Option<String>,
         status: SubagentStatus,
         parent_ref: Option<String>,
+        /// Container kind of this roster entry, learned from the spawning wire
+        /// frame (claude `task_started.task_type`; only that frame carries it —
+        /// `task_progress`/`task_updated`/`task_notification` do not, and codex
+        /// collab threads never declare one → `None`). `WorkflowContainer` marks
+        /// the ONE kind whose turn emits multiple `result` frames (launch +
+        /// terminal after completion, fixture invariant 2.1.176/2.1.220), so it
+        /// alone may hold a turn open via the pump's Finish-suppression roster.
+        /// A background bash (`local_bash`) or unknown kind must never suppress:
+        /// its turn gets no later terminal result, so suppression == a wedged
+        /// turn that only the 15s watchdog can end (live 2026-07-30).
+        #[serde(default)]
+        kind: Option<SubagentTaskKind>,
     },
 
     /// 009 R6b / §3 / H1: RICH per-agent workflow detail for the background-plane
@@ -553,6 +565,18 @@ pub enum SubagentKind {
         session_id: String,
     },
     Workflow,
+}
+
+/// Container kind of a `SubagentUpdate` roster entry (see that variant's `kind`
+/// field). Normalized from the claude wire's `task_started.task_type`:
+/// `"local_workflow"` → `WorkflowContainer`, any other declared value (e.g.
+/// `"local_bash"`) → `Other`. Deliberately two-valued: the only consumer is the
+/// pump's suppression-roster admission, which needs exactly the bit "may this
+/// ref hold the turn open".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SubagentTaskKind {
+    WorkflowContainer,
+    Other,
 }
 
 /// 007 §9.17/§6b b3: a `Permission` request's class. Default `Tool` (existing
@@ -936,7 +960,8 @@ mod additive_tests {
                 r#ref: "a1".into(),
                 label: None,
                 status: SubagentStatus::Running,
-                parent_ref: None
+                parent_ref: None,
+                kind: None
             }),
             EventClass::BackendProduced
         );
@@ -1261,6 +1286,7 @@ mod additive_tests {
                     label: None,
                     status: SubagentStatus::Running,
                     parent_ref: None,
+                    kind: None,
                 },
                 BackendProduced,
                 DisplayAndState,
@@ -1313,7 +1339,8 @@ mod additive_tests {
                 r#ref: "a".into(),
                 label: None,
                 status: SubagentStatus::Completed,
-                parent_ref: None
+                parent_ref: None,
+                kind: None
             }),
             PersistTier::DisplayAndState
         );
@@ -1359,6 +1386,7 @@ mod additive_tests {
                 label: None,
                 status: SubagentStatus::Running,
                 parent_ref: None, // top-level boundary
+                kind: None,
             },
             SessionEvent::BackendBound {
                 backend_session_id: None, // lost-binding boundary
@@ -1440,6 +1468,7 @@ mod additive_tests {
                 label: Some("reviewer".into()),
                 status: SubagentStatus::Interrupted,
                 parent_ref: Some("wf-root".into()),
+                kind: None,
             },
             SessionEvent::Notice {
                 level: NoticeLevel::Info,

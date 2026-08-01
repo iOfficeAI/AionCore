@@ -2747,6 +2747,10 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                             label: label.clone(),
                             status,
                             parent_ref: parent_ref.clone(),
+                            // codex collab threads declare no container kind, and no
+                            // sample proves a codex turn emits a post-completion
+                            // terminal result — so they must not hold a turn open.
+                            kind: None,
                         });
                     }
                 }
@@ -2765,6 +2769,8 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                             SubagentStatus::Running
                         },
                         parent_ref,
+                        // Same as the agentsStates branch: no declared kind.
+                        kind: None,
                     });
                 }
             }
@@ -5354,6 +5360,7 @@ mod tests {
                     status: SubagentStatus::PendingInit,
                     parent_ref: Some(p),
                     label: Some(l),
+                    kind: None,
                 } if r#ref == "019eabea-child" && p == "019eabe9-parent" && l == "openai.gpt-5.5"
             )),
             "real collab frame → SubagentUpdate keyed by CHILD thread, status from agentsStates, parent edge from senderThreadId, got {events:?}"
