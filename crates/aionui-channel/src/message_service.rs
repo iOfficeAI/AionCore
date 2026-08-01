@@ -365,8 +365,9 @@ fn platform_to_source(platform: PluginType) -> ConversationSource {
         PluginType::Lark => ConversationSource::Lark,
         PluginType::Dingtalk => ConversationSource::Dingtalk,
         PluginType::Weixin => ConversationSource::Weixin,
-        // Reserved variants default to Aionui
-        PluginType::Slack | PluginType::Discord => ConversationSource::Aionui,
+        PluginType::Slack => ConversationSource::Slack,
+        // Discord keeps the generic source until a dedicated channel ships.
+        PluginType::Discord => ConversationSource::Aionui,
     }
 }
 
@@ -419,10 +420,33 @@ fn channel_conversation_name(
         parts.push(b.to_owned());
     }
     if let Some(cid) = chat_id {
-        let end = cid.len().min(8);
-        parts.push(cid[..end].to_owned());
+        parts.push(chat_id_name_suffix(cid));
     }
     parts.join("-")
+}
+
+/// Short, display-friendly slug from a session `chat_id`.
+///
+/// Plain ids (Telegram, etc.) keep the historical first-8 truncation.
+/// Composite keys like Slack `{channel}:{thread_root}` also include a
+/// thread suffix so two threads in the same channel do not share the same
+/// conversation title in the sidebar.
+fn chat_id_name_suffix(chat_id: &str) -> String {
+    match chat_id.split_once(':') {
+        Some((channel, thread)) if !channel.is_empty() && !thread.is_empty() => {
+            let channel_part: String = channel.chars().take(8).collect();
+            // Slack thread ts is e.g. "1712345678.123456" — keep alphanumerics only
+            // and take the last 8 so nearby threads still differ.
+            let thread_digits: String = thread.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+            let thread_part = if thread_digits.len() <= 8 {
+                thread_digits
+            } else {
+                thread_digits[thread_digits.len() - 8..].to_owned()
+            };
+            format!("{channel_part}-{thread_part}")
+        }
+        _ => chat_id.chars().take(8).collect(),
+    }
 }
 
 #[cfg(test)]
@@ -457,8 +481,12 @@ mod tests {
     }
 
     #[test]
-    fn platform_to_source_reserved_defaults_to_aionui() {
-        assert_eq!(platform_to_source(PluginType::Slack), ConversationSource::Aionui);
+    fn platform_to_source_slack() {
+        assert_eq!(platform_to_source(PluginType::Slack), ConversationSource::Slack);
+    }
+
+    #[test]
+    fn platform_to_source_discord_defaults_to_aionui() {
         assert_eq!(platform_to_source(PluginType::Discord), ConversationSource::Aionui);
     }
 
@@ -705,5 +733,30 @@ mod tests {
     fn conv_name_non_acp_ignores_backend() {
         let name = channel_conversation_name(PluginType::Telegram, "aionrs", Some("claude"), Some("70880480"));
         assert_eq!(name, "tg-aionrs-70880480");
+    }
+
+    #[test]
+    fn conv_name_slack_composite_chat_id_includes_thread() {
+        let a = channel_conversation_name(
+            PluginType::Slack,
+            "aionrs",
+            None,
+            Some("D0BKLLCM:1710000000.000100"),
+        );
+        let b = channel_conversation_name(
+            PluginType::Slack,
+            "aionrs",
+            None,
+            Some("D0BKLLCM:1710000000.000200"),
+        );
+        assert_eq!(a, "slack-aionrs-D0BKLLCM-00000100");
+        assert_eq!(b, "slack-aionrs-D0BKLLCM-00000200");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn chat_id_suffix_plain_still_truncates_to_eight() {
+        assert_eq!(chat_id_name_suffix("123456789abcdef"), "12345678");
+        assert_eq!(chat_id_name_suffix("70880480"), "70880480");
     }
 }
