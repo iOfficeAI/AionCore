@@ -286,6 +286,7 @@ async fn list_skills_builtin_entries_carry_relative_location() {
 
     let mut saw_builtin = false;
     let mut saw_custom = false;
+    let mut saw_lark = false;
     for item in arr {
         match item["source"].as_str().unwrap() {
             "builtin" => {
@@ -304,6 +305,10 @@ async fn list_skills_builtin_entries_carry_relative_location() {
                     std::path::Path::new(loc).exists(),
                     "builtin skill file missing on disk: {loc}"
                 );
+                if item["name"] == "lark" {
+                    saw_lark = true;
+                    assert_eq!(normalized_rel, "lark/SKILL.md");
+                }
             }
             "custom" => {
                 saw_custom = true;
@@ -323,6 +328,7 @@ async fn list_skills_builtin_entries_carry_relative_location() {
         }
     }
     assert!(saw_builtin, "expected at least one builtin entry");
+    assert!(saw_lark, "expected lark to be listed as a builtin skill");
     assert!(saw_custom, "expected the seeded custom entry");
 }
 
