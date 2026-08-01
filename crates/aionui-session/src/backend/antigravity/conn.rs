@@ -310,13 +310,38 @@ impl AntigravitySessionBackend {
         }
     }
 
+    /// The model to actually pass to agy, dropping one it cannot accept.
+    ///
+    /// A model id can reach us that agy rejects outright ("invalid model
+    /// selection"), which fails the whole turn: when discovery has not produced
+    /// a list yet, the UI has no agy models to offer and falls back to whatever
+    /// model the user last used elsewhere — a Gemini/Claude provider id that
+    /// means nothing to agy. Running on agy's own default is far better than
+    /// failing the conversation over a picker default the user never chose.
+    ///
+    /// Only filters once discovery has actually produced a list; an empty list
+    /// means "unknown", not "nothing is valid", so the request passes through.
+    fn effective_model(&self) -> Option<String> {
+        let requested = self.config.model.clone()?;
+        let known = self.models.read().ok()?;
+        if known.is_empty() || known.iter().any(|m| m.id == requested) {
+            return Some(requested);
+        }
+        tracing::warn!(
+            session_id = %self.session_id,
+            requested = %requested,
+            "antigravity: requested model is not one agy reported; falling back to agy's default"
+        );
+        None
+    }
+
     async fn start_turn(&self, content: Vec<ContentBlock>) -> Result<u64, BackendError> {
         let turn_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let input = ArgvInput {
             prompt: Self::prompt_text(&content),
             resume_conversation_id: self.anchor.lock().await.clone(),
             workspace: self.config.cwd.clone(),
-            model: self.config.model.clone(),
+            model: self.effective_model(),
             mode: self.config.mode.clone(),
         };
         let spec = CommandSpec {
@@ -942,5 +967,65 @@ mod tests {
         assert!(c.prompt_blocks.text);
         assert!(!c.prompt_blocks.image, "`agy -p` has no image input");
         assert_eq!(c.prompt_accepted, PromptAcceptedSource::Synthesized);
+    }
+
+    /// Build a backend with a known model list, bypassing the async probe.
+    fn backend_with_models(models: &[&str], requested: Option<&str>) -> AntigravitySessionBackend {
+        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let mut cfg = config("/tmp/ws");
+        cfg.model = requested.map(str::to_owned);
+        AntigravitySessionBackend {
+            session_id: "s1".into(),
+            slash_commands: Vec::new(),
+            models: Arc::new(std::sync::RwLock::new(
+                models
+                    .iter()
+                    .map(|id| crate::capability::ModelInfo {
+                        id: (*id).to_owned(),
+                        name: (*id).to_owned(),
+                        description: None,
+                        reasoning_efforts: Vec::new(),
+                    })
+                    .collect(),
+            )),
+            config: cfg,
+            spawner: Arc::new(crate::testing::FakeSpawner::new()),
+            event_tx,
+            turn_gen: AtomicU64::new(0),
+            anchor: Arc::new(Mutex::new(None)),
+            current: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            permission_seq: AtomicU64::new(0),
+            weak_self: std::sync::OnceLock::new(),
+            in_flight: Arc::new(AtomicBool::new(false)),
+            queued: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    #[test]
+    fn a_model_agy_never_reported_is_dropped_rather_than_failing_the_turn() {
+        // Before discovery lands the UI has no agy models to offer and seeds the
+        // conversation with the user's last model from another agent (e.g.
+        // `gemini-3.1-pro-preview`). agy rejects it with "invalid model
+        // selection" and the whole turn fails; its own default is better.
+        let b = backend_with_models(
+            &["gemini-3.1-pro-low", "claude-sonnet-4-6"],
+            Some("gemini-3.1-pro-preview"),
+        );
+        assert_eq!(b.effective_model(), None);
+    }
+
+    #[test]
+    fn a_model_agy_reported_is_passed_through() {
+        let b = backend_with_models(&["gemini-3.1-pro-low"], Some("gemini-3.1-pro-low"));
+        assert_eq!(b.effective_model().as_deref(), Some("gemini-3.1-pro-low"));
+    }
+
+    #[test]
+    fn an_empty_model_list_means_unknown_not_invalid() {
+        // Discovery may not have finished (or agy is signed out). Dropping the
+        // user's model here would silently ignore a perfectly good choice.
+        let b = backend_with_models(&[], Some("gemini-3.1-pro-low"));
+        assert_eq!(b.effective_model().as_deref(), Some("gemini-3.1-pro-low"));
     }
 }
