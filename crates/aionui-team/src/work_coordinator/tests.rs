@@ -106,13 +106,14 @@ fn run_less_batch_lifecycle_publishes_per_slot_work_snapshots() {
 }
 
 #[test]
-fn foreground_precedes_background_and_fifo_is_stable() {
+fn priority_lanes_claim_foreground_then_directed_then_control_then_background() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
-    enqueue(&coordinator, WorkSource::McpSendMessage, "background-1");
+    enqueue(&coordinator, WorkSource::TeamMembershipChanged, "background-1");
+    enqueue(&coordinator, WorkSource::McpShutdownRequest, "control-1");
+    enqueue(&coordinator, WorkSource::McpSendMessage, "directed-1");
     enqueue(&coordinator, WorkSource::UserMessage, "foreground-1");
     enqueue(&coordinator, WorkSource::UserIntervention, "foreground-2");
-    enqueue(&coordinator, WorkSource::TeamMembershipChanged, "background-2");
 
     let ReconcileDecision::Claim(foreground) = coordinator.next("lead-1") else {
         panic!("foreground batch must be claimable");
@@ -124,14 +125,48 @@ fn foreground_precedes_background_and_fifo_is_stable() {
     );
     assert_eq!(coordinator.complete_batch(&foreground), CommitResult::Committed);
 
+    let ReconcileDecision::Claim(directed) = coordinator.next("lead-1") else {
+        panic!("directed batch must follow foreground");
+    };
+    assert_eq!(directed.highest_priority, WorkPriority::Directed);
+    assert_eq!(directed.mailbox_message_ids, vec!["directed-1"]);
+    assert_eq!(coordinator.complete_batch(&directed), CommitResult::Committed);
+
+    let ReconcileDecision::Claim(control) = coordinator.next("lead-1") else {
+        panic!("control batch must follow directed");
+    };
+    assert_eq!(control.highest_priority, WorkPriority::Control);
+    assert_eq!(control.mailbox_message_ids, vec!["control-1"]);
+    assert_eq!(coordinator.complete_batch(&control), CommitResult::Committed);
+
     let ReconcileDecision::Claim(background) = coordinator.next("lead-1") else {
-        panic!("background batch must follow foreground");
+        panic!("background batch must follow control");
     };
     assert_eq!(background.highest_priority, WorkPriority::Background);
-    assert_eq!(
-        background.mailbox_message_ids,
-        vec!["background-1".to_owned(), "background-2".to_owned()]
-    );
+    assert_eq!(background.mailbox_message_ids, vec!["background-1"]);
+}
+
+#[test]
+fn directed_message_follows_a_coalesced_foreground_backlog() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::McpSendMessage, "directed-1");
+    for index in 1..=5 {
+        enqueue(&coordinator, WorkSource::UserMessage, &format!("foreground-{index}"));
+    }
+
+    let ReconcileDecision::Claim(foreground) = coordinator.next("lead-1") else {
+        panic!("foreground backlog must be claimable");
+    };
+    assert_eq!(foreground.highest_priority, WorkPriority::Foreground);
+    assert_eq!(foreground.mailbox_message_ids.len(), 5);
+    assert_eq!(coordinator.complete_batch(&foreground), CommitResult::Committed);
+
+    let ReconcileDecision::Claim(directed) = coordinator.next("lead-1") else {
+        panic!("directed message must follow the foreground batch");
+    };
+    assert_eq!(directed.highest_priority, WorkPriority::Directed);
+    assert_eq!(directed.mailbox_message_ids, vec!["directed-1"]);
 }
 
 #[test]

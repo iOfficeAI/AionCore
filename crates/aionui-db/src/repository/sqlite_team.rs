@@ -241,13 +241,47 @@ impl ITeamRepository for SqliteTeamRepository {
              FROM mailbox \
              WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
                AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?) \
-             ORDER BY created_at ASC",
+             ORDER BY created_at ASC, id ASC",
         )
         .bind(team_id)
         .bind(to_agent_id)
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
+        Ok(rows)
+    }
+
+    async fn peek_unread_by_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        to_agent_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut rows = Vec::new();
+        for chunk in ids.chunks(500) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT id, team_id, to_agent_id, from_agent_id, \
+                        type, content, summary, files, read, created_at \
+                 FROM mailbox \
+                 WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
+                   AND id IN ({placeholders}) \
+                   AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?)"
+            );
+            let mut query = sqlx::query_as::<_, MailboxMessageRow>(&sql)
+                .bind(team_id)
+                .bind(to_agent_id);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            query = query.bind(user_id);
+            rows.extend(query.fetch_all(&self.pool).await?);
+        }
         Ok(rows)
     }
 

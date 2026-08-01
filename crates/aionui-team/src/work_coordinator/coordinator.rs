@@ -26,6 +26,7 @@ pub(super) struct ActiveBatch {
 pub(super) struct SlotState {
     pub(super) role: TeamRunTargetRole,
     pub(super) foreground: VecDeque<String>,
+    pub(super) directed: VecDeque<String>,
     pub(super) control: VecDeque<String>,
     pub(super) background: VecDeque<String>,
     pub(super) active: Option<ActiveBatch>,
@@ -40,6 +41,7 @@ impl SlotState {
         Self {
             role,
             foreground: VecDeque::new(),
+            directed: VecDeque::new(),
             control: VecDeque::new(),
             background: VecDeque::new(),
             active: None,
@@ -53,6 +55,7 @@ impl SlotState {
     fn queue(&self, priority: WorkPriority) -> &VecDeque<String> {
         match priority {
             WorkPriority::Foreground => &self.foreground,
+            WorkPriority::Directed => &self.directed,
             WorkPriority::Control => &self.control,
             WorkPriority::Background => &self.background,
         }
@@ -61,6 +64,7 @@ impl SlotState {
     fn queue_mut(&mut self, priority: WorkPriority) -> &mut VecDeque<String> {
         match priority {
             WorkPriority::Foreground => &mut self.foreground,
+            WorkPriority::Directed => &mut self.directed,
             WorkPriority::Control => &mut self.control,
             WorkPriority::Background => &mut self.background,
         }
@@ -69,12 +73,18 @@ impl SlotState {
     pub(super) fn queued_ids(&self) -> impl Iterator<Item = &String> {
         self.foreground
             .iter()
+            .chain(self.directed.iter())
             .chain(self.control.iter())
             .chain(self.background.iter())
     }
 
     fn remove_queued(&mut self, intent_id: &str) {
-        for queue in [&mut self.foreground, &mut self.control, &mut self.background] {
+        for queue in [
+            &mut self.foreground,
+            &mut self.directed,
+            &mut self.control,
+            &mut self.background,
+        ] {
             queue.retain(|candidate| candidate != intent_id);
         }
     }
@@ -304,11 +314,23 @@ impl SlotWorkCoordinator {
         CommitResult::Committed
     }
 
+    #[cfg(test)]
     pub(crate) fn reconcile_mailbox(
         &self,
         slot_id: &str,
         unread_message_ids: &[String],
         role: TeamRunTargetRole,
+    ) -> ReconcileProjection {
+        let stale_candidates = self.mailbox_reconcile_candidates(slot_id);
+        self.reconcile_mailbox_snapshot(slot_id, unread_message_ids, role, &stale_candidates)
+    }
+
+    pub(crate) fn reconcile_mailbox_snapshot(
+        &self,
+        slot_id: &str,
+        unread_message_ids: &[String],
+        role: TeamRunTargetRole,
+        stale_candidates: &HashSet<String>,
     ) -> ReconcileProjection {
         let mut state = self.lock_state();
         let unread = unread_message_ids.iter().cloned().collect::<HashSet<_>>();
@@ -330,7 +352,7 @@ impl SlotWorkCoordinator {
                 retained_intent_ids.push(intent_id);
                 continue;
             };
-            if unread.contains(message_id) {
+            if unread.contains(message_id) || !stale_candidates.contains(&intent_id) {
                 retained_intent_ids.push(intent_id);
             } else {
                 intent.state = WorkIntentState::Completed;
@@ -393,6 +415,23 @@ impl SlotWorkCoordinator {
         }
     }
 
+    pub(crate) fn mailbox_reconcile_candidates(&self, slot_id: &str) -> HashSet<String> {
+        let state = self.lock_state();
+        state
+            .slots
+            .get(slot_id)
+            .into_iter()
+            .flat_map(SlotState::queued_ids)
+            .filter(|intent_id| {
+                state
+                    .intents
+                    .get(*intent_id)
+                    .is_some_and(|intent| intent.mailbox_message_id.is_some())
+            })
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn next(&self, slot_id: &str) -> ReconcileDecision {
         let mut state = self.lock_state();
         let Some(slot) = state.slots.get(slot_id) else {
@@ -410,6 +449,7 @@ impl SlotWorkCoordinator {
 
         let selected_priority = [
             WorkPriority::Foreground,
+            WorkPriority::Directed,
             WorkPriority::Control,
             WorkPriority::Background,
         ]
@@ -813,6 +853,7 @@ impl SlotWorkCoordinator {
             }
             let slot = state.slots.get_mut(slot_id).expect("constrained slot exists");
             slot.foreground.clear();
+            slot.directed.clear();
             slot.control.clear();
             slot.background.clear();
             slot.active = None;
@@ -940,6 +981,7 @@ impl SlotWorkCoordinator {
         }
         if let Some(slot) = state.slots.get_mut(slot_id) {
             slot.foreground.clear();
+            slot.directed.clear();
             slot.control.clear();
             slot.background.clear();
             slot.active = None;
@@ -968,6 +1010,7 @@ impl SlotWorkCoordinator {
         }
         for slot in state.slots.values_mut() {
             slot.foreground.clear();
+            slot.directed.clear();
             slot.control.clear();
             slot.background.clear();
             slot.active = None;

@@ -350,6 +350,10 @@ impl TeamSession {
                 .await?;
         }
 
+        // Only intents already queued before this snapshot are eligible for stale
+        // cleanup. A concurrently committed intent may not appear in the snapshot,
+        // but must remain claimable for the authoritative post-claim reread below.
+        let stale_candidates = self.work_coordinator.mailbox_reconcile_candidates(slot_id);
         let unread = self
             .mailbox
             .peek_unread(&self.team.id, slot_id)
@@ -358,20 +362,50 @@ impl TeamSession {
             .filter(|message| message.from_agent_id != slot_id)
             .collect::<Vec<_>>();
         let unread_ids = unread.iter().map(|message| message.id.clone()).collect::<Vec<_>>();
-        self.work_coordinator
-            .reconcile_mailbox(slot_id, &unread_ids, target_role_for(agent.role));
+        self.work_coordinator.reconcile_mailbox_snapshot(
+            slot_id,
+            &unread_ids,
+            target_role_for(agent.role),
+            &stale_candidates,
+        );
 
         match self.work_coordinator.next(slot_id) {
             ReconcileDecision::Claim(batch) => {
-                let claimed_ids = batch
+                let claimed_rows = match self
+                    .mailbox
+                    .peek_unread_by_ids(&self.team.id, slot_id, &batch.mailbox_message_ids)
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        self.work_coordinator.retry_start(&batch, "batch_mailbox_reread_failed");
+                        return Err(error);
+                    }
+                };
+                let mut claimed_by_id = claimed_rows
+                    .into_iter()
+                    .map(|message| (message.id.clone(), message))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let claimed_unread = batch
                     .mailbox_message_ids
                     .iter()
-                    .map(String::as_str)
-                    .collect::<std::collections::HashSet<_>>();
-                let claimed_unread = unread
-                    .into_iter()
-                    .filter(|message| claimed_ids.contains(message.id.as_str()))
+                    .filter_map(|message_id| claimed_by_id.remove(message_id))
                     .collect::<Vec<_>>();
+                if claimed_unread.len() != batch.mailbox_message_ids.len() {
+                    warn!(
+                        team_id = %self.team.id,
+                        slot_id,
+                        batch_id = %batch.batch_id,
+                        claimed_count = batch.mailbox_message_ids.len(),
+                        found_count = claimed_unread.len(),
+                        "team work batch mailbox reread incomplete"
+                    );
+                    self.work_coordinator
+                        .retry_start(&batch, "batch_mailbox_reread_incomplete");
+                    return Err(TeamError::InvalidRequest(
+                        "claimed team mailbox messages are no longer unread".into(),
+                    ));
+                }
                 let tasks = match self.scheduler.list_tasks().await {
                     Ok(tasks) => tasks,
                     Err(error) => {
@@ -2956,6 +2990,99 @@ mod tests {
         };
 
         assert!(matches!(error, TeamError::Database(_)));
+        let slot = session.work_coordinator.slot_snapshot("lead-1").unwrap();
+        assert_eq!(slot.state, SlotPhase::Queued);
+        assert!(slot.active_batch.is_none());
+        assert_eq!(slot.queued_foreground_count, 1);
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn prepare_next_batch_rereads_messages_committed_after_initial_peek() {
+        let (session, repo) = start_session_with(empty_task_manager()).await;
+        let session = Arc::new(session);
+        let first = session.send_message("first", None).await.unwrap();
+        register_test_event_loop(&session, "lead-1");
+
+        let (snapshot_tx, snapshot_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        repo.arm_peek_barrier(snapshot_tx, release_rx);
+
+        let preparing_session = session.clone();
+        let prepare = tokio::spawn(async move { preparing_session.prepare_next_batch("lead-1").await });
+        snapshot_rx.await.expect("initial unread snapshot must be captured");
+
+        let late_lease = session
+            .work_coordinator
+            .acquire_enqueue(EnqueueRequest {
+                slot_id: "lead-1".into(),
+                role: TeamRunTargetRole::Lead,
+                source: WorkSource::UserIntervention,
+                binding: CausalBinding::UserVisible,
+            })
+            .unwrap();
+        let late = session
+            .mailbox
+            .write("t1", "lead-1", "user", MailboxMessageType::Message, "late", None)
+            .await
+            .unwrap();
+        session
+            .commit_persisted_enqueue(&late_lease, late.id.clone())
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+
+        let PrepareBatchResult::Execute { batch, input } = prepare.await.unwrap().unwrap() else {
+            panic!("both committed messages must be prepared together");
+        };
+        assert_eq!(
+            batch.mailbox_message_ids,
+            vec![first.message_id, late.id],
+            "the claim includes the message committed after the initial peek"
+        );
+        assert_eq!(
+            input
+                .unread
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "late"],
+            "the post-claim reread must include every claimed message in the prompt input"
+        );
+        assert!(input.first_message.contains("first"));
+        assert!(input.first_message.contains("late"));
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn prepare_next_batch_requeues_when_a_claimed_mailbox_row_is_missing() {
+        let (session, repo) = start_session_with(empty_task_manager()).await;
+        let session = Arc::new(session);
+        let first = session.send_message("first", None).await.unwrap();
+        register_test_event_loop(&session, "lead-1");
+
+        let (snapshot_tx, snapshot_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        repo.arm_peek_barrier(snapshot_tx, release_rx);
+
+        let preparing_session = session.clone();
+        let prepare = tokio::spawn(async move { preparing_session.prepare_next_batch("lead-1").await });
+        snapshot_rx.await.expect("initial unread snapshot must be captured");
+        repo.state
+            .lock()
+            .unwrap()
+            .messages
+            .iter_mut()
+            .find(|message| message.id == first.message_id)
+            .expect("persisted mailbox row")
+            .read = true;
+        release_tx.send(()).unwrap();
+
+        let error = match prepare.await.unwrap() {
+            Err(error) => error,
+            Ok(_) => panic!("an incomplete claimed batch must not be executed"),
+        };
+        assert!(matches!(error, TeamError::InvalidRequest(_)));
         let slot = session.work_coordinator.slot_snapshot("lead-1").unwrap();
         assert_eq!(slot.state, SlotPhase::Queued);
         assert!(slot.active_batch.is_none());
