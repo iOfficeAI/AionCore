@@ -80,11 +80,21 @@ pub fn has_mcp_capability(agent_capabilities: Option<&serde_json::Value>) -> boo
     mcp_capability_object(agent_capabilities).is_some()
 }
 
+/// Whether the agent actually implements MCP, judged from the transports it
+/// advertises in `mcpCapabilities`.
+///
+/// ACP declares stdio mandatory and therefore has no `stdio` flag to read — but
+/// LIVE evidence shows the declaration is not honoured uniformly: `omp`
+/// (`http:true,sse:true`) loads a stdio MCP server, while `pi`
+/// (`http:false,sse:false`) does not, both probed with the same stdio-launched
+/// Sentry MCP server. So an agent that advertises NO optional transport is
+/// treated as not implementing MCP at all, and Team falls back to the CLI
+/// transport for it.
 fn has_enabled_team_mcp_transport(agent_capabilities: Option<&serde_json::Value>) -> bool {
     let Some(caps) = mcp_capability_object(agent_capabilities) else {
         return false;
     };
-    bool_field(caps, "stdio") || bool_field(caps, "http")
+    bool_field(caps, "http") || bool_field(caps, "sse")
 }
 
 fn mcp_capability_object(agent_capabilities: Option<&serde_json::Value>) -> Option<&serde_json::Value> {
@@ -139,24 +149,33 @@ mod tests {
         assert!(supports_team_mcp("aionrs", Some(&json!({}))));
     }
 
+    /// LIVE-probed contract (2026-07-30, same stdio-launched Sentry MCP server on
+    /// both): `omp` advertises `http:true,sse:true` and loads the server; `pi`
+    /// advertises `http:false,sse:false` and does not. So an advertised optional
+    /// transport — EITHER one — is the signal that the agent implements MCP at
+    /// all, and advertising neither means Team must not route MCP to it. ACP has
+    /// no `stdio` flag (the transport is mandatory in the spec and therefore never
+    /// declared), so reading one only ever matched non-ACP payloads.
     #[test]
-    fn acp_backends_require_stdio_or_http_capability_for_team_mcp() {
-        assert!(supports_team_mcp(
-            "claude",
-            Some(&json!({ "mcp_capabilities": { "stdio": true } }))
-        ));
+    fn acp_backends_require_an_advertised_mcp_transport_for_team_mcp() {
         assert!(supports_team_mcp(
             "codex",
             Some(&json!({ "mcp_capabilities": { "http": true, "sse": false } }))
         ));
-
-        assert!(!supports_team_mcp(
+        assert!(supports_team_mcp(
             "gemini",
             Some(&json!({ "mcp_capabilities": { "http": false, "sse": true } }))
         ));
+
         assert!(!supports_team_mcp(
             "codebuddy",
             Some(&json!({ "mcp_capabilities": { "http": false, "sse": false } }))
+        ));
+        // A spec-mandatory transport is never advertised, so it can never be the
+        // evidence: claiming `stdio` must not by itself unlock Team MCP.
+        assert!(!supports_team_mcp(
+            "claude",
+            Some(&json!({ "mcp_capabilities": { "stdio": true } }))
         ));
         assert!(!supports_team_mcp("acp", None));
         assert!(!supports_team_mcp("claude", Some(&json!({ "mcp_capabilities": {} }))));

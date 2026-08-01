@@ -33,9 +33,16 @@ pub struct AgentMetadataRow {
 
     pub behavior_policy: Option<String>,
     /// Native mode id that AionUi's legacy `yolo` / `yoloNoSandbox`
-    /// aliases resolve to before calling `session/set_mode`. `None`
-    /// means the backend has no yolo equivalent and the alias should
-    /// pass through unchanged.
+    /// aliases resolve to before calling `session/set_mode`.
+    ///
+    /// `None` does NOT mean "pass the alias through unchanged": every
+    /// DB-reading caller falls back to `AgentType::full_auto_mode_id`
+    /// (`aionui-common/src/enums.rs`), a hardcoded per-backend table whose
+    /// default arm is the literal `"yolo"` — see Team spawn
+    /// (`aionui-team/src/service/spawn_support.rs`) and cron
+    /// (`aionui-cron/src/service.rs`). So clearing this column silently hands
+    /// the agent that table's guess. Keep the two in sync: an agent whose
+    /// verified mode id is stored here should not also be listed there.
     pub yolo_id: Option<String>,
 
     pub agent_capabilities: Option<String>,

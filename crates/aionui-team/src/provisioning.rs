@@ -406,6 +406,24 @@ impl TeamAgentProvisioner {
         Ok(())
     }
 
+    /// Pick how team tools reach this agent. Deliberately a DIFFERENT question
+    /// from "may this agent join a team" (`AgentMetadata::team_capable`), and
+    /// deliberately judged from `agent_capabilities` ALONE:
+    ///
+    /// - The membership gate may say yes from `behavior_policy.supports_team` — a
+    ///   known-good whitelist that needs no probe evidence. That whitelist must
+    ///   NOT reach in here: which transport actually works is a property of the
+    ///   running agent, not of a policy row, and guessing MCP for an agent that
+    ///   silently ignores injected `mcpServers` loses every team tool with no
+    ///   error to show for it. CLI is the safe answer when unproven.
+    /// - `agent_capabilities` is only written by a live handshake (plus the seed
+    ///   backfills in migrations 003/033). So an agent that has never connected on
+    ///   this machine has NULL capabilities and lands on CLI even when it does
+    ///   support MCP — notably claude/codex/gemini on a fresh install. The next
+    ///   rebuild after its first handshake promotes it to MCP.
+    ///
+    /// Both transports coordinate a team; MCP exposes the tools natively, CLI
+    /// prompts the agent to shell out to `$AIONUI_HELPER_BIN team ...`.
     pub(crate) async fn team_tool_transport(
         &self,
         user_id: &str,

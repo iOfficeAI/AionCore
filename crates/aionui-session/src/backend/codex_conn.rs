@@ -2747,6 +2747,10 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                             label: label.clone(),
                             status,
                             parent_ref: parent_ref.clone(),
+                            // codex collab threads declare no container kind, and no
+                            // sample proves a codex turn emits a post-completion
+                            // terminal result — so they must not hold a turn open.
+                            kind: None,
                         });
                     }
                 }
@@ -2765,6 +2769,8 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                             SubagentStatus::Running
                         },
                         parent_ref,
+                        // Same as the agentsStates branch: no declared kind.
+                        kind: None,
                     });
                 }
             }
@@ -2805,6 +2811,18 @@ fn item_kind_for(item_type: &str) -> crate::event::ItemKind {
 /// thread/tokenUsage/updated → UsageDelta. codex gives BOTH total (cumulative)
 /// and last (per-turn); we use `.last` directly (G6: native per-turn, no
 /// subtraction, no double-count on reconnect — measured 2026-06-10).
+///
+/// `.last` is also the right figure for the usage indicator's CURRENT CONTEXT
+/// OCCUPANCY, which is why it feeds `used`. Live two-turn probe (0.145.0,
+/// window 258400): turn 2 reported `last{inputTokens:11024, cachedInputTokens:
+/// 11006, outputTokens:6, totalTokens:11030}` while `total.totalTokens` had
+/// already reached 22043. `last.inputTokens` INCLUDES the cached part, so
+/// `last.totalTokens` == the request carrying the whole history + its reply —
+/// the occupancy. `total.*` accumulates across turns and would exceed the window
+/// on a long session; it must never feed `used`.
+///
+/// `modelContextWindow` is the indicator's denominator and is nullable in the
+/// schema (verified: `codex app-server generate-json-schema` → ThreadTokenUsage).
 fn map_usage(params: &Value) -> Vec<SessionEvent> {
     let usage = params.get("tokenUsage").unwrap_or(&Value::Null);
     let last = usage.get("last").unwrap_or(&Value::Null);
@@ -2814,7 +2832,118 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
         output_tokens: g("outputTokens"),
         total_tokens: g("totalTokens"),
         cost_usd: None,
+        // DELIBERATELY NOT REPORTED, despite `tokenUsage.modelContextWindow` being
+        // the only context-window field in the whole codex protocol.
+        //
+        // Live-probed on 0.145.0 through a custom `model_provider`: `gpt-5.6-sol`,
+        // `gpt-5.5` and `gpt-5.6-luna` ALL report 258_400, and an explicit
+        // `model_context_window` (in `config.toml` AND via `-c`) is ignored. A
+        // figure that never varies by model and cannot be configured says nothing
+        // about the model in use, and a wrong denominator is worse than none: the
+        // renderer has a designed "context window size unknown" state that shows a
+        // plain token count instead of inventing a percentage.
+        //
+        // The likely explanation is that codex falls back to a stand-in for models
+        // it does not recognise, i.e. any custom provider — an official/Bedrock
+        // setup may well report a real window. That is UNVERIFIED: this machine has
+        // no official codex auth (no `~/.codex/auth.json`) to test against. Suppress
+        // unconditionally rather than encode a guess; revisit with a capture from a
+        // first-party provider, and gate on that evidence rather than on a
+        // hardcoded constant.
+        context_window: None,
+        // Per-turn detail line. codex reports every field natively on `last`
+        // (verified: TokenUsageBreakdown in the generated schema), including the
+        // reasoning tokens claude only exposes per-call.
+        breakdown: crate::event::UsageBreakdown {
+            cached_read_tokens: g("cachedInputTokens"),
+            cached_write_tokens: g("cacheWriteInputTokens"),
+            thought_tokens: g("reasoningOutputTokens"),
+        },
     }]
+}
+
+#[cfg(test)]
+mod usage_window_tests {
+    use super::*;
+
+    /// Verbatim `tokenUsage` from a live two-turn probe (codex-cli 0.145.0,
+    /// `gpt-5.6-sol`): turn 2, window 258400. `used` must stay on `last`
+    /// (11030 = the request carrying the whole history + its reply), NOT on the
+    /// cumulative `total` (22043) which would blow past any window on a long
+    /// session. The reported `modelContextWindow` is NOT forwarded — see
+    /// `map_usage` for why codex's only window figure is unusable.
+    #[test]
+    fn live_token_usage_maps_last_as_occupancy_and_drops_the_window() {
+        let params: Value = serde_json::from_str(
+            r#"{"threadId":"th1","turnId":"t1","tokenUsage":{
+                 "modelContextWindow":258400,
+                 "last":{"totalTokens":11030,"inputTokens":11024,"cachedInputTokens":11006,
+                         "cacheWriteInputTokens":16,"outputTokens":6,"reasoningOutputTokens":0},
+                 "total":{"totalTokens":22043,"inputTokens":22032,"cachedInputTokens":11006,
+                          "cacheWriteInputTokens":11022,"outputTokens":11,"reasoningOutputTokens":0}}}"#,
+        )
+        .unwrap();
+        let events = map_usage(&params);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::UsageDelta {
+                    input_tokens: 11024,
+                    output_tokens: 6,
+                    total_tokens: 11030,
+                    // The frame carried `modelContextWindow: 258400`; it is
+                    // deliberately not forwarded — see `map_usage`.
+                    context_window: None,
+                    cost_usd: None,
+                    ..
+                }]
+            ),
+            "expected last-based occupancy and no window, got {events:?}"
+        );
+    }
+
+    /// codex reports the whole detail line natively on `last`, including the
+    /// reasoning tokens claude only exposes per-call. Values from the live two-turn
+    /// probe (turn 2).
+    #[test]
+    fn breakdown_comes_straight_off_last() {
+        let params: Value = serde_json::from_str(
+            r#"{"tokenUsage":{"modelContextWindow":258400,
+                 "last":{"totalTokens":11030,"inputTokens":11024,"cachedInputTokens":11006,
+                         "cacheWriteInputTokens":16,"outputTokens":6,"reasoningOutputTokens":242}}}"#,
+        )
+        .unwrap();
+        let b = match map_usage(&params).into_iter().next() {
+            Some(SessionEvent::UsageDelta { breakdown, .. }) => breakdown,
+            other => panic!("expected UsageDelta, got {other:?}"),
+        };
+        assert_eq!(b.cached_read_tokens, 11_006);
+        assert_eq!(b.cached_write_tokens, 16);
+        assert_eq!(b.thought_tokens, 242, "reasoningOutputTokens is the thinking count");
+    }
+
+    /// `modelContextWindow` is `int|null` in the schema — a null (or absent) field
+    /// must degrade to `None`, never to 0, which would render a 0-sized bar.
+    #[test]
+    fn null_or_absent_context_window_is_none() {
+        for raw in [
+            r#"{"tokenUsage":{"modelContextWindow":null,"last":{"totalTokens":5,"inputTokens":4,"outputTokens":1}}}"#,
+            r#"{"tokenUsage":{"last":{"totalTokens":5,"inputTokens":4,"outputTokens":1}}}"#,
+        ] {
+            let params: Value = serde_json::from_str(raw).unwrap();
+            assert!(
+                matches!(
+                    map_usage(&params).as_slice(),
+                    [SessionEvent::UsageDelta {
+                        context_window: None,
+                        total_tokens: 5,
+                        ..
+                    }]
+                ),
+                "expected no window for {raw}"
+            );
+        }
+    }
 }
 
 /// LC-8a: codex `turn/plan/updated` params → `SessionEvent::Plan`. `plan` is an
@@ -4791,6 +4920,16 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(
                 e,
+                SessionEvent::UsageDelta {
+                    context_window: None,
+                    ..
+                }
+            )),
+            "codex never reports a window: its only figure is an unusable stand-in"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
                 SessionEvent::TurnResult {
                     is_error: false,
                     outcome: TurnOutcome::Completed { .. },
@@ -5221,6 +5360,7 @@ mod tests {
                     status: SubagentStatus::PendingInit,
                     parent_ref: Some(p),
                     label: Some(l),
+                    kind: None,
                 } if r#ref == "019eabea-child" && p == "019eabe9-parent" && l == "openai.gpt-5.5"
             )),
             "real collab frame → SubagentUpdate keyed by CHILD thread, status from agentsStates, parent edge from senderThreadId, got {events:?}"

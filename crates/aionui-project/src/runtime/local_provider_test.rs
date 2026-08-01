@@ -220,6 +220,29 @@ async fn read_dir_populates_inode() {
     assert!(entries[0].1.inode != 0);
 }
 
+// ── noise filtering (read_dir) ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn read_dir_hides_os_junk_and_vcs_but_keeps_real_dotfiles() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    // Noise — must be hidden.
+    std::fs::write(root.join(".DS_Store"), b"x").unwrap();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(root.join("Thumbs.db"), b"x").unwrap();
+    std::fs::write(root.join("._resource"), b"x").unwrap();
+    // Kept — real files including user-meaningful dotfiles.
+    std::fs::write(root.join("README.md"), b"x").unwrap();
+    std::fs::write(root.join(".env"), b"x").unwrap();
+    std::fs::create_dir(root.join("src")).unwrap();
+
+    let provider = LocalFsProvider::new();
+    let mut entries = provider.read_dir(canon(root).as_str()).await.unwrap();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec![".env", "README.md", "src"]);
+}
+
 // ── filename search (IFsSearchProvider) ──────────────────────────────────────
 
 /// Test sink: collects `(relative_path, name)` hits under a mutex.
@@ -316,6 +339,26 @@ async fn search_stops_at_budget_and_reports_limit_reached() {
     // Budget caps total emitted hits; the cap is reported.
     assert_eq!(hits.len(), 3);
     assert!(capped);
+}
+
+#[tokio::test]
+async fn search_hides_git_internals_and_os_junk() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".git").join("HEAD"), b"ref: x").unwrap();
+    std::fs::write(root.join(".git").join("config"), b"x").unwrap();
+    std::fs::write(root.join(".DS_Store"), b"x").unwrap();
+    std::fs::write(root.join("main.rs"), b"x").unwrap();
+
+    let (hits, _) = search_collect(root, "", MatchMode::Substring, 100).await;
+    let names: Vec<&str> = hits.iter().map(|(_, n)| n.as_str()).collect();
+    // Only the real file — no `.git` internals, no `.DS_Store`.
+    assert_eq!(names, vec!["main.rs"]);
+    assert!(
+        !hits.iter().any(|(rel, _)| rel.contains(".git")),
+        "search must not descend into .git: {hits:?}"
+    );
 }
 
 #[tokio::test]

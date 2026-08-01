@@ -17,6 +17,33 @@
 /// `AdapterSpecific.payload` is an opaque escape hatch this contract does NOT
 /// promise total equality over; `assert_eq!` only needs `PartialEq`. Deriving
 /// fewer traits than available is always legal ⇒ the shape compiles as-is.
+/// Per-turn token counters for the usage indicator's detail line
+/// ("input · output · cache read · thinking"). Every field is a per-turn total,
+/// NOT a running context figure — `UsageDelta.total_tokens` carries occupancy.
+///
+/// Both direct backends report all of it (live-verified): claude via
+/// `result.usage` plus the `thinking_tokens` summed off each `message_delta`,
+/// codex via `tokenUsage.last`. Backends that report none leave it zeroed, and
+/// the renderer then omits the line entirely.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageBreakdown {
+    /// Cache HITS — tokens read from an existing prefix cache.
+    pub cached_read_tokens: u64,
+    /// Cache WRITES — tokens newly committed to the cache this turn.
+    pub cached_write_tokens: u64,
+    /// Reasoning/thinking tokens, billed as output but rendered separately.
+    pub thought_tokens: u64,
+}
+
+impl UsageBreakdown {
+    /// Whether anything was reported. A fully zeroed breakdown is indistinguishable
+    /// from "this backend tells us nothing", so it is omitted rather than rendered
+    /// as a row of zeros.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)] // +Serialize/Deserialize (Addendum 2a, 007 §C2). only PartialEq — see FIX 4a above
 pub enum SessionEvent {
     // ---- command lower (FIX 2): orchestration lowers Command::Send here ----
@@ -275,6 +302,15 @@ pub enum SessionEvent {
         output_tokens: u64,
         total_tokens: u64,
         cost_usd: Option<f64>,
+        /// Per-turn counters behind the indicator's detail line. Separate from
+        /// `total_tokens`, which is context OCCUPANCY: on claude the two even come
+        /// from different frames (the turn aggregate vs. the last API call).
+        breakdown: UsageBreakdown,
+        /// The model's total context window, when the backend reports one
+        /// (claude `result.modelUsage.<model>.contextWindow`; codex
+        /// `tokenUsage.modelContextWindow`, which is nullable). Renders as the
+        /// denominator of the usage indicator; `None` leaves it a bare counter.
+        context_window: Option<u64>,
     },
 
     /// MCP / tool provisioning as a LIVE event (Addendum 5 / U16). Reducer no-op.
@@ -332,6 +368,18 @@ pub enum SessionEvent {
         label: Option<String>,
         status: SubagentStatus,
         parent_ref: Option<String>,
+        /// Container kind of this roster entry, learned from the spawning wire
+        /// frame (claude `task_started.task_type`; only that frame carries it —
+        /// `task_progress`/`task_updated`/`task_notification` do not, and codex
+        /// collab threads never declare one → `None`). `WorkflowContainer` marks
+        /// the ONE kind whose turn emits multiple `result` frames (launch +
+        /// terminal after completion, fixture invariant 2.1.176/2.1.220), so it
+        /// alone may hold a turn open via the pump's Finish-suppression roster.
+        /// A background bash (`local_bash`) or unknown kind must never suppress:
+        /// its turn gets no later terminal result, so suppression == a wedged
+        /// turn that only the 15s watchdog can end (live 2026-07-30).
+        #[serde(default)]
+        kind: Option<SubagentTaskKind>,
     },
 
     /// 009 R6b / §3 / H1: RICH per-agent workflow detail for the background-plane
@@ -517,6 +565,18 @@ pub enum SubagentKind {
         session_id: String,
     },
     Workflow,
+}
+
+/// Container kind of a `SubagentUpdate` roster entry (see that variant's `kind`
+/// field). Normalized from the claude wire's `task_started.task_type`:
+/// `"local_workflow"` → `WorkflowContainer`, any other declared value (e.g.
+/// `"local_bash"`) → `Other`. Deliberately two-valued: the only consumer is the
+/// pump's suppression-roster admission, which needs exactly the bit "may this
+/// ref hold the turn open".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SubagentTaskKind {
+    WorkflowContainer,
+    Other,
 }
 
 /// 007 §9.17/§6b b3: a `Permission` request's class. Default `Tool` (existing
@@ -900,7 +960,8 @@ mod additive_tests {
                 r#ref: "a1".into(),
                 label: None,
                 status: SubagentStatus::Running,
-                parent_ref: None
+                parent_ref: None,
+                kind: None
             }),
             EventClass::BackendProduced
         );
@@ -1123,6 +1184,8 @@ mod additive_tests {
                     output_tokens: 1,
                     total_tokens: 2,
                     cost_usd: None,
+                    context_window: None,
+                    breakdown: Default::default(),
                 },
                 BackendProduced,
                 Display,
@@ -1223,6 +1286,7 @@ mod additive_tests {
                     label: None,
                     status: SubagentStatus::Running,
                     parent_ref: None,
+                    kind: None,
                 },
                 BackendProduced,
                 DisplayAndState,
@@ -1275,7 +1339,8 @@ mod additive_tests {
                 r#ref: "a".into(),
                 label: None,
                 status: SubagentStatus::Completed,
-                parent_ref: None
+                parent_ref: None,
+                kind: None
             }),
             PersistTier::DisplayAndState
         );
@@ -1321,6 +1386,7 @@ mod additive_tests {
                 label: None,
                 status: SubagentStatus::Running,
                 parent_ref: None, // top-level boundary
+                kind: None,
             },
             SessionEvent::BackendBound {
                 backend_session_id: None, // lost-binding boundary
@@ -1386,6 +1452,8 @@ mod additive_tests {
                 output_tokens: 50,
                 total_tokens: 150,
                 cost_usd: Some(0.0021),
+                context_window: None,
+                breakdown: Default::default(),
             },
             SessionEvent::Provisioning {
                 phase: ProvisioningPhase::ToolsWaiting,
@@ -1400,6 +1468,7 @@ mod additive_tests {
                 label: Some("reviewer".into()),
                 status: SubagentStatus::Interrupted,
                 parent_ref: Some("wf-root".into()),
+                kind: None,
             },
             SessionEvent::Notice {
                 level: NoticeLevel::Info,

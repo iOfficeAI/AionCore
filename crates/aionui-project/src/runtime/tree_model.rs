@@ -19,6 +19,7 @@ use crate::canonical;
 
 use super::error::FsError;
 use super::fs_runtime::{FsRuntimeRegistry, IFsRuntime};
+use super::noise::should_hide;
 use super::provider::{EntryFact, Kind};
 use super::watcher::WatchHandle;
 
@@ -210,6 +211,12 @@ impl TreeModel {
             Hint::ChildNames(child_names) => {
                 let mut map = old.clone();
                 for name in child_names {
+                    // Noise never enters the tree — a watcher event for a hidden
+                    // name (e.g. `.DS_Store` written mid-session) is ignored, so
+                    // the tree stays consistent with `read_dir`/search.
+                    if should_hide(&name) {
+                        continue;
+                    }
                     let uri = child_uri(canonical, &name)?;
                     match runtime.provider().stat(&uri).await? {
                         Some(fact) => {

@@ -791,9 +791,19 @@ fn decode_row(
     };
 
     let backend_str = row.backend.as_deref().unwrap_or("");
-    let inferred_team_capable = behavior_policy.supports_team
+    // Team MEMBERSHIP (may this agent be picked into a team) — distinct from the
+    // team TRANSPORT chosen later at provisioning time, which reads capabilities
+    // only. Whitelist first, inference second:
+    //   - `supports_team` is the known-good opt-in (migration 014). It carries
+    //     agents whose `agent_capabilities` are still NULL because they have never
+    //     handshaken on this machine (claude/codex/gemini on a fresh install), and
+    //     aionrs, whose NULL backend the inference cannot judge at all.
+    //   - otherwise infer from the advertised MCP transports / CLI eligibility.
+    // There is deliberately no veto flag on this path: a stored "false" could not
+    // be lifted once an agent proved itself, since builtin rows reject metadata
+    // edits through the agent API.
+    let team_capable = behavior_policy.supports_team
         || aionui_common::constants::is_team_capable(backend_str, handshake.agent_capabilities.as_ref());
-    let team_capable = behavior_policy.team_capable_override.unwrap_or(inferred_team_capable);
 
     let mut meta = AgentMetadata {
         id: row.id,
@@ -1631,7 +1641,13 @@ mod tests {
         assert_eq!(pi.agent_source_info.binary_name.as_deref(), Some("pi"));
         assert_eq!(pi.agent_source_info.bridge_binary.as_deref(), Some("npx"));
         assert_eq!(pi.native_skills_dirs.as_deref(), Some(&[".pi/skills".to_owned()][..]));
-        assert!(!pi.team_capable);
+        // Team-capable through the CLI transport. pi advertises no optional MCP
+        // transport and LIVE-probed does not load a stdio MCP server, so Team
+        // gives it the `$AIONUI_HELPER_BIN team ...` command surface instead of
+        // MCP tools — but that surface works, so the picker must not block it.
+        // (This asserted `false` while builtin rows carried a hard veto flag; the
+        // flag is gone, and blocking a CLI-coordinating agent was never right.)
+        assert!(pi.team_capable);
         assert_eq!(pi.yolo_id, None);
         assert_eq!(
             pi.handshake

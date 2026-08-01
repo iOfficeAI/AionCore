@@ -5,12 +5,12 @@ use notify::{Event, EventKind};
 
 use super::{RawEvent, map_event};
 
-/// Resolve any path under `/root` to the fixed canonical, everything else None.
-fn resolve_root(p: &Path) -> Option<String> {
+/// Resolve any path under `/root` to the fixed canonical, everything else empty.
+fn resolve_root(p: &Path) -> Vec<String> {
     if p.starts_with("/root") {
-        Some("file:///root".to_owned())
+        vec!["file:///root".to_owned()]
     } else {
-        None
+        vec![]
     }
 }
 
@@ -48,14 +48,14 @@ fn map_event_drops_unresolved_paths() {
     );
 }
 
-/// Resolve `/root` and `/lib` to distinct canonicals, everything else None.
-fn resolve_two(p: &Path) -> Option<String> {
+/// Resolve `/root` and `/lib` to distinct canonicals, everything else empty.
+fn resolve_two(p: &Path) -> Vec<String> {
     if p.starts_with("/root") {
-        Some("file:///root".to_owned())
+        vec!["file:///root".to_owned()]
     } else if p.starts_with("/lib") {
-        Some("file:///lib".to_owned())
+        vec!["file:///lib".to_owned()]
     } else {
-        None
+        vec![]
     }
 }
 
@@ -107,6 +107,47 @@ fn map_event_rescan_dedups_overflow_per_canonical() {
                 canonical: "file:///lib".to_owned()
             },
         ]
+    );
+}
+
+/// Resolve a watched subdir path to BOTH the subdir itself and its parent root
+/// (the self-then-parent shape `resolve_owner` returns for a watched subdir);
+/// any other path under `/root` resolves to root only.
+fn resolve_self_and_parent(p: &Path) -> Vec<String> {
+    if p == Path::new("/root/a") {
+        vec!["file:///root/a".to_owned(), "file:///root".to_owned()]
+    } else if p.starts_with("/root") {
+        vec!["file:///root".to_owned()]
+    } else {
+        vec![]
+    }
+}
+
+#[test]
+fn map_event_fans_watched_subdir_to_both_self_and_parent() {
+    // Deleting a watched subdir `a`: the event path is `/root/a`, which is both a
+    // watched directory (self) and a child of watched root (parent). map_event
+    // must emit a Changed for the PARENT root mentioning `a` — that is the change
+    // that reconciles root's listing and removes the stale `a`. Reverting
+    // resolve to self-only (the old exact-match precedence) drops the root group
+    // and this assertion fails — the regression tripwire.
+    let event = Event::new(EventKind::Remove(notify::event::RemoveKind::Folder)).add_path(PathBuf::from("/root/a"));
+
+    let out = map_event(&event, &resolve_self_and_parent);
+
+    assert_eq!(
+        out,
+        vec![
+            RawEvent::Changed {
+                canonical: "file:///root/a".to_owned(),
+                paths: vec!["/root/a".to_owned()],
+            },
+            RawEvent::Changed {
+                canonical: "file:///root".to_owned(),
+                paths: vec!["/root/a".to_owned()],
+            },
+        ],
+        "a watched subdir's event must reconcile its parent, not only itself"
     );
 }
 

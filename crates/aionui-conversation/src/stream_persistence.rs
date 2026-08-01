@@ -379,6 +379,12 @@ impl StreamPersistenceAdapter {
 
     #[tracing::instrument(skip_all)]
     pub async fn persist_thinking_segment(&self, segment: ThinkingSegmentState, duration_ms: u64) {
+        // An empty segment should no longer be reachable: StreamRelay drops a
+        // thinking chunk that has no text before it can open one (see the POLICY
+        // note there). This stays as the second line of defense — persisting a
+        // contentless row is what put a column of blank "thinking done · 0s" cards
+        // into the reloaded view, so the storage layer refuses it too rather than
+        // trusting every future caller to have filtered upstream.
         if segment.buffer.is_empty() {
             return;
         }

@@ -94,6 +94,66 @@ async fn apply_child_names_stats_only_named_children() {
 }
 
 #[tokio::test]
+async fn apply_child_names_removes_deleted_subdir() {
+    // The parent-reconcile half of the filetree-stale fix: once the watcher
+    // attributes a subdir deletion to the PARENT (see local_watcher_test), the
+    // parent applies `ChildNames([sub])` and must emit `Removed{sub}` so the
+    // stale subdir node drops out of the listing.
+    let (mut tree, dir) = real_tree();
+    std::fs::create_dir(dir.path().join("a")).unwrap();
+    std::fs::write(dir.path().join("keep.txt"), b"x").unwrap();
+    let c = canon(dir.path());
+    tree.mount(c.as_str()).await.unwrap();
+
+    std::fs::remove_dir_all(dir.path().join("a")).unwrap();
+
+    let delta = tree
+        .apply(c.as_str(), Hint::ChildNames(vec!["a".to_owned()]))
+        .await
+        .unwrap()
+        .expect("changes");
+    assert_eq!(delta.changes, vec![Change::Removed { name: "a".to_owned() }]);
+}
+
+#[tokio::test]
+async fn apply_child_names_renamed_subdir_surfaces_on_parent() {
+    // Renaming an expanded subdir a→a2: the watcher attributes events on both
+    // paths to the parent, which applies `ChildNames([a, a2])`. A real rename
+    // preserves the inode, so the parent's diff coalesces removed+added into a
+    // single `Renamed{a→a2}` (the frontend applies it in place) — the parent's
+    // listing is reconciled either way, never left showing a stale `a`.
+    let (mut tree, dir) = real_tree();
+    std::fs::create_dir(dir.path().join("a")).unwrap();
+    let c = canon(dir.path());
+    tree.mount(c.as_str()).await.unwrap();
+
+    std::fs::rename(dir.path().join("a"), dir.path().join("a2")).unwrap();
+
+    let delta = tree
+        .apply(c.as_str(), Hint::ChildNames(vec!["a".to_owned(), "a2".to_owned()]))
+        .await
+        .unwrap()
+        .expect("changes");
+    // Real-FS inode is preserved across rename → synthesized Renamed. On any
+    // platform that reports inode 0 (e.g. Windows) this degrades to
+    // Removed{a}+Added{a2}; both leave the parent listing correct, so assert the
+    // stale `a` is gone rather than pinning one representation.
+    let has_stale_a = delta.changes.iter().any(|ch| {
+        matches!(ch, Change::Added { name, .. } if name == "a") || matches!(ch, Change::Renamed { to, .. } if to == "a")
+    });
+    let drops_a = delta.changes.iter().any(|ch| {
+        matches!(ch, Change::Removed { name } if name == "a")
+            || matches!(ch, Change::Renamed { from, .. } if from == "a")
+    });
+    assert!(drops_a, "parent must drop the old `a` entry, got {:?}", delta.changes);
+    assert!(
+        !has_stale_a,
+        "parent must not keep a stale `a`, got {:?}",
+        delta.changes
+    );
+}
+
+#[tokio::test]
 async fn apply_is_idempotent_when_nothing_changed() {
     let (mut tree, dir) = real_tree();
     std::fs::write(dir.path().join("a.txt"), b"x").unwrap();

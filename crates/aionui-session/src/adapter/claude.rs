@@ -29,6 +29,29 @@ pub struct ClaudeAdapter {
     /// text fragments emit as incremental `MessageDelta`s (typewriter) and the
     /// consolidated `assistant` frame skips re-emitting text it already streamed.
     stream: StreamState,
+    /// Context occupancy from the most recent API call in the session, summed as
+    /// `input + cache_creation + cache_read + output` off the last
+    /// `message_delta.usage`.
+    ///
+    /// Deliberately NOT per-message state: it must outlive `message_start`, since
+    /// the figure we want is the LAST call of the turn. `result.usage` cannot
+    /// supply it — that field AGGREGATES every API call in the turn, so a
+    /// four-tool-call turn reported 107_974 where the real occupancy was 27_467
+    /// (live-captured, 2.1.220; its `cache_read` 95_709 is exactly the four calls'
+    /// 15_493+26_345+26_485+27_386 summed). Feeding the aggregate to the usage
+    /// indicator drove it past 100% of the context window.
+    last_call_tokens: Option<u64>,
+    /// Thinking tokens accumulated across the turn's API calls. `result.usage`
+    /// reports `output_tokens_details: null` (live-captured), so the only source is
+    /// each `message_delta.usage.output_tokens_details.thinking_tokens` — 60 on the
+    /// first call of a captured four-call turn. Summed here because the breakdown
+    /// is a PER-TURN figure; reset when the `result` frame consumes it.
+    turn_thought_tokens: u64,
+    /// The model id claude last announced on `system{subtype:"init"}` — the
+    /// authoritative "what am I running now", re-emitted on model switch and after
+    /// a compaction. Spelled exactly like the `modelUsage` keys
+    /// (`"claude-opus-5"`), so it selects the right entry directly.
+    current_model: Option<String>,
 }
 
 /// Per-message streaming state for `--include-partial-messages`. Reset on each
@@ -262,7 +285,7 @@ impl ClaudeAdapter {
             "system" => self.parse_system(v),
             "assistant" => self.parse_assistant(v),
             "user" => self.parse_user(v),
-            "result" => Self::parse_result(v),
+            "result" => self.parse_result(v),
             // F3 control channel (--permission-prompt-tool stdio). A
             // `control_request` whose `request.subtype == can_use_tool` needs a
             // user answer → `Permission{request_id}` (the reducer ref-counts; the
@@ -292,11 +315,39 @@ impl ClaudeAdapter {
     /// system frames: `init` carries no state signal; `api_retry` and the
     /// compaction milestones normalize to the backend-neutral `Heartbeat`;
     /// anything else is opaque.
-    fn parse_system(&self, v: &Value) -> Vec<SessionEvent> {
+    fn parse_system(&mut self, v: &Value) -> Vec<SessionEvent> {
         match v.get("subtype").and_then(Value::as_str).unwrap_or("") {
-            "init" => Vec::new(),
+            "init" => {
+                // Carries the live model id; latch it for `result_context_window`.
+                if let Some(model) = v.get("model").and_then(Value::as_str) {
+                    self.current_model = Some(model.to_owned());
+                }
+                Vec::new()
+            }
+            "compact_boundary" => {
+                // A compaction rewrites the context, so the occupancy latched off
+                // the last API call is now stale — and the compaction turn itself
+                // streams NO `message_delta` to refresh it (live-captured: five
+                // turns climbing to 27_349, then `compact_boundary{pre:27349,
+                // post:3158}` followed by a `result` with `num_turns:0` and a zero
+                // aggregate, then the next real turn reporting 23_779).
+                //
+                // Without this reset the stale 27_349 would survive the fallback
+                // and sail past the zero-usage guard, re-publishing a
+                // pre-compaction figure as if it were current. Dropping it lets the
+                // compaction's zero aggregate be discarded as intended, so the
+                // indicator holds its previous reading until the next real turn
+                // measures the new context.
+                //
+                // The boundary's own `post_tokens` cannot substitute: it counts the
+                // compacted transcript only (3_158 here) while occupancy also
+                // carries the system prompt and tools — the next turn measured
+                // 23_779, ~20k higher. Different baselines.
+                self.last_call_tokens = None;
+                vec![SessionEvent::Heartbeat]
+            }
             // network backoff + the no-chunk compaction window both = liveness.
-            "api_retry" | "compact_boundary" | "compacting" => vec![SessionEvent::Heartbeat],
+            "api_retry" | "compacting" => vec![SessionEvent::Heartbeat],
             other => vec![SessionEvent::AdapterSpecific {
                 tag: format!("system/{other}"),
                 payload: v.clone(),
@@ -350,10 +401,23 @@ impl ClaudeAdapter {
                     text: b.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
                 }),
                 "thinking" if streamed_thinking => {}
-                "thinking" => out.push(SessionEvent::ThoughtDelta {
-                    item_id: think_key.clone(),
-                    text: b.get("thinking").and_then(Value::as_str).unwrap_or("").to_string(),
-                }),
+                // A thinking block whose plaintext is absent carries only its
+                // encrypted `signature` — that is what the CLI emits whenever
+                // thinking display resolves to `omitted` (verified: claude 2.1.220,
+                // capture with/without `--thinking-display summarized`). An empty
+                // ThoughtDelta becomes a thinking card that expands to nothing, so
+                // drop it. The streaming path (parse_stream_event) already skips
+                // empty `thinking_delta`s; this mirrors that guard on the
+                // consolidated frame, which previously lacked it.
+                "thinking" => {
+                    let text = b.get("thinking").and_then(Value::as_str).unwrap_or("");
+                    if !text.is_empty() {
+                        out.push(SessionEvent::ThoughtDelta {
+                            item_id: think_key.clone(),
+                            text: text.to_string(),
+                        });
+                    }
+                }
                 "tool_use" => {
                     let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
                     // #486 (parity with aionrs output_sink): DROP a malformed empty-name
@@ -452,7 +516,7 @@ impl ClaudeAdapter {
     /// on the same result frame). Returns a Vec so the usage rides alongside the
     /// terminal — codex already emits UsageDelta (map_usage); this closes the
     /// claude/codex asymmetry. The wrapping ClaudeConnection inherits both for free.
-    fn parse_result(v: &Value) -> Vec<SessionEvent> {
+    fn parse_result(&mut self, v: &Value) -> Vec<SessionEvent> {
         let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
         let result_text = match v.get("result").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -517,18 +581,94 @@ impl ClaudeAdapter {
             let output_tokens = get("output_tokens");
             let cache_creation = get("cache_creation_input_tokens");
             let cache_read = get("cache_read_input_tokens");
-            let total_tokens = usage
-                .get("total_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(input_tokens + output_tokens + cache_creation + cache_read);
+            // CONTEXT OCCUPANCY, not the turn's billed volume. `result.usage`
+            // aggregates every API call in the turn, so summing its buckets
+            // overstates occupancy by roughly the number of tool rounds (measured
+            // 107_974 vs a true 27_467 on a four-call turn) and pushed the usage
+            // indicator past 100%. Prefer the last call's own usage, tracked off
+            // `message_delta`. The aggregate remains the fallback for a turn that
+            // streamed no `message_delta` at all (no `--include-partial-messages`,
+            // or a resumed/consolidated frame); it is exact for a single-call turn
+            // and only overstates once tool rounds appear.
+            let total_tokens = self.last_call_tokens.unwrap_or_else(|| {
+                usage
+                    .get("total_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(input_tokens + output_tokens + cache_creation + cache_read)
+            });
             out.push(SessionEvent::UsageDelta {
                 input_tokens,
                 output_tokens,
                 total_tokens,
                 cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
+                context_window: self.result_context_window(v),
+                // Per-turn detail line. These stay on the AGGREGATE `result.usage`
+                // (unlike `total_tokens`, which must be the last call's occupancy):
+                // the breakdown answers "what did this turn cost", so counting every
+                // API call is the correct reading.
+                breakdown: crate::event::UsageBreakdown {
+                    cached_read_tokens: cache_read,
+                    cached_write_tokens: cache_creation,
+                    thought_tokens: std::mem::take(&mut self.turn_thought_tokens),
+                },
             });
         }
         out
+    }
+
+    /// The model's total context window from a `result` frame, for the usage
+    /// indicator's denominator. It rides `modelUsage.<model>.contextWindow`
+    /// (live-captured, claude 2.1.220: `{"claude-opus-5":{…,"contextWindow":1000000}}`).
+    ///
+    /// The entry cannot be selected by model id — the frame's own `model` field is
+    /// `null` on the wire. One entry (the observed shape) is used directly; when a
+    /// turn touched several models (a subagent on a different one) the DOMINANT
+    /// entry by `inputTokens + outputTokens` wins, i.e. the main conversation model.
+    /// That tie-break is a heuristic: only the single-entry shape has been captured.
+    /// Absent / non-integer → `None`, which renders as a counter with no percentage.
+    fn result_context_window(&self, v: &Value) -> Option<u64> {
+        let entries = v.get("modelUsage")?.as_object()?;
+        // Prefer the model claude says it is CURRENTLY running. `modelUsage` is
+        // session-CUMULATIVE (live-measured: `cacheReadInputTokens` 18_384 after
+        // turn 1, 44_791 after turn 2), so after a model switch the outgoing
+        // model's accumulated volume still dwarfs the new one's first turn — a
+        // volume ranking would pin the window to the old model forever. That is
+        // exactly the reported bug: switching opus -> haiku kept showing 1M
+        // instead of 200k. `system{subtype:"init"}` announces the live model and
+        // is re-emitted on a switch, spelled identically to these keys.
+        if let Some(current) = self.current_model.as_deref()
+            && let Some(window) = entries
+                .get(current)
+                .and_then(|m| m.get("contextWindow"))
+                .and_then(Value::as_u64)
+        {
+            return Some(window);
+        }
+        // Fallback for a session that never announced a model (or announced one
+        // absent from `modelUsage`): the heaviest entry, cache included, since the
+        // main conversation model is the one carrying the history as cache.
+        entries
+            .values()
+            .filter_map(|m| {
+                let window = m.get("contextWindow").and_then(Value::as_u64)?;
+                // Weigh by the FULL volume including both cache buckets. A
+                // `modelUsage` entry's `inputTokens`/`outputTokens` EXCLUDE cache,
+                // and the main conversation model is precisely the one carrying the
+                // history as cache: live-captured, the main entry read
+                // `inputTokens:10, outputTokens:34, cacheReadInputTokens:27953` —
+                // 44 against 27_953. Ranking on in+out alone let any Task subagent
+                // doing uncached work outrank it, handing the indicator the
+                // subagent's window (e.g. haiku's 200k in place of opus's 1M) and
+                // inflating the percentage fivefold.
+                let field = |k: &str| m.get(k).and_then(Value::as_u64).unwrap_or(0);
+                let volume = field("inputTokens")
+                    + field("outputTokens")
+                    + field("cacheReadInputTokens")
+                    + field("cacheCreationInputTokens");
+                Some((volume, window))
+            })
+            .max_by_key(|(volume, _)| *volume)
+            .map(|(_, window)| window)
     }
 
     /// C-1: map a claude result frame's `terminal_reason` (preferred, 12-value) or
@@ -666,6 +806,28 @@ impl ClaudeAdapter {
             // No FSM signal, now an EXPECTED frame (not unknown) → emit nothing.
             "content_block_stop" | "message_stop" => Vec::new(),
             "message_delta" => {
+                // Each `message_delta` closes ONE API call and carries that call's
+                // complete usage. The last one of the turn is therefore the current
+                // context occupancy — the figure the usage indicator needs, and the
+                // one `result.usage` cannot give (it sums every call; see
+                // `last_call_tokens`). Live-captured tail of a four-call turn:
+                // `{input_tokens:2, cache_creation:79, cache_read:27386, output:5}`
+                // = 27_472, against an aggregate of 107_974.
+                if let Some(usage) = event.and_then(|e| e.get("usage")).and_then(Value::as_object) {
+                    let field = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+                    let occupancy = field("input_tokens")
+                        + field("cache_creation_input_tokens")
+                        + field("cache_read_input_tokens")
+                        + field("output_tokens");
+                    if occupancy > 0 {
+                        self.last_call_tokens = Some(occupancy);
+                    }
+                    self.turn_thought_tokens += usage
+                        .get("output_tokens_details")
+                        .and_then(|d| d.get("thinking_tokens"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                }
                 let stop_reason = event
                     .and_then(|e| e.get("delta"))
                     .and_then(|d| d.get("stop_reason"))
@@ -804,6 +966,14 @@ impl BackendAdapter for ClaudeAdapter {
             // later result TurnResult is absorbed by the reducer's I10.
             "--include-partial-messages".to_string(),
             "--replay-user-messages".to_string(),
+            // NOTE: `--thinking-display summarized` (ask for PLAINTEXT thinking —
+            // current models default the display to `omitted` and then stream
+            // signature-only thinking blocks) is NOT built here. It is version-gated
+            // and therefore supplied by the manager through `extra_args`
+            // (aionui-ai-agent `claude_flags`): the CLI rejects an unknown option at
+            // parse time, so passing it to an older PATH-resolved claude would kill
+            // the spawn outright. This crate is self-contained (aionui-process +
+            // aionui-common only) and cannot probe `--version` itself.
             // Feature 004 F3: enable the bidirectional control channel. With
             // `--permission-prompt-tool stdio`, claude emits a `control_request`
             // (subtype `can_use_tool`) on stdout and BLOCKS until the host writes
@@ -1771,6 +1941,393 @@ mod tests {
         assert_eq!(msg, Some(("msg_z:text".to_string(), "answer".to_string())));
     }
 
+    /// A consolidated `thinking` block with NO plaintext (only its encrypted
+    /// `signature`) must emit NO ThoughtDelta. That is the exact shape the CLI
+    /// sends whenever thinking display resolves to `omitted` (live-probed on
+    /// claude 2.1.220: `thinking` is "" while `signature` is ~650 chars).
+    /// Emitting an empty delta produced a thinking card that expanded to nothing
+    /// — a whole column of them once the empty segments started being persisted.
+    /// The sibling text block must still come through untouched.
+    #[test]
+    fn consolidated_thinking_block_without_plaintext_emits_no_thought() {
+        let mut a = ClaudeAdapter::new();
+        let evs = a.parse_chunk(
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg_e","role":"assistant","content":[{"type":"thinking","thinking":"","signature":"ErUBCkYIBxgCKkC0"},{"type":"text","text":"answer"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        );
+        assert!(
+            !evs.iter().any(|e| matches!(e, SessionEvent::ThoughtDelta { .. })),
+            "an empty thinking block must not produce a ThoughtDelta, got: {evs:?}"
+        );
+        let msg = evs.iter().find_map(|e| match e {
+            SessionEvent::MessageDelta { item_id, text } => Some((item_id.clone(), text.clone())),
+            _ => None,
+        });
+        assert_eq!(msg, Some(("msg_e:text".to_string(), "answer".to_string())));
+    }
+
+    /// End-to-end on CAPTURED wire bytes: the frames a real `--thinking-display
+    /// summarized` turn emits must parse into a NON-empty ThoughtDelta. Frames are
+    /// verbatim from a live claude 2.1.220 capture (same flags the adapter spawns
+    /// with), trimmed to the thinking block. Guards the whole reason the flag is
+    /// passed — a parser that dropped this text would put us back to blank cards.
+    #[test]
+    fn captured_summarized_thinking_frames_yield_plaintext_thought() {
+        let mut a = ClaudeAdapter::new();
+        let evs = a.parse_chunk(
+            concat!(
+                r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_011CdZNE8pQQoWm1S5ytUj9a","role":"assistant"}}}"#,
+                "\n",
+                r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}}"#,
+                "\n",
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"17是质数，我只需检查它能","estimated_tokens":null}}}"#,
+                "\n",
+            )
+            .as_bytes(),
+        );
+        let think = evs.iter().find_map(|e| match e {
+            SessionEvent::ThoughtDelta { item_id, text } => Some((item_id.clone(), text.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            think,
+            Some((
+                "msg_011CdZNE8pQQoWm1S5ytUj9a:think".to_string(),
+                "17是质数，我只需检查它能".to_string()
+            ))
+        );
+        // The `content_block_start` carries an empty `thinking` too — it must not
+        // leak an extra blank delta ahead of the real text.
+        assert_eq!(
+            evs.iter()
+                .filter(|e| matches!(e, SessionEvent::ThoughtDelta { .. }))
+                .count(),
+            1
+        );
+    }
+
+    /// `--thinking-display` is version-gated and therefore manager-supplied, NOT
+    /// built here (an older PATH-resolved claude rejects it at parse time and the
+    /// spawn dies). Two things must hold: this crate never hardcodes it, and a
+    /// manager that DOES pass it gets it through to the wire verbatim.
+    #[tokio::test]
+    async fn thinking_display_is_manager_supplied_not_hardcoded() {
+        use crate::testing::FakeSpawner;
+
+        let spawn_with = |extra: Vec<String>| async move {
+            let spawner = FakeSpawner::new();
+            let adapter = ClaudeAdapter::new();
+            // FakeSpawner records the CommandSpec then Errs (it cannot make a real
+            // process) — the spec we assert on was already captured.
+            let _ = adapter
+                .start_turn(
+                    &spawner,
+                    &SessionSpec::Fresh("11111111-1111-4111-8111-111111111111".into()),
+                    None,
+                    &extra,
+                    &[],
+                    None,
+                )
+                .await;
+            spawner.last_command().await.expect("a spawn was recorded").args
+        };
+
+        let bare = spawn_with(Vec::new()).await;
+        assert!(
+            !bare.iter().any(|a| a == "--thinking-display"),
+            "the adapter must not hardcode a version-gated flag, got: {bare:?}"
+        );
+
+        let gated = spawn_with(vec!["--thinking-display".to_string(), "summarized".to_string()]).await;
+        let at = gated
+            .iter()
+            .position(|a| a == "--thinking-display")
+            .expect("a manager-supplied flag must reach the spawn");
+        assert_eq!(gated.get(at + 1).map(String::as_str), Some("summarized"));
+    }
+
+    /// Helper: drive one `result` NDJSON line through the adapter and return the
+    /// `context_window` the emitted `UsageDelta` carries.
+    #[cfg(test)]
+    fn window_of(line: &str) -> Option<Option<u64>> {
+        let mut a = ClaudeAdapter::new();
+        a.parse_chunk(format!("{line}\n").as_bytes())
+            .into_iter()
+            .find_map(|e| match e {
+                SessionEvent::UsageDelta { context_window, .. } => Some(context_window),
+                _ => None,
+            })
+    }
+
+    /// The context-window size the usage indicator renders as `size` rides
+    /// `result.modelUsage.<model>.contextWindow`. Verbatim shape from a live
+    /// claude 2.1.220 turn (model `claude-opus-5`, window 1_000_000).
+    #[test]
+    fn result_carries_context_window_from_single_model_usage_entry() {
+        let line = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":2,"cache_creation_input_tokens":10920,"#,
+            r#""cache_read_input_tokens":15493,"output_tokens":5},"model":null,"#,
+            r#""modelUsage":{"claude-opus-5":{"inputTokens":2,"outputTokens":5,"#,
+            r#""contextWindow":1000000,"maxOutputTokens":64000}}}"#
+        );
+        assert_eq!(window_of(line), Some(Some(1_000_000)));
+    }
+
+    /// `result.model` is null on the wire, so the entry cannot be picked by model
+    /// id. With several entries (a subagent ran on a different model) take the
+    /// DOMINANT one by token volume — the main conversation model. Heuristic: only
+    /// the single-entry shape has been captured live.
+    #[test]
+    fn multi_entry_model_usage_picks_the_dominant_model() {
+        let line = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":10,"output_tokens":5},"#,
+            r#""modelUsage":{"claude-haiku-4-5":{"inputTokens":12,"outputTokens":3,"contextWindow":200000},"#,
+            r#""claude-opus-5":{"inputTokens":900,"outputTokens":100,"contextWindow":1000000}}}"#
+        );
+        assert_eq!(window_of(line), Some(Some(1_000_000)));
+    }
+
+    /// A usage-bearing result with no `modelUsage` (or an unparseable one) must
+    /// still emit the UsageDelta — just without a window. The frontend guards on
+    /// `size > 0`, so `None` degrades to "counter without a percentage".
+    #[test]
+    fn missing_or_malformed_model_usage_yields_no_window() {
+        let bare = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":10,"output_tokens":5}}"#
+        );
+        assert_eq!(window_of(bare), Some(None));
+
+        let malformed = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":10,"output_tokens":5},"modelUsage":{"m":{"contextWindow":"big"}}}"#
+        );
+        assert_eq!(window_of(malformed), Some(None));
+    }
+
+    /// A turn with tool rounds makes several API calls, and `result.usage`
+    /// AGGREGATES them — feeding that to the indicator drove it past 100% of the
+    /// window (reported in the wild at 340%). Occupancy is the LAST call's own
+    /// usage. Frames verbatim from a live four-call turn (2.1.220): the per-call
+    /// `message_delta.usage` values, then the aggregate `result.usage` whose
+    /// `cache_read_input_tokens` 95_709 is exactly 15_493+26_345+26_485+27_386.
+    #[test]
+    fn multi_call_turn_reports_last_call_occupancy_not_the_turn_aggregate() {
+        let mut a = ClaudeAdapter::new();
+        let deltas = [
+            (2, 10852, 15493, 134),
+            (2, 140, 26345, 73),
+            (2, 901, 26485, 73),
+            (2, 79, 27386, 5),
+        ];
+        for (i, cc, cr, o) in deltas {
+            let line = format!(
+                r#"{{"type":"stream_event","event":{{"type":"message_delta","delta":{{"stop_reason":"tool_use"}},"usage":{{"input_tokens":{i},"cache_creation_input_tokens":{cc},"cache_read_input_tokens":{cr},"output_tokens":{o}}}}}}}"#
+            );
+            a.parse_chunk(format!("{line}\n").as_bytes());
+        }
+        let result = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":8,"cache_creation_input_tokens":11972,"#,
+            r#""cache_read_input_tokens":95709,"output_tokens":285},"total_cost_usd":0.5}"#,
+            "\n"
+        );
+        let total = a
+            .parse_chunk(result.as_bytes())
+            .into_iter()
+            .find_map(|e| match e {
+                SessionEvent::UsageDelta { total_tokens, .. } => Some(total_tokens),
+                _ => None,
+            })
+            .expect("result emits a UsageDelta");
+        assert_eq!(
+            total, 27_472,
+            "occupancy is the last call (2+79+27386+5), NOT the 107_974 aggregate"
+        );
+    }
+
+    /// The detail line's counters are PER-TURN, so they ride the aggregate
+    /// `result.usage` even though `total_tokens` must not. Thinking tokens are the
+    /// exception: `result.usage.output_tokens_details` is null (live-captured), so
+    /// they are summed off each `message_delta` — 60 + 12 across two calls here.
+    #[test]
+    fn breakdown_sums_thinking_across_calls_and_reads_caches_from_the_aggregate() {
+        let mut a = ClaudeAdapter::new();
+        for (cr, think) in [(15493u64, 60u64), (27386, 12)] {
+            let line = format!(
+                r#"{{"type":"stream_event","event":{{"type":"message_delta","delta":{{"stop_reason":"tool_use"}},"usage":{{"input_tokens":2,"cache_creation_input_tokens":79,"cache_read_input_tokens":{cr},"output_tokens":5,"output_tokens_details":{{"thinking_tokens":{think}}}}}}}}}"#
+            );
+            a.parse_chunk(format!("{line}\n").as_bytes());
+        }
+        let result = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":8,"cache_creation_input_tokens":11972,"#,
+            r#""cache_read_input_tokens":95709,"output_tokens":285}}"#,
+            "\n"
+        );
+        let b = a
+            .parse_chunk(result.as_bytes())
+            .into_iter()
+            .find_map(|e| match e {
+                SessionEvent::UsageDelta { breakdown, .. } => Some(breakdown),
+                _ => None,
+            })
+            .expect("result emits a UsageDelta");
+        assert_eq!(b.cached_read_tokens, 95_709, "per-turn cache reads");
+        assert_eq!(b.cached_write_tokens, 11_972, "per-turn cache writes");
+        assert_eq!(b.thought_tokens, 72, "thinking summed across the turn's calls");
+
+        // The accumulator resets, or the next turn would inherit this turn's total.
+        let next = a
+            .parse_chunk(result.as_bytes())
+            .into_iter()
+            .find_map(|e| match e {
+                SessionEvent::UsageDelta { breakdown, .. } => Some(breakdown),
+                _ => None,
+            })
+            .expect("second result emits a UsageDelta");
+        assert_eq!(next.thought_tokens, 0, "thinking must not carry into the next turn");
+    }
+
+    /// Without any streamed `message_delta` the aggregate is the only figure
+    /// available, and for a single-call turn it IS the occupancy — so the fallback
+    /// must still produce a number rather than nothing.
+    #[test]
+    fn without_streamed_calls_the_result_aggregate_is_used() {
+        let line = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":2,"cache_creation_input_tokens":79,"#,
+            r#""cache_read_input_tokens":27386,"output_tokens":5}}"#,
+            "\n"
+        );
+        let mut a = ClaudeAdapter::new();
+        let total = a
+            .parse_chunk(line.as_bytes())
+            .into_iter()
+            .find_map(|e| match e {
+                SessionEvent::UsageDelta { total_tokens, .. } => Some(total_tokens),
+                _ => None,
+            })
+            .expect("result emits a UsageDelta");
+        assert_eq!(total, 27_472);
+    }
+
+    /// Replays a live-captured compaction: five turns climbing to 27_349, the
+    /// boundary, the compaction's own `result` (`num_turns:0`, zero aggregate, and
+    /// crucially NO `message_delta`), then the next real turn at 23_779.
+    ///
+    /// The compaction must publish NOTHING. Its turn cannot measure the new
+    /// context, and the latched pre-compaction figure would otherwise slip past
+    /// the zero-usage guard and be re-published as current — the reported "used
+    /// tokens never update after a compaction".
+    #[test]
+    fn compaction_invalidates_the_latched_occupancy() {
+        let mut a = ClaudeAdapter::new();
+        let occupancy_of = |evs: Vec<SessionEvent>| {
+            evs.into_iter().find_map(|e| match e {
+                SessionEvent::UsageDelta { total_tokens, .. } => Some(total_tokens),
+                _ => None,
+            })
+        };
+        let delta = |cr: u64| {
+            format!(
+                r#"{{"type":"stream_event","event":{{"type":"message_delta","delta":{{"stop_reason":"end_turn"}},"usage":{{"input_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":{cr},"output_tokens":0}}}}}}"#
+            )
+        };
+        let result_with = |agg: u64| {
+            format!(
+                r#"{{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{{"input_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":{agg},"output_tokens":0}}}}"#
+            )
+        };
+
+        // A normal turn establishes the latch.
+        a.parse_chunk(format!("{}\n", delta(27_347)).as_bytes());
+        assert_eq!(
+            occupancy_of(a.parse_chunk(format!("{}\n", result_with(27_347)).as_bytes())),
+            Some(27_349)
+        );
+
+        // The compaction: boundary, then a zero-aggregate result with no delta.
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":27349,"post_tokens":3158}}"#;
+        a.parse_chunk(format!("{boundary}\n").as_bytes());
+        let zero_result = r#"{"type":"result","subtype":"success","is_error":false,"result":"","usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}"#;
+        assert_eq!(
+            occupancy_of(a.parse_chunk(format!("{zero_result}\n").as_bytes())),
+            Some(0),
+            "the compaction must report zero (dropped downstream), NOT the stale 27_349"
+        );
+
+        // The next real turn measures the compacted context.
+        a.parse_chunk(format!("{}\n", delta(23_777)).as_bytes());
+        assert_eq!(
+            occupancy_of(a.parse_chunk(format!("{}\n", result_with(23_777)).as_bytes())),
+            Some(23_779)
+        );
+    }
+
+    /// Switching models must move the window. `modelUsage` is session-CUMULATIVE
+    /// (live-measured: `cacheReadInputTokens` 18_384 after turn 1, 44_791 after
+    /// turn 2), so the model just switched AWAY from keeps the larger volume and a
+    /// volume ranking pins the window to it — the reported bug, where opus -> haiku
+    /// still displayed 1M instead of 200k. `system{subtype:"init"}` announces the
+    /// live model, so that selects the entry.
+    #[test]
+    fn model_switch_moves_the_window_despite_cumulative_model_usage() {
+        let result = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":10,"output_tokens":5},"#,
+            // opus carries the whole accumulated history; haiku has just started.
+            r#""modelUsage":{"claude-opus-5":{"inputTokens":4,"outputTokens":10,"#,
+            r#""cacheReadInputTokens":44791,"contextWindow":1000000},"#,
+            r#""claude-haiku-4-5":{"inputTokens":2,"outputTokens":5,"#,
+            r#""cacheReadInputTokens":120,"contextWindow":200000}}}"#,
+            "\n"
+        );
+        let window_after_init = |model: &str| {
+            let mut a = ClaudeAdapter::new();
+            let init = format!(r#"{{"type":"system","subtype":"init","model":"{model}"}}"#);
+            a.parse_chunk(format!("{init}\n").as_bytes());
+            a.parse_chunk(result.as_bytes()).into_iter().find_map(|e| match e {
+                SessionEvent::UsageDelta { context_window, .. } => Some(context_window),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            window_after_init("claude-haiku-4-5"),
+            Some(Some(200_000)),
+            "after switching to haiku the window must follow, not stay on opus's 1M"
+        );
+        assert_eq!(window_after_init("claude-opus-5"), Some(Some(1_000_000)));
+    }
+
+    /// The dominant-model pick must weigh CACHE too. A `modelUsage` entry's
+    /// in/out exclude cache, and the main model is the one holding the history as
+    /// cache (live-captured: `inputTokens:10, outputTokens:34,
+    /// cacheReadInputTokens:27953`). Ranking on in+out alone handed the window to
+    /// a Task subagent doing uncached work.
+    #[test]
+    fn dominant_model_is_ranked_by_cache_inclusive_volume() {
+        let line = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":10,"output_tokens":34},"#,
+            // Main model: tiny in/out, huge cache — must win.
+            r#""modelUsage":{"claude-opus-5":{"inputTokens":10,"outputTokens":34,"#,
+            r#""cacheReadInputTokens":27953,"contextWindow":1000000},"#,
+            // Subagent: larger uncached volume, smaller window — must NOT win.
+            r#""claude-haiku-4-5":{"inputTokens":1445,"outputTokens":1767,"contextWindow":200000}}}"#
+        );
+        assert_eq!(
+            window_of(line),
+            Some(Some(1_000_000)),
+            "the cache-heavy main model owns the window, not the busier subagent"
+        );
+    }
+
     /// H4 (design-vs-code gap audit, §5): `UsageDelta.total_tokens` MUST count the
     /// cache buckets (`cache_read_input_tokens` + `cache_creation_input_tokens`),
     /// which ARE billed input tokens — omitting them under-reported a cache-heavy
@@ -1801,6 +2358,7 @@ mod tests {
                     output_tokens,
                     total_tokens,
                     cost_usd,
+                    ..
                 } => Some((input_tokens, output_tokens, total_tokens, cost_usd)),
                 _ => None,
             })
@@ -1932,7 +2490,7 @@ mod tests {
         // ::claude_live_cancel_before_output_never_leaks_ede_diagnostic`.
         let raw = include_str!("../../tests/fixtures/claude_2.1.185_cancel_before_output_result.ndjson");
         let frame: serde_json::Value = serde_json::from_str(raw.trim()).expect("fixture is valid result JSON");
-        let events = ClaudeAdapter::parse_result(&frame);
+        let events = ClaudeAdapter::new().parse_result(&frame);
         match events.first() {
             Some(SessionEvent::TurnResult {
                 result_text, is_error, ..
@@ -1960,7 +2518,7 @@ mod tests {
             "is_error": true,
             "errors": ["[ede_diagnostic] result_type=user stop_reason=null", "rate limit exceeded"],
         });
-        let events = ClaudeAdapter::parse_result(&frame);
+        let events = ClaudeAdapter::new().parse_result(&frame);
         match events.first() {
             Some(SessionEvent::TurnResult { result_text, .. }) => {
                 assert_eq!(
@@ -1979,8 +2537,8 @@ mod tests {
     /// this table pins every documented subtype + the unknown fallthrough.
     #[test]
     fn parse_system_subtypes_map_to_heartbeat_or_opaque() {
-        let a = ClaudeAdapter::new();
-        let sys = |subtype: &str| {
+        let mut a = ClaudeAdapter::new();
+        let mut sys = |subtype: &str| {
             let v = serde_json::json!({ "type": "system", "subtype": subtype });
             a.parse_system(&v)
         };
@@ -2007,7 +2565,7 @@ mod tests {
             }
             other => panic!("expected one AdapterSpecific, got {other:?}"),
         }
-        let no_subtype = a.parse_system(&serde_json::json!({ "type": "system" }));
+        let no_subtype = sys("");
         assert!(
             matches!(no_subtype.as_slice(), [SessionEvent::AdapterSpecific { tag, .. }] if tag == "system/"),
             "absent subtype → opaque `system/` (no panic), got {no_subtype:?}"
@@ -2060,7 +2618,7 @@ mod tests {
     /// leak "success"; an empty success turn must read as EmptyTurn upstream).
     #[test]
     fn parse_result_text_fallback_chain_each_arm() {
-        let text_of = |v: &Value| match ClaudeAdapter::parse_result(v).into_iter().next() {
+        let text_of = |v: &Value| match ClaudeAdapter::new().parse_result(v).into_iter().next() {
             Some(SessionEvent::TurnResult { result_text, .. }) => result_text,
             other => panic!("expected a TurnResult, got {other:?}"),
         };
@@ -2126,7 +2684,7 @@ mod tests {
             if let Some(r) = result { frame["result"] = serde_json::json!(r); }
             frame["errors"] = serde_json::json!(errors);
 
-            let events = ClaudeAdapter::parse_result(&frame); // (1) must not panic
+            let events = ClaudeAdapter::new().parse_result(&frame); // (1) must not panic
             let tr = events.iter().find(|e| matches!(e, SessionEvent::TurnResult { .. }));
             prop_assert!(tr.is_some(), "parse_result must emit a TurnResult");
             if let Some(SessionEvent::TurnResult { is_error, result_text, .. }) = tr {

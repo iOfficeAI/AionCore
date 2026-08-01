@@ -1773,6 +1773,12 @@ async fn map_update(
                 output_tokens: output,
                 total_tokens: total,
                 cost_usd,
+                // ACP spells the context window `size` (the UsageUpdate shape the
+                // frontend indicator reads back as its denominator).
+                context_window: update.get("size").and_then(Value::as_u64),
+                // ACP's UsageUpdate carries no per-turn split, so the detail
+                // line stays empty and the renderer omits it.
+                breakdown: crate::event::UsageBreakdown::default(),
             }]
         }
         "current_mode_update" => {
@@ -1951,6 +1957,10 @@ fn parse_acp_result_usage(frame: &Value) -> Option<SessionEvent> {
         output_tokens: output,
         total_tokens: total,
         cost_usd,
+        // ACP spells the context window `size` (see the notification path above).
+        context_window: usage.get("size").and_then(Value::as_u64),
+        // ACP's end-of-turn usage carries no per-turn split either.
+        breakdown: crate::event::UsageBreakdown::default(),
     })
 }
 
@@ -3658,6 +3668,7 @@ mod tests {
                 output_tokens,
                 total_tokens,
                 cost_usd,
+                ..
             } => {
                 assert_eq!(
                     *input_tokens, 0,
@@ -3691,6 +3702,7 @@ mod tests {
                 output_tokens,
                 total_tokens,
                 cost_usd,
+                ..
             }) => {
                 assert_eq!(*input_tokens, 1200);
                 assert_eq!(*output_tokens, 340);
@@ -3717,6 +3729,7 @@ mod tests {
                 output_tokens,
                 total_tokens,
                 cost_usd,
+                ..
             }) => {
                 assert_eq!((input_tokens, output_tokens, total_tokens), (900, 50, 950));
                 assert_eq!(cost_usd, Some(0.007));

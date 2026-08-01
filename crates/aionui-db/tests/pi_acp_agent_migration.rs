@@ -22,7 +22,10 @@ async fn pi_acp_builtin_metadata_is_seeded() {
 
     let behavior_policy: serde_json::Value =
         serde_json::from_str(pi.behavior_policy.as_deref().expect("seeded behavior policy")).unwrap();
-    assert_eq!(behavior_policy["team_capable_override"], false);
+    // 033 strips the retired team veto keys: team capability is derived from the
+    // advertised MCP transports, never pinned in the stored policy.
+    assert!(behavior_policy.get("team_capable_override").is_none());
+    assert!(behavior_policy.get("supports_team").is_none());
 
     let capabilities: serde_json::Value =
         serde_json::from_str(pi.agent_capabilities.as_deref().expect("seeded capabilities")).unwrap();

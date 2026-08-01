@@ -52,6 +52,32 @@ async fn watch_emits_changed_on_child_create() {
     );
 }
 
+#[tokio::test]
+async fn removing_watched_subdir_emits_change_on_parent() {
+    // Regression (filetree-stale): with both a directory and its subdir watched
+    // (the subdir was expanded in the tree), deleting the subdir must surface as
+    // a change on the PARENT — that is what removes the stale subdir node from
+    // the parent's listing. Before the fix the event attributed only to the
+    // subdir itself, so the parent never learned it was gone.
+    let root = tempdir().unwrap();
+    let sub_path = root.path().join("a");
+    std::fs::create_dir(&sub_path).unwrap();
+
+    let (watcher, mut rx) = LocalWatcher::new().unwrap();
+    let root_c = canon(root.path());
+    let sub_c = canon(&sub_path);
+    watcher.watch(root_c.as_str()).unwrap();
+    watcher.watch(sub_c.as_str()).unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    std::fs::remove_dir_all(&sub_path).unwrap();
+
+    assert!(
+        saw_change(&mut rx, root_c.as_str(), "a", Duration::from_secs(5)).await,
+        "parent root must observe a Changed mentioning the removed subdir `a`"
+    );
+}
+
 // ── Event-path attribution: the realpath double-key fold (pure, all platforms)
 //
 // FSEvents delivers realpath'd paths (macOS `/var` → `/private/var`); `watch`
@@ -88,8 +114,9 @@ fn resolve_owner_folds_realpath_alias_back_to_lexical() {
     watched.insert(lexical.as_str().to_owned(), entry.clone());
     watched.insert(alias.as_str().to_owned(), entry);
 
-    let want = Some(lexical.as_str().to_owned());
-    // Alias'd child path (as macOS FSEvents reports) attributes to the lexical id.
+    let want = vec![lexical.as_str().to_owned()];
+    // Alias'd child path (as macOS FSEvents reports) attributes to the lexical id
+    // via its parent (the child file itself is not a watched directory).
     assert_eq!(resolve_owner(&watched, &alias_dir.join("child.txt")), want);
     // Lexical child path (as Linux inotify reports) attributes to the same id.
     assert_eq!(resolve_owner(&watched, &lex_dir.join("child.txt")), want);
@@ -99,7 +126,39 @@ fn resolve_owner_folds_realpath_alias_back_to_lexical() {
     let unrelated = PathBuf::from(r"C:\other\x.txt");
     #[cfg(not(windows))]
     let unrelated = PathBuf::from("/other/x.txt");
-    assert_eq!(resolve_owner(&watched, &unrelated), None);
+    assert_eq!(resolve_owner(&watched, &unrelated), Vec::<String>::new());
+}
+
+#[test]
+fn resolve_owner_attributes_watched_subdir_to_both_self_and_parent() {
+    // The stale-tree fix: when a watched subdirectory's own path is the event
+    // path (delete/rename of the subdir), it must attribute to BOTH the subdir
+    // (self) AND its watched parent — the parent is the directory whose listing
+    // must drop the removed entry. Old behavior returned self only (exact-match
+    // precedence), so the parent never reconciled and the tree went stale.
+    let (parent_dir, _) = alias_dirs();
+    let sub_dir = parent_dir.join("a");
+    let parent = canon(&parent_dir);
+    let sub = canon(&sub_dir);
+
+    let parent_entry = WatchEntry {
+        lexical: parent.as_str().to_owned(),
+        notify_path: parent_dir.clone(),
+    };
+    let sub_entry = WatchEntry {
+        lexical: sub.as_str().to_owned(),
+        notify_path: sub_dir.clone(),
+    };
+    let mut watched: HashMap<String, WatchEntry> = HashMap::new();
+    watched.insert(parent.as_str().to_owned(), parent_entry);
+    watched.insert(sub.as_str().to_owned(), sub_entry);
+
+    // Self first, then parent — a removed watched subdir reconciles both.
+    assert_eq!(
+        resolve_owner(&watched, &sub_dir),
+        vec![sub.as_str().to_owned(), parent.as_str().to_owned()],
+        "a watched subdir's own path must attribute to self AND its watched parent"
+    );
 }
 
 #[test]
@@ -124,13 +183,13 @@ fn resolve_owner_case_folding_is_platform_relative() {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     assert_eq!(
         resolve_owner(&watched, &child),
-        Some(lexical.as_str().to_owned()),
+        vec![lexical.as_str().to_owned()],
         "case-insensitive platform folds the cased path back to the watched id"
     );
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     assert_eq!(
         resolve_owner(&watched, &child),
-        None,
+        Vec::<String>::new(),
         "case-sensitive platform treats the cased path as a different directory"
     );
 }

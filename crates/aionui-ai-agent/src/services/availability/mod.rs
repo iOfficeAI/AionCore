@@ -166,7 +166,7 @@ impl AgentAvailabilityService {
 }
 
 async fn run_probe(
-    _registry: &Arc<AgentRegistry>,
+    registry: &Arc<AgentRegistry>,
     provider_repo: &Arc<dyn IProviderRepository>,
     meta: &AgentMetadata,
     user_id: &str,
@@ -202,26 +202,43 @@ async fn run_probe(
                 Some("package_lock_invalid".to_owned()),
                 Some(error),
             ),
-            Ok(args) => match custom_agent_probe::try_connect_custom_agent(command, &args, &env, None).await {
-                TryConnectCustomAgentResponse::Success => (AgentSnapshotCheckStatus::Online, None, None),
-                TryConnectCustomAgentResponse::FailCli { error } => (
-                    AgentSnapshotCheckStatus::Offline,
-                    Some("command_not_found".to_owned()),
-                    Some(error),
-                ),
-                TryConnectCustomAgentResponse::FailAcp { error } => (
-                    AgentSnapshotCheckStatus::Offline,
-                    Some("acp_init_failed".to_owned()),
-                    Some(error),
-                ),
-                // Reachable but not authorized: still offline (unusable), but a
-                // dedicated code lets the UI guide the user to log in.
-                TryConnectCustomAgentResponse::FailAuth { error } => (
-                    AgentSnapshotCheckStatus::Offline,
-                    Some("auth_required".to_owned()),
-                    Some(error),
-                ),
-            },
+            Ok(args) => {
+                match custom_agent_probe::try_connect_custom_agent_with_catalog(command, &args, &env, None).await {
+                    // The probe opened a real session to reach this verdict, so its
+                    // `session/new` already carried whatever modes / models / config
+                    // options the agent advertises. Persist them through the same
+                    // channel a live conversation uses, so the pickers are populated
+                    // before the user ever opens one. Best-effort and additive:
+                    // `apply_handshake` skips `None` fields, so this never blanks a
+                    // catalog a real session had filled in, and an agent that
+                    // advertises nothing sends nothing.
+                    (TryConnectCustomAgentResponse::Success, catalog) => {
+                        if let Some(partial) = catalog {
+                            registry
+                                .catalog_sender()
+                                .send_partial(user_id.to_owned(), meta.id.clone(), *partial);
+                        }
+                        (AgentSnapshotCheckStatus::Online, None, None)
+                    }
+                    (TryConnectCustomAgentResponse::FailCli { error }, _) => (
+                        AgentSnapshotCheckStatus::Offline,
+                        Some("command_not_found".to_owned()),
+                        Some(error),
+                    ),
+                    (TryConnectCustomAgentResponse::FailAcp { error }, _) => (
+                        AgentSnapshotCheckStatus::Offline,
+                        Some("acp_init_failed".to_owned()),
+                        Some(error),
+                    ),
+                    // Reachable but not authorized: still offline (unusable), but a
+                    // dedicated code lets the UI guide the user to log in.
+                    (TryConnectCustomAgentResponse::FailAuth { error }, _) => (
+                        AgentSnapshotCheckStatus::Offline,
+                        Some("auth_required".to_owned()),
+                        Some(error),
+                    ),
+                }
+            }
         }
     } else if meta.backend.is_some() {
         // Commandless builtin fallback: same PATH + `--version` treatment as
