@@ -26,14 +26,6 @@ impl SlackApi {
         }
     }
 
-    pub fn bot_token(&self) -> &str {
-        &self.bot_token
-    }
-
-    pub fn app_token(&self) -> &str {
-        &self.app_token
-    }
-
     /// `auth.test` — validates the bot token and returns bot identity.
     pub async fn auth_test(&self) -> Result<AuthTestResult, ChannelError> {
         self.bot_post_empty::<AuthTestResult>("auth.test").await

@@ -22,11 +22,7 @@ pub(crate) struct AuthTestResult {
     #[serde(default)]
     pub user: Option<String>,
     #[serde(default)]
-    pub bot_id: Option<String>,
-    #[serde(default)]
     pub team: Option<String>,
-    #[serde(default)]
-    pub team_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,8 +35,6 @@ pub(crate) struct ConnectionsOpenResult {
 pub(crate) struct ChatPostResult {
     #[serde(default)]
     pub ts: Option<String>,
-    #[serde(default)]
-    pub channel: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -86,8 +80,6 @@ pub(crate) struct SocketEnvelope {
 pub(crate) struct EventsApiPayload {
     #[serde(default)]
     pub event: Option<SlackEvent>,
-    #[serde(default)]
-    pub team_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,8 +103,6 @@ pub(crate) struct SlackEvent {
     pub subtype: Option<String>,
     #[serde(default)]
     pub bot_id: Option<String>,
-    #[serde(default)]
-    pub app_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +206,6 @@ mod tests {
             channel_type: Some(channel_type.into()),
             subtype: None,
             bot_id: None,
-            app_id: None,
         }
     }
 
