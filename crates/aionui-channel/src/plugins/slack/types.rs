@@ -128,6 +128,38 @@ pub(crate) fn is_dm_event(event: &SlackEvent) -> bool {
             .is_some_and(|c| c.starts_with('D'))
 }
 
+/// Hermes-style session key: each Slack thread is its own conversation.
+///
+/// - Top-level message (no `thread_ts`): thread root = this message's `ts`
+/// - Reply in an existing thread: thread root = `thread_ts`
+///
+/// Encoded as `{channel}:{thread_root}` so session isolation is
+/// `(user_id, chat_id)` without changing the core session manager.
+pub(crate) fn encode_session_chat_id(channel: &str, thread_root: &str) -> String {
+    format!("{channel}:{thread_root}")
+}
+
+/// Split a session chat_id into `(channel, thread_ts)`.
+///
+/// Bare channel ids (legacy) decode as `(channel, None)`.
+pub(crate) fn decode_session_chat_id(chat_id: &str) -> (&str, Option<&str>) {
+    match chat_id.split_once(':') {
+        Some((channel, thread_ts)) if !channel.is_empty() && !thread_ts.is_empty() => {
+            (channel, Some(thread_ts))
+        }
+        _ => (chat_id, None),
+    }
+}
+
+/// Thread root for an inbound event: existing thread, else this message ts.
+pub(crate) fn thread_root_for_event(event: &SlackEvent) -> Option<String> {
+    event
+        .thread_ts
+        .clone()
+        .or_else(|| event.ts.clone())
+        .filter(|s| !s.is_empty())
+}
+
 /// Whether the message text @mentions the bot user.
 pub(crate) fn text_mentions_bot(text: &str, bot_user_id: &str) -> bool {
     if bot_user_id.is_empty() {
@@ -325,5 +357,35 @@ mod tests {
     #[test]
     fn strip_bot_mention_cleans_text() {
         assert_eq!(strip_bot_mention("<@U_BOT>  run tests", "U_BOT"), "run tests");
+    }
+
+    #[test]
+    fn session_chat_id_roundtrip() {
+        let encoded = encode_session_chat_id("D123", "1710000.000100");
+        assert_eq!(encoded, "D123:1710000.000100");
+        let (ch, thr) = decode_session_chat_id(&encoded);
+        assert_eq!(ch, "D123");
+        assert_eq!(thr, Some("1710000.000100"));
+    }
+
+    #[test]
+    fn session_chat_id_legacy_bare_channel() {
+        let (ch, thr) = decode_session_chat_id("D123");
+        assert_eq!(ch, "D123");
+        assert!(thr.is_none());
+    }
+
+    #[test]
+    fn thread_root_top_level_uses_message_ts() {
+        let event = msg("D1", "im", "hi");
+        assert_eq!(thread_root_for_event(&event).as_deref(), Some("1.0"));
+    }
+
+    #[test]
+    fn thread_root_in_thread_uses_thread_ts() {
+        let mut event = msg("D1", "im", "follow up");
+        event.thread_ts = Some("1.0".into());
+        event.ts = Some("2.0".into());
+        assert_eq!(thread_root_for_event(&event).as_deref(), Some("1.0"));
     }
 }

@@ -4,7 +4,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use tokio::sync::{mpsc, watch};
@@ -22,7 +21,8 @@ use crate::types::{
 use super::api::SlackApi;
 use super::types::{
     AcceptDecision, ChatPostMessageRequest, ChatUpdateRequest, EventsApiPayload, SocketEnvelope, SlackEvent,
-    classify_event, is_dm_event, parse_allowed_channels, strip_bot_mention,
+    classify_event, decode_session_chat_id, encode_session_chat_id, is_dm_event, parse_allowed_channels,
+    strip_bot_mention, thread_root_for_event,
 };
 
 /// Slack Bot plugin (Socket Mode).
@@ -42,8 +42,6 @@ pub struct SlackPlugin {
     callbacks: Option<PluginCallbacks>,
     allowed_channels: HashSet<String>,
     bot_user_id: String,
-    /// Last thread root per channel for outbound replies (personal-bot MVP).
-    last_thread_ts: Arc<DashMap<String, String>>,
     ws_handle: Option<JoinHandle<()>>,
     shutdown_tx: Option<watch::Sender<bool>>,
 }
@@ -58,7 +56,6 @@ impl Default for SlackPlugin {
             callbacks: None,
             allowed_channels: HashSet::new(),
             bot_user_id: String::new(),
-            last_thread_ts: Arc::new(DashMap::new()),
             ws_handle: None,
             shutdown_tx: None,
         }
@@ -162,7 +159,6 @@ impl ChannelPlugin for SlackPlugin {
 
         let allowed = self.allowed_channels.clone();
         let bot_user_id = self.bot_user_id.clone();
-        let last_thread_ts = self.last_thread_ts.clone();
 
         self.ws_handle = Some(tokio::spawn(socket_mode_loop(
             api,
@@ -170,7 +166,6 @@ impl ChannelPlugin for SlackPlugin {
             shutdown_rx,
             allowed,
             bot_user_id,
-            last_thread_ts,
         )));
 
         self.status = PluginStatus::Running;
@@ -190,7 +185,6 @@ impl ChannelPlugin for SlackPlugin {
 
         self.api = None;
         self.callbacks = None;
-        self.last_thread_ts.clear();
         self.status = PluginStatus::Stopped;
         info!("Slack plugin stopped");
         Ok(())
@@ -203,13 +197,17 @@ impl ChannelPlugin for SlackPlugin {
             .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
 
         let text = truncate_message(message.text.as_deref().unwrap_or(""), SLACK_MESSAGE_LIMIT);
+        let (channel, session_thread) = decode_session_chat_id(chat_id);
+        // Prefer explicit reply_to, else thread root embedded in session chat_id
+        // (Hermes-style: every conversation lives inside a Slack thread).
         let thread_ts = message
             .reply_to_message_id
-            .clone()
-            .or_else(|| self.last_thread_ts.get(chat_id).map(|v| v.clone()));
+            .as_deref()
+            .or(session_thread)
+            .map(str::to_owned);
 
         let req = ChatPostMessageRequest {
-            channel: chat_id,
+            channel,
             text: &text,
             thread_ts: thread_ts.as_deref(),
             mrkdwn: Some(true),
@@ -230,8 +228,9 @@ impl ChannelPlugin for SlackPlugin {
             .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
 
         let text = truncate_message(message.text.as_deref().unwrap_or(""), SLACK_MESSAGE_LIMIT);
+        let (channel, _) = decode_session_chat_id(chat_id);
         let req = ChatUpdateRequest {
-            channel: chat_id,
+            channel,
             ts: message_id,
             text: &text,
         };
@@ -269,7 +268,6 @@ async fn socket_mode_loop(
     mut shutdown_rx: watch::Receiver<bool>,
     allowed: HashSet<String>,
     bot_user_id: String,
-    last_thread_ts: Arc<DashMap<String, String>>,
 ) {
     let mut consecutive_errors: u32 = 0;
 
@@ -279,15 +277,7 @@ async fn socket_mode_loop(
             break;
         }
 
-        match connect_and_listen(
-            &api,
-            &message_tx,
-            &mut shutdown_rx,
-            &allowed,
-            &bot_user_id,
-            &last_thread_ts,
-        )
-        .await
+        match connect_and_listen(&api, &message_tx, &mut shutdown_rx, &allowed, &bot_user_id).await
         {
             Ok(()) => {
                 consecutive_errors = 0;
@@ -327,7 +317,6 @@ async fn connect_and_listen(
     shutdown_rx: &mut watch::Receiver<bool>,
     allowed: &HashSet<String>,
     bot_user_id: &str,
-    last_thread_ts: &DashMap<String, String>,
 ) -> Result<(), ChannelError> {
     use tokio_tungstenite::connect_async_tls_with_config;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -355,14 +344,7 @@ async fn connect_and_listen(
             frame = read.next() => {
                 match frame {
                     Some(Ok(WsMessage::Text(text))) => {
-                        handle_socket_text(
-                            &text,
-                            &mut write,
-                            message_tx,
-                            allowed,
-                            bot_user_id,
-                            last_thread_ts,
-                        ).await;
+                        handle_socket_text(&text, &mut write, message_tx, allowed, bot_user_id).await;
                     }
                     Some(Ok(WsMessage::Ping(payload))) => {
                         let _ = write.send(WsMessage::Pong(payload)).await;
@@ -393,7 +375,6 @@ async fn handle_socket_text<S>(
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     allowed: &HashSet<String>,
     bot_user_id: &str,
-    last_thread_ts: &DashMap<String, String>,
 ) where
     S: SinkExt<tokio_tungstenite::tungstenite::Message> + Unpin,
     S::Error: std::fmt::Display,
@@ -436,7 +417,7 @@ async fn handle_socket_text<S>(
                 }
             };
             if let Some(event) = payload.event {
-                handle_slack_event(event, message_tx, allowed, bot_user_id, last_thread_ts).await;
+                handle_slack_event(event, message_tx, allowed, bot_user_id).await;
             } else {
                 warn!("Slack events_api payload missing event");
             }
@@ -452,7 +433,6 @@ async fn handle_slack_event(
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     allowed: &HashSet<String>,
     bot_user_id: &str,
-    last_thread_ts: &DashMap<String, String>,
 ) {
     let decision = classify_event(&event, bot_user_id, allowed);
     info!(
@@ -462,6 +442,7 @@ async fn handle_slack_event(
         subtype = ?event.subtype,
         user = ?event.user,
         bot_id = ?event.bot_id,
+        thread_ts = ?event.thread_ts,
         text_len = event.text.as_ref().map(|t| t.len()).unwrap_or(0),
         ?decision,
         "Slack event received"
@@ -496,17 +477,22 @@ async fn handle_slack_event(
         strip_bot_mention(&raw_text, bot_user_id)
     };
 
-    // Thread root for outbound replies: existing thread or this message.
-    let thread_root = event.thread_ts.clone().unwrap_or_else(|| ts.clone());
-    if !is_dm_event(&event) {
-        last_thread_ts.insert(channel.clone(), thread_root);
-    }
+    // Hermes-style: top-level msg opens a new thread session (root = this ts);
+    // replies inside a thread continue that session (root = thread_ts).
+    let thread_root = match thread_root_for_event(&event) {
+        Some(root) => root,
+        None => {
+            warn!(channel = %channel, "Slack event missing ts/thread_ts");
+            return;
+        }
+    };
+    let session_chat_id = encode_session_chat_id(&channel, &thread_root);
 
     let unified = UnifiedIncomingMessage {
         owner_user_id: None,
         id: ts,
         platform: PluginType::Slack,
-        chat_id: channel.clone(),
+        chat_id: session_chat_id.clone(),
         user: UnifiedUser {
             id: user_id.clone(),
             username: None,
@@ -523,7 +509,8 @@ async fn handle_slack_event(
             attachments: None,
         },
         timestamp: chrono_now(),
-        reply_to_message_id: event.thread_ts,
+        // Keep thread root so outbound path can still prefer explicit reply_to
+        reply_to_message_id: Some(thread_root.clone()),
         action: None,
         raw: None,
     };
@@ -532,7 +519,13 @@ async fn handle_slack_event(
         error!("Slack message channel closed; orchestrator not receiving events");
         return;
     }
-    info!(channel = %channel, user = %user_id, "Slack message forwarded to channel pipeline");
+    info!(
+        channel = %channel,
+        thread_root = %thread_root,
+        session_chat_id = %session_chat_id,
+        user = %user_id,
+        "Slack message forwarded to channel pipeline"
+    );
 }
 
 // ---------------------------------------------------------------------------
