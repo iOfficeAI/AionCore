@@ -158,10 +158,7 @@ impl TeamEventEmitter {
             active_turn_id = ?payload.slot_work.active_turn_id,
             "team websocket event emitted"
         );
-        let event = WebSocketMessage::new(
-            TEAM_SLOT_WORK_CHANGED_EVENT,
-            serde_json::to_value(payload).expect("serialize team slot work payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_SLOT_WORK_CHANGED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -426,6 +423,7 @@ mod tests {
         let events = bc.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "team.slotWorkChanged");
+        assert_eq!(events[0].data["user_id"], "user-1");
 
         let payload: aionui_api_types::TeamSlotWorkChangedPayload =
             serde_json::from_value(events[0].data.clone()).unwrap();
@@ -433,6 +431,32 @@ mod tests {
         assert_eq!(payload.slot_work.slot_id, "lead-1");
         assert_eq!(payload.slot_work.state, aionui_api_types::TeamSlotWorkState::Idle);
         assert_eq!(payload.slot_work.active_turn_id, None);
+    }
+
+    #[test]
+    fn slot_work_changed_event_is_routable_to_owning_user() {
+        let (emitter, bc) = make_emitter();
+        emitter.broadcast_slot_work(aionui_api_types::TeamSlotWorkChangedPayload {
+            team_id: "team-1".into(),
+            slot_work: aionui_api_types::TeamSlotWorkPayload {
+                slot_id: "lead-1".into(),
+                role: aionui_api_types::TeamRunTargetRole::Lead,
+                state: aionui_api_types::TeamSlotWorkState::Running,
+                queued_foreground_count: 0,
+                queued_background_count: 0,
+                active_turn_id: Some("turn-1".into()),
+                active_turn_started_at_ms: Some(1),
+                active_turn_elapsed_ms: Some(2),
+                active_turn_slow: Some(false),
+                active_turn_slow_threshold_ms: Some(3),
+                blocked_reason: None,
+                team_run_id: Some("run-1".into()),
+            },
+        });
+
+        let events = bc.events();
+        let routed_user_id = events[0].data.get("user_id").and_then(Value::as_str);
+        assert_eq!(routed_user_id, Some("user-1"));
     }
 
     #[test]
