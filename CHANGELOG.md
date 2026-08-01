@@ -3,6 +3,11 @@
 ## [0.1.56](https://github.com/suoak/AionCore/compare/v0.1.55...v0.1.56) (2026-07-31)
 
 
+### Features
+
+* **skills:** add the built-in Lark CLI progressive-disclosure skill ([473b252](https://github.com/suoak/AionCore/commit/473b252af4987dde87ef8ea7aa2d4f901654d230))
+
+
 ### Bug Fixes
 
 * **ci:** normalize manual release tag input ([8f47633](https://github.com/suoak/AionCore/commit/8f47633dac734592539f8197abb3c63cb3ffb6b5))
