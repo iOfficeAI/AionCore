@@ -16,7 +16,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use aionui_ai_agent::{
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, agent_routes, remote_agent_routes,
 };
-use aionui_api_types::ErrorResponse;
+use aionui_api_types::{ErrorResponse, WebSocketMessage};
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
@@ -34,7 +34,7 @@ use aionui_file::file_routes;
 use aionui_mcp::mcp_routes;
 use aionui_office::{office_proxy_routes, office_routes};
 use aionui_project::project_routes;
-use aionui_realtime::{NoopMessageRouter, WsHandlerState, ws_upgrade_handler};
+use aionui_realtime::{NoopMessageRouter, WebSocketManager, WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
 use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
 use aionui_team::{TeamSessionService, team_routes};
@@ -50,6 +50,41 @@ use super::trace::with_access_log;
 pub struct RouterRuntime {
     pub client_pref_service: ClientPrefService,
     pub team_service: Arc<TeamSessionService>,
+}
+
+async fn forward_event_bus_to_websocket(
+    mut event_rx: tokio::sync::broadcast::Receiver<WebSocketMessage<serde_json::Value>>,
+    ws_manager: Arc<WebSocketManager>,
+) {
+    loop {
+        let event = match event_rx.recv().await {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    skipped,
+                    "websocket event bus bridge lagged; skipped stale events and will continue"
+                );
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        };
+
+        if let Some(user_id) = event
+            .data
+            .get("user_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+        {
+            ws_manager.broadcast_to_user(&user_id, event);
+        } else if is_global_websocket_event(&event.name) {
+            ws_manager.broadcast_all(event);
+        } else {
+            tracing::warn!(
+                event_name = %event.name,
+                "dropping websocket event without user_id; add user_id to payload or whitelist explicit global event"
+            );
+        }
+    }
 }
 
 /// Create the application router with all routes and global middleware.
@@ -71,27 +106,9 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
 
     // Bridge event bus → WebSocket manager: forward all broadcast events
     // to connected WebSocket clients.
-    let mut event_rx = services.event_bus.subscribe();
+    let event_rx = services.event_bus.subscribe();
     let ws_manager = services.ws_manager.clone();
-    tokio::spawn(async move {
-        while let Ok(event) = event_rx.recv().await {
-            if let Some(user_id) = event
-                .data
-                .get("user_id")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
-            {
-                ws_manager.broadcast_to_user(&user_id, event);
-            } else if is_global_websocket_event(&event.name) {
-                ws_manager.broadcast_all(event);
-            } else {
-                tracing::warn!(
-                    event_name = %event.name,
-                    "dropping websocket event without user_id; add user_id to payload or whitelist explicit global event"
-                );
-            }
-        }
-    });
+    tokio::spawn(forward_event_bus_to_websocket(event_rx, ws_manager));
 
     let (states, channel_components) = build_module_states(services).await?;
     let client_pref_service = states.system.client_pref_service.clone();
@@ -563,9 +580,17 @@ fn boundary_error_for_status(status: StatusCode) -> Option<(&'static str, &'stat
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
+    use std::sync::Arc;
 
-    use super::{boundary_error_for_status, create_router_with_runtime, is_global_websocket_event};
+    use aionui_api_types::WebSocketMessage;
+    use aionui_realtime::{BroadcastEventBus, EventBroadcaster, WebSocketManager, WsOutbound};
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    use super::{
+        boundary_error_for_status, create_router_with_runtime, forward_event_bus_to_websocket,
+        is_global_websocket_event,
+    };
     use crate::config::AppConfig;
     use crate::services::AppServices;
 
@@ -608,5 +633,46 @@ mod tests {
         let (_router, _runtime) = create_router_with_runtime(&services)
             .await
             .expect("router runtime should build");
+    }
+
+    #[tokio::test]
+    async fn websocket_event_bridge_continues_after_receiver_lag() {
+        let event_bus = BroadcastEventBus::new(2);
+        let event_rx = event_bus.subscribe();
+        let ws_manager = Arc::new(WebSocketManager::new());
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel(8);
+        ws_manager.add_client_for_user("user-a".into(), "token".into(), outbound_tx);
+
+        for sequence in 1..=3 {
+            event_bus.broadcast(WebSocketMessage::new(
+                "test.beforeLag",
+                json!({"user_id": "user-a", "sequence": sequence}),
+            ));
+        }
+
+        let bridge = tokio::spawn(forward_event_bus_to_websocket(event_rx, ws_manager));
+        event_bus.broadcast(WebSocketMessage::new(
+            "test.afterLag",
+            json!({"user_id": "user-a", "sequence": 4}),
+        ));
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match outbound_rx.recv().await {
+                    Some(WsOutbound::Text(text)) => {
+                        let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if event["name"] == "test.afterLag" {
+                            break event;
+                        }
+                    }
+                    other => panic!("expected a text websocket event, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the bridge should deliver events after recovering from lag");
+
+        assert_eq!(delivered["data"]["sequence"], 4);
+        bridge.abort();
     }
 }
