@@ -21,8 +21,8 @@ use crate::types::{
 
 use super::api::SlackApi;
 use super::types::{
-    ChatPostMessageRequest, ChatUpdateRequest, EventsApiPayload, SocketEnvelope, SlackEvent, is_dm_event,
-    parse_allowed_channels, should_accept_event, strip_bot_mention,
+    AcceptDecision, ChatPostMessageRequest, ChatUpdateRequest, EventsApiPayload, SocketEnvelope, SlackEvent,
+    classify_event, is_dm_event, parse_allowed_channels, strip_bot_mention,
 };
 
 /// Slack Bot plugin (Socket Mode).
@@ -418,13 +418,14 @@ async fn handle_socket_text<S>(
 
     match envelope.envelope_type.as_str() {
         "hello" => {
-            debug!("Slack Socket Mode hello");
+            info!("Slack Socket Mode hello (connection ready for events)");
         }
         "disconnect" => {
             warn!(reason = ?envelope.reason, "Slack Socket Mode disconnect requested");
         }
         "events_api" => {
             let Some(payload_val) = envelope.payload else {
+                warn!("Slack events_api envelope missing payload");
                 return;
             };
             let payload: EventsApiPayload = match serde_json::from_value(payload_val) {
@@ -436,10 +437,12 @@ async fn handle_socket_text<S>(
             };
             if let Some(event) = payload.event {
                 handle_slack_event(event, message_tx, allowed, bot_user_id, last_thread_ts).await;
+            } else {
+                warn!("Slack events_api payload missing event");
             }
         }
         other => {
-            debug!(envelope_type = other, "Ignoring Slack Socket Mode envelope");
+            info!(envelope_type = other, "Slack Socket Mode envelope (ignored)");
         }
     }
 }
@@ -451,17 +454,39 @@ async fn handle_slack_event(
     bot_user_id: &str,
     last_thread_ts: &DashMap<String, String>,
 ) {
-    if !should_accept_event(&event, bot_user_id, allowed) {
+    let decision = classify_event(&event, bot_user_id, allowed);
+    info!(
+        event_type = %event.event_type,
+        channel = ?event.channel,
+        channel_type = ?event.channel_type,
+        subtype = ?event.subtype,
+        user = ?event.user,
+        bot_id = ?event.bot_id,
+        text_len = event.text.as_ref().map(|t| t.len()).unwrap_or(0),
+        ?decision,
+        "Slack event received"
+    );
+
+    if !matches!(
+        decision,
+        AcceptDecision::AcceptDm | AcceptDecision::AcceptMention
+    ) {
         return;
     }
 
     let channel = match event.channel.as_deref() {
         Some(c) if !c.is_empty() => c.to_string(),
-        _ => return,
+        _ => {
+            warn!("Slack accepted event missing channel");
+            return;
+        }
     };
     let user_id = match event.user.as_deref() {
         Some(u) if !u.is_empty() => u.to_string(),
-        _ => return,
+        _ => {
+            warn!(channel = %channel, "Slack accepted event missing user");
+            return;
+        }
     };
     let ts = event.ts.clone().unwrap_or_else(|| chrono_now().to_string());
     let raw_text = event.text.clone().unwrap_or_default();
@@ -481,9 +506,9 @@ async fn handle_slack_event(
         owner_user_id: None,
         id: ts,
         platform: PluginType::Slack,
-        chat_id: channel,
+        chat_id: channel.clone(),
         user: UnifiedUser {
-            id: user_id,
+            id: user_id.clone(),
             username: None,
             display_name: event.user.clone().unwrap_or_default(),
             avatar_url: None,
@@ -503,7 +528,11 @@ async fn handle_slack_event(
         raw: None,
     };
 
-    let _ = message_tx.send(unified).await;
+    if message_tx.send(unified).await.is_err() {
+        error!("Slack message channel closed; orchestrator not receiving events");
+        return;
+    }
+    info!(channel = %channel, user = %user_id, "Slack message forwarded to channel pipeline");
 }
 
 // ---------------------------------------------------------------------------

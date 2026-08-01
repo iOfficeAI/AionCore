@@ -142,53 +142,82 @@ pub(crate) fn strip_bot_mention(text: &str, bot_user_id: &str) -> String {
     text.replace(&token, "").trim().to_string()
 }
 
+/// Why an event was accepted or dropped (for diagnostics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcceptDecision {
+    AcceptDm,
+    AcceptMention,
+    DropBotMessage,
+    DropSubtype,
+    DropEventType,
+    DropNotAllowlisted,
+    DropNoMention,
+    DropNoChannel,
+}
+
 /// Decide whether an inbound event should be processed by the agent.
 ///
 /// Policy:
 /// - Always accept 1:1 DMs.
 /// - Channels/groups: only if `channel` is in `allowed` **and** the bot is @mentioned
 ///   (or the event is `app_mention`). Empty allowlist → drop all non-DMs.
-pub(crate) fn should_accept_event(
+pub(crate) fn classify_event(
     event: &SlackEvent,
     bot_user_id: &str,
     allowed: &std::collections::HashSet<String>,
-) -> bool {
+) -> AcceptDecision {
     // Ignore bot-authored / system noise
     if event.bot_id.is_some() {
-        return false;
+        return AcceptDecision::DropBotMessage;
     }
     if let Some(sub) = event.subtype.as_deref() {
         // message_changed, message_deleted, bot_message, channel_join, etc.
         if sub != "file_share" && sub != "me_message" {
-            return false;
+            return AcceptDecision::DropSubtype;
         }
     }
 
     let is_app_mention = event.event_type == "app_mention";
     let is_message = event.event_type == "message";
     if !is_app_mention && !is_message {
-        return false;
+        return AcceptDecision::DropEventType;
     }
 
     if is_dm_event(event) {
-        return true;
+        return AcceptDecision::AcceptDm;
     }
 
     let channel = match event.channel.as_deref() {
         Some(c) if !c.is_empty() => c,
-        _ => return false,
+        _ => return AcceptDecision::DropNoChannel,
     };
 
     if !allowed.contains(channel) {
-        return false;
+        return AcceptDecision::DropNotAllowlisted;
     }
 
     if is_app_mention {
-        return true;
+        return AcceptDecision::AcceptMention;
     }
 
     let text = event.text.as_deref().unwrap_or("");
-    text_mentions_bot(text, bot_user_id)
+    if text_mentions_bot(text, bot_user_id) {
+        AcceptDecision::AcceptMention
+    } else {
+        AcceptDecision::DropNoMention
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn should_accept_event(
+    event: &SlackEvent,
+    bot_user_id: &str,
+    allowed: &std::collections::HashSet<String>,
+) -> bool {
+    matches!(
+        classify_event(event, bot_user_id, allowed),
+        AcceptDecision::AcceptDm | AcceptDecision::AcceptMention
+    )
 }
 
 #[cfg(test)]
@@ -229,23 +258,35 @@ mod tests {
     fn channel_dropped_when_not_allowlisted() {
         let allowed = parse_allowed_channels(Some("C_OTHER"));
         let event = msg("C_MAIN", "channel", "<@U_BOT> hi");
-        assert!(!should_accept_event(&event, "U_BOT", &allowed));
+        assert_eq!(
+            classify_event(&event, "U_BOT", &allowed),
+            AcceptDecision::DropNotAllowlisted
+        );
     }
 
     #[test]
     fn channel_needs_mention_even_when_allowlisted() {
         let allowed = parse_allowed_channels(Some("C_MAIN"));
         let plain = msg("C_MAIN", "channel", "hi everyone");
-        assert!(!should_accept_event(&plain, "U_BOT", &allowed));
+        assert_eq!(
+            classify_event(&plain, "U_BOT", &allowed),
+            AcceptDecision::DropNoMention
+        );
         let mentioned = msg("C_MAIN", "channel", "<@U_BOT> hi");
-        assert!(should_accept_event(&mentioned, "U_BOT", &allowed));
+        assert_eq!(
+            classify_event(&mentioned, "U_BOT", &allowed),
+            AcceptDecision::AcceptMention
+        );
     }
 
     #[test]
     fn empty_allowlist_blocks_channels() {
         let allowed = parse_allowed_channels(None);
         let event = msg("C_MAIN", "channel", "<@U_BOT> hi");
-        assert!(!should_accept_event(&event, "U_BOT", &allowed));
+        assert_eq!(
+            classify_event(&event, "U_BOT", &allowed),
+            AcceptDecision::DropNotAllowlisted
+        );
     }
 
     #[test]
@@ -253,7 +294,10 @@ mod tests {
         let allowed = parse_allowed_channels(Some("C_MAIN"));
         let mut event = msg("C_MAIN", "channel", "hi");
         event.event_type = "app_mention".into();
-        assert!(should_accept_event(&event, "U_BOT", &allowed));
+        assert_eq!(
+            classify_event(&event, "U_BOT", &allowed),
+            AcceptDecision::AcceptMention
+        );
     }
 
     #[test]
@@ -261,7 +305,21 @@ mod tests {
         let allowed = parse_allowed_channels(Some("C_MAIN"));
         let mut event = msg("C_MAIN", "channel", "<@U_BOT> hi");
         event.bot_id = Some("B123".into());
-        assert!(!should_accept_event(&event, "U_BOT", &allowed));
+        assert_eq!(
+            classify_event(&event, "U_BOT", &allowed),
+            AcceptDecision::DropBotMessage
+        );
+    }
+
+    #[test]
+    fn dm_without_channel_type_still_accepted() {
+        let allowed = std::collections::HashSet::new();
+        let mut event = msg("D999", "channel", "hello");
+        event.channel_type = None;
+        assert_eq!(
+            classify_event(&event, "U_BOT", &allowed),
+            AcceptDecision::AcceptDm
+        );
     }
 
     #[test]
