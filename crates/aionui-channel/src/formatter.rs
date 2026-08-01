@@ -139,18 +139,14 @@ fn markdown_to_slack_mrkdwn(text: &str) -> String {
     // temporarily protecting them.
     let mut links: Vec<String> = Vec::new();
     let s = {
-        static RE_SLACK_LINK: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"<(https?://[^|>]+)\|([^>]+)>").unwrap());
+        static RE_SLACK_LINK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<(https?://[^|>]+)\|([^>]+)>").unwrap());
         RE_SLACK_LINK.replace_all(&s, |caps: &regex::Captures| {
             let idx = links.len();
             links.push(caps[0].to_owned());
             format!("\u{E000}LINK{idx}\u{E001}")
         })
     };
-    let s = s
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
+    let s = s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
 
     // Restore protected segments (reverse order of replacement).
     let mut out = s;

@@ -121,11 +121,7 @@ pub(crate) fn parse_allowed_channels(raw: Option<&str>) -> std::collections::Has
 
 /// Whether this event is a 1:1 DM (`im`).
 pub(crate) fn is_dm_event(event: &SlackEvent) -> bool {
-    matches!(event.channel_type.as_deref(), Some("im"))
-        || event
-            .channel
-            .as_deref()
-            .is_some_and(|c| c.starts_with('D'))
+    matches!(event.channel_type.as_deref(), Some("im")) || event.channel.as_deref().is_some_and(|c| c.starts_with('D'))
 }
 
 /// Hermes-style session key: each Slack thread is its own conversation.
@@ -144,9 +140,7 @@ pub(crate) fn encode_session_chat_id(channel: &str, thread_root: &str) -> String
 /// Bare channel ids (legacy) decode as `(channel, None)`.
 pub(crate) fn decode_session_chat_id(chat_id: &str) -> (&str, Option<&str>) {
     match chat_id.split_once(':') {
-        Some((channel, thread_ts)) if !channel.is_empty() && !thread_ts.is_empty() => {
-            (channel, Some(thread_ts))
-        }
+        Some((channel, thread_ts)) if !channel.is_empty() && !thread_ts.is_empty() => (channel, Some(thread_ts)),
         _ => (chat_id, None),
     }
 }
@@ -300,10 +294,7 @@ mod tests {
     fn channel_needs_mention_even_when_allowlisted() {
         let allowed = parse_allowed_channels(Some("C_MAIN"));
         let plain = msg("C_MAIN", "channel", "hi everyone");
-        assert_eq!(
-            classify_event(&plain, "U_BOT", &allowed),
-            AcceptDecision::DropNoMention
-        );
+        assert_eq!(classify_event(&plain, "U_BOT", &allowed), AcceptDecision::DropNoMention);
         let mentioned = msg("C_MAIN", "channel", "<@U_BOT> hi");
         assert_eq!(
             classify_event(&mentioned, "U_BOT", &allowed),
@@ -326,10 +317,7 @@ mod tests {
         let allowed = parse_allowed_channels(Some("C_MAIN"));
         let mut event = msg("C_MAIN", "channel", "hi");
         event.event_type = "app_mention".into();
-        assert_eq!(
-            classify_event(&event, "U_BOT", &allowed),
-            AcceptDecision::AcceptMention
-        );
+        assert_eq!(classify_event(&event, "U_BOT", &allowed), AcceptDecision::AcceptMention);
     }
 
     #[test]
@@ -348,10 +336,7 @@ mod tests {
         let allowed = std::collections::HashSet::new();
         let mut event = msg("D999", "channel", "hello");
         event.channel_type = None;
-        assert_eq!(
-            classify_event(&event, "U_BOT", &allowed),
-            AcceptDecision::AcceptDm
-        );
+        assert_eq!(classify_event(&event, "U_BOT", &allowed), AcceptDecision::AcceptDm);
     }
 
     #[test]

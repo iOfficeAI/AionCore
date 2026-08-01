@@ -737,18 +737,8 @@ mod tests {
 
     #[test]
     fn conv_name_slack_composite_chat_id_includes_thread() {
-        let a = channel_conversation_name(
-            PluginType::Slack,
-            "aionrs",
-            None,
-            Some("D0BKLLCM:1710000000.000100"),
-        );
-        let b = channel_conversation_name(
-            PluginType::Slack,
-            "aionrs",
-            None,
-            Some("D0BKLLCM:1710000000.000200"),
-        );
+        let a = channel_conversation_name(PluginType::Slack, "aionrs", None, Some("D0BKLLCM:1710000000.000100"));
+        let b = channel_conversation_name(PluginType::Slack, "aionrs", None, Some("D0BKLLCM:1710000000.000200"));
         assert_eq!(a, "slack-aionrs-D0BKLLCM-00000100");
         assert_eq!(b, "slack-aionrs-D0BKLLCM-00000200");
         assert_ne!(a, b);

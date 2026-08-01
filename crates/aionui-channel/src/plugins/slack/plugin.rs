@@ -20,7 +20,7 @@ use crate::types::{
 
 use super::api::SlackApi;
 use super::types::{
-    AcceptDecision, ChatPostMessageRequest, ChatUpdateRequest, EventsApiPayload, SocketEnvelope, SlackEvent,
+    AcceptDecision, ChatPostMessageRequest, ChatUpdateRequest, EventsApiPayload, SlackEvent, SocketEnvelope,
     classify_event, decode_session_chat_id, encode_session_chat_id, is_dm_event, parse_allowed_channels,
     strip_bot_mention, thread_root_for_event,
 };
@@ -277,8 +277,7 @@ async fn socket_mode_loop(
             break;
         }
 
-        match connect_and_listen(&api, &message_tx, &mut shutdown_rx, &allowed, &bot_user_id).await
-        {
+        match connect_and_listen(&api, &message_tx, &mut shutdown_rx, &allowed, &bot_user_id).await {
             Ok(()) => {
                 consecutive_errors = 0;
                 if *shutdown_rx.borrow() {
@@ -448,10 +447,7 @@ async fn handle_slack_event(
         "Slack event received"
     );
 
-    if !matches!(
-        decision,
-        AcceptDecision::AcceptDm | AcceptDecision::AcceptMention
-    ) {
+    if !matches!(decision, AcceptDecision::AcceptDm | AcceptDecision::AcceptMention) {
         return;
     }
 
