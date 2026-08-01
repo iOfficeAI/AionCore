@@ -37,6 +37,9 @@ pub const LARK_MESSAGE_LIMIT: usize = 4000;
 /// Maximum characters per DingTalk message.
 pub const DINGTALK_MESSAGE_LIMIT: usize = 4000;
 
+/// Maximum characters per Slack message (practical chunk; API allows more).
+pub const SLACK_MESSAGE_LIMIT: usize = 4000;
+
 // ---------------------------------------------------------------------------
 // Reconnection (Telegram long-polling)
 // ---------------------------------------------------------------------------
@@ -63,6 +66,16 @@ pub const DINGTALK_MAX_RECONNECT_ATTEMPTS: u32 = 10;
 
 /// Maximum delay between DingTalk reconnection attempts (exponential backoff cap).
 pub const DINGTALK_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+
+// ---------------------------------------------------------------------------
+// Slack
+// ---------------------------------------------------------------------------
+
+/// Maximum reconnection attempts for Slack Socket Mode.
+pub const SLACK_MAX_RECONNECT_ATTEMPTS: u32 = 10;
+
+/// Maximum delay between Slack Socket Mode reconnection attempts.
+pub const SLACK_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 
 /// DingTalk access token TTL refresh margin (5 minutes before expiry).
 /// Used by `DingtalkApi` for proactive token refresh.

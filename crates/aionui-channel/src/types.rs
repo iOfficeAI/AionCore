@@ -158,12 +158,13 @@ impl PairingStatus {
 /// - Lark: `app_id` + `app_secret` + optional `encrypt_key`/`verification_token`
 /// - DingTalk: `client_id` + `client_secret`
 /// - WeChat: `account_id` + `bot_token`
+/// - Slack: `token` (bot `xoxb-`) + `app_token` (app-level `xapp-` for Socket Mode)
 ///
 /// Remaining fields are captured in `extra` for extensibility
 /// (API Spec `[key: string]: unknown`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PluginCredentials {
-    // Telegram
+    // Telegram / Slack bot token
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 
@@ -189,6 +190,10 @@ pub struct PluginCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_token: Option<String>,
 
+    // Slack Socket Mode app-level token (`xapp-…`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_token: Option<String>,
+
     // Extensibility
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -210,6 +215,7 @@ impl PluginCredentials {
             && self.client_secret.is_none()
             && self.account_id.is_none()
             && self.bot_token.is_none()
+            && self.app_token.is_none()
             && self.extra.is_empty()
     }
 }
@@ -228,6 +234,11 @@ pub struct PluginConfigOptions {
     pub rate_limit: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub require_mention: Option<bool>,
+    /// Comma-separated Slack conversation IDs (`C…`/`G…`/`D…`) the bot may
+    /// process outside of 1:1 DMs. Empty / absent → channels and groups are
+    /// ignored (DM-only). Mentions are still required inside listed channels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_channels: Option<String>,
 
     // Extensibility
     #[serde(flatten)]
@@ -605,6 +616,7 @@ mod tests {
             client_secret: None,
             account_id: None,
             bot_token: None,
+            app_token: None,
             extra: HashMap::new(),
         };
         let json = serde_json::to_value(&creds).unwrap();
@@ -625,6 +637,7 @@ mod tests {
             client_secret: None,
             account_id: None,
             bot_token: None,
+            app_token: None,
             extra: HashMap::new(),
         };
         let json = serde_json::to_value(&creds).unwrap();
@@ -1030,6 +1043,7 @@ mod tests {
                 client_secret: None,
                 account_id: None,
                 bot_token: None,
+                app_token: None,
                 extra: HashMap::new(),
             },
             config: Some(PluginConfigOptions {
@@ -1037,6 +1051,7 @@ mod tests {
                 webhook_url: None,
                 rate_limit: Some(5),
                 require_mention: None,
+                allowed_channels: None,
                 extra: HashMap::new(),
             }),
         };
