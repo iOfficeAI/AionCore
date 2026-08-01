@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::FileError;
+use crate::path_safety::strip_verbatim_prefix;
 use aionui_api_types::{BrowseDirectoryResponse, BrowseEntry};
 
 /// Sentinel returned as `parent_path` on Windows drive roots, signaling the
@@ -151,16 +152,6 @@ pub fn resolve_browse_path(raw: &str, allowed_roots: &[PathBuf]) -> Result<PathB
 /// Internal sandbox comparisons keep using the canonical (verbatim) form.
 fn to_response_path(path: &Path) -> String {
     strip_verbatim_prefix(&path.to_string_lossy())
-}
-
-fn strip_verbatim_prefix(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
-        rest.to_owned()
-    } else {
-        path.to_owned()
-    }
 }
 
 fn expand_tilde(input: &str) -> PathBuf {
@@ -493,30 +484,8 @@ mod tests {
         );
     }
 
-    // Regression tests for iOfficeAI/AionUi#3191: responses must never carry
-    // Windows extended-length (verbatim) prefixes.
-
-    #[test]
-    fn strips_verbatim_disk_prefix() {
-        assert_eq!(strip_verbatim_prefix(r"\\?\C:\DEV\project"), r"C:\DEV\project");
-        assert_eq!(strip_verbatim_prefix(r"\\?\C:\"), r"C:\");
-    }
-
-    #[test]
-    fn strips_verbatim_unc_prefix() {
-        assert_eq!(
-            strip_verbatim_prefix(r"\\?\UNC\server\share\dir"),
-            r"\\server\share\dir"
-        );
-    }
-
-    #[test]
-    fn leaves_non_verbatim_paths_untouched() {
-        assert_eq!(strip_verbatim_prefix(r"C:\DEV\project"), r"C:\DEV\project");
-        assert_eq!(strip_verbatim_prefix(r"\\server\share"), r"\\server\share");
-        assert_eq!(strip_verbatim_prefix("/home/user/project"), "/home/user/project");
-        assert_eq!(strip_verbatim_prefix(""), "");
-    }
+    // Pure `strip_verbatim_prefix` unit tests live in `path_safety` (its new
+    // home). Below is the browse-specific end-to-end assertion.
 
     /// End-to-end assertion on Windows: `fs::canonicalize` produces verbatim
     /// paths there, and every path in the response must come out clean.

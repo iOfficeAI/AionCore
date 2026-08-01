@@ -69,8 +69,8 @@ pub use event::UsageBreakdown;
 pub use event::{
     CancelReason, CheckpointEntry, EventClass, ExitStatusLite, FinalizedMessage, ItemKind, NoticeLevel, Outcome,
     PermissionKind, PersistTier, PlanEntry, PlanPriority, PlanStatus, ProvisioningPhase, SessionEvent, StopReason,
-    SubagentKind, SubagentStatus, ToolResultContent, TruncationInfo, TruncationKind, TurnOutcome, classify,
-    persist_tier,
+    SubagentKind, SubagentStatus, SubagentTaskKind, ToolResultContent, TruncationInfo, TruncationKind, TurnOutcome,
+    classify, persist_tier,
 };
 pub use reducer::{Transition, crash_outcome, step};
 pub use state::{

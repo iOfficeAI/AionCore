@@ -560,17 +560,35 @@ impl SessionAgentTask {
         };
         let backend = self.backend.clone();
         let request_id = call_id.to_string();
+        let conv_id = self.conversation_id.clone();
         // dispatch is async; confirm() is sync in IAgentTask's sibling API, so
-        // fire-and-forget on the runtime (the answer rides the stdin FIFO).
+        // fire-and-forget on the runtime (the answer rides the stdin FIFO). The
+        // REST confirm has already returned success by the time this runs, so a
+        // dispatch failure here is INVISIBLE to the caller — it MUST be surfaced
+        // in the log or a wedged permission (claude blocked forever on
+        // can_use_tool) is undiagnosable in production.
         tokio::spawn(async move {
-            let _ = backend
+            match backend
                 .dispatch(Command::AnswerPermission {
-                    request_id,
+                    request_id: request_id.clone(),
                     decision,
                     selected,
                     answers: Vec::new(),
                 })
-                .await;
+                .await
+            {
+                Ok(_) => tracing::info!(
+                    conv_id = %conv_id,
+                    request_id = %request_id,
+                    "permission answer delivered to backend"
+                ),
+                Err(e) => tracing::error!(
+                    conv_id = %conv_id,
+                    request_id = %request_id,
+                    error = %e,
+                    "permission answer FAILED after REST confirm already returned success — claude stays blocked on can_use_tool"
+                ),
+            }
         });
         Ok(())
     }
@@ -1905,6 +1923,25 @@ fn spawn_event_pump(
         // would terminate the relay and drop the workflow's completion message, so
         // we suppress the intermediate Finish until this set drains.
         let mut workflow_inflight: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Is a suppressed launch Finish still OWED for the current turn? While true,
+        // the relay is held open on credit: the turn's real Finish was swallowed
+        // (branch below), betting on the 2.1.176 invariant that a terminal `result`
+        // follows natural workflow completion. The bet only pays on NATURAL
+        // completion — an interrupt kills the workflow with task frames and NO
+        // result frame (verified: samples/claude-cli/2.1.220/
+        // _all_workflow_interrupt.jsonl, scenario A), so the `Interrupted` drain
+        // below must settle the debt itself or the turn never drains and the 15s
+        // UserCancelTimeout watchdog force-kills a healthy session (ELECTRON-3RP).
+        // Settled by the drain, by a real (unsuppressed) terminal, or when the
+        // envelope `turn_gen` advances (see `last_seen_turn_gen`).
+        let mut finish_suppressed_pending = false;
+        // Did the pump already close the current turn with a synthetic Finish (the
+        // cancel-drain settlement below)? A real terminal `result` can still trail
+        // it in an interrupt-vs-natural-completion race; its Finish must then be
+        // swallowed — the relay/persistence contract is ONE Finish per turn.
+        // Reset when `turn_gen` advances: the trailing-result window is bounded by
+        // the turn itself, and the next turn's real Finish must NOT be eaten.
+        let mut synthetic_finish_emitted = false;
         // Remembered `tool_use_id` → tool name, learned from each `ToolCall` frame.
         // A tool's lifecycle emits SEVERAL frames sharing one call_id — the initial
         // ToolCall (name known), any codex `ToolOutputDelta` (name absent on the wire),
@@ -1937,11 +1974,45 @@ fn spawn_event_pump(
         // Detached AFTER the turn's result → absorbed (I10) — it must track this
         // itself. Without it, a Detached that trails a completed turn (idle-kill,
         // clean shutdown) would be misread as a mid-turn crash. Set on the terminal
-        // TurnResult, reset on the next TurnStarted.
+        // TurnResult, reset when `turn_gen` advances (new turn).
         let mut terminal_result_seen = false;
+        // The `turn_gen` of the last envelope processed. This — not `TurnStarted` —
+        // is the per-turn reset boundary that actually fires on EVERY backend:
+        // claude_conn never emits `TurnStarted` (only the codex/acp adapters
+        // synthesize it), but its reader stamps every envelope with the current
+        // turn_gen, bumping it per accepted Send and deliberately NOT bumping it
+        // for a mid-turn injection. A reset keyed only on the TurnStarted arm is
+        // therefore dead code on the claude stream: the swallow guard armed by a
+        // cancel-drain settlement in turn N leaked into turn N+1 and ate its real
+        // Finish, leaving the turn open forever (live: dev 2026-07-31, conv
+        // ee61bd05, turn_7c5c89fd stuck "processing" after workflow-cancel +
+        // follow-up message). Gen-advance also bounds the trailing-result swallow
+        // window precisely: a trailing result rides the OLD gen (FIFO stdout), the
+        // next turn's frames ride the new gen.
+        let mut last_seen_turn_gen: u64 = 0;
         while let Some(env) = events.next().await {
             runtime.touch();
             tracing::debug!(conv_id = %conversation_id, event = session_event_name(&env.event), "session-pump: backend event");
+
+            if env.turn_gen > last_seen_turn_gen {
+                if last_seen_turn_gen > 0 {
+                    tracing::debug!(
+                        conv_id = %conversation_id,
+                        from = last_seen_turn_gen,
+                        to = env.turn_gen,
+                        "session-pump: turn gen advanced; per-turn suppression state reset"
+                    );
+                }
+                last_seen_turn_gen = env.turn_gen;
+                runtime.set_status(ConversationStatus::Running);
+                terminal_result_seen = false;
+                // Per-turn workflow-suppression state must not leak across turns —
+                // same rationale as the TurnStarted arm below, which claude never
+                // reaches.
+                workflow_inflight.clear();
+                finish_suppressed_pending = false;
+                synthetic_finish_emitted = false;
+            }
 
             // Empty-turn diagnostic Tip to emit for THIS terminal, if the turn was a
             // clean blank reply. Computed in the terminal match arm below (while
@@ -2097,17 +2168,108 @@ fn spawn_event_pump(
             // Mirrors `state::background_active`: a ref is in-flight while its status
             // is non-terminal ({PendingInit, Running}); a terminal status
             // ({Interrupted, Completed, Errored, Shutdown}) removes it.
-            if let SessionEvent::SubagentUpdate { r#ref, status, .. } = &env.event {
-                use aionui_session::SubagentStatus;
+            if let SessionEvent::SubagentUpdate {
+                r#ref, status, kind, ..
+            } = &env.event
+            {
+                use aionui_session::{SubagentStatus, SubagentTaskKind};
                 match status {
                     SubagentStatus::PendingInit | SubagentStatus::Running => {
-                        workflow_inflight.insert(r#ref.clone());
+                        // Suppression-roster admission is WORKFLOW-ONLY. The multi-result
+                        // invariant this roster bets on (launch result suppressed, terminal
+                        // result follows completion) is proven ONLY for `local_workflow`
+                        // tasks. A background bash (`local_bash`) outlives its turn with NO
+                        // later terminal result, so admitting it wedges the turn until the
+                        // 15s watchdog (live 2026-07-30: user's `sleep 60 &` cancel hang).
+                        // `kind` rides only `task_started`; a kind-less `task_updated`
+                        // re-assert therefore can't insert — which also retires the
+                        // "task_updated re-inserts a dead ref" oscillation by construction.
+                        if matches!(kind, Some(SubagentTaskKind::WorkflowContainer)) {
+                            workflow_inflight.insert(r#ref.clone());
+                            tracing::debug!(
+                                conv_id = %conversation_id,
+                                subagent_ref = %r#ref,
+                                ?status,
+                                inflight = workflow_inflight.len(),
+                                "session-pump: workflow container in-flight"
+                            );
+                        }
                     }
-                    SubagentStatus::Interrupted
+                    terminal @ (SubagentStatus::Interrupted
                     | SubagentStatus::Completed
                     | SubagentStatus::Errored
-                    | SubagentStatus::Shutdown => {
+                    | SubagentStatus::Shutdown) => {
                         workflow_inflight.remove(r#ref);
+                        tracing::debug!(
+                            conv_id = %conversation_id,
+                            subagent_ref = %r#ref,
+                            status = ?terminal,
+                            inflight = workflow_inflight.len(),
+                            "session-pump: subagent terminal"
+                        );
+                        // The roster just drained while a launch Finish is owed: decide
+                        // how the turn ends by HOW the LAST ref drained.
+                        //  - `Completed`: keep waiting — after natural completion the
+                        //    CLI still sends the terminal `result` (fixture invariant:
+                        //    samples/claude-cli/2.1.176 + 2.1.220), and settling here
+                        //    would break the relay before the completion message lands.
+                        //  - `Interrupted`: the workflow was KILLED (user interrupt).
+                        //    No result frame ever follows (verified: samples/claude-cli/
+                        //    2.1.220/_all_workflow_interrupt.jsonl — a kill emits only
+                        //    task_updated{killed}+task_notification{stopped} per task),
+                        //    so the owed Finish must be paid NOW or the relay never
+                        //    breaks and `cancelling` never clears.
+                        //  - `Errored`/`Shutdown`: whether a result trails is UNSAMPLED;
+                        //    settle like `Interrupted` (a hung turn costs more than a
+                        //    raced double Finish, which the swallow guard below absorbs)
+                        //    and warn so a live capture can pin the real contract.
+                        // Keying on the LAST removal (not "any Interrupted seen") is
+                        // deliberate: a workflow that survives one killed child still
+                        // completes naturally, and its roster drains via `Completed`.
+                        if workflow_inflight.is_empty()
+                            && finish_suppressed_pending
+                            && !matches!(terminal, SubagentStatus::Completed)
+                        {
+                            if matches!(terminal, SubagentStatus::Interrupted) {
+                                tracing::info!(
+                                    conv_id = %conversation_id,
+                                    "session-pump: workflow interrupted while its launch Finish was suppressed; emitting the owed Finish (cancel drain)"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    conv_id = %conversation_id,
+                                    status = ?terminal,
+                                    "session-pump: workflow drained via unsampled terminal while its launch Finish was suppressed; settling to avoid a hung turn"
+                                );
+                            }
+                            finish_suppressed_pending = false;
+                            synthetic_finish_emitted = true;
+                            // The kill decided this turn: a later Detached is an
+                            // absorbed teardown, not a mid-turn crash (see
+                            // `crash_outcome`).
+                            terminal_result_seen = true;
+                            // Same per-turn closure the real terminal arm performs:
+                            // close every tool call left open as Canceled BEFORE the
+                            // Finish (the relay stops forwarding the turn at Finish).
+                            for (call_id, name) in open_tools.drain() {
+                                let _ = runtime.tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                                    call_id,
+                                    name,
+                                    args: serde_json::Value::Null,
+                                    status: ToolCallStatus::Canceled,
+                                    input: None,
+                                    output: None,
+                                    description: None,
+                                }));
+                            }
+                            tool_output.clear();
+                            tool_name.clear();
+                            saw_visible_output = false;
+                            // Idempotent clean-converge shared with the watchdog kill
+                            // path: sets status Finished + broadcasts the Finish that
+                            // drives relay break → turn release → `cancelling` cleared.
+                            runtime.emit_finish_once();
+                        }
                     }
                 }
             }
@@ -2136,6 +2298,13 @@ fn spawn_event_pump(
                     runtime.set_status(ConversationStatus::Running);
                     // New turn: the prior turn's terminal no longer applies.
                     terminal_result_seen = false;
+                    // Per-turn workflow-suppression state must not leak across turns:
+                    // a stale in-flight ref (e.g. a `task_updated` re-insert racing a
+                    // cancelled workflow's teardown) would re-arm suppression and
+                    // swallow THIS turn's Finish. A new turn starts unsuppressed.
+                    workflow_inflight.clear();
+                    finish_suppressed_pending = false;
+                    synthetic_finish_emitted = false;
                 }
                 // Track the call's open/closed lifecycle. Also remember the name for
                 // `stamp_tool_name` — the map was previously never populated, so
@@ -2148,6 +2317,9 @@ fn spawn_event_pump(
                     open_tools.remove(tool_use_id);
                 }
                 SessionEvent::TurnResult { .. } | SessionEvent::Detached { .. } if !suppress_intermediate_finish => {
+                    // A real (unsuppressed) terminal settles any owed launch Finish —
+                    // its own Finish/Error closes the turn.
+                    finish_suppressed_pending = false;
                     runtime.set_status(ConversationStatus::Finished);
                     // Close every tool call the turn left open (cancel/crash/dropped
                     // result): emit a terminal `Canceled` frame per call so the
@@ -2236,6 +2408,19 @@ fn spawn_event_pump(
                 if event_is_user_visible_output(&ev) {
                     saw_visible_output = true;
                 }
+                // The pump already closed this turn with a synthetic Finish (cancel
+                // drain above); a real terminal trailing it in the interrupt-vs-
+                // completion race must not emit a SECOND Finish — and must not fire
+                // the empty-turn Tip below either (the relay already broke; per-turn
+                // output accumulators were reset at settlement, so the tip would be
+                // spurious).
+                if synthetic_finish_emitted && matches!(ev, AgentStreamEvent::Finish(_)) {
+                    tracing::info!(
+                        conv_id = %conversation_id,
+                        "session-pump: swallowing trailing real Finish after synthetic cancel-drain Finish"
+                    );
+                    continue;
+                }
                 // Emit the empty-turn diagnostic Tip immediately BEFORE the Finish it
                 // was computed for. It MUST precede Finish: the relay breaks the turn on
                 // Finish (stream_relay.rs), so a Tips sent afterwards would never be
@@ -2259,6 +2444,9 @@ fn spawn_event_pump(
                 // the relay (never forwarded to the WS), so it changes only bubble
                 // boundaries, not the wire contract.
                 if suppress_intermediate_finish && matches!(ev, AgentStreamEvent::Finish(_)) {
+                    // The turn now owes this Finish; the workflow drain (or a later
+                    // real terminal) must settle it — see `finish_suppressed_pending`.
+                    finish_suppressed_pending = true;
                     let _ = runtime.tx.send(AgentStreamEvent::SegmentBreak);
                     continue;
                 }
@@ -4844,9 +5032,13 @@ mod pump_tests {
     }
 
     fn env(event: SessionEvent) -> SessionEnvelope {
+        env_gen(1, event)
+    }
+
+    fn env_gen(turn_gen: u64, event: SessionEvent) -> SessionEnvelope {
         SessionEnvelope {
             session_id: "conv-1".into(),
-            turn_gen: 1,
+            turn_gen,
             event,
         }
     }
@@ -5383,12 +5575,14 @@ mod pump_tests {
                 input: serde_json::Value::Null,
                 parent_tool_use_id: None,
             }),
-            // Workflow starts running (in-flight).
+            // Workflow starts running (in-flight; task_started declares the
+            // container kind → admitted to the suppression roster).
             env(SessionEvent::SubagentUpdate {
                 r#ref: "task-1".into(),
                 label: Some("wf".into()),
                 status: SubagentStatus::Running,
                 parent_ref: Some("toolu_wf".into()),
+                kind: Some(aionui_session::SubagentTaskKind::WorkflowContainer),
             }),
             env(SessionEvent::MessageDelta {
                 item_id: "m".into(),
@@ -5404,12 +5598,13 @@ mod pump_tests {
                 outcome: aionui_session::TurnOutcome::EndTurn,
             }),
             // Workflow completes (matches the fixture invariant: completed precedes
-            // the terminal result).
+            // the terminal result; task_notification carries no task_type).
             env(SessionEvent::SubagentUpdate {
                 r#ref: "task-1".into(),
                 label: Some("wf".into()),
                 status: SubagentStatus::Completed,
                 parent_ref: Some("toolu_wf".into()),
+                kind: None,
             }),
             env(SessionEvent::MessageDelta {
                 item_id: "m2".into(),
@@ -5480,6 +5675,7 @@ mod pump_tests {
                 label: Some("wf".into()),
                 status: SubagentStatus::Running,
                 parent_ref: None,
+                kind: Some(aionui_session::SubagentTaskKind::WorkflowContainer),
             }),
             env(SessionEvent::TurnResult {
                 is_error: true,
@@ -5494,6 +5690,444 @@ mod pump_tests {
             frames.iter().any(|f| matches!(f, AgentStreamEvent::Error(_))),
             "an error result terminates the turn even while a workflow is in flight, got {:?}",
             frames.iter().map(frame_name).collect::<Vec<_>>()
+        );
+    }
+
+    // A user interrupt KILLS an in-flight workflow and the CLI emits NO result
+    // frame afterwards — only task frames (verified: samples/claude-cli/2.1.220/
+    // _all_workflow_interrupt.jsonl, scenario A: task_updated{killed} +
+    // task_notification{stopped} per task, then silence). The suppressed launch
+    // Finish is the turn's ONLY possible terminal, so the pump must emit it when
+    // the roster drains via `Interrupted` — else the relay never breaks,
+    // `cancelling` never clears, and the 15s UserCancelTimeout watchdog
+    // force-kills a healthy session (ELECTRON-3RP/3RW).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interrupted_workflow_drain_settles_suppressed_finish() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        // `kind` mirrors the wire: only `task_started` declares task_type
+        // (workflow container vs bash child); `task_updated`/`task_notification`
+        // frames carry None.
+        let wf_update = |status: SubagentStatus, kind: Option<SubagentTaskKind>| {
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-wf".into(),
+                label: Some("wf".into()),
+                status,
+                parent_ref: Some("toolu_wf".into()),
+                kind,
+            })
+        };
+        let bash_update = |status: SubagentStatus, kind: Option<SubagentTaskKind>| {
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-bash".into(),
+                label: Some("local_bash".into()),
+                status,
+                parent_ref: Some("task-wf".into()),
+                kind,
+            })
+        };
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_wf".into(),
+                name: "Task".into(),
+                subagent: aionui_session::SubagentKind::Workflow,
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+            }),
+            wf_update(SubagentStatus::Running, Some(SubagentTaskKind::WorkflowContainer)),
+            env(SessionEvent::MessageDelta {
+                item_id: "m".into(),
+                text: "launching workflow".into(),
+            }),
+            // LAUNCH result — suppressed (workflow in flight): the turn now OWES
+            // this Finish.
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+            // The workflow's child bash is `local_bash` — visible in the display
+            // roster but NOT admitted to the suppression roster.
+            bash_update(SubagentStatus::Running, Some(SubagentTaskKind::Other)),
+            // Interrupt kill sequence, frame-faithful to the 2.1.220 fixture:
+            // task_updated{killed} maps to Running with NO task_type (kind None —
+            // cannot re-insert), each followed by its task_notification{stopped}
+            // → Interrupted. No result frame ever follows.
+            wf_update(SubagentStatus::Running, None),
+            wf_update(SubagentStatus::Interrupted, None),
+            bash_update(SubagentStatus::Running, None),
+            bash_update(SubagentStatus::Interrupted, None),
+        ];
+        let frames = drain_script(script).await;
+        let seq: Vec<&str> = frames.iter().map(frame_name).collect();
+        let finish_count = frames
+            .iter()
+            .filter(|f| matches!(f, AgentStreamEvent::Finish(_)))
+            .count();
+        assert_eq!(
+            finish_count, 1,
+            "the Interrupted drain settles the owed Finish exactly once, got {seq:?}"
+        );
+        assert!(
+            matches!(frames.last(), Some(AgentStreamEvent::Finish(_))),
+            "the settled Finish is the turn's terminal frame, got {seq:?}"
+        );
+        // The Task tool call left open by the kill is closed as Canceled BEFORE the
+        // Finish, so the persisted row leaves "work" and the frontend spinner stops.
+        let cancel_idx = frames
+            .iter()
+            .position(|f| matches!(f, AgentStreamEvent::ToolCall(d) if d.status == ToolCallStatus::Canceled && d.call_id == "toolu_wf"))
+            .unwrap_or_else(|| panic!("open Task call must be closed as Canceled, got {seq:?}"));
+        let finish_idx = frames
+            .iter()
+            .position(|f| matches!(f, AgentStreamEvent::Finish(_)))
+            .unwrap();
+        assert!(
+            cancel_idx < finish_idx,
+            "the Canceled tool close must precede the Finish (relay breaks at Finish), got {seq:?}"
+        );
+    }
+
+    // A background bash (`local_bash`, e.g. Bash{run_in_background}) is NOT a
+    // workflow container: it outlives the turn with no later terminal result, so
+    // it must NEVER hold the turn open. Regression (live 2026-07-30): a bash-only
+    // roster suppressed the launch Finish → turn wedged until the 15s watchdog,
+    // and the user's Stop clicks could not drain it (interrupt emits no task
+    // frames for a plain background bash).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_bash_does_not_suppress_turn_finish() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_bash".into(),
+                name: "Bash".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::ToolResult {
+                tool_use_id: "toolu_bash".into(),
+                is_error: false,
+                content: Vec::new(),
+                parent_tool_use_id: None,
+            }),
+            // task_started for the background bash: kind = Other.
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-bash".into(),
+                label: Some("bash".into()),
+                status: SubagentStatus::Running,
+                parent_ref: Some("toolu_bash".into()),
+                kind: Some(SubagentTaskKind::Other),
+            }),
+            env(SessionEvent::MessageDelta {
+                item_id: "m".into(),
+                text: "已启动，60 秒后完成".into(),
+            }),
+            // The turn's clean result: with only a bash in the roster this is the
+            // turn's REAL terminal and its Finish must flow immediately — the
+            // bash keeps running in the CLI, unrelated to turn lifecycle.
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+        ];
+        let frames = drain_script(script).await;
+        let seq: Vec<&str> = frames.iter().map(frame_name).collect();
+        assert!(
+            matches!(frames.last(), Some(AgentStreamEvent::Finish(_))),
+            "the clean result's Finish must flow while a background bash is alive, got {seq:?}"
+        );
+        assert!(
+            !frames.iter().any(|f| matches!(f, AgentStreamEvent::SegmentBreak)),
+            "no suppression SegmentBreak for a bash-only roster, got {seq:?}"
+        );
+    }
+
+    // Interrupt-vs-natural-completion race: if a real terminal result trails the
+    // synthetic settlement, its Finish must be swallowed (ONE Finish per turn —
+    // the relay already broke) and no spurious empty-turn Tip may fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trailing_real_finish_after_synthetic_settlement_is_swallowed() {
+        use aionui_session::SubagentStatus;
+        let script = vec![
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-wf".into(),
+                label: Some("wf".into()),
+                status: SubagentStatus::Running,
+                parent_ref: None,
+                kind: Some(aionui_session::SubagentTaskKind::WorkflowContainer),
+            }),
+            env(SessionEvent::MessageDelta {
+                item_id: "m".into(),
+                text: "launching workflow".into(),
+            }),
+            // Launch result — suppressed.
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+            // Kill drain → synthetic settlement (task_notification: no task_type).
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-wf".into(),
+                label: Some("wf".into()),
+                status: SubagentStatus::Interrupted,
+                parent_ref: None,
+                kind: None,
+            }),
+            // Trailing real terminal (the race) — must NOT produce a second Finish.
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+        ];
+        let frames = drain_script(script).await;
+        let seq: Vec<&str> = frames.iter().map(frame_name).collect();
+        let finish_count = frames
+            .iter()
+            .filter(|f| matches!(f, AgentStreamEvent::Finish(_)))
+            .count();
+        assert_eq!(finish_count, 1, "trailing real Finish is swallowed, got {seq:?}");
+        assert!(
+            !frames.iter().any(|f| matches!(f, AgentStreamEvent::Tips(_))),
+            "no spurious empty-turn Tip after the synthetic settlement, got {seq:?}"
+        );
+    }
+
+    // THE FIX (live: dev 2026-07-31, conv ee61bd05 stuck "processing"): the
+    // swallow guard armed by a cancel-drain settlement must disarm when the
+    // envelope `turn_gen` advances. claude_conn NEVER emits `TurnStarted` (only
+    // the codex/acp adapters synthesize it), so a reset keyed on that arm alone
+    // is dead code on the claude stream — the guard leaked into the follow-up
+    // turn and ate its real Finish, so the relay never broke and the turn stayed
+    // open forever. The script mirrors the live log: gen 1 = workflow launch
+    // (suppressed result) + kill drain (synthetic Finish); gen 2 = follow-up
+    // message answered with claude's usual double terminal result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swallow_guard_disarms_when_turn_gen_advances() {
+        use aionui_session::SubagentStatus;
+        let script = vec![
+            env_gen(
+                1,
+                SessionEvent::SubagentUpdate {
+                    r#ref: "task-wf".into(),
+                    label: Some("wf".into()),
+                    status: SubagentStatus::Running,
+                    parent_ref: None,
+                    kind: Some(aionui_session::SubagentTaskKind::WorkflowContainer),
+                },
+            ),
+            env_gen(
+                1,
+                SessionEvent::MessageDelta {
+                    item_id: "m1".into(),
+                    text: "launching workflow".into(),
+                },
+            ),
+            // Launch result — suppressed while the workflow is in flight.
+            env_gen(
+                1,
+                SessionEvent::TurnResult {
+                    is_error: false,
+                    api_error_status: None,
+                    result_text: String::new(),
+                    epoch: 0,
+                    outcome: aionui_session::TurnOutcome::EndTurn,
+                },
+            ),
+            // User cancel → kill drain → synthetic settlement Finish (arms the guard).
+            env_gen(
+                1,
+                SessionEvent::SubagentUpdate {
+                    r#ref: "task-wf".into(),
+                    label: Some("wf".into()),
+                    status: SubagentStatus::Interrupted,
+                    parent_ref: None,
+                    kind: None,
+                },
+            ),
+            // ── Follow-up message: the reader bumps turn_gen on the accepted Send. ──
+            env_gen(
+                2,
+                SessionEvent::PromptAccepted {
+                    client_msg_id: "u-2".into(),
+                },
+            ),
+            env_gen(
+                2,
+                SessionEvent::MessageDelta {
+                    item_id: "m2".into(),
+                    text: "follow-up answer".into(),
+                },
+            ),
+            // claude's double terminal per turn (known-benign duplicate).
+            env_gen(
+                2,
+                SessionEvent::TurnResult {
+                    is_error: false,
+                    api_error_status: None,
+                    result_text: String::new(),
+                    epoch: 0,
+                    outcome: aionui_session::TurnOutcome::EndTurn,
+                },
+            ),
+            env_gen(
+                2,
+                SessionEvent::TurnResult {
+                    is_error: false,
+                    api_error_status: None,
+                    result_text: String::new(),
+                    epoch: 0,
+                    outcome: aionui_session::TurnOutcome::EndTurn,
+                },
+            ),
+        ];
+        let frames = drain_script(script).await;
+        let seq: Vec<&str> = frames.iter().map(frame_name).collect();
+        let last_content = seq
+            .iter()
+            .rposition(|f| *f == "content")
+            .expect("follow-up turn text present");
+        let last_finish = seq
+            .iter()
+            .rposition(|f| *f == "finish")
+            .unwrap_or_else(|| panic!("no Finish at all — guard ate the follow-up turn's terminal, got {seq:?}"));
+        assert!(
+            last_finish > last_content,
+            "the follow-up turn's real Finish must flow after its content (guard must disarm on gen advance), got {seq:?}"
+        );
+        let finish_count = frames
+            .iter()
+            .filter(|f| matches!(f, AgentStreamEvent::Finish(_)))
+            .count();
+        assert!(
+            finish_count >= 2,
+            "expected the settlement Finish AND the follow-up turn's Finish, got {seq:?}"
+        );
+    }
+
+    // Cross-gen guard for the empty-turn Tip. The interrupt-vs-completion race can
+    // leave a trailing real `TurnResult{is_error:false}` on the OLD gen AFTER the
+    // synthetic settlement — with `saw_visible_output` already reset to false, that
+    // terminal arms `pending_empty_turn_tip`, and the swallow guard `continue`s past
+    // its Finish without draining it. This asserts that a Some(tip) so armed on gen 1
+    // can never surface on the NEXT (real, output-bearing) turn's Finish as a spurious
+    // ACP_EMPTY_TURN. The guarantee is structural: `pending_empty_turn_tip` is a
+    // per-iteration binding (dropped at the end of each envelope), so it cannot cross
+    // the gen boundary — this test pins that invariant against future refactors that
+    // might hoist the binding out of the loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_turn_tip_armed_on_trailing_result_does_not_leak_to_next_turn() {
+        use aionui_session::SubagentStatus;
+        let script = vec![
+            env_gen(
+                1,
+                SessionEvent::SubagentUpdate {
+                    r#ref: "task-wf".into(),
+                    label: Some("wf".into()),
+                    status: SubagentStatus::Running,
+                    parent_ref: None,
+                    kind: Some(aionui_session::SubagentTaskKind::WorkflowContainer),
+                },
+            ),
+            env_gen(
+                1,
+                SessionEvent::MessageDelta {
+                    item_id: "m1".into(),
+                    text: "launching workflow".into(),
+                },
+            ),
+            // Launch result — suppressed while the workflow is in flight.
+            env_gen(
+                1,
+                SessionEvent::TurnResult {
+                    is_error: false,
+                    api_error_status: None,
+                    result_text: String::new(),
+                    epoch: 0,
+                    outcome: aionui_session::TurnOutcome::EndTurn,
+                },
+            ),
+            // User cancel → kill drain → synthetic settlement Finish. Arms the swallow
+            // guard AND resets `saw_visible_output` to false.
+            env_gen(
+                1,
+                SessionEvent::SubagentUpdate {
+                    r#ref: "task-wf".into(),
+                    label: Some("wf".into()),
+                    status: SubagentStatus::Interrupted,
+                    parent_ref: None,
+                    kind: None,
+                },
+            ),
+            // Trailing real terminal (the race): with `saw_visible_output` false this
+            // ARMS `pending_empty_turn_tip`, but the guard swallows its Finish — so the
+            // tip is never drained on THIS turn. It must be dropped, not carried over.
+            env_gen(
+                1,
+                SessionEvent::TurnResult {
+                    is_error: false,
+                    api_error_status: None,
+                    result_text: String::new(),
+                    epoch: 0,
+                    outcome: aionui_session::TurnOutcome::EndTurn,
+                },
+            ),
+            // ── Follow-up turn on the NEXT gen: it DOES produce visible output, so it
+            // must never receive an empty-turn Tip. ──
+            env_gen(
+                2,
+                SessionEvent::PromptAccepted {
+                    client_msg_id: "u-2".into(),
+                },
+            ),
+            env_gen(
+                2,
+                SessionEvent::MessageDelta {
+                    item_id: "m2".into(),
+                    text: "follow-up answer".into(),
+                },
+            ),
+            env_gen(
+                2,
+                SessionEvent::TurnResult {
+                    is_error: false,
+                    api_error_status: None,
+                    result_text: String::new(),
+                    epoch: 0,
+                    outcome: aionui_session::TurnOutcome::EndTurn,
+                },
+            ),
+        ];
+        let frames = drain_script(script).await;
+        let seq: Vec<&str> = frames.iter().map(frame_name).collect();
+        assert!(
+            !frames.iter().any(|f| matches!(f, AgentStreamEvent::Tips(_))),
+            "an empty-turn Tip armed on the trailing gen-1 result must not leak onto \
+             the output-bearing gen-2 turn's Finish, got {seq:?}"
+        );
+        // Sanity: the follow-up turn's real Finish still flows after its content, so
+        // the assertion above is testing a turn that actually reached a terminal.
+        let last_content = seq
+            .iter()
+            .rposition(|f| *f == "content")
+            .expect("follow-up turn text present");
+        let last_finish = seq
+            .iter()
+            .rposition(|f| *f == "finish")
+            .expect("follow-up turn Finish present");
+        assert!(
+            last_finish > last_content,
+            "follow-up turn's Finish must flow after its content, got {seq:?}"
         );
     }
 

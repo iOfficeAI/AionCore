@@ -732,6 +732,13 @@ impl ClaudeSessionBackend {
                 .await
                 .map_err(|e| BackendError::Transport(format!("write control_response: {e}")))?;
         }
+        // Production-diagnosable lifecycle marker: the wedge class "user approved
+        // but claude never resumed" hinges on whether this write happened.
+        tracing::info!(
+            conversation_id = %self.session_id,
+            request_id = %request_id,
+            "claude control_response (permission answer) written to stdin"
+        );
         // RA -1: the reducer leaves requires-action only on PermissionResolved.
         let cur_gen = self.turn_gen.load(Ordering::SeqCst);
         let _ = self.event_tx.send(SessionEnvelope {
@@ -1524,15 +1531,22 @@ fn register_or_clear_pending(
             if tool_use_id.is_empty() {
                 return; // can't echo toolUseID → can't answer; parse degrades it to opaque too
             }
+            let tool_name = request
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            tracing::debug!(
+                request_id = %request_id,
+                tool_use_id = %tool_use_id,
+                tool_name = %tool_name,
+                "claude can_use_tool registered as pending permission"
+            );
             pending.lock().unwrap_or_else(|e| e.into_inner()).insert(
                 request_id.to_string(),
                 PendingPerm {
                     tool_use_id: tool_use_id.to_string(),
-                    tool_name: request
-                        .get("tool_name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
+                    tool_name,
                     input: request.get("input").cloned().unwrap_or(Value::Null),
                 },
             );
@@ -2069,6 +2083,16 @@ fn sniff_task(
         .and_then(Value::as_str)
         .map(str::to_string);
     let parent_ref = frame.get("tool_use_id").and_then(Value::as_str).map(str::to_string);
+    // Container kind, declared ONLY on `task_started` (`task_type`:
+    // "local_workflow" for a Workflow container, "local_bash" for a background
+    // bash — verified: samples/claude-cli/2.1.176/workflow_*.ndjson +
+    // 2.1.220/_all_workflow_interrupt.jsonl; progress/updated/notification
+    // frames carry no task_type → None). The pump admits ONLY WorkflowContainer
+    // refs into its Finish-suppression roster.
+    let kind = frame.get("task_type").and_then(Value::as_str).map(|t| match t {
+        "local_workflow" => crate::event::SubagentTaskKind::WorkflowContainer,
+        _ => crate::event::SubagentTaskKind::Other,
+    });
     let _ = event_tx.send(SessionEnvelope {
         session_id: session_id.to_string(),
         turn_gen,
@@ -2077,6 +2101,7 @@ fn sniff_task(
             label,
             status,
             parent_ref,
+            kind,
         },
     });
 
@@ -5081,8 +5106,13 @@ mod tests {
         // parent = tool_use_id, label = subagent_type/workflow_name). task_started →
         // Running; task_notification{status} → terminal. The reducer upserts these
         // into Running.subagents, which drives has_foreground_activity.
+        // `kind` is learned ONLY from task_started.task_type: local_workflow →
+        // WorkflowContainer, local_bash (or any other value) → Other, absent
+        // (progress/notification frames) → None — the pump admits only
+        // WorkflowContainer refs into its Finish-suppression roster.
         let frames = [
-            r#"{"type":"system","subtype":"task_started","task_id":"tk-1","tool_use_id":"toolu-9","subagent_type":"general-purpose"}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"tk-1","tool_use_id":"toolu-9","subagent_type":"general-purpose","task_type":"local_workflow"}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"tk-2","tool_use_id":"toolu-8","subagent_type":"bash","task_type":"local_bash"}"#,
             r#"{"type":"system","subtype":"task_notification","task_id":"tk-1","tool_use_id":"toolu-9","status":"completed"}"#,
         ];
         let bytes = format!("{}\n", frames.join("\n")).into_bytes();
@@ -5097,10 +5127,11 @@ mod tests {
                     status,
                     parent_ref,
                     label,
+                    kind,
                 } = env.event
                 {
-                    updates.push((r#ref, status, parent_ref, label));
-                    if updates.len() == 2 {
+                    updates.push((r#ref, status, parent_ref, label, kind));
+                    if updates.len() == 3 {
                         return;
                     }
                 }
@@ -5110,8 +5141,8 @@ mod tests {
 
         assert_eq!(
             updates.len(),
-            2,
-            "task_started + task_notification → 2 SubagentUpdate, got {updates:?}"
+            3,
+            "2 task_started + task_notification → 3 SubagentUpdate, got {updates:?}"
         );
         // started → Running, keyed by task_id, parent = tool_use_id, label = subagent_type.
         assert_eq!(updates[0].0, "tk-1", "ref = task_id");
@@ -5126,13 +5157,27 @@ mod tests {
             Some("general-purpose"),
             "label = subagent_type"
         );
-        // notification completed → Completed, SAME ref (lifecycle upsert).
-        assert_eq!(updates[1].0, "tk-1", "same ref across the lifecycle");
         assert_eq!(
-            updates[1].1,
+            updates[0].4,
+            Some(crate::event::SubagentTaskKind::WorkflowContainer),
+            "task_type=local_workflow → WorkflowContainer"
+        );
+        // A background bash task is NOT a workflow container (the user-facing
+        // regression: its ref must never hold a turn open).
+        assert_eq!(
+            updates[1].4,
+            Some(crate::event::SubagentTaskKind::Other),
+            "task_type=local_bash → Other"
+        );
+        // notification completed → Completed, SAME ref (lifecycle upsert); the
+        // frame carries no task_type → kind None.
+        assert_eq!(updates[2].0, "tk-1", "same ref across the lifecycle");
+        assert_eq!(
+            updates[2].1,
             crate::event::SubagentStatus::Completed,
             "status=completed → Completed"
         );
+        assert_eq!(updates[2].4, None, "task_notification carries no task_type → kind None");
     }
 
     /// sniff_mode: claude's AUTHORITATIVE mode signal is `permissionMode` on a
