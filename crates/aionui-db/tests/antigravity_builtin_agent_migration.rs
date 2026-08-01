@@ -52,15 +52,22 @@ async fn args_stay_empty_because_agy_argv_is_per_turn() {
 }
 
 #[tokio::test]
-async fn yolo_id_is_null_because_full_auto_is_a_flag() {
-    // agy's full-auto is `--dangerously-skip-permissions`, not a mode id.
-    // Storing one would make callers try to switch to a mode agy never offers.
+async fn yolo_id_is_the_sentinel_so_unattended_callers_can_ask_for_full_auto() {
+    // agy has no full-auto MODE — measured on 1.1.9, all three of its modes are
+    // refused the "command" permission without `--dangerously-skip-permissions`
+    // and all three run commands with it, so the flag alone decides.
+    //
+    // A NULL here (the previous value) left "run unattended" indistinguishable
+    // from "the user picked the default mode": a teammate or a scheduled run
+    // would sit on approval prompts nobody is there to answer. The sentinel lets
+    // them ask through the same channel every other agent uses; the backend
+    // answers it by not installing its approval hook.
     let pool = migrated_pool().await;
     let yolo: Option<String> = sqlx::query_scalar("SELECT yolo_id FROM agent_metadata WHERE id = 'a9f3c21e'")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert!(yolo.is_none(), "expected NULL yolo_id, got {yolo:?}");
+    assert_eq!(yolo.as_deref(), Some("yolo"));
 }
 
 #[tokio::test]
@@ -76,6 +83,12 @@ async fn available_modes_match_the_capability_projection_shape() {
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let modes = v["available_modes"].as_array().expect("top-level available_modes key");
     let ids: Vec<&str> = modes.iter().map(|m| m["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, vec!["default", "accept-edits", "plan"]);
+    // agy's own axis is default / accept-edits / plan; `yolo` is AionUi's
+    // sentinel, offered here so full auto is a deliberate choice rather than
+    // something only teams and cron can reach.
+    assert_eq!(ids, vec!["default", "accept-edits", "plan", "yolo"]);
     assert_eq!(v["current_mode_id"], "default");
+    // The sentinel must never be the seeded current mode: that would silently
+    // start every new conversation with approval prompts turned off.
+    assert_ne!(v["current_mode_id"], "yolo");
 }
