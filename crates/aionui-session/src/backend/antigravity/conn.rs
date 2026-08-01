@@ -46,6 +46,23 @@ use crate::event::{PermissionKind, SessionEvent, TurnOutcome};
 /// large enough that a slow subscriber does not lose a turn's worth of frames.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Which text represents the turn's reply, given agy's terminal frame.
+///
+/// agy's `result.response` is the SAME reply the deltas carried, but assembled
+/// once and therefore intact — the deltas are cut on byte boundaries and mangle
+/// any multi-byte character that straddles two of them (verified against agy
+/// 1.1.9: `--output-format stream-json` yields U+FFFD where `json`/`text` do
+/// not). So the terminal frame wins whenever it actually carries the reply.
+///
+/// On a failed turn `result_text` is the error, not the reply, so the buffered
+/// deltas are the only reply there is.
+fn final_turn_text(is_error: bool, result_text: &str, buffered: &str) -> Option<String> {
+    let authoritative = (!is_error && !result_text.is_empty()).then(|| result_text.to_owned());
+    authoritative
+        .or_else(|| (!buffered.is_empty()).then(|| buffered.to_owned()))
+        .filter(|t| !t.is_empty())
+}
+
 /// agy's declared capability surface.
 pub fn antigravity_capabilities() -> Capabilities {
     Capabilities {
@@ -385,21 +402,74 @@ impl AntigravitySessionBackend {
             let mut translator = Translator::default();
             let mut saw_terminal = false;
 
+            // agy corrupts multi-byte characters when it splits `text_delta`
+            // (it cuts on byte boundaries, so a Chinese character straddling
+            // two deltas arrives as two U+FFFD). Its `result` frame carries the
+            // same reply intact, so assistant text is held back here and
+            // emitted once, from the authoritative source.
+            let mut buffered_text = String::new();
+            let mut text_item_id = String::new();
+            let mut text_flushed = false;
+
             if let Some((_stdin, stdout)) = proc.take_stdio().await {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let Some(ev) = parse_line(&line) else { continue };
                     for out in translator.translate(ev) {
-                        if matches!(out, SessionEvent::TurnResult { .. }) {
-                            saw_terminal = true;
+                        match out {
+                            SessionEvent::MessageDelta { item_id, text } => {
+                                if text_item_id.is_empty() {
+                                    text_item_id = item_id;
+                                }
+                                buffered_text.push_str(&text);
+                            }
+                            SessionEvent::TurnResult {
+                                ref is_error,
+                                ref result_text,
+                                ..
+                            } => {
+                                saw_terminal = true;
+                                if let Some(text) = final_turn_text(*is_error, result_text, &buffered_text) {
+                                    text_flushed = true;
+                                    let _ = event_tx.send(SessionEnvelope {
+                                        session_id: session_id.clone(),
+                                        turn_gen,
+                                        event: SessionEvent::MessageDelta {
+                                            item_id: std::mem::take(&mut text_item_id),
+                                            text,
+                                        },
+                                    });
+                                }
+                                let _ = event_tx.send(SessionEnvelope {
+                                    session_id: session_id.clone(),
+                                    turn_gen,
+                                    event: out,
+                                });
+                            }
+                            other => {
+                                let _ = event_tx.send(SessionEnvelope {
+                                    session_id: session_id.clone(),
+                                    turn_gen,
+                                    event: other,
+                                });
+                            }
                         }
-                        let _ = event_tx.send(SessionEnvelope {
-                            session_id: session_id.clone(),
-                            turn_gen,
-                            event: out,
-                        });
                     }
                 }
+            }
+
+            // Cancelled or crashed: no `result` frame ever arrives, so the text
+            // gathered so far is all there is. Losing the partial reply would be
+            // worse than showing agy's own mojibake.
+            if !text_flushed && !buffered_text.is_empty() {
+                let _ = event_tx.send(SessionEnvelope {
+                    session_id: session_id.clone(),
+                    turn_gen,
+                    event: SessionEvent::MessageDelta {
+                        item_id: text_item_id,
+                        text: std::mem::take(&mut buffered_text),
+                    },
+                });
             }
 
             if let Some(id) = translator.backend_session_id() {
@@ -1027,5 +1097,37 @@ mod tests {
         // user's model here would silently ignore a perfectly good choice.
         let b = backend_with_models(&[], Some("gemini-3.1-pro-low"));
         assert_eq!(b.effective_model().as_deref(), Some("gemini-3.1-pro-low"));
+    }
+
+    #[test]
+    fn the_terminal_frame_wins_because_the_deltas_are_mangled() {
+        // agy cuts `text_delta` on byte boundaries, so a multi-byte character
+        // split across two deltas arrives as a pair of U+FFFD. Its `result`
+        // frame carries the same reply assembled once, hence intact.
+        let buffered = "\u{fffd}\u{fffd}建 Web 应用程序";
+        let clean = "设计和构建 Web 应用程序";
+        assert_eq!(final_turn_text(false, clean, buffered).as_deref(), Some(clean));
+    }
+
+    #[test]
+    fn a_failed_turn_keeps_the_reply_it_managed_to_stream() {
+        // On failure `result_text` is the error message, not the reply.
+        let out = final_turn_text(true, "authentication failed", "partial reply");
+        assert_eq!(out.as_deref(), Some("partial reply"));
+    }
+
+    #[test]
+    fn a_terminal_frame_without_a_reply_falls_back_to_the_deltas() {
+        assert_eq!(
+            final_turn_text(false, "", "streamed only").as_deref(),
+            Some("streamed only")
+        );
+    }
+
+    #[test]
+    fn a_turn_with_no_text_at_all_emits_nothing() {
+        // A tool-only turn must not produce an empty assistant bubble.
+        assert_eq!(final_turn_text(false, "", ""), None);
+        assert_eq!(final_turn_text(true, "", ""), None);
     }
 }
