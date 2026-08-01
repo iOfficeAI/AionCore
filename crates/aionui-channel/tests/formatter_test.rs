@@ -97,11 +97,38 @@ fn weixin_nested_tags() {
     assert!(!result.contains('<'), "got: {result}");
 }
 
+// ── Slack: markdown → mrkdwn ─────────────────────────────────────
+
+#[test]
+fn slack_bold_and_headers() {
+    let input = "## Conforto e diversão\n\n**9. Sistema de som multiroom**";
+    let result = format_text_for_platform(input, PluginType::Slack);
+    assert!(result.contains("*Conforto e diversão*"), "got: {result}");
+    assert!(result.contains("*9. Sistema de som multiroom*"), "got: {result}");
+    assert!(!result.contains("##"), "got: {result}");
+    assert!(!result.contains("**"), "got: {result}");
+}
+
+#[test]
+fn slack_inline_code_and_links() {
+    let input = "see `foo` and [docs](https://example.com)";
+    let result = format_text_for_platform(input, PluginType::Slack);
+    assert!(result.contains("`foo`"), "got: {result}");
+    assert!(result.contains("<https://example.com|docs>"), "got: {result}");
+}
+
+#[test]
+fn slack_escapes_raw_angles() {
+    let input = "a <b> tag";
+    let result = format_text_for_platform(input, PluginType::Slack);
+    assert!(result.contains("&lt;b&gt;"), "got: {result}");
+}
+
 // ── Fallback: escape HTML ────────────────────────────────────────
 
 #[test]
 fn fallback_escapes_html() {
     let input = "<b>bold</b>";
-    let result = format_text_for_platform(input, PluginType::Slack);
+    let result = format_text_for_platform(input, PluginType::Discord);
     assert!(result.contains("&lt;b&gt;"), "got: {result}");
 }
