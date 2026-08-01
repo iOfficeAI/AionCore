@@ -34,7 +34,7 @@
     "grok": {
       "registry_json_id": "grok-build",
       "package": "@xai-official/grok",
-      "version": "0.2.117"
+      "version": "0.2.118"
     },
     "kilo": {
       "registry_json_id": "kilo",
