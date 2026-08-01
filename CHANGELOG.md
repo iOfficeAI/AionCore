@@ -1,15 +1,17 @@
 # Changelog
 
-## [0.1.56](https://github.com/iOfficeAI/AionCore/compare/v0.1.55...v0.1.56) (2026-07-31)
+## [0.1.56](https://github.com/suoak/AionCore/compare/v0.1.55...v0.1.56) (2026-07-31)
 
 
 ### Features
 
+* **skills:** add the built-in Lark CLI progressive-disclosure skill ([473b252](https://github.com/suoak/AionCore/commit/473b252af4987dde87ef8ea7aa2d4f901654d230))
 * **project:** hide OS-junk and VCS-internal noise from listings ([#727](https://github.com/iOfficeAI/AionCore/issues/727)) ([6197117](https://github.com/iOfficeAI/AionCore/commit/6197117ef09bc0797f5656d3d6c3ec2e40161c09))
 
 
 ### Bug Fixes
 
+* **ci:** normalize manual release tag input ([8f47633](https://github.com/suoak/AionCore/commit/8f47633dac734592539f8197abb3c63cb3ffb6b5))
 * **agents:** persist the catalog the availability probe already fetched ([#735](https://github.com/iOfficeAI/AionCore/issues/735)) ([2438095](https://github.com/iOfficeAI/AionCore/commit/24380952e133b38b2f0192d2be09bda1f5306d5a))
 * **ai-agent:** token usage for the direct-CLI backends (claude / codex) ([#733](https://github.com/iOfficeAI/AionCore/issues/733)) ([93a24f4](https://github.com/iOfficeAI/AionCore/commit/93a24f43fcd0f1ecc4528b690d34ba83153f4834))
 * **conversation:** request plaintext thinking from claude, drop blank thought cards ([#731](https://github.com/iOfficeAI/AionCore/issues/731)) ([9cd4fb9](https://github.com/iOfficeAI/AionCore/commit/9cd4fb99648c7d624fa3f897b6291fea51b7c034))

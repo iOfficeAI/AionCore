@@ -3397,6 +3397,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn embedded_lark_skill_is_a_single_discovery_bundle() {
+        let lark = BUILTIN_SKILLS
+            .get_dir("lark")
+            .expect("lark builtin skill should be embedded");
+        let manifest = BUILTIN_SKILLS
+            .get_file("lark/SKILL.md")
+            .expect("lark SKILL.md should be embedded");
+        let content = std::str::from_utf8(manifest.contents()).expect("lark SKILL.md should be UTF-8");
+        let (name, description) = parse_frontmatter_fields(content).expect("lark frontmatter should be valid");
+
+        assert_eq!(name, "lark");
+        assert!(description.contains("Lark CLI"));
+        assert!(
+            BUILTIN_SKILLS.get_file("lark/references/routing.md").is_some(),
+            "lark routing guide should be embedded"
+        );
+        assert!(
+            BUILTIN_SKILLS
+                .get_file("lark/references/subskills/upstream.lock.json")
+                .is_some(),
+            "lark upstream lock should be embedded"
+        );
+
+        let mut manifests = Vec::new();
+        collect_embedded_skill_manifests(lark, &mut manifests);
+        assert_eq!(
+            manifests,
+            vec!["lark/SKILL.md".to_owned()],
+            "nested domain guides must not be discoverable as standalone skills"
+        );
+    }
+
+    fn collect_embedded_skill_manifests(dir: &Dir<'static>, manifests: &mut Vec<String>) {
+        for file in dir.files() {
+            if file.path().file_name().and_then(|name| name.to_str()) == Some(SKILL_MANIFEST_FILE) {
+                manifests.push(file.path().to_string_lossy().replace('\\', "/"));
+            }
+        }
+        for subdir in dir.dirs() {
+            collect_embedded_skill_manifests(subdir, manifests);
+        }
+        manifests.sort();
+    }
+
     fn assert_embedded_skill_frontmatter(dir: &Dir<'static>, checked: &mut usize, failures: &mut Vec<String>) {
         for file in dir.files() {
             if file.path().file_name().and_then(|name| name.to_str()) != Some(SKILL_MANIFEST_FILE) {
