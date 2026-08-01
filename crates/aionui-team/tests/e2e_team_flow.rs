@@ -111,13 +111,53 @@ impl AgentTurnCancellationPort for NoopCancellationPort {
     }
 }
 
-struct ErrorBeforeStartTurnPort;
+struct ErrorBeforeStartTurnPort {
+    requests: Arc<Mutex<Vec<AgentTurnRequest>>>,
+    failures_before_success: usize,
+}
+
+impl ErrorBeforeStartTurnPort {
+    fn new(failures_before_success: usize) -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            failures_before_success,
+        }
+    }
+
+    fn requests(&self) -> Arc<Mutex<Vec<AgentTurnRequest>>> {
+        self.requests.clone()
+    }
+}
 
 #[async_trait]
 impl AgentTurnExecutionPort for ErrorBeforeStartTurnPort {
-    async fn run_agent_turn(&self, _request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
-        Err(AgentTurnExecutionError::Failed {
-            reason: "failed before start".into(),
+    async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        let attempt = {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.clone());
+            requests.len()
+        };
+        if attempt <= self.failures_before_success {
+            return Err(AgentTurnExecutionError::Failed {
+                reason: "failed before start".into(),
+            });
+        }
+        let turn_id = format!("turn-recovered-{attempt}");
+        if let Some(on_started) = request.on_started.as_ref() {
+            on_started(AgentTurnStarted {
+                team_run_id: request.team_run_id.clone(),
+                slot_id: request.slot_id.clone(),
+                role: request.role.clone(),
+                conversation_id: request.conversation_id.clone(),
+                turn_id: turn_id.clone(),
+            })
+            .await;
+        }
+        Ok(AgentTurnOutcome {
+            conversation_id: request.conversation_id,
+            turn_id,
+            status: AgentTurnStatus::Completed,
+            runtime: None,
         })
     }
 }
@@ -143,25 +183,44 @@ impl AgentTurnExecutionPort for SkippedBusyTurnPort {
     }
 }
 
-struct StartedThenFailedTurnPort;
+#[derive(Default)]
+struct StartedThenFailedTurnPort {
+    requests: Arc<Mutex<Vec<AgentTurnRequest>>>,
+}
+
+impl StartedThenFailedTurnPort {
+    fn requests(&self) -> Arc<Mutex<Vec<AgentTurnRequest>>> {
+        self.requests.clone()
+    }
+}
 
 #[async_trait]
 impl AgentTurnExecutionPort for StartedThenFailedTurnPort {
     async fn run_agent_turn(&self, request: AgentTurnRequest) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+        let attempt = {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.clone());
+            requests.len()
+        };
+        let turn_id = format!("turn-started-{attempt}");
         if let Some(on_started) = request.on_started.as_ref() {
             on_started(AgentTurnStarted {
                 team_run_id: request.team_run_id.clone(),
                 slot_id: request.slot_id.clone(),
                 role: request.role.clone(),
                 conversation_id: request.conversation_id.clone(),
-                turn_id: "turn-failed".into(),
+                turn_id: turn_id.clone(),
             })
             .await;
         }
         Ok(AgentTurnOutcome {
             conversation_id: request.conversation_id,
-            turn_id: "turn-failed".into(),
-            status: AgentTurnStatus::Failed,
+            turn_id,
+            status: if attempt == 1 {
+                AgentTurnStatus::Failed
+            } else {
+                AgentTurnStatus::Completed
+            },
             runtime: None,
         })
     }
@@ -800,6 +859,17 @@ async fn wait_for_turn_request_count(requests: &Arc<Mutex<Vec<AgentTurnRequest>>
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("timed out waiting for {count} turn requests");
+}
+
+async fn wait_for_unread_count(session: &TeamSession, slot_id: &str, count: usize) {
+    for _ in 0..100 {
+        let unread = session.mailbox().peek_unread("e2e-team", slot_id).await.unwrap();
+        if unread.len() == count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {count} unread messages for {slot_id}");
 }
 
 async fn wait_for_cancelled_turn_count(cancelled: &Arc<Mutex<Vec<String>>>, count: usize) {
@@ -1693,14 +1763,12 @@ async fn one_turn_claims_every_message_it_reads() {
 }
 
 #[tokio::test]
-async fn nonretryable_start_failure_is_terminal_and_not_recovered() {
+async fn start_failure_preserves_unread_and_retries_successfully() {
     let broadcaster = Arc::new(RecordingBroadcaster::new());
-    let session = setup_session_with_runtime_ports(
-        Arc::new(ErrorBeforeStartTurnPort),
-        Arc::new(NoopCancellationPort),
-        broadcaster.clone(),
-    )
-    .await;
+    let turn_port = Arc::new(ErrorBeforeStartTurnPort::new(1));
+    let requests = turn_port.requests();
+    let session =
+        setup_session_with_runtime_ports(turn_port, Arc::new(NoopCancellationPort), broadcaster.clone()).await;
 
     session
         .send_message("user input to team", None)
@@ -1708,14 +1776,43 @@ async fn nonretryable_start_failure_is_terminal_and_not_recovered() {
         .expect("send_message must succeed");
 
     wait_for_event(&broadcaster, "team.runFailed").await;
+    wait_for_turn_request_count(&requests, 2).await;
+    wait_for_unread_count(&session, "lead-1", 0).await;
     assert_eq!(session.team_run_manager().current_active_run_id(), None);
-    assert!(
-        session
-            .mailbox()
-            .peek_unread("e2e-team", "lead-1")
-            .await
-            .unwrap()
-            .is_empty()
+    let requests = requests.lock().unwrap();
+    let AgentTurnSource::Mailbox {
+        unread_message_ids: first_ids,
+        ..
+    } = &requests[0].source;
+    let AgentTurnSource::Mailbox {
+        unread_message_ids: retry_ids,
+        ..
+    } = &requests[1].source;
+    assert_eq!(retry_ids, first_ids, "the retry must deliver the same mailbox message");
+
+    session.stop();
+}
+
+#[tokio::test]
+async fn repeated_start_failure_stops_after_three_attempts_and_marks_slot_error() {
+    let broadcaster = Arc::new(RecordingBroadcaster::new());
+    let turn_port = Arc::new(ErrorBeforeStartTurnPort::new(usize::MAX));
+    let requests = turn_port.requests();
+    let session =
+        setup_session_with_runtime_ports(turn_port, Arc::new(NoopCancellationPort), broadcaster.clone()).await;
+
+    session
+        .send_message("user input to team", None)
+        .await
+        .expect("send_message must succeed");
+
+    wait_for_turn_request_count(&requests, 3).await;
+    wait_for_unread_count(&session, "lead-1", 0).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(requests.lock().unwrap().len(), 3, "delivery must not retry forever");
+    assert_eq!(
+        session.scheduler().get_status("lead-1").await.unwrap(),
+        aionui_team::TeammateStatus::Error
     );
 
     session.stop();
@@ -1763,14 +1860,12 @@ async fn retryable_start_requeues_without_marking_mailbox_read() {
 }
 
 #[tokio::test]
-async fn s9c_event_loop_fails_run_when_started_turn_returns_failed() {
+async fn failed_started_turn_preserves_unread_and_retries_successfully() {
     let broadcaster = Arc::new(RecordingBroadcaster::new());
-    let session = setup_session_with_runtime_ports(
-        Arc::new(StartedThenFailedTurnPort),
-        Arc::new(NoopCancellationPort),
-        broadcaster.clone(),
-    )
-    .await;
+    let turn_port = Arc::new(StartedThenFailedTurnPort::default());
+    let requests = turn_port.requests();
+    let session =
+        setup_session_with_runtime_ports(turn_port, Arc::new(NoopCancellationPort), broadcaster.clone()).await;
 
     session
         .send_message("user input to team", None)
@@ -1778,7 +1873,19 @@ async fn s9c_event_loop_fails_run_when_started_turn_returns_failed() {
         .expect("send_message must succeed");
 
     wait_for_event(&broadcaster, "team.runFailed").await;
+    wait_for_turn_request_count(&requests, 2).await;
+    wait_for_unread_count(&session, "lead-1", 0).await;
     assert_eq!(session.team_run_manager().current_active_run_id(), None);
+    let requests = requests.lock().unwrap();
+    let AgentTurnSource::Mailbox {
+        unread_message_ids: first_ids,
+        ..
+    } = &requests[0].source;
+    let AgentTurnSource::Mailbox {
+        unread_message_ids: retry_ids,
+        ..
+    } = &requests[1].source;
+    assert_eq!(retry_ids, first_ids, "the retry must deliver the same mailbox message");
 
     session.stop();
 }

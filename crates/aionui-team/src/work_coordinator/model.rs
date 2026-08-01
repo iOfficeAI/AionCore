@@ -3,6 +3,8 @@ use aionui_common::TimestampMs;
 
 use crate::work_source::WorkSource;
 
+pub(crate) const MAX_MESSAGE_DELIVERY_FAILURES: u8 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkPriority {
     Foreground,
@@ -165,6 +167,12 @@ pub(crate) enum CommitResult {
     Committed,
     StaleOwner,
     Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchFailureResult {
+    pub(crate) commit_result: CommitResult,
+    pub(crate) exhausted_message_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

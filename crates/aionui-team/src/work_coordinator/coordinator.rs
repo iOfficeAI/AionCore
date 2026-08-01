@@ -33,6 +33,7 @@ pub(super) struct SlotState {
     pub(super) paused: bool,
     pub(super) runtime_constraint: RuntimeConstraint,
     known_unread_message_ids: HashSet<String>,
+    delivery_failure_counts: HashMap<String, u8>,
     removed: bool,
 }
 
@@ -48,6 +49,7 @@ impl SlotState {
             paused: false,
             runtime_constraint: RuntimeConstraint::Starting { operation_id: 0 },
             known_unread_message_ids: HashSet::new(),
+            delivery_failure_counts: HashMap::new(),
             removed: false,
         }
     }
@@ -340,6 +342,8 @@ impl SlotWorkCoordinator {
             .or_insert_with(|| SlotState::new(role.clone()));
         slot.role = role.clone();
         slot.known_unread_message_ids = unread.clone();
+        slot.delivery_failure_counts
+            .retain(|message_id, _| unread.contains(message_id));
 
         let candidates = slot.queued_ids().cloned().collect::<Vec<_>>();
         let mut retained_intent_ids = Vec::new();
@@ -655,8 +659,52 @@ impl SlotWorkCoordinator {
         self.terminalize_batch(batch, WorkIntentState::Completed, "completed")
     }
 
-    pub(crate) fn fail_batch(&self, batch: &WorkBatch, classification: &'static str) -> CommitResult {
-        self.terminalize_batch(batch, WorkIntentState::Failed { classification }, classification)
+    pub(crate) fn fail_batch(&self, batch: &WorkBatch, classification: &'static str) -> BatchFailureResult {
+        let mut state = self.lock_state();
+        if !self.is_current_batch(&state, batch) {
+            self.log_stale_batch(batch, "fail_batch");
+            return BatchFailureResult {
+                commit_result: CommitResult::StaleOwner,
+                exhausted_message_ids: Vec::new(),
+            };
+        }
+        for intent_id in &batch.intent_ids {
+            if let Some(intent) = state.intents.get_mut(intent_id) {
+                intent.state = WorkIntentState::Failed { classification };
+            }
+        }
+        let slot = state.slots.get_mut(&batch.slot_id).expect("current batch slot exists");
+        slot.active = None;
+        let mut exhausted_message_ids = Vec::new();
+        for message_id in &batch.mailbox_message_ids {
+            let failure_count = slot.delivery_failure_counts.entry(message_id.clone()).or_default();
+            *failure_count = failure_count.saturating_add(1);
+            if *failure_count >= MAX_MESSAGE_DELIVERY_FAILURES {
+                exhausted_message_ids.push(message_id.clone());
+            }
+        }
+        if !exhausted_message_ids.is_empty() {
+            slot.paused = true;
+        }
+        let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
+        let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
+        drop(state);
+        self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
+        info!(
+            team_id = %self.team_id,
+            session_generation = %self.session_generation,
+            slot_id = %batch.slot_id,
+            batch_id = %batch.batch_id,
+            operation_id = batch.operation_id,
+            classification,
+            exhausted_message_count = exhausted_message_ids.len(),
+            "team work batch terminal"
+        );
+        BatchFailureResult {
+            commit_result: CommitResult::Committed,
+            exhausted_message_ids,
+        }
     }
 
     pub(crate) fn cancel_batch(&self, batch: &WorkBatch, classification: &'static str) -> CommitResult {
@@ -1083,11 +1131,11 @@ impl SlotWorkCoordinator {
                 intent.state = terminal_state.clone();
             }
         }
-        state
-            .slots
-            .get_mut(&batch.slot_id)
-            .expect("current batch slot exists")
-            .active = None;
+        let slot = state.slots.get_mut(&batch.slot_id).expect("current batch slot exists");
+        slot.active = None;
+        for message_id in &batch.mailbox_message_ids {
+            slot.delivery_failure_counts.remove(message_id);
+        }
         let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
         let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
         drop(state);

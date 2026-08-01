@@ -463,6 +463,94 @@ fn unread_without_projection_creates_one_recovery_intent() {
 }
 
 #[test]
+fn failed_batch_is_reprojected_from_the_unread_mailbox() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("message must be claimable");
+    };
+
+    let failure = coordinator.fail_batch(&first, "turn_start_failed");
+    assert_eq!(failure.commit_result, CommitResult::Committed);
+    assert!(failure.exhausted_message_ids.is_empty());
+
+    coordinator.reconcile_mailbox("lead-1", &["m1".into()], TeamRunTargetRole::Lead);
+    let ReconcileDecision::Claim(retry) = coordinator.next("lead-1") else {
+        panic!("unread failed delivery must be reprojected");
+    };
+    assert_eq!(retry.mailbox_message_ids, vec!["m1"]);
+    assert_ne!(retry.intent_ids, first.intent_ids);
+    assert_eq!(
+        coordinator
+            .intents_for_slot("lead-1")
+            .into_iter()
+            .find(|intent| retry.intent_ids.contains(&intent.intent_id))
+            .expect("recovery intent must exist")
+            .source,
+        WorkSource::RecoveryDrain
+    );
+}
+
+#[test]
+fn delivery_failures_pause_after_three_attempts() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+
+    for attempt in 1..=MAX_MESSAGE_DELIVERY_FAILURES {
+        let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+            panic!("attempt {attempt} must be claimable");
+        };
+        let failure = coordinator.fail_batch(&batch, "turn_failed");
+        assert_eq!(failure.commit_result, CommitResult::Committed);
+        if attempt < MAX_MESSAGE_DELIVERY_FAILURES {
+            assert!(failure.exhausted_message_ids.is_empty());
+            coordinator.reconcile_mailbox("lead-1", &["m1".into()], TeamRunTargetRole::Lead);
+        } else {
+            assert_eq!(failure.exhausted_message_ids, vec!["m1"]);
+        }
+    }
+
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().state, SlotPhase::Paused);
+    coordinator.reconcile_mailbox("lead-1", &[], TeamRunTargetRole::Lead);
+    assert_eq!(coordinator.next("lead-1"), ReconcileDecision::Quiescent);
+}
+
+#[test]
+fn successful_retry_clears_the_consecutive_failure_count() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("first attempt must be claimable");
+    };
+    assert!(
+        coordinator
+            .fail_batch(&first, "turn_failed")
+            .exhausted_message_ids
+            .is_empty()
+    );
+    coordinator.reconcile_mailbox("lead-1", &["m1".into()], TeamRunTargetRole::Lead);
+    let ReconcileDecision::Claim(success) = coordinator.next("lead-1") else {
+        panic!("successful retry must be claimable");
+    };
+    assert_eq!(coordinator.complete_batch(&success), CommitResult::Committed);
+
+    coordinator.reconcile_mailbox("lead-1", &["m1".into()], TeamRunTargetRole::Lead);
+    let ReconcileDecision::Claim(after_success) = coordinator.next("lead-1") else {
+        panic!("simulated mark-read failure must be recoverable");
+    };
+    assert!(
+        coordinator
+            .fail_batch(&after_success, "turn_failed")
+            .exhausted_message_ids
+            .is_empty(),
+        "a success between failures must reset the consecutive count"
+    );
+}
+
+#[test]
 fn active_batch_prevents_unread_projection_from_being_rebuilt() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
