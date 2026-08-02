@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
 
 use aionui_api_types::{
@@ -244,11 +244,12 @@ impl SkillRegistryService {
         validate_identity(&request.namespace, &request.slug)?;
         validate_segment(&request.version)?;
         let operation_key = format!("{user_id}:{}:{}", request.namespace, request.slug);
-        let mut operations = self.operations.lock().map_err(|_| SkillRegistryError::Persistence)?;
-        if !operations.insert(operation_key.clone()) {
-            return Err(SkillRegistryError::OperationInProgress);
+        {
+            let mut operations = self.operations.lock().map_err(|_| SkillRegistryError::Persistence)?;
+            if !operations.insert(operation_key.clone()) {
+                return Err(SkillRegistryError::OperationInProgress);
+            }
         }
-        drop(operations);
         let _guard = OperationGuard {
             operations: self.operations.clone(),
             key: operation_key,
