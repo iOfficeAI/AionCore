@@ -214,13 +214,12 @@ impl ConversationTurnOrchestrator {
         // Ends as Completed, not Failed — a turn the user cancelled is not an
         // error, and reporting one would surface a red bubble for something
         // they asked for.
-        if runtime_state.is_cancelling(&input.conv_id) {
+        if runtime_state.take_deferred_cancel(&input.conv_id, &input.turn_id) {
             info!(
                 conversation_id = %input.conv_id,
                 turn_id = %input.turn_id,
                 "Applying a cancel that arrived while the agent was still being built"
             );
-            runtime_state.clear_cancelling(&input.conv_id);
             return Err(ConversationTurnResult {
                 status: ConversationTurnStatus::Completed,
                 error_message: None,

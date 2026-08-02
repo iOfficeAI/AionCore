@@ -3216,7 +3216,7 @@ impl ConversationService {
             // Record the intent instead. The orchestrator applies it as soon as
             // the task appears, so a cancel issued during the build behaves like
             // one issued a second later.
-            self.runtime_state.mark_cancelling(conversation_id);
+            self.runtime_state.defer_cancel(conversation_id, turn_id);
             info!(
                 conversation_id,
                 turn_id, "Cancel arrived before the agent registered; deferring it to the build"

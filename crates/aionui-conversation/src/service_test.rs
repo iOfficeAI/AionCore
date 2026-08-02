@@ -8186,7 +8186,27 @@ async fn cancel_during_the_build_is_recorded_instead_of_dropped() {
     svc.cancel("user_1", &conv.id, &send.turn_id, &task_mgr).await.unwrap();
 
     assert!(
-        svc.runtime_state().is_cancelling(&conv.id),
+        svc.runtime_state().take_deferred_cancel(&conv.id, &send.turn_id),
         "the cancel must be remembered so the orchestrator can apply it when the task appears"
     );
+    assert!(
+        !svc.runtime_state().is_cancelling(&conv.id),
+        "it must NOT reuse the ordinary cancelling flag: that one is also set when the \
+         agent was handed the cancel directly, and the orchestrator would then abort turns \
+         whose cancel is already being handled"
+    );
+}
+
+#[tokio::test]
+async fn a_deferred_cancel_does_not_leak_into_a_later_turn() {
+    // The record is keyed by turn: one left behind must never abort the next
+    // turn the user starts.
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    svc.runtime_state().defer_cancel(&conv.id, "turn_old");
+    assert!(!svc.runtime_state().take_deferred_cancel(&conv.id, "turn_new"));
+    assert!(svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
+    // Consumed exactly once.
+    assert!(!svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
 }
