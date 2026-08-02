@@ -56,7 +56,14 @@ pub(super) async fn build(
     // token that authenticates the hook's callback. Without this the session
     // still runs, but with agy's gate wide open and no per-call approval — so a
     // failure here must be loud.
-    let full_auto = is_full_auto(config.session_mode.as_deref(), yolo_mode_id(meta.yolo_id.as_deref()));
+    // Resolve the mode the same way the session itself will (snapshot over
+    // create-time seed, aliases normalized). Reading `config.session_mode`
+    // directly saw only the value the conversation was created with, so a
+    // runtime switch to full auto — and the mode a scheduled run resolves —
+    // never reached this decision.
+    let resolved_mode =
+        crate::session_agent::resolved_session_mode(&config, build_context.session_snapshot.as_ref(), &meta);
+    let full_auto = is_full_auto(resolved_mode.as_deref(), yolo_mode_id(meta.yolo_id.as_deref()));
     let hook_env = match deps.antigravity_hook_base_url.as_deref() {
         _ if full_auto => {
             tracing::info!(

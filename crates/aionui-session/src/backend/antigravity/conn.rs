@@ -235,6 +235,7 @@ impl BackendConnection for AntigravityConnection {
             session_id,
             slash_commands,
             models: Arc::new(std::sync::RwLock::new(Vec::new())),
+            mode_override: Arc::new(std::sync::RwLock::new(None)),
             config,
             spawner: Arc::clone(&self.spawner),
             event_tx,
@@ -275,6 +276,8 @@ pub struct AntigravitySessionBackend {
     /// so the catalog write-back can populate the picker. Filled in by a
     /// background probe, hence the lock.
     models: Arc<std::sync::RwLock<Vec<ModelInfo>>>,
+    /// Mode chosen at runtime, overriding the create-time seed.
+    mode_override: Arc<std::sync::RwLock<Option<String>>>,
     config: SessionConfig,
     spawner: Arc<dyn Spawner>,
     event_tx: broadcast::Sender<SessionEnvelope>,
@@ -451,6 +454,21 @@ impl AntigravitySessionBackend {
         }
     }
 
+    /// The mode this session is on right now, honouring a runtime switch.
+    fn effective_mode(&self) -> Option<String> {
+        self.mode_override
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .or_else(|| self.config.mode.clone())
+    }
+
+    /// Whether this session currently runs without approval prompts.
+    fn is_full_auto(&self) -> bool {
+        self.effective_mode()
+            .is_some_and(|m| m.eq_ignore_ascii_case(super::argv::FULL_AUTO_SENTINEL))
+    }
+
     /// The model to actually pass to agy, dropping one it cannot accept.
     ///
     /// A model id can reach us that agy rejects outright ("invalid model
@@ -483,7 +501,7 @@ impl AntigravitySessionBackend {
             resume_conversation_id: self.anchor.lock().await.clone(),
             workspace: self.config.cwd.clone(),
             model: self.effective_model(),
-            mode: self.config.mode.clone(),
+            mode: self.effective_mode(),
         };
         let spec = CommandSpec {
             command: self
@@ -731,7 +749,22 @@ impl SessionBackend for AntigravitySessionBackend {
             }),
             // Mode/model are spawn-time flags for agy: there is no live process
             // to reconfigure, so the next turn simply picks up the new value.
-            Command::SetMode { .. } | Command::SetModel { .. } => Ok(CommandReceipt {
+            Command::SetMode { ref mode } => {
+                // Recording this is what makes a mid-conversation switch mean
+                // anything: the next turn's argv reads it, and so does the
+                // full-auto check in `request_external_permission`. Leaving it
+                // unrecorded made the UI's mode picker a control that reported
+                // success and changed nothing.
+                if let Ok(mut guard) = self.mode_override.write() {
+                    *guard = Some(mode.clone());
+                }
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                })
+            }
+            Command::SetModel { .. } => Ok(CommandReceipt {
                 accepted: true,
                 admission: Admission::Started,
                 turn_gen: self.turn_gen.load(Ordering::SeqCst),
@@ -795,6 +828,18 @@ impl SessionBackend for AntigravitySessionBackend {
     }
 
     async fn request_external_permission(&self, tool_name: String, input: serde_json::Value) -> PermissionDecision {
+        // Full auto answers itself. The hook file is only removed for sessions
+        // that START in full auto; a session switched into it mid-conversation
+        // still has the hook installed, and without this it would keep raising
+        // cards the user explicitly asked not to see.
+        if self.is_full_auto() {
+            tracing::debug!(
+                session_id = %self.session_id,
+                tool = %tool_name,
+                "antigravity: full-auto mode — approving without a prompt"
+            );
+            return PermissionDecision::Approved;
+        }
         let request_id = format!("agy-perm-{}", self.permission_seq.fetch_add(1, Ordering::SeqCst) + 1);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(
@@ -972,6 +1017,7 @@ mod tests {
             session_id: "conv-1".into(),
             models: Arc::new(std::sync::RwLock::new(Vec::new())),
             slash_commands: Vec::new(),
+            mode_override: Arc::new(std::sync::RwLock::new(None)),
             config: config("/w"),
             spawner: Arc::new(FakeSpawner::new()),
             event_tx,
@@ -1090,6 +1136,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switching_to_full_auto_mid_conversation_stops_the_prompts() {
+        // The hook file is only skipped for sessions that START in full auto, so
+        // a session switched into it still has the hook installed. Without this
+        // the user would keep seeing cards they explicitly turned off.
+        let b = backend_for_permissions().await;
+        b.dispatch(Command::SetMode {
+            mode: "yolo".to_owned(),
+        })
+        .await
+        .expect("mode switch accepted");
+
+        let decision = b.request_external_permission("run_command".into(), json!({})).await;
+        assert_eq!(decision, PermissionDecision::Approved);
+        assert!(
+            b.pending_permission_requests().is_empty(),
+            "full auto must not raise a card at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_back_out_of_full_auto_restores_the_prompts() {
+        // Turning it off has to take effect too, or the user cannot get the
+        // safety back without recreating the conversation.
+        let b = backend_for_permissions().await;
+        b.dispatch(Command::SetMode {
+            mode: "yolo".to_owned(),
+        })
+        .await
+        .unwrap();
+        b.dispatch(Command::SetMode {
+            mode: "default".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        assert!(!b.is_full_auto());
+        // Now it goes back to asking — and, unanswered, refuses (see the deadline).
+        let decision = b.request_external_permission("run_command".into(), json!({})).await;
+        assert_eq!(decision, PermissionDecision::Denied);
+    }
+
+    #[test]
+    fn a_runtime_switch_reaches_the_next_turns_argv() {
+        // agy spawns a fresh process per turn, so the mode only takes effect if
+        // the override is what argv reads.
+        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let mut cfg = config("/tmp/ws");
+        cfg.mode = Some("default".to_owned());
+        let b = AntigravitySessionBackend {
+            session_id: "s1".into(),
+            slash_commands: Vec::new(),
+            mode_override: Arc::new(std::sync::RwLock::new(None)),
+            models: Arc::new(std::sync::RwLock::new(Vec::new())),
+            config: cfg,
+            spawner: Arc::new(crate::testing::FakeSpawner::new()),
+            event_tx,
+            turn_gen: AtomicU64::new(0),
+            anchor: Arc::new(Mutex::new(None)),
+            current: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            permission_seq: AtomicU64::new(0),
+            weak_self: std::sync::OnceLock::new(),
+            in_flight: Arc::new(AtomicBool::new(false)),
+            queued: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        assert_eq!(b.effective_mode().as_deref(), Some("default"));
+        *b.mode_override.write().unwrap() = Some("plan".to_owned());
+        assert_eq!(b.effective_mode().as_deref(), Some("plan"));
+    }
+
+    #[tokio::test]
     async fn answering_an_unknown_request_is_not_an_error() {
         // Double-click, or an answer racing the turn's own drain.
         let b = backend_for_permissions().await;
@@ -1139,6 +1256,7 @@ mod tests {
                 reasoning_efforts: Vec::new(),
             }])),
             slash_commands: Vec::new(),
+            mode_override: Arc::new(std::sync::RwLock::new(None)),
             config: SessionConfig {
                 cwd: Some("/w".into()),
                 model: Some("gemini-3.1-pro-high".into()),
@@ -1264,6 +1382,7 @@ mod tests {
         AntigravitySessionBackend {
             session_id: "s1".into(),
             slash_commands: Vec::new(),
+            mode_override: Arc::new(std::sync::RwLock::new(None)),
             models: Arc::new(std::sync::RwLock::new(
                 models
                     .iter()

@@ -1222,6 +1222,27 @@ pub struct SessionBuildInputs<'a> {
     pub prompt_dump_dir: Option<std::path::PathBuf>,
 }
 
+/// The mode a session actually starts on.
+///
+/// The persisted snapshot wins over the create-time seed: it is where a runtime
+/// switch lands (`save_acp_runtime_mode`) and where a scheduled run records the
+/// full-auto mode it resolved. Reading only `config.session_mode` would see the
+/// value the conversation was created with and miss both.
+///
+/// Aliases are normalized to the backend-native id here, so callers compare
+/// against catalog values rather than whatever spelling reached the API.
+pub(crate) fn resolved_session_mode(
+    config: &AcpBuildExtra,
+    session_snapshot: Option<&PersistedSessionState>,
+    metadata: &aionui_api_types::AgentMetadata,
+) -> Option<String> {
+    session_snapshot
+        .and_then(|s| s.current_mode_id.as_ref().map(|m| m.as_str().to_owned()))
+        .or_else(|| config.session_mode.clone())
+        .map(|m| crate::manager::acp::mode_normalize::normalize_requested_mode(metadata, &m))
+        .filter(|s| !s.is_empty())
+}
+
 /// The pure spec + mode/model mapping — the sibling of clean-slate's
 /// `spec_and_config`. Extracted from `build_session_instance` so it is unit-testable
 /// without spawning a backend.
@@ -1258,11 +1279,7 @@ fn spec_mode_model(
     // the catalog row's `yolo_id` / backend label; a mode without an alias passes
     // through unchanged. Runs BEFORE the codex sandbox/approval derivation downstream
     // (which matches both the alias and the native id, so ordering is safe).
-    let mode = session_snapshot
-        .and_then(|s| s.current_mode_id.as_ref().map(|m| m.as_str().to_owned()))
-        .or_else(|| config.session_mode.clone())
-        .map(|m| crate::manager::acp::mode_normalize::normalize_requested_mode(metadata, &m))
-        .filter(|s| !s.is_empty());
+    let mode = resolved_session_mode(config, session_snapshot, metadata);
     let model = session_snapshot
         .and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned()))
         .or_else(|| config.current_model_id.clone())
