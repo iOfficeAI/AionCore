@@ -492,7 +492,7 @@ fn builtin_troubleshooting_skill_uses_diagnose_cli_not_python_helper() {
     for forbidden in ["python3", "aion_diag.py", "lsof", "ps -", "curl"] {
         assert!(
             !skill.contains(forbidden),
-            "aionui-troubleshooting skill must not mention {forbidden}"
+            "csbu-workmate-troubleshooting skill must not mention {forbidden}"
         );
     }
     assert!(skill.contains("\"$AIONUI_HELPER_BIN\" diagnose capabilities"));

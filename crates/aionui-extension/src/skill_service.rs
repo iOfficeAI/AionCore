@@ -13,6 +13,7 @@ use crate::constants::{
     COMMON_SKILL_DIRS, CRON_SKILLS_DIR_NAME, SKILL_MANIFEST_FILE, SKILLS_DIR_NAME,
 };
 use crate::error::ExtensionError;
+use aionui_api_types::SkillRegistryOriginResponse;
 
 /// Built-in skill corpus embedded into the binary at compile time.
 ///
@@ -286,6 +287,7 @@ pub struct SkillListItem {
     pub relative_location: Option<String>,
     pub is_custom: bool,
     pub source: SkillSource,
+    pub registry_origin: Option<SkillRegistryOriginResponse>,
 }
 
 /// List all available skills (built-in + user custom), deduplicated.
@@ -384,6 +386,7 @@ async fn list_builtin_skills_from_disk(dir: &Path) -> Vec<SkillListItem> {
                 relative_location: Some(rel),
                 is_custom: false,
                 source: SkillSource::Builtin,
+                registry_origin: None,
             });
         }
     }
@@ -410,6 +413,7 @@ async fn list_builtin_skills_from_disk(dir: &Path) -> Vec<SkillListItem> {
                 relative_location: Some(rel),
                 is_custom: false,
                 source: SkillSource::Builtin,
+                registry_origin: None,
             });
         }
     }
@@ -498,6 +502,17 @@ pub async fn read_skill_info(skill_path: &Path) -> Result<(String, String), Exte
     };
 
     Ok((final_name, description))
+}
+
+/// Parse skill metadata from an in-memory `SKILL.md` document.
+pub fn read_skill_info_from_content(content: &str) -> Result<(String, String), ExtensionError> {
+    let (name, description) = parse_frontmatter_fields(content)
+        .ok_or_else(|| ExtensionError::SkillInvalidFrontmatter(SKILL_MANIFEST_FILE.to_owned()))?;
+    if name.trim().is_empty() {
+        return Err(ExtensionError::SkillInvalidFrontmatter(SKILL_MANIFEST_FILE.to_owned()));
+    }
+    validate_filename(&name)?;
+    Ok((name, description))
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,7 +1076,7 @@ async fn replace_existing_path(path: &Path) -> Result<(), ExtensionError> {
     Ok(())
 }
 
-fn user_skill_root_for_user(paths: &SkillPaths, user_id: &str) -> PathBuf {
+pub(crate) fn user_skill_root_for_user(paths: &SkillPaths, user_id: &str) -> PathBuf {
     // Type-first per-user root: skills/users/{user_dir}/ for every user,
     // including the default user (no more flat-root special case).
     let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
@@ -1241,7 +1256,8 @@ pub async fn delete_skill_with_repo_for_user(
         );
     }
 
-    repo.delete_by_name_for_user(user_id, skill_name).await?;
+    repo.delete_by_name_with_registry_origin_for_user(user_id, skill_name)
+        .await?;
     debug!(skill = %skill_name, "skill marked deleted");
     Ok(())
 }
@@ -1640,10 +1656,22 @@ async fn list_skills_from_repo(
     repo: &dyn ISkillRepository,
     user_id: &str,
 ) -> Result<Vec<SkillListItem>, ExtensionError> {
+    let origins: std::collections::HashMap<_, _> = repo
+        .list_registry_installs_for_user(user_id)
+        .await?
+        .into_iter()
+        .map(|origin| (origin.skill_id.clone(), origin))
+        .collect();
     let mut items = Vec::new();
     for row in dedupe_user_visible_skill_rows(repo.list_for_user(user_id).await?) {
         let description = row.description.clone().unwrap_or_default();
-        items.push(skill_row_to_list_item(paths, row, description));
+        let registry_origin = origins.get(&row.id).map(|origin| SkillRegistryOriginResponse {
+            registry_key: origin.registry_key.clone(),
+            namespace: origin.namespace.clone(),
+            slug: origin.slug.clone(),
+            installed_version: origin.installed_version.clone(),
+        });
+        items.push(skill_row_to_list_item(paths, row, description, registry_origin));
     }
     Ok(items)
 }
@@ -1805,7 +1833,12 @@ fn is_user_scoped_skill_storage_path(path: &Path) -> bool {
     })
 }
 
-fn skill_row_to_list_item(paths: &SkillPaths, row: SkillRow, description: String) -> SkillListItem {
+fn skill_row_to_list_item(
+    paths: &SkillPaths,
+    row: SkillRow,
+    description: String,
+    registry_origin: Option<SkillRegistryOriginResponse>,
+) -> SkillListItem {
     let source = skill_source_from_row(&row.source);
     let relative_location = skill_relative_location(paths, &row, source);
     let location = match source {
@@ -1823,6 +1856,7 @@ fn skill_row_to_list_item(paths: &SkillPaths, row: SkillRow, description: String
         relative_location,
         is_custom: source == SkillSource::Custom,
         source,
+        registry_origin,
     }
 }
 
@@ -1866,6 +1900,7 @@ async fn list_user_skills_from_disk(paths: &SkillPaths) -> Result<Vec<SkillListI
             relative_location: None,
             is_custom: true,
             source: SkillSource::Custom,
+            registry_origin: None,
         })
         .collect())
 }

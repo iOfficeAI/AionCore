@@ -73,6 +73,7 @@ pub async fn build_app_with_skill_paths(root: &std::path::Path) -> (axum::Router
         skill_repo: std::sync::Arc::new(aionui_db::SqliteSkillRepository::new(services.database.pool().clone())),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: states.skill.assistant_dispatcher.clone(),
+        registry_service: None,
     };
 
     let router = create_router_with_states(&services, states);

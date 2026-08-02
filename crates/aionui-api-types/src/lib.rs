@@ -150,12 +150,14 @@ pub use shell::{
 };
 pub use skill::{
     AddExternalPathRequest, DeleteSkillRequest, ExportSkillRequest, ExternalSkillSourceResponse,
-    ImportSkillFailureResponse, ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest,
-    MaterializeSkillsResponse, MaterializedSkillRef, NamedPathResponse, ReadAssistantRuleRequest,
+    ImportSkillFailureResponse, ImportSkillRequest, ImportSkillResponse, InstallOfficialSkillRequest,
+    MaterializeSkillsRequest, MaterializeSkillsResponse, MaterializedSkillRef, NamedPathResponse, OfficialSkillDetail,
+    OfficialSkillFile, OfficialSkillInstallStatus, OfficialSkillInstallationResponse, OfficialSkillSearchQuery,
+    OfficialSkillSearchResponse, OfficialSkillSummary, OfficialSkillVersionResponse, ReadAssistantRuleRequest,
     ReadBuiltinResourceRequest, ReadSkillInfoRequest, ReadSkillInfoResponse, RemoveExternalPathRequest,
     ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse, SkillImportLimitsResponse,
-    SkillImportRecordResponse, SkillListItemResponse, SkillPathsResponse, SkillSourceResponse,
-    WriteAssistantRuleRequest,
+    SkillImportRecordResponse, SkillListItemResponse, SkillPathsResponse, SkillRegistryOriginResponse,
+    SkillSourceResponse, UpdateOfficialSkillRequest, WriteAssistantRuleRequest,
 };
 pub use system::{
     ClientPreferencesResponse, FeedbackDiagnosticsContextResponse, FeedbackDiagnosticsPrivacyResponse,

@@ -1,5 +1,5 @@
 ---
-name: aionui-config
+name: csbu-workmate-config
 description: >-
   Configure CSBU WorkMate itself through the bundled aioncore config CLI: create and edit assistants, update assistant rules, inspect and import skills, manage MCP servers, configure model providers, update settings, manage agents, configure scheduled tasks, and manage app configuration from an agent conversation. Use when the user wants you to set up or modify an CSBU WorkMate assistant, attach skills, change an assistant's system prompt, add MCP or model provider configuration, schedule recurring work, or otherwise configure their CSBU WorkMate installation, including when the user needs to know whether assistant changes affect the current conversation or only new conversations.
 ---
@@ -121,7 +121,7 @@ Create an assistant:
     "Turn this feature idea into a PRD",
     "Review this PRD and identify confusing parts for new users"
   ],
-  "enabled_skills": ["aionui-config"]
+  "enabled_skills": ["csbu-workmate-config"]
 }
 JSON
 ```
@@ -231,7 +231,7 @@ Attach skills to an assistant by updating the assistant's full skill list:
 "$AIONUI_HELPER_BIN" config assistants update <<'JSON'
 {
   "assistant_id": "current",
-  "enabled_skills": ["aionui-config", "cron"]
+  "enabled_skills": ["csbu-workmate-config", "cron"]
 }
 JSON
 ```

@@ -24,6 +24,8 @@ use aionui_db::ISkillRepository;
 use crate::classifier::AssistantRuleDispatcher;
 use crate::error::ExtensionError;
 use crate::external_paths::ExternalPathsManager;
+use crate::skill_registry::SkillRegistryService;
+use crate::skill_registry::routes::skill_registry_routes;
 use crate::skill_service::{self, SkillPaths, SkillSource};
 
 fn to_source_response(source: SkillSource) -> SkillSourceResponse {
@@ -54,6 +56,7 @@ pub struct SkillRouterState {
     /// `None`, the legacy user-directory-only behavior is preserved.
     #[allow(clippy::type_complexity)]
     pub assistant_dispatcher: Option<Arc<dyn AssistantRuleDispatcher>>,
+    pub registry_service: Option<SkillRegistryService>,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,7 +67,8 @@ pub struct SkillRouterState {
 ///
 /// All routes require authentication (applied by the caller).
 pub fn skill_routes(state: SkillRouterState) -> Router {
-    Router::new()
+    let registry_service = state.registry_service.clone();
+    let routes = Router::new()
         // Skill listing & info
         .route("/api/skills", get(list_skills))
         .route("/api/skills/import-history", get(list_import_history))
@@ -102,7 +106,12 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
         // Skills market
         .route("/api/skills/market/enable", post(enable_skills_market))
         .route("/api/skills/market/disable", post(disable_skills_market))
-        .with_state(state)
+        .with_state(state);
+    if let Some(service) = registry_service {
+        routes.merge(skill_registry_routes(service))
+    } else {
+        routes
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +139,7 @@ async fn list_skills(
             relative_location: s.relative_location,
             is_custom: s.is_custom,
             source: to_source_response(s.source),
+            registry_origin: s.registry_origin,
         })
         .collect();
     Ok(Json(ApiResponse::ok(resp)))
@@ -643,6 +653,7 @@ mod tests {
             skill_repo,
             external_paths_manager: ext_mgr,
             assistant_dispatcher: None,
+            registry_service: None,
         }
     }
 

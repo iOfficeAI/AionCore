@@ -35,3 +35,19 @@ pub struct SkillImportRecordRow {
     pub column: Option<i64>,
     pub created_at: TimestampMs,
 }
+
+/// Provenance for a user skill installed from an online registry.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SkillRegistryInstallRow {
+    pub id: String,
+    pub user_id: String,
+    pub skill_id: String,
+    pub registry_key: String,
+    pub namespace: String,
+    pub slug: String,
+    pub remote_skill_id: i64,
+    pub remote_version_id: i64,
+    pub installed_version: String,
+    pub installed_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}

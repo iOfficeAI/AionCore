@@ -144,7 +144,7 @@ fn aionrs_final_input_dump_value_contains_raw_split_input_and_context() {
         base_url: Some("https://example.test/v1".to_owned()),
         system_prompt: Some("assistant rule raw".to_owned()),
         session_mode: Some("yolo".to_owned()),
-        skills: vec!["aionui-config".to_owned()],
+        skills: vec!["csbu-workmate-config".to_owned()],
         mcp_servers,
         runtime_env: vec![("AIONUI_RAW".to_owned(), "raw-env-value".to_owned())],
     };
@@ -168,7 +168,7 @@ fn aionrs_final_input_dump_value_contains_raw_split_input_and_context() {
     assert_eq!(value["resolved_context"]["provider"], "openai");
     assert_eq!(value["resolved_context"]["model"], "gpt-test");
     assert_eq!(value["resolved_context"]["workspace"]["path"], "/workspace");
-    assert_eq!(value["resolved_context"]["skills"][0], "aionui-config");
+    assert_eq!(value["resolved_context"]["skills"][0], "csbu-workmate-config");
     assert_eq!(
         value["resolved_context"]["mcp_servers"]["raw-mcp"]["env"]["TOKEN"],
         "raw-token-value"

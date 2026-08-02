@@ -1,8 +1,10 @@
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{SkillImportRecordRow, SkillRow};
-use crate::repository::skill::{CreateSkillImportRecordParams, ISkillRepository, UpsertSkillParams};
+use crate::models::{SkillImportRecordRow, SkillRegistryInstallRow, SkillRow};
+use crate::repository::skill::{
+    CreateSkillImportRecordParams, ISkillRepository, UpsertSkillParams, UpsertSkillRegistryInstallParams,
+};
 
 const DEFAULT_USER_ID: &str = "system_default_user";
 
@@ -186,6 +188,41 @@ impl ISkillRepository for SqliteSkillRepository {
             .ok_or_else(|| DbError::NotFound(format!("skill '{name}'")))
     }
 
+    async fn delete_by_name_with_registry_origin_for_user(
+        &self,
+        user_id: &str,
+        name: &str,
+    ) -> Result<SkillRow, DbError> {
+        let mut transaction = self.pool.begin().await?;
+        let row =
+            sqlx::query_as::<_, SkillRow>("SELECT * FROM skills WHERE user_id = ? AND name = ? AND deleted_at IS NULL")
+                .bind(user_id)
+                .bind(name)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or_else(|| DbError::NotFound(format!("skill '{name}'")))?;
+        let now = aionui_common::now_ms();
+        sqlx::query("UPDATE skills SET enabled = 0, deleted_at = ?, updated_at = ? WHERE id = ? AND user_id = ?")
+            .bind(now)
+            .bind(now)
+            .bind(&row.id)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM skill_registry_installs WHERE user_id = ? AND skill_id = ?")
+            .bind(user_id)
+            .bind(&row.id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(SkillRow {
+            enabled: false,
+            deleted_at: Some(now),
+            updated_at: now,
+            ..row
+        })
+    }
+
     async fn create_import_record(
         &self,
         params: CreateSkillImportRecordParams<'_>,
@@ -250,6 +287,101 @@ impl ISkillRepository for SqliteSkillRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    async fn list_registry_installs_for_user(&self, user_id: &str) -> Result<Vec<SkillRegistryInstallRow>, DbError> {
+        Ok(sqlx::query_as::<_, SkillRegistryInstallRow>(
+            "SELECT * FROM skill_registry_installs WHERE user_id = ? ORDER BY updated_at DESC, id DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn find_registry_install_for_user(
+        &self,
+        user_id: &str,
+        registry_key: &str,
+        namespace: &str,
+        slug: &str,
+    ) -> Result<Option<SkillRegistryInstallRow>, DbError> {
+        Ok(sqlx::query_as::<_, SkillRegistryInstallRow>(
+            "SELECT * FROM skill_registry_installs \
+             WHERE user_id = ? AND registry_key = ? AND namespace = ? AND slug = ?",
+        )
+        .bind(user_id)
+        .bind(registry_key)
+        .bind(namespace)
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn find_registry_install_by_skill_for_user(
+        &self,
+        user_id: &str,
+        skill_id: &str,
+    ) -> Result<Option<SkillRegistryInstallRow>, DbError> {
+        Ok(sqlx::query_as::<_, SkillRegistryInstallRow>(
+            "SELECT * FROM skill_registry_installs WHERE user_id = ? AND skill_id = ?",
+        )
+        .bind(user_id)
+        .bind(skill_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn upsert_registry_install_for_user(
+        &self,
+        user_id: &str,
+        params: UpsertSkillRegistryInstallParams<'_>,
+    ) -> Result<SkillRegistryInstallRow, DbError> {
+        let now = aionui_common::now_ms();
+        let existing = self
+            .find_registry_install_for_user(user_id, params.registry_key, params.namespace, params.slug)
+            .await?;
+        let id = existing
+            .as_ref()
+            .map(|row| row.id.clone())
+            .unwrap_or_else(|| aionui_common::generate_prefixed_id("skill_registry_install"));
+        let installed_at = existing.as_ref().map(|row| row.installed_at).unwrap_or(now);
+
+        sqlx::query(
+            "INSERT INTO skill_registry_installs \
+                (id, user_id, skill_id, registry_key, namespace, slug, remote_skill_id, remote_version_id, \
+                 installed_version, installed_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(user_id, registry_key, namespace, slug) DO UPDATE SET \
+                skill_id = excluded.skill_id, remote_skill_id = excluded.remote_skill_id, \
+                remote_version_id = excluded.remote_version_id, installed_version = excluded.installed_version, \
+                updated_at = excluded.updated_at",
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(params.skill_id)
+        .bind(params.registry_key)
+        .bind(params.namespace)
+        .bind(params.slug)
+        .bind(params.remote_skill_id)
+        .bind(params.remote_version_id)
+        .bind(params.installed_version)
+        .bind(installed_at)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        self.find_registry_install_for_user(user_id, params.registry_key, params.namespace, params.slug)
+            .await?
+            .ok_or_else(|| DbError::NotFound("skill registry install was not found after upsert".into()))
+    }
+
+    async fn delete_registry_install_by_skill_for_user(&self, user_id: &str, skill_id: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM skill_registry_installs WHERE user_id = ? AND skill_id = ?")
+            .bind(user_id)
+            .bind(skill_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
@@ -481,6 +613,101 @@ mod tests {
                 .path,
             "/tmp/global"
         );
+    }
+
+    #[tokio::test]
+    async fn registry_install_records_are_upserted_and_scoped_by_user() {
+        let (repo, _db) = setup().await;
+        let skill_a = repo
+            .upsert_for_user(
+                USER_A,
+                UpsertSkillParams {
+                    name: "registry-skill",
+                    description: None,
+                    path: "/tmp/registry-a",
+                    source: "user",
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        let skill_b = repo
+            .upsert_for_user(
+                USER_B,
+                UpsertSkillParams {
+                    name: "registry-skill",
+                    description: None,
+                    path: "/tmp/registry-b",
+                    source: "user",
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        for (user_id, skill_id) in [(USER_A, skill_a.id.as_str()), (USER_B, skill_b.id.as_str())] {
+            repo.upsert_registry_install_for_user(
+                user_id,
+                UpsertSkillRegistryInstallParams {
+                    skill_id,
+                    registry_key: "csbu-skillhub",
+                    namespace: "global",
+                    slug: "registry-skill",
+                    remote_skill_id: 10,
+                    remote_version_id: 20,
+                    installed_version: "1.0.0",
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        repo.upsert_registry_install_for_user(
+            USER_A,
+            UpsertSkillRegistryInstallParams {
+                skill_id: &skill_a.id,
+                registry_key: "csbu-skillhub",
+                namespace: "global",
+                slug: "registry-skill",
+                remote_skill_id: 10,
+                remote_version_id: 21,
+                installed_version: "2.0.0",
+            },
+        )
+        .await
+        .unwrap();
+
+        let a = repo
+            .find_registry_install_for_user(USER_A, "csbu-skillhub", "global", "registry-skill")
+            .await
+            .unwrap()
+            .unwrap();
+        let b = repo
+            .find_registry_install_for_user(USER_B, "csbu-skillhub", "global", "registry-skill")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.installed_version, "2.0.0");
+        assert_eq!(b.installed_version, "1.0.0");
+        assert_eq!(repo.list_registry_installs_for_user(USER_A).await.unwrap().len(), 1);
+
+        repo.delete_by_name_with_registry_origin_for_user(USER_A, "registry-skill")
+            .await
+            .unwrap();
+        assert!(repo.list_registry_installs_for_user(USER_A).await.unwrap().is_empty());
+        assert!(
+            repo.find_by_name_for_user(USER_A, "registry-skill")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.find_by_name_for_user(USER_B, "registry-skill")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(repo.list_registry_installs_for_user(USER_B).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

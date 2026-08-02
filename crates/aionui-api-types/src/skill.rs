@@ -39,6 +39,113 @@ pub struct SkillListItemResponse {
     pub is_auto_inject: bool,
     pub is_custom: bool,
     pub source: SkillSourceResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_origin: Option<SkillRegistryOriginResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillRegistryOriginResponse {
+    pub registry_key: String,
+    pub namespace: String,
+    pub slug: String,
+    pub installed_version: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct OfficialSkillSearchQuery {
+    #[serde(default)]
+    pub q: String,
+    #[serde(default = "default_official_skill_sort")]
+    pub sort: String,
+    #[serde(default)]
+    pub page: u32,
+    #[serde(default = "default_official_skill_page_size")]
+    pub size: u32,
+}
+
+fn default_official_skill_sort() -> String {
+    "newest".to_owned()
+}
+
+fn default_official_skill_page_size() -> u32 {
+    20
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OfficialSkillInstallStatus {
+    NotInstalled,
+    Installed,
+    UpdateAvailable,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OfficialSkillVersionResponse {
+    pub id: i64,
+    pub version: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OfficialSkillSummary {
+    pub id: i64,
+    pub namespace: String,
+    pub slug: String,
+    pub display_name: String,
+    pub summary: String,
+    pub download_count: i64,
+    pub star_count: i64,
+    pub updated_at: String,
+    pub published_version: OfficialSkillVersionResponse,
+    pub install_status: OfficialSkillInstallStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OfficialSkillSearchResponse {
+    pub items: Vec<OfficialSkillSummary>,
+    pub total: u64,
+    pub page: u32,
+    pub size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OfficialSkillDetail {
+    #[serde(flatten)]
+    pub skill: OfficialSkillSummary,
+    pub owner_display_name: String,
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OfficialSkillFile {
+    pub id: i64,
+    pub file_path: String,
+    pub file_size: u64,
+    pub content_type: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct InstallOfficialSkillRequest {
+    pub namespace: String,
+    pub slug: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct UpdateOfficialSkillRequest {
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OfficialSkillInstallationResponse {
+    pub skill_name: String,
+    pub namespace: String,
+    pub slug: String,
+    pub installed_version: String,
 }
 
 /// Request body for `POST /api/skills/info`.
@@ -296,6 +403,7 @@ mod tests {
             is_auto_inject: false,
             is_custom: true,
             source: SkillSourceResponse::Custom,
+            registry_origin: None,
         };
         let json = serde_json::to_value(&item).unwrap();
         assert_eq!(json["name"], "my-skill");
@@ -320,6 +428,7 @@ mod tests {
             is_auto_inject: true,
             is_custom: false,
             source: SkillSourceResponse::Builtin,
+            registry_origin: None,
         };
         let json = serde_json::to_value(&item).unwrap();
         // Project-wide wire contract: relative_location stays snake_case.
@@ -621,6 +730,32 @@ mod tests {
         assert_eq!(json["builtin_skills_dir"], "/app/resources/skills");
         assert!(json.get("userSkillsDir").is_none());
         assert!(json.get("builtinSkillsDir").is_none());
+    }
+
+    #[test]
+    fn official_skill_summary_uses_snake_case_wire_fields() {
+        let summary = OfficialSkillSummary {
+            id: 1,
+            namespace: "global".into(),
+            slug: "fixture".into(),
+            display_name: "Fixture".into(),
+            summary: "Fixture skill".into(),
+            download_count: 3,
+            star_count: 2,
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            published_version: OfficialSkillVersionResponse {
+                id: 10,
+                version: "1.0".into(),
+                status: "PUBLISHED".into(),
+            },
+            install_status: OfficialSkillInstallStatus::UpdateAvailable,
+            installed_version: Some("0.9".into()),
+        };
+        let value = serde_json::to_value(summary).unwrap();
+        assert_eq!(value["display_name"], "Fixture");
+        assert_eq!(value["published_version"]["version"], "1.0");
+        assert_eq!(value["install_status"], "update_available");
+        assert!(value.get("displayName").is_none());
     }
 
     // -- Assistant rules --

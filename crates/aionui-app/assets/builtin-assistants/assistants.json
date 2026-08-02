@@ -505,7 +505,7 @@
       "agent_ref": "aionrs",
       "enabled_skills": [
         "openclaw-setup",
-        "aionui-webui-setup"
+        "csbu-workmate-webui-setup"
       ],
       "custom_skill_names": [],
       "disabled_builtin_skills": [],
@@ -1107,9 +1107,9 @@
       "avatar": "avatars/aionui-assistant.jpg",
       "agent_ref": "aionrs",
       "enabled_skills": [
-        "aionui-config",
-        "aionui-troubleshooting",
-        "aionui-webui-public"
+        "csbu-workmate-config",
+        "csbu-workmate-troubleshooting",
+        "csbu-workmate-webui-public"
       ],
       "custom_skill_names": [],
       "disabled_builtin_skills": [],

@@ -25,8 +25,8 @@ use aionui_db::{
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
-    HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
-    resolve_scan_paths_for_data_dir, resolve_state_file_path,
+    HubIndexManager, HubInstaller, HubRouterState, SkillHubClient, SkillRegistryService, SkillRouterState,
+    resolve_install_target_dir_for_data_dir, resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
 use aionui_file::{BrowseRoots, FileRouterState, FileService, FileWatchService, SnapshotService};
 use aionui_mcp::{
@@ -905,6 +905,11 @@ pub async fn build_extension_states(
     let installer = HubInstaller::new(index_manager.clone(), registry.clone());
 
     let ext_paths_mgr = Arc::new(ExternalPathsManager::new(&skill_data_dir).await);
+    let skill_registry_service = SkillRegistryService::new(
+        SkillHubClient::production().expect("fixed CSBU SkillHub client must build"),
+        services.skill_paths.as_ref().clone(),
+        services.skill_repo.clone(),
+    );
 
     let ext_state = ExtensionRouterState {
         registry: registry.clone(),
@@ -920,6 +925,7 @@ pub async fn build_extension_states(
         skill_repo: services.skill_repo.clone(),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: None,
+        registry_service: Some(skill_registry_service),
     };
 
     (ext_state, hub_state, skill_state)

@@ -1091,7 +1091,7 @@ fn builtin_config_skills_use_config_cli_not_python_or_cron_helper() {
     for forbidden in ["python3", "aionui_api.py", "lsof", "netstat", "curl"] {
         assert!(
             !aionui_config.contains(forbidden),
-            "aionui-config skill must not mention {forbidden}"
+            "csbu-workmate-config skill must not mention {forbidden}"
         );
     }
     assert!(aionui_config.contains("\"$AIONUI_HELPER_BIN\" config context"));
@@ -1107,7 +1107,7 @@ fn builtin_config_skills_use_config_cli_not_python_or_cron_helper() {
     ] {
         assert!(
             aionui_config.contains(command),
-            "aionui-config skill must document {command}"
+            "csbu-workmate-config skill must document {command}"
         );
     }
 
