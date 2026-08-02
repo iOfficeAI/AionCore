@@ -202,7 +202,7 @@ Users can also manually load files via:
 1. **Mandatory requirement**: For PNG/WebP images, must use parser tool (`parse-character-card.js`) to extract data
 2. **Forbidden behavior**: Absolutely cannot guess, fabricate, or infer character information based on image appearance
 3. **Parsing process**:
-   - **Parser tool location**: Pre-installed in AionUi project's `skills/story-roleplay/scripts/` directory
+   - **Parser tool location**: Pre-installed in CSBU WorkMate project's `skills/story-roleplay/scripts/` directory
    - **Must copy to use**: If tool doesn't exist in workspace, MUST use `cp` command to copy from preset directory
    - **Path finding**: If direct path fails, need to find project root (directory containing `skills` directory) first, then use relative path to copy
    - **ABSOLUTELY FORBIDDEN**: Creating, writing, or generating parser tool script yourself

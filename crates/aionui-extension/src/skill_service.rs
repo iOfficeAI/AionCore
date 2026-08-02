@@ -21,6 +21,7 @@ use crate::error::ExtensionError;
 /// (`AIONUI_BUILTIN_SKILLS_PATH`) is consulted at runtime for rapid
 /// iteration and E2E fixtures.
 static BUILTIN_SKILLS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../aionui-app/assets/builtin-skills");
+const BUILTIN_SKILLS_BRAND_REVISION: &str = "csbu-workmate-v1";
 
 /// Name of the environment variable that, when set, overrides the embedded
 /// corpus with an on-disk directory. Consumed by
@@ -60,8 +61,9 @@ pub fn builtin_skills_corpus() -> &'static Dir<'static> {
 /// files change.
 pub fn builtin_skills_materialize_marker(corpus: &Dir<'static>, package_version: &str) -> String {
     format!(
-        "{package_version}+builtin-skills.{}",
-        builtin_skills_corpus_fingerprint(corpus)
+        "{package_version}+builtin-skills.{}.{}",
+        builtin_skills_corpus_fingerprint(corpus),
+        BUILTIN_SKILLS_BRAND_REVISION
     )
 }
 

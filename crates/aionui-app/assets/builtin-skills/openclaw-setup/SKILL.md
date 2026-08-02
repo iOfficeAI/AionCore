@@ -36,7 +36,7 @@ description: 'OpenClaw usage expert: Helps you install, deploy, configure, and u
 **在回答任何 OpenClaw 问题之前，先执行环境诊断，确认工具可以被找到：**
 
 ```bash
-# 1. 检查 AionUi 工作进程中实际可用的 PATH
+# 1. 检查 CSBU WorkMate 工作进程中实际可用的 PATH
 node -e "console.log('PATH entries:', process.env.PATH.split(require('path').delimiter).length); console.log('First 3:', process.env.PATH.split(require('path').delimiter).slice(0,3))"
 
 # 2. 检查 openclaw 是否在 PATH 中可找到
@@ -51,7 +51,7 @@ npm root -g && npm bin -g
 - ✅ `openclaw` 找到了 → 环境正常，继续正常操作
 - ❌ `openclaw NOT found in PATH` → 环境问题，按以下步骤排查：
   1. 先确认 `openclaw` 已安装：`npm list -g openclaw`
-  2. 若已安装但找不到，说明 PATH 不包含 npm 全局 bin 目录，这通常是 AionUi 启动方式（非终端）导致的
+  2. 若已安装但找不到，说明 PATH 不包含 npm 全局 bin 目录，这通常是 CSBU WorkMate 启动方式（非终端）导致的
   3. 临时解决：在命令中使用绝对路径，例如 `$(npm bin -g)/openclaw doctor`
 
 ## 快速判断用户状态

@@ -36,6 +36,13 @@ async fn resolves_internal_agent_type_when_backend_is_null() {
     assert_eq!(resolved.agent_source, "internal");
     assert_eq!(resolved.agent_type, "aionrs");
     assert_eq!(resolved.runtime_backend, "aionrs");
+
+    let name: String =
+        sqlx::query_scalar("SELECT name FROM agent_metadata WHERE agent_id = '632f31d2' AND agent_source = 'internal'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(name, "CSBU WorkMate");
 }
 
 #[tokio::test]

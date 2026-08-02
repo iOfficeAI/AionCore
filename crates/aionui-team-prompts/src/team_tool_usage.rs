@@ -43,7 +43,7 @@ For exact schema, run team capabilities.\n\n\
 
 fn render_cli_usage(role: TeamPromptRole, descriptors: &[TeamToolDescriptor]) -> String {
     let mut text = String::from(
-        "You MUST use AionCore Team CLI for ALL team coordination:\n\
+        "You MUST use CSBU WorkMate Team CLI for ALL team coordination:\n\
 \"$AIONUI_HELPER_BIN\" team ...\n\n\
 Run \"$AIONUI_HELPER_BIN\" team capabilities when you need command names,\n\
 stdin JSON schema, required fields, enum values, permissions, examples,\n\
@@ -81,6 +81,8 @@ mod tests {
     #[test]
     fn cli_teammate_usage_excludes_lead_only_tools() {
         let usage = build_team_tool_usage(TeamPromptRole::Teammate, TeamToolTransport::CliAssumed);
+        assert!(usage.contains("CSBU WorkMate Team CLI"));
+        assert!(!usage.contains("AionCore Team CLI"));
         assert!(usage.contains("\"$AIONUI_HELPER_BIN\" team"));
         assert!(usage.contains("team send-message"));
         assert!(!usage.contains("team spawn-agent"));

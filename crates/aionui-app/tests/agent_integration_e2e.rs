@@ -281,6 +281,12 @@ async fn management_endpoint_keeps_deprecated_runtime_rows_for_diagnostics() {
     assert!(types.contains(&"nanobot"));
     assert!(types.contains(&"remote"));
     assert!(types.contains(&"gemini"));
+    assert!(
+        agents
+            .iter()
+            .filter(|agent| agent["agent_type"] == "aionrs" && agent["agent_source"] == "internal")
+            .all(|agent| agent["name"] == "CSBU WorkMate")
+    );
 }
 
 #[tokio::test]

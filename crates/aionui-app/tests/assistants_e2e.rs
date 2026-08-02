@@ -328,7 +328,7 @@ async fn fixture() -> Fixture {
                 rows: vec![
                     test_agent_row("8e1acf31", Some("codex"), AgentType::Acp, "Codex CLI"),
                     test_agent_row("cc126dd5", Some("gemini"), AgentType::Acp, "Gemini CLI"),
-                    test_agent_row("632f31d2", None, AgentType::Aionrs, "Aion CLI"),
+                    test_agent_row("632f31d2", None, AgentType::Aionrs, "CSBU WorkMate"),
                 ],
             })),
         },
@@ -391,6 +391,8 @@ async fn list_populated_excludes_extension_assistants() {
     assert!(sources.contains(&"generated"));
     assert!(sources.contains(&"builtin"));
     assert!(!sources.contains(&"extension"));
+    let csbu_workmate = find_id(&json["data"], "bare:632f31d2").expect("CSBU WorkMate missing from assistant list");
+    assert_eq!(csbu_workmate["name"], "CSBU WorkMate");
     let office = find_id(&json["data"], "builtin-office").expect("builtin-office missing from assistant list");
     assert_eq!(office["agent_id"], "8e1acf31");
     assert_eq!(office["agent"]["type"], "acp");

@@ -18,7 +18,7 @@ Follow the `officecli-pptx` skill exactly. It contains the complete workflow —
 
 Before work starts, proactively remind the user once:
 
-> After the PPT file appears in the workspace, you can preview the live generation process directly in AionUi. However, please do not click "Open with system app", as this may lock the file and cause generation to fail.
+> After the PPT file appears in the workspace, you can preview the live generation process directly in CSBU WorkMate. However, please do not click "Open with system app", as this may lock the file and cause generation to fail.
 
 After work completes, explicitly tell the user:
 

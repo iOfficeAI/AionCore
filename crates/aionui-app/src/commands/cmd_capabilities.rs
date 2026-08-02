@@ -28,7 +28,7 @@ fn data() -> Value {
         "contract": "agent-facing-aioncore-cli",
         "stability": "stable",
         "entrypoint": "aioncore capabilities",
-        "purpose": "Top-level index for agent-facing AionCore CLI domains.",
+        "purpose": "Top-level index for agent-facing CSBU WorkMate backend CLI domains.",
         "output": {
             "stdout": "JSON envelope",
             "stderr": "single stable ..._FAILED error line when output cannot be written",

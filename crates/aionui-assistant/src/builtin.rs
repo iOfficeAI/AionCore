@@ -253,10 +253,7 @@ fn parse_manifest_bytes(bytes: &[u8]) -> HashMap<String, BuiltinAssistant> {
 }
 
 fn brand_text(value: &str) -> String {
-    value
-        .replace("AionUI", "CSBU WorkMate")
-        .replace("AionUi", "CSBU WorkMate")
-        .replace("Aion UI", "CSBU WorkMate")
+    aionui_common::normalize_product_brand_text(value)
 }
 
 fn brand_assistant(assistant: &mut BuiltinAssistant) {
@@ -370,6 +367,24 @@ mod tests {
         let rule = String::from_utf8(rule).expect("embedded butler rule should be UTF-8");
         assert!(rule.contains("CSBU WorkMate"));
         assert!(!rule.contains("AionUi"));
+    }
+
+    #[test]
+    fn legacy_agent_names_use_csbu_workmate_branding() {
+        assert_eq!(brand_text("Aion CLI"), "CSBU WorkMate");
+        assert_eq!(brand_text("Aion Assistant"), "CSBU WorkMate");
+        assert_eq!(brand_text("Powered by @aionui"), "Powered by CSBU WorkMate");
+    }
+
+    #[test]
+    fn embedded_rule_replaces_legacy_powered_by_attribution() {
+        let reg = BuiltinAssistantRegistry::load_embedded();
+        let rule = reg
+            .rule_bytes("moltbook", "en-US")
+            .expect("embedded moltbook rule should exist");
+        let rule = String::from_utf8(rule).expect("embedded moltbook rule should be UTF-8");
+        assert!(rule.contains("Powered by CSBU WorkMate"));
+        assert!(!rule.contains("Powered by @aionui"));
     }
 
     #[test]

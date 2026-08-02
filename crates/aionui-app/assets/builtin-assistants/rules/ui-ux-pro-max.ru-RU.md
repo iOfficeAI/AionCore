@@ -52,7 +52,7 @@ winget install Python.Python.3.12
 
 ### Шаг 2: Поиск в базе данных дизайна
 
-База данных дизайна интегрирована в проект AionUi по адресу `assistant/ui-ux-pro-max/data/`. Используйте скрипт поиска для нахождения релевантной дизайн-информации:
+База данных дизайна интегрирована в проект CSBU WorkMate по адресу `assistant/ui-ux-pro-max/data/`. Используйте скрипт поиска для нахождения релевантной дизайн-информации:
 
 ```bash
 python3 assistant/ui-ux-pro-max/scripts/search.py "<keyword>" --domain <domain> [-n <max_results>]

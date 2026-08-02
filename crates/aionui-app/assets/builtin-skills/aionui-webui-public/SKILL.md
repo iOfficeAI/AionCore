@@ -1,7 +1,7 @@
 ---
 name: aionui-webui-public
 description: >-
-  Expose the user's local AionUi WebUI to the public internet with a near-zero-effort flow. Detects whether the WebUI is running, guides the user to switch it on if needed (the only manual step), self-installs cloudflared cross-platform, opens a Cloudflare quick tunnel, verifies the public URL actually works, then explains the limitations honestly (temporary/random URL, must stay running, password is the only protection, traffic transits Cloudflare). Use whenever the user wants to reach their AionUi from outside the LAN, over the internet, or share a public link. Distinct from aionui-webui-setup (which covers manual LAN / Tailscale / server config through the settings UI): this skill produces a one-click public link via an automatic tunnel.
+  Expose the user's local CSBU WorkMate WebUI to the public internet with a near-zero-effort flow. Detects whether the WebUI is running, guides the user to switch it on if needed (the only manual step), self-installs cloudflared cross-platform, opens a Cloudflare quick tunnel, verifies the public URL actually works, then explains the limitations honestly (temporary/random URL, must stay running, password is the only protection, traffic transits Cloudflare). Use whenever the user wants to reach their CSBU WorkMate from outside the LAN, over the internet, or share a public link. Distinct from aionui-webui-setup (which covers manual LAN / Tailscale / server config through the settings UI): this skill produces a one-click public link via an automatic tunnel.
 ---
 
 > **⚠️ Platform note — read before running any command.** The shell snippets in this skill are written for **macOS / Linux** (bash/zsh). Always check which OS you are on first. On **Windows** do **not** run them verbatim — the underlying tool/CLI commands are usually cross-platform, but the surrounding shell syntax is not. Translate it to PowerShell before running:
@@ -20,13 +20,13 @@ description: >-
 >
 > If a command has no obvious Windows equivalent, prefer the built-in file/HTTP tools over raw shell.
 
-# AionUi WebUI Public Access Guide
+# CSBU WorkMate WebUI Public Access Guide
 
-You help a user turn their local AionUi WebUI (LAN-only at best) into a public internet URL, with the user doing almost nothing. You have a shell (Bash) and run on the same machine as AionUi, so you do the work yourself. The user only does what you architecturally cannot: flip the WebUI toggle in the desktop UI.
+You help a user turn their local CSBU WorkMate WebUI (LAN-only at best) into a public internet URL, with the user doing almost nothing. You have a shell (Bash) and run on the same machine as CSBU WorkMate, so you do the work yourself. The user only does what you architecturally cannot: flip the WebUI toggle in the desktop UI.
 
 ## Core facts (verified, do not re-derive)
 
-- AionUi WebUI is a local HTTP server on port 25808 (the aioncore default; override with the `--port` CLI flag — so don't hardcode it, confirm with the curl probe below). It has built-in user+password / JWT auth, which is the *only* thing protecting it once it's on the public internet — so the password is load-bearing, not a formality (see Step 6 risks).
+- CSBU WorkMate WebUI is a local HTTP server on port 25808 (the aioncore default; override with the `--port` CLI flag — so don't hardcode it, confirm with the curl probe below). It has built-in user+password / JWT auth, which is the *only* thing protecting it once it's on the public internet — so the password is load-bearing, not a formality (see Step 6 risks).
 - There is NO HTTP/CLI way to start the desktop WebUI. Starting it is Electron-IPC only, so you cannot turn it on; you must guide the user to the toggle. You CAN detect its state, install the tunnel, run the tunnel, and verify, all yourself.
 - The tunnel tool is cloudflared (Cloudflare quick tunnel, no account needed). It must be forced to --protocol http2 (see Gotcha).
 - Password changes DO have HTTP routes you can call for the user (see "Optional: change credentials").
@@ -97,16 +97,16 @@ Before handing the URL to the user, prove it from the public side:
 curl -s -o /dev/null -w "%{http_code}" --max-time 20 "<public-url>/"
 ```
 
-Retry 2-3 times with a few seconds between; a freshly created tunnel can return 530/000 for the first few seconds before the edge is ready. Consider it good only when you get 200. For extra confidence, confirm it is really AionUi:
+Retry 2-3 times with a few seconds between; a freshly created tunnel can return 530/000 for the first few seconds before the edge is ready. Consider it good only when you get 200. For extra confidence, confirm it is really CSBU WorkMate:
 
 ```bash
-curl -s --max-time 20 "<public-url>/" | grep -i "<title>AionUi</title>"
+curl -s --max-time 20 "<public-url>/" | grep -i "<title>CSBU WorkMate</title>"
 ```
 
 ### Step 6 - Before handing off: check the password is strong
 
 The moment this URL is public, the WebUI password is the only thing standing
-between the open internet and the user's AionUi. **Before** you give them the
+between the open internet and the user's CSBU WorkMate. **Before** you give them the
 link, proactively ask whether their WebUI password is set and strong — if it's
 still the default, blank, or something weak, offer to change it right now via the
 API (see "Optional - change credentials" below). Don't hand over a public URL
