@@ -52,7 +52,7 @@ winget install Python.Python.3.12
 
 ### 步骤 2：搜索设计数据库
 
-设计数据库已集成到 AionUi 项目的 `assistant/ui-ux-pro-max/data/` 目录中。使用搜索脚本查找相关设计信息：
+设计数据库已集成到 CSBU WorkMate 项目的 `assistant/ui-ux-pro-max/data/` 目录中。使用搜索脚本查找相关设计信息：
 
 ```bash
 python3 assistant/ui-ux-pro-max/scripts/search.py "<关键词>" --domain <域名> [-n <最大结果数>]

@@ -31,6 +31,13 @@ const DEFAULT_CLIENT_ID: &str = "aionui";
 /// Token expiry safety margin (refresh 5 minutes before expiration).
 const EXPIRY_MARGIN_MS: i64 = 5 * 60 * 1000;
 
+const OAUTH_SUCCESS_RESPONSE: &str = "HTTP/1.1 200 OK\r\n\
+    Content-Type: text/html; charset=utf-8\r\n\
+    Connection: close\r\n\r\n\
+    <html><body><h1>Authorization successful!</h1>\
+    <p>You can close this window and return to CSBU WorkMate.</p>\
+    </body></html>";
+
 // ---------------------------------------------------------------------------
 // Discovery response
 // ---------------------------------------------------------------------------
@@ -364,14 +371,7 @@ impl McpOAuthService {
         }
 
         // Send a success response to the browser.
-        let response = "HTTP/1.1 200 OK\r\n\
-            Content-Type: text/html; charset=utf-8\r\n\
-            Connection: close\r\n\r\n\
-            <html><body><h1>Authorization successful!</h1>\
-            <p>You can close this window and return to AionUi.</p>\
-            </body></html>";
-
-        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(OAUTH_SUCCESS_RESPONSE.as_bytes()).await;
 
         Ok((code, state))
     }
@@ -589,6 +589,12 @@ mod tests {
     use super::*;
 
     const TEST_USER_ID: &str = "user-1";
+
+    #[test]
+    fn oauth_success_page_uses_current_product_brand() {
+        assert!(OAUTH_SUCCESS_RESPONSE.contains("return to CSBU WorkMate"));
+        assert!(!OAUTH_SUCCESS_RESPONSE.contains("AionUi"));
+    }
 
     // -- parse_callback_query ------------------------------------------------
 

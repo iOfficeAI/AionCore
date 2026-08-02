@@ -29,6 +29,10 @@ async fn materialize_writes_tree_and_version_file() {
         target.join("example-skill").join("SKILL.md").is_file(),
         "expected fixture skill to be materialized"
     );
+    let skill = std::fs::read_to_string(target.join("example-skill").join("SKILL.md")).unwrap();
+    assert!(skill.contains("Fixture body for CSBU WorkMate and CSBU WorkMate."));
+    assert!(skill.contains("https://github.com/iOfficeAI/AionUi"));
+    assert!(skill.contains("/Applications/AionUi.app"));
 }
 
 #[tokio::test]
@@ -108,6 +112,7 @@ async fn gate_triggers_when_existing_marker_lacks_corpus_fingerprint() {
     std::fs::write(target.join("sentinel"), "will-be-wiped").unwrap();
 
     let marker = aionui_extension::builtin_skills_materialize_marker(&FIXTURE_CORPUS, "1.2.3");
+    assert!(marker.ends_with(".csbu-workmate-v1"));
     let wrote = materialize_if_needed(tmp.path(), &FIXTURE_CORPUS, &marker)
         .await
         .unwrap();

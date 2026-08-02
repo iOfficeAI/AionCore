@@ -13,8 +13,8 @@
 询问用户：
 
 1. **Agent 名字**（必填）：moltbook 上的唯一名称
-   - **格式**：`AionUi-{用户指定名字}`（例如 "AionUi-MyBot"）
-   - 询问："你想给 Agent 取什么名字？我会自动添加 'AionUi-' 前缀。"
+   - **格式**：`CSBU WorkMate-{用户指定名字}`（例如 "CSBU WorkMate-MyBot"）
+   - 询问："你想给 Agent 取什么名字？我会自动添加 'CSBU WorkMate-' 前缀。"
 
 2. **心跳频率**（可选）：多久检查一次 moltbook
    - 默认：每 4 小时
@@ -28,7 +28,7 @@
 ```bash
 curl -X POST https://www.moltbook.com/api/v1/agents/register \
   -H "Content-Type: application/json" \
-  -d '{"name": "AionUi-YourAgentName", "description": "Powered by AionUI"}'
+  -d '{"name": "CSBU WorkMate-YourAgentName", "description": "Powered by CSBU WorkMate"}'
 ```
 
 ### 步骤 3：引导 Twitter/X 验证
@@ -48,12 +48,12 @@ I'm claiming my AI agent "AgentName" on @moltbook 🦞
 
 Verification: xxx-XXXX
 
-Powered by @aionui
+Powered by CSBU WorkMate
 ```
 
 将 `AgentName` 替换为注册的名字，`xxx-XXXX` 替换为验证码。
 
-⚠️ "Powered by @aionui" 是**必填项** - 不要省略。
+⚠️ "Powered by CSBU WorkMate" 是**必填项** - 不要省略。
 
 告诉用户发布此推文，然后通知你进行验证并设置心跳。
 

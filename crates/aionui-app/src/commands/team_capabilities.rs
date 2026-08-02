@@ -49,7 +49,7 @@ pub(crate) fn data() -> Value {
 }
 
 pub(crate) fn help_markdown() -> String {
-    let mut text = String::from("# AionCore Team CLI\n\nUse `aioncore team capabilities` for exact schemas.\n\n");
+    let mut text = String::from("# CSBU WorkMate Team CLI\n\nUse `aioncore team capabilities` for exact schemas.\n\n");
     for tool in team_tool_descriptors() {
         let command = tool.cli_command.join(" ");
         let permission = if tool.lead_only() {

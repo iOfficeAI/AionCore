@@ -52,7 +52,7 @@ Extract key information from the user's request:
 
 ### Step 2: Search Design Database
 
-The design database is integrated into the AionUi project at `assistant/ui-ux-pro-max/data/`. Use the search script to find relevant design information:
+The design database is integrated into the CSBU WorkMate project at `assistant/ui-ux-pro-max/data/`. Use the search script to find relevant design information:
 
 ```bash
 python3 assistant/ui-ux-pro-max/scripts/search.py "<keyword>" --domain <domain> [-n <max_results>]

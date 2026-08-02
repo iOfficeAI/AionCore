@@ -304,7 +304,15 @@ async fn write_dir_recursive(dir: &Dir<'static>, dest: &Path) -> Result<(), Exte
             if let Some(parent) = out_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            tokio::fs::write(&out_path, file.contents()).await?;
+            let contents = if out_path.extension().is_some_and(|extension| extension == "md") {
+                std::str::from_utf8(file.contents())
+                    .map(aionui_common::normalize_product_brand_text)
+                    .map(String::into_bytes)
+                    .unwrap_or_else(|_| file.contents().to_vec())
+            } else {
+                file.contents().to_vec()
+            };
+            tokio::fs::write(&out_path, contents).await?;
         }
         for sub in d.dirs() {
             let sub_rel = sub.path();

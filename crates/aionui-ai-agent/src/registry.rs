@@ -848,11 +848,15 @@ fn decode_row(
     // same merged command/env without either needing extra plumbing.
     let command_override = meta_command_override(&command_override_raw);
     let is_internal_aion_cli = is_internal_aion_cli(&meta);
+    if is_internal_aion_cli {
+        meta.name = AgentType::Aionrs.display_name().to_owned();
+        meta.name_i18n = None;
+    }
     if is_internal_aion_cli && command_override.is_some() {
         warn!(
             id = %meta.id,
             name = %meta.name,
-            "Ignoring command override for internal Aion CLI agent"
+            "Ignoring command override for internal CSBU WorkMate agent"
         );
     }
     let env_override = parse_env_override(&env_override_raw);
@@ -860,7 +864,7 @@ fn decode_row(
         warn!(
             id = %meta.id,
             name = %meta.name,
-            "Ignoring environment overrides for internal Aion CLI agent"
+            "Ignoring environment overrides for internal CSBU WorkMate agent"
         );
     }
 
@@ -2089,6 +2093,8 @@ mod tests {
         let (meta, reason) = super::decode_row(row, super::AvailabilityProjection::Cached).expect("decodes");
         assert_eq!(meta.agent_type, AgentType::Aionrs);
         assert_eq!(meta.agent_source, AgentSource::Internal);
+        assert_eq!(meta.name, "CSBU WorkMate");
+        assert_eq!(meta.name_i18n, None);
         assert_eq!(meta.command, None);
         assert!(!meta.has_command_override);
         assert_eq!(meta.env_override_key_count, 0);

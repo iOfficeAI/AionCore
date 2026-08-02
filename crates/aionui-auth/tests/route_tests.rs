@@ -176,6 +176,11 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+async fn body_text(resp: axum::response::Response) -> String {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
 fn extract_session_token(resp: &axum::response::Response) -> Option<String> {
     resp.headers()
         .get_all(header::SET_COOKIE)
@@ -826,6 +831,10 @@ async fn qr_login_page_returns_html() {
     assert_eq!(resp.status(), StatusCode::OK);
     let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap();
     assert!(content_type.contains("text/html"));
+    let body = body_text(resp).await;
+    assert!(body.contains("QR Login - CSBU WorkMate"));
+    assert!(body.contains("<h1>CSBU WorkMate</h1>"));
+    assert!(!body.contains("AionUI"));
 }
 
 // ===========================================================================

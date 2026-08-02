@@ -139,7 +139,9 @@ impl AgentService {
             .is_some_and(|entries| entries.iter().any(|entry| !entry.name.trim().is_empty()));
 
         if (command_override.is_some() || has_env_override) && is_internal_aion_cli_row(&row) {
-            return Err(AgentError::bad_request("Internal Aion CLI does not support overrides"));
+            return Err(AgentError::bad_request(
+                "Internal CSBU WorkMate agent does not support overrides",
+            ));
         }
 
         // Launch-path overrides only make sense for direct-CLI rows. Bridge-launched
