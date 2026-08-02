@@ -79,6 +79,7 @@ async fn fixture_embedded() -> Fixture {
         skill_repo: skill_repo.clone(),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: states.skill.assistant_dispatcher.clone(),
+        registry_service: None,
     };
     aionui_extension::sync_skill_catalog_into_repo(&states.skill.skill_paths, skill_repo.as_ref())
         .await
@@ -115,6 +116,29 @@ async fn unified_skill_list_includes_auto_inject_entries_from_embedded_corpus() 
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     let arr = json["data"].as_array().unwrap();
+    let all_names: Vec<&str> = arr.iter().filter_map(|item| item["name"].as_str()).collect();
+    for expected in [
+        "csbu-workmate-webui-setup",
+        "csbu-workmate-webui-public",
+        "csbu-workmate-troubleshooting",
+        "csbu-workmate-config",
+    ] {
+        assert!(
+            all_names.contains(&expected),
+            "rebranded builtin skill missing: {expected}"
+        );
+    }
+    for legacy in [
+        "aionui-webui-setup",
+        "aionui-webui-public",
+        "aionui-troubleshooting",
+        "aionui-config",
+    ] {
+        assert!(
+            !all_names.contains(&legacy),
+            "legacy branded builtin skill is still exposed: {legacy}"
+        );
+    }
     let auto_items: Vec<&Value> = arr
         .iter()
         .filter(|item| {
@@ -131,8 +155,8 @@ async fn unified_skill_list_includes_auto_inject_entries_from_embedded_corpus() 
     );
     let names: Vec<&str> = auto_items.iter().filter_map(|item| item["name"].as_str()).collect();
     assert!(
-        names.contains(&"aionui-config"),
-        "aionui-config should be shipped as an auto-inject builtin skill: {names:?}",
+        names.contains(&"csbu-workmate-config"),
+        "csbu-workmate-config should be shipped as an auto-inject builtin skill: {names:?}",
     );
     assert!(
         !names.contains(&"aionui-skills"),

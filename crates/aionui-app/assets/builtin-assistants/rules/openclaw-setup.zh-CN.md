@@ -205,7 +205,7 @@ OpenClaw 设计为在受信任的环境中使用，所有操作都需要你的�
    - 询问用户想配置哪个渠道（Telegram、WhatsApp、Discord、Slack 等）→ **等待用户回复**
    - 说明需要的信息（Bot Token/凭证）→ 获得同意后配置（环境同步格式）→ 验证
 4. **方案 B：启动 CSBU WorkMate WebUI 远程模式**
-   - **必须使用 aionui-webui-setup 技能**：查阅 `references/aionui-webui.md`
+   - **必须使用 csbu-workmate-webui-setup 技能**：查阅 `references/aionui-webui.md`
    - **工作流程**：
      1. 询问用户需求：同一 WiFi、跨网络访问，还是服务器部署？→ **等待用户回复**
      2. 用户回复后，**引导用户到 CSBU WorkMate 设置界面配置**：
@@ -213,7 +213,7 @@ OpenClaw 设计为在受信任的环境中使用，所有操作都需要你的�
           - "请点击 CSBU WorkMate 左下角的**设置图标**（齿轮图标）"
           - "在设置菜单中，点击 **'WebUI'** 选项"
           - "进入 WebUI 配置界面"
-        - **配置步骤**：按照 `aionui-webui-setup` 技能的 `references/aionui-webui.md` 文档，引导用户完成：
+        - **配置步骤**：按照 `csbu-workmate-webui-setup` 技能的 `references/aionui-webui.md` 文档，引导用户完成：
           - Step 1：启用 WebUI（将"启用 WebUI"开关切换到开启状态）
           - Step 2：启用远程访问（如果需要，将"允许远程访问"开关切换到开启状态）
           - Step 3：获取访问信息（告诉用户在设置界面中可以找到访问地址、用户名和密码）
@@ -252,7 +252,7 @@ OpenClaw 设计为在受信任的环境中使用，所有操作都需要你的�
 - 高级场景 → 阅读 `references/best-practices.md`
 - 卸载问题 → 阅读 `references/uninstallation.md`
 
-### aionui-webui-setup 技能
+### csbu-workmate-webui-setup 技能
 
 **核心文档**：`references/aionui-webui.md`
 
@@ -320,7 +320,7 @@ OpenClaw 设计为在受信任的环境中使用，所有操作都需要你的�
 1. 介绍两种方案 → 询问用户选择
 2. **选择 IM 渠道**：询问渠道 → 配置（环境同步格式）→ 验证
 3. **选择 WebUI**：
-   - 使用 `aionui-webui-setup` 技能
+   - 使用 `csbu-workmate-webui-setup` 技能
    - 询问需求：同一 WiFi、跨网络访问，还是服务器部署？→ **等待用户回复**
    - 用户回复后，引导用户到设置界面：
      - "请点击 CSBU WorkMate 左下角的**设置图标**（齿轮图标）"
@@ -343,5 +343,5 @@ OpenClaw 设计为在受信任的环境中使用，所有操作都需要你的�
 6. **远程使用**：介绍两种方案（IM 渠道 vs WebUI）→ 用户选择 → **等待回复** → 配置
 7. **技能使用**：
    - OpenClaw 问题 → `openclaw-setup` 技能（查阅对应文档）
-   - WebUI 配置 → **必须使用 `aionui-webui-setup` 技能**（直接查阅 `references/aionui-webui.md` 并按文档执行，不要重复文档中的详细步骤）
+   - WebUI 配置 → **必须使用 `csbu-workmate-webui-setup` 技能**（直接查阅 `references/aionui-webui.md` 并按文档执行，不要重复文档中的详细步骤）
 8. **不假设**：不假设工具存在，检测不一致时用环境同步方法重检

@@ -1,5 +1,5 @@
 ---
-name: aionui-webui-setup
+name: csbu-workmate-webui-setup
 description: 'CSBU WorkMate WebUI configuration expert: Helps users configure CSBU WorkMate WebUI mode for remote access through the settings interface. Supports LAN connection, Tailscale VPN, and server deployment. Use when users need to set up CSBU WorkMate WebUI, configure remote access, troubleshoot WebUI issues, or deploy CSBU WorkMate on servers.'
 ---
 

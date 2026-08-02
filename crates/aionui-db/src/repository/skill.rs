@@ -1,5 +1,5 @@
 use crate::error::DbError;
-use crate::models::{SkillImportRecordRow, SkillRow};
+use crate::models::{SkillImportRecordRow, SkillRegistryInstallRow, SkillRow};
 
 /// Skill metadata and import-history data access abstraction.
 #[async_trait::async_trait]
@@ -39,6 +39,17 @@ pub trait ISkillRepository: Send + Sync {
     /// Soft-deletes an active skill owned by `user_id`.
     async fn delete_by_name_for_user(&self, user_id: &str, name: &str) -> Result<SkillRow, DbError>;
 
+    /// Soft-deletes a user skill and removes its registry provenance atomically when supported.
+    async fn delete_by_name_with_registry_origin_for_user(
+        &self,
+        user_id: &str,
+        name: &str,
+    ) -> Result<SkillRow, DbError> {
+        let row = self.delete_by_name_for_user(user_id, name).await?;
+        self.delete_registry_install_by_skill_for_user(user_id, &row.id).await?;
+        Ok(row)
+    }
+
     /// Appends one import record.
     async fn create_import_record(
         &self,
@@ -61,6 +72,42 @@ pub trait ISkillRepository: Send + Sync {
         user_id: &str,
         limit: i64,
     ) -> Result<Vec<SkillImportRecordRow>, DbError>;
+
+    async fn list_registry_installs_for_user(&self, _user_id: &str) -> Result<Vec<SkillRegistryInstallRow>, DbError> {
+        Ok(Vec::new())
+    }
+
+    async fn find_registry_install_for_user(
+        &self,
+        _user_id: &str,
+        _registry_key: &str,
+        _namespace: &str,
+        _slug: &str,
+    ) -> Result<Option<SkillRegistryInstallRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn find_registry_install_by_skill_for_user(
+        &self,
+        _user_id: &str,
+        _skill_id: &str,
+    ) -> Result<Option<SkillRegistryInstallRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn upsert_registry_install_for_user(
+        &self,
+        _user_id: &str,
+        _params: UpsertSkillRegistryInstallParams<'_>,
+    ) -> Result<SkillRegistryInstallRow, DbError> {
+        Err(DbError::NotFound(
+            "skill registry install repository is unavailable".into(),
+        ))
+    }
+
+    async fn delete_registry_install_by_skill_for_user(&self, _user_id: &str, _skill_id: &str) -> Result<(), DbError> {
+        Ok(())
+    }
 }
 
 /// Parameters for creating or updating a skill row.
@@ -89,4 +136,15 @@ pub struct CreateSkillImportRecordParams<'a> {
     pub limit_bytes: Option<i64>,
     pub line: Option<i64>,
     pub column: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertSkillRegistryInstallParams<'a> {
+    pub skill_id: &'a str,
+    pub registry_key: &'a str,
+    pub namespace: &'a str,
+    pub slug: &'a str,
+    pub remote_skill_id: i64,
+    pub remote_version_id: i64,
+    pub installed_version: &'a str,
 }

@@ -272,6 +272,7 @@ async fn fixture() -> Fixture {
         skill_repo: std::sync::Arc::new(aionui_db::SqliteSkillRepository::new(services.database.pool().clone())),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: None, // wired below once service is constructed
+        registry_service: None,
     };
 
     // Rebuild AssistantService pointing at our temp built-in manifest + temp

@@ -27,8 +27,8 @@ pub use models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow,
     AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams,
     ExternalUserProjection, FolderRow, ProjectExplorerRow, ProjectKind, ProjectRow, Role, SkillImportRecordRow,
-    SkillRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
-    UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    SkillRegistryInstallRow, SkillRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
+    UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams, UserStatus,
     UserType,
 };
@@ -44,7 +44,7 @@ pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
-pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams};
+pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams, UpsertSkillRegistryInstallParams};
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{
     CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile, FeedbackDiagnosticsProfileResult,

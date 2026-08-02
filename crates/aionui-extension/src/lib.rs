@@ -19,6 +19,7 @@ pub mod registry;
 mod registry_helpers;
 pub mod resolvers;
 pub mod routes;
+pub mod skill_registry;
 pub mod skill_routes;
 pub mod skill_service;
 pub mod startup_materialize;
@@ -50,6 +51,7 @@ pub use external_paths::ExternalPathsManager;
 pub use hub::{HubIndexManager, HubInstaller};
 pub use hub_routes::{HubRouterState, hub_routes};
 pub use routes::{ExtensionRouterState, extension_routes};
+pub use skill_registry::{SkillHubClient, SkillRegistryService};
 pub use skill_routes::{SkillRouterState, skill_routes};
 pub use skill_service::{
     BUILTIN_SKILLS_ENV_VAR, ExternalSkillSource, NamedPath, ResolvedAgentSkill, ScannedSkill, SkillListItem,

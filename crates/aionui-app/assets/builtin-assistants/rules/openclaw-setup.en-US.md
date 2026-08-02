@@ -201,7 +201,7 @@ I've explained OpenClaw's capabilities and permission scope. OpenClaw is a power
    - Ask user which channel (Telegram, WhatsApp, Discord, Slack, etc.) → **Wait for user reply**
    - Explain required info (Bot Token/credentials) → Get consent → Configure (environment-synchronized format) → Verify
 4. **Option B: Start CSBU WorkMate WebUI Remote Mode**
-   - **Must use aionui-webui-setup skill**: Consult `references/aionui-webui.md`
+   - **Must use csbu-workmate-webui-setup skill**: Consult `references/aionui-webui.md`
    - **Workflow**:
      1. Ask user needs: Same WiFi, cross-network access, or server deployment? → **Wait for user reply**
      2. After user replies, **guide user to CSBU WorkMate settings interface**:
@@ -209,7 +209,7 @@ I've explained OpenClaw's capabilities and permission scope. OpenClaw is a power
           - "Please click the **Settings icon** (gear icon) at the bottom left of CSBU WorkMate"
           - "In the settings menu, click the **'WebUI'** option"
           - "Enter the WebUI configuration interface"
-        - **Configuration steps**: Follow `aionui-webui-setup` skill's `references/aionui-webui.md` documentation to guide user:
+        - **Configuration steps**: Follow `csbu-workmate-webui-setup` skill's `references/aionui-webui.md` documentation to guide user:
           - Step 1: Enable WebUI (switch "Enable WebUI" toggle to ON)
           - Step 2: Enable remote access (if needed, switch "Allow Remote Access" toggle to ON)
           - Step 3: Get access information (tell user they can find access URL, username, and password in settings interface)
@@ -248,7 +248,7 @@ Contains comprehensive OpenClaw documentation:
 - Advanced scenarios → Read `references/best-practices.md`
 - Uninstallation questions → Read `references/uninstallation.md`
 
-### aionui-webui-setup Skill
+### csbu-workmate-webui-setup Skill
 
 **Core documentation**: `references/aionui-webui.md`
 
@@ -315,7 +315,7 @@ Contains comprehensive OpenClaw documentation:
 
 1. Introduce both options → Ask user to choose
 2. **Choose IM Channels**: Ask channel → Configure (environment-synchronized format) → Verify
-3. **Choose WebUI**: Use `aionui-webui-setup` skill → Ask needs → Choose solution → Execute configuration → Provide usage instructions
+3. **Choose WebUI**: Use `csbu-workmate-webui-setup` skill → Ask needs → Choose solution → Execute configuration → Provide usage instructions
 4. Verify success → Ask about other needs
 
 ---
@@ -330,5 +330,5 @@ Contains comprehensive OpenClaw documentation:
 6. **Remote usage**: Introduce both options (IM Channels vs WebUI) → User chooses → **Wait for reply** → Configure
 7. **Skill usage**:
    - OpenClaw questions → `openclaw-setup` skill (consult corresponding documentation)
-   - WebUI configuration → **Must use `aionui-webui-setup` skill** (directly consult `references/aionui-webui.md` and follow documentation, don't repeat detailed steps from documentation)
+   - WebUI configuration → **Must use `csbu-workmate-webui-setup` skill** (directly consult `references/aionui-webui.md` and follow documentation, don't repeat detailed steps from documentation)
 8. **Don't assume**: Don't assume tools exist, if detection inconsistent use environment synchronization method to re-check
