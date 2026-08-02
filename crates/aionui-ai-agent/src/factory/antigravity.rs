@@ -112,6 +112,14 @@ pub(super) async fn build(
         }
     };
 
+    // Prepared in every branch: full auto does not install it now, but the user
+    // may switch out of full auto later and the backend needs it to restore the
+    // gate.
+    let permission_hook_body = deps
+        .antigravity_hook_base_url
+        .as_deref()
+        .map(|_| crate::antigravity_hook::hooks_json_body(deps.backend_binary_path.as_path()));
+
     let mut runtime_env = ctx.runtime_env.clone();
     runtime_env.extend(hook_env);
 
@@ -133,6 +141,7 @@ pub(super) async fn build(
             // Persists the resume anchor + observed mode/model from the pump.
             acp_session_repo: Some(deps.acp_agent_service.repo()),
             prompt_dump_dir: None,
+            permission_hook_body,
         },
         deps.session_spawner.clone(),
     )

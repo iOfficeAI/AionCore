@@ -89,6 +89,20 @@ pub fn remove_hooks_json(workspace: &Path) {
 pub fn write_hooks_json(workspace: &Path, hook_binary: &Path) -> std::io::Result<()> {
     let dir = workspace.join(AGENTS_DIR);
     std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("hooks.json"), hooks_json_body(hook_binary).as_bytes())
+}
+
+/// The `hooks.json` contents, without writing them.
+///
+/// A session that starts in full auto installs no hook — but it may be switched
+/// out of full auto later, and the backend has no way to rebuild this on its own
+/// (it knows the workspace, not where AionUi's binary lives). Handing it the
+/// prepared body lets it restore the gate when the user asks for it back.
+pub fn hooks_json_body(hook_binary: &Path) -> String {
+    // A COMMAND LINE, not a bare path: agy word-splits it and honours double
+    // quotes (verified against 1.1.8, including a path containing spaces).
+    // Without the subcommand agy would launch the whole backend; without the
+    // quotes any install path with a space would break word splitting.
     let command = format!("\"{}\" {HOOK_SUBCOMMAND}", hook_binary.to_string_lossy());
     let body = serde_json::json!({
         AntigravityHookConfig::HOOK_NAME: {
@@ -102,7 +116,7 @@ pub fn write_hooks_json(workspace: &Path, hook_binary: &Path) -> std::io::Result
             }],
         }
     });
-    std::fs::write(dir.join("hooks.json"), serde_json::to_vec_pretty(&body)?)
+    serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_owned())
 }
 
 #[cfg(test)]

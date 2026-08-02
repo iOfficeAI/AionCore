@@ -248,6 +248,15 @@ pub struct SessionConfig {
     /// only (byte-identical to the pre-#103 spawn). Carried into the F-4 wake
     /// recipe so a resume-respawn re-applies the same env (R16 continuity).
     pub spawn_env: Vec<aionui_common::EnvVar>,
+    /// Antigravity only: the `.agents/hooks.json` body that registers AionUi as
+    /// agy's approval gate.
+    ///
+    /// Carried rather than written unconditionally because a session that starts
+    /// in full auto installs no hook — and the backend cannot rebuild this body
+    /// itself (it knows the workspace, not where AionUi's binary lives). Holding
+    /// it lets a later switch OUT of full auto restore the gate; without it that
+    /// switch would silently leave the session running unattended.
+    pub permission_hook_body: Option<String>,
     /// G1-A: the codex sandbox policy injected into `thread/start` (the native
     /// codex app-server `sandbox` field; codex_conn serializes it data-driven
     /// instead of the hardcoded `"workspace-write"`). `None` (default) ⇒

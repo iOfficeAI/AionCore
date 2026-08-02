@@ -454,6 +454,45 @@ impl AntigravitySessionBackend {
         }
     }
 
+    /// Install or remove the approval hook so agy's view matches the current mode.
+    ///
+    /// Removal alone would be unsafe in reverse: with no `hooks.json` agy never
+    /// calls back, so switching OUT of full auto has to put the file back or the
+    /// session keeps running unattended behind a UI that says otherwise.
+    fn sync_permission_hook(&self) {
+        let Some(cwd) = self.config.cwd.as_deref() else {
+            return;
+        };
+        let dir = std::path::Path::new(cwd).join(".agents");
+        let path = dir.join("hooks.json");
+        if self.is_full_auto() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    tracing::info!(session_id = %self.session_id, "antigravity: full auto — approval hook removed")
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(session_id = %self.session_id, error = %e, "antigravity: could not remove the approval hook")
+                }
+            }
+            return;
+        }
+        let Some(body) = self.config.permission_hook_body.as_deref() else {
+            // No hook was ever configured for this session (no callback address),
+            // so there is nothing to restore — and nothing gating tools either.
+            tracing::warn!(
+                session_id = %self.session_id,
+                "antigravity: leaving full auto but no approval hook is configured; tools stay unattended"
+            );
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, body)) {
+            tracing::warn!(session_id = %self.session_id, error = %e, "antigravity: could not restore the approval hook");
+        } else {
+            tracing::info!(session_id = %self.session_id, "antigravity: approval hook restored");
+        }
+    }
+
     /// The mode this session is on right now, honouring a runtime switch.
     fn effective_mode(&self) -> Option<String> {
         self.mode_override
@@ -758,6 +797,12 @@ impl SessionBackend for AntigravitySessionBackend {
                 if let Ok(mut guard) = self.mode_override.write() {
                     *guard = Some(mode.clone());
                 }
+                // The hook FILE has to follow the switch too. Turning full auto
+                // off is the dangerous direction: a session that started in it
+                // has no hook installed, so agy never calls back and the
+                // in-process check never runs — the user would think they had
+                // restored approval prompts while everything still ran freely.
+                self.sync_permission_hook();
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -1135,6 +1180,35 @@ mod tests {
         assert_eq!(decision, PermissionDecision::Approved);
     }
 
+    /// A backend rooted at `cwd`, in `mode`, carrying a prepared hook body.
+    fn backend_with_hook_body(
+        cwd: &std::path::Path,
+        mode: Option<&str>,
+        hook_body: Option<&str>,
+    ) -> Arc<AntigravitySessionBackend> {
+        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let mut cfg = config(&cwd.to_string_lossy());
+        cfg.mode = mode.map(str::to_owned);
+        cfg.permission_hook_body = hook_body.map(str::to_owned);
+        Arc::new(AntigravitySessionBackend {
+            session_id: "s1".into(),
+            slash_commands: Vec::new(),
+            mode_override: Arc::new(std::sync::RwLock::new(None)),
+            models: Arc::new(std::sync::RwLock::new(Vec::new())),
+            config: cfg,
+            spawner: Arc::new(crate::testing::FakeSpawner::new()),
+            event_tx,
+            turn_gen: AtomicU64::new(0),
+            anchor: Arc::new(Mutex::new(None)),
+            current: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            permission_seq: AtomicU64::new(0),
+            weak_self: std::sync::OnceLock::new(),
+            in_flight: Arc::new(AtomicBool::new(false)),
+            queued: Arc::new(Mutex::new(VecDeque::new())),
+        })
+    }
+
     #[tokio::test]
     async fn switching_to_full_auto_mid_conversation_stops_the_prompts() {
         // The hook file is only skipped for sessions that START in full auto, so
@@ -1156,25 +1230,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn switching_back_out_of_full_auto_restores_the_prompts() {
-        // Turning it off has to take effect too, or the user cannot get the
-        // safety back without recreating the conversation.
-        let b = backend_for_permissions().await;
-        b.dispatch(Command::SetMode {
-            mode: "yolo".to_owned(),
-        })
-        .await
-        .unwrap();
+    async fn switching_back_out_of_full_auto_reinstalls_the_hook_file() {
+        // The FILE is what decides whether agy asks at all. A session that
+        // started in full auto has none, so agy never calls back and the
+        // in-process check never runs — asserting only that the check returns
+        // Denied would pass while the session kept running unattended, which is
+        // exactly how the original bug hid.
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join(".agents/hooks.json");
+        let b = backend_with_hook_body(dir.path(), Some("yolo"), Some("{\"stub\":true}"));
+        assert!(!hook.exists(), "a full-auto session starts without the hook");
+
         b.dispatch(Command::SetMode {
             mode: "default".to_owned(),
         })
         .await
         .unwrap();
 
-        assert!(!b.is_full_auto());
-        // Now it goes back to asking — and, unanswered, refuses (see the deadline).
-        let decision = b.request_external_permission("run_command".into(), json!({})).await;
-        assert_eq!(decision, PermissionDecision::Denied);
+        assert!(hook.exists(), "leaving full auto must restore the gate");
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), "{\"stub\":true}");
+    }
+
+    #[tokio::test]
+    async fn switching_into_full_auto_removes_the_hook_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join(".agents/hooks.json");
+        std::fs::create_dir_all(dir.path().join(".agents")).unwrap();
+        std::fs::write(&hook, "{}").unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("default"), Some("{}"));
+
+        b.dispatch(Command::SetMode {
+            mode: "yolo".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        assert!(!hook.exists(), "full auto must not leave a hook agy would call");
     }
 
     #[test]

@@ -1220,6 +1220,9 @@ pub struct SessionBuildInputs<'a> {
     /// spawn-time `session-cli-config` dump AND threads it (with the vendor
     /// label) into the `SessionAgentTask` for the send-time dump.
     pub prompt_dump_dir: Option<std::path::PathBuf>,
+    /// Antigravity only: the prepared `.agents/hooks.json` body, so a session
+    /// switched out of full auto can restore its approval gate.
+    pub permission_hook_body: Option<String>,
 }
 
 /// The mode a session actually starts on.
@@ -1325,6 +1328,7 @@ pub async fn build_antigravity_instance(
         // agy has no prompt-dump lane yet (the dev dump is keyed by a
         // claude/codex label); skip it rather than mislabel the dump.
         prompt_dump_dir: _,
+        permission_hook_body,
     } = inputs;
 
     let (spec, mode, model) = spec_mode_model(&conversation_id, backend_session_id, config, session_snapshot, metadata);
@@ -1366,6 +1370,7 @@ pub async fn build_antigravity_instance(
         model,
         mode,
         init,
+        permission_hook_body,
         // agy is NOT shipped with the app: it is a large native binary the user
         // installs themselves, so there is no bundled path to resolve and the
         // backend always spawns the `agy` on PATH.
@@ -1433,6 +1438,8 @@ pub async fn build_session_instance(
         catalog_writeback,
         acp_session_repo,
         prompt_dump_dir,
+        // claude/codex gate through CLI flags, not an installed hook file.
+        permission_hook_body: _,
     } = inputs;
 
     // GAP #1/#2 — the pure spec + mode/model mapping (resume anchor → Resume/Fresh,
