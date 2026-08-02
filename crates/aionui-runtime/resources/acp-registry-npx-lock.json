@@ -24,7 +24,7 @@
     "dirac": {
       "registry_json_id": "dirac",
       "package": "dirac-cli",
-      "version": "0.4.31"
+      "version": "0.4.32"
     },
     "glm-acp-agent": {
       "registry_json_id": "glm-acp-agent",
@@ -48,7 +48,7 @@
     "nova": {
       "registry_json_id": "nova",
       "package": "@compass-ai/nova",
-      "version": "1.1.30"
+      "version": "1.1.31"
     },
     "omp": {
       "package": "@oh-my-pi/pi-coding-agent",
