@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use aionui_api_types::{
     ApiResponse, InstallOfficialSkillRequest, OfficialSkillDetail, OfficialSkillFile,
     OfficialSkillInstallationResponse, OfficialSkillSearchQuery, OfficialSkillSearchResponse, OfficialSkillSummary,

@@ -675,7 +675,7 @@ fn portable_path_key(path: &str) -> Result<String, SkillRegistryError> {
     }
     let mut normalized = Vec::new();
     for segment in path.split('/') {
-        let segment = segment.trim_end_matches(|character| character == '.' || character == ' ');
+        let segment = segment.trim_end_matches(['.', ' ']);
         if segment.is_empty()
             || segment == "."
             || segment
