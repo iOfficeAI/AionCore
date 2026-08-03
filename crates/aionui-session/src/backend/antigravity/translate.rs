@@ -92,26 +92,18 @@ impl Translator {
                 if let Some(u) = r.usage {
                     out.push(usage_delta(&u));
                 }
-                let failed = std::mem::take(&mut self.failed_steps);
-                out.push(SessionEvent::TurnResult {
-                    is_error,
-                    api_error_status: None,
-                    result_text,
-                    // The adapter layer is epoch-agnostic; the ai-agent reader
-                    // stamps the live epoch when forwarding.
-                    epoch: 0,
-                    outcome,
-                });
-                // AFTER the result, deliberately. agy calls a turn SUCCESS even
-                // when every tool in it was refused and signs off claiming the
-                // work is done — verified on 1.1.9 in this integration's own
-                // hooks.json shape: three refused steps, terminal SUCCESS,
-                // "已成功创建 random_data_11-46.json", and an empty workspace.
+                // BEFORE the terminal, and it MUST stay there. `StreamRelay`
+                // breaks out of its receive loop the moment it sees the turn's
+                // terminal frame (stream_relay.rs, `break RelayOutcome`), so
+                // anything emitted after it is never persisted and never
+                // rendered. Moving this below `TurnResult` to give the
+                // correction the last word silently deleted it: verified live in
+                // conversation 0803-4, where the log shows four denied
+                // permissions, `event=Notice` at 05:58:29.558 — and no tips row
+                // in the database at all.
                 //
-                // Emitted BEFORE the result, this notice was pushed above the
-                // claim it contradicts and the false success was the last thing
-                // the user read (measured: 2 ms apart, warning first). The
-                // correction has to have the last word.
+                // The cost is that it renders above the claim it corrects. That
+                // is worse than ideal and better than absent.
                 //
                 // It states what the STREAM shows — N steps failed — and never
                 // what the agent said. Whether the reply claims success is not
@@ -124,6 +116,7 @@ impl Translator {
                 // real reasoning, and rewriting the agent's words would be its
                 // own kind of lie. This only refuses to let "success" stand
                 // unqualified.
+                let failed = std::mem::take(&mut self.failed_steps);
                 if !is_error && failed > 0 {
                     out.push(SessionEvent::Notice {
                         // Info, not Warning. The common trigger is a refusal the
@@ -140,6 +133,15 @@ impl Translator {
                         ),
                     });
                 }
+                out.push(SessionEvent::TurnResult {
+                    is_error,
+                    api_error_status: None,
+                    result_text,
+                    // The adapter layer is epoch-agnostic; the ai-agent reader
+                    // stamps the live epoch when forwarding.
+                    epoch: 0,
+                    outcome,
+                });
                 out
             }
         }
@@ -541,11 +543,13 @@ mod tests {
     }
 
     #[test]
-    fn the_correction_has_the_last_word() {
-        // Emitted before the result, the warning was pushed ABOVE the claim it
-        // contradicts and the user's last line was still "已成功创建 …" for a
-        // file that was never written (observed live, 2 ms apart). Order is the
-        // whole point of the warning, so it is pinned here.
+    fn the_notice_precedes_the_terminal_or_it_is_never_delivered() {
+        // NOT cosmetic ordering. `StreamRelay` breaks out of its receive loop on
+        // the terminal frame, so an event emitted after it is dropped before
+        // persistence. Moving the notice below `TurnResult` — to give the
+        // correction the last word — deleted it outright: conversation 0803-4
+        // logged four denied permissions and `event=Notice`, and no tips row was
+        // ever written. Reading above the claim is the price of existing.
         let (_, evs) = tr(REFUSED_TURN);
         let result_at = evs
             .iter()
@@ -556,8 +560,8 @@ mod tests {
             .position(|e| matches!(e, SessionEvent::Notice { .. }))
             .expect("a refused turn must be flagged");
         assert!(
-            notice_at > result_at,
-            "the warning must follow the claim it corrects, got notice@{notice_at} result@{result_at}"
+            notice_at < result_at,
+            "a notice after the terminal is discarded by the relay, got notice@{notice_at} result@{result_at}"
         );
     }
 
