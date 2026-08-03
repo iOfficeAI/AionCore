@@ -92,6 +92,10 @@ pub enum NodeRuntimeFailureKind {
     UnsupportedPlatform,
     BundledResourceMissing,
     BundledResourceInvalid,
+    /// Transient copy/activation I/O failure that persisted past the bounded
+    /// retry budget. Distinct from a missing/corrupt bundled resource: the
+    /// resource is present and may self-heal, so this must NOT drive a reinstall.
+    ActivationIoFailed,
     Unknown,
 }
 

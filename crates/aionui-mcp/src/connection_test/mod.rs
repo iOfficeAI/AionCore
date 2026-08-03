@@ -456,6 +456,7 @@ fn map_failure_kind(kind: NodeRuntimeFailureKind) -> RuntimeFailureKind {
         NodeRuntimeFailureKind::UnsupportedPlatform => RuntimeFailureKind::UnsupportedPlatform,
         NodeRuntimeFailureKind::BundledResourceMissing => RuntimeFailureKind::BundledResourceMissing,
         NodeRuntimeFailureKind::BundledResourceInvalid => RuntimeFailureKind::BundledResourceInvalid,
+        NodeRuntimeFailureKind::ActivationIoFailed => RuntimeFailureKind::ActivationIoFailed,
         NodeRuntimeFailureKind::Unknown => RuntimeFailureKind::Unknown,
     }
 }
