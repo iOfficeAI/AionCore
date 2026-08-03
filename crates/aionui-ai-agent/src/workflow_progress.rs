@@ -132,9 +132,33 @@ pub(crate) struct Rendered {
     pub entries: Vec<ToolGroupEntry>,
 }
 
+/// What kind of background work this card tracks. All three arrive as the same
+/// `task_started` shape, differing only in `task_type`:
+///
+/// - `local_workflow` → [`CardKind::Workflow`]: has a per-agent roster
+///   (`workflow_progress[]`) to render.
+/// - `local_bash` / `local_agent` → [`CardKind::BackgroundTask`]: no roster ever
+///   arrives — the card is a single live row on the launching tool call.
+///
+/// (verified: local_agent + linkage in
+/// `claude_2.1.169_single_tool_turn.ndjson`; local_bash + linkage in
+/// `claude_2.1.220_background_bash_turn.ndjson`; local_workflow in
+/// `claude_2.1.176_workflow_multiagent_3parallel_1fail.ndjson`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardKind {
+    Workflow,
+    BackgroundTask,
+}
+
 /// Live ledger for ONE workflow container.
 #[derive(Debug, Clone)]
 pub(crate) struct WorkflowCard {
+    kind: CardKind,
+    /// Static headline prefix for a [`CardKind::BackgroundTask`] card, built at
+    /// open from the launching call's own arguments (`description`/`command` for
+    /// Bash, `description` for Task) plus the task id — the id is what the user
+    /// quotes to ask the model to stop the task. Empty for workflow cards.
+    bg_headline: String,
     /// The Workflow tool call's own id, so the emitted `tool_call` updates the
     /// card already on screen instead of adding a second one.
     call_id: String,
@@ -164,6 +188,8 @@ pub(crate) struct WorkflowCard {
 impl WorkflowCard {
     pub fn new(call_id: String, tool_name: String, args: serde_json::Value, now_ms: i64) -> Self {
         Self {
+            kind: CardKind::Workflow,
+            bg_headline: String::new(),
             call_id,
             tool_name,
             args,
@@ -175,6 +201,30 @@ impl WorkflowCard {
             last_render: None,
             last_emit_ms: None,
         }
+    }
+
+    /// A rosterless background task (`local_bash` / `local_agent`). `desc` is the
+    /// launching call's own description of the work; `task_id` rides in the
+    /// headline so the user can name the task when asking to stop it.
+    pub fn new_background(
+        call_id: String,
+        tool_name: String,
+        args: serde_json::Value,
+        task_id: &str,
+        desc: Option<String>,
+        now_ms: i64,
+    ) -> Self {
+        let mut card = Self::new(call_id, tool_name, args, now_ms);
+        card.kind = CardKind::BackgroundTask;
+        card.bg_headline = match desc {
+            Some(d) => format!("{} · bg task {task_id}", elide_middle(&d, SUMMARY_MAX)),
+            None => format!("bg task {task_id}"),
+        };
+        card
+    }
+
+    pub fn is_background(&self) -> bool {
+        self.kind == CardKind::BackgroundTask
     }
 
     pub fn call_id(&self) -> &str {
@@ -237,8 +287,10 @@ impl WorkflowCard {
     /// both a content change and the throttle window to have elapsed. Returns
     /// `None` when nothing should go out.
     pub fn take_emission(&mut self, now_ms: i64, forced: bool) -> Option<(ToolCallEventData, Vec<ToolGroupEntry>)> {
-        // An empty roster renders to a contentless card; wait for the first agent.
-        if self.agents.is_empty() {
+        // A WORKFLOW card with an empty roster renders to a contentless card;
+        // wait for the first agent. A background task never has a roster — its
+        // headline alone is the content, so it emits from the moment it opens.
+        if self.kind == CardKind::Workflow && self.agents.is_empty() {
             return None;
         }
         let rendered = self.render(now_ms);
@@ -255,7 +307,13 @@ impl WorkflowCard {
             args: self.args.clone(),
             status: self.status.as_tool_call(),
             input: None,
-            output: Some(rendered.output.clone()),
+            // A background card must NOT send output: the launching call's real
+            // tool_result (e.g. the task-id text) is already persisted there, and
+            // the DB merge-patch would clobber it with an empty tree.
+            output: match self.kind {
+                CardKind::Workflow => Some(rendered.output.clone()),
+                CardKind::BackgroundTask => None,
+            },
             description: Some(rendered.description.clone()),
         };
         let entries = rendered.entries.clone();
@@ -270,6 +328,14 @@ impl WorkflowCard {
     // place and only these tests.
 
     fn render(&self, now_ms: i64) -> Rendered {
+        if self.kind == CardKind::BackgroundTask {
+            // One live row: headline + elapsed. No roster, no expandable tree.
+            return Rendered {
+                description: format!("{} · {}", self.bg_headline, fmt_clock(self.elapsed_ms(now_ms))),
+                output: String::new(),
+                entries: Vec::new(),
+            };
+        }
         Rendered {
             description: self.render_description(now_ms),
             output: self.render_output(),

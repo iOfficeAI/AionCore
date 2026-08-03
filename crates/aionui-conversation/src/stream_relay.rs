@@ -529,7 +529,9 @@ impl StreamRelay {
                             // either, since a progress refresh is not the turn doing work.
                             self.forward_workflow_progress(data);
                             self.adapter.persist_tool_call(&data.card).await;
-                            self.adapter.persist_tool_group(&data.agents).await;
+                            if !data.agents.is_empty() {
+                                self.adapter.persist_tool_group(&data.agents).await;
+                            }
                         }
                         AgentStreamEvent::Tips(data) => {
                             // Only a Success tip blocks auto-replay: it can represent
@@ -842,10 +844,13 @@ impl StreamRelay {
     /// `workflow_progress` on the wire, which no frontend arm handles (it would
     /// land in `useAcpMessage`'s `default:` and light a spurious turn timer).
     fn forward_workflow_progress(&self, data: &aionui_ai_agent::protocol::events::WorkflowProgressData) {
-        for (kind, body) in [
-            ("tool_call", serde_json::to_value(&data.card)),
-            ("tool_group", serde_json::to_value(&data.agents)),
-        ] {
+        let mut frames = vec![("tool_call", serde_json::to_value(&data.card))];
+        // A background-task card has no per-agent roster; an EMPTY tool_group
+        // would persist a junk row under a freshly minted id.
+        if !data.agents.is_empty() {
+            frames.push(("tool_group", serde_json::to_value(&data.agents)));
+        }
+        for (kind, body) in frames {
             let mut body = match body {
                 Ok(v) => v,
                 Err(e) => {
