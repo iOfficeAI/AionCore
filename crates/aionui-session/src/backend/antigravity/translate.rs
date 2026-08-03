@@ -5,7 +5,7 @@
 //! id for pairing a tool's ACTIVE and DONE frames.
 
 use super::wire::{AgyEvent, AgyState, AgyStepType, AgyStepUpdate, AgyUsage};
-use crate::event::{CancelReason, SessionEvent, ToolResultContent, TurnOutcome, UsageBreakdown};
+use crate::event::{CancelReason, NoticeLevel, SessionEvent, ToolResultContent, TurnOutcome, UsageBreakdown};
 
 /// Rewrite agy's terminal error into something the user can act on.
 ///
@@ -36,6 +36,12 @@ pub(crate) struct Translator {
     /// rejected `--model` and fell back to its default. There is no error on
     /// stderr, so this flag is the only signal.
     model_fallback: bool,
+    /// How many steps agy failed during THIS turn.
+    ///
+    /// agy reports a turn as `SUCCESS` even when every tool in it was refused,
+    /// and its closing message claims the work is done. Counting these is the
+    /// only way to notice, because the terminal frame carries no trace of them.
+    failed_steps: u32,
 }
 
 impl Translator {
@@ -82,9 +88,27 @@ impl Translator {
                 } else {
                     r.response
                 };
-                let mut out = Vec::with_capacity(2);
+                let mut out = Vec::with_capacity(3);
                 if let Some(u) = r.usage {
                     out.push(usage_delta(&u));
+                }
+                // agy calls a turn SUCCESS even when every tool in it was
+                // refused, and signs off claiming the work is done — verified
+                // on 1.1.9 with a PreToolUse hook answering `deny`: four failed
+                // steps, terminal SUCCESS, reply "DONE", file never written.
+                // Left alone, the user reads a flat lie. agy's own text is
+                // still shown (it may hold real reasoning); this only refuses
+                // to let "success" stand unqualified.
+                let failed = std::mem::take(&mut self.failed_steps);
+                if !is_error && failed > 0 {
+                    out.push(SessionEvent::Notice {
+                        level: NoticeLevel::Warning,
+                        message: format!(
+                            "The agent reported success, but {failed} step{} failed during this turn — \
+                             any refused or errored action did NOT happen. Verify the result before relying on it.",
+                            if failed == 1 { "" } else { "s" }
+                        ),
+                    });
                 }
                 out.push(SessionEvent::TurnResult {
                     is_error,
@@ -181,6 +205,15 @@ impl Translator {
             }
             // Pure bookkeeping frames: agy echoes the user turn, checkpoints and
             // system notices as steps. They carry no user-visible content.
+            // Counted, not rendered: the frame carries no message, tool name or
+            // cause (only `duration_seconds`), so there is nothing truthful to
+            // put on screen per-step. The count is what makes the turn's
+            // closing "success" answerable.
+            AgyStepType::ErrorMessage => {
+                if su.state == AgyState::Done {
+                    self.failed_steps = self.failed_steps.saturating_add(1);
+                }
+            }
             AgyStepType::UserInput | AgyStepType::Checkpoint | AgyStepType::SystemMessage | AgyStepType::Unknown => {}
         }
 
@@ -444,5 +477,99 @@ mod tests {
             r#"{"event":"step_update","step_update":{"step_index":9,"state":"DONE","step_type":"brand_new_thing"}}"#,
         ]);
         assert!(evs.is_empty(), "unexpected events: {evs:?}");
+    }
+
+    /// The exact frame sequence agy 1.1.9 produced when a PreToolUse hook
+    /// answered `deny`: failed steps, then a SUCCESS terminal claiming "DONE",
+    /// with the file never written.
+    const REFUSED_TURN: &[&str] = &[
+        r#"{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"error_message","duration_seconds":0.62}}"#,
+        r#"{"event":"step_update","step_update":{"step_index":6,"state":"DONE","step_type":"error_message","duration_seconds":0.02}}"#,
+        r#"{"event":"step_update","step_update":{"step_index":11,"state":"DONE","step_type":"agent_response","text_delta":"DONE\n"}}"#,
+        r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"DONE\n"}}"#,
+    ];
+
+    #[test]
+    fn a_success_that_hides_refused_steps_is_flagged() {
+        let (_, evs) = tr(REFUSED_TURN);
+        let notice = evs
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Notice { level, message } => Some((level, message)),
+                _ => None,
+            })
+            .expect("a turn that refused work must not read as plain success");
+        assert_eq!(*notice.0, NoticeLevel::Warning);
+        assert!(notice.1.contains('2'), "the count is the whole signal: {}", notice.1);
+
+        // agy's own text still reaches the user — it may carry real reasoning,
+        // and silently rewriting the agent's words would be its own kind of lie.
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            SessionEvent::TurnResult { is_error: false, result_text, .. } if result_text.contains("DONE")
+        )));
+    }
+
+    #[test]
+    fn a_clean_turn_stays_quiet() {
+        // The warning must mean something; firing it on healthy turns would
+        // train the user to ignore it.
+        let (_, evs) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"hi"}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"hi"}}"#,
+        ]);
+        assert!(
+            !evs.iter().any(|e| matches!(e, SessionEvent::Notice { .. })),
+            "unexpected notice: {evs:?}"
+        );
+    }
+
+    #[test]
+    fn an_already_failed_turn_is_not_double_reported() {
+        // The terminal already says it failed; a second warning adds nothing.
+        let (_, evs) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"error_message"}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","error":"boom"}}"#,
+        ]);
+        assert!(
+            !evs.iter().any(|e| matches!(e, SessionEvent::Notice { .. })),
+            "unexpected notice: {evs:?}"
+        );
+    }
+
+    #[test]
+    fn the_count_does_not_leak_into_the_next_turn() {
+        // One Translator lives for the whole session (agy resumes by id), so a
+        // refused turn must not make every later success look suspect.
+        let mut t = Translator::default();
+        for line in REFUSED_TURN {
+            t.translate(parse_line(line).expect("fixture must parse"));
+        }
+        let clean: Vec<_> = t.translate(
+            parse_line(r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"ok"}}"#)
+                .expect("fixture must parse"),
+        );
+        assert!(
+            !clean.iter().any(|e| matches!(e, SessionEvent::Notice { .. })),
+            "stale count leaked: {clean:?}"
+        );
+    }
+
+    #[test]
+    fn an_in_flight_failed_step_is_counted_once() {
+        // agy emits ACTIVE then DONE for a step; counting both would double it.
+        let (_, evs) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"error_message"}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"error_message"}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"done"}}"#,
+        ]);
+        let msg = evs
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Notice { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("notice expected");
+        assert!(msg.contains('1') && !msg.contains('2'), "counted twice: {msg}");
     }
 }

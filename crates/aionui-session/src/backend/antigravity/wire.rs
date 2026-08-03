@@ -33,6 +33,14 @@ pub(crate) enum AgyStepType {
     Tool,
     Checkpoint,
     SystemMessage,
+    /// A step agy failed. Carries NO payload — no message, no tool name, no
+    /// cause — only `duration_seconds`, so it can be counted but not explained.
+    ///
+    /// Measured on 1.1.9: a refused tool produces one of these per attempt and
+    /// agy then reports the TURN as `status:"SUCCESS"` anyway (verified with a
+    /// PreToolUse hook answering `deny`: four `error_message` steps, terminal
+    /// `SUCCESS`, reply "DONE", and the file never written).
+    ErrorMessage,
     #[serde(other)]
     Unknown,
 }

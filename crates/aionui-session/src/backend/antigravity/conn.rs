@@ -1109,8 +1109,9 @@ mod tests {
 
     #[tokio::test]
     async fn terminate_denies_parked_requests_instead_of_stranding_them() {
-        // A stranded hook holds agy's tool call open until --print-timeout
-        // (5 min), which the user experiences as an unexplained hang.
+        // A stranded hook holds agy's tool call open until --print-timeout,
+        // which the user experiences as an unexplained hang. That backstop is
+        // now an hour, so answering here is what actually keeps it short.
         let b = backend_for_permissions().await;
         let asker = Arc::clone(&b);
         let waiting =

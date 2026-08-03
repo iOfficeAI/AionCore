@@ -25,17 +25,25 @@ pub(crate) struct ArgvInput {
 
 /// How long agy may wait in print mode before abandoning the turn.
 ///
-/// agy's own default is 5m0s (`agy --help`, 1.1.9), which is a wall-clock cap
-/// on the WHOLE turn — a long build, a big refactor or a slow tool run trips it
-/// even while agy is making steady progress. This layer deliberately has no
-/// wall-clock turn cap (see `Admission::Started`: "long turns are normal;
-/// liveness = StuckDetector dead-silence"), so agy's cap is a second, blunter
-/// authority that cannot tell "still working" from "hung".
+/// agy's own default is 5m0s (`agy --help`, 1.1.9) and it is a wall-clock cap
+/// on the WHOLE turn, not an idle timeout: a long build, a big refactor or a
+/// slow tool run trips it while agy is still making steady progress. Measured
+/// on 1.1.9, the cap fires as a clean terminal frame — `result` with
+/// `status:"ERROR"`, `error:"timeout waiting for response"`, exit 1 — so the
+/// turn dies with an error the user cannot act on.
 ///
-/// Pushing it far out hands liveness back to the detector that can make that
-/// distinction — and to the user's own Cancel. Go duration syntax; verified
-/// accepted by agy 1.1.9 (an unparseable value is a hard flag error).
-const PRINT_TIMEOUT: &str = "24h";
+/// It is raised, but NOT removed, because it is the only automatic recovery
+/// this integration has. There is no in-turn silence watchdog anywhere in the
+/// stack: `suspend.rs`'s `last_activity` only moves on dispatch (a session
+/// dormancy TTL), and `collect_idle` skips tasks that are still running. So if
+/// agy goes quiet while alive, the only other ways out are the user's Cancel —
+/// which nobody is there to press on a scheduled run — and this cap.
+///
+/// One hour is therefore the trade: 12× agy's default, comfortably past any
+/// legitimate turn, while still bounding a silent hang instead of parking a
+/// cron conversation for a day. Go duration syntax; verified accepted by agy
+/// 1.1.9 (an unparseable value is a hard flag error).
+const PRINT_TIMEOUT: &str = "1h";
 
 fn non_blank(value: &Option<String>) -> Option<&str> {
     value.as_deref().map(str::trim).filter(|s| !s.is_empty())
