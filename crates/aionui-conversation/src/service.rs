@@ -595,7 +595,7 @@ impl ConversationService {
     /// watcher on its fresh broadcast channel while the old one exits on
     /// `Closed`. Non-Session instances (ACP manager, aionrs, teammates) keep
     /// their existing delivery paths untouched.
-    fn ensure_background_watcher(&self, user_id: &str, conversation_id: &str, agent: &AgentInstance) {
+    pub(crate) fn ensure_background_watcher(&self, user_id: &str, conversation_id: &str, agent: &AgentInstance) {
         let AgentInstance::Session(task) = agent else {
             return;
         };

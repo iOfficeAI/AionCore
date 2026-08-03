@@ -924,3 +924,104 @@ async fn live_claude_workflow_progress_streams() {
         cards.len()
     );
 }
+
+/// PROBE, not a contract test: drive real codex (app-server) through our full
+/// stack and RECORD what background/collab work looks like on the wire — which
+/// SessionEvents arrive, whether anything arrives after the turn's finish, and
+/// what the out-of-turn watcher does with it. codex's background/collab frames
+/// are unsampled territory; this prints facts instead of asserting shapes.
+#[tokio::test]
+#[ignore = "spawns the real codex CLI; needs credentials"]
+async fn live_codex_background_work_probe() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "aionui_ai_agent=debug,aionui_session=debug,aionui_conversation=info",
+        ))
+        .try_init();
+    let app = start_live_app().await;
+
+    let ws_dir = std::env::temp_dir().join(format!("live-codex-bg-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/conversations",
+        json!({
+            "type": "acp",
+            "extra": {"workspace": ws_dir.to_string_lossy(), "backend": "codex"}
+        }),
+    )
+    .await;
+    let conv_id = created["data"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("conversation create failed: {created}"))
+        .to_owned();
+    println!("[codex-bg] conversation {conv_id} workspace {}", ws_dir.display());
+
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+
+    // Ask for BOTH shapes in one turn: a collab sub-agent and a long shell
+    // command, launched without waiting. Whatever codex actually does — spawn,
+    // refuse, run inline — is the data we came for.
+    let sent = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "请派一个协作 sub-agent(collab agent),让它执行 `sleep 40 && echo CODEX_AGENT_DONE` 然后汇报。\
+            派出去之后立刻回复我「已派出」,不要等它完成。如果你还能把 shell 命令放到后台执行,也用后台方式跑一个 `sleep 30 && echo CODEX_BG_DONE`。"}),
+    )
+    .await;
+    assert!(sent["data"]["turn_id"].is_string(), "send failed: {sent}");
+
+    let started = Instant::now();
+    let mut finish_at: Option<Duration> = None;
+    let mut printed = 0usize;
+    while started.elapsed() < Duration::from_secs(150) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        let stream: Vec<&Value> = stream_frames_for(&snapshot, &conv_id);
+        // Print frames incrementally with elapsed + post-finish marker.
+        for f in stream.iter().skip(printed) {
+            let ftype = f["data"]["type"].as_str().unwrap_or("?");
+            let brief = match ftype {
+                "text" | "content" => f["data"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect::<String>(),
+                "tool_call" => format!(
+                    "{} {} {}",
+                    f["data"]["data"]["name"].as_str().unwrap_or("?"),
+                    f["data"]["data"]["status"].as_str().unwrap_or("?"),
+                    f["data"]["data"]["description"].as_str().unwrap_or("")
+                ),
+                "tool_group" => f["data"]["data"].to_string().chars().take(90).collect(),
+                _ => String::new(),
+            };
+            let tag = if finish_at.is_some() { "POST-FINISH" } else { "" };
+            println!(
+                "[codex-bg] +{:5.1}s {tag:11} {ftype:14} {brief}",
+                started.elapsed().as_secs_f32()
+            );
+            if ftype == "finish" && finish_at.is_none() {
+                finish_at = Some(started.elapsed());
+            }
+        }
+        printed = stream.len();
+        // Keep listening well past the finish: the whole point is what (if
+        // anything) arrives once the turn is over.
+        if let Some(f) = finish_at
+            && started.elapsed() > f + Duration::from_secs(60)
+        {
+            break;
+        }
+    }
+    println!(
+        "[codex-bg] done: {} frames, finish at {:?}",
+        printed,
+        finish_at.map(|d| d.as_secs_f32())
+    );
+    assert!(printed > 0, "[codex-bg] no frames at all — probe produced nothing");
+}
