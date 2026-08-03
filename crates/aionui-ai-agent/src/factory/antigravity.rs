@@ -56,7 +56,14 @@ pub(super) async fn build(
     // token that authenticates the hook's callback. Without this the session
     // still runs, but with agy's gate wide open and no per-call approval — so a
     // failure here must be loud.
-    let full_auto = is_full_auto(config.session_mode.as_deref(), yolo_mode_id(meta.yolo_id.as_deref()));
+    // Resolve the mode the same way the session itself will (snapshot over
+    // create-time seed, aliases normalized). Reading `config.session_mode`
+    // directly saw only the value the conversation was created with, so a
+    // runtime switch to full auto — and the mode a scheduled run resolves —
+    // never reached this decision.
+    let resolved_mode =
+        crate::session_agent::resolved_session_mode(&config, build_context.session_snapshot.as_ref(), &meta);
+    let full_auto = is_full_auto(resolved_mode.as_deref(), yolo_mode_id(meta.yolo_id.as_deref()));
     let hook_env = match deps.antigravity_hook_base_url.as_deref() {
         _ if full_auto => {
             tracing::info!(
@@ -105,6 +112,14 @@ pub(super) async fn build(
         }
     };
 
+    // Prepared in every branch: full auto does not install it now, but the user
+    // may switch out of full auto later and the backend needs it to restore the
+    // gate.
+    let permission_hook_body = deps
+        .antigravity_hook_base_url
+        .as_deref()
+        .map(|_| crate::antigravity_hook::hooks_json_body(deps.backend_binary_path.as_path()));
+
     let mut runtime_env = ctx.runtime_env.clone();
     runtime_env.extend(hook_env);
 
@@ -126,6 +141,7 @@ pub(super) async fn build(
             // Persists the resume anchor + observed mode/model from the pump.
             acp_session_repo: Some(deps.acp_agent_service.repo()),
             prompt_dump_dir: None,
+            permission_hook_body,
         },
         deps.session_spawner.clone(),
     )

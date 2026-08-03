@@ -92,3 +92,35 @@ async fn available_modes_match_the_capability_projection_shape() {
     // start every new conversation with approval prompts turned off.
     assert_ne!(v["current_mode_id"], "yolo");
 }
+
+#[tokio::test]
+async fn the_row_agrees_with_the_hardcoded_agent_type_defaults() {
+    // Two of the code paths that serve Antigravity read the compiled-in
+    // `AgentType` defaults rather than this row: `native_skills_dirs` falls
+    // through to `AgentType::native_skills_dirs()` (the row-reading branch is
+    // ACP-only, and widening it would let a NULL column disable skills), and
+    // team spawn falls back to `full_auto_mode_id()` when no row is in hand.
+    // They are correct today only because the two sources agree — so pin that,
+    // rather than leaving a silent divergence for whoever edits either one.
+    use aionui_common::AgentType;
+
+    let pool = migrated_pool().await;
+    let row = sqlx::query("SELECT native_skills_dirs, yolo_id FROM agent_metadata WHERE id = 'a9f3c21e'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let seeded_dirs: Vec<String> = serde_json::from_str(&row.get::<String, _>("native_skills_dirs")).unwrap();
+    let compiled_dirs: Vec<String> = AgentType::Antigravity
+        .native_skills_dirs()
+        .expect("agy discovers skills natively")
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    assert_eq!(seeded_dirs, compiled_dirs);
+
+    assert_eq!(
+        row.get::<String, _>("yolo_id"),
+        AgentType::Antigravity.full_auto_mode_id(Some("antigravity"))
+    );
+}

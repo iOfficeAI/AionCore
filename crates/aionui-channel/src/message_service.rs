@@ -381,6 +381,11 @@ fn parse_agent_type(s: &str) -> Result<AgentType, ChannelError> {
         "nanobot" => AgentType::Nanobot,
         "remote" => AgentType::Remote,
         "aionrs" => AgentType::Aionrs,
+        // agy is a direct-CLI agent that does NOT speak ACP. Letting it reach
+        // the `_` fallback below made a channel bot bound to Antigravity open
+        // its conversation as `acp`, which routes it into the ACP manager and
+        // fails to start — the fallback's "unknown" warning is the only trace.
+        "antigravity" => AgentType::Antigravity,
         _ => {
             warn!(agent_type = %s, "unknown agent type, defaulting to Acp");
             AgentType::Acp
@@ -468,6 +473,13 @@ mod tests {
     fn parse_known_agent_types() {
         assert_eq!(parse_agent_type("acp").unwrap(), AgentType::Acp);
         assert_eq!(parse_agent_type("aionrs").unwrap(), AgentType::Aionrs);
+    }
+
+    #[test]
+    fn antigravity_is_not_collapsed_into_acp() {
+        // Falling through to the `_` arm would open the channel conversation as
+        // `acp` and route agy into the ACP manager, which it does not speak.
+        assert_eq!(parse_agent_type("antigravity").unwrap(), AgentType::Antigravity);
     }
 
     #[test]

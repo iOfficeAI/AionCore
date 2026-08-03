@@ -23,6 +23,28 @@ pub(crate) struct ArgvInput {
     pub mode: Option<String>,
 }
 
+/// How long agy may wait in print mode before abandoning the turn.
+///
+/// agy's own default is 5m0s (`agy --help`, 1.1.9) and it is a wall-clock cap
+/// on the WHOLE turn, not an idle timeout: a long build, a big refactor or a
+/// slow tool run trips it while agy is still making steady progress. Measured
+/// on 1.1.9, the cap fires as a clean terminal frame — `result` with
+/// `status:"ERROR"`, `error:"timeout waiting for response"`, exit 1 — so the
+/// turn dies with an error the user cannot act on.
+///
+/// It is raised, but NOT removed, because it is the only automatic recovery
+/// this integration has. There is no in-turn silence watchdog anywhere in the
+/// stack: `suspend.rs`'s `last_activity` only moves on dispatch (a session
+/// dormancy TTL), and `collect_idle` skips tasks that are still running. So if
+/// agy goes quiet while alive, the only other ways out are the user's Cancel —
+/// which nobody is there to press on a scheduled run — and this cap.
+///
+/// One hour is therefore the trade: 12× agy's default, comfortably past any
+/// legitimate turn, while still bounding a silent hang instead of parking a
+/// cron conversation for a day. Go duration syntax; verified accepted by agy
+/// 1.1.9 (an unparseable value is a hard flag error).
+const PRINT_TIMEOUT: &str = "1h";
+
 fn non_blank(value: &Option<String>) -> Option<&str> {
     value.as_deref().map(str::trim).filter(|s| !s.is_empty())
 }
@@ -38,6 +60,8 @@ pub(crate) fn build_argv(input: &ArgvInput) -> Vec<String> {
     // "allow" cannot override that (hooks can tighten, not loosen). AionUi
     // opens the gate here and gates each call in its own hook bridge instead.
     a.push("--dangerously-skip-permissions".into());
+    a.push("--print-timeout".into());
+    a.push(PRINT_TIMEOUT.into());
 
     if let Some(id) = non_blank(&input.resume_conversation_id) {
         a.push("--conversation".into());
@@ -92,6 +116,36 @@ mod tests {
         assert!(a.contains(&"hello".to_string()));
         assert_eq!(flag_value(&a, "--output-format"), Some("stream-json"));
         assert!(!a.contains(&"--conversation".to_string()));
+    }
+
+    #[test]
+    fn every_turn_lifts_agys_five_minute_wall_clock_cap() {
+        // Left at agy's 5m0s default, a long-but-healthy turn (big refactor,
+        // slow build) is killed by agy itself while this layer — which has no
+        // wall-clock cap and detects hangs by dead silence — sees nothing wrong.
+        for input in [
+            base(),
+            ArgvInput {
+                mode: Some("plan".into()),
+                ..base()
+            },
+        ] {
+            let a = build_argv(&input);
+            assert_eq!(flag_value(&a, "--print-timeout"), Some(PRINT_TIMEOUT), "argv={a:?}");
+        }
+    }
+
+    #[test]
+    fn the_print_timeout_is_a_duration_agy_can_parse() {
+        // agy rejects an unparseable duration at flag-parse time, so a typo here
+        // would break EVERY turn, not just long ones. Go duration syntax:
+        // a number followed by a unit.
+        let (digits, unit) = PRINT_TIMEOUT.split_at(PRINT_TIMEOUT.find(|c: char| !c.is_ascii_digit()).unwrap_or(0));
+        assert!(!digits.is_empty(), "no leading number in {PRINT_TIMEOUT:?}");
+        assert!(
+            matches!(unit, "h" | "m" | "s" | "ms"),
+            "unit {unit:?} is not a Go duration unit"
+        );
     }
 
     #[test]

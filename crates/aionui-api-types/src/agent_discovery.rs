@@ -216,6 +216,11 @@ pub struct AgentMetadata {
     pub last_check_status: Option<AgentSnapshotCheckStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check_kind: Option<AgentSnapshotCheckKind>,
+    /// Diagnostic code from the last check. NOT necessarily an error: an agent
+    /// can probe `Online` and still carry one — `version_drift_*` reports that
+    /// the installed CLI differs from the verified build while the agent works
+    /// fine. Anything deciding "is this agent broken" must read
+    /// `last_check_status`, never the presence of a code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check_error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

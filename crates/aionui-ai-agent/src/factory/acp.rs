@@ -120,6 +120,9 @@ pub(super) async fn build(
                 // DEV (`--dump-prompts`): resolve the dump dir once (mirrors the
                 // aionrs factory's `prompt_dump_dir`). `None` when off.
                 prompt_dump_dir: crate::dev_prompt_dump::dump_dir_for_data_dir(&deps.data_dir, deps.dump_prompts),
+                // claude/codex gate permissions through their own CLI flags, not
+                // through an installed hook file.
+                permission_hook_body: None,
             },
             deps.session_spawner.clone(),
         )
@@ -909,7 +912,7 @@ mod tests {
         )
         .await
         .expect("resolved release-pinned builtin command spec");
-        assert_eq!(spec.args, vec!["-y", "pi-acp@0.0.32"]);
+        assert_eq!(spec.args, vec!["-y", "pi-acp@0.0.33"]);
     }
 
     #[cfg(unix)]

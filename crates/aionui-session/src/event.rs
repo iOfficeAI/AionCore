@@ -414,7 +414,15 @@ pub enum SessionEvent {
     /// `{turnId, willRetry}` and is either a transient retry (→ Heartbeat) or the
     /// turn's terminal cause (→ already covered by `turn/completed`). Reducer NO-OP
     /// (an advisory does not move the FSM). Only the conversation layer projects it.
-    Notice { level: NoticeLevel, message: String },
+    Notice {
+        level: NoticeLevel,
+        /// English text, ALWAYS present. It is what the UI shows when
+        /// `localized` is absent or its code has no translation in the active
+        /// locale, so it must stand on its own — never a placeholder.
+        message: String,
+        /// Optional translation handle. `None` renders `message` verbatim.
+        localized: Option<LocalizedText>,
+    },
 
     /// Live tool-OUTPUT delta (codex `item/commandExecution/outputDelta`). The
     /// incremental stdout/stderr of a RUNNING tool, keyed by the owning tool's
@@ -711,6 +719,35 @@ pub enum ProvisioningPhase {
 /// `warning` / `guardianWarning` / `configWarning` (something the user should know
 /// but the turn can still proceed); `Info` covers `deprecationNotice` (advisory,
 /// non-urgent). Backend-neutral so a future backend's advisory maps here too.
+/// A message the UI can translate: a stable code plus its interpolation values.
+///
+/// The emitting backend owns the code; the frontend looks it up under
+/// `conversation.agentTip.codes.<code>.body` and falls back to the `Notice`'s
+/// English `message` when the key is missing. Params are whatever that string
+/// interpolates (e.g. `{"count": 2}`), carried as JSON so a backend can add a
+/// placeholder without changing this type.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LocalizedText {
+    pub code: String,
+    #[serde(default)]
+    pub params: serde_json::Map<String, serde_json::Value>,
+}
+
+impl LocalizedText {
+    pub fn new(code: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            params: serde_json::Map::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        self.params.insert(key.into(), value.into());
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NoticeLevel {
     Info,
@@ -1066,6 +1103,7 @@ mod additive_tests {
                 SessionEvent::Notice {
                     level: NoticeLevel::Warning,
                     message: "config key X is deprecated".into(),
+                    localized: None,
                 },
                 BackendProduced,
                 Display,
@@ -1473,6 +1511,7 @@ mod additive_tests {
             SessionEvent::Notice {
                 level: NoticeLevel::Info,
                 message: "deprecated: use --foo".into(),
+                localized: None,
             },
             SessionEvent::ToolOutputDelta {
                 item_id: "call_0".into(),

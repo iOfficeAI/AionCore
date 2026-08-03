@@ -13,7 +13,9 @@ use crate::error::FileError;
 use aionui_api_types::WebSocketMessage;
 use aionui_realtime::EventBroadcaster;
 
-use crate::path_safety::{has_traversal, validate_path_for_write, validate_path_with_extra_root};
+use crate::path_safety::{
+    has_traversal, strip_verbatim_prefix, validate_path_for_write, validate_path_with_extra_root,
+};
 use crate::types::{
     ContentUpdateEvent, ContentUpdateOperation, CopyResult, DirOrFile, FileMetadata, WorkspaceFlatFile, ZipEntry,
 };
@@ -143,7 +145,7 @@ fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileEr
 
         let name = entry.file_name().to_string_lossy().into_owned();
 
-        let full_path = path.to_string_lossy().into_owned();
+        let full_path = strip_verbatim_prefix(&path.to_string_lossy());
         let relative_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
 
         let is_dir = metadata.is_dir();
@@ -190,7 +192,7 @@ fn read_children_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileErr
 
         let name = entry.file_name().to_string_lossy().into_owned();
 
-        let full_path = path.to_string_lossy().into_owned();
+        let full_path = strip_verbatim_prefix(&path.to_string_lossy());
         let relative_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
 
         children.push(DirOrFile {
@@ -247,7 +249,7 @@ fn list_workspace_files_sync(root: &Path) -> Result<Vec<WorkspaceFlatFile>, File
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        let full_path = path.to_string_lossy().into_owned();
+        let full_path = strip_verbatim_prefix(&path.to_string_lossy());
         let relative_path = path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned();
 
         files.push(WorkspaceFlatFile {
@@ -1296,6 +1298,48 @@ mod tests {
         let main_file = files.iter().find(|f| f.name == "main.rs").unwrap();
 
         assert_eq!(main_file.relative_path, "src/main.rs");
+    }
+
+    /// Regression for ELECTRON-3TG: production canonicalizes the workspace root
+    /// (via `validate_path_with_extra_root`) before walking, which on Windows
+    /// yields a verbatim `\\?\` root. Every emitted `full_path` must be stripped
+    /// so mention / preview consumers never receive verbatim paths.
+    #[cfg(windows)]
+    #[test]
+    fn windows_full_paths_are_not_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn main(){}").unwrap();
+
+        // Mirror production: the walked root is the canonicalized (verbatim) form.
+        let canonical_root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(
+            canonical_root.to_string_lossy().starts_with(r"\\?\"),
+            "precondition: canonicalize should yield a verbatim root on Windows"
+        );
+
+        let flat = list_workspace_files_sync(&canonical_root).unwrap();
+        assert!(!flat.is_empty());
+        for f in &flat {
+            assert!(
+                !f.full_path.starts_with(r"\\?\"),
+                "flat-list full_path is verbatim: {}",
+                f.full_path
+            );
+        }
+
+        let tree = build_dir_tree_sync(&canonical_root, &canonical_root).unwrap();
+        fn assert_no_verbatim(nodes: &[DirOrFile]) {
+            for n in nodes {
+                assert!(
+                    !n.full_path.starts_with(r"\\?\"),
+                    "dir-tree full_path is verbatim: {}",
+                    n.full_path
+                );
+                assert_no_verbatim(&n.children);
+            }
+        }
+        assert_no_verbatim(&tree);
     }
 
     #[cfg(unix)]

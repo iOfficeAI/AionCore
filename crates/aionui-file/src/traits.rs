@@ -287,3 +287,17 @@ pub type FileWatchServiceRef = Arc<dyn IFileWatchService>;
 
 /// Convenience alias for an Arc-wrapped snapshot service.
 pub type SnapshotServiceRef = Arc<dyn ISnapshotService>;
+
+/// Reveal an absolute filesystem path in the OS file manager (a "show item in
+/// folder" / "open enclosing folder" capability). Defined here as the narrow
+/// port the `/api/fs/reveal` route depends on; the composition layer supplies an
+/// adapter over the shell service, so this crate needs no shell dependency.
+#[async_trait::async_trait]
+pub trait IItemRevealer: Send + Sync {
+    /// Reveal `absolute_path` in the OS file manager. The path is the resolved,
+    /// contained absolute path from `resolve_reference` — never client input.
+    async fn reveal(&self, absolute_path: &str) -> Result<(), FileError>;
+}
+
+/// Convenience alias for an Arc-wrapped item revealer.
+pub type ItemRevealerRef = Arc<dyn IItemRevealer>;

@@ -2071,7 +2071,11 @@ impl ConversationService {
             });
         }
 
-        if existing_type == AgentType::Acp
+        // Antigravity keeps its runtime mode/model in the same `acp_session`
+        // snapshot ACP does, so `extra` is just as much a second source of
+        // truth here — a client PATCH that set them would diverge from the
+        // snapshot the session actually resolves from.
+        if matches!(existing_type, AgentType::Acp | AgentType::Antigravity)
             && let Some(incoming) = &req.extra
             && (incoming.get("current_model_id").is_some() || incoming.get("current_mode_id").is_some())
         {
@@ -3233,7 +3237,11 @@ impl ConversationService {
             return Err(e.into());
         }
 
-        if agent.agent_type() == AgentType::Acp {
+        // The watchdog is runtime-agnostic — it only checks whether the turn is
+        // still claimed and kills the task. agy cancels by killing its per-turn
+        // child, but nothing guarantees the pump drains, and without this net a
+        // stuck cancel leaves the conversation wedged with no way back.
+        if matches!(agent.agent_type(), AgentType::Acp | AgentType::Antigravity) {
             let runtime_state = self.runtime_state();
             let task_manager = Arc::clone(task_manager);
             let conv_id = conversation_id.to_owned();
@@ -3248,7 +3256,7 @@ impl ConversationService {
                         conversation_id = %conv_id,
                         turn_id = %active_turn,
                         timeout_ms = ACP_CANCEL_DRAIN_TIMEOUT.as_millis() as u64,
-                        "ACP cancel did not drain before timeout; killing task"
+                        "CLI agent cancel did not drain before timeout; killing task"
                     );
                     task_manager
                         .kill_and_wait(&conv_id, Some(AgentKillReason::UserCancelTimeout))

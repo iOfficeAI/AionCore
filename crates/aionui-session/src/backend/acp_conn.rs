@@ -1170,6 +1170,7 @@ async fn reader_task(ctx: ReaderCtx) {
                                         // the message + the error! log above).
                                         level: crate::event::NoticeLevel::Warning,
                                         message: format!("{label} failed: {message}"),
+                                        localized: None,
                                     },
                                 );
                             } else if let Some((kind, value)) = label.split_once('\u{2192}') {
@@ -3429,7 +3430,7 @@ mod tests {
 
         let notice = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(env) = events.next().await {
-                if let SessionEvent::Notice { level, message } = env.event {
+                if let SessionEvent::Notice { level, message, .. } = env.event {
                     return Some((level, message));
                 }
             }

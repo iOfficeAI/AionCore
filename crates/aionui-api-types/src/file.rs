@@ -75,6 +75,17 @@ pub struct CopyFilesRequest {
     pub source_root: Option<String>,
 }
 
+/// Request body for `POST /api/fs/reveal` — reveal a pe-addressed file/dir in
+/// the OS file manager ("open enclosing folder"). The backend resolves the
+/// identity to an absolute path via `resolve_reference`, then hands it to the
+/// shell reveal capability.
+#[derive(Debug, Deserialize)]
+pub struct RevealItemRequest {
+    pub pe_id: String,
+    /// Relative path under the pe's folder root (`""` = the root itself).
+    pub relative_path: String,
+}
+
 /// Request body for `POST /api/fs/remove` — remove file or directory.
 #[derive(Debug, Deserialize)]
 pub struct RemoveEntryRequest {

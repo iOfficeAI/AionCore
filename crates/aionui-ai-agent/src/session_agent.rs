@@ -1220,6 +1220,30 @@ pub struct SessionBuildInputs<'a> {
     /// spawn-time `session-cli-config` dump AND threads it (with the vendor
     /// label) into the `SessionAgentTask` for the send-time dump.
     pub prompt_dump_dir: Option<std::path::PathBuf>,
+    /// Antigravity only: the prepared `.agents/hooks.json` body, so a session
+    /// switched out of full auto can restore its approval gate.
+    pub permission_hook_body: Option<String>,
+}
+
+/// The mode a session actually starts on.
+///
+/// The persisted snapshot wins over the create-time seed: it is where a runtime
+/// switch lands (`save_acp_runtime_mode`) and where a scheduled run records the
+/// full-auto mode it resolved. Reading only `config.session_mode` would see the
+/// value the conversation was created with and miss both.
+///
+/// Aliases are normalized to the backend-native id here, so callers compare
+/// against catalog values rather than whatever spelling reached the API.
+pub(crate) fn resolved_session_mode(
+    config: &AcpBuildExtra,
+    session_snapshot: Option<&PersistedSessionState>,
+    metadata: &aionui_api_types::AgentMetadata,
+) -> Option<String> {
+    session_snapshot
+        .and_then(|s| s.current_mode_id.as_ref().map(|m| m.as_str().to_owned()))
+        .or_else(|| config.session_mode.clone())
+        .map(|m| crate::manager::acp::mode_normalize::normalize_requested_mode(metadata, &m))
+        .filter(|s| !s.is_empty())
 }
 
 /// The pure spec + mode/model mapping — the sibling of clean-slate's
@@ -1258,11 +1282,7 @@ fn spec_mode_model(
     // the catalog row's `yolo_id` / backend label; a mode without an alias passes
     // through unchanged. Runs BEFORE the codex sandbox/approval derivation downstream
     // (which matches both the alias and the native id, so ordering is safe).
-    let mode = session_snapshot
-        .and_then(|s| s.current_mode_id.as_ref().map(|m| m.as_str().to_owned()))
-        .or_else(|| config.session_mode.clone())
-        .map(|m| crate::manager::acp::mode_normalize::normalize_requested_mode(metadata, &m))
-        .filter(|s| !s.is_empty());
+    let mode = resolved_session_mode(config, session_snapshot, metadata);
     let model = session_snapshot
         .and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned()))
         .or_else(|| config.current_model_id.clone())
@@ -1308,6 +1328,7 @@ pub async fn build_antigravity_instance(
         // agy has no prompt-dump lane yet (the dev dump is keyed by a
         // claude/codex label); skip it rather than mislabel the dump.
         prompt_dump_dir: _,
+        permission_hook_body,
     } = inputs;
 
     let (spec, mode, model) = spec_mode_model(&conversation_id, backend_session_id, config, session_snapshot, metadata);
@@ -1349,6 +1370,7 @@ pub async fn build_antigravity_instance(
         model,
         mode,
         init,
+        permission_hook_body,
         // agy is NOT shipped with the app: it is a large native binary the user
         // installs themselves, so there is no bundled path to resolve and the
         // backend always spawns the `agy` on PATH.
@@ -1416,6 +1438,8 @@ pub async fn build_session_instance(
         catalog_writeback,
         acp_session_repo,
         prompt_dump_dir,
+        // claude/codex gate through CLI flags, not an installed hook file.
+        permission_hook_body: _,
     } = inputs;
 
     // GAP #1/#2 — the pure spec + mode/model mapping (resume anchor → Resume/Fresh,
@@ -3336,16 +3360,28 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         // turn that is already running (or immediately re-settled by the turn's terminal
         // Finish), so it does not manufacture a spurious idle timer the way a config frame
         // would. `NoticeLevel` has only Info/Warning (no Error tier), matching TipType.
-        SessionEvent::Notice { level, message } => {
+        SessionEvent::Notice {
+            level,
+            message,
+            localized,
+        } => {
             let tip_type = match level {
                 aionui_session::NoticeLevel::Info => TipType::Info,
                 aionui_session::NoticeLevel::Warning => TipType::Warning,
             };
+            // `content` stays the English text even when a code travels with it:
+            // the frontend passes it as i18next's `defaultValue`, so a locale
+            // that has not translated the key yet shows real prose instead of a
+            // raw key.
+            let (code, params) = match localized {
+                Some(l) => (Some(l.code), Some(serde_json::Value::Object(l.params))),
+                None => (None, None),
+            };
             vec![AgentStreamEvent::Tips(TipsEventData {
                 content: message,
                 tip_type,
-                code: None,
-                params: None,
+                code,
+                params,
             })]
         }
         // Events with no origin-side counterpart (or purely internal) are dropped.
@@ -4061,6 +4097,7 @@ mod translate_tests {
                 SessionEvent::Notice {
                     level,
                     message: "set effort: rejected by agent".into(),
+                    localized: None,
                 },
                 "conv-1",
                 false,
