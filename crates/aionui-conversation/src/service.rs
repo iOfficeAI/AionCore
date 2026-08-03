@@ -3210,9 +3210,20 @@ impl ConversationService {
         }
 
         let Some(agent) = task_manager.get_task(conversation_id) else {
+            // The turn IS live — its id matched above — but its agent has not
+            // registered yet, because building one runs real work first (an
+            // Antigravity build probes models, checks the CLI version, installs
+            // its permission hook and writes the MCP config). Dropping the
+            // request here loses it: the turn runs to completion while the user
+            // has been told it stopped.
+            //
+            // Record the intent instead. The orchestrator applies it as soon as
+            // the task appears, so a cancel issued during the build behaves like
+            // one issued a second later.
+            self.runtime_state.defer_cancel(conversation_id, turn_id);
             info!(
                 conversation_id,
-                turn_id, "No active agent to cancel; returning runtime summary"
+                turn_id, "Cancel arrived before the agent registered; deferring it to the build"
             );
             return Ok(CancelConversationResponse {
                 runtime: self.runtime_summary_for(conversation_id).await,

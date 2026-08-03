@@ -8159,3 +8159,54 @@ async fn get_usage_reads_the_persisted_snapshot_when_no_task_is_live() {
         "a reaped task must not blank the usage indicator"
     );
 }
+
+#[tokio::test]
+async fn cancel_during_the_build_is_recorded_instead_of_dropped() {
+    // The turn is live — its id matches — but the agent has not registered yet,
+    // because building one runs real work first (an Antigravity build probes
+    // models, checks the CLI version, installs its permission hook). Returning a
+    // bare runtime summary here loses the request: the turn runs to completion
+    // while the UI has already reported it as stopped. See #746.
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let slow = Arc::new(SlowBuildTaskManager::new(Duration::from_millis(1_500)));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = slow.clone();
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let send = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+
+    // No task is registered yet: this is the window the bug lived in.
+    assert!(
+        task_mgr.get_task(&conv.id).is_none(),
+        "test needs the pre-registration window"
+    );
+
+    svc.cancel("user_1", &conv.id, &send.turn_id, &task_mgr).await.unwrap();
+
+    assert!(
+        svc.runtime_state().take_deferred_cancel(&conv.id, &send.turn_id),
+        "the cancel must be remembered so the orchestrator can apply it when the task appears"
+    );
+    assert!(
+        !svc.runtime_state().is_cancelling(&conv.id),
+        "it must NOT reuse the ordinary cancelling flag: that one is also set when the \
+         agent was handed the cancel directly, and the orchestrator would then abort turns \
+         whose cancel is already being handled"
+    );
+}
+
+#[tokio::test]
+async fn a_deferred_cancel_does_not_leak_into_a_later_turn() {
+    // The record is keyed by turn: one left behind must never abort the next
+    // turn the user starts.
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    svc.runtime_state().defer_cancel(&conv.id, "turn_old");
+    assert!(!svc.runtime_state().take_deferred_cancel(&conv.id, "turn_new"));
+    assert!(svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
+    // Consumed exactly once.
+    assert!(!svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
+}

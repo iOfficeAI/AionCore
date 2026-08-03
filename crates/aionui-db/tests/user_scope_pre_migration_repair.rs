@@ -44,6 +44,36 @@ async fn build_v29_db(path: &Path, seed: &[&str]) {
     pool.close().await;
 }
 
+/// Like [`build_v29_db`] but stops at `through_version` (< 29), leaving BOTH 029
+/// and 030 pending. This is the ELECTRON-31Z one-step upgrade: a DB that never
+/// stopped at v29 (AionCore 0.1.52 stops at 28) jumps straight to a build with
+/// 030. Staged init must run the repair before the migrator applies 029 + 030 in
+/// a single pass — the path the old `== 29` gate skipped entirely.
+async fn build_db_through(path: &Path, through_version: i64, seed: &[&str]) {
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let pool = SqlitePoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF").execute(&pool).await.unwrap();
+    let full = Migrator::new(Path::new("migrations")).await.unwrap();
+    let subset = full
+        .migrations
+        .iter()
+        .filter(|m| m.version <= through_version)
+        .cloned()
+        .collect::<Vec<_>>();
+    let migrator = Migrator {
+        migrations: Cow::Owned(subset),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    migrator.run(&pool).await.unwrap();
+    for sql in seed {
+        sqlx::query(sql).execute(&pool).await.unwrap();
+    }
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&pool).await.ok();
+    pool.close().await;
+}
+
 async fn max_applied_version(db: &aionui_db::Database) -> i64 {
     sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
         .fetch_one(db.pool())
@@ -103,6 +133,66 @@ async fn stuck_user_with_orphans_self_heals_and_030_applies() {
         .await
         .unwrap();
     assert_eq!(orphan, 0, "orphan message removed");
+    db.close().await;
+}
+
+#[tokio::test]
+async fn v28_start_point_self_heals_across_029_and_030() {
+    // ELECTRON-31Z root case: a DB stopped at v28 (AionCore 0.1.52) upgrades in
+    // one step, so the migrator must apply BOTH 029 and 030. The widened gate
+    // runs the pre-migration repair before that pass, so 030's CHECK(ok=1)
+    // guards see normalized data. The old `== 29` gate skipped v28 and 030
+    // aborted here (SQLite 275). Same dirty-data shape as the v29 case, but from
+    // a start point that never passes through v29.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aionui-backend.db");
+    build_db_through(
+        &path,
+        28,
+        &[
+            "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at) \
+             VALUES ('c_valid','system_default_user','Valid','acp','{}','pending',1,1)",
+            "INSERT INTO messages (id, conversation_id, type, content, created_at) \
+             VALUES ('m_valid','c_valid','user','{}',1)",
+            "INSERT INTO messages (id, conversation_id, type, content, created_at) \
+             VALUES ('m_orphan','c_missing','user','{}',1)",
+            "INSERT INTO acp_session (conversation_id, agent_source, agent_id, session_status, session_config) \
+             VALUES ('c_missing','builtin','a','idle','{}')",
+        ],
+    )
+    .await;
+
+    // Precondition: this really is a pre-029 start point (029 + 030 both pending).
+    {
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let pool = SqlitePoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+        let max: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(max, 28, "fixture must start at v28 so 029 and 030 are both pending");
+        pool.close().await;
+    }
+
+    let db = init_database_staged(&path)
+        .await
+        .expect("v28 stuck DB must self-heal across 029 + 030");
+    assert_eq!(
+        max_applied_version(&db).await,
+        latest_bundled_version().await,
+        "029 and 030 both applied after repair"
+    );
+
+    let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id='m_valid'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(valid, 1, "valid message preserved");
+    let orphan: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id='m_orphan'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(orphan, 0, "orphan message removed before 030");
     db.close().await;
 }
 

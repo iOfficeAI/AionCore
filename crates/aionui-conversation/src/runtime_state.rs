@@ -21,6 +21,9 @@ struct ConversationRuntimeState {
     active_turns: HashMap<String, String>,
     deleting_conversations: HashSet<String>,
     cancelling_conversations: HashSet<String>,
+    /// Cancels that arrived before the turn's agent registered, keyed by
+    /// conversation and holding the turn they were meant for.
+    deferred_cancels: HashMap<String, String>,
     shutting_down: bool,
 }
 
@@ -189,6 +192,44 @@ impl ConversationRuntimeStateService {
                     "conversation runtime state lock poisoned while clearing cancel"
                 );
             }
+        }
+    }
+
+    /// Remember a cancel that arrived before the turn's agent registered.
+    ///
+    /// Deliberately NOT `mark_cancelling`: that flag is also set on the ordinary
+    /// cancel path (where the agent was handed the request directly), so reusing
+    /// it would make the orchestrator abort turns whose cancel is already being
+    /// handled. This one is turn-scoped and consumed exactly once.
+    pub fn defer_cancel(&self, conversation_id: &str, turn_id: &str) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state
+                    .deferred_cancels
+                    .insert(conversation_id.to_owned(), turn_id.to_owned());
+                info!(conversation_id, turn_id, "cancel deferred until the agent registers");
+            }
+            Err(_) => warn!(
+                conversation_id,
+                "conversation runtime state lock poisoned while deferring cancel"
+            ),
+        }
+    }
+
+    /// Consume a deferred cancel for `turn_id`, if one is pending for it.
+    ///
+    /// A record left by an earlier turn must not stop a later one, so the turn
+    /// id has to match.
+    pub fn take_deferred_cancel(&self, conversation_id: &str, turn_id: &str) -> bool {
+        match self.state.lock() {
+            Ok(mut state) => match state.deferred_cancels.get(conversation_id) {
+                Some(pending) if pending == turn_id => {
+                    state.deferred_cancels.remove(conversation_id);
+                    true
+                }
+                _ => false,
+            },
+            Err(_) => false,
         }
     }
 

@@ -205,6 +205,27 @@ impl ConversationTurnOrchestrator {
 
         let persistence = self.service.runtime_persistence();
         let runtime_state = self.service.runtime_state();
+
+        // A cancel may have arrived while the task was still being built, when
+        // there was no agent to hand it to (see `ConversationService::cancel`).
+        // Honour it here, BEFORE the prompt goes out: the user withdrew this
+        // turn, so the cleanest outcome is that the CLI never runs at all.
+        //
+        // Ends as Completed, not Failed — a turn the user cancelled is not an
+        // error, and reporting one would surface a red bubble for something
+        // they asked for.
+        if runtime_state.take_deferred_cancel(&input.conv_id, &input.turn_id) {
+            info!(
+                conversation_id = %input.conv_id,
+                turn_id = %input.turn_id,
+                "Applying a cancel that arrived while the agent was still being built"
+            );
+            return Err(ConversationTurnResult {
+                status: ConversationTurnStatus::Completed,
+                error_message: None,
+            });
+        }
+
         let mut pending_send = Some((input.send, input.msg_id));
         let mut continuation_count = input.continuation_count;
         let continuation_policy = TurnContinuationPolicy::new(MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN);
