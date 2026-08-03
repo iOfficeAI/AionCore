@@ -2227,6 +2227,26 @@ fn spawn_event_pump(
                 synthetic_finish_emitted = false;
             }
 
+            // The deferred DUPLICATE terminal: claude ends a turn twice — the
+            // real-time `--include-partial-messages` boundary first, then the
+            // `result` frame (often ~1s later, or minutes later when background
+            // tasks defer it). The first one settled the turn: per-turn
+            // accumulators were reset, so processing the second would fabricate
+            // an empty-turn `ACP_EMPTY_TURN` tip and a stray Finish. Before the
+            // background-stream watcher those landed in a dead channel and were
+            // invisible; with out-of-turn delivery they became a spurious notice
+            // bubble in the conversation (live 2026-08-03, conv 0be95fea).
+            // Swallow the whole envelope. `terminal_result_seen` resets on
+            // turn_gen advance/TurnStarted, so a NEW turn's terminal is never
+            // confused with a duplicate of the old one.
+            if terminal_result_seen && matches!(env.event, SessionEvent::TurnResult { .. }) {
+                tracing::info!(
+                    conv_id = %conversation_id,
+                    "session-pump: swallowing deferred duplicate terminal (turn already settled)"
+                );
+                continue;
+            }
+
             // Empty-turn diagnostic Tip to emit for THIS terminal, if the turn was a
             // clean blank reply. Computed in the terminal match arm below (while
             // `saw_visible_output` still reflects this turn) and drained just before the
@@ -6526,6 +6546,44 @@ mod pump_tests {
             settled.is_some(),
             "a cancelled turn must settle the background card, got {:?}",
             frames.iter().map(frame_name).collect::<Vec<_>>()
+        );
+    }
+
+    /// claude ends a turn TWICE: the real-time partial-messages boundary, then
+    /// the deferred `result` frame. The second is a duplicate of an already
+    /// settled turn — reprocessing it fabricated an `ACP_EMPTY_TURN` tip (the
+    /// per-turn output flag was reset at the first terminal) plus a stray
+    /// Finish, which the out-of-turn watcher then faithfully delivered as a
+    /// spurious notice bubble (live 2026-08-03, conv 0be95fea).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_duplicate_terminal_is_swallowed_whole() {
+        let clean_result = || {
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            })
+        };
+        let script = vec![
+            env(SessionEvent::MessageDelta {
+                item_id: "m".into(),
+                text: "已启动".into(),
+            }),
+            clean_result(), // real-time boundary — settles the turn
+            clean_result(), // deferred `result` duplicate — must vanish entirely
+        ];
+        let frames = drain_script(script).await;
+        let seq: Vec<&str> = frames.iter().map(frame_name).collect();
+        let finishes = frames
+            .iter()
+            .filter(|f| matches!(f, AgentStreamEvent::Finish(_)))
+            .count();
+        assert_eq!(finishes, 1, "one turn, one Finish, got {seq:?}");
+        assert!(
+            !frames.iter().any(|f| matches!(f, AgentStreamEvent::Tips(_))),
+            "the duplicate must not fabricate an empty-turn tip, got {seq:?}"
         );
     }
 

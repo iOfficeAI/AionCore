@@ -67,9 +67,14 @@ impl BackgroundStreamWatcher {
                 | AgentStreamEvent::Plan(_)
                 | AgentStreamEvent::Permission(_)
                 | AgentStreamEvent::AcpPermission(_)
-                | AgentStreamEvent::Tips(_)
                 | AgentStreamEvent::Error(_)
         )
+        // Deliberately absent: Tips. Tips are OUR pump-side diagnostics, never
+        // how a CLI-initiated turn begins (those open with thinking/tool/text) —
+        // a stray out-of-turn tip fabricating a whole orphan turn is exactly how
+        // the duplicate-terminal ACP_EMPTY_TURN bubble reached the user. A tip
+        // INSIDE a running orphan turn still flows: the feeder forwards
+        // everything once a turn is open.
     }
 
     pub async fn run(self, mut rx: broadcast::Receiver<AgentStreamEvent>) {
