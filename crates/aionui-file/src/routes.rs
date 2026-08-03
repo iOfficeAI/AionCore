@@ -44,6 +44,12 @@ impl From<FileError> for ApiError {
             },
             FileError::NotFound(message) => ApiError::NotFound(message),
             FileError::Internal(message) => ApiError::Internal(message),
+            FileError::WatchUnavailable { errno } => ApiError::coded(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "FILE_WATCH_UNAVAILABLE",
+                "File watching is unavailable on this system.",
+                errno.map(|n| serde_json::json!({ "errno": n })),
+            ),
         }
     }
 }
@@ -805,6 +811,24 @@ mod tests {
         assert_eq!(api_err.error_code(), "PATH_OUTSIDE_SANDBOX");
         assert_eq!(api_err.error_details().unwrap()["field"], "path");
         assert_eq!(api_err.error_details().unwrap()["operation"], "access");
+    }
+
+    #[test]
+    fn watch_unavailable_maps_to_stable_code_with_errno_details() {
+        // The A contract: the frontend recognizes this exact code to render an
+        // accurate "file watching unavailable" notice (never a reinstall prompt).
+        let api_err = ApiError::from(FileError::WatchUnavailable { errno: Some(24) });
+        assert_eq!(api_err.error_code(), "FILE_WATCH_UNAVAILABLE");
+        assert_eq!(api_err.status_code(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(api_err.error_details().unwrap()["errno"], 24);
+    }
+
+    #[test]
+    fn watch_unavailable_without_errno_omits_details() {
+        let api_err = ApiError::from(FileError::WatchUnavailable { errno: None });
+        assert_eq!(api_err.error_code(), "FILE_WATCH_UNAVAILABLE");
+        assert_eq!(api_err.status_code(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(api_err.error_details().is_none());
     }
 
     #[test]
