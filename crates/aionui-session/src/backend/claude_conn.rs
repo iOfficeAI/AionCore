@@ -1893,6 +1893,7 @@ fn sniff_set_config_reject(
         event: SessionEvent::Notice {
             level: crate::event::NoticeLevel::Warning,
             message: format!("{label} failed: {err}"),
+            localized: None,
         },
     });
 }
@@ -5318,7 +5319,7 @@ mod tests {
 
         let notice = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(env) = events.next().await {
-                if let SessionEvent::Notice { level, message } = env.event {
+                if let SessionEvent::Notice { level, message, .. } = env.event {
                     return Some((level, message));
                 }
             }

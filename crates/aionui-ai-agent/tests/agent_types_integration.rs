@@ -152,7 +152,7 @@ async fn aionrs_agent_metadata() {
 fn agent_session_kind_is_limited_to_runnable_runtimes() {
     fn assert_runnable(kind: AgentSessionKind) {
         match kind {
-            AgentSessionKind::Acp(_) | AgentSessionKind::Aionrs(_) => {}
+            AgentSessionKind::Acp(_) | AgentSessionKind::Aionrs(_) | AgentSessionKind::Antigravity(_) => {}
         }
     }
 
@@ -191,6 +191,9 @@ async fn collect_idle_ignores_aionrs_agent_type() {
                 team: None,
                 belongs_to_team: false,
             })),
+            AgentType::Antigravity => {
+                unreachable!("antigravity has no AgentSessionKind until its factory lands")
+            }
             AgentType::Gemini
             | AgentType::OpenclawGateway
             | AgentType::Remote

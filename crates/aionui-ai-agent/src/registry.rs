@@ -77,10 +77,18 @@ enum InlineProbeOutcome {
 
 /// One unit of work submitted to the catalog sync consumer task.
 #[derive(Debug)]
-struct CatalogSyncMessage {
-    user_id: String,
-    agent_metadata_id: String,
-    handshake: AgentHandshake,
+pub(crate) struct CatalogSyncMessage {
+    pub(crate) user_id: String,
+    pub(crate) agent_metadata_id: String,
+    pub(crate) handshake: AgentHandshake,
+}
+
+/// A `CatalogSender` wired to a plain receiver, so catalog-publishing logic can
+/// be tested without standing up a whole registry.
+#[cfg(test)]
+pub(crate) fn catalog_channel_for_test(capacity: usize) -> (CatalogSender, mpsc::Receiver<CatalogSyncMessage>) {
+    let (tx, rx) = mpsc::channel(capacity);
+    (CatalogSender { tx }, rx)
 }
 
 #[cfg(test)]
@@ -1591,7 +1599,7 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 42);
+        assert_eq!(all.len(), 43, "seed rows: 42 pre-existing + antigravity");
     }
 
     #[tokio::test]
@@ -1920,7 +1928,7 @@ mod tests {
     async fn diagnostic_snapshot_pairs_rows_with_reasons() {
         let reg = registry().await;
         let snapshot = reg.diagnostic_snapshot().await;
-        assert_eq!(snapshot.len(), 42, "every row appears once");
+        assert_eq!(snapshot.len(), 43, "every row appears once");
 
         for (meta, reason) in &snapshot {
             match (meta.available, reason) {

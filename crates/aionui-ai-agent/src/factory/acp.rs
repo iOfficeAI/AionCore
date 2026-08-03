@@ -22,6 +22,30 @@ use tracing::{info, warn};
 
 use crate::runtime_status::conversation_runtime_reporter;
 
+/// Where a conversation that arrived on the ACP factory actually has to run.
+///
+/// Conversations reach this factory by their *family*, not by how their agent
+/// talks: the frontend renders every non-aionrs agent through the ACP chat
+/// surface, so the backend label is the only thing that says which runtime a
+/// row really needs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BackendRoute {
+    /// claude/codex — direct-CLI via `build_session_instance`.
+    DirectCli,
+    /// agy — direct-CLI via its own factory (does NOT speak ACP).
+    Antigravity,
+    /// A real ACP vendor: the `AcpAgentManager` handshake path.
+    AcpManager,
+}
+
+pub(crate) fn route_for_backend(backend: Option<&str>) -> BackendRoute {
+    match backend {
+        Some("antigravity") => BackendRoute::Antigravity,
+        Some("claude" | "codex") => BackendRoute::DirectCli,
+        _ => BackendRoute::AcpManager,
+    }
+}
+
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AcpSessionBuildContext,
@@ -43,6 +67,21 @@ pub(super) async fn build(
         config.backend.clone_from(&meta.backend);
     }
 
+    if matches!(route_for_backend(config.backend.as_deref()), BackendRoute::Antigravity) {
+        return super::antigravity::build(
+            deps,
+            crate::session_context::AntigravitySessionBuildContext {
+                config,
+                team: build_context.team,
+                belongs_to_team: build_context.belongs_to_team,
+                session_id: build_context.session_id,
+                session_snapshot: build_context.session_snapshot,
+            },
+            ctx,
+        )
+        .await;
+    }
+
     // Session-model port: claude/codex ALWAYS run through the clean-slate direct-CLI
     // SessionBackend (SessionAgentTask), NOT the ACP manager. Every other ACP vendor
     // keeps the AcpAgentManager path below. There is no fallback: a claude/codex
@@ -50,7 +89,7 @@ pub(super) async fn build(
     // build inputs mirror clean-slate `build_runtime` 1:1 (resume anchor, mode/model
     // precedence, MCP + preset + skills init surface, cc-switch env, codex sandbox/approval).
     if let Some(backend_label) = config.backend.as_deref()
-        && matches!(backend_label, "claude" | "codex")
+        && matches!(route_for_backend(Some(backend_label)), BackendRoute::DirectCli)
     {
         let instance = crate::session_agent::build_session_instance(
             backend_label,
@@ -81,6 +120,9 @@ pub(super) async fn build(
                 // DEV (`--dump-prompts`): resolve the dump dir once (mirrors the
                 // aionrs factory's `prompt_dump_dir`). `None` when off.
                 prompt_dump_dir: crate::dev_prompt_dump::dump_dir_for_data_dir(&deps.data_dir, deps.dump_prompts),
+                // claude/codex gate permissions through their own CLI flags, not
+                // through an installed hook file.
+                permission_hook_body: None,
             },
             deps.session_spawner.clone(),
         )
@@ -226,7 +268,7 @@ pub(super) async fn build(
     Ok(instance)
 }
 
-async fn resolve_catalog_metadata(
+pub(super) async fn resolve_catalog_metadata(
     registry: &Arc<AgentRegistry>,
     config: &aionui_api_types::AcpBuildExtra,
     user_id: &str,
@@ -1147,5 +1189,29 @@ mod tests {
 
         let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
         assert!(servers.is_empty());
+    }
+
+    /// Antigravity arrives on the ACP factory because the renderer puts every
+    /// non-aionrs agent on the ACP chat surface — but agy does not speak ACP.
+    /// Routing it to the manager makes the initialize handshake time out and the
+    /// user sees "The selected Agent failed to start", with a fully working agy
+    /// installed. Verified end-to-end from the AionUi UI.
+    #[test]
+    fn antigravity_never_routes_to_the_acp_manager() {
+        assert_eq!(route_for_backend(Some("antigravity")), BackendRoute::Antigravity);
+    }
+
+    #[test]
+    fn claude_and_codex_keep_the_direct_cli_route() {
+        assert_eq!(route_for_backend(Some("claude")), BackendRoute::DirectCli);
+        assert_eq!(route_for_backend(Some("codex")), BackendRoute::DirectCli);
+    }
+
+    #[test]
+    fn a_real_acp_vendor_still_reaches_the_manager() {
+        // The default must stay the manager: every other vendor DOES speak ACP.
+        assert_eq!(route_for_backend(Some("gemini")), BackendRoute::AcpManager);
+        assert_eq!(route_for_backend(Some("opencode")), BackendRoute::AcpManager);
+        assert_eq!(route_for_backend(None), BackendRoute::AcpManager);
     }
 }

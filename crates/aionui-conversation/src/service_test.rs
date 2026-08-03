@@ -5813,7 +5813,9 @@ async fn auto_replay_rebuild_keeps_existing_acp_session_id_in_build_options() {
             AgentSessionKind::Acp(ctx) => {
                 assert_eq!(ctx.session_id.as_deref(), Some("sess-existing"));
             }
-            AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+            AgentSessionKind::Aionrs(_) | AgentSessionKind::Antigravity(_) => {
+                panic!("test conversation should build ACP options")
+            }
         }
     }
 }
@@ -7177,7 +7179,9 @@ async fn assistant_backed_acp_build_options_include_snapshot_rule_as_preset_cont
         AgentSessionKind::Acp(ctx) => {
             assert_eq!(ctx.config.preset_context.as_deref(), Some("assistant rule body"));
         }
-        AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+        AgentSessionKind::Aionrs(_) | AgentSessionKind::Antigravity(_) => {
+            panic!("test conversation should build ACP options")
+        }
     }
 }
 
@@ -7216,7 +7220,9 @@ async fn assistant_backed_aionrs_build_options_include_snapshot_rule_as_preset_r
     let options = svc.build_task_options(&row).await.unwrap();
 
     match options.context.kind {
-        AgentSessionKind::Acp(_) => panic!("test conversation should build Aionrs options"),
+        AgentSessionKind::Acp(_) | AgentSessionKind::Antigravity(_) => {
+            panic!("test conversation should build Aionrs options")
+        }
         AgentSessionKind::Aionrs(ctx) => {
             assert_eq!(ctx.config.preset_rules.as_deref(), Some("assistant rule body"));
         }
@@ -8038,7 +8044,7 @@ async fn seed_aionrs_conversation_with_snapshot(
 fn aionrs_session_mode(options: &BuildTaskOptions) -> Option<String> {
     match &options.context.kind {
         AgentSessionKind::Aionrs(ctx) => ctx.config.session_mode.clone(),
-        AgentSessionKind::Acp(_) => panic!("expected Aionrs build options"),
+        AgentSessionKind::Acp(_) | AgentSessionKind::Antigravity(_) => panic!("expected Aionrs build options"),
     }
 }
 
@@ -8126,5 +8132,30 @@ async fn cron_required_runtime_mode_wins_over_resolved_permission_seed() {
         agent.set_config_option_calls.lock().unwrap().as_slice(),
         &[("mode".to_owned(), "default".to_owned())],
         "cron required-runtime-mode must override the rebuild permission seed"
+    );
+}
+
+#[tokio::test]
+async fn get_usage_reads_the_persisted_snapshot_when_no_task_is_live() {
+    // The usage indicator has to survive switching away from a conversation and
+    // back. The task is reaped when the session goes idle, and requiring a live
+    // one here made the figure vanish exactly then — the snapshot is durable in
+    // `acp_session.session_config.runtime.context_usage` precisely so a cold
+    // read can serve it.
+    let acp_repo = Arc::new(StubAcpSessionRepo::default());
+    *acp_repo.runtime_state.lock().unwrap() = Some(PersistedSessionState {
+        context_usage_json: Some(r#"{"used":10465}"#.to_owned()),
+        ..Default::default()
+    });
+    let (svc, _broadcaster, repo, _task_mgr) =
+        make_service_with_resolver_and_acp_session_repo(Arc::new(FixedSkillResolver { names: vec![] }), acp_repo);
+    // No task is ever registered for this conversation — the cold path.
+    let conv = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+
+    let usage = svc.get_usage("user_1", &conv.id).await.expect("cold read failed");
+    assert_eq!(
+        usage.and_then(|v| v.get("used").and_then(|u| u.as_i64())),
+        Some(10465),
+        "a reaped task must not blank the usage indicator"
     );
 }

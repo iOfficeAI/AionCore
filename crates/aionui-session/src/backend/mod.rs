@@ -9,6 +9,7 @@
 //! compile in parallel.
 
 mod acp_conn;
+mod antigravity;
 mod claude_conn;
 mod codex_conn;
 mod conversation_session;
@@ -18,6 +19,9 @@ mod suspend;
 mod types;
 
 pub use acp_conn::{AcpConnection, AcpSessionBackend, acp_capabilities};
+pub use antigravity::{
+    AntigravityConnection, AntigravitySessionBackend, VersionDrift, antigravity_capabilities, version_drift,
+};
 pub use claude_conn::{ClaudeConnection, ClaudeSessionBackend};
 pub use codex_conn::{CodexConnection, CodexSessionBackend, codex_capabilities, slash_command_name};
 pub use conversation_session::{ConversationSession, MsgStatus, PendingMessage};
@@ -105,6 +109,21 @@ pub trait SessionBackend: Send + Sync {
     /// purely Drop-driven (and every test double) are unchanged — only the
     /// direct-CLI claude/codex backends override this.
     async fn terminate(&self) {}
+
+    /// Raise a permission request that originated OUTSIDE this backend's own
+    /// wire, and block until the user answers it.
+    ///
+    /// Only Antigravity needs this. agy cannot prompt for tool permission in
+    /// headless mode, so AionUi registers itself as agy's `PreToolUse` hook;
+    /// the request therefore arrives over HTTP from a separate hook process
+    /// rather than up the backend's stream. Every other backend raises
+    /// permissions on its own wire and never calls this.
+    ///
+    /// Default is `Denied`, deliberately: a backend that does not implement
+    /// externally-raised permissions must not silently let the tool run.
+    async fn request_external_permission(&self, _tool_name: String, _input: serde_json::Value) -> PermissionDecision {
+        PermissionDecision::Denied
+    }
 }
 
 /// Connection-level factory (§C1): holds the transport singleton and mints many
@@ -231,6 +250,15 @@ pub struct SessionConfig {
     /// only (byte-identical to the pre-#103 spawn). Carried into the F-4 wake
     /// recipe so a resume-respawn re-applies the same env (R16 continuity).
     pub spawn_env: Vec<aionui_common::EnvVar>,
+    /// Antigravity only: the `.agents/hooks.json` body that registers AionUi as
+    /// agy's approval gate.
+    ///
+    /// Carried rather than written unconditionally because a session that starts
+    /// in full auto installs no hook — and the backend cannot rebuild this body
+    /// itself (it knows the workspace, not where AionUi's binary lives). Holding
+    /// it lets a later switch OUT of full auto restore the gate; without it that
+    /// switch would silently leave the session running unattended.
+    pub permission_hook_body: Option<String>,
     /// G1-A: the codex sandbox policy injected into `thread/start` (the native
     /// codex app-server `sandbox` field; codex_conn serializes it data-driven
     /// instead of the hardcoded `"workspace-write"`). `None` (default) ⇒

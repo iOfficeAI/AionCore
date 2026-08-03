@@ -23,6 +23,7 @@ use aionui_api_types::AgentErrorCode;
 fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
     match &options.context.kind {
         AgentSessionKind::Acp(ctx) => ctx.config.backend.as_deref(),
+        AgentSessionKind::Antigravity(ctx) => ctx.config.backend.as_deref(),
         AgentSessionKind::Aionrs(_) => None,
     }
 }
@@ -590,6 +591,12 @@ impl ConversationTurnOrchestrator {
 fn availability_agent_id(options: &BuildTaskOptions) -> Option<String> {
     match &options.context.kind {
         AgentSessionKind::Acp(context) => context
+            .config
+            .agent_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        AgentSessionKind::Antigravity(context) => context
             .config
             .agent_id
             .as_deref()

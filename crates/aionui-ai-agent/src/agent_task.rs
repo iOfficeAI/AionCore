@@ -150,9 +150,10 @@ pub trait IMockAgent: IAgentTask {
 pub enum AgentInstance {
     Acp(Arc<AcpAgentManager>),
     Aionrs(Arc<AionrsAgentManager>),
-    /// clean-slate direct-CLI session model (claude/codex only). Wraps an
-    /// `aionui_session::SessionBackend` via [`SessionAgentTask`]. Every other
-    /// backend keeps the `Acp` path. See the session-model-port design doc.
+    /// clean-slate direct-CLI session model (claude / codex / antigravity).
+    /// Wraps an `aionui_session::SessionBackend` via [`SessionAgentTask`],
+    /// which is backend-agnostic. Every other backend keeps the `Acp` path.
+    /// See the session-model-port design doc.
     Session(Arc<crate::session_agent::SessionAgentTask>),
     /// Test-only trait-object escape hatch used by downstream crates
     /// (conversation/cron/team/app tests) to inject fake agents without

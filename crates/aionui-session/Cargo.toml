@@ -35,7 +35,7 @@ test-support = []
 # `build_with_io` — all gated behind `cfg(any(test, feature = "test-support"))`,
 # which the bare integration build does NOT enable on its own.
 aionui-session = { path = ".", features = ["test-support"] }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 proptest.workspace = true
 # live_cli_e2e.rs (#[ignore] LIVE tests): a tempdir-backed FileRegistryStore for
 # constructing a production RealSpawner without touching the real data dir.

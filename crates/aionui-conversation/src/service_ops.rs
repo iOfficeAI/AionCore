@@ -143,10 +143,23 @@ impl ConversationService {
         conversation_id: &str,
     ) -> Result<Option<serde_json::Value>, ConversationError> {
         self.ensure_owned_conversation(user_id, conversation_id).await?;
-        self.task(conversation_id)?
-            .get_usage()
+        // A reaped task must NOT mean "no usage". The indicator's whole point is
+        // to survive switching away and back, and the snapshot it needs is
+        // already durable in `acp_session.session_config.runtime.context_usage`
+        // — `SessionAgentTask::get_usage` reads it from there too. Requiring a
+        // live task here made the figure vanish exactly when the user returned
+        // to an idle conversation.
+        if let Ok(task) = self.task(conversation_id) {
+            return task.get_usage().await.map_err(ConversationError::from);
+        }
+        let state = self
+            .acp_session_repo()
+            .load_runtime_state_for_user(user_id, conversation_id)
             .await
-            .map_err(ConversationError::from)
+            .map_err(|e| ConversationError::internal(format!("Failed to load usage state: {e}")))?;
+        Ok(state
+            .and_then(|s| s.context_usage_json)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()))
     }
 
     pub async fn get_slash_commands(

@@ -1016,7 +1016,9 @@ impl ConversationService {
             }
             if let Some(permission) = snapshot.resolved_defaults.permission.as_ref() {
                 obj.insert("session_mode".to_owned(), serde_json::Value::String(permission.clone()));
-                if matches!(effective_type, AgentType::Acp) {
+                // Antigravity carries the same mode axis (agy's `--mode`), so it
+                // needs the seeded current value too or the picker opens blank.
+                if matches!(effective_type, AgentType::Acp | AgentType::Antigravity) {
                     obj.insert(
                         "current_mode_id".to_owned(),
                         serde_json::Value::String(permission.clone()),
@@ -1031,7 +1033,9 @@ impl ConversationService {
             }
             if !snapshot.rules.content.trim().is_empty() {
                 match effective_type {
-                    AgentType::Acp => {
+                    // Antigravity joins ACP here: both carry rules through the
+                    // session-init `preset_context` surface.
+                    AgentType::Acp | AgentType::Antigravity => {
                         obj.insert(
                             "preset_context".to_owned(),
                             serde_json::Value::String(snapshot.rules.content.clone()),
@@ -1336,7 +1340,13 @@ impl ConversationService {
         // ACP conversations own one `acp_session` row (1:1 by
         // conversation_id). Other agent types have no session-level
         // state so we only create it for ACP.
-        if effective_type == AgentType::Acp {
+        //
+        // Antigravity is included because it has exactly that state: a resume
+        // anchor (agy's own conversation id), the observed mode/model, and the
+        // context-usage snapshot the indicator reads back. Without the row those
+        // writes have nowhere to land — the usage indicator stays at zero and a
+        // reopened conversation cannot resume agy's session.
+        if matches!(effective_type, AgentType::Acp | AgentType::Antigravity) {
             self.create_acp_session_row(user_id, &id, &extra, assistant_snapshot.as_ref())
                 .await?;
         }
@@ -2061,7 +2071,11 @@ impl ConversationService {
             });
         }
 
-        if existing_type == AgentType::Acp
+        // Antigravity keeps its runtime mode/model in the same `acp_session`
+        // snapshot ACP does, so `extra` is just as much a second source of
+        // truth here — a client PATCH that set them would diverge from the
+        // snapshot the session actually resolves from.
+        if matches!(existing_type, AgentType::Acp | AgentType::Antigravity)
             && let Some(incoming) = &req.extra
             && (incoming.get("current_model_id").is_some() || incoming.get("current_mode_id").is_some())
         {
@@ -3212,7 +3226,11 @@ impl ConversationService {
             return Err(e.into());
         }
 
-        if agent.agent_type() == AgentType::Acp {
+        // The watchdog is runtime-agnostic — it only checks whether the turn is
+        // still claimed and kills the task. agy cancels by killing its per-turn
+        // child, but nothing guarantees the pump drains, and without this net a
+        // stuck cancel leaves the conversation wedged with no way back.
+        if matches!(agent.agent_type(), AgentType::Acp | AgentType::Antigravity) {
             let runtime_state = self.runtime_state();
             let task_manager = Arc::clone(task_manager);
             let conv_id = conversation_id.to_owned();
@@ -3227,7 +3245,7 @@ impl ConversationService {
                         conversation_id = %conv_id,
                         turn_id = %active_turn,
                         timeout_ms = ACP_CANCEL_DRAIN_TIMEOUT.as_millis() as u64,
-                        "ACP cancel did not drain before timeout; killing task"
+                        "CLI agent cancel did not drain before timeout; killing task"
                     );
                     task_manager
                         .kill_and_wait(&conv_id, Some(AgentKillReason::UserCancelTimeout))
@@ -4001,6 +4019,7 @@ fn context_backend_value(context: &AgentSessionContext) -> Option<serde_json::Va
 fn build_options_backend(options: &BuildTaskOptions) -> Option<&str> {
     match &options.context.kind {
         AgentSessionKind::Acp(ctx) => ctx.config.backend.as_deref(),
+        AgentSessionKind::Antigravity(ctx) => ctx.config.backend.as_deref(),
         AgentSessionKind::Aionrs(_) => None,
     }
 }
@@ -4049,6 +4068,16 @@ impl ConversationService {
         match agent_type {
             AgentType::Acp => resolve_acp_mcp_support_policy(&self.agent_metadata_repo, user_id, extra).await,
             AgentType::Aionrs => Ok(McpSupportPolicy::AIONRS),
+            // agy supports exactly two MCP transports: stdio (local command)
+            // and SSE (remote `serverUrl`). Letting it fall through to the
+            // all-true default would let users configure HTTP-transport servers
+            // that write cleanly into agy's config and then never connect.
+            AgentType::Antigravity => Ok(McpSupportPolicy {
+                stdio: true,
+                sse: true,
+                http: false,
+                streamable_http: false,
+            }),
             _ => Ok(McpSupportPolicy::AIONRS),
         }
     }

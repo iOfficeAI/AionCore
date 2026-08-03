@@ -490,6 +490,21 @@ impl SessionAgentTask {
     /// live `AcpPermission` frame so a duplicate live+recovered pair de-dups. Options
     /// mirror the live translation: AskUserQuestion → its question options, else the
     /// generic allow/deny.
+    /// Raise a tool approval that came from OUTSIDE the backend's stream and
+    /// block until the user answers.
+    ///
+    /// Only Antigravity uses this: agy cannot prompt in headless mode, so its
+    /// `PreToolUse` hook calls AionUi over HTTP instead, and that request lands
+    /// here. Backends that raise permissions on their own wire return `Denied`
+    /// from the trait default and never reach this path.
+    pub async fn request_external_permission(
+        &self,
+        tool_name: String,
+        input: serde_json::Value,
+    ) -> aionui_session::PermissionDecision {
+        self.backend.request_external_permission(tool_name, input).await
+    }
+
     pub fn get_confirmations(&self) -> Vec<aionui_common::Confirmation> {
         self.backend
             .pending_permission_requests()
@@ -1205,6 +1220,30 @@ pub struct SessionBuildInputs<'a> {
     /// spawn-time `session-cli-config` dump AND threads it (with the vendor
     /// label) into the `SessionAgentTask` for the send-time dump.
     pub prompt_dump_dir: Option<std::path::PathBuf>,
+    /// Antigravity only: the prepared `.agents/hooks.json` body, so a session
+    /// switched out of full auto can restore its approval gate.
+    pub permission_hook_body: Option<String>,
+}
+
+/// The mode a session actually starts on.
+///
+/// The persisted snapshot wins over the create-time seed: it is where a runtime
+/// switch lands (`save_acp_runtime_mode`) and where a scheduled run records the
+/// full-auto mode it resolved. Reading only `config.session_mode` would see the
+/// value the conversation was created with and miss both.
+///
+/// Aliases are normalized to the backend-native id here, so callers compare
+/// against catalog values rather than whatever spelling reached the API.
+pub(crate) fn resolved_session_mode(
+    config: &AcpBuildExtra,
+    session_snapshot: Option<&PersistedSessionState>,
+    metadata: &aionui_api_types::AgentMetadata,
+) -> Option<String> {
+    session_snapshot
+        .and_then(|s| s.current_mode_id.as_ref().map(|m| m.as_str().to_owned()))
+        .or_else(|| config.session_mode.clone())
+        .map(|m| crate::manager::acp::mode_normalize::normalize_requested_mode(metadata, &m))
+        .filter(|s| !s.is_empty())
 }
 
 /// The pure spec + mode/model mapping — the sibling of clean-slate's
@@ -1243,11 +1282,7 @@ fn spec_mode_model(
     // the catalog row's `yolo_id` / backend label; a mode without an alias passes
     // through unchanged. Runs BEFORE the codex sandbox/approval derivation downstream
     // (which matches both the alias and the native id, so ordering is safe).
-    let mode = session_snapshot
-        .and_then(|s| s.current_mode_id.as_ref().map(|m| m.as_str().to_owned()))
-        .or_else(|| config.session_mode.clone())
-        .map(|m| crate::manager::acp::mode_normalize::normalize_requested_mode(metadata, &m))
-        .filter(|s| !s.is_empty());
+    let mode = resolved_session_mode(config, session_snapshot, metadata);
     let model = session_snapshot
         .and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned()))
         .or_else(|| config.current_model_id.clone())
@@ -1262,6 +1297,116 @@ fn spec_mode_model(
 /// assembly (`crates/aionui-app/src/session_runtime/mod.rs`): it resolves the
 /// resume spec, the mode/model precedence, the MCP + preset + skills init surface,
 /// the claude cc-switch provider env, and the codex sandbox/approval policy — so a
+/// Build an Antigravity (`agy` CLI) `SessionAgentTask`.
+///
+/// Deliberately SEPARATE from [`build_session_instance`]: that function carries
+/// claude/codex-private assembly — cc-switch provider env, the codex
+/// sandbox/approval derivation, persisted-effort replay, and a binary
+/// `if claude { "claude" } else { "codex" }` label that would silently
+/// mislabel any third backend. Antigravity needs none of it, so it shares this
+/// module's helpers (`spec_mode_model`, the MCP fold, `assemble_spawn_env`,
+/// `spawn_catalog_writeback`) without entering that path.
+pub async fn build_antigravity_instance(
+    inputs: SessionBuildInputs<'_>,
+    spawner: Arc<dyn aionui_process::Spawner>,
+) -> Result<crate::agent_task::AgentInstance, AgentError> {
+    use aionui_session::{AntigravityConnection, BackendConnection, McpServerSpec, SessionConfig, SessionInit};
+
+    let SessionBuildInputs {
+        conversation_id,
+        user_id,
+        workspace,
+        config,
+        metadata,
+        session_snapshot,
+        backend_session_id,
+        mcp_server_repo,
+        runtime_env,
+        broadcaster,
+        catalog_writeback,
+        acp_session_repo,
+        // agy has no prompt-dump lane yet (the dev dump is keyed by a
+        // claude/codex label); skip it rather than mislabel the dump.
+        prompt_dump_dir: _,
+        permission_hook_body,
+    } = inputs;
+
+    let (spec, mode, model) = spec_mode_model(&conversation_id, backend_session_id, config, session_snapshot, metadata);
+
+    // Same MCP init surface and ordering as the claude/codex path: user servers
+    // resolved from the repo, plus the inline snapshot, with the team
+    // coordination server PREPENDED.
+    let mut neutral = match mcp_server_repo {
+        Some(repo) => {
+            crate::mcp_resolve::resolve_session_mcp_servers(
+                repo.as_ref(),
+                &user_id,
+                config.mcp_server_ids.as_deref(),
+                &conversation_id,
+                broadcaster.clone(),
+            )
+            .await
+        }
+        None => Vec::new(),
+    };
+    neutral.extend(config.session_mcp_servers.iter().cloned());
+    let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
+    if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
+        let mut coordination = vec![team_mcp_server_spec(cfg)];
+        coordination.append(&mut mcp_servers);
+        mcp_servers = coordination;
+    }
+
+    let init = SessionInit {
+        mcp_servers,
+        skills: config.skills.clone(),
+        preset_context: config.preset_context.clone(),
+        session_snapshot: None,
+        resume: matches!(spec, aionui_session::SessionSpec::Resume { .. }),
+    };
+
+    let mut session_config = SessionConfig {
+        cwd: Some(workspace.clone()),
+        model,
+        mode,
+        init,
+        permission_hook_body,
+        // agy is NOT shipped with the app: it is a large native binary the user
+        // installs themselves, so there is no bundled path to resolve and the
+        // backend always spawns the `agy` on PATH.
+        cli_program: None,
+        ..Default::default()
+    };
+    session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
+
+    let backend = AntigravityConnection::new(spawner)
+        .open_session(spec, session_config)
+        .await
+        .map_err(|e| match e {
+            aionui_session::BackendError::WorkspaceUnavailable(path) => {
+                AgentError::workspace_path_runtime_unavailable(path)
+            }
+            e => AgentError::bad_gateway(format!("open antigravity session: {e}")),
+        })?;
+
+    if let Some((agent_id, catalog_tx)) = catalog_writeback {
+        spawn_catalog_writeback(agent_id, user_id.clone(), backend.clone(), catalog_tx);
+    }
+
+    let task = SessionAgentTask::new_with_preload(
+        AgentType::Antigravity,
+        conversation_id,
+        user_id,
+        workspace,
+        backend,
+        acp_session_repo,
+        &metadata.handshake,
+        None,
+        Some(broadcaster),
+    );
+    Ok(crate::agent_task::AgentInstance::Session(task))
+}
+
 /// claude/codex session started through the ACP factory is byte-equivalent to one
 /// started through the clean-slate registry.
 pub async fn build_session_instance(
@@ -1293,6 +1438,8 @@ pub async fn build_session_instance(
         catalog_writeback,
         acp_session_repo,
         prompt_dump_dir,
+        // claude/codex gate through CLI flags, not an installed hook file.
+        permission_hook_body: _,
     } = inputs;
 
     // GAP #1/#2 — the pure spec + mode/model mapping (resume anchor → Resume/Fresh,
@@ -1688,6 +1835,17 @@ fn team_mcp_server_spec(cfg: &aionui_api_types::TeamMcpStdioConfig) -> aionui_se
 /// Verbatim port of clean-slate `session_runtime::spawn_catalog_writeback`: wait
 /// for MODELS specifically before committing (codex answers modes before models),
 /// forwarding the best model-less partial only if the window elapses.
+/// How often the write-back re-reads `capabilities()`.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+/// When to publish modes/commands even though no models have shown up (5s).
+/// A backend that never reports models must not be held back by the longer
+/// window below.
+const INTERIM_PUBLISH_TICKS: usize = 100;
+/// How long to keep watching for a LATE model list (35s). agy discovers models
+/// by running `agy models` off the open path — ~3s cold and slower on a bad
+/// network, which the 5s deadline alone could not cover.
+const MODEL_WINDOW_TICKS: usize = 700;
+
 pub fn spawn_catalog_writeback(
     agent_id: String,
     user_id: String,
@@ -1696,7 +1854,8 @@ pub fn spawn_catalog_writeback(
 ) {
     tokio::spawn(async move {
         let mut best_partial = None;
-        for _ in 0..100 {
+        let mut interim_sent = false;
+        for tick in 0..MODEL_WINDOW_TICKS {
             let caps = backend.capabilities();
             if let Some(partial) = catalog_partial_from_caps(&caps) {
                 if !caps.available_models.is_empty() {
@@ -1707,9 +1866,18 @@ pub fn spawn_catalog_writeback(
                 // Modes/commands only so far — remember it, keep waiting for models.
                 best_partial = Some(partial);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Publish what we have at the original deadline so a backend that
+            // legitimately has no model list (claude/codex fill capabilities
+            // from the handshake) is not held back by the longer model window.
+            if tick + 1 == INTERIM_PUBLISH_TICKS
+                && let Some(partial) = best_partial.clone()
+            {
+                catalog_tx.send_partial(user_id.clone(), agent_id.clone(), partial);
+                interim_sent = true;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
-        if let Some(partial) = best_partial {
+        if !interim_sent && let Some(partial) = best_partial {
             catalog_tx.send_partial(user_id, agent_id, partial);
         }
     });
@@ -3192,16 +3360,28 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         // turn that is already running (or immediately re-settled by the turn's terminal
         // Finish), so it does not manufacture a spurious idle timer the way a config frame
         // would. `NoticeLevel` has only Info/Warning (no Error tier), matching TipType.
-        SessionEvent::Notice { level, message } => {
+        SessionEvent::Notice {
+            level,
+            message,
+            localized,
+        } => {
             let tip_type = match level {
                 aionui_session::NoticeLevel::Info => TipType::Info,
                 aionui_session::NoticeLevel::Warning => TipType::Warning,
             };
+            // `content` stays the English text even when a code travels with it:
+            // the frontend passes it as i18next's `defaultValue`, so a locale
+            // that has not translated the key yet shows real prose instead of a
+            // raw key.
+            let (code, params) = match localized {
+                Some(l) => (Some(l.code), Some(serde_json::Value::Object(l.params))),
+                None => (None, None),
+            };
             vec![AgentStreamEvent::Tips(TipsEventData {
                 content: message,
                 tip_type,
-                code: None,
-                params: None,
+                code,
+                params,
             })]
         }
         // Events with no origin-side counterpart (or purely internal) are dropped.
@@ -3917,6 +4097,7 @@ mod translate_tests {
                 SessionEvent::Notice {
                     level,
                     message: "set effort: rejected by agent".into(),
+                    localized: None,
                 },
                 "conv-1",
                 false,
@@ -6864,5 +7045,128 @@ mod force_kill_tests {
             "non-UserCancel kill must not broadcast Finish/Error, got {terminal:?}"
         );
         assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Running));
+    }
+}
+
+#[cfg(test)]
+mod catalog_writeback_tests {
+    //! When a backend discovers models LATE. agy runs `agy models` off the open
+    //! path (~3s cold, slower on a bad network), so the write-back must keep
+    //! watching well past the point where modes are already known.
+    use super::*;
+    use aionui_session::{Admission, Capabilities, CommandReceipt, ModeInfo, ModelInfo};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `catalog_partial_from_caps` nests the list under its own key alongside
+    /// `current_*`, so reach through that wrapper rather than the outer value.
+    fn nested_len(field: Option<&serde_json::Value>, key: &str) -> usize {
+        field
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    }
+
+    /// Reports modes immediately and models only after `polls_before_models`
+    /// calls to `capabilities()` — the write-back polls every 50ms, so the
+    /// count sets how late discovery lands.
+    struct LateModelsBackend {
+        polls: AtomicUsize,
+        polls_before_models: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for LateModelsBackend {
+        async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::NoTurn,
+                turn_gen: 0,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            let n = self.polls.fetch_add(1, Ordering::SeqCst);
+            let available_models = if n >= self.polls_before_models {
+                vec![ModelInfo {
+                    id: "gemini-3.6-flash-high".into(),
+                    name: "gemini-3.6-flash-high".into(),
+                    description: None,
+                    reasoning_efforts: Vec::new(),
+                }]
+            } else {
+                Vec::new()
+            };
+            Capabilities {
+                available_modes: vec![ModeInfo {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    description: None,
+                }],
+                available_models,
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Drain the channel until a message carrying models arrives, or the
+    /// write-back gives up. Returns every message it saw.
+    async fn collect_until_models(
+        rx: &mut tokio::sync::mpsc::Receiver<crate::registry::CatalogSyncMessage>,
+    ) -> Vec<crate::registry::CatalogSyncMessage> {
+        let mut seen = Vec::new();
+        while let Some(msg) = rx.recv().await {
+            let has_models = nested_len(msg.handshake.available_models.as_ref(), "available_models") > 0;
+            seen.push(msg);
+            if has_models {
+                break;
+            }
+        }
+        seen
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn models_discovered_after_the_interim_publish_still_reach_the_catalog() {
+        // 200 polls ≈ 10s: past the interim publish, well inside the model
+        // window. Before this fix the write-back stopped at 5s and the model
+        // picker stayed empty for the whole session with no error anywhere.
+        let backend = Arc::new(LateModelsBackend {
+            polls: AtomicUsize::new(0),
+            polls_before_models: 200,
+        });
+        let (tx, mut rx) = crate::registry::catalog_channel_for_test(16);
+        spawn_catalog_writeback("agent-1".into(), "user-1".into(), backend, tx);
+
+        let seen = collect_until_models(&mut rx).await;
+        let last = seen.last().expect("write-back published nothing at all");
+        assert_eq!(
+            nested_len(last.handshake.available_models.as_ref(), "available_models"),
+            1,
+            "late-discovered models never reached the catalog; saw {} message(s)",
+            seen.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backend_that_never_reports_models_still_publishes_its_modes() {
+        // claude/codex fill capabilities from the handshake and may legitimately
+        // have no model list. Waiting for the longer model window must not stop
+        // their modes from landing.
+        let backend = Arc::new(LateModelsBackend {
+            polls: AtomicUsize::new(0),
+            polls_before_models: usize::MAX,
+        });
+        let (tx, mut rx) = crate::registry::catalog_channel_for_test(16);
+        spawn_catalog_writeback("agent-2".into(), "user-2".into(), backend, tx);
+
+        let msg = rx.recv().await.expect("modes were never published");
+        assert_eq!(msg.agent_metadata_id, "agent-2");
+        assert!(
+            nested_len(msg.handshake.available_modes.as_ref(), "available_modes") > 0,
+            "expected the modes-only partial to be published"
+        );
     }
 }

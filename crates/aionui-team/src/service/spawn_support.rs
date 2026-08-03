@@ -22,19 +22,47 @@ pub(crate) fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
     Err(TeamError::InvalidRequest(format!("unsupported backend: {backend}")))
 }
 
-fn find_acp_backend_metadata(rows: &[AgentMetadataRow], backend: &str) -> Option<AgentMetadataRow> {
+/// The catalog row for a CLI-agent backend slug, whichever agent type it is
+/// filed under.
+///
+/// agy's builtin row is filed as `antigravity`, not `acp`, so matching only
+/// `acp` rows missed it: every caller below then took its "no metadata" path
+/// and read the hardcoded sentinel instead of the row. That agrees with the
+/// row today only because both say `yolo` — a catalog row that renames its
+/// `yolo_id` would silently strand a teammate on a permission prompt no one
+/// is there to answer.
+fn find_cli_backend_metadata(rows: &[AgentMetadataRow], backend: &str) -> Option<AgentMetadataRow> {
     rows.iter()
-        .find(|row| row.agent_type == AgentType::Acp.serde_name() && row.backend.as_deref() == Some(backend))
+        .find(|row| {
+            row.backend.as_deref() == Some(backend)
+                && (row.agent_type == AgentType::Acp.serde_name()
+                    || row.agent_type == AgentType::Antigravity.serde_name())
+        })
         .cloned()
 }
 
-pub(crate) async fn acp_backend_metadata(
+pub(crate) async fn cli_backend_metadata(
     agent_metadata_repo: &Arc<dyn IAgentMetadataRepository>,
     user_id: &str,
     backend: &str,
 ) -> Result<Option<AgentMetadataRow>, TeamError> {
     let rows = agent_metadata_repo.list_all_for_user(user_id).await?;
-    Ok(find_acp_backend_metadata(&rows, backend))
+    Ok(find_cli_backend_metadata(&rows, backend))
+}
+
+/// The runtime `AgentType` for a backend slug.
+///
+/// The row wins when there is one: a backend slug like `claude` is not itself
+/// an `AgentType`, and now that the lookup also returns `antigravity` rows,
+/// assuming `Acp` whenever a row exists would mis-type agy.
+pub(crate) fn agent_type_for_backend(
+    metadata: Option<&AgentMetadataRow>,
+    backend: &str,
+) -> Result<AgentType, TeamError> {
+    match metadata {
+        Some(row) => parse_agent_type(&row.agent_type),
+        None => parse_agent_type(backend),
+    }
 }
 
 pub(crate) fn session_mode_for_backend(
@@ -914,6 +942,48 @@ mod tests {
         assert_eq!(
             session_mode_for_backend("codex", AgentType::Acp, None),
             "agent-full-access"
+        );
+    }
+
+    #[test]
+    fn the_antigravity_row_is_found_even_though_it_is_not_filed_under_acp() {
+        // agy's builtin row carries agent_type `antigravity`. Missing it sent
+        // every caller down the no-metadata path.
+        let mut row = agent_metadata_row("antigravity", Some("yolo"));
+        row.agent_type = AgentType::Antigravity.serde_name().to_owned();
+
+        let found = find_cli_backend_metadata(&[row], "antigravity").expect("agy's row must be found");
+        assert_eq!(found.agent_type, AgentType::Antigravity.serde_name());
+    }
+
+    #[test]
+    fn a_found_row_types_the_agent_instead_of_assuming_acp() {
+        // Widening the lookup without this would type agy as Acp and route it
+        // into a protocol it does not speak.
+        let mut agy = agent_metadata_row("antigravity", Some("yolo"));
+        agy.agent_type = AgentType::Antigravity.serde_name().to_owned();
+        assert_eq!(
+            agent_type_for_backend(Some(&agy), "antigravity").unwrap(),
+            AgentType::Antigravity
+        );
+
+        // A backend slug is not itself an AgentType, so the row still decides.
+        let claude = agent_metadata_row("claude", Some("bypassPermissions"));
+        assert_eq!(agent_type_for_backend(Some(&claude), "claude").unwrap(), AgentType::Acp);
+        assert_eq!(agent_type_for_backend(None, "aionrs").unwrap(), AgentType::Aionrs);
+    }
+
+    #[test]
+    fn a_renamed_sentinel_on_the_antigravity_row_now_reaches_the_teammate() {
+        // The whole point of reading the row: `yolo_id` is data. Before the
+        // widening this returned the hardcoded `yolo` and full auto was lost.
+        let mut row = agent_metadata_row("antigravity", Some("full-access"));
+        row.agent_type = AgentType::Antigravity.serde_name().to_owned();
+
+        let found = find_cli_backend_metadata(&[row], "antigravity").unwrap();
+        assert_eq!(
+            session_mode_for_backend("antigravity", AgentType::Antigravity, Some(&found)),
+            "full-access"
         );
     }
 

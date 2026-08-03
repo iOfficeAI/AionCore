@@ -6,6 +6,7 @@ mod acp_prompt_hook;
 mod agent_build_extra;
 mod agent_discovery;
 mod agent_error;
+mod antigravity_hook;
 mod assistant;
 mod auth;
 mod channel;
@@ -52,6 +53,10 @@ pub use agent_discovery::{
 pub use agent_error::{
     AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind, AgentErrorResolutionTarget,
     AgentStreamErrorData,
+};
+pub use antigravity_hook::{
+    AntigravityHookConfig, AntigravityHookDecision, AntigravityHookInput, AntigravityHookOutput,
+    AntigravityHookToolCall,
 };
 pub use assistant::{
     AssistantAgentResponse, AssistantCapabilitiesResponse, AssistantDefaultListRequest, AssistantDefaultListResponse,
@@ -109,9 +114,9 @@ pub use file::{
     CopyFilesResponse, CopyTarget, CreateTempFileRequest, DirOrFileResponse, FetchRemoteImageRequest,
     FileChangeInfoResponse, FileMetadataResponse, FileWatchRequest, GetFileMetadataRequest, GetFilesByDirRequest,
     GetImageBase64Request, ListWorkspaceFilesRequest, ReadFileBufferRequest, ReadFileRequest, RemoveEntryRequest,
-    RenameRequest, RenameResponse, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest,
-    SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest, SnapshotWorkspaceRequest, WorkspaceFlatFileResponse,
-    WorkspaceOfficeWatchRequest, WriteFileRequest, ZipFileEntry, ZipRequest,
+    RenameRequest, RenameResponse, RevealItemRequest, SnapshotBaselineRequest, SnapshotCompareResponse,
+    SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest, SnapshotWorkspaceRequest,
+    WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest, ZipFileEntry, ZipRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{
