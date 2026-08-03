@@ -69,6 +69,14 @@ fn spawn_escaping_tree(marker: &str) -> (u32, u32) {
     panic!("grandchild never reported its pid");
 }
 
+fn which_path(bin: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(bin))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
 fn which(bin: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
@@ -78,6 +86,23 @@ fn which(bin: &str) -> bool {
 fn alive(pid: u32) -> bool {
     // SAFETY: signal 0 performs error checking only; it never delivers a signal.
     unsafe { libc::kill(pid as libc::c_int, 0) == 0 }
+}
+
+/// Wait until `child` is in a different process group from `parent`.
+///
+/// The detach happens INSIDE the child (setsid after fork, before exec), so the
+/// pid is published by the shell before the new group exists. Comparing the two
+/// immediately is a race: it passed by luck and failed under load. Returns
+/// false if the split never happens, so the caller still fails loudly on a
+/// fixture that genuinely does not escape.
+fn wait_until_group_split(parent: u32, child: u32) -> bool {
+    for _ in 0..200 {
+        if pgid(parent) != pgid(child) && pgid(child) > 0 {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    false
 }
 
 fn pgid(pid: u32) -> i32 {
@@ -97,9 +122,8 @@ fn a_tool_child_that_left_the_group_is_still_reaped() {
     // Without this the fixture is worthless: if the child shared the outer's
     // group, the plain group kill would remove it and the test would pass with
     // the reap deleted. An earlier version of this file did exactly that.
-    assert_ne!(
-        pgid(outer),
-        pgid(inner),
+    assert!(
+        wait_until_group_split(outer, inner),
         "fixture did not escape the group; the test would prove nothing"
     );
 
@@ -165,4 +189,78 @@ fn an_unrelated_process_is_left_running() {
         outer_survived,
         "killing a leaf must not walk upwards and take out its parent"
     );
+}
+
+/// The path a user's Cancel actually takes.
+///
+/// The first version of this fix lived in `ProcessGroupContainment::kill_all`,
+/// which has NO caller in production code — the only thing invoking it was the
+/// test above. Cancel goes through `ManagedProcess::kill`, so the fix was
+/// green in tests and absent in reality; driving a real agy turn through the
+/// HTTP Cancel still leaked `sleep 600` under init. This test pins the path
+/// that matters.
+#[tokio::test]
+async fn managed_process_kill_reaps_a_child_that_left_the_group() {
+    use aionui_common::CommandSpec;
+    use aionui_process::ManagedProcess;
+
+    let marker = std::env::temp_dir().join(format!("aionui-mpkill-{}.pid", std::process::id()));
+    let marker_s = marker.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&marker);
+
+    // ABSOLUTE paths: `ManagedProcess` spawns through the runtime's cleaned
+    // environment, so a helper resolved from the test's own PATH may simply not
+    // be found in the child — the detach would silently no-op and the fixture
+    // would stop escaping.
+    let detach = match (which_path("setsid"), which_path("perl")) {
+        (Some(p), _) => p.display().to_string(),
+        (None, Some(p)) => format!("{} -e 'use POSIX; POSIX::setsid(); exec @ARGV'", p.display()),
+        _ => panic!("need setsid(1) or perl"),
+    };
+    let proc = ManagedProcess::spawn(
+        CommandSpec {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".to_owned(),
+                format!("{detach} sleep 600 & echo $! > {marker_s}; sleep 600"),
+            ],
+            env: Vec::new(),
+            cwd: None,
+        },
+        &[],
+    )
+    .await
+    .expect("spawn");
+
+    let mut inner = 0u32;
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        if let Ok(s) = std::fs::read_to_string(&marker)
+            && let Ok(pid) = s.trim().parse::<u32>()
+        {
+            inner = pid;
+            break;
+        }
+    }
+    assert_ne!(inner, 0, "grandchild never reported its pid");
+    assert!(
+        wait_until_group_split(proc.pid(), inner),
+        "fixture did not escape the group; the test would prove nothing"
+    );
+
+    proc.kill(std::time::Duration::from_millis(200)).await.expect("kill");
+    for _ in 0..80 {
+        if !alive(inner) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    let _ = std::fs::remove_file(&marker);
+    let leaked = alive(inner);
+    if leaked {
+        // SAFETY: cleaning up a pid this test created.
+        unsafe { libc::kill(inner as libc::c_int, libc::SIGKILL) };
+    }
+    assert!(!leaked, "ManagedProcess::kill left the escaped child running");
 }

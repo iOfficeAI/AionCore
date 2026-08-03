@@ -225,3 +225,61 @@ mod tests {
         assert!(table.iter().any(|(pid, _)| *pid == me), "own pid missing from table");
     }
 }
+
+/// Descendants of `pid` paired with their start-times, captured for a later
+/// sweep.
+///
+/// Must be called BEFORE the kill: the parent link is the only thing tying an
+/// escaped child to this tree, and the kernel severs it by reparenting orphans
+/// to init the instant their parent dies.
+///
+/// Not filtered to processes outside `group`: one still inside it is already
+/// dead by sweep time, and `SIGKILL` to a gone pid is a no-op (`ESRCH` is
+/// success). Filtering would need a second per-pid accessor to buy nothing.
+pub(crate) fn escaped_descendants(pid: u32, _group: Option<u32>) -> Vec<(u32, Option<u64>)> {
+    let table = parent_table();
+    collect_descendants(pid, &table)
+        .into_iter()
+        .map(|p| (p, crate::read_process_start_time(p)))
+        .collect()
+}
+
+/// `SIGKILL` snapshot members that are still the same process; returns how many
+/// are STILL alive afterwards.
+///
+/// Identity is start-time equality. Between the snapshot and the sweep a pid
+/// may have been recycled onto something unrelated, and killing that is far
+/// worse than leaking — so anything not positively identified (no recorded
+/// start-time, none observable, or a mismatch) is left alone, matching this
+/// crate's standing "never kill on doubt" rule.
+pub(crate) fn reap(snapshot: &[(u32, Option<u64>)]) -> usize {
+    let own_pid = std::process::id();
+    let mut still_alive = 0usize;
+    for &(pid, recorded) in snapshot {
+        if pid == own_pid {
+            continue; // never signal the reaper itself
+        }
+        let observed = match crate::probe(pid) {
+            crate::ObservedLiveness::Alive { start_ticks } => start_ticks,
+            crate::ObservedLiveness::Gone => continue,
+            crate::ObservedLiveness::EpermAlive => {
+                still_alive += 1;
+                continue;
+            }
+        };
+        let same_process = match (recorded, observed) {
+            // `0` is this crate's non-identity sentinel (see `classify_liveness`):
+            // corrupt data, not a discriminator.
+            (Some(0), _) | (_, Some(0)) | (None, _) | (_, None) => false,
+            (Some(rec), Some(obs)) => rec == obs,
+        };
+        if !same_process {
+            still_alive += 1;
+            continue;
+        }
+        if crate::force_kill(pid, None).is_err() {
+            still_alive += 1;
+        }
+    }
+    still_alive
+}

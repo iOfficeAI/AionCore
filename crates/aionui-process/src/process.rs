@@ -393,6 +393,17 @@ impl ManagedProcess {
     pub async fn kill(&self, grace: Duration) -> Result<(), ProcessError> {
         self.close_stdin().await;
 
+        // BEFORE anything can exit. A descendant that left this process group
+        // is unreachable by the group SIGKILL below, and the parent link that
+        // still identifies it is severed the moment its parent dies — the
+        // kernel reparents orphans to init. Captured after the grace wait, this
+        // set is already empty for exactly the processes that need reaping.
+        //
+        // Measured with agy 1.1.10 driven through a real Cancel: its tool child
+        // runs as its own group leader (agy pgid=66986, tool pgid=67093), so
+        // the group kill removed agy and left `sleep 600` running under init.
+        let escaped = crate::proc_tree::escaped_descendants(self.pid, self.process_group_id);
+
         let mut rx = self.exit_rx.clone();
         let exited = tokio::time::timeout(grace, async {
             if rx.borrow().is_some() {
@@ -416,6 +427,17 @@ impl ManagedProcess {
             job.terminate();
         } else {
             crate::force_kill(self.pid, self.process_group_id)?;
+        }
+
+        // Sweep the descendants that were never in the group. Deliberately after
+        // the group kill: most of them die with it, and the survivors are the
+        // ones this exists for.
+        let strays = crate::proc_tree::reap(&escaped);
+        if strays > 0 {
+            warn!(
+                pid = self.pid,
+                strays, "descendants outside the group survived the sweep"
+            );
         }
 
         // Wait for the exit monitor to observe termination so callers don't

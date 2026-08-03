@@ -45,62 +45,6 @@ impl ProcessGroupContainment {
     pub fn new(pid: u32, process_group_id: Option<u32>) -> Self {
         Self { pid, process_group_id }
     }
-
-    /// Every descendant of the contained pid, each paired with its start-time
-    /// so it can be re-identified after the kill.
-    ///
-    /// Not filtered to "escaped" ones: a descendant still inside the group is
-    /// already dead by the time we sweep, and `SIGKILL`ing a gone pid is a
-    /// no-op (`ESRCH` is success). Filtering would need a second per-pid
-    /// accessor to buy nothing.
-    fn descendant_snapshot(&self) -> Vec<(u32, Option<u64>)> {
-        let table = crate::proc_tree::parent_table();
-        crate::proc_tree::collect_descendants(self.pid, &table)
-            .into_iter()
-            .map(|pid| (pid, crate::read_process_start_time(pid)))
-            .collect()
-    }
-
-    /// `SIGKILL` snapshot members that are still the same process, and report
-    /// how many are STILL alive afterwards.
-    ///
-    /// Identity is start-time equality: between the snapshot and this sweep the
-    /// pid may have been recycled onto something unrelated, and killing that
-    /// would be far worse than leaking. Anything we cannot positively identify
-    /// — no recorded start-time, none observable, or a mismatch — is left
-    /// alone, matching this crate's standing "never kill on doubt" rule.
-    fn reap(&self, snapshot: &[(u32, Option<u64>)]) -> usize {
-        let own_pid = std::process::id();
-        let mut still_alive = 0usize;
-        for &(pid, recorded) in snapshot {
-            if pid == own_pid {
-                continue; // never signal the reaper itself
-            }
-            let observed = match crate::probe(pid) {
-                crate::ObservedLiveness::Alive { start_ticks } => start_ticks,
-                // Gone: nothing to do. EpermAlive: alive but not provably ours.
-                crate::ObservedLiveness::Gone => continue,
-                crate::ObservedLiveness::EpermAlive => {
-                    still_alive += 1;
-                    continue;
-                }
-            };
-            let same_process = match (recorded, observed) {
-                // `0` is this crate's non-identity sentinel (see
-                // `classify_liveness`): corrupt data, not a discriminator.
-                (Some(0), _) | (_, Some(0)) | (None, _) | (_, None) => false,
-                (Some(rec), Some(obs)) => rec == obs,
-            };
-            if !same_process {
-                still_alive += 1;
-                continue;
-            }
-            if crate::force_kill(pid, None).is_err() {
-                still_alive += 1;
-            }
-        }
-        still_alive
-    }
 }
 
 impl Containment for ProcessGroupContainment {
@@ -109,7 +53,7 @@ impl Containment for ProcessGroupContainment {
         // an escaped child to this tree, and the kernel reparents it to init
         // the moment the CLI dies. Looked up afterwards, the set is empty and
         // the child is unreachable forever.
-        let snapshot = self.descendant_snapshot();
+        let snapshot = crate::proc_tree::escaped_descendants(self.pid, self.process_group_id);
 
         crate::force_kill(self.pid, self.process_group_id)?;
         // SIGKILL is async; give the kernel a brief bounded settle before the
@@ -127,7 +71,7 @@ impl Containment for ProcessGroupContainment {
             std::thread::sleep(STEP);
         }
 
-        let strays = self.reap(&snapshot);
+        let strays = crate::proc_tree::reap(&snapshot);
         if group_gone && strays == 0 {
             return Ok(ContainmentKillOutcome::ProbedGone);
         }
