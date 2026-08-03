@@ -2484,6 +2484,10 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
         // Info (advisory, non-urgent). Shapes schema-verified (ServerNotification.json).
         "warning" | "guardianWarning" => {
             let message = params.get("message").and_then(Value::as_str).unwrap_or("").to_string();
+            if is_workmate_temp_workspace_trust_notice(&message) {
+                tracing::info!("codex: suppressed non-actionable trust notice for WorkMate temporary workspace");
+                return vec![];
+            }
             vec![SessionEvent::Notice {
                 level: crate::event::NoticeLevel::Warning,
                 message,
@@ -2491,6 +2495,10 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
         }
         "configWarning" => {
             let message = notice_message(params);
+            if is_workmate_temp_workspace_trust_notice(&message) {
+                tracing::info!("codex: suppressed non-actionable trust notice for WorkMate temporary workspace");
+                return vec![];
+            }
             vec![SessionEvent::Notice {
                 level: crate::event::NoticeLevel::Warning,
                 message,
@@ -2532,6 +2540,10 @@ fn notice_message(params: &Value) -> String {
         Some(d) if !d.is_empty() => format!("{summary} — {d}"),
         _ => summary.to_string(),
     }
+}
+
+fn is_workmate_temp_workspace_trust_notice(message: &str) -> bool {
+    message.contains("Project-local config, hooks, and exec policies are disabled") && message.contains("codex-temp-")
 }
 
 /// Map codex's 7-state `CollabAgentStatus` (schema-full/ServerNotification.json
@@ -4427,6 +4439,28 @@ mod tests {
             cfg.iter()
                 .any(|e| matches!(e, SessionEvent::Notice { level: NoticeLevel::Warning, message } if message == "unknown key X")),
             "configWarning → Notice(Warning), got {cfg:?}"
+        );
+        let temp_trust = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"configWarning","params":{"summary":"Project-local config, hooks, and exec policies are disabled in C:\\data\\codex-temp-123\\.codex"}}"#,
+        ])
+        .await;
+        assert!(
+            !temp_trust.iter().any(|e| matches!(e, SessionEvent::Notice { .. })),
+            "WorkMate temporary workspace trust warning should be suppressed, got {temp_trust:?}"
+        );
+        let user_project_trust = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"configWarning","params":{"summary":"Project-local config, hooks, and exec policies are disabled in C:\\code\\customer-project\\.codex"}}"#,
+        ])
+        .await;
+        assert!(
+            user_project_trust.iter().any(|e| matches!(
+                e,
+                SessionEvent::Notice {
+                    level: NoticeLevel::Warning,
+                    ..
+                }
+            )),
+            "user project trust warning must remain visible, got {user_project_trust:?}"
         );
         // error{willRetry:true} → Heartbeat (transient retry, not a duplicate terminal)
         let retry = drive_codex(&[

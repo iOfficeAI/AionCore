@@ -1159,6 +1159,9 @@ pub struct SessionBuildInputs<'a> {
     pub user_id: String,
     /// The resolved workspace path (`SessionConfig.cwd`).
     pub workspace: String,
+    /// Whether the workspace came from the user. WorkMate-created workspaces
+    /// may receive narrowly scoped CLI bootstrap policy; user projects must not.
+    pub is_custom_workspace: bool,
     /// The conversation's persisted build `extra` (mode/model/mcp/preset/skills).
     pub config: &'a AcpBuildExtra,
     /// The resolved catalog row. Used to normalize the persisted/requested mode
@@ -1283,6 +1286,7 @@ pub async fn build_session_instance(
         conversation_id,
         user_id,
         workspace,
+        is_custom_workspace,
         config,
         metadata,
         session_snapshot,
@@ -1354,6 +1358,13 @@ pub async fn build_session_instance(
             .or_else(|| aionui_runtime::resolve_command_path(backend_label)),
         ..Default::default()
     };
+
+    if backend_label == "codex"
+        && let Some(trust_override) = codex_workspace_trust_override(&workspace, is_custom_workspace)
+    {
+        session_config.extra_args.extend(["-c".to_string(), trust_override]);
+        tracing::info!(conv_id = %conversation_id, "codex: trusting WorkMate-provisioned workspace for this process");
+    }
 
     // Ask claude for PLAINTEXT thinking. Current models resolve the thinking
     // display to `omitted`, which streams signature-only thinking blocks whose
@@ -1533,6 +1544,17 @@ pub async fn build_session_instance(
         Some(broadcaster),
     );
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
+}
+
+/// Build a process-local Codex config override for a WorkMate-provisioned
+/// workspace. JSON string escaping is compatible with TOML basic strings and
+/// keeps Windows separators and quotes from changing the config key.
+fn codex_workspace_trust_override(workspace: &str, is_custom_workspace: bool) -> Option<String> {
+    if is_custom_workspace {
+        return None;
+    }
+    let quoted_workspace = serde_json::to_string(workspace).expect("serializing a string cannot fail");
+    Some(format!("projects.{quoted_workspace}.trust_level=\"trusted\""))
 }
 
 /// Assemble the direct-CLI spawn env (legacy spawn-surface parity; order
@@ -2933,6 +2955,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             input,
             ..
         } => {
+            let input = compact_stream_tool_payload(input);
             vec![AgentStreamEvent::ToolCall(ToolCallEventData {
                 call_id: tool_use_id,
                 name,
@@ -3047,6 +3070,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             input,
             ..
         } => {
+            let input = input.map(compact_stream_tool_payload);
             // The frontend permission card renders whatever `options[]` we send as the
             // selectable choices (MessageAcpPermission maps each to a radio). So the
             // options MUST reflect what the user is actually choosing between:
@@ -3216,15 +3240,51 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
 
 /// Flatten a tool result's content parts into a single text string for the
 /// `ToolCallEventData.output` field (origin renders that).
+const STREAM_TOOL_PAYLOAD_CAP: usize = 64 * 1024;
+const STREAM_TOOL_TEXT_TRUNCATED: &str = "\n...[truncated]";
+
+/// Keep agent/MCP tool arguments bounded before they cross the desktop IPC
+/// bridge. Binary content must travel as a file reference, never as inline
+/// base64 embedded in an otherwise ordinary JSON argument.
+fn compact_stream_tool_payload(value: serde_json::Value) -> serde_json::Value {
+    let encoded_len = serde_json::to_vec(&value).map_or(usize::MAX, |encoded| encoded.len());
+    if encoded_len <= STREAM_TOOL_PAYLOAD_CAP {
+        return value;
+    }
+
+    serde_json::json!({
+        "_omitted": true,
+        "_reason": "payload_too_large",
+        "_bytes": encoded_len,
+    })
+}
+
 fn tool_result_text(content: &[ToolResultContent]) -> Option<String> {
     let mut buf = String::new();
+    let mut truncated = false;
     for part in content {
         if let ToolResultContent::Text(t) = part {
-            if !buf.is_empty() {
+            let separator_len = usize::from(!buf.is_empty());
+            if buf.len() + separator_len + t.len() > STREAM_TOOL_PAYLOAD_CAP {
+                let available = STREAM_TOOL_PAYLOAD_CAP.saturating_sub(buf.len() + separator_len);
+                if separator_len > 0 && available > 0 {
+                    buf.push('\n');
+                }
+                let available = STREAM_TOOL_PAYLOAD_CAP.saturating_sub(buf.len());
+                buf.push_str(&t[..t.floor_char_boundary(available)]);
+                truncated = true;
+                break;
+            }
+            if separator_len > 0 {
                 buf.push('\n');
             }
             buf.push_str(t);
         }
+    }
+    if truncated {
+        let body_cap = STREAM_TOOL_PAYLOAD_CAP.saturating_sub(STREAM_TOOL_TEXT_TRUNCATED.len());
+        buf.truncate(buf.floor_char_boundary(body_cap));
+        buf.push_str(STREAM_TOOL_TEXT_TRUNCATED);
     }
     if buf.is_empty() { None } else { Some(buf) }
 }
@@ -3238,6 +3298,22 @@ mod build_mapping_tests {
     use super::*;
     use crate::shared_kernel::{ModeId, ModelId};
     use aionui_session::SessionSpec;
+
+    #[test]
+    fn codex_temp_workspace_trust_override_escapes_windows_path() {
+        assert_eq!(
+            codex_workspace_trust_override(r#"C:\Users\admin\Work Mate\codex-temp-123"#, false),
+            Some(r#"projects."C:\\Users\\admin\\Work Mate\\codex-temp-123".trust_level="trusted""#.to_string())
+        );
+    }
+
+    #[test]
+    fn codex_custom_workspace_is_never_auto_trusted() {
+        assert_eq!(
+            codex_workspace_trust_override(r#"C:\code\customer-project"#, true),
+            None
+        );
+    }
 
     fn snapshot(mode: Option<&str>, model: Option<&str>) -> PersistedSessionState {
         PersistedSessionState {
@@ -3771,6 +3847,70 @@ mod translate_tests {
     }
 
     #[test]
+    fn oversized_tool_call_input_is_compacted_before_streaming() {
+        let inline_image = "A".repeat(STREAM_TOOL_PAYLOAD_CAP + 1);
+        let events = translate_event(
+            SessionEvent::ToolCall {
+                tool_use_id: "call-image".into(),
+                name: "ImageEdit".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"image": {"data": inline_image}}),
+                parent_tool_use_id: None,
+            },
+            "conv-1",
+            false,
+        );
+        let AgentStreamEvent::ToolCall(call) = &events[0] else {
+            panic!("expected ToolCall, got {:?}", events[0]);
+        };
+        assert_eq!(call.args["_omitted"], true);
+        assert_eq!(call.args["_reason"], "payload_too_large");
+        assert!(call.args["_bytes"].as_u64().is_some());
+        assert_eq!(call.input.as_ref(), Some(&call.args));
+        assert!(
+            serde_json::to_vec(&call.args).unwrap().len() < 256,
+            "the replacement frame must remain small"
+        );
+    }
+
+    #[test]
+    fn image_tool_result_bytes_never_cross_the_agent_stream() {
+        let events = translate_event(
+            SessionEvent::ToolResult {
+                tool_use_id: "call-read-image".into(),
+                is_error: false,
+                content: vec![ToolResultContent::Image {
+                    media_type: "image/png".into(),
+                    data: vec![7; STREAM_TOOL_PAYLOAD_CAP * 2],
+                }],
+                parent_tool_use_id: None,
+            },
+            "conv-1",
+            false,
+        );
+        let AgentStreamEvent::ToolCall(call) = &events[0] else {
+            panic!("expected ToolCall, got {:?}", events[0]);
+        };
+        assert_eq!(call.status, ToolCallStatus::Completed);
+        assert!(
+            call.output.is_none(),
+            "inline image bytes must not become textual output"
+        );
+    }
+
+    #[test]
+    fn aggregate_tool_result_text_is_bounded() {
+        let content = vec![
+            ToolResultContent::Text("x".repeat(STREAM_TOOL_PAYLOAD_CAP / 2)),
+            ToolResultContent::Text("界".repeat(STREAM_TOOL_PAYLOAD_CAP)),
+        ];
+        let output = tool_result_text(&content).expect("text output");
+        assert!(output.len() <= STREAM_TOOL_PAYLOAD_CAP);
+        assert!(output.ends_with("...[truncated]"));
+        assert!(output.is_char_boundary(output.len()));
+    }
+
+    #[test]
     fn permission_surfaces_as_acp_permission_keyed_on_request_id() {
         let events = translate_event(
             SessionEvent::Permission {
@@ -3798,6 +3938,58 @@ mod translate_tests {
         // A NON-AskUserQuestion tool approval offers the generic Allow/AllowAlways/Reject.
         assert_eq!(req.options.len(), 3);
         let ids: Vec<&str> = req.options.iter().map(|o| o.option_id.as_str()).collect();
+        assert_eq!(ids, vec!["allow", "allow_always", "reject"]);
+    }
+
+    #[test]
+    fn oversized_permission_input_is_compacted_before_streaming() {
+        let events = translate_event(
+            SessionEvent::Permission {
+                request_id: "req-large".into(),
+                kind: PermissionKind::Tool,
+                metadata: None,
+                tool_name: Some("McpImageTool".into()),
+                input: Some(serde_json::json!({
+                    "image_base64": "A".repeat(STREAM_TOOL_PAYLOAD_CAP + 1)
+                })),
+            },
+            "conv-1",
+            false,
+        );
+        let AgentStreamEvent::AcpPermission(crate::protocol::events::AcpPermissionEventData::Request(req)) = &events[0]
+        else {
+            panic!("expected AcpPermission Request, got {:?}", events[0]);
+        };
+        let raw_input = req.tool_call.raw_input.as_ref().expect("compacted input");
+        assert_eq!(raw_input["_omitted"], true);
+        assert_eq!(raw_input["_reason"], "payload_too_large");
+        assert!(serde_json::to_vec(raw_input).unwrap().len() < 256);
+    }
+
+    #[test]
+    fn oversized_ask_user_question_cannot_bypass_the_permission_cap() {
+        let events = translate_event(
+            SessionEvent::Permission {
+                request_id: "req-large-ask".into(),
+                kind: PermissionKind::Tool,
+                metadata: None,
+                tool_name: Some("AskUserQuestion".into()),
+                input: Some(serde_json::json!({
+                    "questions": [{
+                        "question": "Choose",
+                        "options": [{"label": "A".repeat(STREAM_TOOL_PAYLOAD_CAP + 1)}]
+                    }]
+                })),
+            },
+            "conv-1",
+            false,
+        );
+        let AgentStreamEvent::AcpPermission(crate::protocol::events::AcpPermissionEventData::Request(req)) = &events[0]
+        else {
+            panic!("expected AcpPermission Request, got {:?}", events[0]);
+        };
+        assert_eq!(req.tool_call.raw_input.as_ref().unwrap()["_omitted"], true);
+        let ids: Vec<&str> = req.options.iter().map(|option| option.option_id.as_str()).collect();
         assert_eq!(ids, vec!["allow", "allow_always", "reject"]);
     }
 

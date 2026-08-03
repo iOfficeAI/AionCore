@@ -569,6 +569,81 @@ mod tests {
     }
 
     #[test]
+    fn grok_image_tool_update_maps_imagegen_path_to_structured_image() {
+        let image_path = r"C:\Users\test\.grok\sessions\session-1\images\1.jpg";
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "grok-image",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::Completed)
+                    .raw_output(json!({
+                        "type": "ImageGen",
+                        "path": image_path,
+                        "filename": "1.jpg",
+                        "status": "completed"
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        let json = serde_json::to_value(&events[0]).unwrap();
+
+        assert_eq!(json["data"]["update"]["status"], "completed");
+        assert_eq!(json["data"]["update"]["rawOutput"]["image"]["path"], image_path);
+        assert_eq!(json["data"]["update"]["rawOutput"]["image"]["mime_type"], "image/jpeg");
+    }
+
+    #[test]
+    fn generic_tool_path_is_not_misclassified_as_an_image() {
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "generic-path",
+                ToolCallUpdateFields::new().raw_output(json!({
+                    "type": "ReadFile",
+                    "path": "/tmp/screenshot.png"
+                })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        let json = serde_json::to_value(&events[0]).unwrap();
+
+        assert!(json["data"]["update"]["rawOutput"].get("image").is_none());
+    }
+
+    #[test]
+    fn grok_read_image_update_omits_nested_base64_data() {
+        let image_data = format!("/9j/{}", "A".repeat(128 * 1024));
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "grok-read-image",
+                ToolCallUpdateFields::new()
+                    .status(SdkToolCallStatus::Completed)
+                    .raw_output(json!({
+                        "type": "ReadFile",
+                        "image_content": {
+                            "data": image_data,
+                            "mime_type": "image/jpeg"
+                        },
+                        "status": "completed"
+                    })),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        let json = serde_json::to_value(&events[0]).unwrap();
+        let image_content = &json["data"]["update"]["rawOutput"]["image_content"];
+
+        assert!(image_content.get("data").is_none());
+        assert_eq!(image_content["data_omitted"], true);
+        assert_eq!(image_content["data_bytes"], 128 * 1024 + 4);
+        assert_eq!(image_content["mime_type"], "image/jpeg");
+    }
+
+    #[test]
     fn codex_tool_update_keeps_non_image_saved_path_in_progress() {
         let notif = SessionNotification::new(
             "sess-1",

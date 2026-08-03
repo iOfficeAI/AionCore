@@ -264,7 +264,12 @@ impl ManagedProcess {
         let exit_task = tokio::spawn(async move {
             match child.wait().await {
                 Ok(status) => {
-                    debug!(pid, ?status, "subprocess exited");
+                    tracing::info!(
+                        pid,
+                        success = status.success(),
+                        code = status.code(),
+                        "subprocess exited"
+                    );
                     let _ = exit_tx.send(Some(TerminalExit::Exited(status)));
                 }
                 Err(e) => {

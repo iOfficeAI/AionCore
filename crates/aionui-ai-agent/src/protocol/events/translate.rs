@@ -174,11 +174,14 @@ fn sanitize_inline_image_result(value: &mut serde_json::Value) {
         return;
     };
 
+    sanitize_grok_read_image(obj);
+
     let saved_path = obj
         .get("saved_path")
         .and_then(|v| v.as_str())
         .filter(|path| !path.is_empty())
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .or_else(|| grok_image_path(obj).map(str::to_owned));
     // Strip any oversized inline-image `result` regardless of whether the image was
     // saved to disk. Older codex versions and interrupted/failed generations may emit
     // the multi-MB base64 without a `saved_path`; that payload must never reach the
@@ -214,6 +217,41 @@ fn sanitize_inline_image_result(value: &mut serde_json::Value) {
     if let Some(path) = saved_path {
         insert_image_output(obj, &path);
     }
+}
+
+fn sanitize_grok_read_image(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(image_content) = obj.get_mut("image_content").and_then(|value| value.as_object_mut()) else {
+        return;
+    };
+    let Some(data_len) = image_content
+        .get("data")
+        .and_then(|value| value.as_str())
+        .filter(|data| data.len() > ACP_RAW_OUTPUT_INLINE_IMAGE_LIMIT)
+        .map(str::len)
+    else {
+        return;
+    };
+
+    image_content.remove("data");
+    image_content.insert("data_omitted".to_owned(), serde_json::Value::Bool(true));
+    image_content.insert(
+        "data_bytes".to_owned(),
+        serde_json::Value::Number(serde_json::Number::from(data_len)),
+    );
+}
+
+fn grok_image_path(obj: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    let is_image_generation = obj
+        .get("type")
+        .and_then(|value| value.as_str())
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("ImageGen"));
+    if !is_image_generation {
+        return None;
+    }
+
+    obj.get("path")
+        .and_then(|value| value.as_str())
+        .filter(|path| !path.is_empty() && is_probably_image_path(path))
 }
 
 fn is_probably_inline_image_result(value: &str) -> bool {
