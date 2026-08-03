@@ -27,4 +27,11 @@ pub enum FileError {
     /// `FILE_WATCH_UNAVAILABLE`.
     #[error("file watch service is unavailable")]
     WatchUnavailable { errno: Option<i32> },
+
+    /// Revealing an item in the OS file manager failed (the shell reveal command
+    /// errored). Distinct from `NotFound` (missing path) so the frontend can tell
+    /// "couldn't open the file manager" from "the item is gone". Maps to the
+    /// stable API code `REVEAL_FAILED`.
+    #[error("failed to reveal item: {0}")]
+    RevealFailed(String),
 }
