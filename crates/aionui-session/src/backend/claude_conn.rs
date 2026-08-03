@@ -5607,8 +5607,7 @@ mod tests {
     #[tokio::test]
     async fn sniff_task_keys_agents_by_index_so_a_dispatch_batch_is_not_double_counted() {
         use serde_json::Value;
-        let fixture =
-            include_str!("../../tests/fixtures/claude_2.1.176_workflow_multiagent_3parallel_1fail.ndjson");
+        let fixture = include_str!("../../tests/fixtures/claude_2.1.176_workflow_multiagent_3parallel_1fail.ndjson");
         // The dispatch frame: the one whose workflow_progress[] repeats agents.
         let frame = fixture
             .lines()
@@ -5617,14 +5616,12 @@ mod tests {
                 serde_json::from_str::<Value>(l)
                     .ok()
                     .and_then(|v| {
-                        v.get("workflow_progress")
-                            .and_then(Value::as_array)
-                            .map(|a| {
-                                a.iter()
-                                    .filter(|e| e.get("type").and_then(Value::as_str) == Some("workflow_agent"))
-                                    .count()
-                                    > 3
-                            })
+                        v.get("workflow_progress").and_then(Value::as_array).map(|a| {
+                            a.iter()
+                                .filter(|e| e.get("type").and_then(Value::as_str) == Some("workflow_agent"))
+                                .count()
+                                > 3
+                        })
                     })
                     .unwrap_or(false)
             })

@@ -510,12 +510,7 @@ impl StreamPersistenceAdapter {
         if !self.allows_write(RuntimeWriteKind::ToolGroupPersist) {
             return;
         }
-        let all_done = entries.iter().all(|e| {
-            matches!(
-                e.status,
-                ToolCallStatus::Completed | ToolCallStatus::Error | ToolCallStatus::Canceled
-            )
-        });
+        let all_done = entries.iter().all(|e| e.status.is_terminal());
         let status = if all_done { "finish" } else { "work" };
         let content = serde_json::to_string(entries).unwrap_or_default();
 

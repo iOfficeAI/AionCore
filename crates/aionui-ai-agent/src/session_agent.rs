@@ -2129,6 +2129,18 @@ fn spawn_event_pump(
         // terminal arm below closes every remaining entry with a `Canceled` frame
         // BEFORE the Finish (the relay stops forwarding a turn at Finish).
         let mut open_tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // Live progress ledgers for running workflows (container task_id → card).
+        // A Workflow's tool_result lands the instant it is LAUNCHED, so its call is
+        // never in `open_tools` and the terminal arms below cannot settle it; these
+        // cards are settled explicitly alongside them (search: settle_workflow_cards).
+        let mut workflow_cards: std::collections::HashMap<String, crate::workflow_progress::WorkflowCard> =
+            std::collections::HashMap::new();
+        // Arguments of each tool call, kept so a workflow progress frame can re-send
+        // them. The persisted row is merged with JSON merge-patch and `args` has no
+        // `skip_serializing_if`, so emitting it as null would DELETE the stored
+        // arguments; and a workflow outlives the turn whose `tool_name` map is
+        // cleared at settlement, so it cannot rely on `stamp_tool_name` either.
+        let mut tool_args: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
         // Did the CURRENT turn emit any user-visible output (text / thinking / tool /
         // plan / permission)? Mirrors the ACP path's `is_empty_turn` (agent_session_flow.rs):
         // a clean terminal with this still `false` is a "blank reply" (ELECTRON-1JG) and
@@ -2331,6 +2343,20 @@ fn spawn_event_pump(
                 continue;
             }
 
+            // Project a running workflow's roster to the UI. Everything a workflow
+            // does after launch arrives ONLY as these task frames, so without this
+            // the conversation shows nothing at all for the whole flight.
+            for data in update_workflow_cards(
+                &mut workflow_cards,
+                &tool_name,
+                &tool_args,
+                &env.event,
+                aionui_common::now_ms(),
+                &conversation_id,
+            ) {
+                let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+            }
+
             // Track in-flight workflow/subagent refs so a non-blocking Workflow's
             // intermediate `result` frame does not prematurely terminate the turn.
             // Mirrors `state::background_active`: a ref is in-flight while its status
@@ -2416,6 +2442,17 @@ fn spawn_event_pump(
                             // absorbed teardown, not a mid-turn crash (see
                             // `crash_outcome`).
                             terminal_result_seen = true;
+                            // The workflow was killed: close its progress card too.
+                            // It is NOT in `open_tools` — a Workflow's tool_result
+                            // lands at launch — so the drain below cannot reach it.
+                            for data in settle_workflow_cards(
+                                &mut workflow_cards,
+                                crate::workflow_progress::CardStatus::Cancelled,
+                                aionui_common::now_ms(),
+                                &conversation_id,
+                            ) {
+                                let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+                            }
                             // Same per-turn closure the real terminal arm performs:
                             // close every tool call left open as Canceled BEFORE the
                             // Finish (the relay stops forwarding the turn at Finish).
@@ -2477,9 +2514,16 @@ fn spawn_event_pump(
                 // Track the call's open/closed lifecycle. Also remember the name for
                 // `stamp_tool_name` — the map was previously never populated, so
                 // ToolOutputDelta/ToolResult follow-up frames went out nameless.
-                SessionEvent::ToolCall { tool_use_id, name, .. } => {
+                SessionEvent::ToolCall {
+                    tool_use_id,
+                    name,
+                    input,
+                    ..
+                } => {
                     tool_name.insert(tool_use_id.clone(), name.clone());
                     open_tools.insert(tool_use_id.clone(), name.clone());
+                    // Kept for a workflow progress frame to re-send (see `tool_args`).
+                    tool_args.insert(tool_use_id.clone(), input.clone());
                 }
                 SessionEvent::ToolResult { tool_use_id, .. } => {
                     open_tools.remove(tool_use_id);
@@ -2493,6 +2537,18 @@ fn spawn_event_pump(
                     // result): emit a terminal `Canceled` frame per call so the
                     // persisted row leaves "work" and the frontend spinner stops.
                     // Must precede the Finish emitted by the translate loop below.
+                    // Same reasoning as the cancel-drain above: a workflow still
+                    // running when the turn ends (crash, dropped result) would
+                    // otherwise spin forever, since its call left `open_tools` at
+                    // launch.
+                    for data in settle_workflow_cards(
+                        &mut workflow_cards,
+                        crate::workflow_progress::CardStatus::Cancelled,
+                        aionui_common::now_ms(),
+                        &conversation_id,
+                    ) {
+                        let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+                    }
                     for (call_id, name) in open_tools.drain() {
                         tracing::info!(
                             conv_id = %conversation_id,
@@ -3000,6 +3056,171 @@ fn ask_user_question_options(
 /// onto any later empty-name frame for the same `call_id`, mirroring the reference
 /// `BackendOutputSink::emit_tool_result`, which re-sends the name on completion.
 /// `names` is the pump-local map (cleared per turn); non-`ToolCall` events are inert.
+/// Fold one workflow event into its container's ledger, returning any progress
+/// frames that should go out now.
+///
+/// A card is created ONLY for a `local_workflow` container. A background bash's
+/// task frames carry a `tool_use_id` belonging to a tool call INSIDE a workflow
+/// agent, which never appeared as a `tool_use` on the main stream — keying a card
+/// on it would conjure a blank tool card out of nowhere.
+fn update_workflow_cards(
+    cards: &mut std::collections::HashMap<String, crate::workflow_progress::WorkflowCard>,
+    tool_name: &std::collections::HashMap<String, String>,
+    tool_args: &std::collections::HashMap<String, serde_json::Value>,
+    event: &SessionEvent,
+    now_ms: i64,
+    conversation_id: &str,
+) -> Vec<crate::protocol::events::WorkflowProgressData> {
+    use crate::protocol::events::WorkflowProgressData;
+    use crate::workflow_progress::{AgentDetail, CardStatus, WorkflowCard};
+    use aionui_session::{SubagentStatus, SubagentTaskKind};
+
+    let mut out = Vec::new();
+    match event {
+        SessionEvent::SubagentUpdate {
+            r#ref,
+            status,
+            kind,
+            parent_ref,
+            ..
+        } => match status {
+            SubagentStatus::PendingInit | SubagentStatus::Running => {
+                if !matches!(kind, Some(SubagentTaskKind::WorkflowContainer)) || cards.contains_key(r#ref) {
+                    return out;
+                }
+                let Some(call_id) = parent_ref.clone() else {
+                    // Never seen in any capture; without the launching tool call's
+                    // id there is no card to attach progress to.
+                    tracing::warn!(
+                        conv_id = %conversation_id,
+                        task_id = %r#ref,
+                        "session-pump: workflow container has no parent tool call; progress will not render"
+                    );
+                    return out;
+                };
+                let name = tool_name
+                    .get(&call_id)
+                    .cloned()
+                    .unwrap_or_else(|| "Workflow".to_owned());
+                let args = tool_args.get(&call_id).cloned().unwrap_or(serde_json::Value::Null);
+                cards.insert(r#ref.clone(), WorkflowCard::new(call_id.clone(), name, args, now_ms));
+                tracing::info!(
+                    conv_id = %conversation_id,
+                    task_id = %r#ref,
+                    %call_id,
+                    "session-pump: workflow progress card opened"
+                );
+            }
+            terminal => {
+                let Some(mut card) = cards.remove(r#ref) else {
+                    return out;
+                };
+                let status = match terminal {
+                    SubagentStatus::Completed => CardStatus::Completed,
+                    SubagentStatus::Errored => CardStatus::Errored,
+                    _ => CardStatus::Cancelled,
+                };
+                card.settle(status);
+                tracing::info!(
+                    conv_id = %conversation_id,
+                    task_id = %r#ref,
+                    call_id = %card.call_id(),
+                    ?status,
+                    agents = card.agent_count(),
+                    elapsed_ms = card.elapsed_ms(now_ms),
+                    "session-pump: workflow progress card settled"
+                );
+                if let Some((card, agents)) = card.take_emission(now_ms, true) {
+                    out.push(WorkflowProgressData { card, agents });
+                }
+            }
+        },
+        SessionEvent::SubagentDetail {
+            r#ref,
+            parent_ref,
+            label,
+            loop_state,
+            model,
+            tokens,
+            tool_calls,
+            last_tool_name,
+            phase_index,
+            phase_title,
+            last_tool_summary,
+            duration_ms,
+        } => {
+            // parent_ref is the container task_id; a detail for an unknown container
+            // has no card (e.g. it arrived after settlement).
+            let Some(card) = parent_ref.as_ref().and_then(|t| cards.get_mut(t)) else {
+                return out;
+            };
+            let forced = card.upsert_agent(
+                r#ref,
+                AgentDetail {
+                    label: label.clone(),
+                    phase_index: *phase_index,
+                    phase_title: phase_title.clone(),
+                    model: model.clone(),
+                    loop_state: *loop_state,
+                    tokens: *tokens,
+                    tool_calls: *tool_calls,
+                    last_tool_name: last_tool_name.clone(),
+                    last_tool_summary: last_tool_summary.clone(),
+                    duration_ms: *duration_ms,
+                },
+            );
+            if let Some((card, agents)) = card.take_emission(now_ms, forced) {
+                out.push(WorkflowProgressData { card, agents });
+            }
+        }
+        SessionEvent::WorkflowPhase { task_id, index, title } => {
+            let Some(card) = cards.get_mut(task_id) else {
+                return out;
+            };
+            let forced = card.declare_phase(*index, title.clone());
+            if let Some((card, agents)) = card.take_emission(now_ms, forced) {
+                out.push(WorkflowProgressData { card, agents });
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Close out every open workflow card, e.g. because the turn is ending or the
+/// backend died.
+///
+/// The companion to the `open_tools` drain at each terminal — and NOT covered by
+/// it: a Workflow's `tool_result` arrives at LAUNCH, so its call left `open_tools`
+/// long ago. Without this a killed or crashed workflow leaves its container card
+/// and every agent row spinning forever, and `hasRunningToolMessages` keeps the
+/// conversation's running indicator lit with nothing left to clear it.
+fn settle_workflow_cards(
+    cards: &mut std::collections::HashMap<String, crate::workflow_progress::WorkflowCard>,
+    status: crate::workflow_progress::CardStatus,
+    now_ms: i64,
+    conversation_id: &str,
+) -> Vec<crate::protocol::events::WorkflowProgressData> {
+    use crate::protocol::events::WorkflowProgressData;
+    if cards.is_empty() {
+        return Vec::new();
+    }
+    tracing::info!(
+        conv_id = %conversation_id,
+        open_cards = cards.len(),
+        ?status,
+        "session-pump: settling workflow progress cards at turn end"
+    );
+    cards
+        .drain()
+        .filter_map(|(_, mut card)| {
+            card.settle(status);
+            card.take_emission(now_ms, true)
+                .map(|(card, agents)| WorkflowProgressData { card, agents })
+        })
+        .collect()
+}
+
 fn stamp_tool_name(names: &mut std::collections::HashMap<String, String>, ev: &mut AgentStreamEvent) {
     let AgentStreamEvent::ToolCall(data) = ev else {
         return;
@@ -3032,6 +3253,10 @@ fn event_is_user_visible_output(event: &AgentStreamEvent) -> bool {
             | AgentStreamEvent::Permission(_)
             | AgentStreamEvent::AcpPermission(_)
     )
+    // Deliberately absent: WorkflowProgress. It is an out-of-band refresh of a
+    // card the turn already produced, not the turn saying something — counting it
+    // would suppress the blank-reply tip on a turn that only launched a workflow
+    // and then said nothing.
 }
 
 /// Build the empty-turn diagnostic Tip for a clean terminal that produced no
@@ -5841,6 +6066,211 @@ mod pump_tests {
         assert!(
             first_text < seg_break && seg_break < last_text,
             "SegmentBreak must separate the two text batches, got {seq:?}"
+        );
+    }
+
+    fn wf_frames(frames: &[AgentStreamEvent]) -> Vec<&crate::protocol::events::WorkflowProgressData> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                AgentStreamEvent::WorkflowProgress(d) => Some(d),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn wf_detail(r#ref: &str, label: &str, state: aionui_session::WorkflowLoopState) -> aionui_session::SessionEvent {
+        SessionEvent::SubagentDetail {
+            r#ref: r#ref.into(),
+            parent_ref: Some("task-wf".into()),
+            label: Some(label.into()),
+            loop_state: Some(state),
+            model: Some("global.anthropic.claude-opus-4-8".into()),
+            tokens: Some(8_600),
+            tool_calls: Some(1),
+            last_tool_name: Some("Bash".into()),
+            last_tool_summary: Some("sleep 8".into()),
+            duration_ms: None,
+            phase_index: Some(1),
+            phase_title: Some("Run".into()),
+        }
+    }
+
+    fn wf_container(
+        status: aionui_session::SubagentStatus,
+        kind: Option<aionui_session::SubagentTaskKind>,
+    ) -> SessionEvent {
+        SessionEvent::SubagentUpdate {
+            r#ref: "task-wf".into(),
+            label: Some("wf".into()),
+            status,
+            parent_ref: Some("toolu_wf".into()),
+            kind,
+        }
+    }
+
+    /// Everything a workflow does after launch arrives ONLY as task frames, which
+    /// the pump used to consume silently — the conversation showed nothing for the
+    /// entire flight. The pump must now project that roster as it moves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workflow_progress_streams_while_the_workflow_runs() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind, WorkflowLoopState};
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_wf".into(),
+                name: "Workflow".into(),
+                subagent: aionui_session::SubagentKind::Workflow,
+                input: serde_json::json!({"script": "phase('Run')"}),
+                parent_tool_use_id: None,
+            }),
+            env(wf_container(
+                SubagentStatus::Running,
+                Some(SubagentTaskKind::WorkflowContainer),
+            )),
+            env(SessionEvent::WorkflowPhase {
+                task_id: "task-wf".into(),
+                index: 1,
+                title: "Run".into(),
+            }),
+            env(wf_detail("1", "run:A", WorkflowLoopState::Progress)),
+            env(wf_detail("2", "run:B", WorkflowLoopState::Progress)),
+            env(wf_detail("1", "run:A", WorkflowLoopState::Done)),
+            env(wf_container(SubagentStatus::Completed, None)),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+        ];
+        let frames = drain_script(script).await;
+        let progress = wf_frames(&frames);
+        assert!(
+            progress.len() >= 2,
+            "the roster must stream as it moves, got {} frame(s)",
+            progress.len()
+        );
+
+        // Every frame updates the card the user already sees, and re-sends the
+        // identity fields the persisted row would otherwise lose.
+        for p in &progress {
+            assert_eq!(p.card.call_id, "toolu_wf", "keyed to the Workflow tool call");
+            assert_eq!(p.card.name, "Workflow", "name must survive the merge-patch");
+            assert_eq!(
+                p.card.args,
+                serde_json::json!({"script": "phase('Run')"}),
+                "args must be re-sent or the persisted row loses them"
+            );
+            assert!(p.card.description.is_some(), "headline is always visible");
+        }
+
+        // The last frame is the settled one: container Completed, every agent row
+        // terminal, and the FULL roster present.
+        let last = progress.last().unwrap();
+        assert_eq!(last.card.status, ToolCallStatus::Completed);
+        assert_eq!(last.agents.len(), 2, "full roster, not a delta: {:?}", last.agents);
+        assert!(
+            last.agents.iter().all(|a| a.status.is_terminal()),
+            "no agent row may keep spinning after the workflow completes: {:?}",
+            last.agents
+        );
+        let names: Vec<&str> = last.agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["run:A", "run:B"],
+            "stable insertion order keys the group row"
+        );
+    }
+
+    /// A background bash's `task_started` carries a `tool_use_id` belonging to a
+    /// tool call INSIDE a workflow agent — it never appeared as a tool_use on the
+    /// main stream. Opening a card for it would conjure a blank tool card.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_workflow_task_opens_no_progress_card() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let script = vec![
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-bash".into(),
+                label: Some("local_bash".into()),
+                status: SubagentStatus::Running,
+                parent_ref: Some("toolu_inner_never_seen".into()),
+                kind: Some(SubagentTaskKind::Other),
+            }),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+        ];
+        let frames = drain_script(script).await;
+        assert!(
+            wf_frames(&frames).is_empty(),
+            "only a local_workflow container gets a card, got {:?}",
+            frames.iter().map(frame_name).collect::<Vec<_>>()
+        );
+    }
+
+    /// A killed workflow emits NO result frame — only task frames. Its container
+    /// card is NOT in `open_tools` (a Workflow's tool_result lands at launch), so
+    /// the turn-end drain cannot close it. Without an explicit settle the card and
+    /// every agent row spin forever, and `hasRunningToolMessages` keeps the
+    /// conversation's running indicator lit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interrupted_workflow_settles_its_progress_card_before_finish() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind, WorkflowLoopState};
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_wf".into(),
+                name: "Workflow".into(),
+                subagent: aionui_session::SubagentKind::Workflow,
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+            }),
+            env(wf_container(
+                SubagentStatus::Running,
+                Some(SubagentTaskKind::WorkflowContainer),
+            )),
+            env(wf_detail("1", "run:A", WorkflowLoopState::Progress)),
+            // Launch result — suppressed, so the turn owes a Finish.
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+            // The kill: task frames only, no result ever follows.
+            env(wf_container(SubagentStatus::Interrupted, None)),
+        ];
+        let frames = drain_script(script).await;
+        let seq: Vec<&str> = frames.iter().map(frame_name).collect();
+
+        let settled = wf_frames(&frames)
+            .into_iter()
+            .rev()
+            .find(|p| p.card.status == ToolCallStatus::Canceled)
+            .unwrap_or_else(|| panic!("the killed workflow's card must be settled, got {seq:?}"));
+        assert!(
+            settled.agents.iter().all(|a| a.status.is_terminal()),
+            "every agent row must stop spinning on interrupt: {:?}",
+            settled.agents
+        );
+
+        // And it must precede the Finish: the relay stops forwarding at Finish.
+        let last_progress = frames
+            .iter()
+            .rposition(|f| matches!(f, AgentStreamEvent::WorkflowProgress(_)))
+            .expect("a progress frame");
+        let finish = frames
+            .iter()
+            .position(|f| matches!(f, AgentStreamEvent::Finish(_)))
+            .expect("the owed Finish");
+        assert!(
+            last_progress < finish,
+            "the settled card must be forwarded before the turn's Finish, got {seq:?}"
         );
     }
 

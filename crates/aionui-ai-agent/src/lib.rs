@@ -31,6 +31,7 @@ pub mod session_context;
 pub mod shared_kernel;
 pub mod task_manager;
 pub mod types;
+mod workflow_progress;
 
 pub use active_lease::{ACTIVE_LEASE_TTL_MS, ActiveLeaseRegistry};
 pub use agent_runtime::AgentRuntime;

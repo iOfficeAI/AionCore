@@ -325,13 +325,13 @@ mod tests {
             ToolGroupEntry {
                 call_id: "c1".into(),
                 name: "read".into(),
-                status: ToolCallStatus::Completed,
+                status: ToolGroupStatus::Success,
                 description: Some("Read file".into()),
             },
             ToolGroupEntry {
                 call_id: "c2".into(),
                 name: "write".into(),
-                status: ToolCallStatus::Running,
+                status: ToolGroupStatus::Executing,
                 description: None,
             },
         ];

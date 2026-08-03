@@ -764,3 +764,125 @@ async fn live_claude_workflow_cancel_recovers_conversation() {
         reply_text.chars().take(60).collect::<String>()
     );
 }
+
+/// LIVE proof that a running workflow is actually VISIBLE.
+///
+/// Everything a workflow does after launch arrives only as `system/task_*`
+/// frames, which the pump used to consume silently — the conversation showed
+/// nothing for the whole flight. The unit tests drive synthetic events; only this
+/// one proves the real CLI's frames reach the WebSocket as renderable rows.
+///
+/// The assertion deliberately requires the roster to CHANGE across frames: a
+/// single static frame would also satisfy "something was sent" while still
+/// leaving the user staring at a frozen card.
+#[tokio::test]
+#[ignore = "spawns the real claude CLI; needs credentials"]
+async fn live_claude_workflow_progress_streams() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "aionui_ai_agent=debug,aionui_session=info",
+        ))
+        .try_init();
+    let app = start_live_app().await;
+
+    let ws_dir = std::env::temp_dir().join(format!("live-wf-progress-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/conversations",
+        json!({
+            "type": "acp",
+            "extra": {"workspace": ws_dir.to_string_lossy(), "backend": "claude"}
+        }),
+    )
+    .await;
+    let conv_id = created["data"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("conversation create failed: {created}"))
+        .to_owned();
+    println!("[wf-progress] conversation {conv_id} workspace {}", ws_dir.display());
+
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+
+    // Two agents so the roster has something to show, and long enough that the
+    // progress stream spans many frames.
+    let sent = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "用 Workflow 工具启动一个 workflow：一个 phase「Run」，两个 agent 并行，\
+            每个 agent 各自执行 sleep 20（睡 20 秒）。用后台方式启动（run_in_background），\
+            启动后立刻回复我「已启动」，不要等待它完成。"}),
+    )
+    .await;
+    assert!(sent["data"]["turn_id"].is_string(), "send failed: {sent}");
+
+    let mut confirmed: BTreeSet<String> = BTreeSet::new();
+    let started = Instant::now();
+    // Distinct roster snapshots seen, in arrival order.
+    let mut rosters: Vec<String> = Vec::new();
+    let mut cards: Vec<Value> = Vec::new();
+
+    while started.elapsed() < Duration::from_secs(180) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        auto_confirm_permissions(&app, &conv_id, &snapshot, &mut confirmed).await;
+        rosters.clear();
+        cards.clear();
+        for f in stream_frames_for(&snapshot, &conv_id) {
+            match f["data"]["type"].as_str().unwrap_or("") {
+                "tool_group" => {
+                    let serialized = f["data"]["data"].to_string();
+                    if rosters.last() != Some(&serialized) {
+                        rosters.push(serialized);
+                    }
+                }
+                "tool_call" if f["data"]["data"]["name"] == "Workflow" => cards.push(f["data"]["data"].clone()),
+                _ => {}
+            }
+        }
+        // Enough evidence: the roster moved at least once and the workflow ended.
+        let settled = rosters.last().is_some_and(|r| !r.contains("Executing"));
+        if rosters.len() >= 2 && settled {
+            break;
+        }
+    }
+
+    assert!(
+        rosters.len() >= 2,
+        "[wf-progress] the roster must stream and CHANGE while the workflow runs; saw {} distinct snapshot(s)",
+        rosters.len()
+    );
+    assert!(
+        !cards.is_empty(),
+        "[wf-progress] the container row must be forwarded as a tool_call named Workflow"
+    );
+    // Every container frame carries the headline and keeps its identity fields —
+    // losing `name`/`args` would blank the persisted row.
+    for card in &cards {
+        assert!(
+            card["description"].as_str().is_some_and(|d| !d.is_empty()),
+            "[wf-progress] container row must carry a headline: {card}"
+        );
+        assert_eq!(card["name"], "Workflow", "[wf-progress] name must survive: {card}");
+    }
+
+    let last = rosters.last().unwrap();
+    assert!(
+        !last.contains("Executing"),
+        "[wf-progress] no agent row may still be Executing after the workflow ends: {last}"
+    );
+    // The status vocabulary must be tool_group's PascalCase — snake_case would
+    // miss every arm of normalizeToolGroupStatus and pin the rows to a spinner.
+    assert!(
+        last.contains("Success") || last.contains("Canceled") || last.contains("Error"),
+        "[wf-progress] terminal rows must use the tool_group status vocabulary: {last}"
+    );
+    println!(
+        "[wf-progress] ✅ {} roster updates, {} container updates",
+        rosters.len(),
+        cards.len()
+    );
+}

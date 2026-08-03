@@ -155,7 +155,7 @@ impl ToolGroupStatus {
 }
 
 /// A single entry in a `ToolGroup` event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolGroupEntry {
     pub call_id: String,
     pub name: String,
