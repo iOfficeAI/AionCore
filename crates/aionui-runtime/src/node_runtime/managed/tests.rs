@@ -46,6 +46,24 @@ fn classify_error_detects_bundled_node_runtime_missing() {
     assert_eq!(status, None);
 }
 
+#[test]
+fn classify_error_prefers_explicit_activation_io_failed() {
+    let err = NodeRuntimeError::activation_io_failed(
+        "bundled Node runtime activation copy failed after retries under X: os error 1450",
+    );
+    let (kind, status) = classify_error(&err);
+    assert_eq!(kind, NodeRuntimeFailureKind::ActivationIoFailed);
+    assert_eq!(status, None);
+}
+
+#[test]
+fn classify_error_still_detects_bundled_invalid_by_message() {
+    // Post-copy validation failure keeps its existing semantics (spec 12 acceptance 4).
+    let err = NodeRuntimeError::managed_invalid("bundled Node runtime failed validation under X: boom");
+    let (kind, _status) = classify_error(&err);
+    assert_eq!(kind, NodeRuntimeFailureKind::BundledResourceInvalid);
+}
+
 #[tokio::test]
 async fn bundled_runtime_missing_reports_bundled_resource_missing() {
     let tmp = tempfile::tempdir().unwrap();

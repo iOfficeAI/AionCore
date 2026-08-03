@@ -210,30 +210,47 @@ pub struct DoctorRow {
 #[error("{message}")]
 pub struct NodeRuntimeError {
     message: String,
+    failure_kind: Option<NodeRuntimeFailureKind>,
 }
 
 impl NodeRuntimeError {
     pub fn system_invalid(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            failure_kind: None,
         }
     }
 
     pub fn managed_invalid(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            failure_kind: None,
         }
     }
 
     pub fn unsupported_platform(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            failure_kind: None,
         }
     }
 
     pub fn io_system(error: std::io::Error) -> Self {
         Self {
             message: error.to_string(),
+            failure_kind: None,
         }
+    }
+
+    /// Persistent transient copy/activation I/O failure (retries exhausted).
+    pub fn activation_io_failed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            failure_kind: Some(NodeRuntimeFailureKind::ActivationIoFailed),
+        }
+    }
+
+    pub fn failure_kind(&self) -> Option<NodeRuntimeFailureKind> {
+        self.failure_kind
     }
 }

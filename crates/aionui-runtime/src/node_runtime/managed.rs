@@ -862,6 +862,12 @@ fn http_status_error(stage: &str, url: &str, status: reqwest::StatusCode) -> Nod
 }
 
 fn classify_error(error: &NodeRuntimeError) -> (NodeRuntimeFailureKind, Option<u16>) {
+    // An explicitly tagged failure kind is decided at the io::Error layer (e.g. a
+    // retry-exhausted transient copy failure) and must not be re-derived from the
+    // stringified message, which cannot distinguish copy vs validation failures.
+    if let Some(kind) = error.failure_kind() {
+        return (kind, None);
+    }
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("timed out") {
         return (NodeRuntimeFailureKind::Timeout, None);
