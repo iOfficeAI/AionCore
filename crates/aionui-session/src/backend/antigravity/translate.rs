@@ -92,14 +92,31 @@ impl Translator {
                 if let Some(u) = r.usage {
                     out.push(usage_delta(&u));
                 }
-                // agy calls a turn SUCCESS even when every tool in it was
-                // refused, and signs off claiming the work is done — verified
-                // on 1.1.9 with a PreToolUse hook answering `deny`: four failed
-                // steps, terminal SUCCESS, reply "DONE", file never written.
-                // Left alone, the user reads a flat lie. agy's own text is
-                // still shown (it may hold real reasoning); this only refuses
-                // to let "success" stand unqualified.
                 let failed = std::mem::take(&mut self.failed_steps);
+                out.push(SessionEvent::TurnResult {
+                    is_error,
+                    api_error_status: None,
+                    result_text,
+                    // The adapter layer is epoch-agnostic; the ai-agent reader
+                    // stamps the live epoch when forwarding.
+                    epoch: 0,
+                    outcome,
+                });
+                // AFTER the result, deliberately. agy calls a turn SUCCESS even
+                // when every tool in it was refused and signs off claiming the
+                // work is done — verified on 1.1.9 in this integration's own
+                // hooks.json shape: three refused steps, terminal SUCCESS,
+                // "已成功创建 random_data_11-46.json", and an empty workspace.
+                //
+                // Emitted BEFORE the result, this warning was pushed above the
+                // claim it contradicts and the false success was the last thing
+                // the user read (measured: 2 ms apart, warning first). The
+                // correction has to have the last word.
+                //
+                // agy's own text is still delivered unchanged — it can carry
+                // real reasoning, and rewriting the agent's words would be its
+                // own kind of lie. This only refuses to let "success" stand
+                // unqualified.
                 if !is_error && failed > 0 {
                     out.push(SessionEvent::Notice {
                         level: NoticeLevel::Warning,
@@ -110,15 +127,6 @@ impl Translator {
                         ),
                     });
                 }
-                out.push(SessionEvent::TurnResult {
-                    is_error,
-                    api_error_status: None,
-                    result_text,
-                    // The adapter layer is epoch-agnostic; the ai-agent reader
-                    // stamps the live epoch when forwarding.
-                    epoch: 0,
-                    outcome,
-                });
                 out
             }
         }
@@ -508,6 +516,27 @@ mod tests {
             e,
             SessionEvent::TurnResult { is_error: false, result_text, .. } if result_text.contains("DONE")
         )));
+    }
+
+    #[test]
+    fn the_correction_has_the_last_word() {
+        // Emitted before the result, the warning was pushed ABOVE the claim it
+        // contradicts and the user's last line was still "已成功创建 …" for a
+        // file that was never written (observed live, 2 ms apart). Order is the
+        // whole point of the warning, so it is pinned here.
+        let (_, evs) = tr(REFUSED_TURN);
+        let result_at = evs
+            .iter()
+            .position(|e| matches!(e, SessionEvent::TurnResult { .. }))
+            .expect("a terminal is always emitted");
+        let notice_at = evs
+            .iter()
+            .position(|e| matches!(e, SessionEvent::Notice { .. }))
+            .expect("a refused turn must be flagged");
+        assert!(
+            notice_at > result_at,
+            "the warning must follow the claim it corrects, got notice@{notice_at} result@{result_at}"
+        );
     }
 
     #[test]
