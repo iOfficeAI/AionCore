@@ -165,16 +165,48 @@ mod tests {
     }
 }
 
-/// Drift guidance for an installed agy, as plain advisory text — no `Notice`,
-/// no level.
+/// Diagnostic codes for the availability path. NOT errors: the agent probed
+/// online and works — these say the installed build differs from the verified
+/// one. The frontend resolves them under
+/// `settings.agentManagement.errorCodes.<code>`.
+pub const DIAGNOSTIC_VERSION_DRIFT_OLDER: &str = "version_drift_older";
+pub const DIAGNOSTIC_VERSION_DRIFT_NEWER: &str = "version_drift_newer";
+
+/// What the availability probe reports for an agy whose version drifted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionDrift {
+    /// Diagnostic code the UI translates.
+    pub code: &'static str,
+    /// The two version numbers, in a form that needs no translation. Carried
+    /// separately because the UI appends it to the TRANSLATED sentence: the
+    /// prose is what differs by locale, the numbers are what the user acts on,
+    /// and a translated string cannot interpolate them (the availability
+    /// snapshot has no structured params column to carry them in).
+    pub detail: String,
+    /// Full English sentence, used verbatim when the locale has no entry for
+    /// `code`.
+    pub guidance: String,
+}
+
+/// Drift verdict for the availability probe.
 ///
-/// The availability probe already runs `agy --version` for its integrity check
-/// and reaches the user BEFORE any conversation exists, which is where a
-/// version warning actually helps: the user is choosing whether to rely on this
-/// agent. It has no notice channel, only a guidance string, so the same verdict
-/// is exposed here in the shape that path can use.
-pub fn version_guidance(reported: &str) -> Option<String> {
-    drift_notice(reported).map(|(_, message, _)| message)
+/// That probe already runs `agy --version` for its integrity check and reaches
+/// the user BEFORE any conversation exists — which is where a version warning
+/// actually helps, since that is when the user decides whether to rely on this
+/// agent. It has no notice channel, so the same verdict is exposed here in the
+/// shape that path can persist.
+pub fn version_drift(reported: &str) -> Option<VersionDrift> {
+    let code = match classify_version(reported) {
+        VersionVerdict::Older => DIAGNOSTIC_VERSION_DRIFT_OLDER,
+        VersionVerdict::Newer => DIAGNOSTIC_VERSION_DRIFT_NEWER,
+        VersionVerdict::Verified | VersionVerdict::Unknown => return None,
+    };
+    let (_, guidance, _) = drift_notice(reported)?;
+    Some(VersionDrift {
+        code,
+        detail: format!("agy {reported} / verified {VERIFIED_AGY_VERSION}"),
+        guidance,
+    })
 }
 
 #[cfg(test)]
@@ -185,15 +217,20 @@ mod guidance_tests {
     fn a_matching_install_gets_no_guidance() {
         // Silence is the whole point: an ⓘ on every connection test would be
         // noise, and the verified version is what most users have.
-        assert_eq!(version_guidance(VERIFIED_AGY_VERSION), None);
+        assert_eq!(version_drift(VERIFIED_AGY_VERSION), None);
     }
 
     #[test]
     fn a_drifting_install_gets_actionable_text() {
-        let older = version_guidance("1.1.8").expect("older must be reported");
-        assert!(older.contains("1.1.8") && older.contains(VERIFIED_AGY_VERSION));
-        let newer = version_guidance("1.2.0").expect("newer must be reported");
-        assert!(newer.contains("1.2.0"));
+        let older = version_drift("1.1.8").expect("older must be reported");
+        assert_eq!(older.code, DIAGNOSTIC_VERSION_DRIFT_OLDER);
+        // The detail is what survives translation, so both numbers must be in it.
+        assert!(older.detail.contains("1.1.8") && older.detail.contains(VERIFIED_AGY_VERSION));
+        assert!(older.guidance.contains("1.1.8"));
+
+        let newer = version_drift("1.1.10").expect("a patch bump still drifts");
+        assert_eq!(newer.code, DIAGNOSTIC_VERSION_DRIFT_NEWER);
+        assert!(newer.detail.contains("1.1.10"));
     }
 
     #[test]
@@ -201,7 +238,7 @@ mod guidance_tests {
         // The probe hands over whatever the CLI printed. Claiming drift from a
         // line we could not parse would invent a problem.
         for raw in ["", "error: not signed in", "???"] {
-            assert_eq!(version_guidance(raw), None, "raw={raw:?}");
+            assert_eq!(version_drift(raw), None, "raw={raw:?}");
         }
     }
 }

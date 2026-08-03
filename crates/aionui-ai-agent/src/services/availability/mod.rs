@@ -210,12 +210,29 @@ async fn run_probe(
                 // Reported HERE and not only mid-conversation: this is where the
                 // user is deciding whether to rely on the agent, and the
                 // session-time notice arrives long after that choice is made.
-                if meta.backend.as_deref() == Some("antigravity")
-                    && let Some(reported) = success.reported_version.as_deref()
-                {
-                    guidance = aionui_session::version_guidance(reported);
+                let drift = (meta.backend.as_deref() == Some("antigravity"))
+                    .then(|| {
+                        success
+                            .reported_version
+                            .as_deref()
+                            .and_then(aionui_session::version_drift)
+                    })
+                    .flatten();
+                match drift {
+                    // Status stays ONLINE — the agent works. The code rides the
+                    // error_code column because that is what the UI translates,
+                    // and `last_success_at` keys off `status`, not the code, so
+                    // a drifting agent is still recorded as a success.
+                    Some(drift) => {
+                        guidance = Some(drift.guidance);
+                        (
+                            AgentSnapshotCheckStatus::Online,
+                            Some(drift.code.to_owned()),
+                            Some(drift.detail),
+                        )
+                    }
+                    None => (AgentSnapshotCheckStatus::Online, None, None),
                 }
-                (AgentSnapshotCheckStatus::Online, None, None)
             }
             Err(failure) => (
                 AgentSnapshotCheckStatus::Offline,
