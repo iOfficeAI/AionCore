@@ -25,11 +25,8 @@ pub trait IFileService: Send + Sync {
 
     /// Read a pre-resolved absolute path and encode it per `encoding`
     /// (utf8 text / base64 / data URL). `NotFound` if the file is gone.
-    async fn read_resolved_content(
-        &self,
-        absolute_path: &Path,
-        encoding: ContentEncoding,
-    ) -> Result<String, FileError>;
+    async fn read_resolved_content(&self, absolute_path: &Path, encoding: ContentEncoding)
+    -> Result<String, FileError>;
 
     /// Write `data` to a pre-resolved absolute path (full overwrite).
     async fn write_resolved_content(&self, absolute_path: &Path, data: &[u8]) -> Result<(), FileError>;

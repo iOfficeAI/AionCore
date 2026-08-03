@@ -323,7 +323,12 @@ async fn read_content(
     let Json(req) = body.map_err(ApiError::from)?;
     let abs = state
         .project
-        .resolve_chat_file_ref(&user.id, &req.file, &content_upload_root(), aionui_project::FileOp::Read)
+        .resolve_chat_file_ref(
+            &user.id,
+            &req.file,
+            &content_upload_root(),
+            aionui_project::FileOp::Read,
+        )
         .await
         .map_err(ApiError::from)?;
     let content = state
@@ -347,7 +352,12 @@ async fn write_content(
     let Json(req) = body.map_err(ApiError::from)?;
     let abs = state
         .project
-        .resolve_chat_file_ref(&user.id, &req.file, &content_upload_root(), aionui_project::FileOp::Write)
+        .resolve_chat_file_ref(
+            &user.id,
+            &req.file,
+            &content_upload_root(),
+            aionui_project::FileOp::Write,
+        )
         .await
         .map_err(ApiError::from)?;
     let path = Path::new(&abs);
@@ -361,7 +371,10 @@ async fn write_content(
         }
     }
 
-    state.file_service.write_resolved_content(path, req.data.as_bytes()).await?;
+    state
+        .file_service
+        .write_resolved_content(path, req.data.as_bytes())
+        .await?;
     Ok(Json(ApiResponse::ok(true)))
 }
 
@@ -374,7 +387,12 @@ async fn content_metadata(
     let Json(req) = body.map_err(ApiError::from)?;
     let abs = state
         .project
-        .resolve_chat_file_ref(&user.id, &req.file, &content_upload_root(), aionui_project::FileOp::Read)
+        .resolve_chat_file_ref(
+            &user.id,
+            &req.file,
+            &content_upload_root(),
+            aionui_project::FileOp::Read,
+        )
         .await
         .map_err(ApiError::from)?;
     let meta = state.file_service.resolved_metadata(Path::new(&abs)).await?;
