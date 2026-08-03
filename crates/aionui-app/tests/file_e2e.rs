@@ -1177,7 +1177,11 @@ async fn stream_serves_full_file_with_content_type() {
     std::fs::write(&fp, bytes).unwrap();
 
     let uri = format!("/api/fs/stream?kind=local&path={}", fp.to_str().unwrap());
-    let resp = app.clone().oneshot(get_with_token(&uri, &token, &csrf, None)).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(&uri, &token, &csrf, None))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers().get("content-type").unwrap().to_str().unwrap(),

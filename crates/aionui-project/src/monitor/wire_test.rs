@@ -17,8 +17,7 @@ fn fact(kind: Kind) -> EntryFact {
 
 #[test]
 fn incoming_request_parses_id_method_params() {
-    let v =
-        json!({"jsonrpc":"2.0","id":3,"method":"fs/mkdir","params":{"dir":{"pe_id":"pe1","relative_path":"a"}}});
+    let v = json!({"jsonrpc":"2.0","id":3,"method":"fs/mkdir","params":{"dir":{"pe_id":"pe1","relative_path":"a"}}});
     let frame: IncomingFrame = serde_json::from_value(v).unwrap();
     assert_eq!(frame.id, Some(json!(3)));
     assert_eq!(frame.method, "fs/mkdir");

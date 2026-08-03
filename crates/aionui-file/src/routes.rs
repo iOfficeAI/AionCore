@@ -16,8 +16,8 @@ use aionui_api_types::{
     FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, FileWatchRequest, GetFileMetadataRequest,
     GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest, ReadContentRequest, ReadFileRequest,
     RevealItemRequest, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse,
-    SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest,
-    WriteContentRequest, WriteFileRequest,
+    SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery, WorkspaceFlatFileResponse,
+    WorkspaceOfficeWatchRequest, WriteContentRequest, WriteFileRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -418,10 +418,17 @@ async fn stream_file(
 ) -> Result<Response, ApiError> {
     let Query(params) =
         Query::<StreamQuery>::try_from_uri(request.uri()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let file_ref = params.to_chat_file_ref().map_err(|m| ApiError::BadRequest(m.to_owned()))?;
+    let file_ref = params
+        .to_chat_file_ref()
+        .map_err(|m| ApiError::BadRequest(m.to_owned()))?;
     let abs = state
         .project
-        .resolve_chat_file_ref(&user.id, &file_ref, &content_upload_root(), aionui_project::FileOp::Read)
+        .resolve_chat_file_ref(
+            &user.id,
+            &file_ref,
+            &content_upload_root(),
+            aionui_project::FileOp::Read,
+        )
         .await
         .map_err(ApiError::from)?;
     // ServeFile owns Range/If-Range/Content-Type; the path is already
