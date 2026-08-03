@@ -113,6 +113,13 @@ impl Translator {
                 // the user read (measured: 2 ms apart, warning first). The
                 // correction has to have the last word.
                 //
+                // It states what the STREAM shows — N steps failed — and never
+                // what the agent said. Whether the reply claims success is not
+                // knowable from these frames: the same refusal that produced
+                // "已成功创建 …" once produced an honest apology the next turn,
+                // and a notice opening "The agent reported success, but …" then
+                // accused it of a lie it had not told.
+                //
                 // agy's own text is still delivered unchanged — it can carry
                 // real reasoning, and rewriting the agent's words would be its
                 // own kind of lie. This only refuses to let "success" stand
@@ -121,8 +128,8 @@ impl Translator {
                     out.push(SessionEvent::Notice {
                         level: NoticeLevel::Warning,
                         message: format!(
-                            "The agent reported success, but {failed} step{} failed during this turn — \
-                             any refused or errored action did NOT happen. Verify the result before relying on it.",
+                            "{failed} step{} failed during this turn and did NOT take effect. \
+                             agy still ends such turns as successful, so check the result itself rather than the reply.",
                             if failed == 1 { "" } else { "s" }
                         ),
                     });
@@ -509,6 +516,15 @@ mod tests {
             .expect("a turn that refused work must not read as plain success");
         assert_eq!(*notice.0, NoticeLevel::Warning);
         assert!(notice.1.contains('2'), "the count is the whole signal: {}", notice.1);
+        // The stream shows which STEPS failed, never what the agent claimed.
+        // Asserting the reply said "success" accused an agy that had just
+        // apologised for the same refusal (observed in 0803-2).
+        let lower = notice.1.to_ascii_lowercase();
+        assert!(
+            !lower.contains("reported success") && !lower.contains("the agent said"),
+            "the notice must not characterise the agent's words: {}",
+            notice.1
+        );
 
         // agy's own text still reaches the user — it may carry real reasoning,
         // and silently rewriting the agent's words would be its own kind of lie.
