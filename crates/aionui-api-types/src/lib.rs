@@ -111,11 +111,11 @@ pub use extension::{
 };
 pub use file::{
     ContentEncoding, ContentMetadataRequest, CopyFailure, CopyFilesRequest, CopyFilesResponse, CopyTarget,
-    DirOrFileResponse, FetchRemoteImageRequest, ReadContentRequest, WriteContentRequest,
-    FileChangeInfoResponse, FileMetadataResponse, FileWatchRequest, GetFileMetadataRequest, GetFilesByDirRequest,
-    GetImageBase64Request, ListWorkspaceFilesRequest, ReadFileRequest, RevealItemRequest, SnapshotBaselineRequest,
-    SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest,
-    SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest,
+    DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, FileWatchRequest,
+    GetFileMetadataRequest, GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest, ReadContentRequest,
+    ReadFileRequest, RevealItemRequest, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest,
+    SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest, SnapshotWorkspaceRequest, WorkspaceFlatFileResponse,
+    WorkspaceOfficeWatchRequest, WriteContentRequest, WriteFileRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{
