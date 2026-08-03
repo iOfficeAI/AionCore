@@ -2108,17 +2108,34 @@ fn sniff_task(
 
     // 009 R6b / H1: emit RICH per-agent detail from `workflow_progress[]`. The
     // workflow (task_id) is 1:N over its per-agent children (workflow_agent
-    // entries), each carrying display fields the panel renders. Keyed by `agentId`
-    // (present once running) falling back to `label` (the start frame has only
-    // index/label); parent_ref = task_id (the container). Each child is a
-    // SubagentDetail; the orchestrator folds them into workflow_roster.
+    // entries), each carrying display fields the panel renders. parent_ref =
+    // task_id (the container). Each child is a SubagentDetail; the orchestrator
+    // folds them into workflow_roster.
+    //
+    // KEY = `index`. A dispatch batch describes the SAME agent twice in ONE
+    // array: first with only `index`/`label` (no agentId assigned yet), then
+    // again with `agentId` once it is running (verified: frame 10 of
+    // tests/fixtures/claude_2.1.176_workflow_multiagent_3parallel_1fail.ndjson —
+    // 3 label-only entries followed by the same 3 agents carrying agentId). The
+    // previous `agentId.or(label)` key therefore admitted each agent TWICE (once
+    // under its label, again under its agentId), inflating a 3-agent phase to 6
+    // roster entries and over-counting the background activity `has_activity`
+    // reads. `index` is present on all 48 workflow_agent entries of that capture
+    // and is unique per agent, so it is the only stable key; agentId/label remain
+    // as fallbacks for a shape that omits it.
     if let Some(agents) = frame.get("workflow_progress").and_then(Value::as_array) {
         for a in agents
             .iter()
             .filter(|a| a.get("type").and_then(Value::as_str) == Some("workflow_agent"))
         {
             let label = a.get("label").and_then(Value::as_str);
-            let Some(agent_ref) = a.get("agentId").and_then(Value::as_str).or(label).map(str::to_string) else {
+            let Some(agent_ref) = a
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|i| i.to_string())
+                .or_else(|| a.get("agentId").and_then(Value::as_str).map(str::to_string))
+                .or_else(|| label.map(str::to_string))
+            else {
                 continue; // no stable ref for this agent
             };
             let loop_state = match a.get("state").and_then(Value::as_str) {
@@ -5441,9 +5458,12 @@ mod tests {
     #[tokio::test]
     async fn sniff_task_emits_rich_subagent_detail_from_workflow_progress() {
         // 009 R6b / H1: a task_progress frame's workflow_progress[] yields a rich
-        // SubagentDetail per workflow_agent — keyed by agentId (the per-agent id,
+        // SubagentDetail per workflow_agent — keyed by `index` (the per-agent slot,
         // distinct from the container task_id), parent_ref = task_id, carrying
         // model/tokens/toolCalls/loop-state/lastToolName for the per-agent panel.
+        // (The key was `agentId` until it was found to double-count every agent of
+        // a dispatch batch — see
+        // `sniff_task_keys_agents_by_index_so_a_dispatch_batch_is_not_double_counted`.)
         // (Real shape from workflow_multiagent_3parallel_1fail.ndjson 'done' frame.)
         let frame = r#"{"type":"system","subtype":"task_progress","task_id":"wanv3yy20","tool_use_id":"toolu-1","workflow_progress":[{"type":"workflow_phase","index":1,"title":"Run"},{"type":"workflow_agent","index":1,"label":"run:C","agentId":"agent-C","state":"done","model":"opus","tokens":10107,"toolCalls":4,"lastToolName":"StructuredOutput"}]}"#;
         let bytes = format!("{frame}\n").into_bytes();
@@ -5475,8 +5495,9 @@ mod tests {
             unreachable!()
         };
         assert_eq!(
-            r#ref, "agent-C",
-            "ref = agentId (per-agent id, NOT the container task_id)"
+            r#ref, "1",
+            "ref = the per-agent `index` (NOT the container task_id, and NOT agentId — \
+             which is absent on a batch's first entries and would double-count)"
         );
         assert_eq!(
             parent_ref.as_deref(),
@@ -5489,6 +5510,96 @@ mod tests {
         assert_eq!(tokens, Some(10107));
         assert_eq!(tool_calls, Some(4));
         assert_eq!(last_tool_name.as_deref(), Some("StructuredOutput"));
+    }
+
+    /// The per-agent roster key must be `index`, NOT `agentId.or(label)`.
+    ///
+    /// A single `workflow_progress[]` array can describe the SAME agent twice: the
+    /// dispatch batch first lists each agent with only `index`/`label` (no
+    /// `agentId` is assigned yet), then immediately re-lists the same agents once
+    /// they are running, now carrying `agentId`. Keying on `agentId` with a `label`
+    /// fallback admits each agent TWICE — once under its label, again under its
+    /// agentId — inflating a 3-agent phase to 6 roster entries (and with it the
+    /// background-activity count that `has_activity` reads).
+    ///
+    /// Verified against the real capture: frame 10 of
+    /// `claude_2.1.176_workflow_multiagent_3parallel_1fail.ndjson` carries exactly
+    /// that shape (3 label-only entries + the same 3 agents with agentId). `index`
+    /// is present on all 48 `workflow_agent` entries of that capture and is unique
+    /// per agent, so it is the only stable key.
+    #[tokio::test]
+    async fn sniff_task_keys_agents_by_index_so_a_dispatch_batch_is_not_double_counted() {
+        use serde_json::Value;
+        let fixture =
+            include_str!("../../tests/fixtures/claude_2.1.176_workflow_multiagent_3parallel_1fail.ndjson");
+        // The dispatch frame: the one whose workflow_progress[] repeats agents.
+        let frame = fixture
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .find(|l| {
+                serde_json::from_str::<Value>(l)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("workflow_progress")
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter(|e| e.get("type").and_then(Value::as_str) == Some("workflow_agent"))
+                                    .count()
+                                    > 3
+                            })
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("the capture must contain a dispatch frame that repeats agents");
+
+        // Sanity: this frame really does describe the same 3 labels twice, once
+        // without an agentId. Without this the assertion below proves nothing.
+        let parsed: Value = serde_json::from_str(frame).unwrap();
+        let agents: Vec<&Value> = parsed["workflow_progress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e.get("type").and_then(Value::as_str) == Some("workflow_agent"))
+            .collect();
+        let distinct_labels: std::collections::BTreeSet<&str> =
+            agents.iter().filter_map(|a| a["label"].as_str()).collect();
+        assert!(
+            agents.len() > distinct_labels.len(),
+            "fixture frame must repeat agents ({} entries, {} distinct labels)",
+            agents.len(),
+            distinct_labels.len()
+        );
+        assert!(
+            agents.iter().any(|a| a.get("agentId").is_none()),
+            "fixture frame must contain at least one entry with no agentId"
+        );
+
+        let bytes = format!("{frame}\n").into_bytes();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(bytes))).await;
+        let mut events = backend.events();
+
+        let mut refs: Vec<String> = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1500), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::SubagentDetail { r#ref, .. } = &env.event {
+                    refs.push(r#ref.clone());
+                }
+            }
+        })
+        .await;
+
+        let distinct: std::collections::BTreeSet<&String> = refs.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            distinct_labels.len(),
+            "one roster entry per DISTINCT agent (got refs {refs:?} for labels {distinct_labels:?})"
+        );
+        // And the key is the index, not the agentId.
+        assert!(
+            distinct.iter().all(|r| r.parse::<u64>().is_ok()),
+            "refs must be the numeric `index`, got {distinct:?}"
+        );
     }
 
     /// H1 anti-collapse (audit): replay the REAL multi-agent workflow fixture
