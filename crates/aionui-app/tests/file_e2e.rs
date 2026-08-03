@@ -22,14 +22,9 @@ async fn fs_endpoints_require_auth() {
         "/api/fs/read",
         "/api/fs/write",
         "/api/fs/copy",
-        "/api/fs/remove",
-        "/api/fs/rename",
-        "/api/fs/temp",
         "/api/fs/upload",
         "/api/fs/image-base64",
         "/api/fs/fetch-remote-image",
-        "/api/fs/zip",
-        "/api/fs/zip/cancel",
         "/api/fs/watch/start",
         "/api/fs/watch/stop",
         "/api/fs/watch/stop-all",
@@ -447,33 +442,6 @@ async fn write_file_with_workspace_field_accepts_non_sandbox_path() {
     assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "# created");
 }
 
-#[tokio::test]
-async fn read_file_buffer_returns_base64() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let file_path = dir.path().join("binary.bin");
-    std::fs::write(&file_path, [0x00, 0xFF, 0xAB]).unwrap();
-
-    let req = json_with_token(
-        "POST",
-        "/api/fs/read-buffer",
-        json!({ "path": file_path.to_str().unwrap() }),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json = body_json(resp).await;
-    let encoded = json["data"].as_str().unwrap();
-    // Verify base64 roundtrip
-    use base64::Engine;
-    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
-    assert_eq!(decoded, vec![0x00, 0xFF, 0xAB]);
-}
-
 // ===========================================================================
 // File management
 // ===========================================================================
@@ -560,136 +528,6 @@ async fn copy_files_to_workspace_accepts_non_sandbox_source_and_target_roots() {
     );
 }
 
-#[tokio::test]
-async fn remove_entry_deletes_file() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let file_path = dir.path().join("to_delete.txt");
-    std::fs::write(&file_path, "bye").unwrap();
-
-    let req = json_with_token(
-        "POST",
-        "/api/fs/remove",
-        json!({
-            "path": file_path.to_str().unwrap(),
-            "workspace": dir.path().to_str().unwrap()
-        }),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert!(!file_path.exists());
-}
-
-#[tokio::test]
-async fn remove_entry_with_workspace_field_accepts_non_sandbox_path() {
-    let sandbox = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
-    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-
-    let file_path = workspace.path().join("to_delete.txt");
-    std::fs::write(&file_path, "bye").unwrap();
-
-    let req = json_with_token(
-        "POST",
-        "/api/fs/remove",
-        json!({
-            "path": file_path.to_str().unwrap(),
-            "workspace": workspace.path().to_str().unwrap()
-        }),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert!(!file_path.exists());
-}
-
-#[tokio::test]
-async fn rename_entry_returns_new_path() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let old_path = dir.path().join("old.txt");
-    std::fs::write(&old_path, "data").unwrap();
-
-    let req = json_with_token(
-        "POST",
-        "/api/fs/rename",
-        json!({
-            "path": old_path.to_str().unwrap(),
-            "new_name": "new.txt"
-        }),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json = body_json(resp).await;
-    let new_path = json["data"]["new_path"].as_str().unwrap();
-    assert!(new_path.contains("new.txt"));
-    assert!(!old_path.exists());
-}
-
-#[tokio::test]
-async fn rename_entry_with_workspace_field_accepts_non_sandbox_path() {
-    let sandbox = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
-    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-
-    let old_path = workspace.path().join("old.txt");
-    std::fs::write(&old_path, "data").unwrap();
-
-    let req = json_with_token(
-        "POST",
-        "/api/fs/rename",
-        json!({
-            "path": old_path.to_str().unwrap(),
-            "new_name": "new.txt",
-            "workspace": workspace.path().to_str().unwrap()
-        }),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let new_path = workspace.path().join("new.txt");
-    assert!(new_path.exists());
-    assert!(!old_path.exists());
-}
-
-#[tokio::test]
-async fn create_temp_file_returns_path() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-
-    let req = json_with_token(
-        "POST",
-        "/api/fs/temp",
-        json!({ "file_name": "temp_test.txt" }),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json = body_json(resp).await;
-    let path = json["data"].as_str().unwrap();
-    assert!(path.contains("temp_test.txt"));
-    assert!(std::path::Path::new(path).exists());
-
-    // Cleanup
-    let _ = std::fs::remove_file(path);
-}
-
 // ===========================================================================
 // Image processing
 // ===========================================================================
@@ -746,91 +584,6 @@ async fn fetch_remote_image_non_whitelisted_returns_placeholder_svg() {
         data_url.starts_with("data:image/svg+xml"),
         "expected placeholder SVG for non-whitelisted host"
     );
-}
-
-// ===========================================================================
-// ZIP operations
-// ===========================================================================
-
-#[tokio::test]
-async fn create_zip_with_text_content() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let zip_path = dir.path().join("test.zip");
-
-    let req = json_with_token(
-        "POST",
-        "/api/fs/zip",
-        json!({
-            "path": zip_path.to_str().unwrap(),
-            "files": [
-                { "name": "greeting.txt", "content": "hello zip" }
-            ]
-        }),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json = body_json(resp).await;
-    assert_eq!(json["data"], true);
-    assert!(zip_path.exists());
-}
-
-#[tokio::test]
-async fn create_zip_accepts_non_sandbox_output_and_disk_sources() {
-    let sandbox = tempfile::tempdir().unwrap();
-    let source_root = tempfile::tempdir().unwrap();
-    let output_root = tempfile::tempdir().unwrap();
-    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-
-    let source_file = source_root.path().join("report.txt");
-    std::fs::write(&source_file, "zip me").unwrap();
-    let zip_path = output_root.path().join("archive.zip");
-
-    let req = json_with_token(
-        "POST",
-        "/api/fs/zip",
-        json!({
-            "path": zip_path.to_str().unwrap(),
-            "workspace": output_root.path().to_str().unwrap(),
-            "source_root": source_root.path().to_str().unwrap(),
-            "files": [
-                {
-                    "name": "report.txt",
-                    "source_path": source_file.to_str().unwrap()
-                }
-            ]
-        }),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert!(zip_path.exists());
-}
-
-#[tokio::test]
-async fn cancel_zip_nonexistent_returns_false() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-
-    let req = json_with_token(
-        "POST",
-        "/api/fs/zip/cancel",
-        json!({ "request_id": "nonexistent-id" }),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json = body_json(resp).await;
-    assert_eq!(json["data"], false);
 }
 
 // ===========================================================================
