@@ -294,8 +294,8 @@ mod tests {
                 },
                 ManagedCliResourceContract {
                     name: "codex".into(),
-                    version: "0.144.6".into(),
-                    root: "cli/codex/0.144.6/win32-x64".into(),
+                    version: "0.145.0".into(),
+                    root: "cli/codex/0.145.0/win32-x64".into(),
                     platform_directory: "win32-x64".into(),
                     executable: "vendor/x86_64-pc-windows-msvc/bin/codex.exe".into(),
                     required_files: vec!["vendor/x86_64-pc-windows-msvc/codex-path/rg.exe".into()],

@@ -17,7 +17,7 @@ pub use prepare::{ManagedCliError, PreparedCli, managed_cli_contract_for_export,
 /// Pinned CLI versions — the single source of truth. Bumping a CLI = change the
 /// constant and rebuild (managed-resources is replaced wholesale on app update).
 pub const CLAUDE_CLI_VERSION: &str = "2.1.215";
-pub const CODEX_CLI_VERSION: &str = "0.144.6";
+pub const CODEX_CLI_VERSION: &str = "0.145.0";
 
 /// The pinned version for a supported CLI name, or `None` for unknown names.
 pub fn cli_version(name: &str) -> Option<&'static str> {
