@@ -12,9 +12,10 @@ use aionui_api_types::{
     ApiResponse, BrowseDirectoryQuery, BrowseDirectoryResponse, CancelZipRequest, CopyFilesRequest, CopyFilesResponse,
     CreateTempFileRequest, DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse,
     FileWatchRequest, GetFileMetadataRequest, GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest,
-    ReadFileBufferRequest, ReadFileRequest, RemoveEntryRequest, RenameRequest, RenameResponse, SnapshotBaselineRequest,
-    SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotStageRequest,
-    SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest, ZipRequest,
+    ReadFileBufferRequest, ReadFileRequest, RemoveEntryRequest, RenameRequest, RenameResponse, RevealItemRequest,
+    SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse,
+    SnapshotStageRequest, SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest,
+    WriteFileRequest, ZipRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -22,7 +23,7 @@ use aionui_common::constants::UPLOAD_MAX_SIZE;
 
 use crate::browse;
 use crate::error::FileError;
-use crate::traits::{FileServiceRef, FileWatchServiceRef, SnapshotServiceRef};
+use crate::traits::{FileServiceRef, FileWatchServiceRef, ItemRevealerRef, SnapshotServiceRef};
 use crate::types::{
     CompareResult, CopyResult, DirOrFile, FileChangeInfo, FileMetadata, SnapshotInfo, SnapshotMode, WorkspaceFlatFile,
     ZipEntry,
@@ -49,6 +50,12 @@ impl From<FileError> for ApiError {
                 "FILE_WATCH_UNAVAILABLE",
                 "File watching is unavailable on this system.",
                 errno.map(|n| serde_json::json!({ "errno": n })),
+            ),
+            FileError::RevealFailed(message) => ApiError::coded(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "REVEAL_FAILED",
+                message,
+                None::<serde_json::Value>,
             ),
         }
     }
@@ -100,8 +107,12 @@ pub struct FileRouterState {
     pub file_service: FileServiceRef,
     pub watch_service: FileWatchServiceRef,
     pub snapshot_service: SnapshotServiceRef,
-    /// Resolves pe-addressed copy targets (`/api/fs/copy`) to absolute dirs.
+    /// Resolves pe-addressed copy/reveal targets (`/api/fs/copy`,
+    /// `/api/fs/reveal`) to absolute paths.
     pub project: Arc<aionui_project::ProjectService>,
+    /// Reveals a resolved absolute path in the OS file manager
+    /// (`/api/fs/reveal`). Injected by composition over the shell service.
+    pub revealer: ItemRevealerRef,
     pub allowed_roots: Vec<std::path::PathBuf>,
     /// Roots permitted by the shallow `/api/fs/browse` endpoint. This is
     /// typically wider than `allowed_roots` (it includes `cwd`, Windows
@@ -139,6 +150,7 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .route("/api/fs/read-buffer", post(read_file_buffer))
         .route("/api/fs/write", post(write_file))
         .route("/api/fs/copy", post(copy_files))
+        .route("/api/fs/reveal", post(reveal_item))
         .route("/api/fs/remove", post(remove_entry))
         .route("/api/fs/rename", post(rename_entry))
         .route("/api/fs/temp", post(create_temp_file))
@@ -311,6 +323,43 @@ async fn copy_files(
         .copy_files_to_workspace(&req.file_paths, &dir, req.source_root.as_deref())
         .await?;
     Ok(Json(ApiResponse::ok(to_copy_response(result))))
+}
+
+/// `POST /api/fs/reveal` — reveal a pe-addressed file/dir in the OS file manager
+/// ("open enclosing folder"). Resolves the identity to an absolute path
+/// (containment-checked, op = Read) then hands it to the reveal capability.
+async fn reveal_item(
+    State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<RevealItemRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let resolved = state
+        .project
+        .resolve_reference(
+            &user.id,
+            aionui_project::ReferenceInput {
+                pe_id: req.pe_id,
+                relative_path: req.relative_path,
+                op: aionui_project::FileOp::Read,
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+    reveal_resolved(state.revealer.as_ref(), resolved.absolute_path).await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+/// Reveal the resolved absolute path via the revealer port. Split from the
+/// handler so the resolve → reveal wiring (and its no-local-path / reveal-failed
+/// error mapping) is unit-testable with a mock revealer, independent of the
+/// project service (`resolve_reference` is covered in `aionui-project`).
+async fn reveal_resolved(
+    revealer: &dyn crate::traits::IItemRevealer,
+    absolute_path: Option<String>,
+) -> Result<(), FileError> {
+    let abs = absolute_path.ok_or_else(|| FileError::BadRequest("reveal target is not a local path".to_owned()))?;
+    revealer.reveal(&abs).await
 }
 
 async fn remove_entry(
@@ -829,6 +878,75 @@ mod tests {
         assert_eq!(api_err.error_code(), "FILE_WATCH_UNAVAILABLE");
         assert_eq!(api_err.status_code(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert!(api_err.error_details().is_none());
+    }
+
+    #[test]
+    fn reveal_failed_maps_to_stable_code() {
+        // Contract for the frontend: distinct from NOT_FOUND so it can tell
+        // "couldn't open the file manager" from "item gone".
+        let api_err = ApiError::from(FileError::RevealFailed("gdbus not available".into()));
+        assert_eq!(api_err.error_code(), "REVEAL_FAILED");
+        assert_eq!(api_err.status_code(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // -- reveal_resolved: resolve → reveal wiring (mock revealer seam) ---------
+
+    /// Records the absolute paths handed to `reveal`, and optionally fails.
+    struct MockRevealer {
+        calls: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+    impl MockRevealer {
+        fn new(fail: bool) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                fail,
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::traits::IItemRevealer for MockRevealer {
+        async fn reveal(&self, absolute_path: &str) -> Result<(), FileError> {
+            self.calls.lock().unwrap().push(absolute_path.to_owned());
+            if self.fail {
+                Err(FileError::RevealFailed("mock reveal failed".to_owned()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reveal_resolved_passes_absolute_path_to_revealer() {
+        let mock = MockRevealer::new(false);
+        let result = reveal_resolved(&mock, Some("/abs/target.txt".to_owned())).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert_eq!(
+            *mock.calls.lock().unwrap(),
+            vec!["/abs/target.txt".to_owned()],
+            "revealer must receive the resolved absolute path"
+        );
+    }
+
+    #[tokio::test]
+    async fn reveal_resolved_without_local_path_is_bad_request_and_skips_reveal() {
+        let mock = MockRevealer::new(false);
+        let result = reveal_resolved(&mock, None).await;
+        assert!(
+            matches!(result, Err(FileError::BadRequest(_))),
+            "non-local target must be BadRequest, got {result:?}"
+        );
+        assert!(mock.calls.lock().unwrap().is_empty(), "revealer must not be called");
+    }
+
+    #[tokio::test]
+    async fn reveal_resolved_propagates_reveal_failure() {
+        let mock = MockRevealer::new(true);
+        let result = reveal_resolved(&mock, Some("/abs/x".to_owned())).await;
+        assert!(
+            matches!(result, Err(FileError::RevealFailed(_))),
+            "reveal failure must propagate, got {result:?}"
+        );
     }
 
     #[test]
