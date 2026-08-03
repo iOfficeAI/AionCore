@@ -24,7 +24,7 @@ use super::actor::FsMonitorActor;
 use super::search::{self, ActiveSearch, SearchRoot};
 use super::wire::{
     self, Encoding, InitializeParams, MkdirParams, ReadParams, RemoveParams, RenameParams, ResolveParams, ResourceRef,
-    SearchCancelParams, SearchParams, SubscribeParams, UnsubscribeParams, WriteParams,
+    SearchCancelParams, SearchParams, SubscribeParams, UnsubscribeParams,
 };
 
 impl FsMonitorActor {
@@ -53,7 +53,6 @@ impl FsMonitorActor {
             // PATCH(ELECTRON-3SZ): remove with `handle_resolve` when preview no
             // longer needs absolute paths (see handler doc).
             "fs/resolve" => self.handle_resolve(session, user_id, id, params).await,
-            "fs/write" => self.handle_write(session, user_id, id, params).await,
             "fs/mkdir" => self.handle_mkdir(session, user_id, id, params).await,
             "fs/remove" => self.handle_remove(session, user_id, id, params).await,
             "fs/rename" => self.handle_rename(session, user_id, id, params).await,
@@ -313,29 +312,6 @@ impl FsMonitorActor {
         );
     }
 
-    async fn handle_write(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
-        let Ok(p) = serde_json::from_value::<WriteParams>(params) else {
-            self.push(session, invalid_params(id));
-            return;
-        };
-        let bytes = match decode_content(&p.content, p.encoding.unwrap_or_default()) {
-            Ok(b) => b,
-            Err(()) => {
-                self.push(session, invalid_params(id));
-                return;
-            }
-        };
-        let resolved = match self.resolve_guarded(user_id, &p.file, FileOp::Write).await {
-            Ok(r) => r,
-            Err((code, message)) => {
-                self.push(session, wire::error(id, code, message, ref_data(&p.file)));
-                return;
-            }
-        };
-        let outcome = self.runtime().provider().write(&resolved.resource_uri, &bytes).await;
-        self.reply_unit(session, id, "write", &p.file, outcome);
-    }
-
     async fn handle_mkdir(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
         let Ok(p) = serde_json::from_value::<MkdirParams>(params) else {
             self.push(session, invalid_params(id));
@@ -569,14 +545,6 @@ fn encode_content(bytes: Vec<u8>, requested: Encoding) -> (String, Encoding) {
             Ok(text) => (text, Encoding::Utf8),
             Err(err) => (STANDARD.encode(err.as_bytes()), Encoding::Base64),
         },
-    }
-}
-
-/// Decode wire content to bytes per its declared encoding.
-fn decode_content(content: &str, encoding: Encoding) -> Result<Vec<u8>, ()> {
-    match encoding {
-        Encoding::Utf8 => Ok(content.as_bytes().to_vec()),
-        Encoding::Base64 => STANDARD.decode(content.as_bytes()).map_err(|_| ()),
     }
 }
 

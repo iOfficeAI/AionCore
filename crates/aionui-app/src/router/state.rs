@@ -28,7 +28,7 @@ use aionui_extension::{
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
-use aionui_file::{BrowseRoots, FileRouterState, FileService, FileWatchService, SnapshotService};
+use aionui_file::{FileRouterState, FileService, FileWatchService, SnapshotService};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
@@ -471,7 +471,6 @@ pub fn build_connection_test_state() -> ConnectionTestRouterState {
 pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, RouterBuildError> {
     let broadcaster = services.event_bus.clone();
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
-    let browse_roots = BrowseRoots::new();
     let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
     // Non-fatal: watcher creation failure (e.g. inotify limit) yields a disabled
     // watch service, never a bootstrap abort. See ELECTRON-2PM.
@@ -490,7 +489,6 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         project: Arc::new(services.project_service.clone()),
         revealer,
         allowed_roots,
-        browse_roots,
     })
 }
 

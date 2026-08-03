@@ -359,51 +359,6 @@ async fn resolve_symlink_escape_is_resource_outside_folder() {
 }
 
 #[tokio::test]
-async fn write_then_read_roundtrip() {
-    let (mut actor, _rx, push, pe, _dir, _db) = setup().await;
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(
-                7,
-                "fs/write",
-                json!({"file":dir_ref(&pe, "new.txt"),"content":"written"}),
-            ),
-        )
-        .await;
-    assert!(push.last_for("1").unwrap()["result"].is_object());
-
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(8, "fs/read", json!({"file":dir_ref(&pe, "new.txt")})),
-        )
-        .await;
-    assert_eq!(push.last_for("1").unwrap()["result"]["content"], "written");
-}
-
-#[tokio::test]
-async fn write_base64_decodes_to_bytes() {
-    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
-    // base64("hi") = "aGk="
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(
-                9,
-                "fs/write",
-                json!({"file":dir_ref(&pe, "b.bin"),"content":"aGk=","encoding":"base64"}),
-            ),
-        )
-        .await;
-    assert!(push.last_for("1").unwrap()["result"].is_object());
-    assert_eq!(std::fs::read(dir.path().join("b.bin")).unwrap(), b"hi");
-}
-
-#[tokio::test]
 async fn mkdir_then_remove_roundtrip() {
     let (mut actor, _rx, push, pe, dir, _db) = setup().await;
     actor

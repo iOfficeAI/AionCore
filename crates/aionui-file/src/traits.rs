@@ -5,7 +5,7 @@ use aionui_common::FileChangeOperation;
 
 use crate::error::FileError;
 
-use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotInfo, WorkspaceFlatFile, ZipEntry};
+use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotInfo, WorkspaceFlatFile};
 
 /// Core file operations: directory browsing, file read/write, management,
 /// image processing, and ZIP packaging.
@@ -44,10 +44,6 @@ pub trait IFileService: Send + Sync {
     /// Files larger than 256 MB are rejected.
     async fn read_file(&self, path: &str, extra_root: Option<&Path>) -> Result<Option<String>, FileError>;
 
-    /// Read a file as raw bytes. Returns `None` if the file does not exist.
-    /// Files larger than 256 MB are rejected.
-    async fn read_file_buffer(&self, path: &str, extra_root: Option<&Path>) -> Result<Option<Vec<u8>>, FileError>;
-
     /// Write `data` to `path`. On success, emits a
     /// `fileStream.contentUpdate` event with `operation = write`.
     async fn write_file(&self, path: &str, data: &[u8], workspace: &str) -> Result<bool, FileError>;
@@ -77,40 +73,11 @@ pub trait IFileService: Send + Sync {
         source_root: Option<&str>,
     ) -> Result<CopyResult, FileError>;
 
-    /// Remove a file or directory (recursively). On success, emits a
-    /// `fileStream.contentUpdate` event with `operation = delete`.
-    async fn remove_entry(&self, path: &str, workspace: &str) -> Result<(), FileError>;
-
-    /// User-scoped variant of [`remove_entry`](Self::remove_entry).
-    async fn remove_entry_for_user(&self, user_id: &str, path: &str, workspace: &str) -> Result<(), FileError> {
-        let _ = user_id;
-        self.remove_entry(path, workspace).await
-    }
-
-    /// Rename a file or directory. Returns the new absolute path.
-    async fn rename_entry(&self, path: &str, new_name: &str) -> Result<String, FileError>;
-
-    /// Rename a file or directory, allowing one request-scoped root in
-    /// addition to the service sandbox.
-    async fn rename_entry_with_extra_root(
-        &self,
-        path: &str,
-        new_name: &str,
-        extra_root: Option<&Path>,
-    ) -> Result<String, FileError> {
-        let _ = extra_root;
-        self.rename_entry(path, new_name).await
-    }
-
-    /// Create an empty temporary file and return its absolute path.
-    async fn create_temp_file(&self, file_name: &str) -> Result<String, FileError>;
-
     /// Write `data` to a temporary file and return its absolute path.
     ///
     /// When `conversation_id` is provided, the file is placed under a
     /// per-conversation sub-directory (`<tmp>/aionui/<conversation_id>/`);
-    /// otherwise the shared `<tmp>/aionui/` directory is used (same as
-    /// [`create_temp_file`](Self::create_temp_file)).
+    /// otherwise the shared `<tmp>/aionui/` directory is used.
     ///
     /// `file_name` must not contain path separators or traversal patterns.
     async fn create_upload_file(
@@ -129,36 +96,6 @@ pub trait IFileService: Send + Sync {
     /// Download a remote image and return a base64 Data URL.
     /// On failure, returns a placeholder SVG Data URL.
     async fn fetch_remote_image(&self, url: &str) -> String;
-
-    // -- ZIP --
-
-    /// Create a ZIP archive at `path` from `entries`.
-    /// If `request_id` is provided, the operation can be cancelled via
-    /// [`cancel_zip`](Self::cancel_zip).
-    async fn create_zip(
-        &self,
-        path: &str,
-        entries: Vec<ZipEntry>,
-        request_id: Option<String>,
-    ) -> Result<bool, FileError>;
-
-    /// Create a ZIP archive, allowing request-scoped roots for the output path
-    /// and disk source entries in addition to the service sandbox.
-    async fn create_zip_with_extra_roots(
-        &self,
-        path: &str,
-        entries: Vec<ZipEntry>,
-        request_id: Option<String>,
-        output_root: Option<&Path>,
-        source_root: Option<&Path>,
-    ) -> Result<bool, FileError> {
-        let _ = (output_root, source_root);
-        self.create_zip(path, entries, request_id).await
-    }
-
-    /// Cancel an in-progress ZIP operation by its `request_id`.
-    /// Returns `true` if a matching operation was found and cancelled.
-    async fn cancel_zip(&self, request_id: &str) -> bool;
 }
 
 /// File system watching: single-file changes and workspace Office file

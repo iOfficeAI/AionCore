@@ -34,14 +34,6 @@ pub struct ReadFileRequest {
     pub workspace: Option<String>,
 }
 
-/// Request body for `POST /api/fs/read-buffer` — read file as binary.
-#[derive(Debug, Deserialize)]
-pub struct ReadFileBufferRequest {
-    pub path: String,
-    #[serde(default)]
-    pub workspace: Option<String>,
-}
-
 /// Request body for `POST /api/fs/write` — write file.
 #[derive(Debug, Deserialize)]
 pub struct WriteFileRequest {
@@ -86,32 +78,6 @@ pub struct RevealItemRequest {
     pub relative_path: String,
 }
 
-/// Request body for `POST /api/fs/remove` — remove file or directory.
-#[derive(Debug, Deserialize)]
-pub struct RemoveEntryRequest {
-    pub path: String,
-    /// Workspace root, used to compute `relativePath` in the
-    /// `fileStream.contentUpdate` event.  Falls back to the file's
-    /// parent directory when absent.
-    #[serde(default)]
-    pub workspace: Option<String>,
-}
-
-/// Request body for `POST /api/fs/rename` — rename file or directory.
-#[derive(Debug, Deserialize)]
-pub struct RenameRequest {
-    pub path: String,
-    pub new_name: String,
-    #[serde(default)]
-    pub workspace: Option<String>,
-}
-
-/// Request body for `POST /api/fs/temp` — create temp file.
-#[derive(Debug, Deserialize)]
-pub struct CreateTempFileRequest {
-    pub file_name: String,
-}
-
 /// Request body for `POST /api/fs/image-base64` — get image as base64.
 #[derive(Debug, Deserialize)]
 pub struct GetImageBase64Request {
@@ -124,93 +90,6 @@ pub struct GetImageBase64Request {
 #[derive(Debug, Deserialize)]
 pub struct FetchRemoteImageRequest {
     pub url: String,
-}
-
-/// A single entry in a ZIP creation request.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ZipFileEntry {
-    pub name: String,
-    #[serde(default)]
-    pub content: Option<String>,
-    #[serde(default)]
-    pub file_path: Option<String>,
-}
-
-/// Request body for `POST /api/fs/zip` — create ZIP archive.
-#[derive(Debug, Deserialize)]
-pub struct ZipRequest {
-    pub path: String,
-    #[serde(default)]
-    pub workspace: Option<String>,
-    #[serde(default)]
-    pub source_root: Option<String>,
-    #[serde(default)]
-    pub request_id: Option<String>,
-    pub files: Vec<ZipFileEntry>,
-}
-
-/// Request body for `POST /api/fs/zip/cancel` — cancel ZIP creation.
-#[derive(Debug, Deserialize)]
-pub struct CancelZipRequest {
-    pub request_id: String,
-}
-
-/// Query parameters for `GET /api/fs/browse` — shallow directory browser.
-///
-/// Unlike `/api/fs/dir` (which returns a recursive tree scoped to a workspace
-/// root), `browse` is a WebUI-only host-file picker: it lists a single
-/// directory level, surfaces navigation hints (`can_go_up`, `parent_path`),
-/// and on Windows supports a `__ROOT__` sentinel for the drive-list screen.
-#[derive(Debug, Deserialize)]
-pub struct BrowseDirectoryQuery {
-    /// Directory to list. Empty string means "use default" (Windows: drive
-    /// list; Unix: current working directory). `"__ROOT__"` on Windows is
-    /// treated the same as an empty path.
-    #[serde(default)]
-    pub path: Option<String>,
-    /// When true, include regular files in the response. Defaults to false
-    /// (directories only).
-    #[serde(default)]
-    pub show_files: Option<String>,
-}
-
-/// A single entry in a `/api/fs/browse` response.
-///
-/// Uses camelCase on the wire to match the original Express contract the
-/// frontend `DirectorySelectionModal` still consumes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct BrowseEntry {
-    pub name: String,
-    pub path: String,
-    pub is_directory: bool,
-    pub is_file: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub size: Option<u64>,
-    /// Last-modified time as milliseconds since the unix epoch. Absent when
-    /// the entry has no readable metadata (e.g. a Windows drive stub).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modified: Option<i64>,
-}
-
-/// Response body for `GET /api/fs/browse`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct BrowseDirectoryResponse {
-    /// The resolved directory currently being listed. Empty string when the
-    /// response is a Windows drive-list screen.
-    pub current_path: String,
-    /// Path to navigate to when the user clicks "up". `None` when already at
-    /// the root. Value `"__ROOT__"` is a sentinel used on Windows to mean
-    /// "return to the drive-list screen".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_path: Option<String>,
-    pub items: Vec<BrowseEntry>,
-    pub can_go_up: bool,
-    pub truncated: bool,
-    /// True when the response represents the Windows drive-list screen.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_root: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -263,12 +142,6 @@ pub struct CopyFailure {
 pub struct CopyFilesResponse {
     pub copied_files: Vec<String>,
     pub failed_files: Vec<CopyFailure>,
-}
-
-/// Result of a rename operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RenameResponse {
-    pub new_path: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -401,49 +274,6 @@ mod tests {
         });
         let req: CopyFilesRequest = serde_json::from_value(raw).unwrap();
         assert!(req.source_root.is_none());
-    }
-
-    #[test]
-    fn rename_request_snake_case() {
-        let raw = r#"{"path":"/ws/old.txt","new_name":"new.txt","workspace":"/ws"}"#;
-        let req: RenameRequest = serde_json::from_str(raw).unwrap();
-        assert_eq!(req.path, "/ws/old.txt");
-        assert_eq!(req.new_name, "new.txt");
-        assert_eq!(req.workspace.as_deref(), Some("/ws"));
-    }
-
-    #[test]
-    fn zip_request_snake_case() {
-        let raw = json!({
-            "path": "/out.zip",
-            "workspace": "/out",
-            "source_root": "/src",
-            "request_id": "req-1",
-            "files": [
-                { "name": "a.txt", "content": "hello" },
-                { "name": "b.bin", "file_path": "/src/b.bin" }
-            ]
-        });
-        let req: ZipRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.path, "/out.zip");
-        assert_eq!(req.workspace.as_deref(), Some("/out"));
-        assert_eq!(req.source_root.as_deref(), Some("/src"));
-        assert_eq!(req.request_id.as_deref(), Some("req-1"));
-        assert_eq!(req.files.len(), 2);
-        assert_eq!(req.files[0].content.as_deref(), Some("hello"));
-        assert!(req.files[0].file_path.is_none());
-        assert!(req.files[1].content.is_none());
-        assert_eq!(req.files[1].file_path.as_deref(), Some("/src/b.bin"));
-    }
-
-    #[test]
-    fn zip_request_optional_request_id() {
-        let raw = json!({
-            "path": "/out.zip",
-            "files": [{ "name": "a.txt", "content": "x" }]
-        });
-        let req: ZipRequest = serde_json::from_value(raw).unwrap();
-        assert!(req.request_id.is_none());
     }
 
     #[test]
