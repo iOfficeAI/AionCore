@@ -839,7 +839,6 @@ mod tests {
         assert_eq!(r.is_directory, Some(true));
     }
 
-
     #[test]
     fn snapshot_info_response_git_repo() {
         let info = SnapshotInfo {

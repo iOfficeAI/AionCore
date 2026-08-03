@@ -376,7 +376,6 @@ fn get_file_metadata_sync(path: &Path) -> Result<FileMetadata, FileError> {
     })
 }
 
-
 /// Copy a single file, creating parent directories as needed.
 fn copy_single_file_sync(src: &Path, dest: &Path) -> Result<(), FileError> {
     if let Some(parent) = dest.parent() {
@@ -839,7 +838,6 @@ impl crate::traits::IFileService for FileService {
         let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
         format!("data:{mime};base64,{encoded}")
     }
-
 }
 
 #[cfg(test)]
@@ -1352,5 +1350,4 @@ mod tests {
             assert!(is_allowed_image_host(&url), "host '{host}' should be allowed");
         }
     }
-
 }
