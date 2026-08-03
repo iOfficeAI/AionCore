@@ -187,6 +187,27 @@ struct CatalogPreload {
     current_mode: Option<String>,
 }
 
+/// Per-model reasoning efforts out of the persisted `available_models` column.
+///
+/// The catalog is written by `catalog_partial_from_caps` as
+/// `{available_models:[{id,label,reasoning_efforts?}]}`. Rows written before
+/// that field existed simply have none, so a stale catalog degrades to "no
+/// effort axis" rather than failing to parse.
+fn efforts_for_model(available_models: Option<&serde_json::Value>, model_id: &str) -> Vec<String> {
+    let Some(list) = available_models
+        .and_then(|v| v.get("available_models"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    list.iter()
+        .find(|entry| entry.get("id").and_then(|v| v.as_str()) == Some(model_id))
+        .and_then(|entry| entry.get("reasoning_efforts"))
+        .and_then(|v| v.as_array())
+        .map(|efforts| efforts.iter().filter_map(|e| e.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default()
+}
+
 impl CatalogPreload {
     /// Parse the persisted handshake's `available_models` / `available_modes`
     /// columns into the live-capabilities shape. Reuses the ACP path's
@@ -210,7 +231,13 @@ impl CatalogPreload {
                         id: m.model_id.to_string(),
                         name: m.name.clone(),
                         description: m.description.clone(),
-                        reasoning_efforts: Vec::new(),
+                        // Read straight from the stored JSON: the ACP
+                        // `SessionModelState` this comes from has no effort
+                        // axis, so the parser cannot carry it through.
+                        reasoning_efforts: efforts_for_model(
+                            handshake.available_models.as_ref(),
+                            &m.model_id.to_string(),
+                        ),
                     })
                     .collect::<Vec<_>>();
                 let current = state.current_model_id.to_string();
@@ -1947,9 +1974,20 @@ fn catalog_partial_from_caps(caps: &aionui_session::Capabilities) -> Option<aion
     });
     let available_models = (!caps.available_models.is_empty()).then(|| {
         serde_json::json!({
-            "available_models": caps.available_models.iter().map(|m| serde_json::json!({
-                "id": m.id, "label": m.name,
-            })).collect::<Vec<_>>(),
+            "available_models": caps.available_models.iter().map(|m| {
+                let mut entry = serde_json::json!({ "id": m.id, "label": m.name });
+                // Per-model reasoning efforts (claude's `supportedEffortLevels`).
+                // Dropped here until now, so the persisted catalog carried only
+                // {id,label} and the thought-level picker could not be rebuilt
+                // from it — see `CatalogPreload::from_handshake`. Omitted rather
+                // than written empty for models that have none, keeping the
+                // column byte-identical for every backend that has no effort
+                // axis (agy folds effort into the model id; codex has none).
+                if !m.reasoning_efforts.is_empty() {
+                    entry["reasoning_efforts"] = serde_json::json!(m.reasoning_efforts);
+                }
+                entry
+            }).collect::<Vec<_>>(),
             "current_model_id": caps.current_model,
         })
     });
@@ -7918,6 +7956,82 @@ mod force_kill_tests {
             "non-UserCancel kill must not broadcast Finish/Error, got {terminal:?}"
         );
         assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Running));
+    }
+}
+
+#[cfg(test)]
+mod cold_start_effort_tests {
+    //! A resumed conversation rebuilds its pickers from the persisted catalog
+    //! before the live handshake lands. That catalog carried only `{id,label}`,
+    //! so the thought-level group was missing until the user left the
+    //! conversation and came back — nothing re-publishes config options when
+    //! the handshake arrives. Present since #609 moved claude/codex onto the
+    //! direct-CLI path.
+    use super::*;
+
+    fn handshake_with(models: serde_json::Value) -> aionui_api_types::AgentHandshake {
+        aionui_api_types::AgentHandshake {
+            available_models: Some(models),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_persisted_catalog_round_trips_per_model_efforts() {
+        let caps = aionui_session::Capabilities {
+            available_models: vec![aionui_session::ModelInfo {
+                id: "opus".into(),
+                name: "Opus".into(),
+                description: None,
+                reasoning_efforts: vec!["low".into(), "high".into()],
+            }],
+            current_model: Some("opus".into()),
+            ..Default::default()
+        };
+        let partial = catalog_partial_from_caps(&caps).expect("catalog");
+        let preload = CatalogPreload::from_handshake(&partial);
+
+        assert_eq!(
+            preload.available_models[0].reasoning_efforts,
+            vec!["low".to_owned(), "high".to_owned()],
+            "efforts must survive the write/read round trip, or a resumed \
+             conversation opens without a thought-level picker"
+        );
+        // The whole point: this is what feeds the picker.
+        assert_eq!(
+            resolve_current_model_efforts(&preload.available_models, Some("opus")),
+            vec!["low".to_owned(), "high".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_model_without_efforts_writes_no_key() {
+        // agy folds effort into the model id and codex has no effort axis;
+        // writing an empty array for them would change the stored column for
+        // every backend to fix one.
+        let caps = aionui_session::Capabilities {
+            available_models: vec![aionui_session::ModelInfo {
+                id: "gemini-3.6-flash-low".into(),
+                name: "gemini-3.6-flash-low".into(),
+                description: None,
+                reasoning_efforts: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let partial = catalog_partial_from_caps(&caps).expect("catalog");
+        let entry = &partial.available_models.as_ref().unwrap()["available_models"][0];
+        assert!(entry.get("reasoning_efforts").is_none(), "{entry}");
+    }
+
+    #[test]
+    fn a_catalog_written_before_this_field_still_loads() {
+        // Every row already in the database predates the field.
+        let preload = CatalogPreload::from_handshake(&handshake_with(serde_json::json!({
+            "available_models": [{"id": "opus", "label": "Opus"}],
+            "current_model_id": "opus",
+        })));
+        assert_eq!(preload.available_models.len(), 1);
+        assert!(preload.available_models[0].reasoning_efforts.is_empty());
     }
 }
 
