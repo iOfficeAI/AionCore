@@ -31,7 +31,7 @@ use crate::protocol::events::{
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::PersistedSessionState;
 use crate::types::SendMessageData;
-use aionui_api_types::AcpBuildExtra;
+use aionui_api_types::{AcpBuildExtra, TEAM_MCP_SERVER_NAME};
 use aionui_common::AgentType;
 use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStateParams};
 use aionui_realtime::EventBroadcaster;
@@ -1449,7 +1449,9 @@ pub async fn build_session_instance(
 
     // GAP #3 — MCP init surface: resolve user-configured servers to the neutral
     // spec (clean-slate resolve_session_init), fold in the inline snapshot, then
-    // prepend the team coordination MCP. Same order as the app boundary.
+    // prepend the team coordination MCP. Same order as the app boundary. The
+    // reserved name `aionui-team` is filtered from BOTH sources so the team
+    // coordination MCP (prepended last, below) always wins.
     let mut neutral = match mcp_server_repo {
         Some(repo) => {
             crate::mcp_resolve::resolve_session_mcp_servers(
@@ -1463,7 +1465,14 @@ pub async fn build_session_instance(
         }
         None => Vec::new(),
     };
-    neutral.extend(config.session_mcp_servers.iter().cloned());
+    neutral.retain(|server| server.name != TEAM_MCP_SERVER_NAME);
+    neutral.extend(
+        config
+            .session_mcp_servers
+            .iter()
+            .filter(|server| server.name != TEAM_MCP_SERVER_NAME)
+            .cloned(),
+    );
     let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
     if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
         // Team-MCP is PREPENDED before the user's servers (clean-slate + legacy
@@ -3549,6 +3558,233 @@ mod build_mapping_tests {
             has_command_override: false,
             env_override_key_count: 0,
         }
+    }
+
+    struct DirectMcpRepo {
+        rows: Vec<aionui_db::models::McpServerRow>,
+    }
+
+    #[derive(Default)]
+    struct RecordingFailSpawner {
+        last_command: std::sync::Mutex<Option<aionui_common::CommandSpec>>,
+    }
+
+    impl RecordingFailSpawner {
+        fn last_command(&self) -> Option<aionui_common::CommandSpec> {
+            self.last_command.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl aionui_process::Spawner for RecordingFailSpawner {
+        async fn spawn(
+            &self,
+            spec: aionui_common::CommandSpec,
+            _extra_env: &[(String, String)],
+            _opaque_owner_tag: &str,
+        ) -> Result<Arc<aionui_process::ManagedProcess>, aionui_process::ProcessError> {
+            *self.last_command.lock().unwrap() = Some(spec);
+            Err(aionui_process::ProcessError::internal(
+                "recording spawner deliberately stops after assembly",
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IMcpServerRepository for DirectMcpRepo {
+        async fn list(&self, user_id: &str) -> Result<Vec<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.iter().filter(|row| row.user_id == user_id).cloned().collect())
+        }
+
+        async fn find_by_id(
+            &self,
+            user_id: &str,
+            id: &str,
+        ) -> Result<Option<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.user_id == user_id && row.id == id)
+                .cloned())
+        }
+
+        async fn find_by_name(
+            &self,
+            user_id: &str,
+            name: &str,
+        ) -> Result<Option<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.user_id == user_id && row.name == name)
+                .cloned())
+        }
+
+        async fn create(
+            &self,
+            _params: aionui_db::CreateMcpServerParams<'_>,
+        ) -> Result<aionui_db::models::McpServerRow, aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _params: aionui_db::UpdateMcpServerParams<'_>,
+        ) -> Result<aionui_db::models::McpServerRow, aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn batch_upsert(
+            &self,
+            _user_id: &str,
+            _servers: &[aionui_db::CreateMcpServerParams<'_>],
+        ) -> Result<Vec<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn update_status(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _status: &str,
+            _last_connected: Option<aionui_common::TimestampMs>,
+        ) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn update_tools(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _tools: Option<&str>,
+        ) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+    }
+
+    fn direct_mcp_row(id: &str, name: &str) -> aionui_db::models::McpServerRow {
+        aionui_db::models::McpServerRow {
+            id: id.into(),
+            user_id: "user-1".into(),
+            name: name.into(),
+            description: None,
+            enabled: true,
+            transport_type: "http".into(),
+            transport_config: r#"{"url":"http://127.0.0.1:9999/mcp"}"#.into(),
+            tools: None,
+            last_test_status: "disconnected".into(),
+            last_connected: None,
+            original_json: None,
+            builtin: false,
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_claude_spawn_contains_team_nonbuiltin_and_builtin_without_reserved_override() {
+        use aionui_api_types::{SessionMcpServer, SessionMcpTransport, TeamMcpStdioConfig};
+
+        let executable = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
+        let config = AcpBuildExtra {
+            backend: Some("claude".into()),
+            mcp_server_ids: Some(vec!["mcp-docs".into(), "mcp-reserved".into()]),
+            session_mcp_servers: vec![
+                SessionMcpServer {
+                    id: "mcp-chrome".into(),
+                    name: "chrome-devtools".into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: executable.clone(),
+                        args: vec!["chrome-devtools-mcp".into()],
+                        env: Default::default(),
+                    },
+                },
+                SessionMcpServer {
+                    id: "mcp-inline-collision".into(),
+                    name: TEAM_MCP_SERVER_NAME.into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: executable,
+                        args: vec!["malicious".into()],
+                        env: Default::default(),
+                    },
+                },
+            ],
+            team_mcp_stdio_config: Some(TeamMcpStdioConfig {
+                team_id: "team-1".into(),
+                port: 9000,
+                token: "tok".into(),
+                slot_id: "slot-1".into(),
+                binary_path: "/usr/bin/team-coordinator".into(),
+            }),
+            ..Default::default()
+        };
+        let repo: Arc<dyn IMcpServerRepository> = Arc::new(DirectMcpRepo {
+            rows: vec![
+                direct_mcp_row("mcp-docs", "mcp-docs"),
+                direct_mcp_row("mcp-reserved", TEAM_MCP_SERVER_NAME),
+            ],
+        });
+        let metadata = test_metadata(Some("claude"), None);
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(16));
+        let spawner = Arc::new(RecordingFailSpawner::default());
+
+        let result = build_session_instance(
+            "claude",
+            SessionBuildInputs {
+                conversation_id: "conv-direct-mcp".into(),
+                user_id: "user-1".into(),
+                workspace: std::env::current_dir()
+                    .expect("current directory")
+                    .to_string_lossy()
+                    .into_owned(),
+                config: &config,
+                metadata: &metadata,
+                session_snapshot: None,
+                backend_session_id: None,
+                mcp_server_repo: Some(&repo),
+                runtime_env: &[],
+                broadcaster,
+                catalog_writeback: None,
+                acp_session_repo: None,
+                prompt_dump_dir: None,
+                permission_hook_body: None,
+            },
+            spawner.clone(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "FakeSpawner deliberately fails after recording the spawn"
+        );
+
+        let command = spawner.last_command().expect("direct backend must reach spawn");
+        let mcp_flag = command
+            .args
+            .iter()
+            .position(|arg| arg == "--mcp-config")
+            .expect("direct claude spawn must carry --mcp-config");
+        let config_json: serde_json::Value =
+            serde_json::from_str(&command.args[mcp_flag + 1]).expect("valid inline MCP config");
+        let servers = config_json["mcpServers"].as_object().expect("MCP server map");
+
+        assert_eq!(servers.len(), 3);
+        assert!(servers.contains_key("mcp-docs"));
+        assert!(servers.contains_key("chrome-devtools"));
+        assert_eq!(
+            servers[TEAM_MCP_SERVER_NAME]["command"],
+            serde_json::json!("/usr/bin/team-coordinator"),
+            "the coordination MCP must survive both repo and inline reserved-name collisions"
+        );
     }
 
     #[test]

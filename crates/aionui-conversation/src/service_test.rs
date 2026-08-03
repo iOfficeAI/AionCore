@@ -6475,7 +6475,9 @@ async fn warmup_keeps_existing_acp_session_anchor_in_build_options() {
         AgentSessionKind::Acp(context) => {
             assert_eq!(context.session_id.as_deref(), Some("sess-existing"));
         }
-        AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+        AgentSessionKind::Aionrs(_) | AgentSessionKind::Antigravity(_) => {
+            panic!("test conversation should build ACP options")
+        }
     }
 }
 

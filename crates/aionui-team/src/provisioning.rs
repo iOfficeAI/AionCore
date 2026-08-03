@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AddAgentRequest, GetConfigOptionsResponse, TeamAgentInput, TeamToolTransport};
+use aionui_api_types::{
+    AddAgentRequest, GetConfigOptionsResponse, McpRuntimeSnapshot, TeamAgentInput, TeamMcpSelection, TeamToolTransport,
+};
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
 use aionui_db::models::{AgentMetadataRow, TeamRow};
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
@@ -110,6 +112,32 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), TeamError>;
 
+    /// Resolve the user's globally enabled MCP servers (enabled non-builtin
+    /// rows by id + enabled builtin rows as neutral session servers) into the
+    /// two create-time request shapes. Used by team provisioning so member
+    /// conversations carry the operator's full MCP selection — including
+    /// builtin servers the generic enabled-set fallback hard-excludes.
+    ///
+    /// A repo read failure is an error — never a silently empty set — so
+    /// provisioning aborts instead of dropping every user MCP.
+    async fn resolve_global_mcp_selection(&self, user_id: &str) -> Result<TeamMcpSelection, TeamError> {
+        let _ = user_id;
+        Ok(TeamMcpSelection::default())
+    }
+
+    /// Resolve the user's globally enabled MCP servers into the full typed
+    /// four-field runtime snapshot for an existing conversation's agent
+    /// (names + statuses classified against its transport support). Used by
+    /// the attach path to refresh the persisted snapshot.
+    async fn resolve_conversation_mcp_snapshot(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<McpRuntimeSnapshot, TeamError> {
+        let _ = (user_id, conversation_id);
+        Ok(McpRuntimeSnapshot::default())
+    }
+
     async fn delete_team_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), TeamError>;
 
     async fn lookup_team_binding_by_conversation(
@@ -185,6 +213,12 @@ impl TeamAgentProvisioner {
         let leader_slot_id = generate_id();
         let leader_role = TeammateRole::Lead;
         let leader_assistant_id = Self::effective_assistant_id(leader_input.assistant_id.as_deref());
+        // Resolve the user's globally enabled MCP selection ONCE, before any
+        // conversation is created, and share it across every member (leader +
+        // teammates): N queries would be redundant and could observe an
+        // inconsistent toggle state mid-provisioning. A read failure aborts
+        // here, before any orphan conversation can be created.
+        let mcp_selection = self.conversation_port.resolve_global_mcp_selection(user_id).await?;
         let leader_backend = self
             .resolve_requested_backend(user_id, leader_input.backend.as_deref(), leader_assistant_id.as_deref())
             .await?;
@@ -200,6 +234,7 @@ impl TeamAgentProvisioner {
                 leader_assistant_id.as_deref(),
                 shared_workspace,
                 None,
+                Some(&mcp_selection),
             )
             .await?;
 
@@ -252,6 +287,7 @@ impl TeamAgentProvisioner {
                     assistant_id.as_deref(),
                     Some(&team_workspace),
                     None,
+                    Some(&mcp_selection),
                 )
                 .await?;
             agents.push(TeamAgent {
@@ -305,19 +341,24 @@ impl TeamAgentProvisioner {
         let backend = self
             .resolve_requested_backend(user_id, req.backend.as_deref(), assistant_id.as_deref())
             .await?;
+        // Resolve the global MCP selection once for this agent.
+        let mcp_selection = self.conversation_port.resolve_global_mcp_selection(user_id).await?;
         let agent = self
-            .provision_new_agent(NewAgentProvisioning {
-                user_id: user_id.to_owned(),
-                team_id: team.id.clone(),
-                slot_id: generate_id(),
-                name: req.name,
-                role,
-                backend,
-                model: req.model,
-                assistant_id,
-                workspace: Some(workspace),
-                session_mode: row.session_mode.clone(),
-            })
+            .provision_new_agent(
+                NewAgentProvisioning {
+                    user_id: user_id.to_owned(),
+                    team_id: team.id.clone(),
+                    slot_id: generate_id(),
+                    name: req.name,
+                    role,
+                    backend,
+                    model: req.model,
+                    assistant_id,
+                    workspace: Some(workspace),
+                    session_mode: row.session_mode.clone(),
+                },
+                Some(&mcp_selection),
+            )
             .await?;
         team.agents.push(agent.clone());
         self.persist_agents(&team.id, &team.agents).await?;
@@ -358,19 +399,27 @@ impl TeamAgentProvisioner {
             .ok_or_else(|| TeamError::TeamNotFound(req.team_id.clone()))?;
         let mut team = Team::from_row(&row)?;
         let workspace = self.workspace_resolver().resolve_for_new_agent(&row, &team).await?;
+        // Resolve the global MCP selection once for this spawned agent.
+        let mcp_selection = self
+            .conversation_port
+            .resolve_global_mcp_selection(&req.user_id)
+            .await?;
         let agent = self
-            .provision_new_agent(NewAgentProvisioning {
-                user_id: req.user_id,
-                team_id: req.team_id.clone(),
-                slot_id: req.slot_id,
-                name: req.name,
-                role: TeammateRole::Teammate,
-                backend: req.backend,
-                model: req.model,
-                assistant_id: req.assistant_id,
-                workspace: Some(workspace),
-                session_mode: row.session_mode.clone(),
-            })
+            .provision_new_agent(
+                NewAgentProvisioning {
+                    user_id: req.user_id,
+                    team_id: req.team_id.clone(),
+                    slot_id: req.slot_id,
+                    name: req.name,
+                    role: TeammateRole::Teammate,
+                    backend: req.backend,
+                    model: req.model,
+                    assistant_id: req.assistant_id,
+                    workspace: Some(workspace),
+                    session_mode: row.session_mode.clone(),
+                },
+                Some(&mcp_selection),
+            )
             .await?;
         team.agents.push(agent.clone());
         self.persist_agents(&req.team_id, &team.agents).await?;
@@ -387,13 +436,22 @@ impl TeamAgentProvisioner {
     ) -> Result<(), TeamError> {
         let team_id = mcp_stdio_cfg.team_id.clone();
         let transport = self.team_tool_transport(user_id, agent).await?;
+        // Refresh the user's globally enabled MCP snapshot (including builtin
+        // servers) BEFORE composing the patch so the rebuilt session carries
+        // the current selection. A repo read failure aborts the attach — it is
+        // never treated as "enabled set is empty", which would clear the
+        // stored snapshot.
+        let mcp_snapshot = self
+            .conversation_port
+            .resolve_conversation_mcp_snapshot(user_id, &agent.conversation_id)
+            .await?;
         match transport {
             TeamToolTransport::Mcp => {
-                self.write_team_mcp_runtime_config(user_id, agent, mcp_stdio_cfg, !kill_existing)
+                self.write_team_mcp_runtime_config(user_id, agent, mcp_stdio_cfg, !kill_existing, &mcp_snapshot)
                     .await?
             }
             TeamToolTransport::CliAssumed => {
-                self.write_team_cli_runtime_config(user_id, agent, !kill_existing)
+                self.write_team_cli_runtime_config(user_id, agent, !kill_existing, &mcp_snapshot)
                     .await?
             }
         }
@@ -477,16 +535,27 @@ impl TeamAgentProvisioner {
         agent: &TeamAgent,
         mcp_stdio_cfg: TeamMcpStdioConfig,
         preserve_session_mode: bool,
+        mcp_snapshot: &McpRuntimeSnapshot,
     ) -> Result<(), TeamError> {
         let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
         let agent_type = agent_type_for_backend(cli_metadata.as_ref(), &agent.backend)?;
         let session_mode = session_mode_for_backend(&agent.backend, agent_type, cli_metadata.as_ref());
         let patch = if preserve_session_mode {
-            serde_json::json!({ "team_mcp_stdio_config": mcp_stdio_cfg })
+            serde_json::json!({
+                "team_mcp_stdio_config": mcp_stdio_cfg,
+                "mcp_server_ids": mcp_snapshot.mcp_server_ids,
+                "session_mcp_servers": mcp_snapshot.session_mcp_servers,
+                "mcp_servers": mcp_snapshot.mcp_servers,
+                "mcp_statuses": mcp_snapshot.mcp_statuses,
+            })
         } else {
             serde_json::json!({
                 "team_mcp_stdio_config": mcp_stdio_cfg,
                 "session_mode": session_mode,
+                "mcp_server_ids": mcp_snapshot.mcp_server_ids,
+                "session_mcp_servers": mcp_snapshot.session_mcp_servers,
+                "mcp_servers": mcp_snapshot.mcp_servers,
+                "mcp_statuses": mcp_snapshot.mcp_statuses,
             })
         };
         self.conversation_port
@@ -505,16 +574,27 @@ impl TeamAgentProvisioner {
         user_id: &str,
         agent: &TeamAgent,
         preserve_session_mode: bool,
+        mcp_snapshot: &McpRuntimeSnapshot,
     ) -> Result<(), TeamError> {
         let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
         let agent_type = agent_type_for_backend(cli_metadata.as_ref(), &agent.backend)?;
         let session_mode = session_mode_for_backend(&agent.backend, agent_type, cli_metadata.as_ref());
         let patch = if preserve_session_mode {
-            serde_json::json!({ "team_mcp_stdio_config": null })
+            serde_json::json!({
+                "team_mcp_stdio_config": null,
+                "mcp_server_ids": mcp_snapshot.mcp_server_ids,
+                "session_mcp_servers": mcp_snapshot.session_mcp_servers,
+                "mcp_servers": mcp_snapshot.mcp_servers,
+                "mcp_statuses": mcp_snapshot.mcp_statuses,
+            })
         } else {
             serde_json::json!({
                 "team_mcp_stdio_config": null,
                 "session_mode": session_mode,
+                "mcp_server_ids": mcp_snapshot.mcp_server_ids,
+                "session_mcp_servers": mcp_snapshot.session_mcp_servers,
+                "mcp_servers": mcp_snapshot.mcp_servers,
+                "mcp_statuses": mcp_snapshot.mcp_statuses,
             })
         };
         self.conversation_port
@@ -544,7 +624,11 @@ impl TeamAgentProvisioner {
         Ok(())
     }
 
-    async fn provision_new_agent(&self, input: NewAgentProvisioning) -> Result<TeamAgent, TeamError> {
+    async fn provision_new_agent(
+        &self,
+        input: NewAgentProvisioning,
+        mcp_selection: Option<&TeamMcpSelection>,
+    ) -> Result<TeamAgent, TeamError> {
         let conversation = self
             .create_team_conversation_for_agent(
                 &input.user_id,
@@ -557,6 +641,7 @@ impl TeamAgentProvisioner {
                 input.assistant_id.as_deref(),
                 input.workspace.as_deref(),
                 input.session_mode.as_deref(),
+                mcp_selection,
             )
             .await?;
         Ok(TeamAgent {
@@ -586,6 +671,7 @@ impl TeamAgentProvisioner {
         assistant_id: Option<&str>,
         workspace: Option<&str>,
         session_mode: Option<&str>,
+        mcp_selection: Option<&TeamMcpSelection>,
     ) -> Result<ProvisionedConversation, TeamError> {
         let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, backend).await?;
         let agent_type = agent_type_for_backend(cli_metadata.as_ref(), backend)?;
@@ -600,6 +686,7 @@ impl TeamAgentProvisioner {
             agent_type,
             cli_metadata.as_ref(),
             session_mode,
+            mcp_selection,
         );
         let provider_id = if agent_type == AgentType::Aionrs {
             self.resolve_provider_for_model(user_id, model)
@@ -706,6 +793,7 @@ impl TeamAgentProvisioner {
         agent_type: AgentType,
         cli_metadata: Option<&AgentMetadataRow>,
         session_mode: Option<&str>,
+        mcp_selection: Option<&TeamMcpSelection>,
     ) -> serde_json::Value {
         let session_mode = session_mode
             .map(str::trim)
@@ -727,6 +815,24 @@ impl TeamAgentProvisioner {
         }
         if let Some(workspace) = workspace {
             inherit_team_workspace(&mut extra, workspace);
+        }
+        if let Some(selection) = mcp_selection {
+            // Explicit final snapshot inputs (possibly empty). `create()`
+            // recognizes them for team conversations, classifies valid rows
+            // per agent, and rewrites the full four-field snapshot. Empty arrays are
+            // deliberate — "no user MCP" must win over preset defaults.
+            extra["mcp_server_ids"] = serde_json::Value::Array(
+                selection
+                    .mcp_server_ids
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
+            extra["session_mcp_servers"] =
+                serde_json::to_value(&selection.session_mcp_servers).unwrap_or(serde_json::Value::Array(Vec::new()));
+            extra["mcp_statuses"] =
+                serde_json::to_value(&selection.mcp_statuses).unwrap_or(serde_json::Value::Array(Vec::new()));
         }
         extra
     }
@@ -782,6 +888,11 @@ mod tests {
     struct RecordingProvisioningPort {
         events: Arc<Mutex<Vec<&'static str>>>,
         patches: Arc<Mutex<Vec<serde_json::Value>>>,
+        /// Canned global MCP snapshot returned to the provisioner, so tests can
+        /// assert the composed patch carries the four snapshot fields.
+        mcp_snapshot: Option<McpRuntimeSnapshot>,
+        mcp_error: Option<&'static str>,
+        persisted_extra: Arc<Mutex<serde_json::Value>>,
     }
 
     #[async_trait]
@@ -790,7 +901,34 @@ mod tests {
             &self,
             _request: TeamConversationCreateRequest,
         ) -> Result<TeamConversationCreateResult, TeamError> {
+            self.events.lock().unwrap().push("create");
             Err(TeamError::InvalidRequest("unused".into()))
+        }
+
+        async fn resolve_global_mcp_selection(&self, _user_id: &str) -> Result<TeamMcpSelection, TeamError> {
+            if let Some(message) = self.mcp_error {
+                return Err(TeamError::InvalidRequest(message.into()));
+            }
+            Ok(self
+                .mcp_snapshot
+                .as_ref()
+                .map(|snapshot| TeamMcpSelection {
+                    mcp_server_ids: snapshot.mcp_server_ids.clone(),
+                    session_mcp_servers: snapshot.session_mcp_servers.clone(),
+                    mcp_statuses: snapshot.mcp_statuses.clone(),
+                })
+                .unwrap_or_default())
+        }
+
+        async fn resolve_conversation_mcp_snapshot(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+        ) -> Result<McpRuntimeSnapshot, TeamError> {
+            if let Some(message) = self.mcp_error {
+                return Err(TeamError::InvalidRequest(message.into()));
+            }
+            Ok(self.mcp_snapshot.clone().unwrap_or_default())
         }
 
         async fn conversation_workspace(&self, _conversation_id: &str) -> Result<Option<String>, TeamError> {
@@ -810,6 +948,13 @@ mod tests {
             _conversation_id: &str,
             patch: serde_json::Value,
         ) -> Result<(), TeamError> {
+            if let (Some(stored), Some(incoming)) =
+                (self.persisted_extra.lock().unwrap().as_object_mut(), patch.as_object())
+            {
+                for (key, value) in incoming {
+                    stored.insert(key.clone(), value.clone());
+                }
+            }
             self.patches.lock().unwrap().push(patch);
             self.events.lock().unwrap().push("patch");
             Ok(())
@@ -884,6 +1029,45 @@ mod tests {
                 }
                 events.lock().unwrap().push("kill_wait_done");
             })
+        }
+
+        async fn clear(&self) {}
+
+        fn active_count(&self) -> usize {
+            0
+        }
+
+        fn collect_idle(&self, _idle_threshold_ms: aionui_common::TimestampMs) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    struct NoopKillTaskManager;
+
+    #[async_trait]
+    impl IWorkerTaskManager for NoopKillTaskManager {
+        fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+            None
+        }
+
+        async fn get_or_build_task(
+            &self,
+            _conversation_id: &str,
+            _options: BuildTaskOptions,
+        ) -> Result<AgentInstance, AgentError> {
+            Err(AgentError::internal("unused"))
+        }
+
+        fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        fn kill_and_wait(
+            &self,
+            _conversation_id: &str,
+            _reason: Option<AgentKillReason>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            Box::pin(async {})
         }
 
         async fn clear(&self) {}
@@ -1055,12 +1239,42 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         patches: Arc<Mutex<Vec<serde_json::Value>>>,
     ) -> TeamAgentProvisioner {
+        test_provisioner_with_snapshot(events, patches, None)
+    }
+
+    fn test_provisioner_with_snapshot(
+        events: Arc<Mutex<Vec<&'static str>>>,
+        patches: Arc<Mutex<Vec<serde_json::Value>>>,
+        mcp_snapshot: Option<McpRuntimeSnapshot>,
+    ) -> TeamAgentProvisioner {
+        test_provisioner_with_port_state(
+            events,
+            patches,
+            mcp_snapshot,
+            None,
+            Arc::new(Mutex::new(serde_json::json!({}))),
+        )
+    }
+
+    fn test_provisioner_with_port_state(
+        events: Arc<Mutex<Vec<&'static str>>>,
+        patches: Arc<Mutex<Vec<serde_json::Value>>>,
+        mcp_snapshot: Option<McpRuntimeSnapshot>,
+        mcp_error: Option<&'static str>,
+        persisted_extra: Arc<Mutex<serde_json::Value>>,
+    ) -> TeamAgentProvisioner {
         TeamAgentProvisioner::new(
             Arc::new(crate::test_utils::MockTeamRepo::new()),
             Arc::new(UnusedAgentMetadataRepo),
             Arc::new(EmptyTeamAssistantCatalog),
             Arc::new(EmptyProviderRepo),
-            Arc::new(RecordingProvisioningPort { events, patches }),
+            Arc::new(RecordingProvisioningPort {
+                events,
+                patches,
+                mcp_snapshot,
+                mcp_error,
+                persisted_extra,
+            }),
         )
     }
 
@@ -1076,6 +1290,24 @@ mod tests {
             status: None,
             conversation_type: None,
             cli_path: None,
+        }
+    }
+
+    fn test_mcp_snapshot() -> McpRuntimeSnapshot {
+        use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
+        McpRuntimeSnapshot {
+            mcp_server_ids: vec!["mcp-docs".into()],
+            session_mcp_servers: vec![SessionMcpServer {
+                id: "mcp-chrome".into(),
+                name: "chrome-devtools".into(),
+                transport: SessionMcpTransport::Stdio {
+                    command: "/runtime/npx".into(),
+                    args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
+                    env: Default::default(),
+                },
+            }],
+            mcp_servers: vec!["mcp-docs".into(), "chrome-devtools".into()],
+            mcp_statuses: Vec::new(),
         }
     }
 
@@ -1118,12 +1350,16 @@ mod tests {
         let provisioner = test_provisioner_with_patches(events, Arc::clone(&patches));
 
         provisioner
-            .write_team_cli_runtime_config("user-test", &test_agent(), false)
+            .write_team_cli_runtime_config("user-test", &test_agent(), false, &McpRuntimeSnapshot::default())
             .await
             .unwrap();
 
         let patches = patches.lock().unwrap();
         assert_eq!(patches[0]["team_mcp_stdio_config"], serde_json::Value::Null);
+        assert_eq!(patches[0]["mcp_server_ids"], serde_json::json!([]));
+        assert_eq!(patches[0]["session_mcp_servers"], serde_json::json!([]));
+        assert_eq!(patches[0]["mcp_servers"], serde_json::json!([]));
+        assert_eq!(patches[0]["mcp_statuses"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -1164,6 +1400,213 @@ mod tests {
             ["patch", "kill_wait_start", "kill_wait_done", "warmup"]
         );
         let patches = patches.lock().unwrap();
+        // Single atomic patch: team config + the four MCP snapshot fields are
+        // replaced together, before kill → warmup.
         assert!(patches[0]["team_mcp_stdio_config"].is_object());
+        assert!(patches[0]["mcp_server_ids"].is_array());
+        assert!(patches[0]["session_mcp_servers"].is_array());
+        assert!(patches[0]["mcp_servers"].is_array());
+        assert!(patches[0]["mcp_statuses"].is_array());
+    }
+
+    #[tokio::test]
+    async fn attach_patch_carries_atomic_mcp_snapshot_on_mcp_transport() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let patches = Arc::new(Mutex::new(Vec::new()));
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopKillTaskManager);
+        let mut agent = test_agent();
+        agent.backend = "aionrs".into();
+
+        let snapshot = test_mcp_snapshot();
+        let provisioner =
+            test_provisioner_with_snapshot(Arc::clone(&events), Arc::clone(&patches), Some(snapshot.clone()));
+        provisioner
+            .attach_agent_process("user-1", &agent, test_mcp_config(), &task_manager, false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["patch", "warmup"],
+            "attach must compose ONE patch then warm up"
+        );
+        let patches = patches.lock().unwrap();
+        assert_eq!(patches.len(), 1, "must be a single atomic patch, not two writes");
+        assert!(patches[0]["team_mcp_stdio_config"].is_object());
+        assert_eq!(patches[0]["mcp_server_ids"], serde_json::json!(["mcp-docs"]));
+        assert_eq!(
+            patches[0]["session_mcp_servers"][0]["name"],
+            serde_json::json!("chrome-devtools")
+        );
+        assert_eq!(
+            patches[0]["mcp_servers"],
+            serde_json::json!(["mcp-docs", "chrome-devtools"])
+        );
+        assert!(patches[0]["mcp_statuses"].is_array());
+    }
+
+    #[tokio::test]
+    async fn attach_refreshes_mcp_snapshot_on_cli_transport() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let patches = Arc::new(Mutex::new(Vec::new()));
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopKillTaskManager);
+        let mut agent = test_agent();
+        // Generic ACP backend with no advertised capabilities → CLI transport.
+        agent.backend = "acp".into();
+
+        let provisioner =
+            test_provisioner_with_snapshot(Arc::clone(&events), Arc::clone(&patches), Some(test_mcp_snapshot()));
+        provisioner
+            .attach_agent_process("user-1", &agent, test_mcp_config(), &task_manager, false)
+            .await
+            .unwrap();
+
+        let patches = patches.lock().unwrap();
+        assert_eq!(patches.len(), 1);
+        // CLI-coordinated agents also get the refreshed user MCP snapshot.
+        assert_eq!(patches[0]["team_mcp_stdio_config"], serde_json::Value::Null);
+        assert_eq!(patches[0]["mcp_server_ids"], serde_json::json!(["mcp-docs"]));
+        assert_eq!(
+            patches[0]["session_mcp_servers"][0]["name"],
+            serde_json::json!("chrome-devtools")
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_initial_agents_stops_before_conversation_creation_when_mcp_repo_is_unavailable() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let provisioner = test_provisioner_with_port_state(
+            Arc::clone(&events),
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+            Some("MCP repository unavailable"),
+            Arc::new(Mutex::new(serde_json::json!({}))),
+        );
+        let inputs = vec![TeamAgentInput {
+            name: "Lead".into(),
+            role: "lead".into(),
+            backend: Some("aionrs".into()),
+            model: "test-model".into(),
+            assistant_id: None,
+            conversation_id: None,
+        }];
+
+        let error = match provisioner
+            .provision_initial_agents("user-1", "team-1", &inputs, Some("/workspace"))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("repository failure must abort provisioning"),
+        };
+
+        assert!(error.to_string().contains("MCP repository unavailable"));
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "global MCP resolution must fail before any conversation is created"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_repo_error_preserves_snapshot_without_patch_kill_or_warmup() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let patches = Arc::new(Mutex::new(Vec::new()));
+        let existing_extra = serde_json::json!({
+            "mcp_server_ids": ["old-docs"],
+            "session_mcp_servers": [{
+                "id": "old-chrome",
+                "name": "chrome-devtools",
+                "transport": { "type": "stdio", "command": "/old/npx", "args": [], "env": {} }
+            }],
+            "mcp_servers": ["old-docs", "chrome-devtools"],
+            "mcp_statuses": [{ "id": "old-docs", "name": "old-docs", "status": "loaded" }]
+        });
+        let persisted_extra = Arc::new(Mutex::new(existing_extra.clone()));
+        let provisioner = test_provisioner_with_port_state(
+            Arc::clone(&events),
+            Arc::clone(&patches),
+            None,
+            Some("MCP repository unavailable"),
+            Arc::clone(&persisted_extra),
+        );
+        let (kill_started, _kill_started_rx) = watch::channel(false);
+        let (_release_kill, release_kill_rx) = watch::channel(true);
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(BlockingKillTaskManager {
+            events: Arc::clone(&events),
+            kill_started,
+            release_kill: release_kill_rx,
+        });
+        let mut agent = test_agent();
+        agent.backend = "aionrs".into();
+
+        let error = provisioner
+            .attach_agent_process("user-1", &agent, test_mcp_config(), &task_manager, true)
+            .await
+            .expect_err("repository failure must abort attach");
+
+        assert!(error.to_string().contains("MCP repository unavailable"));
+        assert!(
+            patches.lock().unwrap().is_empty(),
+            "attach must not patch on repository error"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "attach must not patch, kill, or warm up"
+        );
+        assert_eq!(*persisted_extra.lock().unwrap(), existing_extra);
+    }
+
+    #[tokio::test]
+    async fn build_team_extra_injects_explicit_mcp_selection() {
+        let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
+        let selection = TeamMcpSelection {
+            mcp_server_ids: vec!["mcp-docs".into()],
+            session_mcp_servers: test_mcp_snapshot().session_mcp_servers,
+            mcp_statuses: Vec::new(),
+        };
+
+        let extra = provisioner.build_team_extra(
+            "team-1",
+            "slot-1",
+            TeammateRole::Teammate,
+            "claude",
+            "sonnet",
+            None,
+            Some("/ws"),
+            AgentType::Acp,
+            None,
+            None,
+            Some(&selection),
+        );
+
+        // Final snapshot inputs are explicit; no request-only fields leak in.
+        assert_eq!(extra["mcp_server_ids"], serde_json::json!(["mcp-docs"]));
+        assert_eq!(
+            extra["session_mcp_servers"][0]["name"],
+            serde_json::json!("chrome-devtools")
+        );
+        assert_eq!(extra["mcp_statuses"], serde_json::json!([]));
+        assert!(extra.get("selected_mcp_server_ids").is_none());
+        assert!(extra.get("selected_session_mcp_servers").is_none());
+    }
+
+    #[tokio::test]
+    async fn build_team_extra_without_selection_writes_no_mcp_fields() {
+        let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
+        let extra = provisioner.build_team_extra(
+            "team-1",
+            "slot-1",
+            TeammateRole::Teammate,
+            "claude",
+            "sonnet",
+            None,
+            Some("/ws"),
+            AgentType::Acp,
+            None,
+            None,
+            None,
+        );
+
+        assert!(extra.get("selected_mcp_server_ids").is_none());
+        assert!(extra.get("selected_session_mcp_servers").is_none());
     }
 }

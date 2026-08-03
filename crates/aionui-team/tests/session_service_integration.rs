@@ -13,7 +13,7 @@ use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{
     AcpBuildExtra, AcpConfigOptionDto, AcpConfigSelectOptionDto, AddAgentRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, TeamAgentInput, TeamRunSource, WebSocketMessage,
+    GetConfigOptionsResponse, SessionMcpServer, TeamAgentInput, TeamMcpSelection, TeamRunSource, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
@@ -314,6 +314,9 @@ struct FakeConversationPorts {
     repo: Arc<MockConversationRepo>,
     workspace_root: std::path::PathBuf,
     preset_snapshots: Mutex<HashMap<String, FakePresetAssistantSnapshot>>,
+    /// Canned global MCP selection returned by `resolve_global_mcp_selection`;
+    /// `None` means "no MCP configured" (empty selection).
+    global_mcp_selection: Mutex<Option<TeamMcpSelection>>,
     fail_team_temp_create: std::sync::atomic::AtomicBool,
     fail_leader_workspace_patch: std::sync::atomic::AtomicBool,
 }
@@ -333,9 +336,14 @@ impl FakeConversationPorts {
             repo,
             workspace_root,
             preset_snapshots: Mutex::new(HashMap::new()),
+            global_mcp_selection: Mutex::new(None),
             fail_team_temp_create: std::sync::atomic::AtomicBool::new(false),
             fail_leader_workspace_patch: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn set_global_mcp_selection(&self, selection: TeamMcpSelection) {
+        *self.global_mcp_selection.lock().unwrap() = Some(selection);
     }
 
     fn upsert_preset_snapshot(&self, id: &str, snapshot: FakePresetAssistantSnapshot) {
@@ -358,13 +366,18 @@ impl FakeConversationPorts {
         extra["preset_rules"] = serde_json::Value::String(snapshot.rules);
         extra["skills"] =
             serde_json::Value::Array(snapshot.skills.into_iter().map(serde_json::Value::String).collect());
-        extra["mcp_server_ids"] = serde_json::Value::Array(
-            snapshot
-                .mcp_server_ids
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect(),
-        );
+        // MCP defaults from the preset apply ONLY when the request carried no
+        // explicit selection — real create() precedence: the explicit global
+        // selection (even empty) wins over `resolved_defaults.mcp_ids`.
+        if !extra.as_object().is_some_and(|obj| obj.contains_key("mcp_server_ids")) {
+            extra["mcp_server_ids"] = serde_json::Value::Array(
+                snapshot
+                    .mcp_server_ids
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
+        }
     }
 }
 
@@ -394,6 +407,33 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
             });
         let mut extra = request.extra;
         extra["workspace"] = serde_json::Value::String(workspace.clone());
+        // Mirror the real create(): final team snapshot inputs are normalized
+        // into all four persisted fields. An explicit selection
+        // — even an EMPTY one — wins over preset assistant MCP defaults.
+        if extra.get("mcp_server_ids").is_some() || extra.get("session_mcp_servers").is_some() {
+            let ids = serde_json::from_value::<Vec<String>>(extra["mcp_server_ids"].clone()).unwrap_or_default();
+            let session_servers = serde_json::from_value::<Vec<SessionMcpServer>>(extra["session_mcp_servers"].clone())
+                .unwrap_or_default();
+            // Names: repo rows are approximated by their ids in this fake;
+            // inline (builtin) servers carry their real names.
+            let mut names: Vec<String> = ids.clone();
+            for server in &session_servers {
+                if !names.contains(&server.name) {
+                    names.push(server.name.clone());
+                }
+            }
+            for status in extra["mcp_statuses"].as_array().into_iter().flatten() {
+                if let Some(name) = status.get("name").and_then(serde_json::Value::as_str)
+                    && !names.iter().any(|value| value == name)
+                {
+                    names.push(name.to_owned());
+                }
+            }
+            extra["mcp_servers"] = serde_json::json!(names);
+            if extra.get("mcp_statuses").is_none() {
+                extra["mcp_statuses"] = serde_json::json!([]);
+            }
+        }
         self.apply_preset_snapshot(&mut extra);
         self.repo
             .create(&ConversationRow {
@@ -429,6 +469,10 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         }))
+    }
+
+    async fn resolve_global_mcp_selection(&self, _user_id: &str) -> Result<TeamMcpSelection, aionui_team::TeamError> {
+        Ok(self.global_mcp_selection.lock().unwrap().clone().unwrap_or_default())
     }
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, aionui_team::TeamError> {
@@ -3039,7 +3083,15 @@ fn assert_frozen_preset_extra(extra: &serde_json::Value) {
     assert_eq!(extra["preset_context"], serde_json::json!("assistant rule body"));
     assert_eq!(extra["preset_rules"], serde_json::json!("assistant rule body"));
     assert_eq!(extra["skills"], serde_json::json!(["pdf", "cron"]));
-    assert_eq!(extra["mcp_server_ids"], serde_json::json!(["mcp-docs"]));
+    // MCP is NOT part of the frozen preset surface: the explicit global
+    // selection (empty in this fixture) wins over `resolved_defaults.mcp_ids`,
+    // and no request-only `selected_*` fields are introduced.
+    assert_eq!(extra["mcp_server_ids"], serde_json::json!([]));
+    assert_eq!(extra["session_mcp_servers"], serde_json::json!([]));
+    assert_eq!(extra["mcp_servers"], serde_json::json!([]));
+    assert_eq!(extra["mcp_statuses"], serde_json::json!([]));
+    assert!(extra.get("selected_mcp_server_ids").is_none());
+    assert!(extra.get("selected_session_mcp_servers").is_none());
 }
 
 #[tokio::test]
@@ -3089,6 +3141,76 @@ async fn team_preset_assistant_snapshot_is_frozen() {
     assert_frozen_preset_extra(&after_live_change);
 }
 
+#[tokio::test]
+async fn team_global_mcp_selection_wins_over_preset_defaults() {
+    use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
+    let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
+        row: word_creator_definition(),
+    });
+    let (svc, _team_repo, conversation_ports, conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
+        success_factory(),
+        seeded_agent_metadata_repo(),
+        definition_repo,
+        Arc::new(EmptyAssistantOverlayRepo),
+    );
+    // The preset assistant defaults to `mcp-docs`, but the user's global
+    // selection is different (and includes a builtin): the explicit global
+    // selection must win, so the member conversation carries it exactly.
+    conversation_ports.upsert_preset_snapshot(
+        "word-creator",
+        fake_preset_snapshot("assistant rule body", &["pdf", "cron"], &["mcp-docs"]),
+    );
+    conversation_ports.set_global_mcp_selection(TeamMcpSelection {
+        mcp_server_ids: vec!["mcp-global".into()],
+        session_mcp_servers: vec![SessionMcpServer {
+            id: "mcp-chrome".into(),
+            name: "chrome-devtools".into(),
+            transport: SessionMcpTransport::Stdio {
+                command: "/runtime/npx".into(),
+                args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
+                env: Default::default(),
+            },
+        }],
+        mcp_statuses: Vec::new(),
+    });
+
+    let resp = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Global MCP Wins".into(),
+                agents: vec![TeamAgentInput {
+                    name: "Lead".into(),
+                    role: "lead".into(),
+                    backend: Some("claude".into()),
+                    model: "claude-sonnet-4".into(),
+                    assistant_id: Some("word-creator".into()),
+                    conversation_id: None,
+                }],
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+
+    let extra = conv_repo.get_extra(&resp.assistants[0].conversation_id).unwrap();
+    // Rules/skills still frozen from the preset...
+    assert_eq!(extra["preset_rules"], serde_json::json!("assistant rule body"));
+    assert_eq!(extra["skills"], serde_json::json!(["pdf", "cron"]));
+    // ...but MCP comes from the explicit global selection, preset default
+    // `mcp-docs` must NOT leak.
+    assert_eq!(extra["mcp_server_ids"], serde_json::json!(["mcp-global"]));
+    assert_eq!(
+        extra["session_mcp_servers"][0]["name"],
+        serde_json::json!("chrome-devtools")
+    );
+    assert_eq!(
+        extra["mcp_servers"],
+        serde_json::json!(["mcp-global", "chrome-devtools"])
+    );
+    assert!(extra.get("selected_mcp_server_ids").is_none());
+    assert!(extra.get("selected_session_mcp_servers").is_none());
+}
 #[tokio::test]
 async fn spawned_preset_assistant_snapshot_is_frozen() {
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {

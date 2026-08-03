@@ -1045,6 +1045,7 @@ async fn es1_ensure_session() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+// ES-1b: ensure session + team MCP list_assistants projection
 #[tokio::test]
 async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
     let (mut app, services) = build_app_with_mock_agents().await;
@@ -1134,6 +1135,234 @@ async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
     assert_eq!(stop_resp.status(), StatusCode::OK);
 }
 
+// ES-1c: member conversations carry the user's globally enabled MCP snapshot
+// (non-builtin row ids + builtin session servers, e.g. chrome-devtools), and a
+// runtime restart self-heals the snapshot after toggle changes.
+#[tokio::test]
+async fn es1c_team_conversations_carry_global_mcp_snapshot_including_builtin() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let pool = services.database.pool().clone();
+    let user_id = "system_default_user";
+    let now = aionui_common::now_ms() as i64;
+    // Absolute-path stdio command so `ensure_runtime_command` resolves it via
+    // ExplicitPath without touching the managed node runtime.
+    let stdio_command = std::env::current_exe()
+        .expect("test executable path")
+        .to_string_lossy()
+        .to_string();
+
+    // Enabled non-builtin row → repo-id snapshot field.
+    sqlx::query(
+        "INSERT INTO mcp_servers \
+         (id, user_id, name, enabled, transport_type, transport_config, builtin, created_at, updated_at) \
+         VALUES ('mcp-e2e-docs', ?, 'mcp-e2e-docs', 1, 'http', ?, 0, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(r#"{"url":"http://127.0.0.1:9999/mcp"}"#)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed enabled non-builtin mcp");
+    // Enabled builtin row (chrome-devtools shape) → session snapshot field.
+    let stdio_config = serde_json::json!({
+        "command": stdio_command,
+        "args": ["-y", "chrome-devtools-mcp@latest"],
+        "env": {},
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO mcp_servers \
+         (id, user_id, name, enabled, transport_type, transport_config, builtin, created_at, updated_at) \
+         VALUES ('mcp-e2e-chrome', ?, 'chrome-devtools', 1, 'stdio', ?, 1, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(stdio_config)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed enabled builtin mcp");
+    // Disabled row → must stay out of every snapshot field.
+    sqlx::query(
+        "INSERT INTO mcp_servers \
+         (id, user_id, name, enabled, transport_type, transport_config, builtin, created_at, updated_at) \
+         VALUES ('mcp-e2e-off', ?, 'mcp-e2e-off', 0, 'http', ?, 0, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(r#"{"url":"http://127.0.0.1:8888/mcp"}"#)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed disabled mcp");
+    // Enabled but malformed builtin row → warn+skip (never fails the snapshot).
+    sqlx::query(
+        "INSERT INTO mcp_servers \
+         (id, user_id, name, enabled, transport_type, transport_config, builtin, created_at, updated_at) \
+         VALUES ('mcp-e2e-broken', ?, 'broken-builtin', 1, 'stdio', 'not-json', 1, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed malformed builtin mcp");
+    // Reserved coordination name → user row must never enter the snapshot.
+    sqlx::query(
+        "INSERT INTO mcp_servers \
+         (id, user_id, name, enabled, transport_type, transport_config, builtin, created_at, updated_at) \
+         VALUES ('mcp-e2e-reserved', ?, 'aionui-team', 1, 'http', ?, 0, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(r#"{"url":"http://127.0.0.1:7777/mcp"}"#)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed reserved-name mcp");
+
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let lead = &data["assistants"][0];
+    let lead_conversation_id = lead["conversation_id"].as_str().unwrap();
+    let lead_slot_id = lead["slot_id"].as_str().unwrap();
+    let worker_conversation_id = data["assistants"][1]["conversation_id"].as_str().unwrap();
+
+    for conversation_id in [lead_conversation_id, worker_conversation_id] {
+        let extra = conversation_extra(&services, conversation_id).await;
+        assert_eq!(extra["mcp_server_ids"], json!(["mcp-e2e-docs"]), "{conversation_id}");
+        assert_eq!(
+            extra["session_mcp_servers"][0]["name"],
+            json!("chrome-devtools"),
+            "{conversation_id}"
+        );
+        assert_eq!(
+            extra["session_mcp_servers"][0]["transport"]["command"],
+            json!(stdio_command),
+            "{conversation_id}"
+        );
+        assert_eq!(
+            extra["mcp_servers"],
+            json!(["mcp-e2e-docs", "chrome-devtools", "broken-builtin"]),
+            "{conversation_id}"
+        );
+        let statuses = extra["mcp_statuses"].as_array().unwrap();
+        assert_eq!(statuses.len(), 3, "{conversation_id}");
+        assert!(
+            statuses
+                .iter()
+                .any(|status| { status["name"] == json!("broken-builtin") && status["status"] == json!("failed") })
+        );
+        assert!(
+            !extra["mcp_servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == "aionui-team")
+        );
+        // Request-only fields must never leak into the stored row.
+        assert!(extra.get("selected_mcp_server_ids").is_none(), "{conversation_id}");
+        assert!(extra.get("selected_session_mcp_servers").is_none(), "{conversation_id}");
+    }
+
+    // Self-heal: toggle enabled flags, then force a runtime restart; the
+    // refreshed snapshot must drop the disabled row and pick up the new one.
+    sqlx::query("UPDATE mcp_servers SET enabled = 0 WHERE id = 'mcp-e2e-docs'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE mcp_servers SET enabled = 1 WHERE id = 'mcp-e2e-off'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let ensure_req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/session"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let ensure_resp = app.clone().oneshot(ensure_req).await.unwrap();
+    assert_eq!(ensure_resp.status(), StatusCode::OK);
+
+    // The noop agent fixture reports `/tmp/test` as its runtime workspace,
+    // which the first warmup persists and Windows cannot reuse on restart.
+    // Restore an existing path so this test keeps exercising MCP refresh.
+    let valid_workspace = std::env::current_dir()
+        .expect("current workspace")
+        .to_string_lossy()
+        .to_string();
+    services
+        .conversation_service
+        .update_extra(user_id, lead_conversation_id, json!({ "workspace": valid_workspace }))
+        .await
+        .expect("restore valid mock workspace before restart");
+
+    let restart_req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{lead_slot_id}/runtime/restart"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let restart_resp = app.clone().oneshot(restart_req).await.unwrap();
+    let restart_status = restart_resp.status();
+    let restart_body = body_json(restart_resp).await;
+    assert_eq!(
+        restart_status,
+        StatusCode::OK,
+        "member runtime restart should succeed: {restart_body}"
+    );
+    let extra = conversation_extra(&services, lead_conversation_id).await;
+    assert_eq!(extra["mcp_server_ids"], json!(["mcp-e2e-off"]));
+    assert_eq!(extra["session_mcp_servers"][0]["name"], json!("chrome-devtools"));
+    assert_eq!(
+        extra["mcp_servers"],
+        json!(["mcp-e2e-off", "chrome-devtools", "broken-builtin"])
+    );
+    assert_eq!(extra["mcp_statuses"].as_array().unwrap().len(), 3);
+
+    services
+        .conversation_service
+        .update_extra(user_id, lead_conversation_id, json!({ "workspace": valid_workspace }))
+        .await
+        .expect("restore valid mock workspace before second restart");
+
+    // Idempotent: a second restart rewrites the same snapshot — no duplication.
+    let restart_req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{lead_slot_id}/runtime/restart"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let restart_resp = app.oneshot(restart_req).await.unwrap();
+    let restart_status = restart_resp.status();
+    let restart_body = body_json(restart_resp).await;
+    assert_eq!(
+        restart_status,
+        StatusCode::OK,
+        "second member runtime restart should succeed: {restart_body}"
+    );
+    let extra = conversation_extra(&services, lead_conversation_id).await;
+    assert_eq!(extra["mcp_server_ids"], json!(["mcp-e2e-off"]));
+    assert_eq!(extra["session_mcp_servers"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        extra["mcp_servers"],
+        json!(["mcp-e2e-off", "chrome-devtools", "broken-builtin"])
+    );
+}
+
+async fn conversation_extra(services: &aionui_app::AppServices, conversation_id: &str) -> Value {
+    let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let owner = repo.owner_user_id(conversation_id).await.unwrap().unwrap();
+    let row = repo.get(&owner, conversation_id).await.unwrap().unwrap();
+    serde_json::from_str(&row.extra).unwrap()
+}
 // ES-2: Ensure session is idempotent
 #[tokio::test]
 async fn es2_ensure_session_idempotent() {

@@ -264,6 +264,45 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn session_new_payload_contains_team_nonbuiltin_and_builtin_mcp_servers() {
+        let config = AcpBuildExtra {
+            backend: Some("custom-acp".into()),
+            team_mcp_stdio_config: Some(team_cfg()),
+            ..Default::default()
+        };
+        let params = assemble_acp_params(
+            "conv-1".into(),
+            "user-1".into(),
+            WorkspaceInfo {
+                path: "/tmp/workspace".into(),
+                is_custom: false,
+            },
+            test_metadata(),
+            CommandSpec::default(),
+            config,
+            vec![user_stdio("mcp-docs"), user_stdio("chrome-devtools")],
+            None,
+            PathBuf::from("/tmp/data"),
+            false,
+        )
+        .await;
+
+        let request = params.new_session_request();
+        let names = request
+            .mcp_servers
+            .iter()
+            .map(|server| match server {
+                McpServer::Stdio(server) => server.name.as_str(),
+                McpServer::Http(server) => server.name.as_str(),
+                McpServer::Sse(server) => server.name.as_str(),
+                _ => panic!("unexpected MCP transport"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, [TEAM_MCP_SERVER_NAME, "mcp-docs", "chrome-devtools"]);
+    }
+
     /// The pre-fix bug: with no team configured and an empty
     /// user-server list, the payload is empty. This is the *no-fix*
     /// scenario and remains valid (no MCP configured anywhere).

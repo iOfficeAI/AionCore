@@ -276,7 +276,8 @@ pub(crate) mod workspace_harness {
 
     use aionui_ai_agent::{AgentError, IWorkerTaskManager};
     use aionui_api_types::{
-        AcpConfigOptionDto, AcpConfigSelectOptionDto, CreateTeamRequest, GetConfigOptionsResponse, WebSocketMessage,
+        AcpConfigOptionDto, AcpConfigSelectOptionDto, CreateTeamRequest, GetConfigOptionsResponse, SessionMcpServer,
+        WebSocketMessage,
     };
     use aionui_common::{AgentKillReason, AgentType, PaginatedResult, now_ms};
     use aionui_db::models::{
@@ -698,6 +699,34 @@ pub(crate) mod workspace_harness {
                 });
             let mut extra = request.extra;
             extra["workspace"] = serde_json::Value::String(workspace.clone());
+            // Mirror the real create(): final team snapshot inputs are
+            // normalized here into all four persisted fields (empty
+            // arrays are explicit — "no user MCP" wins over preset defaults).
+            if extra.get("mcp_server_ids").is_some() || extra.get("session_mcp_servers").is_some() {
+                let ids = serde_json::from_value::<Vec<String>>(extra["mcp_server_ids"].clone()).unwrap_or_default();
+                let session_servers =
+                    serde_json::from_value::<Vec<SessionMcpServer>>(extra["session_mcp_servers"].clone())
+                        .unwrap_or_default();
+                // Names: repo rows are approximated by their ids in this fake;
+                // inline (builtin) servers carry their real names.
+                let mut names: Vec<String> = ids.clone();
+                for server in &session_servers {
+                    if !names.contains(&server.name) {
+                        names.push(server.name.clone());
+                    }
+                }
+                for status in extra["mcp_statuses"].as_array().into_iter().flatten() {
+                    if let Some(name) = status.get("name").and_then(serde_json::Value::as_str)
+                        && !names.iter().any(|value| value == name)
+                    {
+                        names.push(name.to_owned());
+                    }
+                }
+                extra["mcp_servers"] = serde_json::json!(names);
+                if extra.get("mcp_statuses").is_none() {
+                    extra["mcp_statuses"] = serde_json::json!([]);
+                }
+            }
             let agent_type = request.agent_type.unwrap_or(AgentType::Acp);
             if agent_type == AgentType::Acp {
                 extra["mock_has_acp_session"] = serde_json::Value::Bool(true);

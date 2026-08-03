@@ -5,6 +5,7 @@ use aionui_common::{
 use serde::{Deserialize, Serialize};
 
 use crate::acp::AcpConfigOptionDto;
+use crate::agent_build_extra::SessionMcpServer;
 use crate::chat_file::ChatFileRef;
 
 /// Per-MCP snapshot status stored in `conversation.extra`.
@@ -24,6 +25,26 @@ pub struct ConversationMcpStatus {
     pub status: ConversationMcpStatusKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// Typed runtime MCP snapshot for a conversation, persisted in
+/// `conversation.extra` as the four fields `mcp_server_ids` /
+/// `session_mcp_servers` / `mcp_servers` / `mcp_statuses`.
+///
+/// Shared by `aionui-conversation` (which builds it), `aionui-team` (which
+/// refreshes it on attach) and `aionui-app` (which wires the two), so the team
+/// refresh path never has to reason about raw JSON or raw DB rows.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct McpRuntimeSnapshot {
+    /// Enabled non-builtin MCP row ids (the `mcp_server_ids` extra field).
+    pub mcp_server_ids: Vec<String>,
+    /// Enabled builtin MCP servers in neutral form (the `session_mcp_servers`
+    /// extra field); stdio launch commands are already resolved.
+    pub session_mcp_servers: Vec<SessionMcpServer>,
+    /// Merged display names, deduped by name (the `mcp_servers` extra field).
+    pub mcp_servers: Vec<String>,
+    /// Per-server load status classification (the `mcp_statuses` extra field).
+    pub mcp_statuses: Vec<ConversationMcpStatus>,
 }
 
 // ── Request types ──────────────────────────────────────────────────

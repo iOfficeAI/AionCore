@@ -3,17 +3,41 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::TeamMcpStdioConfig;
 use crate::chat_file::ChatFileRef;
+use crate::{ConversationMcpStatus, SessionMcpServer};
 
 // ---------------------------------------------------------------------------
 // A. Team management — Request DTOs
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// B. Team MCP selection
+// ---------------------------------------------------------------------------
+
+/// The operator's globally enabled MCP servers, ready to freeze into a team
+/// member conversation's final runtime snapshot fields.
+///
+/// Team provisioning resolves this once per team creation and injects it into
+/// every member conversation's `extra`, so the builtin rows (e.g.
+/// `chrome-devtools`) that the generic enabled-set fallback hard-excludes still
+/// reach member sessions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMcpSelection {
+    /// Enabled non-builtin MCP row ids.
+    pub mcp_server_ids: Vec<String>,
+    /// Enabled builtin MCP servers in neutral form (stdio launch commands
+    /// already resolved).
+    pub session_mcp_servers: Vec<SessionMcpServer>,
+    /// Preclassified failures for enabled builtin rows that could not be
+    /// converted into a runtime server. Valid rows are classified per agent
+    /// when the full runtime snapshot is built.
+    pub mcp_statuses: Vec<ConversationMcpStatus>,
+}
 
 /// Input for a single agent when creating a team or adding an agent.
 ///
 /// Each agent gets its own conversation. Create requests must include exactly
 /// one agent with role `lead` or `leader`; that explicit role becomes the team
 /// lead.
-///
 #[derive(Debug, Clone)]
 pub struct TeamAgentInput {
     pub name: String,

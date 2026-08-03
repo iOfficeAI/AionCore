@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::TeamMcpStdioConfig;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionMcpTransport {
     Stdio {
@@ -31,7 +31,7 @@ pub enum SessionMcpTransport {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMcpServer {
     pub id: String,
     pub name: String,

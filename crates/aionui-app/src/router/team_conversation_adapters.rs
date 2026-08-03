@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, GetConfigOptionsResponse};
+use aionui_api_types::{
+    AssistantConversationRequest, CreateConversationRequest, GetConfigOptionsResponse, McpRuntimeSnapshot,
+    TeamMcpSelection,
+};
+use aionui_common::AgentType;
 use aionui_conversation::{
     ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
     ConversationService,
@@ -491,6 +495,37 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError> {
         self.conversation_service
             .create_team_temp_workspace(user_id, team_id)
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn resolve_global_mcp_selection(&self, user_id: &str) -> Result<TeamMcpSelection, TeamError> {
+        self.conversation_service
+            .resolve_global_mcp_selection(user_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn resolve_conversation_mcp_snapshot(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<McpRuntimeSnapshot, TeamError> {
+        let Some(row) = self.conversation_repo.get(user_id, conversation_id).await? else {
+            return Err(TeamError::InvalidRequest(format!(
+                "conversation {conversation_id} not found"
+            )));
+        };
+        let agent_type: AgentType =
+            serde_json::from_value(serde_json::Value::String(row.r#type.clone())).map_err(|e| {
+                TeamError::InvalidRequest(format!(
+                    "conversation {conversation_id} has unparseable type {}: {e}",
+                    row.r#type
+                ))
+            })?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        self.conversation_service
+            .resolve_global_mcp_snapshot(user_id, &agent_type, &extra)
+            .await
             .map_err(map_conversation_update_error)
     }
 

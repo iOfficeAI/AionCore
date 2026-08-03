@@ -20,10 +20,11 @@ use aionui_api_types::{
     ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
     ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
     ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
-    EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    WebSocketMessage, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot,
+    MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
+    SendMessageResponse, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection,
+    TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
+    assistant_avatar_response_value, assistant_avatar_response_value_with_version,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -1151,12 +1152,13 @@ impl ConversationService {
             );
         }
 
+        let is_team_conversation = extra.get("teamId").is_some();
         let selected_mcp_server_ids = match extra.as_object_mut() {
             Some(obj) => {
-                let has_selection = obj.contains_key("selected_mcp_server_ids");
-                let ids = take_string_array(obj, &["selected_mcp_server_ids"]);
-                if has_selection {
-                    Some(ids)
+                if obj.contains_key("selected_mcp_server_ids") {
+                    Some(take_string_array(obj, &["selected_mcp_server_ids"]))
+                } else if is_team_conversation && obj.contains_key("mcp_server_ids") {
+                    Some(take_string_array(obj, &["mcp_server_ids"]))
                 } else {
                     assistant_snapshot
                         .as_ref()
@@ -1167,94 +1169,77 @@ impl ConversationService {
             None => None,
         };
         let selected_session_mcp_servers = match extra.as_object_mut() {
-            Some(obj) => match obj.remove("selected_session_mcp_servers") {
+            Some(obj) => match obj.remove("selected_session_mcp_servers").or_else(|| {
+                (is_team_conversation)
+                    .then(|| obj.remove("session_mcp_servers"))
+                    .flatten()
+            }) {
                 Some(value) => Some(serde_json::from_value::<Vec<SessionMcpServer>>(value).map_err(|e| {
                     ConversationError::BadRequest {
-                        reason: format!("Invalid selected_session_mcp_servers: {e}"),
+                        reason: format!("Invalid session MCP snapshot: {e}"),
                     }
                 })?),
                 None => None,
             },
             None => None,
         };
+        let selected_mcp_statuses = if is_team_conversation {
+            match extra.as_object_mut().and_then(|obj| obj.remove("mcp_statuses")) {
+                Some(value) => serde_json::from_value::<Vec<ConversationMcpStatus>>(value).map_err(|e| {
+                    ConversationError::BadRequest {
+                        reason: format!("Invalid MCP status snapshot: {e}"),
+                    }
+                })?,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
 
-        let mcp_support = self
-            .resolve_mcp_support_policy(user_id, &effective_type, &extra)
+        let mcp_snapshot = self
+            .build_runtime_mcp_snapshot(
+                user_id,
+                selected_mcp_server_ids.as_deref(),
+                selected_session_mcp_servers.as_deref().unwrap_or(&[]),
+                &selected_mcp_statuses,
+                &effective_type,
+                &extra,
+            )
             .await?;
-        let mut selected_row_ids: Vec<String> = Vec::new();
-        let mut selected_mcp_names: Vec<String> = Vec::new();
-        let mut selected_mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
-        let mut seen_mcp_names = HashSet::new();
-        let mut status_index_by_name: HashMap<String, usize> = HashMap::new();
-        let repo = self
-            .mcp_server_repo
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned());
-        if let Some(repo) = repo {
-            let rows = match selected_mcp_server_ids.as_ref() {
-                Some(ids) => repo
-                    .list_by_ids_any(user_id, ids)
-                    .await
-                    .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?,
-                None => repo
-                    .list(user_id)
-                    .await
-                    .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?,
-            };
-            let selected_rows = rows
-                .into_iter()
-                .filter(|row| !row.builtin)
-                .filter(|row| match selected_mcp_server_ids.as_ref() {
-                    Some(ids) => ids.iter().any(|id| id == &row.id),
-                    None => row.enabled,
-                })
-                .collect::<Vec<_>>();
-            selected_row_ids = selected_rows.iter().map(|row| row.id.clone()).collect();
-            for row in &selected_rows {
-                if seen_mcp_names.insert(row.name.clone()) {
-                    selected_mcp_names.push(row.name.clone());
-                }
-                upsert_conversation_mcp_status(
-                    &mut selected_mcp_statuses,
-                    &mut status_index_by_name,
-                    classify_repo_mcp_status(row, mcp_support),
-                );
-            }
-        }
-
-        if let Some(session_servers) = selected_session_mcp_servers.as_ref() {
-            for server in session_servers {
-                if seen_mcp_names.insert(server.name.clone()) {
-                    selected_mcp_names.push(server.name.clone());
-                }
-                upsert_conversation_mcp_status(
-                    &mut selected_mcp_statuses,
-                    &mut status_index_by_name,
-                    classify_session_mcp_status(server, mcp_support),
-                );
-            }
-        }
 
         if let Some(obj) = extra.as_object_mut() {
             obj.insert(
                 "mcp_server_ids".to_owned(),
-                serde_json::Value::Array(selected_row_ids.into_iter().map(serde_json::Value::String).collect()),
+                serde_json::Value::Array(
+                    mcp_snapshot
+                        .mcp_server_ids
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
             );
             obj.insert(
                 "mcp_servers".to_owned(),
-                serde_json::Value::Array(selected_mcp_names.into_iter().map(serde_json::Value::String).collect()),
+                serde_json::Value::Array(
+                    mcp_snapshot
+                        .mcp_servers
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
             );
             obj.insert(
                 "mcp_statuses".to_owned(),
-                serde_json::to_value(&selected_mcp_statuses).map_err(|e| {
+                serde_json::to_value(&mcp_snapshot.mcp_statuses).map_err(|e| {
                     ConversationError::internal(format!("Failed to serialize MCP status snapshot: {e}"))
                 })?,
             );
-            if let Some(session_servers) = selected_session_mcp_servers.as_ref() {
+            if selected_session_mcp_servers.is_some() {
                 obj.insert(
                     "session_mcp_servers".to_owned(),
-                    serde_json::to_value(session_servers).map_err(|e| {
+                    serde_json::to_value(&mcp_snapshot.session_mcp_servers).map_err(|e| {
                         ConversationError::internal(format!("Failed to serialize session MCP snapshot: {e}"))
                     })?,
                 );
@@ -4169,6 +4154,176 @@ async fn native_skills_dirs(
 }
 
 impl ConversationService {
+    /// Build the typed four-field runtime MCP snapshot from explicit request
+    /// selections (or the global enabled fallback when `selected_ids` is
+    /// `None`), deduped by name and classified against the agent's transport
+    /// support. Shared by `create()` and the team refresh path so both persist
+    /// the exact same snapshot shape.
+    async fn build_runtime_mcp_snapshot(
+        &self,
+        user_id: &str,
+        selected_ids: Option<&[String]>,
+        session_servers: &[SessionMcpServer],
+        additional_statuses: &[ConversationMcpStatus],
+        agent_type: &AgentType,
+        extra: &serde_json::Value,
+    ) -> Result<McpRuntimeSnapshot, ConversationError> {
+        let mcp_support = self.resolve_mcp_support_policy(user_id, agent_type, extra).await?;
+        let mut mcp_server_ids: Vec<String> = Vec::new();
+        let mut mcp_servers: Vec<String> = Vec::new();
+        let mut mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
+        let mut seen_mcp_names = HashSet::new();
+        let mut status_index_by_name: HashMap<String, usize> = HashMap::new();
+        let repo = self
+            .mcp_server_repo
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        if let Some(repo) = repo {
+            let rows = match selected_ids {
+                Some(ids) => repo
+                    .list_by_ids_any(user_id, ids)
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?,
+                None => repo
+                    .list(user_id)
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?,
+            };
+            let selected_rows = rows
+                .into_iter()
+                .filter(|row| !row.builtin && row.name != TEAM_MCP_SERVER_NAME)
+                .filter(|row| match selected_ids {
+                    Some(ids) => ids.iter().any(|id| id == &row.id),
+                    None => row.enabled,
+                })
+                .collect::<Vec<_>>();
+            mcp_server_ids = selected_rows.iter().map(|row| row.id.clone()).collect();
+            for row in &selected_rows {
+                if seen_mcp_names.insert(row.name.clone()) {
+                    mcp_servers.push(row.name.clone());
+                }
+                upsert_conversation_mcp_status(
+                    &mut mcp_statuses,
+                    &mut status_index_by_name,
+                    classify_repo_mcp_status(row, mcp_support),
+                );
+            }
+        }
+        let mut selected_session_servers = Vec::with_capacity(session_servers.len());
+        for server in session_servers {
+            if server.name == TEAM_MCP_SERVER_NAME {
+                continue;
+            }
+            selected_session_servers.push(server.clone());
+            if seen_mcp_names.insert(server.name.clone()) {
+                mcp_servers.push(server.name.clone());
+            }
+            upsert_conversation_mcp_status(
+                &mut mcp_statuses,
+                &mut status_index_by_name,
+                classify_session_mcp_status(server, mcp_support),
+            );
+        }
+        for status in additional_statuses {
+            if status.name == TEAM_MCP_SERVER_NAME {
+                continue;
+            }
+            if seen_mcp_names.insert(status.name.clone()) {
+                mcp_servers.push(status.name.clone());
+            }
+            upsert_conversation_mcp_status(&mut mcp_statuses, &mut status_index_by_name, status.clone());
+        }
+        Ok(McpRuntimeSnapshot {
+            mcp_server_ids,
+            session_mcp_servers: selected_session_servers,
+            mcp_servers,
+            mcp_statuses,
+        })
+    }
+
+    /// Resolve the operator's globally enabled MCP servers into final snapshot
+    /// inputs: enabled non-builtin row ids + enabled
+    /// builtin rows (e.g. `chrome-devtools`) converted to neutral session
+    /// servers with stdio launch commands resolved.
+    ///
+    /// A repo read failure is an error — never a silently empty set — so team
+    /// provisioning can abort instead of dropping every user MCP.
+    pub async fn resolve_global_mcp_selection(&self, user_id: &str) -> Result<TeamMcpSelection, ConversationError> {
+        let mut mcp_server_ids: Vec<String> = Vec::new();
+        let mut session_mcp_servers: Vec<SessionMcpServer> = Vec::new();
+        let mut mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
+        let repo = {
+            let repo_guard = self
+                .mcp_server_repo
+                .read()
+                .map_err(|_| ConversationError::internal("MCP server repository lock is poisoned"))?;
+            repo_guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| ConversationError::internal("MCP server repository is unavailable"))?
+        };
+        let rows = repo
+            .list(user_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?;
+        for row in rows {
+            if !row.enabled || row.name == TEAM_MCP_SERVER_NAME {
+                continue;
+            }
+            if row.builtin {
+                match aionui_ai_agent::mcp_resolve::row_to_session_mcp_server(&row).await {
+                    Ok(server) => session_mcp_servers.push(server),
+                    Err(err) => {
+                        mcp_statuses.push(ConversationMcpStatus {
+                            id: row.id.clone(),
+                            name: row.name.clone(),
+                            status: ConversationMcpStatusKind::Failed,
+                            reason: Some(err.clone()),
+                        });
+                        warn!(
+                            user_id,
+                            server_id = %row.id,
+                            server_name = %row.name,
+                            error = %err,
+                            "user_mcp: malformed builtin row skipped from global snapshot"
+                        );
+                    }
+                }
+            } else {
+                mcp_server_ids.push(row.id);
+            }
+        }
+        Ok(TeamMcpSelection {
+            mcp_server_ids,
+            session_mcp_servers,
+            mcp_statuses,
+        })
+    }
+
+    /// Resolve the operator's globally enabled MCP servers into a full typed
+    /// runtime snapshot (four fields) classified against the given agent type
+    /// and `extra`. Used by the team attach path to refresh the persisted
+    /// snapshot before rebuilding a member session. Read-only — the caller
+    /// persists via `update_extra`.
+    pub async fn resolve_global_mcp_snapshot(
+        &self,
+        user_id: &str,
+        agent_type: &AgentType,
+        extra: &serde_json::Value,
+    ) -> Result<McpRuntimeSnapshot, ConversationError> {
+        let selection = self.resolve_global_mcp_selection(user_id).await?;
+        self.build_runtime_mcp_snapshot(
+            user_id,
+            Some(&selection.mcp_server_ids),
+            &selection.session_mcp_servers,
+            &selection.mcp_statuses,
+            agent_type,
+            extra,
+        )
+        .await
+    }
+
     async fn resolve_mcp_support_policy(
         &self,
         user_id: &str,
