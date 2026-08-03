@@ -855,18 +855,56 @@ async fn live_claude_workflow_progress_streams() {
         "[wf-progress] the roster must stream and CHANGE while the workflow runs; saw {} distinct snapshot(s)",
         rosters.len()
     );
+    // claude's OWN `tool_use` frame for the Workflow call is also a tool_call
+    // named "Workflow" — it carries the script but no headline. The progress
+    // projections are the ones with a description, so filter to those before
+    // asserting anything about headlines.
+    let progress_cards: Vec<&Value> = cards
+        .iter()
+        .filter(|c| c["description"].as_str().is_some_and(|d| !d.is_empty()))
+        .collect();
     assert!(
-        !cards.is_empty(),
-        "[wf-progress] the container row must be forwarded as a tool_call named Workflow"
+        !progress_cards.is_empty(),
+        "[wf-progress] the container row must be re-emitted with a live headline; saw only {} raw tool_call frame(s)",
+        cards.len()
     );
-    // Every container frame carries the headline and keeps its identity fields —
-    // losing `name`/`args` would blank the persisted row.
-    for card in &cards {
-        assert!(
-            card["description"].as_str().is_some_and(|d| !d.is_empty()),
-            "[wf-progress] container row must carry a headline: {card}"
-        );
+    // Identity fields must survive every projection — losing `name`/`args` would
+    // blank the persisted row (the DB merges with JSON merge-patch).
+    for card in &progress_cards {
         assert_eq!(card["name"], "Workflow", "[wf-progress] name must survive: {card}");
+        assert!(
+            card["args"]["script"].is_string(),
+            "[wf-progress] args must be re-sent or merge-patch deletes them: {card}"
+        );
+    }
+
+    // Show what the user would actually see, so the rendering can be judged from
+    // a real run rather than a unit fixture.
+    if let Some(head) = progress_cards.last() {
+        println!(
+            "\n[wf-progress] ── container row ──\n  ▸ {}   {}",
+            head["name"].as_str().unwrap_or(""),
+            head["description"].as_str().unwrap_or("")
+        );
+        if let Some(out) = head["output"].as_str() {
+            println!("[wf-progress] ── expanded ──");
+            for line in out.lines() {
+                println!("  {line}");
+            }
+        }
+    }
+    if let Some(final_roster) = rosters.last()
+        && let Ok(rows) = serde_json::from_str::<Vec<Value>>(final_roster)
+    {
+        println!("[wf-progress] ── agent rows ──");
+        for r in rows {
+            println!(
+                "  {:<10} {:<14} {}",
+                r["status"].as_str().unwrap_or("?"),
+                r["name"].as_str().unwrap_or("?"),
+                r["description"].as_str().unwrap_or("")
+            );
+        }
     }
 
     let last = rosters.last().unwrap();
