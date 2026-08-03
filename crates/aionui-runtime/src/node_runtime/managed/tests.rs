@@ -52,7 +52,9 @@ fn classify_error_detects_bundled_node_runtime_missing() {
 fn transient_classifier_matches_only_whitelist() {
     assert!(is_transient_activation_io_error(&IoError::from(ErrorKind::Interrupted)));
     assert!(!is_transient_activation_io_error(&IoError::from(ErrorKind::NotFound)));
-    assert!(!is_transient_activation_io_error(&IoError::from(ErrorKind::PermissionDenied)));
+    assert!(!is_transient_activation_io_error(&IoError::from(
+        ErrorKind::PermissionDenied
+    )));
     #[cfg(windows)]
     {
         assert!(is_transient_activation_io_error(&IoError::from_raw_os_error(1450)));
@@ -107,7 +109,11 @@ fn activation_copy_backoff_schedule_is_local_specific() {
     assert_eq!(MANAGED_NODE_ACTIVATION_COPY_ATTEMPTS, 3);
     assert_eq!(
         MANAGED_NODE_ACTIVATION_COPY_BACKOFFS,
-        [Duration::from_millis(250), Duration::from_millis(500), Duration::from_millis(1000)]
+        [
+            Duration::from_millis(250),
+            Duration::from_millis(500),
+            Duration::from_millis(1000)
+        ]
     );
 }
 
