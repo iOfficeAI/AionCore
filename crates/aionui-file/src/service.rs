@@ -9,7 +9,7 @@ use ignore::WalkBuilder;
 use tracing::warn;
 
 use crate::error::FileError;
-use aionui_api_types::WebSocketMessage;
+use aionui_api_types::{ContentEncoding, WebSocketMessage};
 use aionui_realtime::EventBroadcaster;
 
 use crate::path_safety::{
@@ -404,6 +404,26 @@ fn get_image_base64_sync(path: &Path) -> Result<String, FileError> {
     Ok(format!("data:{mime};base64,{encoded}"))
 }
 
+/// Encode a file's content for the `/api/fs/content` endpoint per `encoding`.
+/// `Utf8` → text (errors on non-UTF-8); `Base64` → raw bytes base64 (no prefix);
+/// `DataUrl` → `data:<mime>;base64,<...>`. The 256 MB read cap applies to all.
+fn read_resolved_content_sync(path: &Path, encoding: ContentEncoding) -> Result<String, FileError> {
+    match encoding {
+        ContentEncoding::Utf8 => {
+            read_file_sync(path)?.ok_or_else(|| FileError::NotFound(format!("file not found: {}", path.display())))
+        }
+        ContentEncoding::Base64 => {
+            if validate_file_for_read(path)?.is_none() {
+                return Err(FileError::NotFound(format!("file not found: {}", path.display())));
+            }
+            let bytes = std::fs::read(path)
+                .map_err(|e| FileError::Internal(format!("cannot read file '{}': {e}", path.display())))?;
+            Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+        ContentEncoding::DataUrl => get_image_base64_sync(path),
+    }
+}
+
 /// Build a placeholder SVG Data URL for failed remote image fetches.
 fn placeholder_svg_data_url() -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(PLACEHOLDER_SVG);
@@ -443,6 +463,41 @@ fn validate_remote_image_url(raw_url: &str) -> Result<reqwest::Url, String> {
 
 #[async_trait::async_trait]
 impl crate::traits::IFileService for FileService {
+    // -- Content endpoint (pre-resolved absolute paths) --
+    //
+    // These operate on a path already resolved + containment-checked upstream by
+    // `ProjectService::resolve_chat_file_ref` (per-variant guards). They do NOT
+    // re-apply the `allowed_roots` sandbox — otherwise a `Local` host-picker file
+    // (legitimately outside any workspace) would be rejected. Mirrors the
+    // `/api/fs/reveal` pattern: resolve the identity, then operate on the path.
+
+    async fn read_resolved_content(
+        &self,
+        absolute_path: &Path,
+        encoding: ContentEncoding,
+    ) -> Result<String, FileError> {
+        let path = absolute_path.to_path_buf();
+        tokio::task::spawn_blocking(move || read_resolved_content_sync(&path, encoding))
+            .await
+            .map_err(|e| FileError::Internal(format!("read content task failed: {e}")))?
+    }
+
+    async fn write_resolved_content(&self, absolute_path: &Path, data: &[u8]) -> Result<(), FileError> {
+        let path = absolute_path.to_path_buf();
+        let data = data.to_vec();
+        tokio::task::spawn_blocking(move || write_file_sync(&path, &data))
+            .await
+            .map_err(|e| FileError::Internal(format!("write content task failed: {e}")))??;
+        Ok(())
+    }
+
+    async fn resolved_metadata(&self, absolute_path: &Path) -> Result<FileMetadata, FileError> {
+        let path = absolute_path.to_path_buf();
+        tokio::task::spawn_blocking(move || get_file_metadata_sync(&path))
+            .await
+            .map_err(|e| FileError::Internal(format!("metadata task failed: {e}")))?
+    }
+
     async fn get_files_by_dir(&self, dir: &str, root: &str) -> Result<Vec<DirOrFile>, FileError> {
         let roots = self.allowed_roots_refs();
         let extra_root = Path::new(root);

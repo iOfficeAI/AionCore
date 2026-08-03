@@ -1,6 +1,53 @@
 use aionui_common::FileChangeOperation;
 use serde::{Deserialize, Serialize};
 
+use crate::chat_file::ChatFileRef;
+
+// ---------------------------------------------------------------------------
+// Content endpoint (ChatFileRef identity) — Request DTOs
+// ---------------------------------------------------------------------------
+
+/// How `POST /api/fs/content` encodes the returned file content.
+///
+/// Mirrors the WS `fs/read` encoding split: `utf8` for text, `base64`/`dataurl`
+/// for binary (dataurl prepends a guessed `data:<mime>;base64,` prefix).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentEncoding {
+    /// UTF-8 text (fails on non-UTF-8 input); returned as the raw string.
+    #[default]
+    Utf8,
+    /// Raw bytes, base64-encoded, no data-URL prefix.
+    Base64,
+    /// Base64 data URL with a guessed MIME type: `data:<mime>;base64,<...>`.
+    DataUrl,
+}
+
+/// Request body for `POST /api/fs/content` — read a file addressed by
+/// [`ChatFileRef`] identity (collapses the old `read` + `image-base64`).
+#[derive(Debug, Deserialize)]
+pub struct ReadContentRequest {
+    pub file: ChatFileRef,
+    #[serde(default)]
+    pub encoding: ContentEncoding,
+}
+
+/// Request body for `PUT /api/fs/content` — write a file addressed by
+/// [`ChatFileRef`] identity. Optimistic-concurrency `If-Match` (last-modified
+/// ms) travels in the request header, not this body.
+#[derive(Debug, Deserialize)]
+pub struct WriteContentRequest {
+    pub file: ChatFileRef,
+    pub data: String,
+}
+
+/// Request body for `POST /api/fs/content/metadata` — metadata for a file
+/// addressed by [`ChatFileRef`] identity.
+#[derive(Debug, Deserialize)]
+pub struct ContentMetadataRequest {
+    pub file: ChatFileRef,
+}
+
 // ---------------------------------------------------------------------------
 // A. Core file operations — Request DTOs
 // ---------------------------------------------------------------------------

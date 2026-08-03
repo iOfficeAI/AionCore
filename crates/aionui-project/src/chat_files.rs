@@ -45,7 +45,10 @@ impl ProjectService {
     ) -> Result<ResolvedChatMessage, ProjectError> {
         let mut paths = Vec::with_capacity(files.len());
         for file in files {
-            paths.push(self.resolve_chat_file_ref(user_id, file, upload_root).await?);
+            paths.push(
+                self.resolve_chat_file_ref(user_id, file, upload_root, FileOp::Read)
+                    .await?,
+            );
         }
 
         let content = if paths.is_empty() {
@@ -61,16 +64,21 @@ impl ProjectService {
     /// The per-ref identity→path core shared by [`resolve_chat_message`](Self::resolve_chat_message)
     /// (send boundary) and the preview content endpoint (`aionui-file`, cross-crate — hence `pub`).
     /// Guards differ by variant:
-    /// - `Project` → [`resolve_reference`](Self::resolve_reference) with `op = Read` (lexical +
-    ///   realpath containment); must exist (file or folder).
+    /// - `Project` → [`resolve_reference`](Self::resolve_reference) with the caller's `op` (lexical +
+    ///   realpath containment; read paths pass `Read`, the write endpoint passes `Write`); must exist
+    ///   (file or folder).
     /// - `Upload` → an existing regular file under the managed `upload_root` (D2 invariant).
     /// - `Local` → a canonicalized existing regular file; **no sandbox** (the host picker that
     ///   produced it already exposes the whole filesystem).
+    ///
+    /// `op` only affects the `Project` arm's containment mode; `Upload`/`Local` are path-based and
+    /// identical regardless of op.
     pub async fn resolve_chat_file_ref(
         &self,
         user_id: &str,
         file: &ChatFileRef,
         upload_root: &Path,
+        op: FileOp,
     ) -> Result<String, ProjectError> {
         match file {
             ChatFileRef::Project { pe_id, relative_path } => {
@@ -80,7 +88,7 @@ impl ProjectService {
                         ReferenceInput {
                             pe_id: pe_id.clone(),
                             relative_path: relative_path.clone(),
-                            op: FileOp::Read,
+                            op,
                         },
                     )
                     .await?;
