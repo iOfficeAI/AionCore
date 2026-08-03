@@ -64,8 +64,8 @@ pub struct BuiltinAssistant {
     #[serde(default)]
     pub sort_order: i32,
     /// Whether this official assistant is enabled by default when a user has
-    /// no overlay for it. Only the butler ships enabled; others default off so
-    /// they don't crowd the user's selection lists. Defaults to false.
+    /// no overlay for it. Most specialized assistants default off so they do
+    /// not crowd the user's selection lists. Defaults to false.
     #[serde(default)]
     pub default_enabled: bool,
 }
@@ -341,6 +341,28 @@ mod tests {
         // Sanity-check a couple of known ids from the committed manifest.
         assert!(reg.has("word-creator"));
         assert!(reg.has("cowork"));
+    }
+
+    #[test]
+    fn embedded_lark_work_assistant_is_enabled_with_lark_skill() {
+        let reg = BuiltinAssistantRegistry::load_embedded();
+        let assistant = reg
+            .get("lark-work-assistant")
+            .expect("embedded Lark work assistant should exist");
+
+        assert!(assistant.default_enabled);
+        assert_eq!(assistant.sort_order, 5);
+        assert_eq!(assistant.agent_ref, "aionrs");
+        assert_eq!(assistant.enabled_skills, ["lark"]);
+        assert_eq!(
+            assistant.name_i18n.get("zh-CN").map(String::as_str),
+            Some("飞书工作助手")
+        );
+        let rule = reg
+            .rule_bytes("lark-work-assistant", "zh-CN")
+            .expect("embedded Lark work assistant rule should exist");
+        let rule = String::from_utf8(rule).expect("Lark work assistant rule should be UTF-8");
+        assert!(rule.contains("`lark` skill"));
     }
 
     #[test]

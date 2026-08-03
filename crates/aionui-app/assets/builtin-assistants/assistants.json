@@ -2,6 +2,66 @@
   "version": "1.0.0",
   "assistants": [
     {
+      "id": "lark-work-assistant",
+      "sort_order": 5,
+      "default_enabled": true,
+      "name": "Lark Work Assistant",
+      "name_i18n": {
+        "en-US": "Lark Work Assistant",
+        "zh-CN": "飞书工作助手",
+        "ru-RU": "Рабочий помощник Lark",
+        "uk-UA": "Робочий помічник Lark"
+      },
+      "description": "Manage everyday work in Lark/Feishu with Lark CLI: chats, calendars, meetings, Docs, Drive, Sheets, Base, tasks, mail, Wiki, approvals, attendance, OKRs, and more.",
+      "description_i18n": {
+        "en-US": "Manage everyday work in Lark/Feishu with Lark CLI: chats, calendars, meetings, Docs, Drive, Sheets, Base, tasks, mail, Wiki, approvals, attendance, OKRs, and more.",
+        "zh-CN": "通过 Lark CLI 管理飞书日常工作：消息与群聊、日历与会议、文档、云盘、表格、多维表格、任务、邮件、知识库、审批、考勤、OKR 等。",
+        "ru-RU": "Управляйте повседневной работой в Lark/Feishu через Lark CLI: чатами, календарями, встречами, документами, Диском, таблицами, Base, задачами, почтой, Wiki, согласованиями, учётом рабочего времени, OKR и многим другим.",
+        "uk-UA": "Керуйте щоденною роботою в Lark/Feishu через Lark CLI: чатами, календарями, зустрічами, документами, Диском, таблицями, Base, завданнями, поштою, Wiki, погодженнями, обліком робочого часу, OKR тощо."
+      },
+      "avatar": "🪽",
+      "agent_ref": "aionrs",
+      "enabled_skills": [
+        "lark"
+      ],
+      "custom_skill_names": [],
+      "disabled_builtin_skills": [],
+      "rule_file": "rules/lark-work-assistant.{locale}.md",
+      "prompts": [
+        "Review my Lark calendar for today and summarize the schedule and preparation items",
+        "Find the latest Lark Docs about this project and summarize the key updates",
+        "Review my Lark tasks and help me prioritize today's work",
+        "Draft a Lark message for my team and ask me to confirm before sending it"
+      ],
+      "prompts_i18n": {
+        "en-US": [
+          "Review my Lark calendar for today and summarize the schedule and preparation items",
+          "Find the latest Lark Docs about this project and summarize the key updates",
+          "Review my Lark tasks and help me prioritize today's work",
+          "Draft a Lark message for my team and ask me to confirm before sending it"
+        ],
+        "zh-CN": [
+          "查看我今天的飞书日程，汇总安排和需要提前准备的事项",
+          "查找飞书中与这个项目相关的最新文档，并总结关键进展",
+          "查看我的飞书任务，帮我安排今天的工作优先级",
+          "帮我起草一条发给团队的飞书消息，发送前让我确认"
+        ],
+        "ru-RU": [
+          "Просмотри мой календарь Lark на сегодня и кратко изложи расписание и пункты подготовки",
+          "Найди последние документы Lark по этому проекту и кратко изложи ключевые обновления",
+          "Просмотри мои задачи Lark и помоги расставить приоритеты на сегодня",
+          "Подготовь сообщение для моей команды в Lark и попроси подтверждение перед отправкой"
+        ],
+        "uk-UA": [
+          "Переглянь мій календар Lark на сьогодні та підсумуй розклад і те, що потрібно підготувати",
+          "Знайди останні документи Lark щодо цього проєкту та підсумуй ключові оновлення",
+          "Переглянь мої завдання Lark і допоможи визначити пріоритети на сьогодні",
+          "Підготуй повідомлення для моєї команди в Lark і попроси підтвердження перед надсиланням"
+        ]
+      },
+      "models": []
+    },
+    {
       "id": "word-creator",
       "sort_order": 10,
       "default_enabled": false,

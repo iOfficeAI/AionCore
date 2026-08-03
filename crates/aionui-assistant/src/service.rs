@@ -2477,8 +2477,8 @@ impl AssistantService {
     /// Manifest-owned listing defaults for a builtin assistant.
     ///
     /// Official assistants cannot be reordered by users, so their `sort_order`
-    /// is always the manifest value (never an overlay). Their default `enabled`
-    /// (butler on, others off) applies only when the user has no overlay.
+    /// is always the manifest value (never an overlay). Their manifest default
+    /// `enabled` value applies only when the user has no overlay.
     /// Returns `(sort_order, default_enabled)`; `None` for non-builtins.
     fn builtin_listing_default(&self, definition: &AssistantDefinitionRow) -> Option<(i32, bool)> {
         if definition.source != "builtin" {
@@ -2520,8 +2520,8 @@ impl AssistantService {
             description_i18n: decode_str_map(Some(definition.description_i18n.as_str()))?,
             avatar: self.avatar_display_value(user_id, definition),
             // For builtins: enabled = overlay if the user has one, else the
-            // manifest default (butler on, others off). sort_order = always the
-            // manifest value (users can't reorder official assistants).
+            // manifest default. sort_order = always the manifest value (users
+            // can't reorder official assistants).
             enabled: match state {
                 Some(row) => row.enabled,
                 None => builtin_default.map(|(_, en)| en).unwrap_or(true),
