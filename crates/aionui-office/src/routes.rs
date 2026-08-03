@@ -252,6 +252,14 @@ fn file_error_to_api_error(error: FileError) -> ApiError {
         },
         FileError::NotFound(message) => ApiError::NotFound(message),
         FileError::Internal(message) => ApiError::Internal(message),
+        // Not reachable from office path-validation, but the mapping must be
+        // total; mirror the file crate's stable unavailable contract.
+        FileError::WatchUnavailable { errno } => ApiError::coded(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "FILE_WATCH_UNAVAILABLE",
+            "File watching is unavailable on this system.",
+            errno.map(|n| serde_json::json!({ "errno": n })),
+        ),
     }
 }
 

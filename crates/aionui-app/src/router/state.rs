@@ -473,7 +473,9 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
     let browse_roots = BrowseRoots::new();
     let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
-    let watch_service = Arc::new(FileWatchService::new(broadcaster).map_err(file_watch_init_error)?);
+    // Non-fatal: watcher creation failure (e.g. inotify limit) yields a disabled
+    // watch service, never a bootstrap abort. See ELECTRON-2PM.
+    let watch_service = Arc::new(FileWatchService::new(broadcaster));
     let snapshot_service = Arc::new(SnapshotService::new());
     Ok(FileRouterState {
         file_service,
@@ -483,10 +485,6 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         allowed_roots,
         browse_roots,
     })
-}
-
-fn file_watch_init_error(error: aionui_file::FileError) -> RouterBuildError {
-    RouterBuildError::new("router.file_watch", "failed to initialize file watch service").with_source(error)
 }
 
 /// Build the project control-plane router state from application services.
@@ -1363,12 +1361,10 @@ mod tests {
         services.database.close().await;
     }
 
-    #[test]
-    fn file_watch_init_error_maps_to_bootstrap_server_failed() {
-        let err = file_watch_init_error(aionui_file::FileError::Internal("watch backend unavailable".into()));
-
-        assert_eq!(err.stage(), "router.file_watch");
-        assert_eq!(err.message(), "failed to initialize file watch service");
-        assert!(!err.to_string().contains("watch backend unavailable"));
-    }
+    // NOTE (ELECTRON-2PM): the former `file_watch_init_error_maps_to_bootstrap_server_failed`
+    // test was removed intentionally. File-watch init is no longer a fatal
+    // bootstrap stage — `FileWatchService::new` is infallible and degrades to a
+    // disabled state, so there is no error-to-BOOTSTRAP_SERVER_FAILED mapping to
+    // assert here. Disabled-state behavior is covered in `aionui-file`
+    // (watch_service disabled-path tests + the `FILE_WATCH_UNAVAILABLE` mapping).
 }
