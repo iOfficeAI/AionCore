@@ -108,7 +108,7 @@ impl Translator {
                 // hooks.json shape: three refused steps, terminal SUCCESS,
                 // "已成功创建 random_data_11-46.json", and an empty workspace.
                 //
-                // Emitted BEFORE the result, this warning was pushed above the
+                // Emitted BEFORE the result, this notice was pushed above the
                 // claim it contradicts and the false success was the last thing
                 // the user read (measured: 2 ms apart, warning first). The
                 // correction has to have the last word.
@@ -126,10 +126,16 @@ impl Translator {
                 // unqualified.
                 if !is_error && failed > 0 {
                     out.push(SessionEvent::Notice {
-                        level: NoticeLevel::Warning,
+                        // Info, not Warning. The common trigger is a refusal the
+                        // user made on purpose and already understands, so an
+                        // alarm-styled card on every such turn is noise that
+                        // trains them to dismiss it — and this notice is only
+                        // worth anything if it is still read on the turn where
+                        // agy fabricates a result.
+                        level: NoticeLevel::Info,
                         message: format!(
-                            "{failed} step{} failed during this turn and did NOT take effect. \
-                             agy still ends such turns as successful, so check the result itself rather than the reply.",
+                            "{failed} step{} failed and did NOT take effect. agy ends such turns as successful, \
+                             so check the result rather than the reply.",
                             if failed == 1 { "" } else { "s" }
                         ),
                     });
@@ -514,7 +520,7 @@ mod tests {
                 _ => None,
             })
             .expect("a turn that refused work must not read as plain success");
-        assert_eq!(*notice.0, NoticeLevel::Warning);
+        assert_eq!(*notice.0, NoticeLevel::Info);
         assert!(notice.1.contains('2'), "the count is the whole signal: {}", notice.1);
         // The stream shows which STEPS failed, never what the agent claimed.
         // Asserting the reply said "success" accused an agy that had just
