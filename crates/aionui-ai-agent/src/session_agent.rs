@@ -2239,12 +2239,36 @@ fn spawn_event_pump(
             // Swallow the whole envelope. `terminal_result_seen` resets on
             // turn_gen advance/TurnStarted, so a NEW turn's terminal is never
             // confused with a duplicate of the old one.
-            if terminal_result_seen && matches!(env.event, SessionEvent::TurnResult { .. }) {
-                tracing::info!(
-                    conv_id = %conversation_id,
-                    "session-pump: swallowing deferred duplicate terminal (turn already settled)"
-                );
-                continue;
+            if terminal_result_seen {
+                match &env.event {
+                    SessionEvent::TurnResult { .. } => {
+                        tracing::info!(
+                            conv_id = %conversation_id,
+                            "session-pump: swallowing deferred duplicate terminal (turn already settled)"
+                        );
+                        continue;
+                    }
+                    // CONTENT after a settled terminal means a CLI-INITIATED turn
+                    // is starting (claude never sends TurnStarted and no Send
+                    // bumps turn_gen for it) — re-arm so that turn's own real
+                    // terminal is processed instead of being mistaken for the
+                    // deferred duplicate. Bookkeeping frames (usage, task roster,
+                    // BackendBound/Provisioning) deliberately do NOT re-arm: they
+                    // routinely trail a settled turn.
+                    SessionEvent::MessageDelta { .. }
+                    | SessionEvent::ThoughtDelta { .. }
+                    | SessionEvent::ToolCall { .. }
+                    | SessionEvent::ToolResult { .. }
+                    | SessionEvent::Permission { .. } => {
+                        tracing::info!(
+                            conv_id = %conversation_id,
+                            event = session_event_name(&env.event),
+                            "session-pump: content after settled terminal — CLI-initiated turn begins"
+                        );
+                        terminal_result_seen = false;
+                    }
+                    _ => {}
+                }
             }
 
             // Empty-turn diagnostic Tip to emit for THIS terminal, if the turn was a
@@ -6585,6 +6609,51 @@ mod pump_tests {
             !frames.iter().any(|f| matches!(f, AgentStreamEvent::Tips(_))),
             "the duplicate must not fabricate an empty-turn tip, got {seq:?}"
         );
+    }
+
+    /// The counterpart: content AFTER a settled terminal is a CLI-INITIATED turn
+    /// (the background-task report). Its own real terminal must be processed —
+    /// an over-eager duplicate guard would swallow it and leave the orphan turn
+    /// to die on the 180s idle valve instead of finishing cleanly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cli_initiated_turn_after_settled_terminal_gets_its_own_finish() {
+        let clean_result = || {
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            })
+        };
+        let script = vec![
+            env(SessionEvent::MessageDelta {
+                item_id: "m1".into(),
+                text: "已启动".into(),
+            }),
+            clean_result(), // launch turn settles
+            clean_result(), // deferred duplicate — swallowed
+            // …30s later the CLI starts its report turn: content re-arms.
+            env(SessionEvent::MessageDelta {
+                item_id: "m2".into(),
+                text: "BG_DONE".into(),
+            }),
+            clean_result(), // the report turn's own terminal — must be honoured
+        ];
+        let frames = drain_script(script).await;
+        let seq: Vec<&str> = frames.iter().map(frame_name).collect();
+        let finishes = frames
+            .iter()
+            .filter(|f| matches!(f, AgentStreamEvent::Finish(_)))
+            .count();
+        assert_eq!(finishes, 2, "launch turn + report turn, got {seq:?}");
+        assert!(
+            !frames.iter().any(|f| matches!(f, AgentStreamEvent::Tips(_))),
+            "neither turn is blank — no empty-turn tip, got {seq:?}"
+        );
+        // Both text segments made it out.
+        let texts = frames.iter().filter(|f| matches!(f, AgentStreamEvent::Text(_))).count();
+        assert_eq!(texts, 2, "launch reply AND report both stream, got {seq:?}");
     }
 
     /// A killed workflow emits NO result frame — only task frames. Its container
