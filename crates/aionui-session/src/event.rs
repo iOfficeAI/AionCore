@@ -401,6 +401,35 @@ pub enum SessionEvent {
         tokens: Option<u64>,
         tool_calls: Option<u64>,
         last_tool_name: Option<String>,
+        /// Which declared phase this agent belongs to (claude `phaseIndex` /
+        /// `phaseTitle`). Lets a consumer group agents under their phase instead
+        /// of rendering one flat list. Both None on a shape that declares no
+        /// phases.
+        phase_index: Option<u32>,
+        phase_title: Option<String>,
+        /// One-line summary of the agent's last tool call (claude
+        /// `lastToolSummary`) — e.g. the command for a Bash step. Pairs with
+        /// `last_tool_name`.
+        last_tool_summary: Option<String>,
+        /// Wall-clock duration of the agent's run. claude emits it ONLY on the
+        /// terminal (`state: "done"`) entry.
+        duration_ms: Option<u64>,
+    },
+
+    /// One declared phase of a running workflow (claude
+    /// `workflow_progress[].workflow_phase`, `{index, title}`).
+    ///
+    /// Container-level, not per-agent: the whole phase list is declared up front
+    /// on the FIRST `task_progress` frame, so a consumer learns the shape of the
+    /// workflow before most agents have been dispatched. Kept separate from
+    /// `SubagentDetail` (whose subject is an agent) so neither event's fields
+    /// have to be made meaningless for the other. Reducer NO-OP, like
+    /// `SubagentDetail`; only the pump/orchestrator read it.
+    WorkflowPhase {
+        /// The container `task_id` these phases belong to.
+        task_id: String,
+        index: u32,
+        title: String,
     },
 
     /// Out-of-turn diagnostic NOTICE (codex `warning` / `guardianWarning` /
@@ -856,6 +885,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | CatalogUpdated { .. }
         | SubagentUpdate { .. }
         | SubagentDetail { .. }
+        | WorkflowPhase { .. }
         | Notice { .. }
         | ToolOutputDelta { .. }
         | TurnDiffUpdated { .. }
@@ -896,6 +926,8 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             CatalogUpdated { .. } => PersistTier::Ephemeral, // async catalog discovery, re-discovered on open (not history)
             SessionInfo { .. } => PersistTier::Ephemeral, // on-demand query snapshot, re-queryable (not history)
             SubagentDetail { .. } => PersistTier::Ephemeral, // transient per-agent progress (roster fill, re-derivable)
+            // the phase list is re-declared on the next run's first progress frame
+            WorkflowPhase { .. } => PersistTier::Ephemeral,
             Plan { .. } => PersistTier::Ephemeral, // LC-8a: live to-do snapshot, full-replace + re-derivable (not history)
             ToolCall { .. }
             | ToolResult { .. }
@@ -1169,6 +1201,10 @@ mod additive_tests {
                     tokens: None,
                     tool_calls: None,
                     last_tool_name: None,
+                    phase_index: None,
+                    phase_title: None,
+                    last_tool_summary: None,
+                    duration_ms: None,
                 },
                 BackendProduced,
                 Ephemeral,

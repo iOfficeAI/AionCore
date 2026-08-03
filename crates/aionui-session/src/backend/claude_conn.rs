@@ -2124,6 +2124,30 @@ fn sniff_task(
     // and is unique per agent, so it is the only stable key; agentId/label remain
     // as fallbacks for a shape that omits it.
     if let Some(agents) = frame.get("workflow_progress").and_then(Value::as_array) {
+        // Container-level phase declarations ride the same array. claude emits the
+        // WHOLE list on the first task_progress frame (verified: the 2.1.176
+        // capture declares `1 Run` + `2 Summarize` before any agent is running),
+        // so a consumer learns the workflow's shape up front.
+        for p in agents
+            .iter()
+            .filter(|p| p.get("type").and_then(Value::as_str) == Some("workflow_phase"))
+        {
+            let (Some(index), Some(title)) = (
+                p.get("index").and_then(Value::as_u64),
+                p.get("title").and_then(Value::as_str),
+            ) else {
+                continue; // a phase with no index/title cannot be grouped under
+            };
+            let _ = event_tx.send(SessionEnvelope {
+                session_id: session_id.to_string(),
+                turn_gen,
+                event: SessionEvent::WorkflowPhase {
+                    task_id: task_id.to_string(),
+                    index: index as u32,
+                    title: title.to_string(),
+                },
+            });
+        }
         for a in agents
             .iter()
             .filter(|a| a.get("type").and_then(Value::as_str) == Some("workflow_agent"))
@@ -2156,6 +2180,11 @@ fn sniff_task(
                     tokens: a.get("tokens").and_then(Value::as_u64),
                     tool_calls: a.get("toolCalls").and_then(Value::as_u64),
                     last_tool_name: a.get("lastToolName").and_then(Value::as_str).map(str::to_string),
+                    phase_index: a.get("phaseIndex").and_then(Value::as_u64).map(|i| i as u32),
+                    phase_title: a.get("phaseTitle").and_then(Value::as_str).map(str::to_string),
+                    last_tool_summary: a.get("lastToolSummary").and_then(Value::as_str).map(str::to_string),
+                    // Present ONLY on the terminal (`state: "done"`) entry.
+                    duration_ms: a.get("durationMs").and_then(Value::as_u64),
                 },
             });
         }
@@ -5465,7 +5494,7 @@ mod tests {
         // a dispatch batch — see
         // `sniff_task_keys_agents_by_index_so_a_dispatch_batch_is_not_double_counted`.)
         // (Real shape from workflow_multiagent_3parallel_1fail.ndjson 'done' frame.)
-        let frame = r#"{"type":"system","subtype":"task_progress","task_id":"wanv3yy20","tool_use_id":"toolu-1","workflow_progress":[{"type":"workflow_phase","index":1,"title":"Run"},{"type":"workflow_agent","index":1,"label":"run:C","agentId":"agent-C","state":"done","model":"opus","tokens":10107,"toolCalls":4,"lastToolName":"StructuredOutput"}]}"#;
+        let frame = r#"{"type":"system","subtype":"task_progress","task_id":"wanv3yy20","tool_use_id":"toolu-1","workflow_progress":[{"type":"workflow_phase","index":1,"title":"Run"},{"type":"workflow_agent","index":1,"label":"run:C","phaseIndex":1,"phaseTitle":"Run","agentId":"agent-C","state":"done","model":"opus","tokens":10107,"toolCalls":4,"lastToolName":"StructuredOutput","lastToolSummary":"exit 1","durationMs":20228}]}"#;
         let bytes = format!("{frame}\n").into_bytes();
         let backend = ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(bytes))).await;
         let mut events = backend.events();
@@ -5490,6 +5519,10 @@ mod tests {
             tokens,
             tool_calls,
             last_tool_name,
+            phase_index,
+            phase_title,
+            last_tool_summary,
+            duration_ms,
         } = detail.expect("a workflow_agent must yield a SubagentDetail")
         else {
             unreachable!()
@@ -5510,6 +5543,50 @@ mod tests {
         assert_eq!(tokens, Some(10107));
         assert_eq!(tool_calls, Some(4));
         assert_eq!(last_tool_name.as_deref(), Some("StructuredOutput"));
+        // Display fields for the phase-grouped render.
+        assert_eq!(phase_index, Some(1), "agents group under their declared phase");
+        assert_eq!(phase_title.as_deref(), Some("Run"));
+        assert_eq!(
+            last_tool_summary.as_deref(),
+            Some("exit 1"),
+            "the last tool's one-line summary rides alongside its name"
+        );
+        assert_eq!(
+            duration_ms,
+            Some(20228),
+            "claude reports durationMs only on the terminal `done` entry"
+        );
+    }
+
+    /// The container's declared phase list (`workflow_progress[].workflow_phase`)
+    /// surfaces as `WorkflowPhase`, keyed to the container task_id — so a consumer
+    /// can group agents under phases. Claude declares the WHOLE list on the first
+    /// progress frame, before most agents exist.
+    #[tokio::test]
+    async fn sniff_task_emits_workflow_phase_declarations() {
+        let frame = r#"{"type":"system","subtype":"task_progress","task_id":"wanv3yy20","tool_use_id":"toolu-1","workflow_progress":[{"type":"workflow_phase","index":1,"title":"Run"},{"type":"workflow_phase","index":2,"title":"Summarize"}]}"#;
+        let bytes = format!("{frame}\n").into_bytes();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(bytes))).await;
+        let mut events = backend.events();
+
+        let mut phases: Vec<(String, u32, String)> = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1500), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::WorkflowPhase { task_id, index, title } = &env.event {
+                    phases.push((task_id.clone(), *index, title.clone()));
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            phases,
+            vec![
+                ("wanv3yy20".to_string(), 1, "Run".to_string()),
+                ("wanv3yy20".to_string(), 2, "Summarize".to_string()),
+            ],
+            "both declared phases surface, keyed to the container task_id"
+        );
     }
 
     /// The per-agent roster key must be `index`, NOT `agentId.or(label)`.

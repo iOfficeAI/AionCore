@@ -952,6 +952,10 @@ mod tests {
                         tokens: Some(10),
                         tool_calls: Some(2),
                         last_tool_name: None,
+                        phase_index: None,
+                        phase_title: None,
+                        last_tool_summary: None,
+                        duration_ms: None,
                     },
                 ),
                 // container completes (terminalizes task-1, NOT agent-A).
@@ -1666,6 +1670,10 @@ mod tests {
                         tokens: Some(8576),
                         tool_calls: Some(0),
                         last_tool_name: None,
+                        phase_index: None,
+                        phase_title: None,
+                        last_tool_summary: None,
+                        duration_ms: None,
                     },
                 ),
                 env(
