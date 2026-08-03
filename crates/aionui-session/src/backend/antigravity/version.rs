@@ -8,7 +8,7 @@
 //! one version. A drifting install must therefore be visible rather than
 //! failing in some unexplained way mid-turn.
 
-use crate::event::NoticeLevel;
+use crate::event::{LocalizedText, NoticeLevel};
 
 /// The agy release every wire contract here was verified against.
 ///
@@ -56,13 +56,32 @@ pub(crate) fn classify_version(reported: &str) -> VersionVerdict {
     }
 }
 
+/// i18n key for the "some steps in this turn did not take effect" notice,
+/// interpolating `{{count}}`.
+pub(crate) const CODE_STEPS_FAILED: &str = "ANTIGRAVITY_STEPS_FAILED";
+
+/// i18n keys for the two drift verdicts, both interpolating
+/// `{{reported}}` / `{{verified}}`. All three resolve on the frontend under
+/// `conversation.agentTip.codes.<code>.body`.
+pub(crate) const CODE_VERSION_OLDER: &str = "ANTIGRAVITY_VERSION_OLDER";
+pub(crate) const CODE_VERSION_NEWER: &str = "ANTIGRAVITY_VERSION_NEWER";
+
 /// The user-facing warning for a drifting install, or `None` when there is
 /// nothing worth saying.
 ///
 /// A NEWER agy is not treated as broken: it usually works, and blocking it
 /// would strand users on an old release. It is reported once so that, if the
 /// session then misbehaves, the cause is already on screen.
-pub(crate) fn drift_notice(reported: &str) -> Option<(NoticeLevel, String)> {
+///
+/// Returns the English text AND its translation handle: the text is the
+/// fallback shown when the locale has no entry for the code, so both travel
+/// together rather than the caller having to rebuild one from the other.
+pub(crate) fn drift_notice(reported: &str) -> Option<(NoticeLevel, String, LocalizedText)> {
+    let localized = |code: &str| {
+        LocalizedText::new(code)
+            .with("reported", reported)
+            .with("verified", VERIFIED_AGY_VERSION)
+    };
     match classify_version(reported) {
         VersionVerdict::Verified => None,
         VersionVerdict::Unknown => None,
@@ -72,6 +91,7 @@ pub(crate) fn drift_notice(reported: &str) -> Option<(NoticeLevel, String)> {
                 "agy {reported} is older than the {VERIFIED_AGY_VERSION} this integration was verified against; \
                  some features may be missing. Consider upgrading agy."
             ),
+            localized(CODE_VERSION_OLDER),
         )),
         VersionVerdict::Newer => Some((
             NoticeLevel::Info,
@@ -79,6 +99,7 @@ pub(crate) fn drift_notice(reported: &str) -> Option<(NoticeLevel, String)> {
                 "agy {reported} is newer than the {VERIFIED_AGY_VERSION} this integration was verified against. \
                  It should still work; report anything that behaves oddly."
             ),
+            localized(CODE_VERSION_NEWER),
         )),
     }
 }
@@ -96,17 +117,26 @@ mod tests {
     #[test]
     fn an_older_install_warns_because_features_may_be_missing() {
         assert_eq!(classify_version("1.1.8"), VersionVerdict::Older);
-        let (level, msg) = drift_notice("1.1.8").expect("older must be reported");
+        let (level, msg, loc) = drift_notice("1.1.8").expect("older must be reported");
         assert_eq!(level, NoticeLevel::Warning);
         assert!(msg.contains("1.1.8") && msg.contains(VERIFIED_AGY_VERSION));
+        // The English text is the fallback; the code+params are what a
+        // translated build actually renders, so both must be present.
+        assert_eq!(loc.code, CODE_VERSION_OLDER);
+        assert_eq!(loc.params.get("reported").and_then(|v| v.as_str()), Some("1.1.8"));
+        assert_eq!(
+            loc.params.get("verified").and_then(|v| v.as_str()),
+            Some(VERIFIED_AGY_VERSION)
+        );
     }
 
     #[test]
     fn a_newer_install_informs_but_does_not_block() {
         // Blocking would strand users on an old agy every time Google ships one.
         assert_eq!(classify_version("1.2.0"), VersionVerdict::Newer);
-        let (level, _) = drift_notice("1.2.0").expect("newer must be reported");
+        let (level, _, loc) = drift_notice("1.2.0").expect("newer must be reported");
         assert_eq!(level, NoticeLevel::Info);
+        assert_eq!(loc.code, CODE_VERSION_NEWER);
     }
 
     #[test]

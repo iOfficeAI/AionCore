@@ -4,8 +4,11 @@
 //! counting across a `--conversation` resume, so `step-<index>` is a stable
 //! id for pairing a tool's ACTIVE and DONE frames.
 
+use super::version::CODE_STEPS_FAILED;
 use super::wire::{AgyEvent, AgyState, AgyStepType, AgyStepUpdate, AgyUsage};
-use crate::event::{CancelReason, NoticeLevel, SessionEvent, ToolResultContent, TurnOutcome, UsageBreakdown};
+use crate::event::{
+    CancelReason, LocalizedText, NoticeLevel, SessionEvent, ToolResultContent, TurnOutcome, UsageBreakdown,
+};
 
 /// Rewrite agy's terminal error into something the user can act on.
 ///
@@ -131,6 +134,7 @@ impl Translator {
                              so check the result rather than the reply.",
                             if failed == 1 { "" } else { "s" }
                         ),
+                        localized: Some(LocalizedText::new(CODE_STEPS_FAILED).with("count", failed)),
                     });
                 }
                 out.push(SessionEvent::TurnResult {
@@ -518,7 +522,7 @@ mod tests {
         let notice = evs
             .iter()
             .find_map(|e| match e {
-                SessionEvent::Notice { level, message } => Some((level, message)),
+                SessionEvent::Notice { level, message, .. } => Some((level, message)),
                 _ => None,
             })
             .expect("a turn that refused work must not read as plain success");

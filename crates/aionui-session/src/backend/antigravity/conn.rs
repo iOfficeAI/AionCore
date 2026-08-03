@@ -410,14 +410,18 @@ impl AntigravitySessionBackend {
                 return;
             };
             tracing::info!(session_id = %session_id, version = %reported, "antigravity: agy version detected");
-            let Some((level, message)) = drift_notice(&reported) else {
+            let Some((level, message, localized)) = drift_notice(&reported) else {
                 return;
             };
             tracing::warn!(session_id = %session_id, version = %reported, "antigravity: agy version drift");
             if let Some(backend) = weak.and_then(|w| w.upgrade()) {
                 backend.emit(
                     backend.turn_gen.load(Ordering::SeqCst),
-                    SessionEvent::Notice { level, message },
+                    SessionEvent::Notice {
+                        level,
+                        message,
+                        localized: Some(localized),
+                    },
                 );
             }
         });

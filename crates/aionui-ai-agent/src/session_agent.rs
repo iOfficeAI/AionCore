@@ -3360,16 +3360,28 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         // turn that is already running (or immediately re-settled by the turn's terminal
         // Finish), so it does not manufacture a spurious idle timer the way a config frame
         // would. `NoticeLevel` has only Info/Warning (no Error tier), matching TipType.
-        SessionEvent::Notice { level, message } => {
+        SessionEvent::Notice {
+            level,
+            message,
+            localized,
+        } => {
             let tip_type = match level {
                 aionui_session::NoticeLevel::Info => TipType::Info,
                 aionui_session::NoticeLevel::Warning => TipType::Warning,
             };
+            // `content` stays the English text even when a code travels with it:
+            // the frontend passes it as i18next's `defaultValue`, so a locale
+            // that has not translated the key yet shows real prose instead of a
+            // raw key.
+            let (code, params) = match localized {
+                Some(l) => (Some(l.code), Some(serde_json::Value::Object(l.params))),
+                None => (None, None),
+            };
             vec![AgentStreamEvent::Tips(TipsEventData {
                 content: message,
                 tip_type,
-                code: None,
-                params: None,
+                code,
+                params,
             })]
         }
         // Events with no origin-side counterpart (or purely internal) are dropped.
@@ -4085,6 +4097,7 @@ mod translate_tests {
                 SessionEvent::Notice {
                     level,
                     message: "set effort: rejected by agent".into(),
+                    localized: None,
                 },
                 "conv-1",
                 false,
