@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.57](https://github.com/iOfficeAI/AionCore/compare/v0.1.56...v0.1.57) (2026-08-03)
+
+
+### Features
+
+* **agent:** add Antigravity (agy CLI) as a direct-CLI agent ([#741](https://github.com/iOfficeAI/AionCore/issues/741)) ([ddfd76b](https://github.com/iOfficeAI/AionCore/commit/ddfd76b9aa0e1192d02918f79490f1c4d06d343e))
+* **fs:** add /api/fs/reveal endpoint (resolve pe-ref + show in folder) ([#754](https://github.com/iOfficeAI/AionCore/issues/754)) ([f6977c7](https://github.com/iOfficeAI/AionCore/commit/f6977c784a7b508a5fc75f4c79977fd43ce22b4e))
+* **session:** make background work visible — live progress cards and out-of-turn delivery ([#758](https://github.com/iOfficeAI/AionCore/issues/758)) ([f0422ca](https://github.com/iOfficeAI/AionCore/commit/f0422ca28b08b3e16e8e8e2dd1778e816694095e))
+
+
+### Bug Fixes
+
+* **conversation:** apply a cancel that arrives while the agent is still building ([#747](https://github.com/iOfficeAI/AionCore/issues/747)) ([42fc44b](https://github.com/iOfficeAI/AionCore/commit/42fc44b51867c525759fd89d4efd7713f0c7f445))
+* **db:** widen migration-030 pre-repair gate to any pre-030 start point ([#756](https://github.com/iOfficeAI/AionCore/issues/756)) ([6e2b33d](https://github.com/iOfficeAI/AionCore/commit/6e2b33d75bfa0b5c504514fc25d1f09d6db7b3f7))
+* **file-watch:** degrade gracefully when watcher init fails instead of killing backend ([#751](https://github.com/iOfficeAI/AionCore/issues/751)) ([bdb6d61](https://github.com/iOfficeAI/AionCore/commit/bdb6d619c62cd5294bb09248b86b10fc5cd9ba1f))
+* **file:** strip verbatim \\?\ prefix from non-browse path outputs ([#736](https://github.com/iOfficeAI/AionCore/issues/736)) ([782ddd0](https://github.com/iOfficeAI/AionCore/commit/782ddd083074bec1857a3a9b5bc64852ae525c4f))
+* **process:** reap tool subprocesses that left the process group ([#753](https://github.com/iOfficeAI/AionCore/issues/753)) ([7bc0260](https://github.com/iOfficeAI/AionCore/commit/7bc026006c55a7f38d94f86a44af6d36105284b3))
+* **runtime:** retry transient bundled-node activation copy and reclassify persistent I/O failures ([#760](https://github.com/iOfficeAI/AionCore/issues/760)) ([23d2ec6](https://github.com/iOfficeAI/AionCore/commit/23d2ec658dd3dfda89156f7119945ac3c7141611))
+* **server:** emit AIONCORE_READY marker once serving begins ([#761](https://github.com/iOfficeAI/AionCore/issues/761)) ([8b08130](https://github.com/iOfficeAI/AionCore/commit/8b08130365ec7c883736c0b4aabcef471002dd7b))
+
 ## [0.1.56](https://github.com/iOfficeAI/AionCore/compare/v0.1.55...v0.1.56) (2026-07-31)
 
 
