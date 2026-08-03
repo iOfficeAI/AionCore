@@ -1,15 +1,24 @@
 use aionui_common::PreviewContentType;
 use serde::{Deserialize, Serialize};
 
+use crate::chat_file::ChatFileRef;
+
 // ---------------------------------------------------------------------------
 // A. Preview requests
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartPreviewRequest {
+    /// Legacy device-path identity. Retained for the frontend migration window;
+    /// used when `file` is absent. Remove once all callers send `file`.
     pub file_path: String,
     #[serde(default)]
     pub workspace: Option<String>,
+    /// Preferred identity: a [`ChatFileRef`] the backend resolves to an absolute
+    /// path (keeps pe→path resolution server-side). When present it takes
+    /// precedence over `file_path`.
+    #[serde(default)]
+    pub file: Option<ChatFileRef>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

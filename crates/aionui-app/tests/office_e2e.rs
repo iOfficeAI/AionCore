@@ -49,13 +49,21 @@ async fn build_office_app_with_roots(
     let services = AppServices::from_config(db, &config).await.unwrap();
     let (mut states, _) = build_module_states(&services).await.expect("build module states");
 
-    states.office = build_test_office_state(tmp.path(), allowed_roots);
+    states.office = build_test_office_state(
+        tmp.path(),
+        allowed_roots,
+        std::sync::Arc::new(services.project_service.clone()),
+    );
 
     let router = create_router_with_states(&services, states);
     (router, services, tmp)
 }
 
-fn build_test_office_state(data_dir: &std::path::Path, allowed_roots: Vec<std::path::PathBuf>) -> OfficeRouterState {
+fn build_test_office_state(
+    data_dir: &std::path::Path,
+    allowed_roots: Vec<std::path::PathBuf>,
+    project: std::sync::Arc<aionui_project::ProjectService>,
+) -> OfficeRouterState {
     use aionui_office::error::OfficeError;
     use aionui_office::types::DocType;
     use aionui_office::{ProcessHandle, ProcessSpawner};
@@ -102,6 +110,7 @@ fn build_test_office_state(data_dir: &std::path::Path, allowed_roots: Vec<std::p
         conversion_service: conversion,
         proxy_service: proxy,
         allowed_roots,
+        project,
     }
 }
 

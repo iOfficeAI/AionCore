@@ -114,8 +114,8 @@ pub use file::{
     DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, FileWatchRequest,
     GetFileMetadataRequest, GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest, ReadContentRequest,
     ReadFileRequest, RevealItemRequest, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest,
-    SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest, SnapshotWorkspaceRequest, WorkspaceFlatFileResponse,
-    WorkspaceOfficeWatchRequest, WriteContentRequest, WriteFileRequest,
+    SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery,
+    WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteContentRequest, WriteFileRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{
