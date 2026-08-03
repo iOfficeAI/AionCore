@@ -17,7 +17,7 @@ static RUNTIME_ROOT_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 /// the first value wins); a warning is logged if a second path is
 /// attempted so unexpected double-inits are visible.
 pub fn init(data_dir: impl AsRef<Path>) {
-    let path = data_dir.as_ref().join("runtime");
+    let path = runtime_root_for(data_dir.as_ref());
     if let Err(existing) = RUNTIME_ROOT_OVERRIDE.set(path.clone())
         && existing != path
     {
@@ -27,6 +27,17 @@ pub fn init(data_dir: impl AsRef<Path>) {
             "aionui_runtime::init called twice with different paths; keeping first"
         );
     }
+}
+
+fn runtime_root_for(data_dir: &Path) -> PathBuf {
+    let data_dir = if data_dir.is_absolute() {
+        data_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current_dir| current_dir.join(data_dir))
+            .unwrap_or_else(|_| data_dir.to_path_buf())
+    };
+    data_dir.join("runtime")
 }
 
 /// Returns the root cache directory used for all aionui runtime artifacts.
@@ -81,5 +92,14 @@ mod tests {
             tail,
             vec!["node".to_string(), "runtime".to_string(), "aionui".to_string()]
         );
+    }
+
+    #[test]
+    fn relative_data_directory_gets_an_absolute_runtime_root() {
+        let root = runtime_root_for(Path::new("relative-aionui-data"));
+
+        assert!(root.is_absolute());
+        assert_eq!(root.file_name().and_then(|name| name.to_str()), Some("runtime"));
+        assert!(root.ends_with(Path::new("relative-aionui-data").join("runtime")));
     }
 }

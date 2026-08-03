@@ -5,6 +5,7 @@ use aionui_common::{CommandSpec, EnvVar, ProviderWithModel};
 use aionui_db::IProviderRepository;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+use tracing::{info, warn};
 
 use crate::capability::cli_process::MANAGED_HERMES_ENV_ISOLATION_MARKER;
 use crate::error::AgentError;
@@ -39,8 +40,20 @@ pub(super) async fn apply_if_hermes(
     data_dir: &Path,
     conversation_id: &str,
 ) -> Result<(), AgentError> {
-    if launch_policy != HermesLaunchPolicy::Managed {
-        return Ok(());
+    match launch_policy {
+        HermesLaunchPolicy::NotHermes => return Ok(()),
+        HermesLaunchPolicy::External if has_model_binding(model) => {
+            warn!(
+                conversation_id,
+                provider_model_binding_present = true,
+                "Rejected Aion-managed Hermes binding for external command override"
+            );
+            return Err(AgentError::bad_request(
+                "Aion-managed Hermes provider/model binding cannot be used with an external Hermes command override",
+            ));
+        }
+        HermesLaunchPolicy::External => return Ok(()),
+        HermesLaunchPolicy::Managed => {}
     }
 
     let overlay = build_session_overlay(model, provider_repo, encryption_key, data_dir, conversation_id).await?;
@@ -49,7 +62,14 @@ pub(super) async fn apply_if_hermes(
         &mut command_spec.env,
         vec![env_var(MANAGED_HERMES_ENV_ISOLATION_MARKER, "1")],
     );
+    info!(conversation_id, "Applied Aion-managed Hermes session configuration");
     Ok(())
+}
+
+fn has_model_binding(model: &ProviderWithModel) -> bool {
+    !model.provider_id.trim().is_empty()
+        || !model.model.trim().is_empty()
+        || model.use_model.as_deref().is_some_and(|value| !value.trim().is_empty())
 }
 
 async fn build_session_overlay(
@@ -60,7 +80,11 @@ async fn build_session_overlay(
     conversation_id: &str,
 ) -> Result<HermesSessionOverlay, AgentError> {
     let provider = resolve_provider(model, provider_repo, encryption_key).await?;
-    let home = session_home(data_dir, conversation_id);
+    // The managed CLI runs with the conversation workspace as its current
+    // directory. Resolve the app data directory before passing HERMES_HOME to
+    // the child so a relative `--data-dir` does not become workspace-relative.
+    let absolute_data_dir = absolute_data_dir(data_dir)?;
+    let home = session_home(&absolute_data_dir, conversation_id);
     ensure_minimal_config(&home).await?;
     let home_value = home
         .to_str()
@@ -78,6 +102,16 @@ async fn build_session_overlay(
             env_var("HERMES_ACP_TOOLSET", "hermes-acp-lite"),
         ],
     })
+}
+
+fn absolute_data_dir(data_dir: &Path) -> Result<PathBuf, AgentError> {
+    if data_dir.is_absolute() {
+        return Ok(data_dir.to_path_buf());
+    }
+
+    let current_dir = std::env::current_dir()
+        .map_err(|error| AgentError::internal(format!("Failed to resolve app data directory: {error}")))?;
+    Ok(current_dir.join(data_dir))
 }
 
 async fn resolve_provider(
@@ -447,6 +481,18 @@ mod tests {
         assert_eq!(first.parent(), Some(expected_parent.as_path()));
     }
 
+    #[test]
+    fn absolute_data_dir_preserves_absolute_paths_and_resolves_relative_paths() {
+        let absolute = std::env::current_dir().unwrap().join("test-data");
+        assert_eq!(absolute_data_dir(&absolute).unwrap(), absolute);
+
+        let relative = Path::new("test-data");
+        assert_eq!(
+            absolute_data_dir(relative).unwrap(),
+            std::env::current_dir().unwrap().join(relative)
+        );
+    }
+
     #[tokio::test]
     async fn minimal_config_contains_no_session_provider_data() {
         let temp = tempfile::tempdir().unwrap();
@@ -619,7 +665,7 @@ mod tests {
         apply_if_hermes(
             &mut command_spec,
             HermesLaunchPolicy::External,
-            &selected_model("missing-provider", "model-a", None),
+            &selected_model("", "", None),
             repo.as_ref(),
             &TEST_KEY,
             temp.path(),
@@ -631,6 +677,33 @@ mod tests {
         assert!(command_spec.env.is_empty());
         assert_eq!(env_value(&command_spec.env, MANAGED_HERMES_ENV_ISOLATION_MARKER), None);
         assert!(!temp.path().join("hermes-sessions").exists());
+    }
+
+    #[tokio::test]
+    async fn external_hermes_rejects_aion_managed_model_binding() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let temp = tempfile::tempdir().unwrap();
+        let mut command_spec = CommandSpec::default();
+
+        let error = apply_if_hermes(
+            &mut command_spec,
+            HermesLaunchPolicy::External,
+            &selected_model("provider", "model-a", None),
+            repo.as_ref(),
+            &TEST_KEY,
+            temp.path(),
+            "conversation",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be used with an external Hermes command override")
+        );
+        assert!(command_spec.env.is_empty());
     }
 
     #[tokio::test]

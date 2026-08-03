@@ -122,12 +122,6 @@ if ($patchHash -ne $lock.aionPatchSha256.ToLowerInvariant()) {
     throw "Aion Hermes patch checksum does not match runtime-lock.json"
 }
 
-$uvCommand = Get-Command uv -ErrorAction Stop
-$uvVersion = (& $uvCommand.Source --version).Trim()
-if ($uvVersion -notmatch ('^uv ' + [Regex]::Escape($lock.uvVersion) + '(?:\s|$)')) {
-    throw "Expected uv $($lock.uvVersion), got $uvVersion"
-}
-
 $gitCommand = Get-Command git -ErrorAction Stop
 $tarCommand = Get-Command tar.exe -ErrorAction Stop
 $outputFull = [IO.Path]::GetFullPath($OutputRoot)
@@ -145,6 +139,30 @@ $backupRoot = Join-Path $outputParent ("." + $outputLeaf + ".old-" + [Guid]::New
 try {
     New-Item -ItemType Directory -Path $workRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $swapRoot -Force | Out-Null
+
+    $uvCommand = Get-Command uv -ErrorAction SilentlyContinue
+    if ($null -ne $uvCommand) {
+        $uvExecutable = $uvCommand.Source
+    }
+    else {
+        $uvArchive = Join-Path $workRoot "uv.zip"
+        $uvExtract = Join-Path $workRoot "uv"
+        Get-VerifiedDownload $lock.uvArchive $uvArchive $lock.uvSha256
+        Expand-Archive -LiteralPath $uvArchive -DestinationPath $uvExtract
+        $uvCandidates = @(
+            Get-ChildItem -LiteralPath $uvExtract -Recurse -Filter uv.exe |
+                Where-Object { $_.PSIsContainer -eq $false }
+        )
+        if ($uvCandidates.Count -ne 1) {
+            throw "Expected one bootstrapped uv.exe, found $($uvCandidates.Count)"
+        }
+        $uvExecutable = $uvCandidates[0].FullName
+        Write-Output "Bootstrapped pinned uv $($lock.uvVersion) for Hermes runtime preparation"
+    }
+    $uvVersion = (& $uvExecutable --version).Trim()
+    if ($uvVersion -notmatch ('^uv ' + [Regex]::Escape($lock.uvVersion) + '(?:\s|$)')) {
+        throw "Expected uv $($lock.uvVersion), got $uvVersion"
+    }
 
     # Fetch and patch the exact first-party adapter source.
     $sourceArchive = Join-Path $workRoot "hermes-source.tar.gz"
@@ -174,7 +192,7 @@ try {
 
     # Install a relocatable CPython distribution directly, without a venv.
     $pythonStore = Join-Path $workRoot "python-store"
-    Invoke-Checked $uvCommand.Source @(
+    Invoke-Checked $uvExecutable @(
         "python", "install", $lock.pythonVersion,
         "--install-dir", $pythonStore,
         "--no-bin",
@@ -212,7 +230,7 @@ try {
     if ($requirementsHash -ne $lock.requirementsSha256.ToLowerInvariant()) {
         throw "Hermes requirements checksum does not match runtime-lock.json"
     }
-    Invoke-Checked $uvCommand.Source @(
+    Invoke-Checked $uvExecutable @(
         "pip", "install",
         "--python", $pythonExe,
         "--break-system-packages",
@@ -224,11 +242,11 @@ try {
     )
 
     # Install the official wheel by its release hash, then overlay only the
-    # three audited files changed by the pinned Aion patch. This avoids an
+    # five audited files changed by the pinned Aion patch. This avoids an
     # unpinned PEP 517 build environment while keeping the patch reviewable.
     $wheel = Join-Path $workRoot "hermes_agent-0.19.0-py3-none-any.whl"
     Get-VerifiedDownload $lock.hermesWheel $wheel $lock.hermesWheelSha256
-    Invoke-Checked $uvCommand.Source @(
+    Invoke-Checked $uvExecutable @(
         "pip", "install",
         "--python", $pythonExe,
         "--break-system-packages",
@@ -243,7 +261,7 @@ try {
     if (-not (Test-Path -LiteralPath $sitePackages -PathType Container)) {
         throw "Failed to locate portable Python site-packages"
     }
-    foreach ($relative in @("acp_adapter\entry.py", "acp_adapter\session.py", "toolsets.py")) {
+    foreach ($relative in @("acp_adapter\entry.py", "acp_adapter\events.py", "acp_adapter\session.py", "agent\coding_context.py", "toolsets.py")) {
         $installedFile = Join-Path $sitePackages $relative
         if (-not (Test-Path -LiteralPath $installedFile -PathType Leaf)) {
             throw "Official Hermes wheel is missing $relative under $sitePackages"
@@ -323,7 +341,7 @@ try {
 }
 finally {
     if (Test-Path -LiteralPath $workRoot) {
-        Remove-Item -LiteralPath $workRoot -Recurse -Force
+        Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
     if (Test-Path -LiteralPath $swapRoot) {
         Remove-Item -LiteralPath $swapRoot -Recurse -Force

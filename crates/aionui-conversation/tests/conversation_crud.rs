@@ -678,7 +678,10 @@ async fn create_rejects_top_level_model_for_acp() {
     match err {
         ConversationError::BadRequest { reason: msg } => {
             assert!(msg.contains("model"), "error message should mention model: {msg}");
-            assert!(msg.contains("extra"), "error message should mention extra: {msg}");
+            assert!(
+                msg.contains("builtin Hermes"),
+                "error message should identify the Hermes exception: {msg}"
+            );
         }
         other => panic!("expected BadRequest, got {other:?}"),
     }

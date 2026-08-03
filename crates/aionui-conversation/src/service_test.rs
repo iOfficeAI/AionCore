@@ -667,6 +667,7 @@ fn stub_agent_metadata_rows() -> Vec<AgentMetadataRow> {
         ("2d23ff1c", Some("claude"), "acp", "Claude Code", 100),
         ("8e1acf31", Some("codex"), "acp", "Codex CLI", 110),
         ("cc126dd5", Some("gemini"), "acp", "Gemini CLI", 120),
+        ("55f3ed1c", Some("hermes"), "acp", "Hermes", 130),
         ("632f31d2", None, "aionrs", "Aion CLI", 200),
         ("b7e8a9c4", Some("openclaw"), "acp", "OpenClaw", 3140),
         ("f9f61666", None, "openclaw-gateway", "OpenClaw Gateway", 3150),
@@ -877,6 +878,7 @@ struct RuntimeStateSaveCall {
 struct StubAcpSessionRepo {
     create_calls: Mutex<Vec<CreateAcpSessionCall>>,
     runtime_state_saves: Mutex<Vec<RuntimeStateSaveCall>>,
+    agent_id: Mutex<String>,
     session_id: Mutex<Option<String>>,
     runtime_state: Mutex<Option<PersistedSessionState>>,
 }
@@ -890,6 +892,7 @@ impl StubAcpSessionRepo {
         Self {
             create_calls: Mutex::new(Vec::new()),
             runtime_state_saves: Mutex::new(Vec::new()),
+            agent_id: Mutex::new("codex".to_owned()),
             session_id: Mutex::new(Some(session_id.into())),
             runtime_state: Mutex::new(None),
         }
@@ -899,6 +902,7 @@ impl StubAcpSessionRepo {
         Self {
             create_calls: Mutex::new(Vec::new()),
             runtime_state_saves: Mutex::new(Vec::new()),
+            agent_id: Mutex::new("codex".to_owned()),
             session_id: Mutex::new(None),
             runtime_state: Mutex::new(Some(state)),
         }
@@ -909,10 +913,11 @@ impl StubAcpSessionRepo {
     }
 
     fn row_for(&self, conversation_id: &str) -> AcpSessionRow {
+        let agent_id = self.agent_id.lock().unwrap().clone();
         AcpSessionRow {
             conversation_id: conversation_id.to_owned(),
             agent_source: "builtin".into(),
-            agent_id: "codex".into(),
+            agent_id: if agent_id.is_empty() { "codex".into() } else { agent_id },
             session_id: self.session_id.lock().unwrap().clone(),
             session_status: "idle".into(),
             session_config: "{}".into(),
@@ -935,6 +940,7 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
         Ok(Some(self.row_for(conversation_id)))
     }
     async fn create(&self, params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
+        *self.agent_id.lock().unwrap() = params.agent_id.to_owned();
         self.create_calls.lock().unwrap().push(CreateAcpSessionCall {
             conversation_id: params.conversation_id.to_owned(),
             agent_source: params.agent_source.to_owned(),
@@ -1635,6 +1641,99 @@ async fn create_stores_model_as_json() {
     let model = resp.model.unwrap();
     assert_eq!(model.provider_id, "p1");
     assert_eq!(model.model, "m1");
+}
+
+#[tokio::test]
+async fn builtin_hermes_requires_and_persists_provider_model_binding() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
+
+    let missing_binding: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace, "backend": "hermes" }
+    }))
+    .unwrap();
+    assert!(matches!(
+        svc.create("user_1", missing_binding).await,
+        Err(ConversationError::HermesProviderRequired)
+    ));
+
+    let request: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "model": { "provider_id": "provider-1", "model": "gpt-5" },
+        "extra": { "workspace": workspace, "backend": "hermes" }
+    }))
+    .unwrap();
+    let conversation = svc.create("user_1", request).await.unwrap();
+    assert_eq!(
+        conversation.model.as_ref().map(|model| model.provider_id.as_str()),
+        Some("provider-1")
+    );
+    assert_eq!(
+        conversation.model.as_ref().map(|model| model.model.as_str()),
+        Some("gpt-5")
+    );
+
+    let row = repo.get(&conversation.id).await.unwrap().unwrap();
+    let options = svc.build_task_options(&row).await.unwrap();
+    assert_eq!(options.context.model.provider_id, "provider-1");
+    assert_eq!(options.context.model.model, "gpt-5");
+}
+
+#[tokio::test]
+async fn builtin_hermes_model_change_requires_reset_and_clears_resume_anchor() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let task = Arc::new(MockTaskManager::new());
+    let task_manager: Arc<dyn IWorkerTaskManager> = task.clone();
+    let acp_session_repo = Arc::new(StubAcpSessionRepo::default());
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster,
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_manager.clone(),
+        repo,
+        Arc::new(StubAgentMetadataRepo),
+        acp_session_repo.clone(),
+    );
+    let workspace = ensure_test_workspace_path();
+    let create: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "model": { "provider_id": "provider-1", "model": "gpt-5" },
+        "extra": { "workspace": workspace, "backend": "hermes" }
+    }))
+    .unwrap();
+    let conversation = svc.create("user_1", create).await.unwrap();
+    acp_session_repo
+        .update_session_id(&conversation.id, "hermes-session")
+        .await
+        .unwrap();
+
+    let update: UpdateConversationRequest = serde_json::from_value(json!({
+        "model": { "provider_id": "provider-1", "model": "gpt-5-mini" }
+    }))
+    .unwrap();
+    assert!(matches!(
+        svc.update("user_1", &conversation.id, update, &task_manager).await,
+        Err(ConversationError::HermesModelChangeRequiresReset { .. })
+    ));
+
+    svc.reset("user_1", &conversation.id).await.unwrap();
+    assert!(acp_session_repo.session_id.lock().unwrap().is_none());
+    assert_eq!(task.kill_records(), vec![(conversation.id.clone(), None)]);
+
+    let update_after_reset: UpdateConversationRequest = serde_json::from_value(json!({
+        "model": { "provider_id": "provider-1", "model": "gpt-5-mini" }
+    }))
+    .unwrap();
+    let updated = svc
+        .update("user_1", &conversation.id, update_after_reset, &task_manager)
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.model.as_ref().map(|model| model.model.as_str()),
+        Some("gpt-5-mini")
+    );
 }
 
 #[tokio::test]

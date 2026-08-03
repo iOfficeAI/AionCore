@@ -11,6 +11,7 @@ use aionui_ai_agent::{
 };
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
+use crate::model_binding_policy::{ConversationModelPolicy, for_agent, validate_required_binding};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
@@ -34,7 +35,7 @@ use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessagePageCursor,
     MessagePageDirection, MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
-    resolve_agent_binding_from_rows,
+    binding_resolution_for_agent, resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -231,6 +232,31 @@ fn resolve_create_agent_type(
     explicit_type.ok_or_else(|| ConversationError::BadRequest {
         reason: "Either `type` or `assistant.id` is required when creating a conversation.".into(),
     })
+}
+
+fn model_policy_for_binding(
+    agent_type: AgentType,
+    binding: Option<&AgentBindingResolution>,
+) -> ConversationModelPolicy {
+    if binding.is_some_and(|value| value.agent_type.trim() != AgentType::Acp.serde_name()) {
+        return ConversationModelPolicy::Forbidden;
+    }
+    for_agent(
+        agent_type,
+        binding.map(|value| value.agent_source.as_str()),
+        binding.map(|value| value.runtime_backend.as_str()),
+    )
+}
+
+fn model_policy_for_assistant(
+    agent_type: AgentType,
+    assistant_snapshot: &AssistantSnapshot,
+) -> ConversationModelPolicy {
+    for_agent(
+        agent_type,
+        Some(assistant_snapshot.agent_source.as_str()),
+        Some(assistant_snapshot.runtime_backend.as_str()),
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -773,6 +799,9 @@ impl ConversationService {
         };
         let explicit_type = req.r#type;
         let effective_type = resolve_create_agent_type(explicit_type, assistant_snapshot.as_ref())?;
+        let model_policy = self
+            .create_model_policy(effective_type, assistant_snapshot.as_ref(), &extra)
+            .await?;
 
         if !effective_type.supports_new_conversation() {
             info!(
@@ -785,27 +814,44 @@ impl ConversationService {
             });
         }
 
-        // Type-aware rule: top-level `model` is aionrs-only. Other agent types
-        // carry model/mode via `extra` (see spec 2026-05-12). Reject early so
-        // clients that still ship the legacy shape get a loud 400 instead of
-        // a silent write to a column nobody reads.
-        if effective_type != AgentType::Aionrs && req.model.is_some() {
-            return Err(ConversationError::BadRequest {
-                reason: format!(
-                    "top-level `model` is only accepted for aionrs conversations; pass model via `extra` for {}",
-                    effective_type.serde_name()
-                ),
-            });
-        }
-
-        // aionrs source-of-truth rule: top-level `model` wins. If an older client
-        // still packs `extra.model`, strip it before persist so the stored row
-        // has a single canonical model representation.
-        if effective_type == AgentType::Aionrs
-            && let Some(obj) = extra.as_object_mut()
-            && obj.remove("model").is_some()
-        {
-            warn!("aionrs create: stripped legacy `extra.model`; top-level `model` is canonical");
+        match model_policy {
+            ConversationModelPolicy::Optional => {
+                // Aionrs keeps `conversation.model` as its canonical source.
+                if let Some(obj) = extra.as_object_mut()
+                    && obj.remove("model").is_some()
+                {
+                    warn!("aionrs create: stripped legacy `extra.model`; top-level `model` is canonical");
+                }
+            }
+            ConversationModelPolicy::Required => {
+                if extra.get("model").is_some() {
+                    return Err(ConversationError::BadRequest {
+                        reason: "Hermes model binding must use top-level `model`, not `extra.model`".into(),
+                    });
+                }
+                if let Err(error) = validate_required_binding(req.model.as_ref()) {
+                    warn!(
+                        conversation_id = %id,
+                        code = error.error_code(),
+                        "Hermes model binding rejected during conversation creation"
+                    );
+                    return Err(error);
+                }
+                info!(
+                    conversation_id = %id,
+                    model_binding_present = true,
+                    "Hermes model binding accepted for conversation"
+                );
+            }
+            ConversationModelPolicy::Forbidden if req.model.is_some() => {
+                return Err(ConversationError::BadRequest {
+                    reason: format!(
+                        "top-level `model` is only accepted for aionrs or builtin Hermes conversations; use the native runtime configuration for {}",
+                        effective_type.serde_name()
+                    ),
+                });
+            }
+            ConversationModelPolicy::Forbidden => {}
         }
 
         // Determine whether the user chose this workspace ("custom") or we
@@ -1337,6 +1383,86 @@ impl ConversationService {
                 .map_err(|e| ConversationError::internal(format!("Failed to seed acp_session runtime state: {e}")))?;
         }
         Ok(())
+    }
+
+    async fn resolve_direct_agent_binding(
+        &self,
+        extra: &serde_json::Value,
+    ) -> Result<Option<AgentBindingResolution>, ConversationError> {
+        if let Some(agent_id) = extra.get("agent_id").and_then(serde_json::Value::as_str).map(str::trim)
+            && !agent_id.is_empty()
+        {
+            return self
+                .agent_metadata_repo
+                .get(agent_id)
+                .await
+                .map(|row| row.map(|value| binding_resolution_for_agent(&value)))
+                .map_err(|error| ConversationError::internal(format!("agent_metadata lookup: {error}")));
+        }
+
+        let Some(backend) = extra
+            .get("backend")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        self.agent_metadata_repo
+            .find_builtin_by_backend(backend)
+            .await
+            .map(|row| row.map(|value| binding_resolution_for_agent(&value)))
+            .map_err(|error| ConversationError::internal(format!("agent_metadata lookup: {error}")))
+    }
+
+    async fn create_model_policy(
+        &self,
+        agent_type: AgentType,
+        assistant_snapshot: Option<&AssistantSnapshot>,
+        extra: &serde_json::Value,
+    ) -> Result<ConversationModelPolicy, ConversationError> {
+        if let Some(assistant_snapshot) = assistant_snapshot {
+            return Ok(model_policy_for_assistant(agent_type, assistant_snapshot));
+        }
+
+        let binding = self.resolve_direct_agent_binding(extra).await?;
+        Ok(model_policy_for_binding(agent_type, binding.as_ref()))
+    }
+
+    async fn existing_model_policy(
+        &self,
+        row: &ConversationRow,
+        agent_type: AgentType,
+    ) -> Result<ConversationModelPolicy, ConversationError> {
+        if agent_type == AgentType::Aionrs {
+            return Ok(ConversationModelPolicy::Optional);
+        }
+        if agent_type != AgentType::Acp {
+            return Ok(ConversationModelPolicy::Forbidden);
+        }
+
+        let session_binding = self
+            .acp_session_repo
+            .get(&row.id)
+            .await?
+            .filter(|session| !session.agent_id.trim().is_empty())
+            .map(|session| session.agent_id);
+        let binding = match session_binding {
+            Some(agent_id) => self
+                .agent_metadata_repo
+                .get(&agent_id)
+                .await
+                .map_err(|error| ConversationError::internal(format!("agent_metadata lookup: {error}")))?
+                .map(|value| binding_resolution_for_agent(&value)),
+            None => {
+                let extra = serde_json::from_str(&row.extra)
+                    .map_err(|error| ConversationError::internal(format!("Invalid extra JSON: {error}")))?;
+                self.resolve_direct_agent_binding(&extra).await?
+            }
+        };
+
+        Ok(model_policy_for_binding(agent_type, binding.as_ref()))
     }
 
     async fn resolve_assistant_agent_binding(
@@ -1898,6 +2024,7 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         let existing_type: AgentType = string_to_enum(&existing.r#type)?;
+        let model_policy = self.existing_model_policy(&existing, existing_type).await?;
 
         // Snapshot invariant: once written at create time, `extra.skills`
         // must not be re-shaped by PATCH. The frontend must clone the
@@ -1928,16 +2055,34 @@ impl ConversationService {
             });
         }
 
-        // Type-aware rule: top-level `model` is aionrs-only. For non-aionrs
-        // conversations, model/mode must be updated via `extra` (see spec
-        // 2026-05-12).
-        if existing_type != AgentType::Aionrs && req.model.is_some() {
-            return Err(ConversationError::BadRequest {
-                reason: format!(
-                    "top-level `model` is only accepted for aionrs conversations; pass model via `extra` for {}",
-                    existing.r#type
-                ),
-            });
+        match model_policy {
+            ConversationModelPolicy::Optional => {}
+            ConversationModelPolicy::Required => {
+                if req.extra.as_ref().is_some_and(|extra| extra.get("model").is_some()) {
+                    return Err(ConversationError::BadRequest {
+                        reason: "Hermes model binding must use top-level `model`, not `extra.model`".into(),
+                    });
+                }
+                if let Some(model) = req.model.as_ref()
+                    && let Err(error) = validate_required_binding(Some(model))
+                {
+                    warn!(
+                        conversation_id = %id,
+                        code = error.error_code(),
+                        "Hermes model binding rejected during conversation update"
+                    );
+                    return Err(error);
+                }
+            }
+            ConversationModelPolicy::Forbidden if req.model.is_some() => {
+                return Err(ConversationError::BadRequest {
+                    reason: format!(
+                        "top-level `model` is only accepted for aionrs or builtin Hermes conversations; use the native runtime configuration for {}",
+                        existing.r#type
+                    ),
+                });
+            }
+            ConversationModelPolicy::Forbidden => {}
         }
 
         let now = now_ms();
@@ -1972,6 +2117,20 @@ impl ConversationService {
             let new_json = serde_json::to_string(new_model).unwrap_or_default();
             existing.model.as_deref() != Some(new_json.as_str())
         });
+
+        if model_changed && model_policy == ConversationModelPolicy::Required {
+            let has_resume_anchor = self
+                .acp_session_repo
+                .get(id)
+                .await?
+                .and_then(|session| session.session_id)
+                .is_some();
+            if has_resume_anchor {
+                return Err(ConversationError::HermesModelChangeRequiresReset {
+                    conversation_id: id.to_owned(),
+                });
+            }
+        }
 
         let model_json = req
             .model
@@ -2200,11 +2359,23 @@ impl ConversationService {
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
     pub async fn reset(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
         // Verify existence and ownership
-        self.conversation_repo
+        let existing = self
+            .conversation_repo
             .get(id)
             .await?
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+
+        let agent_type = string_to_enum(&existing.r#type)?;
+        if self.existing_model_policy(&existing, agent_type).await? == ConversationModelPolicy::Required {
+            info!("Resetting Hermes conversation and clearing its ACP resume anchor");
+            if let Err(error) = self.task_manager.kill(id, None) {
+                warn!(error = %ErrorChain(&error), "Failed to stop Hermes agent during conversation reset");
+            }
+            if !self.acp_session_repo.clear_session_id(id).await? {
+                warn!("Hermes conversation had no ACP session row while clearing its resume anchor");
+            }
+        }
 
         // Delete all messages
         self.conversation_repo.delete_messages_by_conversation(id).await?;

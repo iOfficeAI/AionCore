@@ -121,6 +121,104 @@ index 6f1e17a..2915384 100644
              kwargs.update(
                  {
                      "provider": runtime.get("provider"),
+diff --git a/acp_adapter/events.py b/acp_adapter/events.py
+--- a/acp_adapter/events.py
++++ b/acp_adapter/events.py
+@@ -101,10 +101,14 @@ def _send_update(
+     )
+     if future is None:
+         return
+-    try:
+-        future.result(timeout=5)
+-    except Exception:
+-        logger.debug("Failed to send ACP update", exc_info=True)
++
++    def _log_delivery_failure(completed: object) -> None:
++        try:
++            completed.result()
++        except Exception:
++            logger.debug("Failed to send ACP update", exc_info=True)
++
++    future.add_done_callback(_log_delivery_failure)
+ 
+ 
+ # ------------------------------------------------------------------
+diff --git a/agent/coding_context.py b/agent/coding_context.py
+index db38ab3d..9a8eb44d 100644
+--- a/agent/coding_context.py
++++ b/agent/coding_context.py
+@@ -57,6 +57,7 @@ import os
+ import re
+ import subprocess
+ import tempfile
++import threading
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Optional
+@@ -152,6 +153,8 @@ _MAX_VERIFY_COMMANDS = 8
+ _MAX_FACT_FILE_BYTES = 256 * 1024
+ 
+ _GIT_TIMEOUT = 2.5
++_GIT_TIMEOUT_ROOTS: set[str] = set()
++_GIT_TIMEOUT_ROOTS_LOCK = threading.Lock()
+ 
+ 
+ # Per-model edit-format steering. Matching the edit tool format to how a model
+@@ -689,15 +692,53 @@ def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
+ 
+ 
+ def _git(cwd: Path, *args: str) -> str:
++    root_key = os.path.normcase(str(cwd.resolve()))
++    with _GIT_TIMEOUT_ROOTS_LOCK:
++        if root_key in _GIT_TIMEOUT_ROOTS:
++            return ""
++
++    command = ["git", "-C", str(cwd), *args]
+     _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
+     try:
++        if IS_WINDOWS:
++            # `subprocess.run(capture_output=True, timeout=...)` creates reader
++            # threads on Windows. If git (or one of its descendants) keeps a
++            # pipe handle open after the timeout kills the direct child,
++            # `subprocess.run` waits forever while joining those readers. A
++            # real file handle preserves the bounded timeout and avoids that
++            # post-timeout pipe deadlock.
++            with tempfile.TemporaryFile(
++                mode="w+", encoding="utf-8", errors="replace"
++            ) as stdout_file:
++                out = subprocess.run(
++                    command,
++                    stdout=stdout_file,
++                    stderr=subprocess.DEVNULL,
++                    text=True,
++                    timeout=_GIT_TIMEOUT,
++                    **_popen_kwargs,
++                )
++                if out.returncode != 0:
++                    return ""
++                stdout_file.seek(0)
++                return stdout_file.read().strip()
++
+         out = subprocess.run(
+-            ["git", "-C", str(cwd), *args],
++            command,
+             capture_output=True,
+             text=True,
+             timeout=_GIT_TIMEOUT,
+             **_popen_kwargs,
+         )
++    except subprocess.TimeoutExpired:
++        with _GIT_TIMEOUT_ROOTS_LOCK:
++            _GIT_TIMEOUT_ROOTS.add(root_key)
++        logger.warning(
++            "Git workspace probe timed out after %.1fs; skipping remaining "
++            "Git probes for this workspace",
++            _GIT_TIMEOUT,
++        )
++        return ""
+     except (OSError, subprocess.SubprocessError):
+         return ""
+     return out.stdout.strip() if out.returncode == 0 else ""
 diff --git a/toolsets.py b/toolsets.py
 index 1be6278..a480a16 100644
 --- a/toolsets.py

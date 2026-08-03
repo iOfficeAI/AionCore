@@ -81,6 +81,24 @@ impl From<ConversationError> for ApiError {
                 })),
             ),
             ConversationError::Unprocessable { reason } => ApiError::UnprocessableEntity(reason),
+            ConversationError::HermesProviderRequired => ApiError::coded(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "HERMES_PROVIDER_REQUIRED",
+                "Hermes requires a selected provider",
+                None,
+            ),
+            ConversationError::HermesModelRequired => ApiError::coded(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "HERMES_MODEL_REQUIRED",
+                "Hermes requires a selected model",
+                None,
+            ),
+            ConversationError::HermesModelChangeRequiresReset { conversation_id } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "HERMES_MODEL_CHANGE_REQUIRES_RESET",
+                "Reset the Hermes conversation before changing its provider or model",
+                Some(serde_json::json!({ "conversation_id": conversation_id })),
+            ),
             ConversationError::Internal { reason } => ApiError::Internal(reason),
             ConversationError::WorkspacePathUnavailable { path } => ApiError::WorkspacePathUnavailable(path),
             ConversationError::WorkspacePathRuntimeUnavailable { path } => {

@@ -1164,7 +1164,15 @@ impl AcpAgentManager {
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id))]
     async fn ensure_session_opened(&self) -> Result<String, AgentError> {
         debug!("Ensuring ACP session is opened");
+        info!(
+            conversation_id = %self.params.conversation_id,
+            "ACP send stage: waiting for session-open lock"
+        );
         let _lock = self.session_lock.lock().await;
+        info!(
+            conversation_id = %self.params.conversation_id,
+            "ACP send stage: acquired session-open lock"
+        );
         self.ensure_protocol_connected_for_operation("ensure_session_opened")?;
 
         let (session_id, opened) = {
@@ -1188,6 +1196,10 @@ impl AcpAgentManager {
                 self.backend(),
             )?;
             self.commit_session_changes(&mut s).await;
+            info!(
+                conversation_id = %self.params.conversation_id,
+                "ACP send stage: session is ready"
+            );
             Ok(sid)
         }
     }
@@ -1201,6 +1213,10 @@ impl AcpAgentManager {
     async fn ensure_session_and_send(&self, data: &SendMessageData) -> Result<PromptOutcome, AcpSendFailure> {
         let sid = self.ensure_session_opened().await.map_err(AcpSendFailure::from)?;
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
+        info!(
+            conversation_id = %self.params.conversation_id,
+            "ACP send stage: resolving slash command"
+        );
         let raw_user_input = data.content.clone();
         let matched_command = {
             let session = self.session.read().await;
@@ -1210,7 +1226,17 @@ impl AcpAgentManager {
         };
 
         let content = {
+            info!(
+                conversation_id = %self.params.conversation_id,
+                configured_skill_count = self.params.config.skills.len(),
+                "ACP send stage: waiting for prompt transformation session lock"
+            );
             let mut s = self.session.write().await;
+            info!(
+                conversation_id = %self.params.conversation_id,
+                configured_skill_count = self.params.config.skills.len(),
+                "ACP send stage: prompt transformation started"
+            );
             let mut ctx = PromptCtx {
                 session: &mut s,
                 params: &self.params,
@@ -1218,7 +1244,16 @@ impl AcpAgentManager {
                 runtime: &self.runtime,
             };
             let transformed = self.pipeline.pre_send(&mut ctx, data.content.clone()).await;
+            info!(
+                conversation_id = %self.params.conversation_id,
+                transformed_bytes = transformed.len(),
+                "ACP send stage: prompt transformation completed"
+            );
             self.commit_session_changes(&mut s).await;
+            info!(
+                conversation_id = %self.params.conversation_id,
+                "ACP send stage: prompt transformation session changes committed"
+            );
             transformed
         };
 
@@ -1228,6 +1263,10 @@ impl AcpAgentManager {
             content,
             ..data.clone()
         };
+        info!(
+            conversation_id = %self.params.conversation_id,
+            "ACP send stage: dispatching prompt to CLI"
+        );
         self.prompt_existing_session(&data, Some(&sid), matched_command.as_ref())
             .await
     }
