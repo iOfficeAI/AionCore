@@ -1,4 +1,6 @@
 use super::*;
+use std::cell::Cell;
+use std::io::{Error as IoError, ErrorKind};
 
 fn write_file(path: &Path) {
     if let Some(parent) = path.parent() {
@@ -44,6 +46,69 @@ fn classify_error_detects_bundled_node_runtime_missing() {
 
     assert_eq!(kind, NodeRuntimeFailureKind::BundledResourceMissing);
     assert_eq!(status, None);
+}
+
+#[test]
+fn transient_classifier_matches_only_whitelist() {
+    assert!(is_transient_activation_io_error(&IoError::from(ErrorKind::Interrupted)));
+    assert!(!is_transient_activation_io_error(&IoError::from(ErrorKind::NotFound)));
+    assert!(!is_transient_activation_io_error(&IoError::from(ErrorKind::PermissionDenied)));
+    #[cfg(windows)]
+    {
+        assert!(is_transient_activation_io_error(&IoError::from_raw_os_error(1450)));
+        assert!(is_transient_activation_io_error(&IoError::from_raw_os_error(32)));
+        assert!(is_transient_activation_io_error(&IoError::from_raw_os_error(33)));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn activation_copy_retries_then_succeeds() {
+    let calls = Cell::new(0);
+    let result = activate_copy_with_retry(|| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            Err(IoError::from(ErrorKind::Interrupted))
+        } else {
+            Ok(())
+        }
+    })
+    .await;
+    assert!(result.is_ok());
+    assert_eq!(calls.get(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn activation_copy_persistent_transient_exhausts_to_transient() {
+    let calls = Cell::new(0);
+    let result = activate_copy_with_retry(|| {
+        calls.set(calls.get() + 1);
+        Err(IoError::from(ErrorKind::Interrupted))
+    })
+    .await;
+    assert!(matches!(result, Err(ActivationCopyError::Transient(_))));
+    assert_eq!(calls.get(), MANAGED_NODE_ACTIVATION_COPY_ATTEMPTS); // exactly 3 attempts
+}
+
+#[tokio::test(start_paused = true)]
+async fn activation_copy_non_whitelisted_is_not_retried() {
+    let calls = Cell::new(0);
+    let result = activate_copy_with_retry(|| {
+        calls.set(calls.get() + 1);
+        Err(IoError::from(ErrorKind::PermissionDenied))
+    })
+    .await;
+    assert!(matches!(result, Err(ActivationCopyError::NonTransient(_))));
+    assert_eq!(calls.get(), 1); // stops immediately, no retry, no ActivationIoFailed
+}
+
+#[test]
+fn activation_copy_backoff_schedule_is_local_specific() {
+    use std::time::Duration;
+    assert_eq!(MANAGED_NODE_ACTIVATION_COPY_ATTEMPTS, 3);
+    assert_eq!(
+        MANAGED_NODE_ACTIVATION_COPY_BACKOFFS,
+        [Duration::from_millis(250), Duration::from_millis(500), Duration::from_millis(1000)]
+    );
 }
 
 #[test]
