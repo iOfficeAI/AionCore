@@ -11,18 +11,31 @@ use std::process::{Command, Stdio};
 /// Reproduce the measured agy shape: an outer process in its own group, whose
 /// child puts ITSELF in a different group and so survives a group kill.
 ///
-/// `set -m` (job control) is what makes the background job a group leader —
-/// without it the child inherits the outer's group, the group kill reaches it
-/// anyway, and the test would pass while proving nothing. Verified below by
-/// asserting the two pgids actually differ.
+/// The child must put ITSELF in a new session; inheriting the outer's group
+/// would let the plain group kill reach it and the test would pass while
+/// proving nothing. The pgids are asserted to differ for exactly that reason.
+///
+/// `set -m` was tried first and is NOT portable: on Linux `/bin/sh` is
+/// typically dash, whose background jobs stay in the caller's process group,
+/// so the fixture silently stopped escaping and the guard assertion caught it
+/// on CI. `setsid(1)` exists on Linux but not macOS, and perl's `POSIX::setsid`
+/// covers macOS — so whichever is present is used, and the guard still decides
+/// whether the fixture is worth anything.
 ///
 /// Returns (outer pid, escaped child pid).
 fn spawn_escaping_tree(marker: &str) -> (u32, u32) {
-    // `setsid` is not a binary on macOS, so the outer's own session is created
-    // from Rust via pre_exec rather than a helper.
+    // The outer's own session is created from Rust via pre_exec; only the inner
+    // one needs a helper, because it is the shell that spawns it.
     use std::os::unix::process::CommandExt;
 
-    let script = format!("set -m; sleep 600 & echo $! > {marker}; sleep 600");
+    let detach = if which("setsid") {
+        "setsid".to_owned()
+    } else if which("perl") {
+        "perl -e 'use POSIX; POSIX::setsid(); exec @ARGV'".to_owned()
+    } else {
+        panic!("need setsid(1) or perl to build a process that leaves its group");
+    };
+    let script = format!("{detach} sleep 600 & echo $! > {marker}; sleep 600");
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(script).stdout(Stdio::null()).stderr(Stdio::null());
     // SAFETY: setsid() is async-signal-safe and is the documented way to detach
@@ -54,6 +67,12 @@ fn spawn_escaping_tree(marker: &str) -> (u32, u32) {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     panic!("grandchild never reported its pid");
+}
+
+fn which(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+        .unwrap_or(false)
 }
 
 fn alive(pid: u32) -> bool {
