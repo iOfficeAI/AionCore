@@ -626,6 +626,33 @@ mod tests {
     }
 
     #[test]
+    fn clock_advance_alone_re_emits_a_background_card() {
+        // A background task has no frames between task_started and its terminal,
+        // so the pump's 1s tick is the only thing that moves the clock — and each
+        // tick must also re-assert Running (the launching call's tool_result
+        // repaints the row completed otherwise).
+        let mut c = WorkflowCard::new_background(
+            "toolu_bg".into(),
+            "Bash".into(),
+            serde_json::Value::Null,
+            "b1",
+            Some("sleep 30".into()),
+            0,
+        );
+        let (f, entries) = c.take_emission(0, true).expect("opens immediately, roster or not");
+        assert!(entries.is_empty());
+        assert!(f.description.as_deref().unwrap().ends_with("00:00"));
+        assert!(f.output.is_none(), "no output — it would clobber the task-id text");
+        assert!(
+            c.take_emission(300, false).is_none(),
+            "same displayed second, inside throttle: nothing"
+        );
+        let (f2, _) = c.take_emission(1000, false).expect("a new displayed second re-emits");
+        assert!(f2.description.as_deref().unwrap().ends_with("00:01"));
+        assert_eq!(f2.status, ToolCallStatus::Running, "each tick re-asserts running");
+    }
+
+    #[test]
     fn done_agents_report_success_and_running_ones_execute() {
         let mut c = card();
         c.upsert_agent("1", detail("run:A", WorkflowLoopState::Done));

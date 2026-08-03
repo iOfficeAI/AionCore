@@ -2170,7 +2170,42 @@ fn spawn_event_pump(
         // window precisely: a trailing result rides the OLD gen (FIFO stdout), the
         // next turn's frames ride the new gen.
         let mut last_seen_turn_gen: u64 = 0;
-        while let Some(env) = events.next().await {
+        // 1s heartbeat for live progress cards. A background task has NO frames
+        // between task_started and its terminal notification (verified: the
+        // 2.1.220 bg capture goes 27 task_started → 41 task_updated with nothing
+        // in between), so without this the card's clock froze at 00:00 for the
+        // whole runtime. Each tick re-renders open cards; the throttle/dedup in
+        // `take_emission` keeps this to at most ~1 frame/s per card, and the
+        // select arm is disabled entirely while no card is open.
+        let mut progress_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let env = tokio::select! {
+                maybe_env = events.next() => match maybe_env {
+                    Some(env) => env,
+                    None => break,
+                },
+                _ = progress_tick.tick(), if !workflow_cards.is_empty() => {
+                    let now = aionui_common::now_ms();
+                    for card in workflow_cards.values_mut() {
+                        let Some((card_frame, agents)) = card.take_emission(now, false) else {
+                            continue;
+                        };
+                        let data = crate::protocol::events::WorkflowProgressData {
+                            card: card_frame,
+                            agents,
+                        };
+                        // Between turns the relay is gone; same bypass as below.
+                        if terminal_result_seen
+                            && let Some(bus) = broadcaster.as_ref()
+                        {
+                            broadcast_workflow_progress_frames(bus.as_ref(), &conversation_id, &user_id, &data);
+                        }
+                        let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+                    }
+                    continue;
+                }
+            };
             runtime.touch();
             tracing::debug!(conv_id = %conversation_id, event = session_event_name(&env.event), "session-pump: backend event");
 
@@ -2360,9 +2395,7 @@ fn spawn_event_pump(
                 // it straight to the WebSocket instead, the same bypass usage
                 // frames use (`broadcast_usage_frame`). In-turn frames keep the
                 // relay path, which also persists them.
-                if terminal_result_seen
-                    && let Some(bus) = broadcaster.as_ref()
-                {
+                if terminal_result_seen && let Some(bus) = broadcaster.as_ref() {
                     broadcast_workflow_progress_frames(bus.as_ref(), &conversation_id, &user_id, &data);
                 }
                 let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
@@ -2650,6 +2683,15 @@ fn spawn_event_pump(
                 // the row's name to "". Runs before any routing decision below;
                 // no-op on non-ToolCall frames (e.g. the suppressed Finish).
                 stamp_tool_name(&mut tool_name, &mut ev);
+                // While a progress card is LIVE on a tool call, no translated
+                // frame may repaint that call terminal. The launching call's own
+                // tool_result lands one frame AFTER task_started (verified:
+                // claude_2.1.220_background_bash_turn.ndjsonl frames 27→28), and
+                // its `completed` status was flipping the card green at 00:00 for
+                // the task's whole runtime (live 2026-08-03, the local_agent
+                // test). The card's own settle frame carries the real terminal
+                // once the task actually ends.
+                shield_live_card_status(&workflow_cards, &mut ev);
                 // Record whether this turn produced user-visible output, so a clean
                 // terminal with none is detected as a blank reply (see the terminal
                 // match arm above). Checked against the translated frame so the
@@ -3123,6 +3165,29 @@ fn broadcast_workflow_progress_frames(
             "hidden": false,
         });
         bus.broadcast(aionui_api_types::WebSocketMessage::new("message.stream", payload));
+    }
+}
+
+/// Keep a live progress card's tool call visually RUNNING against later frames.
+///
+/// The launching call's own terminal (`tool_result`, or a turn-end Canceled
+/// close) arrives while the background task is still going; forwarding its
+/// status verbatim repaints the card terminal with nothing left to flip it back
+/// — a background task has no mid-flight frames to re-assert itself (unlike a
+/// workflow's ~1/s progress stream). Only the status is rewritten: the frame's
+/// output (e.g. the task-id text) still flows through.
+fn shield_live_card_status(
+    cards: &std::collections::HashMap<String, crate::workflow_progress::WorkflowCard>,
+    ev: &mut AgentStreamEvent,
+) {
+    let AgentStreamEvent::ToolCall(data) = ev else {
+        return;
+    };
+    if data.status == ToolCallStatus::Running {
+        return;
+    }
+    if cards.values().any(|c| c.call_id() == data.call_id) {
+        data.status = ToolCallStatus::Running;
     }
 }
 
@@ -6372,6 +6437,17 @@ mod pump_tests {
             }),
             // task_started declares the container (kind rides only this frame).
             bg_update(SubagentStatus::Running, Some(SubagentTaskKind::Other)),
+            // The launching call's own terminal lands one frame AFTER
+            // task_started (capture frames 27→28). Untranslated it would repaint
+            // the live card completed/green; the shield must keep it Running.
+            env(SessionEvent::ToolResult {
+                tool_use_id: "toolu_bg".into(),
+                is_error: false,
+                content: vec![aionui_session::ToolResultContent::Text(
+                    "Command running in background with ID: bu9nidbf6".into(),
+                )],
+                parent_tool_use_id: None,
+            }),
             // The launch turn ends CLEANLY while the task still runs — its card
             // must survive (outliving the turn is a background task's whole
             // point).
@@ -6412,6 +6488,27 @@ mod pump_tests {
             "no output — it would clobber the persisted task-id text via merge-patch"
         );
         assert!(open.agents.is_empty(), "a background task has no roster rows");
+
+        // The shield: after the card opened, NO translated tool_call frame may
+        // carry a terminal status for the launching call — the tool_result's
+        // `completed` (and any turn-end close) is rewritten to Running while the
+        // card lives. (live 2026-08-03: without this the card sat green at 00:00
+        // for the task's whole runtime.)
+        let first_progress = frames
+            .iter()
+            .position(|f| matches!(f, AgentStreamEvent::WorkflowProgress(_)))
+            .unwrap();
+        for f in &frames[first_progress..] {
+            if let AgentStreamEvent::ToolCall(d) = f
+                && d.call_id == "toolu_bg"
+            {
+                assert_eq!(
+                    d.status,
+                    ToolCallStatus::Running,
+                    "a live card's launching call must stay Running on the wire"
+                );
+            }
+        }
 
         // The clean turn end must NOT have cancelled it; the settle comes from the
         // task's own notification, after the turn.
