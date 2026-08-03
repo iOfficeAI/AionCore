@@ -14,7 +14,7 @@ use crate::event::{LocalizedText, NoticeLevel};
 ///
 /// Bumping this means re-verifying against captured traffic, not just editing
 /// the constant.
-pub(crate) const VERIFIED_AGY_VERSION: &str = "1.1.9";
+pub(crate) const VERIFIED_AGY_VERSION: &str = "1.1.10";
 
 /// How the installed agy compares to the one this backend was built against.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,8 +110,8 @@ mod tests {
 
     #[test]
     fn the_verified_release_says_nothing() {
-        assert_eq!(classify_version("1.1.9"), VersionVerdict::Verified);
-        assert!(drift_notice("1.1.9").is_none());
+        assert_eq!(classify_version("1.1.10"), VersionVerdict::Verified);
+        assert!(drift_notice("1.1.10").is_none());
     }
 
     #[test]
@@ -151,17 +151,19 @@ mod tests {
     #[test]
     fn a_decorated_version_line_still_parses() {
         assert_eq!(
-            classify_version("agy version v1.1.9 (build abc)"),
+            classify_version("agy version v1.1.10 (build abc)"),
             VersionVerdict::Verified
         );
-        assert_eq!(classify_version("1.1.10"), VersionVerdict::Newer);
+        // 1.1.9 < 1.1.10 numerically; a string compare would call it NEWER.
+        assert_eq!(classify_version("1.1.9"), VersionVerdict::Older);
+        assert_eq!(classify_version("1.1.11"), VersionVerdict::Newer);
     }
 
     #[test]
     fn shorter_and_longer_version_tuples_compare_sanely() {
         assert_eq!(classify_version("1.2"), VersionVerdict::Newer);
         assert_eq!(classify_version("1.1"), VersionVerdict::Older);
-        assert_eq!(classify_version("1.1.9.1"), VersionVerdict::Newer);
+        assert_eq!(classify_version("1.1.10.1"), VersionVerdict::Newer);
     }
 }
 
@@ -228,9 +230,9 @@ mod guidance_tests {
         assert!(older.detail.contains("1.1.8") && older.detail.contains(VERIFIED_AGY_VERSION));
         assert!(older.guidance.contains("1.1.8"));
 
-        let newer = version_drift("1.1.10").expect("a patch bump still drifts");
+        let newer = version_drift("1.1.11").expect("a patch bump still drifts");
         assert_eq!(newer.code, DIAGNOSTIC_VERSION_DRIFT_NEWER);
-        assert!(newer.detail.contains("1.1.10"));
+        assert!(newer.detail.contains("1.1.11"));
     }
 
     #[test]
