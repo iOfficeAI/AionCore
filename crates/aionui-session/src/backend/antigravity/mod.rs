@@ -19,3 +19,4 @@ mod version;
 mod wire;
 
 pub use conn::{AntigravityConnection, AntigravitySessionBackend, antigravity_capabilities};
+pub use version::version_guidance;

@@ -164,3 +164,44 @@ mod tests {
         assert_eq!(classify_version("1.1.9.1"), VersionVerdict::Newer);
     }
 }
+
+/// Drift guidance for an installed agy, as plain advisory text — no `Notice`,
+/// no level.
+///
+/// The availability probe already runs `agy --version` for its integrity check
+/// and reaches the user BEFORE any conversation exists, which is where a
+/// version warning actually helps: the user is choosing whether to rely on this
+/// agent. It has no notice channel, only a guidance string, so the same verdict
+/// is exposed here in the shape that path can use.
+pub fn version_guidance(reported: &str) -> Option<String> {
+    drift_notice(reported).map(|(_, message, _)| message)
+}
+
+#[cfg(test)]
+mod guidance_tests {
+    use super::*;
+
+    #[test]
+    fn a_matching_install_gets_no_guidance() {
+        // Silence is the whole point: an ⓘ on every connection test would be
+        // noise, and the verified version is what most users have.
+        assert_eq!(version_guidance(VERIFIED_AGY_VERSION), None);
+    }
+
+    #[test]
+    fn a_drifting_install_gets_actionable_text() {
+        let older = version_guidance("1.1.8").expect("older must be reported");
+        assert!(older.contains("1.1.8") && older.contains(VERIFIED_AGY_VERSION));
+        let newer = version_guidance("1.2.0").expect("newer must be reported");
+        assert!(newer.contains("1.2.0"));
+    }
+
+    #[test]
+    fn unreadable_version_output_says_nothing() {
+        // The probe hands over whatever the CLI printed. Claiming drift from a
+        // line we could not parse would invent a problem.
+        for raw in ["", "error: not signed in", "???"] {
+            assert_eq!(version_guidance(raw), None, "raw={raw:?}");
+        }
+    }
+}

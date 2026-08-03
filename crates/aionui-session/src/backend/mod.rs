@@ -19,7 +19,7 @@ mod suspend;
 mod types;
 
 pub use acp_conn::{AcpConnection, AcpSessionBackend, acp_capabilities};
-pub use antigravity::{AntigravityConnection, AntigravitySessionBackend, antigravity_capabilities};
+pub use antigravity::{AntigravityConnection, AntigravitySessionBackend, antigravity_capabilities, version_guidance};
 pub use claude_conn::{ClaudeConnection, ClaudeSessionBackend};
 pub use codex_conn::{CodexConnection, CodexSessionBackend, codex_capabilities, slash_command_name};
 pub use conversation_session::{ConversationSession, MsgStatus, PendingMessage};

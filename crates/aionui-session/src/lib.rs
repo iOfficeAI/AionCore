@@ -59,6 +59,7 @@ pub use backend::{
     Orchestrator, PendingMessage, PendingPermissionView, PermissionDecision, QuestionAnswer, SessionBackend,
     SessionConfig, SessionEnvelope, SessionInfoKind, SessionInit, SessionSpec, StateSnapshot, Tier2Checkpoint,
     TransitionReason, acp_capabilities, antigravity_capabilities, codex_capabilities, command_name, rehydrate,
+    version_guidance,
     slash_command_name,
 };
 pub use capability::{
