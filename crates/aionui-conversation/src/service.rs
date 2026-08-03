@@ -328,6 +328,14 @@ pub struct ConversationService {
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
 
+    /// One background-stream watcher per LIVE Session instance (keyed by
+    /// conversation id; value remembers the instance pointer so a rebuilt
+    /// instance gets a fresh watcher). See `background_stream.rs` for why:
+    /// CLI-initiated turns and between-turn card refreshes have no per-turn
+    /// relay to deliver them.
+    background_watchers:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, crate::background_stream::BackgroundWatcherHandle>>>,
+
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
@@ -401,6 +409,7 @@ impl ConversationService {
             runtime_helper_bin: None,
             runtime_base_url: None,
             runtime_token_service: None,
+            background_watchers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
 
             conversation_repo,
             agent_metadata_repo,
@@ -578,6 +587,46 @@ impl ConversationService {
     /// (or none of the service at all, via re-export) can use it.
     pub fn mint_msg_id() -> String {
         generate_short_id()
+    }
+
+    /// Spawn (or replace) the conversation's background-stream watcher for a
+    /// direct-CLI Session instance. Idempotent per instance: keyed by the Arc
+    /// pointer, so a rebuilt instance (crash/resume respawn) gets a fresh
+    /// watcher on its fresh broadcast channel while the old one exits on
+    /// `Closed`. Non-Session instances (ACP manager, aionrs, teammates) keep
+    /// their existing delivery paths untouched.
+    fn ensure_background_watcher(&self, user_id: &str, conversation_id: &str, agent: &AgentInstance) {
+        let AgentInstance::Session(task) = agent else {
+            return;
+        };
+        let instance_ptr = Arc::as_ptr(task) as usize;
+        let mut map = match self.background_watchers.lock() {
+            Ok(map) => map,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(existing) = map.get(conversation_id)
+            && existing.instance_ptr == instance_ptr
+            && !existing.join.is_finished()
+        {
+            return;
+        }
+        if let Some(stale) = map.remove(conversation_id) {
+            stale.join.abort();
+        }
+        let watcher = crate::background_stream::BackgroundStreamWatcher {
+            conversation_id: conversation_id.to_owned(),
+            user_id: user_id.to_owned(),
+            repo: self.conversation_repo.clone(),
+            broadcaster: self.broadcaster.clone(),
+            persistence: self.runtime_persistence(),
+            runtime_state: Arc::clone(&self.runtime_state),
+        };
+        let rx = agent.subscribe();
+        let join = tokio::spawn(watcher.run(rx));
+        map.insert(
+            conversation_id.to_owned(),
+            crate::background_stream::BackgroundWatcherHandle { instance_ptr, join },
+        );
     }
 
     pub fn mint_turn_id() -> String {
@@ -3389,6 +3438,7 @@ impl ConversationService {
 
         if let Some(agent) = task_manager.get_task(conversation_id) {
             debug!(conversation_id, phase, "Conversation runtime already active");
+            self.ensure_background_watcher(user_id, conversation_id, &agent);
             return Ok((agent, false));
         }
 
@@ -3420,6 +3470,8 @@ impl ConversationService {
                 return Err(err.into());
             }
         };
+
+        self.ensure_background_watcher(user_id, conversation_id, &agent);
 
         // Persist auto-resolved workspace if factory picked a different path.
         self.maybe_persist_workspace(user_id, conversation_id, &stored_workspace, agent.workspace())

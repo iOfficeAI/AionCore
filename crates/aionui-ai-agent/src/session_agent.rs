@@ -2195,12 +2195,10 @@ fn spawn_event_pump(
                             card: card_frame,
                             agents,
                         };
-                        // Between turns the relay is gone; same bypass as below.
-                        if terminal_result_seen
-                            && let Some(bus) = broadcaster.as_ref()
-                        {
-                            broadcast_workflow_progress_frames(bus.as_ref(), &conversation_id, &user_id, &data);
-                        }
+                        // Delivery is uniform: in-turn the per-turn relay consumes
+                        // this, between turns the conversation's background stream
+                        // watcher does (forward + persist). The pump no longer
+                        // broadcasts directly — that produced un-persisted frames.
                         let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
                     }
                     continue;
@@ -2389,15 +2387,9 @@ fn spawn_event_pump(
                 aionui_common::now_ms(),
                 &conversation_id,
             ) {
-                // Between turns the relay is gone (it breaks at Finish), so a
-                // frame emitted then — typically a background task settling after
-                // its turn ended — would be shouted into an empty room. Broadcast
-                // it straight to the WebSocket instead, the same bypass usage
-                // frames use (`broadcast_usage_frame`). In-turn frames keep the
-                // relay path, which also persists them.
-                if terminal_result_seen && let Some(bus) = broadcaster.as_ref() {
-                    broadcast_workflow_progress_frames(bus.as_ref(), &conversation_id, &user_id, &data);
-                }
+                // Uniform delivery: the per-turn relay consumes this in-turn; the
+                // conversation's background stream watcher consumes it between
+                // turns (forward + persist), so no pump-side broadcast bypass.
                 let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
             }
 
@@ -3130,44 +3122,6 @@ fn ask_user_question_options(
 /// task frames carry a `tool_use_id` belonging to a tool call INSIDE a workflow
 /// agent, which never appeared as a `tool_use` on the main stream — keying a card
 /// on it would conjure a blank tool card out of nowhere.
-/// Push one workflow/background-task snapshot straight to the WebSocket,
-/// bypassing the relay — used ONLY between turns, when the relay has already
-/// broken at Finish and a frame sent through it would be dropped. Mirrors
-/// `forward_workflow_progress` (stream_relay.rs): the same two frame types the
-/// frontend already renders. NOT persisted — the pump has no message repo (the
-/// conversation layer sits above this crate), so an out-of-turn settle reaches
-/// the live view but the stored row only catches up on the next in-turn frame.
-fn broadcast_workflow_progress_frames(
-    bus: &dyn EventBroadcaster,
-    conversation_id: &str,
-    user_id: &str,
-    data: &crate::protocol::events::WorkflowProgressData,
-) {
-    let mut frames: Vec<(&str, String, serde_json::Value)> = Vec::new();
-    if let Ok(card) = serde_json::to_value(&data.card) {
-        frames.push(("tool_call", data.card.call_id.clone(), card));
-    }
-    if !data.agents.is_empty()
-        && let Ok(agents) = serde_json::to_value(&data.agents)
-    {
-        // msg_id mirrors persistence: the group row is keyed by the first entry.
-        frames.push(("tool_group", data.agents[0].call_id.clone(), agents));
-    }
-    for (kind, msg_id, mut body) in frames {
-        aionui_common::normalize_keys_to_snake_case(&mut body);
-        let payload = serde_json::json!({
-            "conversation_id": conversation_id,
-            "user_id": user_id,
-            "msg_id": msg_id,
-            "turn_id": "",
-            "type": kind,
-            "data": body,
-            "hidden": false,
-        });
-        bus.broadcast(aionui_api_types::WebSocketMessage::new("message.stream", payload));
-    }
-}
-
 /// Keep a live progress card's tool call visually RUNNING against later frames.
 ///
 /// The launching call's own terminal (`tool_result`, or a turn-end Canceled
