@@ -393,7 +393,17 @@ impl WorkflowCard {
                     bits.push(format!("{:.1}s", ms as f64 / 1000.0));
                 }
                 ToolGroupEntry {
-                    call_id: r#ref.clone(),
+                    // MUST be globally unique, not the bare roster key. The roster
+                    // keys agents by `index` ("1", "2", …) — fine for dedup, fatal
+                    // as a `call_id`: `persist_tool_group` uses the FIRST entry's
+                    // call_id as `messages.id`, so a bare index collides with every
+                    // other conversation's workflow ("UNIQUE constraint failed:
+                    // messages.id", seen 77× in a live run — the agent rows then
+                    // never persist and vanish on reload, while the live WebSocket
+                    // still showed them, so only the DB layer noticed).
+                    // The container's tool_use_id is globally unique, so prefixing
+                    // with it is enough.
+                    call_id: format!("{}:{}", self.call_id, r#ref),
                     name: agent.label.clone().unwrap_or_else(|| r#ref.clone()),
                     // start/progress → Executing, done → Success. There is NO
                     // agent-level failure signal: a workflow agent whose command
@@ -490,7 +500,13 @@ mod tests {
         let (_, entries) = c.take_emission(10, true).expect("first emission");
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["run:A", "run:B", "run:C"], "full roster, stable order");
-        assert_eq!(entries[0].call_id, "1", "the first entry keys the persisted row");
+        // The first entry keys the persisted row, so its call_id must be globally
+        // unique — a bare roster index would collide across conversations.
+        assert_eq!(entries[0].call_id, "toolu_wf:1");
+        assert!(
+            entries.iter().all(|e| e.call_id.starts_with("toolu_wf:")),
+            "every entry is namespaced by its container: {entries:?}"
+        );
     }
 
     #[test]
@@ -514,6 +530,32 @@ mod tests {
             entries[1].description.as_deref().unwrap().contains("2.0k tok"),
             "the moved agent picked up its new tokens: {:?}",
             entries[1].description
+        );
+    }
+
+    /// Two workflows (different conversations, different Workflow tool calls)
+    /// must not produce colliding entry ids.
+    ///
+    /// `persist_tool_group` writes the FIRST entry's `call_id` straight into
+    /// `messages.id`, which is globally unique. The roster keys agents by `index`,
+    /// so emitting that bare key made every workflow's first row claim id "1" —
+    /// the second conversation to run one then failed with "UNIQUE constraint
+    /// failed: messages.id" and its agent rows never persisted (observed 77× in a
+    /// live run; the live WebSocket still rendered them, so only the DB noticed).
+    #[test]
+    fn entry_ids_do_not_collide_across_workflows() {
+        let mut a = WorkflowCard::new("toolu_aaa".into(), "Workflow".into(), serde_json::Value::Null, 0);
+        let mut b = WorkflowCard::new("toolu_bbb".into(), "Workflow".into(), serde_json::Value::Null, 0);
+        // Same roster keys on both — this is the norm, `index` restarts at 1 for
+        // every workflow.
+        a.upsert_agent("1", detail("run:A", WorkflowLoopState::Progress));
+        b.upsert_agent("1", detail("run:A", WorkflowLoopState::Progress));
+
+        let (_, ea) = a.take_emission(10, true).unwrap();
+        let (_, eb) = b.take_emission(10, true).unwrap();
+        assert_ne!(
+            ea[0].call_id, eb[0].call_id,
+            "two workflows must not claim the same messages.id"
         );
     }
 
