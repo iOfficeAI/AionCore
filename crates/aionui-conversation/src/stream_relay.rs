@@ -587,8 +587,7 @@ impl StreamRelay {
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::trim)
                                 .filter(|t| !t.is_empty())
-                            {
-                                if let Err(e) = crate::service::apply_agent_title(
+                                && let Err(e) = crate::service::apply_agent_title(
                                     &self.conversation_repo,
                                     &self.broadcaster,
                                     &self.user_id,
@@ -596,9 +595,8 @@ impl StreamRelay {
                                     title,
                                 )
                                 .await
-                                {
-                                    warn!(error = %e, "agent session title apply failed");
-                                }
+                            {
+                                warn!(error = %e, "agent session title apply failed");
                             }
                             // Keep the raw frame flowing to the frontend like the
                             // catch-all did before this dedicated arm existed.
