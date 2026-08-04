@@ -2701,14 +2701,13 @@ impl ConversationService {
                 config_selections_json: None,
                 context_usage_json: None,
             };
-            if seed.current_mode_id.is_some() || seed.current_model_id.is_some() {
-                if let Err(err) = self
+            if (seed.current_mode_id.is_some() || seed.current_model_id.is_some())
+                && let Err(err) = self
                     .acp_session_repo
                     .save_runtime_state_for_user(user_id, &new_id, &seed)
                     .await
-                {
-                    warn!(error = %ErrorChain(&err), "fork: failed to seed runtime state (non-fatal)");
-                }
+            {
+                warn!(error = %ErrorChain(&err), "fork: failed to seed runtime state (non-fatal)");
             }
         }
 
