@@ -1262,21 +1262,33 @@ async fn auto_workspaces_of_two_users_live_under_distinct_user_roots() {
     let dir_b = aionui_common::user_dir_name(&user_b.id).unwrap();
     assert_ne!(dir_a, dir_b);
 
-    let seg_a = format!("conversations/users/{dir_a}/");
-    let seg_b = format!("conversations/users/{dir_b}/");
+    let seg_a = std::path::Path::new("conversations").join("users").join(&dir_a);
+    let seg_b = std::path::Path::new("conversations").join("users").join(&dir_b);
+    let workspace_a = std::path::Path::new(&workspaces[0]);
+    let workspace_b = std::path::Path::new(&workspaces[1]);
     assert!(
-        workspaces[0].contains(&seg_a),
-        "A's workspace must live under its user root: {} (expected segment {seg_a})",
+        workspace_a.ancestors().any(|path| path.ends_with(&seg_a)),
+        "A's workspace must live under its user root: {} (expected segment {})",
+        workspaces[0],
+        seg_a.display()
+    );
+    assert!(
+        workspace_b.ancestors().any(|path| path.ends_with(&seg_b)),
+        "B's workspace must live under its user root: {} (expected segment {})",
+        workspaces[1],
+        seg_b.display()
+    );
+    // Neither leaks into the other user's root, and both dirs exist on disk.
+    assert!(
+        !workspace_a.ancestors().any(|path| path.ends_with(&seg_b)),
+        "A's workspace leaked into B's user root: {}",
         workspaces[0]
     );
     assert!(
-        workspaces[1].contains(&seg_b),
-        "B's workspace must live under its user root: {} (expected segment {seg_b})",
+        !workspace_b.ancestors().any(|path| path.ends_with(&seg_a)),
+        "B's workspace leaked into A's user root: {}",
         workspaces[1]
     );
-    // Neither leaks into the other user's root, and both dirs exist on disk.
-    assert!(!workspaces[0].contains(&seg_b));
-    assert!(!workspaces[1].contains(&seg_a));
     for ws in &workspaces {
         assert!(std::path::Path::new(ws).is_dir(), "workspace dir missing: {ws}");
     }
