@@ -2554,3 +2554,46 @@ async fn cd3_on_conversation_delete_trait() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "cron.job-removed");
 }
+
+// ── CD-4: NewConversation jobs survive conversation deletion ─────
+//
+// Regression: deleting a chat session that a new_conversation job last ran
+// in must NOT delete the job. `delete_jobs_by_conversation` used to call
+// `repo.delete_by_conversation`, which removed every job whose
+// conversation_id matched — including new_conversation jobs.
+
+#[tokio::test]
+async fn cd4_new_conversation_job_survives_cascade() {
+    let (svc, _repo, bc) = setup().await;
+
+    let mut req_nc = make_create_req("New Conversation Job", every_60s());
+    req_nc.conversation_id = "conv_cascade_nc".into();
+    req_nc.execution_mode = Some("new_conversation".into());
+    let job_nc = svc.add_job(req_nc).await.unwrap();
+
+    let mut req_ex = make_create_req("Existing Job", every_60s());
+    req_ex.conversation_id = "conv_cascade_nc".into();
+    req_ex.execution_mode = Some("existing".into());
+    let job_ex = svc.add_job(req_ex).await.unwrap();
+
+    bc.take_events();
+
+    svc.delete_jobs_by_conversation("conv_cascade_nc").await;
+
+    assert!(
+        svc.get_job(&job_nc.id).await.is_ok(),
+        "new_conversation job must survive deletion of its linked conversation"
+    );
+    assert!(
+        svc.get_job(&job_ex.id).await.is_err(),
+        "existing-mode job must be cascade-deleted"
+    );
+
+    let events = bc.take_events();
+    let removed_events: Vec<_> = events.iter().filter(|e| e.name == "cron.job-removed").collect();
+    assert_eq!(
+        removed_events.len(),
+        1,
+        "only the existing-mode job should emit a removed event"
+    );
+}

@@ -1010,22 +1010,28 @@ impl CronService {
         // fresh conversation on every run and merely store the last created
         // conversation_id; deleting that conversation should not delete the
         // cron job itself (the user would lose their scheduled task).
+        // NOTE: delete per job id — `repo.delete_by_conversation` would also
+        // remove NewConversation jobs pointing at this conversation.
         let existing_jobs: Vec<_> = jobs
             .into_iter()
             .filter(|row| row.execution_mode != "new_conversation")
             .collect();
 
+        let mut deleted = 0u32;
         for row in &existing_jobs {
             self.scheduler.cancel_job(&row.id);
+            if let Err(e) = self.repo.delete(&row.id).await {
+                error!(job_id = %row.id, error = %e, "Failed to cascade-delete cron job");
+                continue;
+            }
             self.emitter.emit_job_removed(&row.id);
+            deleted += 1;
         }
 
-        if let Err(e) = self.repo.delete_by_conversation(conversation_id).await {
-            error!(conversation_id, error = %e, "Failed to cascade-delete cron jobs");
-        } else if !existing_jobs.is_empty() {
+        if deleted > 0 {
             info!(
                 conversation_id,
-                count = existing_jobs.len(),
+                count = deleted,
                 "Cascade-deleted cron jobs for conversation"
             );
         }
