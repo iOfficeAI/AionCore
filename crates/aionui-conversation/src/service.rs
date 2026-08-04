@@ -19,14 +19,12 @@ use aionui_api_types::{
     ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
     ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
     ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
-    ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse,
-    ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse,
-    ForkCapabilityView, ForkConversationRequest, ListConversationsQuery, ListMessagesQuery,
-    MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
-    SendMessageResponse, SessionMcpServer, SessionMcpTransport, TeamSessionBinding,
-    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
-    assistant_avatar_response_value,
-    assistant_avatar_response_value_with_version,
+    ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary,
+    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
+    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
+    TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
+    assistant_avatar_response_value, assistant_avatar_response_value_with_version,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -2625,13 +2623,19 @@ impl ConversationService {
             );
         }
 
+        let explicit_name = req.name.filter(|n| !n.is_empty());
+        // Caller-chosen name = user intent (auto-titling must not overwrite it);
+        // an inherited parent name keeps the parent's provenance marker.
+        let name_source = if explicit_name.is_some() {
+            Some("user".to_owned())
+        } else {
+            parent.name_source.clone()
+        };
         let row = aionui_db::models::ConversationRow {
             id: new_id.clone(),
             user_id: user_id.to_owned(),
-            name: req
-                .name
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| parent.name.clone()),
+            name: explicit_name.unwrap_or_else(|| parent.name.clone()),
+            name_source,
             r#type: parent.r#type.clone(),
             extra: serde_json::to_string(&extra)
                 .map_err(|e| ConversationError::internal(format!("Failed to serialize extra: {e}")))?,

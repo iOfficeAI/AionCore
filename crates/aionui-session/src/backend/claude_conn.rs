@@ -2994,7 +2994,7 @@ impl ClaudeSessionBackend {
         let session_id = session_id.into();
         let wake = ClaudeWakeRecipe {
             spawner: Arc::new(crate::testing::FakeSpawner::new()),
-            claude_session_id: session_id.clone(),
+            claude_session_id: Arc::new(std::sync::Mutex::new(session_id.clone())),
             cwd: None,
             extra_args: Vec::new(),
             env: Vec::new(),
