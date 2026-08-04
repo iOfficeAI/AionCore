@@ -574,7 +574,11 @@ impl ClaudeAdapter {
         // omitting them under-reported the total ~10x on a cache-heavy turn (and was
         // inconsistent with codex, whose native `last.totalTokens` already includes
         // cache). `input_tokens`/`output_tokens` stay the wire's base counts; only
-        // `total_tokens` becomes the genuine total. cost from total_cost_usd.
+        // `total_tokens` becomes the genuine total. cost from total_cost_usd —
+        // the RAW wire value, which is only PROCESS-cumulative (a `--resume`
+        // respawn restarts it); the wrapping conn's CostLedger re-bases it to
+        // session-cumulative before broadcast. The adapter stays a pure frame
+        // parser with no cross-process state.
         if let Some(usage) = v.get("usage").and_then(Value::as_object) {
             let get = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
             let input_tokens = get("input_tokens");

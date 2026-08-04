@@ -1287,6 +1287,15 @@ pub(crate) fn resolved_effort(
         .filter(|value| !value.is_empty())
 }
 
+/// The persisted session-cumulative cost (USD) that seeds the claude backend's
+/// cost ledger (`SessionConfig.initial_cost_usd`) on a rebuild. USD only:
+/// claude's own `total_cost_usd` counter is USD, and silently adding a
+/// foreign-currency figure to it would corrupt both.
+pub(crate) fn initial_cost_usd_from_snapshot(session_snapshot: Option<&PersistedSessionState>) -> Option<f64> {
+    let cost = session_snapshot?.context_usage.as_ref()?.cost.as_ref()?;
+    (cost.currency.eq_ignore_ascii_case("usd") && cost.amount > 0.0).then_some(cost.amount)
+}
+
 pub(crate) fn resolved_session_mode(
     config: &AcpBuildExtra,
     session_snapshot: Option<&PersistedSessionState>,
@@ -1567,6 +1576,15 @@ pub async fn build_session_instance(
     // Version-gated on the binary we actually resolved above: the flag is hidden
     // (absent from `--help`) and older builds reject it at argument-parse time, so
     // an ungated flag would make every session unspawnable. See `claude_flags`.
+    // Cost-ledger seed (claude only): claude's `total_cost_usd` is
+    // process-cumulative, so a rebuilt backend (app restart / conversation
+    // reopen) must start its ledger from the conversation's persisted
+    // cumulative cost — otherwise the "session cost" falls back to the new
+    // process's own spend. codex reports no cost; other backends ignore it.
+    if backend_label == "claude" {
+        session_config.initial_cost_usd = initial_cost_usd_from_snapshot(session_snapshot);
+    }
+
     if backend_label == "claude"
         && let Some(program) = session_config.cli_program.clone()
         && crate::claude_flags::supports_thinking_display(&program).await
@@ -3941,6 +3959,37 @@ mod build_mapping_tests {
             thought_level: level.map(str::to_owned),
             ..Default::default()
         }
+    }
+
+    /// The claude cost ledger's app-restart seed: the persisted cumulative cost
+    /// must map into `SessionConfig.initial_cost_usd` — but ONLY a USD figure
+    /// (claude's own counter is USD; a foreign-currency figure persisted by some
+    /// other path must not be silently added to it).
+    #[test]
+    fn initial_cost_seed_reads_the_persisted_usd_cost_only() {
+        use agent_client_protocol::schema::v1::{Cost, UsageUpdate};
+        let usd = PersistedSessionState {
+            context_usage: Some(UsageUpdate::new(12_600, 262_144).cost(Cost::new(6.4294, "USD"))),
+            ..Default::default()
+        };
+        assert_eq!(initial_cost_usd_from_snapshot(Some(&usd)), Some(6.4294));
+
+        let eur = PersistedSessionState {
+            context_usage: Some(UsageUpdate::new(1, 2).cost(Cost::new(1.0, "EUR"))),
+            ..Default::default()
+        };
+        assert_eq!(
+            initial_cost_usd_from_snapshot(Some(&eur)),
+            None,
+            "non-USD must not seed"
+        );
+
+        assert_eq!(initial_cost_usd_from_snapshot(None), None);
+        assert_eq!(
+            initial_cost_usd_from_snapshot(Some(&PersistedSessionState::default())),
+            None,
+            "a snapshot without a cost figure must not seed"
+        );
     }
 
     #[test]

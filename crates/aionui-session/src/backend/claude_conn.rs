@@ -496,6 +496,24 @@ struct DiscoveredCaps {
     slash_commands: Vec<crate::capability::SlashCommandInfo>,
 }
 
+/// Session-cumulative cost ledger. claude's `result.total_cost_usd` is
+/// PROCESS-cumulative (live-captured 2.1.221: a `--resume` respawn restarts the
+/// counter at the new process's own spend), so reporting it raw makes the
+/// "session cost" fall back to one process's spend after every F-4 wake / app
+/// restart. The ledger re-baselines at each process (re)start — `base` absorbs
+/// the finished process's final counter (or, on a fresh backend, the persisted
+/// cumulative seeded via `SessionConfig.initial_cost_usd`) — and every costed
+/// `UsageDelta` is rewritten to `base + raw` before broadcast, so downstream
+/// consumers (the usage indicator, the persisted snapshot's overwrite-merge)
+/// only ever see a monotonic session-cumulative figure.
+#[derive(Debug, Default)]
+struct CostLedger {
+    /// USD the conversation had already spent BEFORE the current process run.
+    base: f64,
+    /// The current process's latest raw `total_cost_usd` report.
+    last_raw: f64,
+}
+
 /// Shared state the reader task drains into — held by the backend, cloned into
 /// each reader (the live one + every post-wake one). Grouped so `spawn` and
 /// `wake_handle` start identical readers without a 7-arg call duplicated twice.
@@ -524,6 +542,10 @@ struct ClaudeReaderState {
     /// `sniff_set_config_reject` can surface a rejection as a `Notice{Warning}`
     /// (shared Arc with `ClaudeSessionBackend.pending_set_config`).
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// Session-cumulative cost ledger (see [`CostLedger`]): survives F-4 wake
+    /// respawns so a new process's restarted `total_cost_usd` counter is reported
+    /// as `base + raw`, never raw alone.
+    cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
 }
 
 /// Spawn a claude stdout reader over `stdout`/`io` using the shared state. Used
@@ -535,6 +557,22 @@ fn start_claude_reader(
     io: Arc<dyn AgentIo>,
 ) -> tokio::task::JoinHandle<()> {
     let state = state.clone();
+    // Every reader start is a process (re)start, where claude's PROCESS-cumulative
+    // `total_cost_usd` counter restarts at zero — fold the finished process's final
+    // counter into the session base so subsequent reports stay session-cumulative.
+    // The initial spawn is a harmless no-op (last_raw is still 0).
+    {
+        let mut ledger = state.cost_ledger.lock().unwrap_or_else(|e| e.into_inner());
+        if ledger.last_raw > 0.0 {
+            ledger.base += ledger.last_raw;
+            ledger.last_raw = 0.0;
+            tracing::debug!(
+                session_id = %state.session_id,
+                cost_base_usd = ledger.base,
+                "claude cost ledger re-baselined for a process respawn"
+            );
+        }
+    }
     tokio::spawn(async move {
         reader_task(
             state.session_id,
@@ -549,6 +587,7 @@ fn start_claude_reader(
             state.turn_in_flight,
             state.current_mode_override,
             state.pending_set_config,
+            state.cost_ledger,
         )
         .await;
     })
@@ -596,6 +635,24 @@ impl ClaudeSessionBackend {
             None => (None, None),
         };
 
+        // Seed the cost ledger with the conversation's persisted cumulative cost
+        // (a resumed conversation on a FRESH backend instance — app restart /
+        // conversation reopen — where the in-memory ledger of the previous
+        // instance is gone). Production-diagnosable at info: one line per open,
+        // and "the indicator jumped down after a restart" hinges on this seed.
+        let initial_cost_usd = config.initial_cost_usd.unwrap_or(0.0);
+        if initial_cost_usd > 0.0 {
+            tracing::info!(
+                session_id = %session_id,
+                cost_base_usd = initial_cost_usd,
+                "claude cost ledger seeded from the persisted session cost"
+            );
+        }
+        let cost_ledger = Arc::new(std::sync::Mutex::new(CostLedger {
+            base: initial_cost_usd,
+            last_raw: 0.0,
+        }));
+
         let reader_state = ClaudeReaderState {
             session_id: session_id.clone(),
             turn_gen: turn_gen.clone(),
@@ -607,6 +664,7 @@ impl ClaudeSessionBackend {
             turn_in_flight: turn_in_flight.clone(),
             current_mode_override: current_mode_override.clone(),
             pending_set_config: pending_set_config.clone(),
+            cost_ledger,
         };
         let reader = start_claude_reader(&reader_state, stdout, io.clone());
 
@@ -1090,6 +1148,7 @@ async fn reader_task(
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
     current_mode_override: Arc<std::sync::Mutex<Option<String>>>,
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
 ) {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
@@ -1227,7 +1286,22 @@ async fn reader_task(
                 // apart at the wire. Done on the RAW frame.
                 sniff_replay_prompt_ack(v, &event_tx, &session_id, cur_gen);
             }
-            for ev in events {
+            for mut ev in events {
+                // Cost ledger: claude's `total_cost_usd` is PROCESS-cumulative, so a
+                // costed report is rewritten to the SESSION-cumulative `base + raw`
+                // (see CostLedger). `last_raw` is recorded on EVERY costed frame —
+                // even ones downstream discards (a zero-token /compact turn) — so the
+                // re-baseline at the next respawn folds in the true final counter.
+                // A frame that carried no cost stays `None`: fabricating `Some(base)`
+                // would masquerade as a fresh agent report downstream.
+                if let SessionEvent::UsageDelta {
+                    cost_usd: Some(raw), ..
+                } = &mut ev
+                {
+                    let mut ledger = cost_ledger.lock().unwrap_or_else(|e| e.into_inner());
+                    ledger.last_raw = *raw;
+                    *raw += ledger.base;
+                }
                 // F-4: a terminal clears the turn-active flag so the idle
                 // timer may suspend the now-idle process (it was held
                 // resident for the whole turn). Cleared BEFORE the broadcast
@@ -2653,6 +2727,26 @@ impl ClaudeSessionBackend {
             cli_program: None,
         };
         Self::spawn(session_id, ClaudeAdapter::new(), io, SessionConfig::default(), wake).await
+    }
+
+    /// Test-support seam: `build_with_io` with a caller-supplied `SessionConfig`
+    /// (e.g. `initial_cost_usd` for the cost-ledger seed tests).
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn build_with_io_config(
+        session_id: impl Into<String>,
+        io: Box<dyn AgentIo>,
+        config: SessionConfig,
+    ) -> Self {
+        let session_id = session_id.into();
+        let wake = ClaudeWakeRecipe {
+            spawner: Arc::new(crate::testing::FakeSpawner::new()),
+            claude_session_id: session_id.clone(),
+            cwd: None,
+            extra_args: Vec::new(),
+            env: Vec::new(),
+            cli_program: None,
+        };
+        Self::spawn(session_id, ClaudeAdapter::new(), io, config, wake).await
     }
 
     /// Test-support seam: build a SUSPENDABLE backend over an injected `AgentIo`,
@@ -5040,6 +5134,107 @@ mod tests {
             spec.args
         );
         drop(backend); // idle timer + (Dormant) controller tear down cleanly
+    }
+
+    /// Await the next `UsageDelta` on the event stream and return its `cost_usd`.
+    async fn next_usage_cost(events: &mut BoxStream<'static, SessionEnvelope>) -> Option<f64> {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::UsageDelta { cost_usd, .. } = env.event {
+                    return cost_usd;
+                }
+            }
+            panic!("event stream closed before a UsageDelta arrived");
+        })
+        .await
+        .expect("timed out waiting for a UsageDelta")
+    }
+
+    /// claude's `total_cost_usd` is PROCESS-cumulative, not session-cumulative
+    /// (live-captured 2.1.221: two turns in one process report 0.250686 →
+    /// 0.278994, then a `--resume` respawn reports 0.028596 — the counter
+    /// restarts at the new process's own spend). The backend must re-baseline its
+    /// cost ledger on every process (re)start so the broadcast UsageDelta stays
+    /// SESSION-cumulative — otherwise a wake respawn makes the usage indicator
+    /// (and the persisted snapshot, which merges cost by overwrite) fall from the
+    /// real total to the last turn's own cost.
+    #[tokio::test]
+    async fn usage_cost_accumulates_across_process_respawn() {
+        let frame1 = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":2,"output_tokens":23},"total_cost_usd":0.25}"#,
+            "\n"
+        );
+        // Gate the fixture so the subscription is wired before the frame flows
+        // (broadcast does not replay to late subscribers).
+        let fake1 = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(frame1.as_bytes().to_vec());
+        let release1 = fake1.stdout_releaser();
+        let backend = ClaudeSessionBackend::build_with_io("cost-accum", Box::new(fake1)).await;
+        let mut events = backend.events();
+        release1();
+        let first = next_usage_cost(&mut events).await.expect("first turn carries a cost");
+        assert!(
+            (first - 0.25).abs() < 1e-9,
+            "process 1 reports its own cumulative cost, got {first}"
+        );
+
+        // Simulate the F-4 wake respawn: a NEW process whose counter restarts at
+        // its own spend. Drives the exact reader entry point `wake_handle` uses
+        // (start_claude_reader over the SAME shared reader_state).
+        let frame2 = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":2,"output_tokens":18},"total_cost_usd":0.03}"#,
+            "\n"
+        );
+        let fake2 = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(frame2.as_bytes().to_vec());
+        let release2 = fake2.stdout_releaser();
+        let io2: Arc<dyn AgentIo> = Arc::from(Box::new(fake2) as Box<dyn AgentIo>);
+        let (_stdin2, stdout2) = io2.take_stdio().await.expect("fake stdio");
+        let _reader2 = start_claude_reader(&backend.reader_state, Some(stdout2), io2);
+        release2();
+        let second = next_usage_cost(&mut events).await.expect("second turn carries a cost");
+        assert!(
+            (second - 0.28).abs() < 1e-9,
+            "a respawned process restarts claude's counter; the ledger must report base+raw (0.25+0.03), got {second}"
+        );
+    }
+
+    /// App restart loses the in-memory ledger, so the orchestration layer seeds
+    /// `SessionConfig.initial_cost_usd` from the persisted usage snapshot. The
+    /// backend must (a) add that base to every costed report and (b) NEVER
+    /// fabricate a cost onto a frame that carried none (a fabricated
+    /// `Some(base)` would masquerade as a fresh agent report downstream).
+    #[tokio::test]
+    async fn initial_cost_seed_offsets_reports_and_is_not_fabricated() {
+        let frames = concat!(
+            // frame 1: no total_cost_usd → cost must stay None even with a base
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"a","#,
+            r#""usage":{"input_tokens":2,"output_tokens":3}}"#,
+            "\n",
+            // frame 2: the process's own cumulative cost rides on top of the seed
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"b","#,
+            r#""usage":{"input_tokens":2,"output_tokens":4},"total_cost_usd":0.1}"#,
+            "\n"
+        );
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(frames.as_bytes().to_vec());
+        let release = fake.stdout_releaser();
+        let config = SessionConfig {
+            initial_cost_usd: Some(6.0),
+            ..Default::default()
+        };
+        let backend = ClaudeSessionBackend::build_with_io_config("cost-seed", Box::new(fake), config).await;
+        let mut events = backend.events();
+        release();
+        let first = next_usage_cost(&mut events).await;
+        assert_eq!(
+            first, None,
+            "a costless frame must not have a cost fabricated from the base"
+        );
+        let second = next_usage_cost(&mut events).await.expect("costed frame");
+        assert!(
+            (second - 6.1).abs() < 1e-9,
+            "resume seed must offset the process-local counter (6.0+0.1), got {second}"
+        );
     }
 
     /// #103: `config.spawn_env` (the cc-switch provider env the app registry fills for
