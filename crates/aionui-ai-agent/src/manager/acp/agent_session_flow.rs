@@ -10,8 +10,8 @@ use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::SessionId as DomainSessionId;
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::v1::{
-    AuthMethod, ContentBlock, ForkSessionRequest, LoadSessionRequest, PromptRequest, PromptResponse, SessionId,
-    StopReason, Usage, UsageUpdate,
+    AudioContent, AuthMethod, ContentBlock, ForkSessionRequest, ImageContent, LoadSessionRequest, PromptRequest,
+    PromptResponse, SessionId, StopReason, Usage, UsageUpdate,
 };
 use aionui_api_types::SlashCommandItem;
 use serde_json::Value;
@@ -329,7 +329,10 @@ impl AcpAgentManager {
             .ok_or_else(|| AgentError::internal("Cannot prompt: no session ID available"))
             .map_err(AcpSendFailure::from)?;
 
-        let content = data.content.clone();
+        let prompt_blocks = {
+            use crate::agent_task::IAgentTask as _;
+            build_prompt_blocks(data, self.prompt_media_caps()).await
+        };
 
         // Subscribe BEFORE emitting Start so we can observe every event
         // produced during this turn. Used after `prompt()` returns to detect
@@ -348,10 +351,7 @@ impl AcpAgentManager {
 
         let prompt_response = self
             .protocol
-            .prompt(PromptRequest::new(
-                SessionId::new(sid),
-                vec![ContentBlock::from(content)],
-            ))
+            .prompt(PromptRequest::new(SessionId::new(sid), prompt_blocks))
             .await
             .map_err(AcpSendFailure::from)?;
 
@@ -489,6 +489,46 @@ impl AcpAgentManager {
 ///
 /// `Lagged` is treated as non-empty: the broadcast buffer overflowed,
 /// meaning many events flew by — definitely not an empty turn.
+/// Build the `session/prompt` content blocks: a text block plus one native
+/// Image/Audio block per attachment the agent's declared `promptCapabilities`
+/// accept. Attachments the agent cannot take (or that fail to read) stay in
+/// the text block's `[[AION_FILES]]` path list, byte-identical to the
+/// pre-multimodal wire form.
+async fn build_prompt_blocks(data: &SendMessageData, caps: crate::types::PromptMediaCaps) -> Vec<ContentBlock> {
+    use base64::Engine as _;
+
+    let partition = crate::media::partition_media(&data.content, &data.files, caps);
+    if partition.media.is_empty() {
+        return vec![ContentBlock::from(partition.content)];
+    }
+
+    let mut media_blocks = Vec::with_capacity(partition.media.len());
+    for attachment in &partition.media {
+        // Any read failure degrades the WHOLE prompt back to the plain text
+        // form: partial degradation would need the marker block rebuilt a
+        // second time, and a file vanishing between classify and read is too
+        // rare to warrant that complexity.
+        let Some(bytes) = crate::media::read_media_bytes(attachment).await else {
+            warn!(path = %attachment.path, "media attachment read failed; falling back to path-only prompt");
+            return vec![ContentBlock::from(data.content.clone())];
+        };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        media_blocks.push(match attachment.kind {
+            crate::media::MediaKind::Image => {
+                let mut image = ImageContent::new(encoded, attachment.mime.clone());
+                image.uri = Some(format!("file://{}", attachment.path));
+                ContentBlock::Image(image)
+            }
+            crate::media::MediaKind::Audio => ContentBlock::Audio(AudioContent::new(encoded, attachment.mime.clone())),
+        });
+    }
+
+    let mut blocks = Vec::with_capacity(media_blocks.len() + 1);
+    blocks.push(ContentBlock::from(partition.content));
+    blocks.extend(media_blocks);
+    blocks
+}
+
 /// Thin wrapper retained for the existing empty-turn detection tests; the
 /// production path now uses [`drain_turn_observations`] to observe the dialect
 /// signal alongside emptiness in a single drain.
@@ -747,7 +787,8 @@ mod tests {
     use crate::manager::acp::{AcpSession, AcpSessionEvent};
     use crate::protocol::error::AcpError;
     use crate::shared_kernel::SessionId as DomainSessionId;
-    use agent_client_protocol::schema::v1::{AgentCapabilities, Cost, PromptResponse, Usage, UsageUpdate};
+    use crate::types::SendMessageData;
+    use agent_client_protocol::schema::v1::{AgentCapabilities, ContentBlock, Cost, PromptResponse, Usage, UsageUpdate};
 
     use super::{end_turn_usage_frame, end_turn_usage_frame_from_response, preserve_known_window};
 
@@ -1473,5 +1514,110 @@ mod tests {
         assert_eq!(error.code, Some(AgentErrorCode::UserLlmProviderBillingRequired));
         assert_eq!(error.retryable, Some(false));
         assert_eq!(error.feedback_recommended, Some(false));
+    }
+
+    #[tokio::test]
+    async fn prompt_blocks_stay_single_text_without_caps() {
+        let dir = std::env::temp_dir().join("aionui-acp-prompt-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("plain.png");
+        std::fs::write(&img, b"fakepng").unwrap();
+        let img = img.to_string_lossy().into_owned();
+        let content = format!(
+            "hi\n\n{}\n{img}",
+            aionui_common::constants::AIONUI_FILES_MARKER
+        );
+        let data = SendMessageData {
+            content: content.clone(),
+            msg_id: "m1".into(),
+            turn_id: None,
+            files: vec![img],
+            inject_skills: vec![],
+        };
+        let blocks = super::build_prompt_blocks(&data, crate::types::PromptMediaCaps::default()).await;
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::Text(text) => assert_eq!(text.text, content),
+            other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_blocks_carry_native_image_when_capable() {
+        use base64::Engine as _;
+        let dir = std::env::temp_dir().join("aionui-acp-prompt-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("native.png");
+        std::fs::write(&img, b"fakepng").unwrap();
+        let img = img.to_string_lossy().into_owned();
+        let pdf = dir.join("doc.pdf");
+        std::fs::write(&pdf, b"fakepdf").unwrap();
+        let pdf = pdf.to_string_lossy().into_owned();
+        let content = format!(
+            "look\n\n{}\n{img}\n{pdf}",
+            aionui_common::constants::AIONUI_FILES_MARKER
+        );
+        let data = SendMessageData {
+            content,
+            msg_id: "m2".into(),
+            turn_id: None,
+            files: vec![img.clone(), pdf.clone()],
+            inject_skills: vec![],
+        };
+        let caps = crate::types::PromptMediaCaps { image: true, audio: false };
+        let blocks = super::build_prompt_blocks(&data, caps).await;
+        assert_eq!(blocks.len(), 2);
+        match &blocks[0] {
+            ContentBlock::Text(text) => {
+                // Image path left the marker list; the pdf stays.
+                assert_eq!(
+                    text.text,
+                    format!("look\n\n{}\n{pdf}", aionui_common::constants::AIONUI_FILES_MARKER)
+                );
+            }
+            other => panic!("expected text block, got {other:?}"),
+        }
+        match &blocks[1] {
+            ContentBlock::Image(image) => {
+                assert_eq!(image.mime_type, "image/png");
+                assert_eq!(
+                    image.data,
+                    base64::engine::general_purpose::STANDARD.encode(b"fakepng")
+                );
+                assert_eq!(image.uri.as_deref(), Some(format!("file://{img}").as_str()));
+            }
+            other => panic!("expected image block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_blocks_fall_back_to_paths_when_read_fails() {
+        let dir = std::env::temp_dir().join("aionui-acp-prompt-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("vanishing.png");
+        std::fs::write(&img, b"fakepng").unwrap();
+        let img_path = img.to_string_lossy().into_owned();
+        let content = format!(
+            "gone\n\n{}\n{img_path}",
+            aionui_common::constants::AIONUI_FILES_MARKER
+        );
+        let data = SendMessageData {
+            content: content.clone(),
+            msg_id: "m3".into(),
+            turn_id: None,
+            files: vec![img_path.clone()],
+            inject_skills: vec![],
+        };
+        let caps = crate::types::PromptMediaCaps { image: true, audio: false };
+        // Classification uses fs::metadata inside partition_media, which runs
+        // inside build_prompt_blocks — so remove the file first and verify the
+        // whole prompt degrades to the original text form.
+        std::fs::remove_file(&img).unwrap();
+        let blocks = super::build_prompt_blocks(&data, caps).await;
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::Text(text) => assert_eq!(text.text, content),
+            other => panic!("expected text block, got {other:?}"),
+        }
     }
 }
