@@ -94,6 +94,57 @@ async fn apply_child_names_stats_only_named_children() {
 }
 
 #[tokio::test]
+async fn apply_child_names_detects_rewritten_file_over_real_fs() {
+    // End-to-end over a real filesystem, which the synthetic `diff` tests cannot
+    // cover: it is `fact_of` that must actually read the timestamp off the
+    // metadata it already fetched. Were mtime left unpopulated, every test above
+    // would still pass while nothing was ever detected in production.
+    //
+    // The new mtime is set explicitly rather than by writing twice: some
+    // filesystems record whole seconds only, so back-to-back writes can leave the
+    // timestamp untouched and the assertion would flake. `File::set_modified` is
+    // stable and available on all supported targets.
+    let (mut tree, dir) = real_tree();
+    let path = dir.path().join("a.txt");
+    std::fs::write(&path, b"before").unwrap();
+    let c = canon(dir.path());
+    let baseline = tree.mount(c.as_str()).await.unwrap();
+    let mtime_before = baseline.entries[0].1.mtime_ms.expect("real fs supplies an mtime");
+
+    std::fs::write(&path, b"after").unwrap();
+    let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(bumped)
+        .unwrap();
+
+    let delta = tree
+        .apply(c.as_str(), Hint::ChildNames(vec!["a.txt".to_owned()]))
+        .await
+        .unwrap()
+        .expect("changes");
+    assert_eq!(
+        delta.changes,
+        vec![Change::Modified {
+            name: "a.txt".to_owned()
+        }]
+    );
+
+    // The node's stored fact advanced, so re-applying with nothing further changed
+    // is silent — a Modified that failed to update state would fire on every event.
+    let after = tree.snapshot(c.as_str()).expect("mounted");
+    assert_ne!(after.entries[0].1.mtime_ms.expect("mtime"), mtime_before);
+    assert!(
+        tree.apply(c.as_str(), Hint::ChildNames(vec!["a.txt".to_owned()]))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn apply_child_names_removes_deleted_subdir() {
     // The parent-reconcile half of the filetree-stale fix: once the watcher
     // attributes a subdir deletion to the PARENT (see local_watcher_test), the
@@ -223,19 +274,44 @@ async fn apply_kind_change_is_remove_plus_add() {
 // same-name kind-change branch (covered by `apply_kind_change_is_remove_plus_add`)
 // and requires its own coverage.
 
+/// Baseline mtime for facts whose timestamp is irrelevant to the assertion.
+/// Shared by both sides of a diff so it never accidentally reads as modified.
+const MTIME: i64 = 1_700_000_000_000;
+
 fn file_fact(inode: u64) -> EntryFact {
+    file_fact_at(inode, Some(MTIME))
+}
+
+/// `file_fact` with an explicit mtime — `None` models a provider/filesystem that
+/// cannot supply one.
+fn file_fact_at(inode: u64, mtime_ms: Option<i64>) -> EntryFact {
     EntryFact {
         kind: Kind::File,
         inode,
         symlink_target: None,
+        mtime_ms,
     }
 }
 
 fn dir_fact(inode: u64) -> EntryFact {
+    dir_fact_at(inode, Some(MTIME))
+}
+
+fn dir_fact_at(inode: u64, mtime_ms: Option<i64>) -> EntryFact {
     EntryFact {
         kind: Kind::Dir,
         inode,
         symlink_target: None,
+        mtime_ms,
+    }
+}
+
+fn symlink_fact_at(inode: u64, mtime_ms: Option<i64>) -> EntryFact {
+    EntryFact {
+        kind: Kind::Symlink,
+        inode,
+        symlink_target: Some("target".to_owned()),
+        mtime_ms,
     }
 }
 
@@ -298,6 +374,149 @@ fn diff_same_nonzero_inode_synthesizes_rename() {
             from: "a".to_owned(),
             to: "b".to_owned()
         }]
+    );
+}
+
+// ── Pure `diff` reconciliation: content-modify detection ───────────────────
+//
+// A surviving file whose mtime moved is `Change::Modified`. The rules under test
+// are all one-directional on purpose: this signal only lights up a refresh
+// affordance, so failing to report is tolerable while reporting spuriously is
+// not. Each test below pins one way that asymmetry must hold.
+
+#[test]
+fn diff_file_mtime_change_is_modified() {
+    // Same name, same kind, same inode — only the timestamp moved. The listing is
+    // unchanged, so nothing else may be emitted alongside it.
+    let old = BTreeMap::from([("a.txt".to_owned(), file_fact_at(7, Some(MTIME)))]);
+    let fresh = BTreeMap::from([("a.txt".to_owned(), file_fact_at(7, Some(MTIME + 1)))]);
+
+    assert_eq!(
+        diff(&old, &fresh),
+        vec![Change::Modified {
+            name: "a.txt".to_owned()
+        }]
+    );
+}
+
+#[test]
+fn diff_identical_mtime_is_no_change() {
+    // The idempotence guard: re-reconciling an untouched level must stay silent,
+    // otherwise every apply would emit a delta for every entry.
+    let old = BTreeMap::from([("a.txt".to_owned(), file_fact(7))]);
+    let fresh = BTreeMap::from([("a.txt".to_owned(), file_fact(7))]);
+
+    assert_eq!(diff(&old, &fresh), vec![]);
+}
+
+#[test]
+fn diff_unknown_mtime_on_either_side_is_never_modified() {
+    // `None` means "cannot tell", never "changed". Both directions matter: the
+    // old→new direction is the first reconcile after a provider starts supplying
+    // timestamps, and new→old is a provider that stopped. Neither may report the
+    // whole level as modified.
+    let known = file_fact_at(7, Some(MTIME));
+    let unknown = file_fact_at(7, None);
+
+    for (old_fact, fresh_fact) in [
+        (unknown.clone(), known.clone()),
+        (known.clone(), unknown.clone()),
+        (unknown.clone(), unknown.clone()),
+    ] {
+        let old = BTreeMap::from([("a.txt".to_owned(), old_fact)]);
+        let fresh = BTreeMap::from([("a.txt".to_owned(), fresh_fact)]);
+        assert_eq!(diff(&old, &fresh), vec![], "unknown mtime must not report modified");
+    }
+}
+
+#[test]
+fn diff_dir_and_symlink_mtime_change_is_not_modified() {
+    // Only files carry a content-modify signal. A directory's mtime also moves
+    // when a child is created or deleted — that is already expressed by the
+    // child's own Added/Removed change, so reporting the parent too would be
+    // duplicate noise. A symlink's mtime describes the link itself, not the
+    // content a subscriber would re-read.
+    let old = BTreeMap::from([
+        ("sub".to_owned(), dir_fact_at(7, Some(MTIME))),
+        ("link".to_owned(), symlink_fact_at(8, Some(MTIME))),
+    ]);
+    let fresh = BTreeMap::from([
+        ("sub".to_owned(), dir_fact_at(7, Some(MTIME + 1))),
+        ("link".to_owned(), symlink_fact_at(8, Some(MTIME + 1))),
+    ]);
+
+    assert_eq!(diff(&old, &fresh), vec![]);
+}
+
+#[test]
+fn diff_kind_change_with_moved_mtime_is_remove_add_not_modified() {
+    // A file replaced by a same-named directory changes kind *and* mtime. Kind
+    // change wins: Removed + Added. Emitting Modified as well would tell a
+    // subscriber to re-read a path that is no longer a file.
+    let old = BTreeMap::from([("x".to_owned(), file_fact_at(7, Some(MTIME)))]);
+    let fresh = BTreeMap::from([("x".to_owned(), dir_fact_at(9, Some(MTIME + 1)))]);
+
+    let mut changes = diff(&old, &fresh);
+    changes.sort_by_key(|c| format!("{c:?}"));
+    assert_eq!(
+        changes,
+        vec![
+            Change::Added {
+                name: "x".to_owned(),
+                kind: Kind::Dir
+            },
+            Change::Removed { name: "x".to_owned() },
+        ]
+    );
+}
+
+#[test]
+fn diff_rename_with_moved_mtime_stays_a_single_rename() {
+    // A rename does not survive under its old name, so it is not a Modified
+    // candidate — even when the move also bumped the timestamp. Guards against
+    // a future refactor matching Modified by inode rather than by surviving name.
+    let old = BTreeMap::from([("a".to_owned(), file_fact_at(42, Some(MTIME)))]);
+    let fresh = BTreeMap::from([("b".to_owned(), file_fact_at(42, Some(MTIME + 1)))]);
+
+    assert_eq!(
+        diff(&old, &fresh),
+        vec![Change::Renamed {
+            from: "a".to_owned(),
+            to: "b".to_owned()
+        }]
+    );
+}
+
+#[test]
+fn diff_reports_modified_alongside_other_changes() {
+    // A debounce window batches unrelated changes to one level: one file rewritten,
+    // one created, one deleted. All three must surface in the same batch — a
+    // Modified must not mask or be masked by its neighbours.
+    let old = BTreeMap::from([
+        ("kept.txt".to_owned(), file_fact_at(1, Some(MTIME))),
+        ("gone.txt".to_owned(), file_fact_at(2, Some(MTIME))),
+    ]);
+    let fresh = BTreeMap::from([
+        ("kept.txt".to_owned(), file_fact_at(1, Some(MTIME + 1))),
+        ("new.txt".to_owned(), file_fact_at(3, Some(MTIME))),
+    ]);
+
+    let mut changes = diff(&old, &fresh);
+    changes.sort_by_key(|c| format!("{c:?}"));
+    assert_eq!(
+        changes,
+        vec![
+            Change::Added {
+                name: "new.txt".to_owned(),
+                kind: Kind::File
+            },
+            Change::Modified {
+                name: "kept.txt".to_owned()
+            },
+            Change::Removed {
+                name: "gone.txt".to_owned()
+            },
+        ]
     );
 }
 

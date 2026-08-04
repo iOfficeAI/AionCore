@@ -383,6 +383,7 @@ async fn fan_out_snapshot_is_scoped_and_pe_keyed_per_subscriber() {
                 kind: Kind::File,
                 inode: 1,
                 symlink_target: None,
+                mtime_ms: Some(1_700_000_000_000),
             },
         )],
     };

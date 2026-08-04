@@ -206,7 +206,8 @@ pub fn delta_params(delta: &DeltaBatch, target: &ResourceRef) -> Value {
     })
 }
 
-/// One reconciled change → tagged wire object (`op` = added/removed/renamed).
+/// One reconciled change → tagged wire object (`op` = added/removed/renamed/
+/// modified).
 fn change_to_wire(change: &Change) -> Value {
     match change {
         Change::Added { name, kind } => json!({
@@ -222,6 +223,13 @@ fn change_to_wire(change: &Change) -> Value {
             "op": "renamed",
             "from": from,
             "to": to,
+        }),
+        // No mtime on the wire, by design — see `Change::Modified`. Adding one op
+        // is a backward-compatible extension: clients ignore ops they do not know,
+        // so this needs no protocol version bump and no lockstep release.
+        Change::Modified { name } => json!({
+            "op": "modified",
+            "name": name,
         }),
     }
 }
