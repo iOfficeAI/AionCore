@@ -309,6 +309,9 @@ pub struct ConversationRowUpdate {
     /// Project binding (project-bind side branch); `Some` sets the column.
     pub project_id: Option<String>,
     pub folder_id: Option<String>,
+    /// Origin of `name` when this update also renames: `Some("user"|"agent")`
+    /// sets the column, `None` leaves it untouched. Never cleared back to NULL.
+    pub name_source: Option<String>,
 }
 
 /// Partial update payload for a message row.
