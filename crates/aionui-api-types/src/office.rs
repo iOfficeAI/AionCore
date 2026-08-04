@@ -20,6 +20,25 @@ pub struct StartPreviewRequest {
     pub file: Option<ChatFileRef>,
 }
 
+/// `POST /api/{word|excel|ppt}-preview/refresh` body — force the running watch
+/// server to re-read this document from disk.
+///
+/// Same shape as [`StartPreviewRequest`]: the caller already holds that payload
+/// for the tab it is refreshing, and the backend has to resolve the identity to
+/// the same absolute path `start` keyed its session on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RefreshPreviewRequest {
+    /// Legacy device-path identity. Retained for the frontend migration window;
+    /// used when `file` is absent.
+    pub file_path: String,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// Preferred identity: a [`ChatFileRef`] the backend resolves to an absolute
+    /// path. When present it takes precedence over `file_path`.
+    #[serde(default)]
+    pub file: Option<ChatFileRef>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct StopPreviewRequest {
     /// Legacy device-path identity. Retained for the frontend migration window;
@@ -40,6 +59,20 @@ pub struct StopPreviewRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PreviewUrlResponse {
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `POST /api/{word|excel|ppt}-preview/refresh` response.
+///
+/// A failed refresh is reported as `ok: false` with a code rather than an HTTP
+/// error: the watch server keeps serving the current document when a reload
+/// fails, so the tab the user is looking at is still intact and the frontend only
+/// needs to say the refresh did not take.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RefreshPreviewResponse {
+    pub ok: bool,
+    /// Stable code for the frontend's existing office-error copy; absent on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

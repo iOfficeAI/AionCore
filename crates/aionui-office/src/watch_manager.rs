@@ -294,6 +294,26 @@ impl OfficecliWatchManager {
         self.sessions.len()
     }
 
+    /// Port of this user's live watch for `file_path`, or `None` when no such
+    /// session exists (never started, already stopped, or the child died).
+    ///
+    /// The inverse of the `is_active_port*` family above, which asks "is this port
+    /// live" — the refresh endpoint arrives with a document and needs the port to
+    /// reach its server on.
+    ///
+    /// `file_path` goes through the same [`resolve_path`] the start path uses before
+    /// keying, so a caller may pass any spelling of the path. Skipping that step
+    /// would make every lookup miss whenever the caller's spelling differed from the
+    /// canonical one, and the failure would look like "no session" rather than a
+    /// key mismatch.
+    pub(crate) fn active_port_for(&self, user_id: &str, file_path: &str, doc_type: DocType) -> Option<u16> {
+        let resolved = resolve_path(file_path).ok()?;
+        let entry = self.sessions.get(&session_key(user_id, &resolved, doc_type))?;
+        // Same liveness test as `start_for_user`: an aborted or dead session still
+        // occupies the map until its next start, and its port serves nothing.
+        (!entry.aborted && entry.process.is_alive()).then_some(entry.port)
+    }
+
     async fn maybe_check_update(&self, doc_type: DocType) {
         let mut last = self.last_version_check.lock().await;
         let should_check = match *last {
@@ -1106,5 +1126,92 @@ mod tests {
     fn resolve_path_nonexistent_returns_original() {
         let result = resolve_path("/nonexistent/path/test.docx").unwrap();
         assert_eq!(result, "/nonexistent/path/test.docx");
+    }
+    // -- active_port_for: document → serving port ---------------------------
+
+    #[tokio::test]
+    async fn active_port_for_finds_a_live_session() {
+        let spawner = Arc::new(MockSpawner::new());
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let mgr = make_manager(Arc::clone(&spawner), Arc::clone(&broadcaster));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doc.docx");
+        std::fs::write(&file, b"x").unwrap();
+        let path = file.to_str().unwrap();
+
+        let port = mgr.start_for_user("u1", path, DocType::Word).await.unwrap();
+
+        assert_eq!(
+            mgr.active_port_for("u1", path, DocType::Word),
+            Some(port),
+            "the port serving this document must be reachable from its path"
+        );
+    }
+
+    /// The lookup has to normalize the path the same way `start_for_user` does before
+    /// keying. Without that, a caller spelling the path differently — which is the
+    /// normal case, since the refresh request carries whatever the tab holds — would
+    /// miss, and the miss would read as "no session" rather than a key mismatch.
+    #[tokio::test]
+    async fn active_port_for_normalizes_the_path_like_start_does() {
+        let spawner = Arc::new(MockSpawner::new());
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let mgr = make_manager(Arc::clone(&spawner), Arc::clone(&broadcaster));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doc.docx");
+        std::fs::write(&file, b"x").unwrap();
+
+        let port = mgr
+            .start_for_user("u1", file.to_str().unwrap(), DocType::Word)
+            .await
+            .unwrap();
+
+        // Same file, spelled with a redundant `.` segment.
+        let indirect = dir.path().join(".").join("doc.docx");
+        assert_eq!(
+            mgr.active_port_for("u1", indirect.to_str().unwrap(), DocType::Word),
+            Some(port)
+        );
+    }
+
+    #[tokio::test]
+    async fn active_port_for_is_none_for_other_users_doc_types_and_unknown_paths() {
+        let spawner = Arc::new(MockSpawner::new());
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let mgr = make_manager(Arc::clone(&spawner), Arc::clone(&broadcaster));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doc.docx");
+        std::fs::write(&file, b"x").unwrap();
+        let path = file.to_str().unwrap();
+
+        mgr.start_for_user("u1", path, DocType::Word).await.unwrap();
+
+        // Another user's session must not be reachable — the port would let them
+        // drive a document they never opened.
+        assert_eq!(mgr.active_port_for("u2", path, DocType::Word), None);
+        // Same path, different doc type is a different session.
+        assert_eq!(mgr.active_port_for("u1", path, DocType::Excel), None);
+        // Never-started document.
+        let other = dir.path().join("absent.docx");
+        assert_eq!(mgr.active_port_for("u1", other.to_str().unwrap(), DocType::Word), None);
+    }
+
+    /// A stopped session leaves nothing to refresh. Returning its old port would
+    /// point the switch call at a port serving nothing — or, worse, at whatever took
+    /// it over.
+    #[tokio::test]
+    async fn active_port_for_is_none_after_stop() {
+        let spawner = Arc::new(MockSpawner::new());
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let mgr = make_manager(Arc::clone(&spawner), Arc::clone(&broadcaster));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doc.docx");
+        std::fs::write(&file, b"x").unwrap();
+        let path = file.to_str().unwrap();
+
+        mgr.start_for_user("u1", path, DocType::Word).await.unwrap();
+        mgr.stop_for_user("u1", path, DocType::Word).await;
+
+        assert_eq!(mgr.active_port_for("u1", path, DocType::Word), None);
     }
 }
