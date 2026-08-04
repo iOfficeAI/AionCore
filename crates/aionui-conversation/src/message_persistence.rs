@@ -53,6 +53,7 @@ impl ConversationService {
             status: Some("error".into()),
             hidden: false,
             created_at: now_ms(),
+            backend_turn_id: None,
         };
 
         if let Err(store_err) = self.conversation_repo().insert_message(user_id, &row).await {

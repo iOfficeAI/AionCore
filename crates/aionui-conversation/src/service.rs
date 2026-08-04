@@ -2959,6 +2959,7 @@ impl ConversationService {
             status: Some("finish".into()),
             hidden: req.hidden,
             created_at: now_ms(),
+            backend_turn_id: None,
         };
         if !self
             .runtime_persistence()
@@ -3085,6 +3086,7 @@ impl ConversationService {
                 status: Some("finish".into()),
                 hidden: request.user_message_hidden,
                 created_at: now_ms(),
+                backend_turn_id: None,
             };
             if self
                 .runtime_persistence()

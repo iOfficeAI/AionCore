@@ -26,4 +26,9 @@ pub struct MessageRow {
     /// Whether this message is hidden (SQLite INTEGER 0/1).
     pub hidden: bool,
     pub created_at: TimestampMs,
+    /// Backend-side turn anchor (codex `Turn.id`), stamped on rows persisted
+    /// while that turn streams. Unrelated to the runtime `turn_<shortid>` ids;
+    /// used to resolve `thread/fork`'s `lastTurnId` when forking mid-history.
+    /// NULL for claude/ACP rows and for rows predating the column.
+    pub backend_turn_id: Option<String>,
 }

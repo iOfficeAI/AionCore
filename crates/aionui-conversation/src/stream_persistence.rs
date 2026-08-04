@@ -178,6 +178,7 @@ impl StreamPersistenceAdapter {
                 status: Some("work".into()),
                 hidden: false,
                 created_at: segment.created_at,
+                backend_turn_id: None,
             };
             if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
                 log_persist_error(&e, "Failed to create streaming text segment");
@@ -221,6 +222,7 @@ impl StreamPersistenceAdapter {
                 status: Some(status.to_owned()),
                 hidden: false,
                 created_at: segment.created_at,
+                backend_turn_id: None,
             };
             if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
                 log_persist_error(&e, "Failed to create finalized text segment");
@@ -312,6 +314,7 @@ impl StreamPersistenceAdapter {
                 status: Some(status.to_owned()),
                 hidden: false,
                 created_at: now_ms(),
+                backend_turn_id: None,
             };
             if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
                 log_persist_error(&e, "Failed to create final fallback message");
@@ -338,6 +341,7 @@ impl StreamPersistenceAdapter {
             status: Some("error".into()),
             hidden: false,
             created_at: now_ms(),
+            backend_turn_id: None,
         };
         if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
             log_persist_error(&e, "Failed to store error message");
@@ -371,6 +375,7 @@ impl StreamPersistenceAdapter {
             status: Some(status.into()),
             hidden: false,
             created_at: now_ms(),
+            backend_turn_id: None,
         };
         if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
             log_persist_error(&e, "Failed to store tip message");
@@ -407,6 +412,7 @@ impl StreamPersistenceAdapter {
             status: Some("finish".into()),
             hidden: false,
             created_at: segment.started_at,
+            backend_turn_id: None,
         };
         if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
             log_persist_error(&e, "Failed to persist thinking message");
@@ -448,6 +454,7 @@ impl StreamPersistenceAdapter {
             status: Some(status.to_owned()),
             hidden: false,
             created_at: now_ms(),
+            backend_turn_id: None,
         };
         if let Err(e) = self.repo.upsert_message(&self.user_id, &row).await {
             error!(
@@ -498,6 +505,7 @@ impl StreamPersistenceAdapter {
             status: Some(status.to_owned()),
             hidden: false,
             created_at: now_ms(),
+            backend_turn_id: None,
         };
         if let Err(e) = self.repo.upsert_message(&self.user_id, &row).await {
             error!(error = %ErrorChain(&e), "Failed to upsert acp_tool_call message");
@@ -573,6 +581,7 @@ impl StreamPersistenceAdapter {
                 status: Some(status.to_owned()),
                 hidden: false,
                 created_at: now_ms(),
+                backend_turn_id: None,
             };
             if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
                 error!(error = %ErrorChain(&e), "Failed to persist tool_group message");

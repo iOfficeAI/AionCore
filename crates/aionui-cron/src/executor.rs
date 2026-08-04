@@ -324,6 +324,7 @@ impl JobExecutor {
             status: Some("finish".into()),
             hidden: false,
             created_at: aionui_common::now_ms(),
+            backend_turn_id: None,
         };
 
         let user_id = self.resolve_target_conversation_user_id(conversation_id).await?;

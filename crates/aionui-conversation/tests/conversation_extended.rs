@@ -145,6 +145,7 @@ fn make_message(conv_id: &str, content: &str, offset_ms: i64) -> MessageRow {
         status: Some("finish".to_string()),
         hidden: false,
         created_at: now_ms() + offset_ms,
+        backend_turn_id: None,
     }
 }
 
@@ -174,6 +175,7 @@ fn make_acp_tool_message(conv_id: &str, id: &str, output: &str, offset_ms: i64) 
         status: Some("finish".to_string()),
         hidden: false,
         created_at: now_ms() + offset_ms,
+        backend_turn_id: None,
     }
 }
 
@@ -637,6 +639,7 @@ async fn t9_5_preview_text_extracts_from_json_content() {
         status: Some("finish".to_string()),
         hidden: false,
         created_at: now_ms(),
+        backend_turn_id: None,
     };
     repo.insert_message(USER_ID, &complex_msg).await.unwrap();
 
