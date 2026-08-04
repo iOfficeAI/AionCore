@@ -280,6 +280,28 @@ pub enum SessionEvent {
         kind: PermissionKind,
     },
 
+    /// A structured question the agent asks the USER (claude `AskUserQuestion`
+    /// via `control_request{can_use_tool}`): its own event, deliberately NOT a
+    /// `Permission` — asking is not authorizing (2026-08-04 design ruling, spec
+    /// `docs/superpowers/specs/2026-08-04-askuserquestion-统一问询设计.md`).
+    /// Enters requires-action via its OWN counter (`waiting_on_question` +1),
+    /// answered by `Command::AnswerAsk` keyed on the same `request_id` (the
+    /// claude control correlation key). `questions` is the tool's raw
+    /// `{questions:[{question, header?, options:[{label, description?}],
+    /// multiSelect?}]}` payload — the SAME shape three independent vendors
+    /// converged on (claude 2.1.178 samples; qwen/grok live captures 2026-08-04),
+    /// so it doubles as the cross-backend contract without a re-mapping layer.
+    /// The reducer never reads it (ref-count on request_id only, §R9).
+    /// ⚠️ TIO-13: question text is user-facing card content, never log at info.
+    Ask {
+        request_id: String,
+        questions: serde_json::Value,
+    },
+    /// The matching resolve for `Ask` (symmetric with `PermissionResolved`,
+    /// counter `waiting_on_question` -1): emitted when the user answers
+    /// (`AnswerAsk`) or claude retracts via `control_cancel_request`.
+    AskResolved { request_id: String },
+
     // ======================================================================
     // ADDITIVE backend-produced / orchestration variants (007 §C2 / §9.0).
     // The reducer takes explicit no-op arms for ALL of these EXCEPT SubagentUpdate
@@ -899,6 +921,8 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | Plan { .. }
         | Permission { .. }
         | PermissionResolved { .. }
+        | Ask { .. }
+        | AskResolved { .. }
         | PromptAccepted { .. }
         | UsageDelta { .. }
         | Provisioning { .. }
@@ -965,6 +989,9 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             Permission { .. } | PermissionResolved { .. } | Detached { .. } | PromptAccepted { .. } => {
                 PersistTier::DisplayAndState
             }
+            // same routing as Permission: the question card is history (display)
+            // AND an open-request the rebuild must re-raise (state).
+            Ask { .. } | AskResolved { .. } => PersistTier::DisplayAndState,
             SubagentUpdate { .. } => PersistTier::DisplayAndState, // roster→display; resumable→Tier2.last_subagents
             Rewound { .. } => PersistTier::State,                  // turn-truncation anchor
             AdapterSpecific { tag, .. } if is_raw_timing(tag) => PersistTier::Ephemeral,

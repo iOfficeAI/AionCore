@@ -220,6 +220,9 @@ impl ChannelMessageService {
             | AgentStreamEvent::Plan(_)
             | AgentStreamEvent::Permission(_)
             | AgentStreamEvent::AcpPermission(_)
+            // IM channels have no interactive question card; the ask stays
+            // pending in the app UI (same treatment as Permission).
+            | AgentStreamEvent::Ask(_)
             | AgentStreamEvent::AcpToolCall(_)
             | AgentStreamEvent::AvailableCommands(_)
             | AgentStreamEvent::SkillSuggest(_)

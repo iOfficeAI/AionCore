@@ -38,6 +38,15 @@ pub enum AgentStreamEvent {
     Plan(PlanEventData),
     Permission(serde_json::Value),
     AcpPermission(AcpPermissionEventData),
+    /// Structured question card (claude AskUserQuestion — `SessionEvent::Ask`).
+    /// Its own frame, NOT an `AcpPermission`: asking is not authorizing
+    /// (2026-08-04 spec). Payload: `{ session_id, request_id, questions }` where
+    /// `questions` is the raw claude `questions[]` array — the cross-vendor shape
+    /// (claude/qwen/grok all converged on it, 2026-08-04 captures):
+    /// `[{question, header?, options:[{label, description?}], multiSelect?}]`.
+    /// Answered via the confirm channel with the FULL per-question answer set;
+    /// wire tag `ask`.
+    Ask(serde_json::Value),
     SkillSuggest(SkillSuggestEventData),
     CronTrigger(CronTriggerEventData),
     AcpModelInfo(serde_json::Value),

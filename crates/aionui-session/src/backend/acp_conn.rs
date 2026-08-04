@@ -2479,6 +2479,10 @@ impl SessionBackend for AcpSessionBackend {
                     turn_gen: self.turn_gen.load(Ordering::SeqCst),
                 })
             }
+            // ACP has no structured-question channel (elicitation unimplemented,
+            // 0/24 live agents emit it — 2026-08-04 sweep); Ask is never raised
+            // here, so an answer has nothing to land on.
+            Command::AnswerAsk { .. } => Err(BackendError::CommandNotSupported { command: "answer_ask" }),
             Command::AnswerAuth { method_id, .. } => {
                 // D2: only when the agent advertised authMethods at initialize
                 // (answer_auth cap dynamically true) do we honor this. ACP auth is a

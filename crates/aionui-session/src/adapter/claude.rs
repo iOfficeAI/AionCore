@@ -52,6 +52,15 @@ pub struct ClaudeAdapter {
     /// a compaction. Spelled exactly like the `modelUsage` keys
     /// (`"claude-opus-5"`), so it selects the right entry directly.
     current_model: Option<String>,
+    /// request_ids of outstanding `AskUserQuestion` can_use_tool requests, so a
+    /// `control_cancel_request` resolves to the RIGHT event: `AskResolved` for a
+    /// question, `PermissionResolved` for a tool approval. The reducer keeps two
+    /// separate counters and a cancel that decrements the wrong one wedges the
+    /// other at >0 (requires-action never clears). Entries are removed on cancel;
+    /// answered requests are cleared by the conn layer's own pending map — a
+    /// stale leftover here is harmless (set membership only biases WHICH resolve
+    /// event a cancel emits, and ids are unique per control request).
+    ask_requests: std::collections::HashSet<String>,
 }
 
 /// Per-message streaming state for `--include-partial-messages`. Reset on each
@@ -293,8 +302,8 @@ impl ClaudeAdapter {
             // retracts a pending one → `PermissionResolved{request_id}`. Other
             // control subtypes (keep_alive / streamlined_* / elicitation) carry no
             // FSM signal → opaque (the manager declines elicitation on the a-side).
-            "control_request" => Self::parse_control_request(v),
-            "control_cancel_request" => Self::parse_control_cancel_request(v),
+            "control_request" => self.parse_control_request(v),
+            "control_cancel_request" => self.parse_control_cancel_request(v),
             // R5 (009): `--include-partial-messages` wraps the streaming Anthropic
             // events in `stream_event`. The ONE we read is `message_delta`, whose
             // `delta.stop_reason` is the REAL-TIME per-turn boundary — it lands as
@@ -869,7 +878,7 @@ impl ClaudeAdapter {
     /// control frame. `request_id` is the TOP-LEVEL field (distinct from the
     /// nested `request.tool_use_id`); a frame missing it cannot be answered, so
     /// it degrades to opaque rather than wedging a request we can't resolve.
-    fn parse_control_request(v: &Value) -> Vec<SessionEvent> {
+    fn parse_control_request(&mut self, v: &Value) -> Vec<SessionEvent> {
         let subtype = v
             .get("request")
             .and_then(|r| r.get("subtype"))
@@ -883,6 +892,23 @@ impl ClaudeAdapter {
                     .and_then(|r| r.get("tool_name"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                // AskUserQuestion is NOT a permission — it is the agent asking the
+                // USER a structured question. Route it to its own `Ask` event
+                // (own counter, own answer command; 2026-08-04 ruling). Remember
+                // the request_id so a later control_cancel_request resolves the
+                // matching counter, not the approval one.
+                if tool_name.as_deref() == Some("AskUserQuestion") {
+                    let questions = request
+                        .and_then(|r| r.get("input"))
+                        .and_then(|i| i.get("questions"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    self.ask_requests.insert(request_id.to_string());
+                    return vec![SessionEvent::Ask {
+                        request_id: request_id.to_string(),
+                        questions,
+                    }];
+                }
                 // Carry the raw `input` for EVERY tool. The permission card must show
                 // the user WHAT they are approving (a Bash `command`, a Write target)
                 // — with only `tool_name` the card reads "命令: Bash" and the user
@@ -919,8 +945,13 @@ impl ClaudeAdapter {
     /// requires-action sub-state can clear without a user answer. The host sends
     /// NO control_response for a cancel (the request is gone); the manager drops
     /// the pending card on the a-side.
-    fn parse_control_cancel_request(v: &Value) -> Vec<SessionEvent> {
+    fn parse_control_cancel_request(&mut self, v: &Value) -> Vec<SessionEvent> {
         match v.get("request_id").and_then(Value::as_str) {
+            // A retracted AskUserQuestion resolves the QUESTION counter — emitting
+            // PermissionResolved here would wedge waiting_on_question at >0 forever.
+            Some(id) if !id.is_empty() && self.ask_requests.remove(id) => {
+                vec![SessionEvent::AskResolved { request_id: id.to_string() }]
+            }
             Some(id) if !id.is_empty() => vec![SessionEvent::PermissionResolved {
                 request_id: id.to_string(),
                 // claude control_cancel_request retracts a TOOL approval (§9.17).

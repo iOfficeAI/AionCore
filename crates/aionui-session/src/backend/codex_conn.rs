@@ -3718,6 +3718,9 @@ impl SessionBackend for CodexSessionBackend {
                     turn_gen: self.turn_gen.load(Ordering::SeqCst),
                 })
             }
+            // codex has no AskUserQuestion (its MCP elicitation degrades to a
+            // Permission with ELICIT_PREFIX); Ask is never raised here.
+            Command::AnswerAsk { .. } => Err(BackendError::CommandNotSupported { command: "answer_ask" }),
             Command::AnswerAuth { method_id, credentials } => {
                 // Mid-session re-auth (R6/R15): the server raised
                 // `account/chatgptAuthTokens/refresh` (a blocking ServerRequest the

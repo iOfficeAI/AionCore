@@ -71,6 +71,7 @@ impl BackgroundStreamWatcher {
                 | AgentStreamEvent::Plan(_)
                 | AgentStreamEvent::Permission(_)
                 | AgentStreamEvent::AcpPermission(_)
+                | AgentStreamEvent::Ask(_)
                 | AgentStreamEvent::Error(_)
         )
         // Deliberately absent: Tips. Tips are OUR pump-side diagnostics, never
@@ -330,6 +331,7 @@ fn frame_kind(ev: &AgentStreamEvent) -> &'static str {
         AgentStreamEvent::Plan(_) => "plan",
         AgentStreamEvent::Permission(_) => "permission",
         AgentStreamEvent::AcpPermission(_) => "acp_permission",
+        AgentStreamEvent::Ask(_) => "ask",
         AgentStreamEvent::Tips(_) => "tips",
         AgentStreamEvent::Error(_) => "error",
         _ => "other",
