@@ -1052,6 +1052,27 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(anchor)
     }
 
+    async fn get_message_by_msg_id_any(
+        &self,
+        user_id: &str,
+        conv_id: &str,
+        msg_id: &str,
+    ) -> Result<Option<MessageRow>, DbError> {
+        let row = sqlx::query_as::<_, MessageRow>(
+            "SELECT m.* FROM messages m \
+             INNER JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? AND m.msg_id = ? \
+             ORDER BY m.created_at ASC, m.id ASC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(conv_id)
+        .bind(msg_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
     async fn get_message_by_msg_id(
         &self,
         user_id: &str,

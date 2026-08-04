@@ -173,6 +173,19 @@ pub trait IConversationRepository: Send + Sync {
         Ok(None)
     }
 
+    /// Finds a message by (conversation_id, msg_id) regardless of type — the
+    /// fork API's fallback: live-streamed frontend messages only know their
+    /// stream `msg_id` (their local `id` is never persisted). Returns the
+    /// EARLIEST match so a fork lands at the segment that opened the bubble.
+    async fn get_message_by_msg_id_any(
+        &self,
+        _user_id: &str,
+        _conv_id: &str,
+        _msg_id: &str,
+    ) -> Result<Option<MessageRow>, DbError> {
+        Ok(None)
+    }
+
     /// Finds a message by (conversation_id, msg_id, type) triple.
     async fn get_message_by_msg_id(
         &self,

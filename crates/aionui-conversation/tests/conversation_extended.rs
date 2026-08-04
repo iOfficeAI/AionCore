@@ -1112,3 +1112,27 @@ async fn delete_parent_keeps_workspace_shared_with_fork() {
     );
     std::fs::remove_dir_all(&workspace).ok();
 }
+
+#[tokio::test]
+async fn fork_resolves_stream_msg_id_when_row_id_unknown() {
+    let (svc, repo, acp_repo) = setup_fork().await;
+    let parent = svc.create(USER_ID, fork_create_req("claude")).await.unwrap();
+    acp_repo
+        .update_session_id_for_user(USER_ID, &parent.id, "parent-sid-msgid")
+        .await
+        .unwrap();
+    // make_message mints msg_id ("client_...") distinct from the row id — the
+    // shape a live-streamed frontend message sends (its local `id` is never
+    // persisted, only the stream msg_id matches anything in the DB).
+    let m = make_message(&parent.id, "hello", 0);
+    repo.insert_message(USER_ID, &m).await.unwrap();
+
+    let fork = svc
+        .fork(USER_ID, &parent.id, fork_req(m.msg_id.as_deref().unwrap()))
+        .await
+        .expect("msg_id fallback resolves the fork point");
+    assert_eq!(
+        fork.extra["fork"]["parent_message_id"], m.id,
+        "resolved to the real row"
+    );
+}

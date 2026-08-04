@@ -2553,13 +2553,18 @@ impl ConversationService {
 
         // Fork point: must be a message of the PARENT conversation. Cursor is
         // the display sort key (created_at, id), endpoint inclusive.
-        let fork_point = self
-            .conversation_repo
-            .get_message(user_id, id, &req.message_id)
-            .await?
-            .ok_or_else(|| ConversationError::MessageNotFound {
-                id: req.message_id.clone(),
-            })?;
+        // Row-id first (history-loaded messages), then stream msg_id (live
+        // messages carry a frontend-local `id` that is never persisted).
+        let fork_point = match self.conversation_repo.get_message(user_id, id, &req.message_id).await? {
+            Some(row) => row,
+            None => self
+                .conversation_repo
+                .get_message_by_msg_id_any(user_id, id, &req.message_id)
+                .await?
+                .ok_or_else(|| ConversationError::MessageNotFound {
+                    id: req.message_id.clone(),
+                })?,
+        };
         let cursor = (fork_point.created_at, fork_point.id.as_str());
 
         // HEAD detection against the visible timeline (the same filtered view
