@@ -144,11 +144,14 @@ impl ProjectService {
     ///
     /// # Platform casing
     ///
-    /// Path comparison goes through [`canonical::canonicalize`], whose case folding
-    /// is a compile-time platform fork ([`canonical::IGNORE_PATH_CASING`]: on for
-    /// macOS/Windows, off for Linux). A caller doing its own `starts_with` on raw
-    /// strings would miss matches on macOS and — worse — conflate distinct files on
-    /// Linux, which is why this lives on the backend.
+    /// Whether two paths naming the same file compare equal is a platform
+    /// property: `fs::canonicalize` resolves through a case-insensitive volume on
+    /// macOS/Windows but not on Linux, the same divide
+    /// [`canonical::IGNORE_PATH_CASING`] encodes for lexical identity. A caller
+    /// doing its own `starts_with` on raw strings would miss matches on macOS and —
+    /// worse — conflate distinct files on Linux, which is why this lives on the
+    /// backend. Comparison here is between two realpaths, so the platform's own
+    /// rule applies rather than a folding step of ours.
     pub async fn upgrade_chat_file_ref(
         &self,
         user_id: &str,
@@ -201,20 +204,33 @@ impl ProjectService {
 
         for entry in detail.explorer.entries {
             // Both sides must be realpaths for the prefix test to mean anything: a
-            // stored root can be lexical while the target came back from
+            // stored root is lexical while the target came back from
             // `fs::canonicalize`, and on macOS that alone is the difference between
             // `/var/...` and `/private/var/...`.
-            let Ok(root) = canonical::canonicalize(&entry.folder.resource_canonical) else {
-                continue;
-            };
-            let Ok(root_path) = canonical::fs_path(&root) else {
+            //
+            // `uri_to_path` rather than `canonicalize`, matching `realpath_within`.
+            // `canonicalize` would additionally ASCII-lowercase the path on
+            // macOS/Windows, which serves lexical comparison — pointless here, since
+            // the next line resolves the path for real. On a case-sensitive APFS
+            // volume the lowercased form need not exist, and the failure would be
+            // silent: this root would simply never match.
+            let Ok(root_path) = canonical::uri_to_path(&entry.folder.resource_canonical) else {
+                tracing::warn!(
+                    pe_id = %entry.pe_id,
+                    "stored folder URI is unparseable; skipping it while resolving a ref"
+                );
                 continue;
             };
             let Ok(root_path) = std::fs::canonicalize(&root_path) else {
                 // A root whose folder is gone (unmounted, deleted) cannot own
                 // anything; skip it instead of failing the whole lookup.
+                tracing::warn!(
+                    pe_id = %entry.pe_id,
+                    "folder root is unreachable on disk; skipping it while resolving a ref"
+                );
                 continue;
             };
+            // Not this root — the ordinary outcome for every root but one, so no log.
             let Ok(relative) = target.strip_prefix(&root_path) else {
                 continue;
             };
