@@ -102,6 +102,47 @@ function Write-RuntimeChecksums {
     )
 }
 
+function Remove-NonRuntimePythonArtifacts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PythonRoot
+    )
+
+    $removedFiles = 0
+    $bytecodeFiles = @(Get-ChildItem -LiteralPath $PythonRoot -Recurse -File -Filter "*.pyc")
+    foreach ($file in $bytecodeFiles) {
+        Remove-Item -LiteralPath $file.FullName -Force
+        $removedFiles++
+    }
+
+    $cacheDirectories = @(
+        Get-ChildItem -LiteralPath $PythonRoot -Recurse -Directory -Filter "__pycache__" |
+            Sort-Object { $_.FullName.Length } -Descending
+    )
+    foreach ($directory in $cacheDirectories) {
+        if (Test-Path -LiteralPath $directory.FullName) {
+            Remove-Item -LiteralPath $directory.FullName -Recurse -Force
+        }
+    }
+
+    # These launchers target ARM and cannot run in the win32-x64 runtime. Keep
+    # unused foreign-architecture PE files out of the platform-specific bundle.
+    foreach ($relative in @(
+        "Lib\site-packages\pip\_vendor\distlib\t64-arm.exe",
+        "Lib\site-packages\pip\_vendor\distlib\w64-arm.exe",
+        "Lib\site-packages\setuptools\cli-arm64.exe",
+        "Lib\site-packages\setuptools\gui-arm64.exe"
+    )) {
+        $candidate = Join-Path $PythonRoot $relative
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            Remove-Item -LiteralPath $candidate -Force
+            $removedFiles++
+        }
+    }
+
+    Write-Output "Pruned $removedFiles non-runtime Python artifact(s) from the Hermes win32-x64 bundle"
+}
+
 if (-not [Environment]::Is64BitOperatingSystem -or [Environment]::Is64BitProcess -eq $false) {
     throw "The managed Hermes runtime pack must be built by a 64-bit Windows process"
 }
@@ -269,6 +310,7 @@ try {
         Copy-Item -LiteralPath (Join-Path $sourceRoot $relative) -Destination $installedFile -Force
     }
 
+    Remove-NonRuntimePythonArtifacts (Split-Path -Parent $pythonExe)
     Invoke-Checked $pythonExe @($verifyPath, $sitePackages)
     Invoke-Checked $pythonExe @("-m", "acp_adapter", "--version")
     Invoke-Checked $pythonExe @("-m", "acp_adapter", "--check")
