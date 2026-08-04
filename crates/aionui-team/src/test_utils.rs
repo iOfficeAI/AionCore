@@ -695,6 +695,7 @@ pub(crate) mod workspace_harness {
                     updated_at: now_ms(),
                     project_id: None,
                     folder_id: None,
+                    name_source: None,
                 })
                 .await?;
             Ok(TeamConversationCreateResult {
@@ -762,6 +763,7 @@ pub(crate) mod workspace_harness {
                         updated_at: Some(now_ms()),
                         project_id: None,
                         folder_id: None,
+                        name_source: None,
                     },
                 )
                 .await?;

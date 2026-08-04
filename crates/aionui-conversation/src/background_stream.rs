@@ -336,6 +336,7 @@ mod tests {
             updated_at: now_ms(),
             project_id: None,
             folder_id: None,
+            name_source: None,
         })
         .await
         .unwrap();

@@ -318,6 +318,9 @@ impl IConversationRepository for MockRepo {
         if let Some(folder_id) = &updates.folder_id {
             row.folder_id = Some(folder_id.clone());
         }
+        if let Some(name_source) = &updates.name_source {
+            row.name_source = Some(name_source.clone());
+        }
         Ok(())
     }
 
@@ -1592,9 +1595,187 @@ async fn insert_conversation_with_type(repo: &Arc<MockRepo>, user_id: &str, agen
         updated_at: 1,
         project_id: None,
         folder_id: None,
+        name_source: None,
     };
     repo.create(&row).await.unwrap();
     row
+}
+
+// ── apply_agent_title guard matrix ─────────────────────────────────
+
+async fn seed_titled_conversation(
+    repo: &Arc<MockRepo>,
+    user_id: &str,
+    name: &str,
+    name_source: Option<&str>,
+) -> String {
+    let mut row = insert_conversation_with_type(repo, user_id, AgentType::Acp).await;
+    row.name = name.to_owned();
+    row.name_source = name_source.map(str::to_owned);
+    // MockRepo::create pushed the original row; rewrite it via update.
+    repo.update(
+        user_id,
+        &row.id,
+        &ConversationRowUpdate {
+            name: Some(row.name.clone()),
+            name_source: row.name_source.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    row.id
+}
+
+async fn get_row(repo: &Arc<MockRepo>, user_id: &str, id: &str) -> ConversationRow {
+    use aionui_db::IConversationRepository as _;
+    repo.get(user_id, id).await.unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn agent_title_applies_to_default_named_conversation() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let id = seed_titled_conversation(&repo, "user_1", "first message placeholder", None).await;
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Fix login bug")
+        .await
+        .unwrap();
+
+    assert!(applied);
+    let row = get_row(&repo, "user_1", &id).await;
+    assert_eq!(row.name, "Fix login bug");
+    assert_eq!(row.name_source.as_deref(), Some("agent"));
+
+    let events = broadcaster.take_events();
+    let event = events
+        .iter()
+        .find(|e| e.name == "conversation.nameUpdated")
+        .expect("nameUpdated event broadcast");
+    assert_eq!(event.data["conversation_id"], id);
+    assert_eq!(event.data["name"], "Fix login bug");
+    assert_eq!(event.data["user_id"], "user_1");
+}
+
+#[tokio::test]
+async fn agent_title_overwrites_previous_agent_title() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let id = seed_titled_conversation(&repo, "user_1", "Old agent title", Some("agent")).await;
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Newer agent title")
+        .await
+        .unwrap();
+
+    assert!(applied);
+    assert_eq!(get_row(&repo, "user_1", &id).await.name, "Newer agent title");
+}
+
+#[tokio::test]
+async fn agent_title_never_overwrites_user_rename() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let id = seed_titled_conversation(&repo, "user_1", "My careful name", Some("user")).await;
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Agent title")
+        .await
+        .unwrap();
+
+    assert!(!applied);
+    let row = get_row(&repo, "user_1", &id).await;
+    assert_eq!(row.name, "My careful name");
+    assert_eq!(row.name_source.as_deref(), Some("user"));
+    assert!(
+        !broadcaster
+            .take_events()
+            .iter()
+            .any(|e| e.name == "conversation.nameUpdated"),
+        "discarded title must not broadcast"
+    );
+}
+
+#[tokio::test]
+async fn agent_title_unchanged_is_noop() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let id = seed_titled_conversation(&repo, "user_1", "Same title", Some("agent")).await;
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Same title")
+        .await
+        .unwrap();
+
+    assert!(!applied);
+    assert!(
+        !broadcaster
+            .take_events()
+            .iter()
+            .any(|e| e.name == "conversation.nameUpdated")
+    );
+}
+
+#[tokio::test]
+async fn agent_title_ignores_unknown_conversation() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", "missing", "Title")
+        .await
+        .unwrap();
+
+    assert!(!applied);
+}
+
+// ── update_conversation name_source intent ─────────────────────────
+
+#[tokio::test]
+async fn update_name_without_source_marks_user() {
+    let (svc, _broadcaster, repo, task_mgr) = make_service();
+    let row = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+
+    let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "Renamed by hand" })).unwrap();
+    svc.update("user_1", &row.id, req, &task_mgr).await.unwrap();
+
+    let updated = get_row(&repo, "user_1", &row.id).await;
+    assert_eq!(updated.name, "Renamed by hand");
+    assert_eq!(updated.name_source.as_deref(), Some("user"));
+}
+
+#[tokio::test]
+async fn update_name_with_auto_source_keeps_origin() {
+    let (svc, _broadcaster, repo, task_mgr) = make_service();
+    let row = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+
+    let req: UpdateConversationRequest =
+        serde_json::from_value(json!({ "name": "Derived title", "name_source": "auto" })).unwrap();
+    svc.update("user_1", &row.id, req, &task_mgr).await.unwrap();
+
+    let updated = get_row(&repo, "user_1", &row.id).await;
+    assert_eq!(updated.name, "Derived title");
+    assert_eq!(updated.name_source, None, "auto rename must stay agent-overwritable");
+}
+
+#[tokio::test]
+async fn update_without_name_leaves_name_source_untouched() {
+    let (svc, _broadcaster, repo, task_mgr) = make_service();
+    let id = seed_titled_conversation(&repo, "user_1", "Agent title", Some("agent")).await;
+
+    let req: UpdateConversationRequest = serde_json::from_value(json!({ "pinned": true })).unwrap();
+    svc.update("user_1", &id, req, &task_mgr).await.unwrap();
+
+    assert_eq!(
+        get_row(&repo, "user_1", &id).await.name_source.as_deref(),
+        Some("agent")
+    );
 }
 
 // ── Create tests ───────────────────────────────────────────────────
@@ -4653,6 +4834,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
                     use_model: Some("model-z".to_owned()),
                 }),
                 name: None,
+                name_source: None,
                 extra: None,
                 pinned: None,
             },
@@ -4726,6 +4908,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
                     use_model: Some("model-y".to_owned()),
                 }),
                 name: None,
+                name_source: None,
                 extra: None,
                 pinned: None,
             },
@@ -7821,6 +8004,7 @@ async fn get_backfills_legacy_row_and_persists() {
         updated_at: 0,
         project_id: None,
         folder_id: None,
+        name_source: None,
     };
     repo.create(&legacy_row).await.unwrap();
 
@@ -7871,6 +8055,7 @@ async fn list_backfills_mixed_rows() {
         updated_at: 1,
         project_id: None,
         folder_id: None,
+        name_source: None,
     };
     // Row 2: already migrated.
     let modern = ConversationRow {
@@ -7893,6 +8078,7 @@ async fn list_backfills_mixed_rows() {
         updated_at: 2,
         project_id: None,
         folder_id: None,
+        name_source: None,
     };
     repo.create(&legacy).await.unwrap();
     repo.create(&modern).await.unwrap();
@@ -8012,6 +8198,7 @@ async fn seed_aionrs_conversation_with_snapshot(
         updated_at: 1,
         project_id: None,
         folder_id: None,
+        name_source: None,
     };
     repo.create(&row).await.unwrap();
     repo.upsert_assistant_snapshot(
