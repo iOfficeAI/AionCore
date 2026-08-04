@@ -249,23 +249,7 @@ pub struct CopyFilesResponse {
 }
 
 // ---------------------------------------------------------------------------
-// D. File watch — Request DTOs
-// ---------------------------------------------------------------------------
-
-/// Request body for `POST /api/fs/watch/start` and `/stop`.
-#[derive(Debug, Deserialize)]
-pub struct FileWatchRequest {
-    pub file_path: String,
-}
-
-/// Request body for `POST /api/fs/office-watch/start` and `/stop`.
-#[derive(Debug, Deserialize)]
-pub struct WorkspaceOfficeWatchRequest {
-    pub workspace: String,
-}
-
-// ---------------------------------------------------------------------------
-// E. Workspace snapshot — Request DTOs
+// B. Workspace snapshot — Request DTOs
 // ---------------------------------------------------------------------------
 
 /// Request body for snapshot init / getInfo / compare / stageAll / unstageAll / dispose.
@@ -297,7 +281,7 @@ pub struct SnapshotDiscardRequest {
 }
 
 // ---------------------------------------------------------------------------
-// E. Workspace snapshot — Response DTOs
+// B. Workspace snapshot — Response DTOs
 // ---------------------------------------------------------------------------
 
 /// Snapshot mode.
@@ -378,13 +362,6 @@ mod tests {
         });
         let req: CopyFilesRequest = serde_json::from_value(raw).unwrap();
         assert!(req.source_root.is_none());
-    }
-
-    #[test]
-    fn file_watch_request_snake_case() {
-        let raw = r#"{"file_path":"/path/to/file.txt"}"#;
-        let req: FileWatchRequest = serde_json::from_str(raw).unwrap();
-        assert_eq!(req.file_path, "/path/to/file.txt");
     }
 
     #[test]

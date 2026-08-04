@@ -13,18 +13,18 @@ use tower_http::services::ServeFile;
 
 use aionui_api_types::{
     ApiResponse, ContentMetadataRequest, CopyFilesRequest, CopyFilesResponse, DirOrFileResponse,
-    FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, FileWatchRequest, GetFileMetadataRequest,
+    FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, GetFileMetadataRequest,
     GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest, OpenSystemFileRequest, ReadContentRequest,
     ReadFileRequest, RevealItemRequest, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest,
     SnapshotInfoResponse, SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery, WorkspaceFlatFileResponse,
-    WorkspaceOfficeWatchRequest, WriteContentRequest, WriteFileRequest,
+    WriteContentRequest, WriteFileRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_common::constants::UPLOAD_MAX_SIZE;
 
 use crate::error::FileError;
-use crate::traits::{FileServiceRef, FileWatchServiceRef, ItemRevealerRef, SnapshotServiceRef, SystemFileOpenerRef};
+use crate::traits::{FileServiceRef, ItemRevealerRef, SnapshotServiceRef, SystemFileOpenerRef};
 
 /// Request-body cap for `PUT /api/fs/content`, aligned with the 256 MB read cap
 /// so large files can be saved (the 10 MB global limit would otherwise 413).
@@ -49,12 +49,6 @@ impl From<FileError> for ApiError {
             },
             FileError::NotFound(message) => ApiError::NotFound(message),
             FileError::Internal(message) => ApiError::Internal(message),
-            FileError::WatchUnavailable { errno } => ApiError::coded(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "FILE_WATCH_UNAVAILABLE",
-                "File watching is unavailable on this system.",
-                errno.map(|n| serde_json::json!({ "errno": n })),
-            ),
             // The cause was logged where it arose; it is not forwarded because it
             // comes from the shell layer and can quote subprocess stderr or a path.
             // The client keys off `REVEAL_FAILED` and supplies its own wording.
@@ -84,7 +78,6 @@ impl From<FileError> for ApiError {
 #[derive(Clone)]
 pub struct FileRouterState {
     pub file_service: FileServiceRef,
-    pub watch_service: FileWatchServiceRef,
     pub snapshot_service: SnapshotServiceRef,
     /// Resolves pe-addressed copy/reveal targets (`/api/fs/copy`,
     /// `/api/fs/reveal`) to absolute paths.
@@ -143,13 +136,7 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .route("/api/fs/open-system", post(open_system_file))
         .route("/api/fs/image-base64", post(get_image_base64))
         .route("/api/fs/fetch-remote-image", post(fetch_remote_image))
-        // D. File watch
-        .route("/api/fs/watch/start", post(start_watch))
-        .route("/api/fs/watch/stop", post(stop_watch))
-        .route("/api/fs/watch/stop-all", post(stop_all_watches))
-        .route("/api/fs/office-watch/start", post(start_office_watch))
-        .route("/api/fs/office-watch/stop", post(stop_office_watch))
-        // E. Workspace snapshot
+        // B. Workspace snapshot
         .route("/api/fs/snapshot/init", post(snapshot_init))
         .route("/api/fs/snapshot/info", post(snapshot_info))
         .route("/api/fs/snapshot/compare", post(snapshot_compare))
@@ -653,73 +640,7 @@ async fn fetch_remote_image(
 }
 
 // ---------------------------------------------------------------------------
-// D. File watch — handlers
-// ---------------------------------------------------------------------------
-
-async fn start_watch(
-    State(state): State<FileRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    body: Result<Json<FileWatchRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    state
-        .watch_service
-        .start_watch_for_user(&user.id, &req.file_path)
-        .await?;
-    Ok(Json(ApiResponse::success()))
-}
-
-async fn stop_watch(
-    State(state): State<FileRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    body: Result<Json<FileWatchRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    state
-        .watch_service
-        .stop_watch_for_user(&user.id, &req.file_path)
-        .await?;
-    Ok(Json(ApiResponse::success()))
-}
-
-async fn stop_all_watches(
-    State(state): State<FileRouterState>,
-    Extension(user): Extension<CurrentUser>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state.watch_service.stop_all_watches_for_user(&user.id).await?;
-    Ok(Json(ApiResponse::success()))
-}
-
-async fn start_office_watch(
-    State(state): State<FileRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    body: Result<Json<WorkspaceOfficeWatchRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let allowed_roots: Vec<&Path> = state.allowed_roots.iter().map(std::path::PathBuf::as_path).collect();
-    crate::path_safety::validate_path_with_extra_root(&req.workspace, &allowed_roots, Some(Path::new(&req.workspace)))?;
-    state
-        .watch_service
-        .start_office_watch_for_user(&user.id, &req.workspace)
-        .await?;
-    Ok(Json(ApiResponse::success()))
-}
-
-async fn stop_office_watch(
-    State(state): State<FileRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    body: Result<Json<WorkspaceOfficeWatchRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    state
-        .watch_service
-        .stop_office_watch_for_user(&user.id, &req.workspace)
-        .await?;
-    Ok(Json(ApiResponse::success()))
-}
-
-// ---------------------------------------------------------------------------
-// E. Workspace snapshot — handlers
+// B. Workspace snapshot — handlers
 // ---------------------------------------------------------------------------
 
 async fn snapshot_init(
@@ -931,24 +852,6 @@ mod tests {
         assert_eq!(api_err.error_code(), "PATH_OUTSIDE_SANDBOX");
         assert_eq!(api_err.error_details().unwrap()["field"], "path");
         assert_eq!(api_err.error_details().unwrap()["operation"], "access");
-    }
-
-    #[test]
-    fn watch_unavailable_maps_to_stable_code_with_errno_details() {
-        // The A contract: the frontend recognizes this exact code to render an
-        // accurate "file watching unavailable" notice (never a reinstall prompt).
-        let api_err = ApiError::from(FileError::WatchUnavailable { errno: Some(24) });
-        assert_eq!(api_err.error_code(), "FILE_WATCH_UNAVAILABLE");
-        assert_eq!(api_err.status_code(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(api_err.error_details().unwrap()["errno"], 24);
-    }
-
-    #[test]
-    fn watch_unavailable_without_errno_omits_details() {
-        let api_err = ApiError::from(FileError::WatchUnavailable { errno: None });
-        assert_eq!(api_err.error_code(), "FILE_WATCH_UNAVAILABLE");
-        assert_eq!(api_err.status_code(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
-        assert!(api_err.error_details().is_none());
     }
 
     #[test]

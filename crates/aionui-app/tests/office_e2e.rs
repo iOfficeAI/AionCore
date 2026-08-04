@@ -2,7 +2,6 @@
 //!
 //! Covers test-plan items:
 //! - AU-1/AU-2: Unauthenticated access rejected
-//! - SH-1..SH-7: Snapshot CRUD (save, list, get-content, not-found, trim, isolation, target combos)
 //! - DC-1/DC-4/DC-9: Document conversion (Excel→JSON, file not found, invalid target)
 //! - RP-2/RP-4: Proxy SSRF protection (inactive port rejected)
 //! - WP-4: Word preview start when officecli not available
@@ -22,7 +21,7 @@ use tower::ServiceExt;
 use common::{body_json, get_with_token, json_with_token, setup_and_login};
 
 use aionui_app::{AppConfig, AppServices, build_module_states, create_router_with_states};
-use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService};
+use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -49,18 +48,13 @@ async fn build_office_app_with_roots(
     let services = AppServices::from_config(db, &config).await.unwrap();
     let (mut states, _) = build_module_states(&services).await.expect("build module states");
 
-    states.office = build_test_office_state(
-        tmp.path(),
-        allowed_roots,
-        std::sync::Arc::new(services.project_service.clone()),
-    );
+    states.office = build_test_office_state(allowed_roots, std::sync::Arc::new(services.project_service.clone()));
 
     let router = create_router_with_states(&services, states);
     (router, services, tmp)
 }
 
 fn build_test_office_state(
-    data_dir: &std::path::Path,
     allowed_roots: Vec<std::path::PathBuf>,
     project: std::sync::Arc<aionui_project::ProjectService>,
 ) -> OfficeRouterState {
@@ -100,22 +94,16 @@ fn build_test_office_state(
     let bc: Arc<dyn aionui_realtime::EventBroadcaster> = Arc::new(NoopBroadcaster);
     let wm = Arc::new(OfficecliWatchManager::new(spawner, bc));
 
-    let snapshot = Arc::new(SnapshotService::new(data_dir));
     let conversion = Arc::new(ConversionService::new(None));
     let proxy = Arc::new(ProxyService::new(wm.clone()));
 
     OfficeRouterState {
         watch_manager: wm,
-        snapshot_service: snapshot,
         conversion_service: conversion,
         proxy_service: proxy,
         allowed_roots,
         project,
     }
-}
-
-fn snapshot_target() -> serde_json::Value {
-    json!({"content_type": "markdown", "file_path": "/a.md"})
 }
 
 // ── AU-1/AU-2: Unauthenticated requests ─────────────────────────────
@@ -138,8 +126,6 @@ async fn au2_unauthenticated_all_office_endpoints() {
         "/api/word-preview/start",
         "/api/excel-preview/start",
         "/api/ppt-preview/start",
-        "/api/preview-history/list",
-        "/api/preview-history/save",
         "/api/document/convert",
     ];
 
@@ -271,216 +257,6 @@ async fn pp1_ppt_preview_with_workspace_accepts_non_sandbox_path() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
-}
-
-// ── SH-1: Save snapshot ─────────────────────────────────────────────
-
-#[tokio::test]
-async fn sh1_save_snapshot() {
-    let (mut app, services, _tmp) = build_office_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-
-    let body = json!({
-        "target": snapshot_target(),
-        "content": "# Hello World"
-    });
-    let req = json_with_token("POST", "/api/preview-history/save", body, &token, &csrf);
-    let resp = app.clone().oneshot(req).await.unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-
-    let data = &json["data"];
-    assert!(data["id"].is_string());
-    assert!(!data["id"].as_str().unwrap().is_empty());
-    assert!(data["created_at"].is_number());
-    assert_eq!(data["size"], 13); // "# Hello World".len()
-    assert_eq!(data["content_type"], "markdown");
-}
-
-// ── SH-2: List snapshots ────────────────────────────────────────────
-
-#[tokio::test]
-async fn sh2_list_snapshots() {
-    let (mut app, services, _tmp) = build_office_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-
-    for i in 0..3 {
-        let body = json!({
-            "target": snapshot_target(),
-            "content": format!("content {i}")
-        });
-        let req = json_with_token("POST", "/api/preview-history/save", body, &token, &csrf);
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    let body = json!({"target": snapshot_target()});
-    let req = json_with_token("POST", "/api/preview-history/list", body, &token, &csrf);
-    let resp = app.clone().oneshot(req).await.unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-
-    let snapshots = json["data"].as_array().unwrap();
-    assert_eq!(snapshots.len(), 3);
-}
-
-// ── SH-3: Get snapshot content ──────────────────────────────────────
-
-#[tokio::test]
-async fn sh3_get_snapshot_content() {
-    let (mut app, services, _tmp) = build_office_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-
-    let save_body = json!({
-        "target": snapshot_target(),
-        "content": "# Hello"
-    });
-    let req = json_with_token("POST", "/api/preview-history/save", save_body, &token, &csrf);
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let save_json = body_json(resp).await;
-    let snapshot_id = save_json["data"]["id"].as_str().unwrap();
-
-    let get_body = json!({
-        "target": snapshot_target(),
-        "snapshot_id": snapshot_id
-    });
-    let req = json_with_token("POST", "/api/preview-history/get-content", get_body, &token, &csrf);
-    let resp = app.clone().oneshot(req).await.unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["content"], "# Hello");
-    assert_eq!(json["data"]["snapshot"]["id"], snapshot_id);
-}
-
-// ── SH-4: Get nonexistent snapshot ──────────────────────────────────
-
-#[tokio::test]
-async fn sh4_get_nonexistent_snapshot() {
-    let (mut app, services, _tmp) = build_office_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-
-    let body = json!({
-        "target": snapshot_target(),
-        "snapshot_id": "nonexistent"
-    });
-    let req = json_with_token("POST", "/api/preview-history/get-content", body, &token, &csrf);
-    let resp = app.clone().oneshot(req).await.unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert!(json["data"].is_null());
-}
-
-// ── SH-5: Snapshot trimming at 50 limit ─────────────────────────────
-
-#[tokio::test]
-async fn sh5_snapshot_trim_at_limit() {
-    let (mut app, services, _tmp) = build_office_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-
-    for i in 0..52 {
-        let body = json!({
-            "target": snapshot_target(),
-            "content": format!("snap {i}")
-        });
-        let req = json_with_token("POST", "/api/preview-history/save", body, &token, &csrf);
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    let body = json!({"target": snapshot_target()});
-    let req = json_with_token("POST", "/api/preview-history/list", body, &token, &csrf);
-    let resp = app.clone().oneshot(req).await.unwrap();
-
-    let json = body_json(resp).await;
-    let snapshots = json["data"].as_array().unwrap();
-    assert!(
-        snapshots.len() <= 50,
-        "expected at most 50 snapshots, got {}",
-        snapshots.len()
-    );
-}
-
-// ── SH-6: Different targets are isolated ────────────────────────────
-
-#[tokio::test]
-async fn sh6_different_targets_isolated() {
-    let (mut app, services, _tmp) = build_office_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-
-    let target_a = json!({"content_type": "markdown", "file_path": "/a.md"});
-    let target_b = json!({"content_type": "code", "file_path": "/b.rs"});
-
-    let body_a = json!({"target": target_a, "content": "AAA"});
-    let req = json_with_token("POST", "/api/preview-history/save", body_a, &token, &csrf);
-    app.clone().oneshot(req).await.unwrap();
-
-    let body_b = json!({"target": target_b, "content": "BBB"});
-    let req = json_with_token("POST", "/api/preview-history/save", body_b, &token, &csrf);
-    app.clone().oneshot(req).await.unwrap();
-
-    let list_a = json!({"target": target_a});
-    let req = json_with_token("POST", "/api/preview-history/list", list_a, &token, &csrf);
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let json_a = body_json(resp).await;
-    assert_eq!(json_a["data"].as_array().unwrap().len(), 1);
-
-    let list_b = json!({"target": target_b});
-    let req = json_with_token("POST", "/api/preview-history/list", list_b, &token, &csrf);
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let json_b = body_json(resp).await;
-    assert_eq!(json_b["data"].as_array().unwrap().len(), 1);
-}
-
-// ── SH-7: Target with multiple fields produces different hash ───────
-
-#[tokio::test]
-async fn sh7_target_field_combination_different_hash() {
-    let (mut app, services, _tmp) = build_office_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-
-    let target_simple = json!({"content_type": "markdown", "file_path": "/a.md"});
-    let target_complex = json!({
-        "content_type": "markdown",
-        "file_path": "/a.md",
-        "workspace": "/ws",
-        "conversation_id": "conv_1"
-    });
-
-    let body = json!({"target": target_simple, "content": "simple"});
-    let req = json_with_token("POST", "/api/preview-history/save", body, &token, &csrf);
-    app.clone().oneshot(req).await.unwrap();
-
-    let body = json!({"target": target_complex, "content": "complex"});
-    let req = json_with_token("POST", "/api/preview-history/save", body, &token, &csrf);
-    app.clone().oneshot(req).await.unwrap();
-
-    let list = json!({"target": target_simple});
-    let req = json_with_token("POST", "/api/preview-history/list", list, &token, &csrf);
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let json = body_json(resp).await;
-    assert_eq!(
-        json["data"].as_array().unwrap().len(),
-        1,
-        "simple target should only have 1 snapshot"
-    );
-
-    let list = json!({"target": target_complex});
-    let req = json_with_token("POST", "/api/preview-history/list", list, &token, &csrf);
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let json = body_json(resp).await;
-    assert_eq!(
-        json["data"].as_array().unwrap().len(),
-        1,
-        "complex target should only have 1 snapshot"
-    );
 }
 
 // ── SO-1: Star Office detect route removed ───────────────────────────

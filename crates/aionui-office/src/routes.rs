@@ -9,8 +9,7 @@ use axum::routing::{get, post};
 use std::path::{Path as FsPath, PathBuf};
 
 use aionui_api_types::{
-    ApiResponse, DocumentConversionRequest, GetSnapshotContentRequest, ListSnapshotsRequest, PreviewSnapshotInfoDto,
-    PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StartPreviewRequest, StopPreviewRequest,
+    ApiResponse, DocumentConversionRequest, PreviewUrlResponse, StartPreviewRequest, StopPreviewRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -58,9 +57,6 @@ pub fn office_routes(state: OfficeRouterState) -> Router {
         .route("/api/excel-preview/stop", post(stop_excel_preview))
         .route("/api/ppt-preview/start", post(start_ppt_preview))
         .route("/api/ppt-preview/stop", post(stop_ppt_preview))
-        .route("/api/preview-history/list", post(list_snapshots))
-        .route("/api/preview-history/save", post(save_snapshot))
-        .route("/api/preview-history/get-content", post(get_snapshot_content))
         .route("/api/document/convert", post(convert_document))
         .with_state(state)
 }
@@ -200,44 +196,6 @@ async fn stop_preview(
     Ok(Json(ApiResponse::success()))
 }
 
-// -- Snapshot handlers ----------------------------------------------------
-
-async fn list_snapshots(
-    State(state): State<OfficeRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    body: Result<Json<ListSnapshotsRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<Vec<PreviewSnapshotInfoDto>>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let snapshots = state.snapshot_service.list_for_user(&user.id, &req.target).await?;
-    Ok(Json(ApiResponse::ok(snapshots)))
-}
-
-async fn save_snapshot(
-    State(state): State<OfficeRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    body: Result<Json<SaveSnapshotRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<PreviewSnapshotInfoDto>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let info = state
-        .snapshot_service
-        .save_for_user(&user.id, &req.target, &req.content)
-        .await?;
-    Ok(Json(ApiResponse::ok(info)))
-}
-
-async fn get_snapshot_content(
-    State(state): State<OfficeRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    body: Result<Json<GetSnapshotContentRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<Option<SnapshotContentResponse>>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let result = state
-        .snapshot_service
-        .get_content_for_user(&user.id, &req.target, &req.snapshot_id)
-        .await?;
-    Ok(Json(ApiResponse::ok(result)))
-}
-
 // -- Document conversion --------------------------------------------------
 
 async fn convert_document(
@@ -279,14 +237,6 @@ fn file_error_to_api_error(error: FileError) -> ApiError {
         },
         FileError::NotFound(message) => ApiError::NotFound(message),
         FileError::Internal(message) => ApiError::Internal(message),
-        // Not reachable from office path-validation, but the mapping must be
-        // total; mirror the file crate's stable unavailable contract.
-        FileError::WatchUnavailable { errno } => ApiError::coded(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "FILE_WATCH_UNAVAILABLE",
-            "File watching is unavailable on this system.",
-            errno.map(|n| serde_json::json!({ "errno": n })),
-        ),
         // Not reachable from office path-validation; the mapping must be total.
         // Mirrors the file crate: the cause is logged at its origin, not forwarded.
         FileError::RevealFailed(_) => ApiError::coded(
@@ -399,7 +349,6 @@ mod tests {
     use crate::conversion::ConversionService;
     use crate::error::OfficeError;
     use crate::proxy::{ProxyError, ProxyService};
-    use crate::snapshot::SnapshotService;
     use crate::state::OfficeRouterState;
     use crate::types::DocType;
     use crate::watch_manager::{OfficecliWatchManager, ProcessHandle, ProcessSpawner};
@@ -536,7 +485,6 @@ mod tests {
         let bc: Arc<dyn aionui_realtime::EventBroadcaster> = Arc::new(NoopBroadcaster);
         let wm = Arc::new(OfficecliWatchManager::new(spawner, bc));
 
-        let snapshot = Arc::new(SnapshotService::new(std::path::Path::new("/tmp/test")));
         let conversion = Arc::new(ConversionService::new(None));
         let proxy = Arc::new(ProxyService::new(wm.clone()));
 
@@ -546,7 +494,6 @@ mod tests {
 
         OfficeRouterState {
             watch_manager: wm,
-            snapshot_service: snapshot,
             conversion_service: conversion,
             proxy_service: proxy,
             allowed_roots: vec![std::env::temp_dir()],

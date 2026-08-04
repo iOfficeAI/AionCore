@@ -118,65 +118,6 @@ pub trait IFileService: Send + Sync {
     async fn fetch_remote_image(&self, url: &str) -> String;
 }
 
-/// File system watching: single-file changes and workspace Office file
-/// additions.
-#[async_trait::async_trait]
-pub trait IFileWatchService: Send + Sync {
-    /// Start watching a single file for changes.
-    /// Emits `fileWatch.fileChanged` events on the broadcast channel.
-    async fn start_watch(&self, file_path: &str) -> Result<(), FileError>;
-
-    /// Start watching a single file for one WebUI user.
-    async fn start_watch_for_user(&self, user_id: &str, file_path: &str) -> Result<(), FileError> {
-        let _ = user_id;
-        self.start_watch(file_path).await
-    }
-
-    /// Stop watching a previously registered file.
-    async fn stop_watch(&self, file_path: &str) -> Result<(), FileError>;
-
-    /// Stop watching a file for one WebUI user.
-    async fn stop_watch_for_user(&self, user_id: &str, file_path: &str) -> Result<(), FileError> {
-        let _ = user_id;
-        self.stop_watch(file_path).await
-    }
-
-    /// Stop all active file watches.
-    async fn stop_all_watches(&self) -> Result<(), FileError>;
-
-    /// Stop all active file watches for one WebUI user.
-    async fn stop_all_watches_for_user(&self, user_id: &str) -> Result<(), FileError> {
-        let _ = user_id;
-        self.stop_all_watches().await
-    }
-
-    /// Start watching a workspace directory for new Office files
-    /// (.pptx, .docx, .xlsx).
-    /// Emits `workspaceOfficeWatch.fileAdded` events.
-    async fn start_office_watch(&self, workspace: &str) -> Result<(), FileError>;
-
-    /// Start watching a workspace for one WebUI user.
-    async fn start_office_watch_for_user(&self, user_id: &str, workspace: &str) -> Result<(), FileError> {
-        let _ = user_id;
-        self.start_office_watch(workspace).await
-    }
-
-    /// Stop watching a workspace directory for Office files.
-    async fn stop_office_watch(&self, workspace: &str) -> Result<(), FileError>;
-
-    /// Stop watching a workspace for one WebUI user.
-    async fn stop_office_watch_for_user(&self, user_id: &str, workspace: &str) -> Result<(), FileError> {
-        let _ = user_id;
-        self.stop_office_watch(workspace).await
-    }
-
-    /// Stop all active Office workspace watches for one WebUI user.
-    async fn stop_all_office_watches_for_user(&self, user_id: &str) -> Result<(), FileError> {
-        let _ = user_id;
-        Ok(())
-    }
-}
-
 /// Git-based workspace snapshot system for tracking file changes.
 ///
 /// Supports two modes:
@@ -238,9 +179,6 @@ pub trait ISnapshotService: Send + Sync {
 
 /// Convenience alias for an Arc-wrapped file service.
 pub type FileServiceRef = Arc<dyn IFileService>;
-
-/// Convenience alias for an Arc-wrapped file watch service.
-pub type FileWatchServiceRef = Arc<dyn IFileWatchService>;
 
 /// Convenience alias for an Arc-wrapped snapshot service.
 pub type SnapshotServiceRef = Arc<dyn ISnapshotService>;
