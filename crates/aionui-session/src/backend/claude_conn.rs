@@ -79,6 +79,22 @@ impl ClaudeConnection {
                     )
                 }
             },
+            SessionSpec::Fork {
+                session_id,
+                parent_backend_session_id,
+                ..
+            } => (
+                session_id.clone(),
+                // The wake slot's INITIAL value is the parent sid — but a wake
+                // can only fire after an idle turn, by which point `system/init`
+                // reported the fork's OWN sid and `sniff_init` updated the slot
+                // (never `--resume <parent>` twice, which would fork again).
+                // `--fork-session` makes claude mint the new id itself; pairing
+                // it with `--session-id` is unsupported (live help 2.1.221), so
+                // the new id is learned, not chosen.
+                parent_backend_session_id.clone(),
+                LegacySessionSpec::ForkFrom(parent_backend_session_id.clone()),
+            ),
         }
     }
 }
@@ -319,7 +335,7 @@ impl BackendConnection for ClaudeConnection {
         // mode AND the same provider env (#103).
         let wake = ClaudeWakeRecipe {
             spawner: self.spawner.clone(),
-            claude_session_id,
+            claude_session_id: Arc::new(std::sync::Mutex::new(claude_session_id)),
             cwd: config.cwd.clone(),
             extra_args: spawn_args,
             env: config.spawn_env.clone(),
@@ -556,7 +572,13 @@ struct PendingPerm {
 /// enabled, so it is never consulted.
 struct ClaudeWakeRecipe {
     spawner: Arc<dyn Spawner>,
-    claude_session_id: String,
+    /// SHARED MUTABLE resume anchor. Open seeds it (Fresh/Resume: the id we
+    /// spawned with; Fork: the PARENT id), and `sniff_init` overwrites it with
+    /// whatever sid claude actually reports — claude can rotate the on-disk id
+    /// (`--fork-session` always does; plain runs may), and a wake that resumes
+    /// the STALE id re-forks / resurrects the parent session. The slot makes
+    /// every wake resume the session claude last said we are attached to.
+    claude_session_id: Arc<std::sync::Mutex<String>>,
     cwd: Option<String>,
     extra_args: Vec<String>,
     /// #103: the spawn env captured at open time (e.g. cc-switch provider env) so
@@ -631,6 +653,10 @@ struct ClaudeReaderState {
     cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
     /// One-shot first-turn title generation (shared Arc with the backend).
     title_gen: Arc<TitleGenState>,
+    /// The wake recipe's SHARED resume-anchor slot (see `ClaudeWakeRecipe`): the
+    /// reader overwrites it from `system/init` so a post-fork / post-rotation
+    /// wake resumes the sid claude actually reported, never the stale spawn id.
+    wake_session_slot: Arc<std::sync::Mutex<String>>,
 }
 
 /// Spawn a claude stdout reader over `stdout`/`io` using the shared state. Used
@@ -674,6 +700,7 @@ fn start_claude_reader(
             state.pending_set_config,
             state.cost_ledger,
             state.title_gen,
+            state.wake_session_slot,
         )
         .await;
     })
@@ -764,6 +791,7 @@ impl ClaudeSessionBackend {
             pending_set_config: pending_set_config.clone(),
             cost_ledger,
             title_gen: title_gen.clone(),
+            wake_session_slot: wake.claude_session_id.clone(),
         };
         let reader = start_claude_reader(&reader_state, stdout, io.clone());
 
@@ -830,7 +858,17 @@ impl ClaudeSessionBackend {
     /// the controller's slot. Only reached when `idle_ttl` is set AND the slot was
     /// suspended (a test backend has no spawner → never enabled).
     async fn wake_handle(&self) -> Result<ProcHandle, BackendError> {
-        let legacy_spec = LegacySessionSpec::Resume(self.wake.claude_session_id.clone());
+        // Read the SHARED slot, not an open-time snapshot: after a fork (or any
+        // claude-side id rotation) `sniff_init` updated it to the sid claude
+        // actually reported — resuming a stale id would re-fork / resurrect the
+        // parent session. A wake NEVER replays `--fork-session`.
+        let resume_sid = self
+            .wake
+            .claude_session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let legacy_spec = LegacySessionSpec::Resume(resume_sid);
         let io = self
             .adapter
             .start_turn(
@@ -1250,6 +1288,7 @@ async fn reader_task(
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
     title_gen: Arc<TitleGenState>,
+    wake_session_slot: Arc<std::sync::Mutex<String>>,
 ) {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
@@ -1313,7 +1352,15 @@ async fn reader_task(
                 // parse_system drops). Done on the RAW frame so parse_chunk's
                 // event stream stays zero-diff. Emits Provisioning per MCP
                 // server (parity with codex mcpServerStatus→Provisioning).
-                sniff_init(v, want_init_model, &discovered_model, &event_tx, &session_id, cur_gen);
+                sniff_init(
+                    v,
+                    want_init_model,
+                    &discovered_model,
+                    &event_tx,
+                    &session_id,
+                    cur_gen,
+                    &wake_session_slot,
+                );
                 // #98/#101: sniff the `control_request{initialize}` RESPONSE for the
                 // selectable model list + slash commands (claude's only catalog
                 // channel — the data init frame above carries neither). Fills
@@ -1769,6 +1816,7 @@ fn sniff_init(
     event_tx: &broadcast::Sender<SessionEnvelope>,
     session_id: &str,
     turn_gen: u64,
+    wake_session_slot: &Arc<std::sync::Mutex<String>>,
 ) {
     use serde_json::Value;
     if frame.get("type").and_then(Value::as_str) != Some("system")
@@ -1786,16 +1834,32 @@ fn sniff_init(
     // common case where claude was started with `--session-id <logical_id>`); a
     // DIFFERENT id means claude rotated/resumed under another on-disk id, which is
     // the value a later `--resume` must target.
-    if let Some(sid) = frame.get("session_id").and_then(Value::as_str)
-        && sid != session_id
-    {
-        let _ = event_tx.send(SessionEnvelope {
-            session_id: session_id.to_string(),
-            turn_gen,
-            event: SessionEvent::BackendBound {
-                backend_session_id: Some(sid.to_string()),
-            },
-        });
+    if let Some(sid) = frame.get("session_id").and_then(Value::as_str) {
+        // Keep the wake recipe's resume anchor in lock-step with claude's own
+        // report (fork rotation `--fork-session`, or any plain rotation): a wake
+        // that resumed the STALE spawn id would re-fork / resurrect the parent
+        // session. Written unconditionally-on-change, independent of the
+        // BackendBound gate below (which compares against the LOGICAL id).
+        {
+            let mut slot = wake_session_slot.lock().unwrap_or_else(|e| e.into_inner());
+            if *slot != sid {
+                tracing::debug!(
+                    session_id = %session_id,
+                    reported_sid = %sid,
+                    "claude reported a rotated session id — updating the wake resume anchor"
+                );
+                *slot = sid.to_string();
+            }
+        }
+        if sid != session_id {
+            let _ = event_tx.send(SessionEnvelope {
+                session_id: session_id.to_string(),
+                turn_gen,
+                event: SessionEvent::BackendBound {
+                    backend_session_id: Some(sid.to_string()),
+                },
+            });
+        }
     }
     if let Some(servers) = frame.get("mcp_servers").and_then(Value::as_array) {
         for s in servers {
@@ -2905,7 +2969,7 @@ impl ClaudeSessionBackend {
         // recipe is never consulted — but `spawn` needs one. Use a FakeSpawner.
         let wake = ClaudeWakeRecipe {
             spawner: Arc::new(crate::testing::FakeSpawner::new()),
-            claude_session_id: session_id.clone(),
+            claude_session_id: Arc::new(std::sync::Mutex::new(session_id.clone())),
             cwd: None,
             extra_args: Vec::new(),
             env: Vec::new(),
@@ -2958,7 +3022,7 @@ impl ClaudeSessionBackend {
         let session_id = session_id.into();
         let wake = ClaudeWakeRecipe {
             spawner: Arc::new(crate::testing::FakeSpawner::new()),
-            claude_session_id: session_id.clone(),
+            claude_session_id: Arc::new(std::sync::Mutex::new(session_id.clone())),
             cwd: None,
             extra_args: Vec::new(),
             env: Vec::new(),
@@ -2985,7 +3049,7 @@ impl ClaudeSessionBackend {
         // `--resume <session_id>`), so it is NOT routed through claude_session_id_for.
         let wake = ClaudeWakeRecipe {
             spawner,
-            claude_session_id: session_id.clone(),
+            claude_session_id: Arc::new(std::sync::Mutex::new(session_id.clone())),
             cwd: None,
             extra_args: Vec::new(),
             env: Vec::new(),
@@ -6294,5 +6358,91 @@ mod tests {
             .flatten();
             assert_eq!(got, Some(expected), "task_notification status={wire} → {expected:?}");
         }
+    }
+
+    /// Fork seam mapping: `SessionSpec::Fork` resumes the PARENT sid with a
+    /// ForkFrom legacy spec, and seeds the wake slot with the parent id (the
+    /// init sniffer rotates it to the fork's own sid before any wake can fire).
+    #[tokio::test]
+    async fn to_legacy_spec_fork_maps_to_fork_from_parent() {
+        let (logical, claude_id, legacy) = ClaudeConnection::to_legacy_spec(&SessionSpec::Fork {
+            session_id: "conv_fork_1".into(),
+            parent_backend_session_id: "8cd37cd6-2e88-4c8d-847a-7b237ffa9710".into(),
+            at_turn_id: None,
+        });
+        assert_eq!(logical, "conv_fork_1");
+        assert_eq!(claude_id, "8cd37cd6-2e88-4c8d-847a-7b237ffa9710");
+        assert!(
+            matches!(legacy, LegacySessionSpec::ForkFrom(ref id) if id == "8cd37cd6-2e88-4c8d-847a-7b237ffa9710"),
+            "fork resumes the parent id with --fork-session"
+        );
+    }
+
+    /// 陷阱 B regression: `system/init` reporting a DIFFERENT sid must rotate the
+    /// wake recipe's resume anchor — for a fork (claude always mints a new id)
+    /// AND for a plain resume rotation. Without the rotation, the next idle-wake
+    /// `--resume <stale>` re-forks / resurrects the parent session.
+    #[test]
+    fn sniff_init_rotates_wake_session_slot() {
+        let slot = Arc::new(std::sync::Mutex::new("parent-sid".to_string()));
+        let discovered_model = Arc::new(std::sync::Mutex::new(None));
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let frame = serde_json::json!({
+            "type": "system", "subtype": "init",
+            "session_id": "33333333-3333-4333-8333-333333333333"
+        });
+        sniff_init(&frame, false, &discovered_model, &event_tx, "conv_fork_1", 0, &slot);
+        assert_eq!(
+            slot.lock().unwrap().as_str(),
+            "33333333-3333-4333-8333-333333333333",
+            "the wake anchor follows claude's reported sid"
+        );
+        // And the rotation is still lowered as BackendBound for persistence.
+        let env = event_rx.try_recv().expect("BackendBound lowered");
+        assert!(
+            matches!(env.event, SessionEvent::BackendBound { backend_session_id: Some(ref sid) }
+                if sid == "33333333-3333-4333-8333-333333333333")
+        );
+    }
+
+    /// 陷阱 B end-to-end: after the slot rotates, a wake resumes the ROTATED sid,
+    /// not the open-time one.
+    #[tokio::test]
+    async fn wake_after_rotation_resumes_the_rotated_sid() {
+        use crate::testing::FakeSpawner;
+        let spawner = Arc::new(FakeSpawner::new());
+        let backend = ClaudeSessionBackend::build_with_io_suspending(
+            "logical-fork-wake",
+            Box::new(FakeAgentIo::never_exits(Vec::new())),
+            spawner.clone(),
+            40,
+        )
+        .await;
+        // Simulate the init sniffer's rotation (same shared Arc the reader holds).
+        *backend.wake.claude_session_id.lock().unwrap() = "44444444-4444-4444-8444-444444444444".to_string();
+
+        let suspended = backend
+            .suspend
+            .suspend_if_idle(aionui_common::now_ms() + 10_000, false)
+            .await;
+        assert!(suspended, "idle past ttl → suspended");
+        let _ = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("wake".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect_err("FakeSpawner cannot make a real process → wake Errs");
+        let spec = spawner.last_command().await.expect("a spawn was recorded");
+        let at = spec.args.iter().position(|a| a == "--resume").expect("wake resumes");
+        assert_eq!(
+            spec.args.get(at + 1).map(String::as_str),
+            Some("44444444-4444-4444-8444-444444444444"),
+            "wake resumes the ROTATED sid, never the stale open-time id"
+        );
+        assert!(
+            !spec.args.iter().any(|a| a == "--fork-session"),
+            "a wake never replays the fork"
+        );
     }
 }

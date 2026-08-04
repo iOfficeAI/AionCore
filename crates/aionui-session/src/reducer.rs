@@ -421,6 +421,9 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // (persist backend_session_id). The reducer NEVER touches SessionState for
         // it — it is not a turn signal, not a requires-action, not a roster update.
         | SessionEvent::BackendBound { .. }
+        // BackendTurnBound is BackendBound's turn-scoped sibling (fork anchor
+        // pass-through for message stamping). Same contract: reducer no-op.
+        | SessionEvent::BackendTurnBound { .. }
         // 009 R6: BackendSuspended is FSM-invisible (the wake re-spawns on the
         // same event_tx). The orchestrator clears the roster on it; the reducer
         // does NOT move SessionState (suspend ≠ a turn boundary).

@@ -213,6 +213,14 @@ impl BackendConnection for AntigravityConnection {
                 session_id,
                 backend_session_id,
             } => (session_id, backend_session_id),
+            // Product decision: antigravity has no headless fork surface (its
+            // only fork is the interactive TUI `/fork`). Defensive reject — the
+            // fork API already refuses agy via the capability gate.
+            SessionSpec::Fork { .. } => {
+                return Err(BackendError::Transport(
+                    "antigravity does not support session forking".into(),
+                ));
+            }
         };
         // agy reads MCP servers from files only — there is no per-run flag — so
         // the session's servers (team coordination first, then the user's) have

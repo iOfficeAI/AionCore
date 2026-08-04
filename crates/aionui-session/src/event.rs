@@ -561,6 +561,17 @@ pub enum SessionEvent {
     /// re-attach, fork, or backend-session loss. `None` = backend session lost /
     /// not yet established.
     BackendBound { backend_session_id: Option<String> },
+
+    /// Fork anchoring (BackendBound's turn-scoped sibling): the adapter lowers
+    /// the backend's OWN id for the turn that just started (codex
+    /// `turn/started` → `Turn.id`) so the conversation layer can stamp it onto
+    /// every message row it persists for that turn. That stamp is what later
+    /// resolves `thread/fork`'s `lastTurnId` when the user forks mid-history —
+    /// the runtime `turn_<shortid>` ids are aionui-minted and mean nothing to
+    /// the backend. Same contract as BackendBound: orchestration-lowered
+    /// pass-through, reducer no-op, never persisted as an event. Only codex
+    /// emits it today; backends without a turn-anchored fork never do.
+    BackendTurnBound { backend_turn_id: String },
 }
 
 // ==========================================================================
@@ -875,6 +886,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | Snapshot { .. }
         | Lagged { .. }
         | BackendBound { .. }
+        | BackendTurnBound { .. }
         | BackendSuspended => EventClass::OrchestrationLowered,
         // backend-produced (self-describing; PERSISTED — tier decided separately, §7.2)
         MessageDelta { .. }
@@ -965,6 +977,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             | Snapshot { .. }
             | Lagged { .. }
             | BackendBound { .. }
+            | BackendTurnBound { .. }
             | BackendSuspended => PersistTier::Ephemeral,
         },
     }
