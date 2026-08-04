@@ -296,7 +296,10 @@ pub enum SessionEvent {
     /// Per-turn typed usage/cost (Addendum 5 / U15). Adapter normalizes a
     /// cumulative wire counter to a per-turn DELTA (G6). Reducer no-op (pure
     /// consumer signal). codex `thread/tokenUsage/updated.last`; claude
-    /// `result.usage`; cost_usd may be None.
+    /// `result.usage`; cost_usd may be None. When present, `cost_usd` is the
+    /// SESSION-cumulative spend: claude's wire value (`total_cost_usd`) is only
+    /// process-cumulative, so its conn re-bases it through a cost ledger before
+    /// broadcast (see `claude_conn::CostLedger`).
     UsageDelta {
         input_tokens: u64,
         output_tokens: u64,

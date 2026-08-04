@@ -1,5 +1,6 @@
 use aionui_db::{
-    DatabaseInitOptions, init_database, init_database_memory, init_database_with_options, maybe_copy_legacy_database,
+    DatabaseInitOptions, init_database, init_database_memory, init_database_staged_with_options,
+    init_database_with_options, maybe_copy_legacy_database,
 };
 use sqlx::Row;
 
@@ -275,6 +276,36 @@ async fn corruption_without_recovery_authorization_preserves_original_file() {
         .filter_map(|e| e.ok())
         .any(|e| e.file_name().to_string_lossy().contains("backup"));
     assert!(!has_backup, "unconfirmed startup must not create a backup file");
+}
+
+#[tokio::test]
+async fn unauthorized_open_stage_corruption_upgrades_to_recoverable_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    // Corruption-like on-disk content: "file is not a database".
+    std::fs::write(&path, b"not a valid sqlite database").unwrap();
+
+    // Unauthorized startup (recover_corrupted_database = false).
+    let err = init_database_staged_with_options(
+        &path,
+        DatabaseInitOptions {
+            recover_corrupted_database: false,
+        },
+    )
+    .await
+    .expect_err("unauthorized corruption must not rebuild, must surface a staged error");
+
+    // The fix: corruption-like failure must upgrade to the recoverable stage,
+    // NOT the generic database.open stage (which AionUi maps to restart-only).
+    assert_eq!(err.stage(), "database.recoverable_corruption");
+
+    // Original corrupt file untouched, no backup created (no rebuild without auth).
+    assert_eq!(std::fs::read(&path).unwrap(), b"not a valid sqlite database");
+    let has_backup = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().contains("backup"));
+    assert!(!has_backup, "unauthorized startup must not create a backup file");
 }
 
 // -- Directory creation --
