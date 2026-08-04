@@ -102,6 +102,36 @@ impl BackgroundStreamWatcher {
             }
             match &ev {
                 AgentStreamEvent::WorkflowProgress(data) => self.handle_card_refresh(data).await,
+                AgentStreamEvent::AcpSessionInfo(payload) => {
+                    // Agent-proposed session title arriving BETWEEN turns. The
+                    // claude generate_session_title reply lands seconds AFTER the
+                    // first turn's Finish (live 2026-08-04: TurnResult 07:21:33 →
+                    // title frame 07:21:36), when the per-turn relay is already
+                    // gone — without this arm the title was silently dropped.
+                    // Mirrors the relay's arm (which still owns mid-turn frames,
+                    // e.g. ACP session_info_update during a prompt). No stream
+                    // forward: apply_agent_title broadcasts its own events.
+                    if let Some(title) = payload
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        && let Err(e) = crate::service::apply_agent_title(
+                            &self.repo,
+                            &self.broadcaster,
+                            &self.user_id,
+                            &self.conversation_id,
+                            title,
+                        )
+                        .await
+                    {
+                        warn!(
+                            conversation_id = %self.conversation_id,
+                            error = %e,
+                            "agent session title apply failed (background)"
+                        );
+                    }
+                }
                 ev_ref if Self::is_orphan_turn_content(ev_ref) => {
                     self.run_orphan_turn(ev.clone(), &mut rx).await;
                 }
@@ -611,5 +641,46 @@ mod tests {
             "the watcher must stay out of an active turn"
         );
         drop(claim);
+    }
+
+    /// The claude generate_session_title reply lands seconds AFTER the first
+    /// turn's Finish (live 2026-08-04), between turns — the watcher must apply
+    /// it (guarded rename + nameUpdated broadcast), since the per-turn relay is
+    /// already gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn between_turns_agent_title_renames_and_broadcasts() {
+        let rig = rig().await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::AcpSessionInfo(serde_json::json!({
+                "title": "Fix login bug"
+            })))
+            .unwrap();
+
+        // Poll until the watcher applies the rename (bounded).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let row = rig.repo.get(&rig.user_id, "conv-1").await.unwrap().unwrap();
+            if row.name == "Fix login bug" {
+                assert_eq!(row.name_source.as_deref(), Some("agent"));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watcher did not apply the between-turns title, name still {:?}",
+                row.name
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let mut saw_name_updated = false;
+        while let Ok(msg) = ws.try_recv() {
+            if msg.name == "conversation.nameUpdated" {
+                saw_name_updated = true;
+                assert_eq!(msg.data["conversation_id"], "conv-1");
+                assert_eq!(msg.data["name"], "Fix login bug");
+            }
+        }
+        assert!(saw_name_updated, "nameUpdated must be broadcast");
     }
 }
