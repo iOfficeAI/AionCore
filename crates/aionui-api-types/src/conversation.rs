@@ -294,6 +294,12 @@ pub struct MessageResponse {
     pub status: Option<MessageStatus>,
     pub hidden: bool,
     pub created_at: TimestampMs,
+    /// Backend turn anchor (codex `Turn.id`) stamped on rows persisted while
+    /// that turn streamed. Presence tells the UI a mid-history fork can anchor
+    /// at (or after) this message; absent on legacy/copied rows and on
+    /// backends without turn-anchored forks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_turn_id: Option<String>,
 }
 
 /// Cursor-paginated list of messages.
@@ -767,6 +773,7 @@ mod tests {
             status: Some(MessageStatus::Finish),
             hidden: false,
             created_at: 1712345678000,
+            backend_turn_id: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], "msg_1");
@@ -795,6 +802,7 @@ mod tests {
             status: None,
             hidden: true,
             created_at: 5000,
+            backend_turn_id: None,
         };
         let serialized = serde_json::to_string(&resp).unwrap();
         let deserialized: MessageResponse = serde_json::from_str(&serialized).unwrap();

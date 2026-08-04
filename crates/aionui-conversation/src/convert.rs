@@ -161,6 +161,7 @@ pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, Conve
         status,
         hidden: row.hidden,
         created_at: row.created_at,
+        backend_turn_id: row.backend_turn_id,
     })
 }
 
