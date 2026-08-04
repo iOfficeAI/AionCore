@@ -64,6 +64,13 @@ pub enum AgentStreamEvent {
     /// under one turn). The relay consumes it internally and never forwards it
     /// to the WebSocket, so no frontend renderer is required.
     SegmentBreak,
+    /// Internal-only: the backend's OWN id for the turn that just started
+    /// (codex `turn/started` → `Turn.id`). The relay consumes it to stamp
+    /// `messages.backend_turn_id` on every row it persists for this turn — the
+    /// lookup key for `thread/fork`'s `lastTurnId` when forking mid-history.
+    /// Never forwarded to the WebSocket; never user-visible output. Only the
+    /// direct-CLI codex pump emits it.
+    BackendTurnBound(String),
     /// Internal-only: one snapshot of a running workflow's progress.
     ///
     /// NOT forwarded to the WebSocket as-is. The relay projects it into the two

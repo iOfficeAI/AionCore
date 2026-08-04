@@ -155,7 +155,9 @@ pub trait IConversationRepository: Send + Sync {
         _target_conversation_id: &str,
         _cursor: (TimestampMs, &str),
     ) -> Result<u64, DbError> {
-        Err(DbError::Init("copy_messages_up_to is not supported by this repository".into()))
+        Err(DbError::Init(
+            "copy_messages_up_to is not supported by this repository".into(),
+        ))
     }
 
     /// Resolves the backend turn anchor for a fork point: the `backend_turn_id`

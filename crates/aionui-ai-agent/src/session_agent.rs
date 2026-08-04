@@ -1328,12 +1328,26 @@ fn spec_mode_model(
 ) -> (aionui_session::SessionSpec, Option<String>, Option<String>) {
     use aionui_session::SessionSpec;
     let spec = match &backend_session_id {
+        // A bound session ALWAYS resumes — even on a forked conversation
+        // (its fork completed; the spec is now pure lineage data).
         Some(_) => SessionSpec::Resume {
             session_id: conversation_id.to_owned(),
             backend_session_id,
         },
-        None => SessionSpec::Fresh {
-            session_id: conversation_id.to_owned(),
+        // Unbound + fork spec = the fork has not materialized yet → open in
+        // Fork mode against the parent's snapshotted sid. This also makes a
+        // post-fork dead-anchor self-heal (clear_session_id) RE-FORK back to
+        // the fork point instead of silently opening Fresh — strictly better
+        // than the plain conversation's lost-anchor behavior.
+        None => match &config.fork {
+            Some(fork) => SessionSpec::Fork {
+                session_id: conversation_id.to_owned(),
+                parent_backend_session_id: fork.parent_session_id.clone(),
+                at_turn_id: fork.last_turn_id.clone(),
+            },
+            None => SessionSpec::Fresh {
+                session_id: conversation_id.to_owned(),
+            },
         },
     };
     // Normalize the resolved mode alias into the backend-native id — the SAME
@@ -3683,6 +3697,12 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         // `TurnStarted` (never reaches this stream) — are therefore NOT re-projected
         // to Start here, or the frontend would see a late/duplicate turn boundary.
         SessionEvent::PromptAccepted { .. } | SessionEvent::TurnStarted { .. } => Vec::new(),
+        // Fork anchoring: forward the backend's own turn id as an internal-only
+        // relay frame so message rows persisted during this turn carry it
+        // (`messages.backend_turn_id`). Never reaches the WebSocket.
+        SessionEvent::BackendTurnBound { backend_turn_id } => {
+            vec![AgentStreamEvent::BackendTurnBound(backend_turn_id)]
+        }
         SessionEvent::MessageDelta { text, .. } => {
             vec![AgentStreamEvent::Text(TextEventData { content: text })]
         }
@@ -4277,6 +4297,48 @@ mod build_mapping_tests {
         ));
         assert_eq!(mode.as_deref(), Some("plan"));
         assert_eq!(model.as_deref(), Some("claude-x"));
+    }
+
+    /// Fork-spec quadrant matrix (sid x fork): a bound sid ALWAYS resumes (the
+    /// fork completed; the spec is lineage data); unbound + fork spec opens in
+    /// Fork mode against the parent's snapshotted sid; unbound + no spec stays
+    /// Fresh.
+    #[test]
+    fn spec_fork_quadrants() {
+        let fork_cfg = AcpBuildExtra {
+            fork: Some(aionui_api_types::ForkSpec {
+                parent_conversation_id: "conv_parent".into(),
+                parent_message_id: "msg_9".into(),
+                parent_session_id: "parent-sid".into(),
+                last_turn_id: Some("turn-4".into()),
+            }),
+            ..Default::default()
+        };
+        let plain_cfg = AcpBuildExtra::default();
+        let md = test_metadata(Some("codex"), None);
+
+        // (None, fork) -> Fork with the parent anchor + turn id.
+        let (spec, _, _) = spec_mode_model("conv_f", None, &fork_cfg, None, &md);
+        assert!(matches!(
+            spec,
+            SessionSpec::Fork { ref parent_backend_session_id, ref at_turn_id, .. }
+                if parent_backend_session_id == "parent-sid" && at_turn_id.as_deref() == Some("turn-4")
+        ));
+
+        // (Some, fork) -> Resume (fork already materialized; never re-fork).
+        let (spec, _, _) = spec_mode_model("conv_f", Some("own-sid".into()), &fork_cfg, None, &md);
+        assert!(matches!(
+            spec,
+            SessionSpec::Resume { backend_session_id: Some(ref b), .. } if b == "own-sid"
+        ));
+
+        // (None, no fork) -> Fresh.
+        let (spec, _, _) = spec_mode_model("conv_f", None, &plain_cfg, None, &md);
+        assert!(matches!(spec, SessionSpec::Fresh { .. }));
+
+        // (Some, no fork) -> Resume (unchanged baseline).
+        let (spec, _, _) = spec_mode_model("conv_f", Some("own-sid".into()), &plain_cfg, None, &md);
+        assert!(matches!(spec, SessionSpec::Resume { .. }));
     }
 
     // The interactive-switch-persisted snapshot selection MUST win over the

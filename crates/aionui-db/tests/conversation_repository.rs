@@ -1338,7 +1338,10 @@ async fn copy_messages_up_to_is_inclusive_reminted_and_order_preserving() {
         .list_messages_page(
             USER_ID,
             &target.id,
-            &MessagePageParams { limit: 50, direction: MessagePageDirection::InitialLatest },
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::InitialLatest,
+            },
         )
         .await
         .unwrap();
@@ -1347,15 +1350,30 @@ async fn copy_messages_up_to_is_inclusive_reminted_and_order_preserving() {
     let contents: Vec<&str> = page
         .items
         .iter()
-        .map(|m| if m.content.contains("one") { "one" } else if m.content.contains("two") { "two" } else { "three" })
+        .map(|m| {
+            if m.content.contains("one") {
+                "one"
+            } else if m.content.contains("two") {
+                "two"
+            } else {
+                "three"
+            }
+        })
         .collect();
-    assert_eq!(contents, vec!["one", "two", "three"], "display order must match the source order");
+    assert_eq!(
+        contents,
+        vec!["one", "two", "three"],
+        "display order must match the source order"
+    );
 
     for (copy, original) in page.items.iter().zip([&m1, &m2, &m3]) {
         assert_ne!(copy.id, original.id, "primary keys must be reminted");
         assert_eq!(copy.msg_id, original.msg_id, "msg_id is preserved");
         assert_eq!(copy.created_at, original.created_at, "created_at is preserved");
-        assert_eq!(copy.backend_turn_id, None, "source turn anchors must not leak into the fork");
+        assert_eq!(
+            copy.backend_turn_id, None,
+            "source turn anchors must not leak into the fork"
+        );
     }
 }
 
@@ -1365,7 +1383,9 @@ async fn copy_messages_up_to_rejects_foreign_target_without_partial_copy() {
     create_user_2(&db).await;
     let source = make_conversation("fork-src-own");
     repo.create(&source).await.unwrap();
-    repo.insert_message(USER_ID, &make_message_at(&source.id, "one", 1000, None)).await.unwrap();
+    repo.insert_message(USER_ID, &make_message_at(&source.id, "one", 1000, None))
+        .await
+        .unwrap();
 
     let mut foreign = make_conversation("fork-dst-foreign");
     foreign.user_id = "user_2".to_string();
@@ -1381,7 +1401,10 @@ async fn copy_messages_up_to_rejects_foreign_target_without_partial_copy() {
         .list_messages_page(
             "user_2",
             &foreign.id,
-            &MessagePageParams { limit: 50, direction: MessagePageDirection::InitialLatest },
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::InitialLatest,
+            },
         )
         .await
         .unwrap();
@@ -1402,15 +1425,24 @@ async fn resolve_backend_turn_anchor_picks_nearest_at_or_before_cursor() {
     }
 
     // Cursor on a row without an anchor → nearest earlier anchor wins.
-    let anchor = repo.resolve_backend_turn_anchor(USER_ID, &conv.id, (2000, &m2.id)).await.unwrap();
+    let anchor = repo
+        .resolve_backend_turn_anchor(USER_ID, &conv.id, (2000, &m2.id))
+        .await
+        .unwrap();
     assert_eq!(anchor.as_deref(), Some("turn_a"));
 
     // Cursor at HEAD → the latest anchor.
-    let anchor = repo.resolve_backend_turn_anchor(USER_ID, &conv.id, (3000, &m3.id)).await.unwrap();
+    let anchor = repo
+        .resolve_backend_turn_anchor(USER_ID, &conv.id, (3000, &m3.id))
+        .await
+        .unwrap();
     assert_eq!(anchor.as_deref(), Some("turn_b"));
 
     // Cursor before every anchored row → None.
-    let anchor = repo.resolve_backend_turn_anchor(USER_ID, &conv.id, (500, "aaa")).await.unwrap();
+    let anchor = repo
+        .resolve_backend_turn_anchor(USER_ID, &conv.id, (500, "aaa"))
+        .await
+        .unwrap();
     assert_eq!(anchor, None);
 }
 
@@ -1425,6 +1457,9 @@ async fn resolve_backend_turn_anchor_is_user_scoped() {
     msg.conversation_id = conv.id.clone();
     repo.insert_message("user_2", &msg).await.unwrap();
 
-    let anchor = repo.resolve_backend_turn_anchor(USER_ID, &conv.id, (2000, "zzz")).await.unwrap();
+    let anchor = repo
+        .resolve_backend_turn_anchor(USER_ID, &conv.id, (2000, "zzz"))
+        .await
+        .unwrap();
     assert_eq!(anchor, None, "foreign conversations must resolve to nothing");
 }

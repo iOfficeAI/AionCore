@@ -38,6 +38,28 @@ pub struct SessionMcpServer {
     pub transport: SessionMcpTransport,
 }
 
+/// The fork spec a forked conversation carries in `conversations.extra.fork`
+/// until its backend session materializes: the parent lineage (UI display) plus
+/// the snapshot the first open needs to fork the backend session. Written ONLY
+/// by the server-side fork API (`create()` strips a client-supplied `fork` key);
+/// once the fork completes and a session id is persisted, this degrades to pure
+/// lineage display data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkSpec {
+    /// The conversation this one was forked from (lineage display; soft
+    /// reference — the parent may be deleted later).
+    pub parent_conversation_id: String,
+    /// The fork-point message in the PARENT conversation (inclusive).
+    pub parent_message_id: String,
+    /// The parent's backend session id, snapshotted AT FORK TIME (the parent
+    /// may rotate/advance afterwards; the fork must not chase it).
+    pub parent_session_id: String,
+    /// Backend turn anchor for an at-turn fork (codex `lastTurnId`); `None` =
+    /// fork at HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_id: Option<String>,
+}
+
 /// ACP-specific fields extracted from `extra` in build task options.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AcpBuildExtra {
@@ -73,6 +95,10 @@ pub struct AcpBuildExtra {
     pub session_mcp_servers: Vec<SessionMcpServer>,
     #[serde(default)]
     pub user_id: Option<String>,
+    /// Present only on a forked conversation (see [`ForkSpec`]). Consumed by
+    /// the first session open when no backend session id is bound yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<ForkSpec>,
 }
 
 /// Aionrs-specific fields extracted from `extra` in build task options.

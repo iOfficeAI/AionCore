@@ -10,8 +10,8 @@ use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::SessionId as DomainSessionId;
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::v1::{
-    AuthMethod, ContentBlock, LoadSessionRequest, PromptRequest, PromptResponse, SessionId, StopReason, Usage,
-    UsageUpdate,
+    AuthMethod, ContentBlock, ForkSessionRequest, LoadSessionRequest, PromptRequest, PromptResponse, SessionId,
+    StopReason, Usage, UsageUpdate,
 };
 use aionui_api_types::SlashCommandItem;
 use serde_json::Value;
@@ -235,6 +235,85 @@ impl AcpAgentManager {
         match self.reconcile_session(session_id).await {
             Ok(()) => Ok(session_id.to_owned()),
             Err(e) if is_acp_session_not_found(&e) => self.rebuild_after_session_not_found(session_id, &e).await,
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Materialize a forked conversation's backend session: `session/fork`
+    /// against the PARENT sid, absorbing the response exactly like
+    /// `session/load` and persisting the NEW sid via `SessionAssigned`.
+    ///
+    /// Deliberately different failure contract from resume: an initial fork
+    /// NEVER falls back to `session/new` — the user asked for the parent's
+    /// context, and a silent fresh session would drop it. Both a missing
+    /// capability and a `SessionNotFound` (the agent does not persist the
+    /// parent session across processes) surface as explicit errors; the fork
+    /// conversation stays unbound (sid NULL) so a later attempt may retry.
+    pub(super) async fn open_session_fork(&self, fork: &aionui_api_types::ForkSpec) -> Result<String, AgentError> {
+        // Live capability gate (second line of defense behind the fork API's
+        // agent_metadata check — the DB declaration can lag the installed CLI).
+        let supports_fork = {
+            let session = self.session.read().await;
+            session
+                .agent_capabilities()
+                .map(|c| c.session_capabilities.fork.is_some())
+                .unwrap_or(false)
+        };
+        if !supports_fork {
+            return Err(AgentError::Conflict(format!(
+                "agent '{}' does not advertise session/fork; cannot materialize the forked conversation",
+                self.backend().unwrap_or("<unknown>")
+            )));
+        }
+
+        let mut req = ForkSessionRequest::new(
+            SessionId::new(fork.parent_session_id.as_str()),
+            &self.params.workspace.path,
+        );
+        if !self.params.mcp_servers.is_empty() {
+            req = req.mcp_servers(self.params.mcp_servers.clone());
+        }
+        let fork_response = match self.protocol.fork_session(req).await {
+            Ok(r) => r,
+            Err(e) if is_acp_session_not_found(&e) => {
+                // NOT rebuild_after_session_not_found: an initial fork must not
+                // silently degrade to a fresh, context-free session.
+                return Err(AgentError::NotFound(format!(
+                    "session/fork: the parent session '{}' is gone on the agent side ({e}); \
+                     the agent may not persist sessions across restarts",
+                    fork.parent_session_id
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let new_sid = fork_response.session_id.to_string();
+
+        {
+            let mut session = self.session.write().await;
+            if let Some(modes) = fork_response.modes {
+                session.apply_advertised_modes(modes);
+            }
+            if let Some(config_options) = fork_response.config_options {
+                session.apply_advertised_config_options(config_options);
+            }
+            session.set_session_id(DomainSessionId::new(new_sid.clone()));
+            self.commit_session_changes(&mut session).await;
+        }
+        self.emit_snapshot_events().await;
+
+        // Persist the NEW sid (acp_session.session_id): from here on every
+        // rebuild takes the plain resume path and the fork spec degrades to
+        // lineage display data.
+        self.runtime
+            .emit(AgentStreamEvent::SessionAssigned(SessionAssignedEventData {
+                session_id: new_sid.clone(),
+            }));
+
+        match self.reconcile_session(&new_sid).await {
+            Ok(()) => Ok(new_sid),
+            // Post-fork reconcile hiccups keep the normal resume-era semantics
+            // (the fork itself succeeded and is persisted).
+            Err(e) if is_acp_session_not_found(&e) => self.rebuild_after_session_not_found(&new_sid, &e).await,
             Err(e) => Err(e.into()),
         }
     }
@@ -872,6 +951,46 @@ mod tests {
         session.apply_advertised_capabilities(caps);
         let supports_load = session.agent_capabilities().map(|c| c.load_session).unwrap_or(false);
         assert!(!supports_load);
+    }
+
+    /// `open_session_fork`'s live gate reads `session_capabilities.fork`
+    /// key-presence (ACP spec semantics: `Some({})` = supported). The three
+    /// cases mirror the session/load trio above.
+    #[test]
+    fn advertised_fork_capability_drives_supports_fork() {
+        let mut session = make_session();
+        let mut caps = AgentCapabilities::new();
+        caps.session_capabilities.fork = Some(Default::default());
+        session.apply_advertised_capabilities(caps);
+        let supports_fork = session
+            .agent_capabilities()
+            .map(|c| c.session_capabilities.fork.is_some())
+            .unwrap_or(false);
+        assert!(
+            supports_fork,
+            "`sessionCapabilities.fork: {{}}` must enable session/fork"
+        );
+    }
+
+    #[test]
+    fn missing_handshake_means_no_fork() {
+        let session = make_session();
+        let supports_fork = session
+            .agent_capabilities()
+            .map(|c| c.session_capabilities.fork.is_some())
+            .unwrap_or(false);
+        assert!(!supports_fork, "without an init handshake fork must be refused");
+    }
+
+    #[test]
+    fn absent_fork_capability_means_no_fork() {
+        let mut session = make_session();
+        session.apply_advertised_capabilities(AgentCapabilities::new());
+        let supports_fork = session
+            .agent_capabilities()
+            .map(|c| c.session_capabilities.fork.is_some())
+            .unwrap_or(false);
+        assert!(!supports_fork, "a handshake without the fork key must be refused");
     }
 
     /// Simulate the aggregate-state effect of a successful warmup that

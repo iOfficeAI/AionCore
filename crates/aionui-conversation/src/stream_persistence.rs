@@ -71,6 +71,12 @@ pub(crate) struct StreamPersistenceAdapter {
     msg_id: String,
     repo: Arc<dyn IConversationRepository>,
     persistence: Option<RuntimePersistenceCoordinator>,
+    /// The backend's own id for the in-flight turn (codex `Turn.id`), stamped
+    /// onto every message row this adapter persists — the lookup key for
+    /// `thread/fork`'s `lastTurnId`. Set by the relay on the internal
+    /// `BackendTurnBound` frame; `None` for backends without one (claude/ACP).
+    /// Shared across clones (the relay and its helpers clone the adapter).
+    backend_turn_id: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl StreamPersistenceAdapter {
@@ -87,7 +93,18 @@ impl StreamPersistenceAdapter {
             msg_id,
             repo,
             persistence,
+            backend_turn_id: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Record the backend's turn id for the in-flight turn (relay-only).
+    pub(crate) fn set_backend_turn_id(&self, backend_turn_id: String) {
+        *self.backend_turn_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(backend_turn_id);
+    }
+
+    /// The stamp every persisted message row of the current turn carries.
+    fn current_backend_turn_id(&self) -> Option<String> {
+        self.backend_turn_id.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn with_persistence(mut self, persistence: RuntimePersistenceCoordinator) -> Self {
@@ -178,7 +195,7 @@ impl StreamPersistenceAdapter {
                 status: Some("work".into()),
                 hidden: false,
                 created_at: segment.created_at,
-                backend_turn_id: None,
+                backend_turn_id: self.current_backend_turn_id(),
             };
             if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
                 log_persist_error(&e, "Failed to create streaming text segment");
@@ -222,7 +239,7 @@ impl StreamPersistenceAdapter {
                 status: Some(status.to_owned()),
                 hidden: false,
                 created_at: segment.created_at,
-                backend_turn_id: None,
+                backend_turn_id: self.current_backend_turn_id(),
             };
             if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
                 log_persist_error(&e, "Failed to create finalized text segment");
@@ -314,7 +331,7 @@ impl StreamPersistenceAdapter {
                 status: Some(status.to_owned()),
                 hidden: false,
                 created_at: now_ms(),
-                backend_turn_id: None,
+                backend_turn_id: self.current_backend_turn_id(),
             };
             if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
                 log_persist_error(&e, "Failed to create final fallback message");
@@ -341,7 +358,7 @@ impl StreamPersistenceAdapter {
             status: Some("error".into()),
             hidden: false,
             created_at: now_ms(),
-            backend_turn_id: None,
+            backend_turn_id: self.current_backend_turn_id(),
         };
         if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
             log_persist_error(&e, "Failed to store error message");
@@ -375,7 +392,7 @@ impl StreamPersistenceAdapter {
             status: Some(status.into()),
             hidden: false,
             created_at: now_ms(),
-            backend_turn_id: None,
+            backend_turn_id: self.current_backend_turn_id(),
         };
         if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
             log_persist_error(&e, "Failed to store tip message");
@@ -412,7 +429,7 @@ impl StreamPersistenceAdapter {
             status: Some("finish".into()),
             hidden: false,
             created_at: segment.started_at,
-            backend_turn_id: None,
+            backend_turn_id: self.current_backend_turn_id(),
         };
         if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
             log_persist_error(&e, "Failed to persist thinking message");
@@ -454,7 +471,7 @@ impl StreamPersistenceAdapter {
             status: Some(status.to_owned()),
             hidden: false,
             created_at: now_ms(),
-            backend_turn_id: None,
+            backend_turn_id: self.current_backend_turn_id(),
         };
         if let Err(e) = self.repo.upsert_message(&self.user_id, &row).await {
             error!(
@@ -505,7 +522,7 @@ impl StreamPersistenceAdapter {
             status: Some(status.to_owned()),
             hidden: false,
             created_at: now_ms(),
-            backend_turn_id: None,
+            backend_turn_id: self.current_backend_turn_id(),
         };
         if let Err(e) = self.repo.upsert_message(&self.user_id, &row).await {
             error!(error = %ErrorChain(&e), "Failed to upsert acp_tool_call message");
@@ -581,7 +598,7 @@ impl StreamPersistenceAdapter {
                 status: Some(status.to_owned()),
                 hidden: false,
                 created_at: now_ms(),
-                backend_turn_id: None,
+                backend_turn_id: self.current_backend_turn_id(),
             };
             if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
                 error!(error = %ErrorChain(&e), "Failed to persist tool_group message");
