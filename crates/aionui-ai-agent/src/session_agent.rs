@@ -2972,7 +2972,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             content,
             ..
         } => {
-            let output = tool_result_text(&content);
+            let output = tool_result_output(&content);
             vec![AgentStreamEvent::ToolCall(ToolCallEventData {
                 call_id: tool_use_id,
                 name: String::new(),
@@ -3238,8 +3238,10 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
     }
 }
 
-/// Flatten a tool result's content parts into a single text string for the
-/// `ToolCallEventData.output` field (origin renders that).
+/// Flatten a tool result's displayable content into the string-based
+/// `ToolCallEventData.output` field used by the origin renderer. Durable file
+/// references must survive this bridge so generated artifacts can be rendered;
+/// inline image bytes remain intentionally excluded.
 const STREAM_TOOL_PAYLOAD_CAP: usize = 64 * 1024;
 const STREAM_TOOL_TEXT_TRUNCATED: &str = "\n...[truncated]";
 
@@ -3259,11 +3261,16 @@ fn compact_stream_tool_payload(value: serde_json::Value) -> serde_json::Value {
     })
 }
 
-fn tool_result_text(content: &[ToolResultContent]) -> Option<String> {
+fn tool_result_output(content: &[ToolResultContent]) -> Option<String> {
     let mut buf = String::new();
     let mut truncated = false;
     for part in content {
-        if let ToolResultContent::Text(t) = part {
+        let display = match part {
+            ToolResultContent::Text(text) => Some(text.as_str()),
+            ToolResultContent::FilePath { path, .. } => Some(path.as_str()),
+            ToolResultContent::Image { .. } => None,
+        };
+        if let Some(t) = display {
             let separator_len = usize::from(!buf.is_empty());
             if buf.len() + separator_len + t.len() > STREAM_TOOL_PAYLOAD_CAP {
                 let available = STREAM_TOOL_PAYLOAD_CAP.saturating_sub(buf.len() + separator_len);
@@ -3899,12 +3906,37 @@ mod translate_tests {
     }
 
     #[test]
+    fn image_tool_result_path_reaches_the_agent_stream() {
+        let image_path = r"C:\Users\test\.codex\generated_images\session\image.png";
+        let events = translate_event(
+            SessionEvent::ToolResult {
+                tool_use_id: "call-generate-image".into(),
+                is_error: false,
+                content: vec![ToolResultContent::FilePath {
+                    path: image_path.into(),
+                    mime: Some("image/png".into()),
+                    old_text: None,
+                    new_text: None,
+                }],
+                parent_tool_use_id: None,
+            },
+            "conv-1",
+            false,
+        );
+        let AgentStreamEvent::ToolCall(call) = &events[0] else {
+            panic!("expected ToolCall, got {:?}", events[0]);
+        };
+        assert_eq!(call.status, ToolCallStatus::Completed);
+        assert_eq!(call.output.as_deref(), Some(image_path));
+    }
+
+    #[test]
     fn aggregate_tool_result_text_is_bounded() {
         let content = vec![
             ToolResultContent::Text("x".repeat(STREAM_TOOL_PAYLOAD_CAP / 2)),
             ToolResultContent::Text("界".repeat(STREAM_TOOL_PAYLOAD_CAP)),
         ];
-        let output = tool_result_text(&content).expect("text output");
+        let output = tool_result_output(&content).expect("text output");
         assert!(output.len() <= STREAM_TOOL_PAYLOAD_CAP);
         assert!(output.ends_with("...[truncated]"));
         assert!(output.is_char_boundary(output.len()));
