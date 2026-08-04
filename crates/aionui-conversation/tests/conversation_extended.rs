@@ -1073,7 +1073,10 @@ async fn get_projects_prompt_capability_on_detail_path() {
     let got = svc.get(USER_ID, &claude_conv.id).await.unwrap();
     assert_eq!(
         got.prompt_capability,
-        Some(aionui_api_types::PromptCapabilityView { image: true, audio: false })
+        Some(aionui_api_types::PromptCapabilityView {
+            image: true,
+            audio: false
+        })
     );
 
     // qwen: 003 seeds image + audio.
@@ -1081,7 +1084,10 @@ async fn get_projects_prompt_capability_on_detail_path() {
     let got = svc.get(USER_ID, &qwen_conv.id).await.unwrap();
     assert_eq!(
         got.prompt_capability,
-        Some(aionui_api_types::PromptCapabilityView { image: true, audio: true })
+        Some(aionui_api_types::PromptCapabilityView {
+            image: true,
+            audio: true
+        })
     );
 }
 

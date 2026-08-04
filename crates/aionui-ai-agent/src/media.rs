@@ -104,7 +104,11 @@ fn classify(path: &str, caps: PromptMediaCaps) -> Option<MediaAttachment> {
             kind,
         }),
         Ok(meta) if meta.is_file() => {
-            warn!(path, bytes = meta.len(), "media attachment exceeds block size limit; sending as path");
+            warn!(
+                path,
+                bytes = meta.len(),
+                "media attachment exceeds block size limit; sending as path"
+            );
             None
         }
         _ => {
@@ -159,8 +163,14 @@ pub async fn read_media_bytes(attachment: &MediaAttachment) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    const CAPS_IMAGE: PromptMediaCaps = PromptMediaCaps { image: true, audio: false };
-    const CAPS_ALL: PromptMediaCaps = PromptMediaCaps { image: true, audio: true };
+    const CAPS_IMAGE: PromptMediaCaps = PromptMediaCaps {
+        image: true,
+        audio: false,
+    };
+    const CAPS_ALL: PromptMediaCaps = PromptMediaCaps {
+        image: true,
+        audio: true,
+    };
 
     fn inline(content: &str, paths: &[&str]) -> String {
         format!("{content}\n\n{AIONUI_FILES_MARKER}\n{}", paths.join("\n"))

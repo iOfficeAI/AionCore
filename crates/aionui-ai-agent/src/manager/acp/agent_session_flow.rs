@@ -788,7 +788,9 @@ mod tests {
     use crate::protocol::error::AcpError;
     use crate::shared_kernel::SessionId as DomainSessionId;
     use crate::types::SendMessageData;
-    use agent_client_protocol::schema::v1::{AgentCapabilities, ContentBlock, Cost, PromptResponse, Usage, UsageUpdate};
+    use agent_client_protocol::schema::v1::{
+        AgentCapabilities, ContentBlock, Cost, PromptResponse, Usage, UsageUpdate,
+    };
 
     use super::{end_turn_usage_frame, end_turn_usage_frame_from_response, preserve_known_window};
 
@@ -1523,10 +1525,7 @@ mod tests {
         let img = dir.join("plain.png");
         std::fs::write(&img, b"fakepng").unwrap();
         let img = img.to_string_lossy().into_owned();
-        let content = format!(
-            "hi\n\n{}\n{img}",
-            aionui_common::constants::AIONUI_FILES_MARKER
-        );
+        let content = format!("hi\n\n{}\n{img}", aionui_common::constants::AIONUI_FILES_MARKER);
         let data = SendMessageData {
             content: content.clone(),
             msg_id: "m1".into(),
@@ -1564,7 +1563,10 @@ mod tests {
             files: vec![img.clone(), pdf.clone()],
             inject_skills: vec![],
         };
-        let caps = crate::types::PromptMediaCaps { image: true, audio: false };
+        let caps = crate::types::PromptMediaCaps {
+            image: true,
+            audio: false,
+        };
         let blocks = super::build_prompt_blocks(&data, caps).await;
         assert_eq!(blocks.len(), 2);
         match &blocks[0] {
@@ -1580,10 +1582,7 @@ mod tests {
         match &blocks[1] {
             ContentBlock::Image(image) => {
                 assert_eq!(image.mime_type, "image/png");
-                assert_eq!(
-                    image.data,
-                    base64::engine::general_purpose::STANDARD.encode(b"fakepng")
-                );
+                assert_eq!(image.data, base64::engine::general_purpose::STANDARD.encode(b"fakepng"));
                 assert_eq!(image.uri.as_deref(), Some(format!("file://{img}").as_str()));
             }
             other => panic!("expected image block, got {other:?}"),
@@ -1597,10 +1596,7 @@ mod tests {
         let img = dir.join("vanishing.png");
         std::fs::write(&img, b"fakepng").unwrap();
         let img_path = img.to_string_lossy().into_owned();
-        let content = format!(
-            "gone\n\n{}\n{img_path}",
-            aionui_common::constants::AIONUI_FILES_MARKER
-        );
+        let content = format!("gone\n\n{}\n{img_path}", aionui_common::constants::AIONUI_FILES_MARKER);
         let data = SendMessageData {
             content: content.clone(),
             msg_id: "m3".into(),
@@ -1608,7 +1604,10 @@ mod tests {
             files: vec![img_path.clone()],
             inject_skills: vec![],
         };
-        let caps = crate::types::PromptMediaCaps { image: true, audio: false };
+        let caps = crate::types::PromptMediaCaps {
+            image: true,
+            audio: false,
+        };
         // Classification uses fs::metadata inside partition_media, which runs
         // inside build_prompt_blocks — so remove the file first and verify the
         // whole prompt degrades to the original text form.
