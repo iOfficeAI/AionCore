@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! A child that leaves the process group must still be torn down.
 //!
 //! Measured motivation (agy 1.1.9): its tool subprocesses each become their own
