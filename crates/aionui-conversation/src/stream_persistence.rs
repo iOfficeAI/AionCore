@@ -103,7 +103,9 @@ impl StreamPersistenceAdapter {
     }
 
     /// The stamp every persisted message row of the current turn carries.
-    fn current_backend_turn_id(&self) -> Option<String> {
+    /// Also read by the relay so live `message.stream` frames carry the anchor
+    /// (without it, mid-history fork entries only appear after a reload).
+    pub(crate) fn current_backend_turn_id(&self) -> Option<String> {
         self.backend_turn_id.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 

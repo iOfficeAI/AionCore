@@ -901,6 +901,13 @@ impl StreamRelay {
                 .or_insert_with(|| serde_json::Value::String(self.user_id.clone()));
             obj.entry("turn_id")
                 .or_insert_with(|| serde_json::Value::String(self.turn_id.clone()));
+            // Fork anchoring parity with persistence: live frames carry the
+            // backend turn anchor so the UI can show mid-history fork entries
+            // during the session, not only after a history reload.
+            if let Some(anchor) = self.adapter.current_backend_turn_id() {
+                obj.entry("backend_turn_id")
+                    .or_insert_with(|| serde_json::Value::String(anchor));
+            }
         }
         let msg = WebSocketMessage::new("message.stream", payload);
         self.broadcaster.broadcast(msg);

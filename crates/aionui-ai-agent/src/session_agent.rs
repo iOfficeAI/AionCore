@@ -1564,17 +1564,17 @@ pub async fn build_session_instance(
         model,
         mode,
         init,
-        // Packaged app: resolve the bundled claude/codex binary and forward its
-        // absolute path so the backend spawns OUR CLI, not the user's PATH one.
-        // Bundled-missing / dev falls back to a PATH lookup via
+        // A user-selected launch path wins so the process uses the same binary
+        // that the registry health check accepted. Otherwise the packaged app
+        // resolves the bundled claude/codex binary and forwards its absolute
+        // path. Bundled-missing / dev falls back to a PATH lookup via
         // `resolve_command_path` (NOT the bare name): on Windows, npm installs
         // ship `claude.cmd`/`codex.cmd` shims which `CreateProcess` does not
         // find from a bare name (#299 parity; Rust std runs `.cmd` via
         // `cmd.exe` since the BatBadBut fix). `None` (nothing on PATH either)
         // keeps the bare name so the spawn error stays diagnosable. Detection
         // (cli_probe) stays PATH-only and is unaffected.
-        cli_program: aionui_runtime::resolve_bundled_cli(backend_label)
-            .or_else(|| aionui_runtime::resolve_command_path(backend_label)),
+        cli_program: resolve_session_cli_program(backend_label, metadata),
         ..Default::default()
     };
 
@@ -1767,6 +1767,24 @@ pub async fn build_session_instance(
         Some(broadcaster),
     );
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
+}
+
+fn resolve_session_cli_program(
+    backend_label: &str,
+    metadata: &aionui_api_types::AgentMetadata,
+) -> Option<std::path::PathBuf> {
+    if metadata.has_command_override {
+        return metadata.resolved_command.clone().or_else(|| {
+            metadata
+                .command
+                .as_deref()
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .map(std::path::PathBuf::from)
+        });
+    }
+
+    aionui_runtime::resolve_bundled_cli(backend_label).or_else(|| aionui_runtime::resolve_command_path(backend_label))
 }
 
 /// Assemble the direct-CLI spawn env (legacy spawn-surface parity; order
@@ -4266,6 +4284,19 @@ mod build_mapping_tests {
             has_command_override: false,
             env_override_key_count: 0,
         }
+    }
+
+    #[test]
+    fn session_cli_program_prefers_explicit_command_override() {
+        let mut metadata = test_metadata(Some("claude"), None);
+        metadata.has_command_override = true;
+        metadata.command = Some("claude".into());
+        metadata.resolved_command = Some(std::path::PathBuf::from("/custom/claude"));
+
+        assert_eq!(
+            resolve_session_cli_program("claude", &metadata),
+            Some(std::path::PathBuf::from("/custom/claude"))
+        );
     }
 
     #[test]
