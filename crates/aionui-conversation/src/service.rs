@@ -21,6 +21,7 @@ use aionui_api_types::{
     ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
     ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
+    PromptCapabilityView,
     ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
     SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
     TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
@@ -2040,14 +2041,16 @@ impl ConversationService {
         let mut response = row_to_response_with_extra(row, extra, &self.workspace_root)?;
         self.attach_assistant_identity(user_id, &mut response).await?;
         response.runtime = Some(self.runtime_summary_for(id).await);
-        // Fork capability: detail-path-only post-fill (list stays N+1-free).
-        // Best-effort — a lookup failure just hides the fork entry point.
+        // Fork + prompt capabilities: detail-path-only post-fill (list stays
+        // N+1-free). Best-effort — a lookup failure just hides the fork entry
+        // point / media hint.
         if let Ok(Some(acp_row)) = self.acp_session_repo.get_for_user(user_id, id).await
-            && let Ok(capability) = self
-                .fork_capability_for_agent(user_id, &acp_row.agent_id, &response.extra.to_string())
+            && let Ok(capabilities) = self
+                .agent_capabilities_for_agent(user_id, &acp_row.agent_id, &response.extra.to_string())
                 .await
         {
-            response.fork_capability = capability;
+            response.fork_capability = capabilities.as_ref().and_then(fork_capability_view);
+            response.prompt_capability = capabilities.as_ref().and_then(prompt_capability_view);
         }
         if project_backfilled {
             self.broadcast_list_changed(user_id, id, "updated", response.source.as_ref());
@@ -2749,6 +2752,21 @@ impl ConversationService {
         agent_id: &str,
         parent_extra: &str,
     ) -> Result<Option<ForkCapabilityView>, ConversationError> {
+        Ok(self
+            .agent_capabilities_for_agent(user_id, agent_id, parent_extra)
+            .await?
+            .as_ref()
+            .and_then(fork_capability_view))
+    }
+
+    /// Load and parse `agent_metadata.agent_capabilities` for the
+    /// conversation's agent (by id, or by `extra.backend` for legacy rows).
+    async fn agent_capabilities_for_agent(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        parent_extra: &str,
+    ) -> Result<Option<serde_json::Value>, ConversationError> {
         let metadata_row = if !agent_id.is_empty() {
             self.agent_metadata_repo
                 .get_for_user(user_id, agent_id)
@@ -2771,19 +2789,7 @@ impl ConversationService {
         let Some(capabilities_json) = metadata_row.and_then(|row| row.agent_capabilities) else {
             return Ok(None);
         };
-        let capabilities: serde_json::Value = match serde_json::from_str(&capabilities_json) {
-            Ok(value) => value,
-            Err(_) => return Ok(None),
-        };
-        let Some(fork) = capabilities.get("session_capabilities").and_then(|s| s.get("fork")) else {
-            return Ok(None);
-        };
-        if fork.is_null() {
-            return Ok(None);
-        }
-        Ok(Some(ForkCapabilityView {
-            at_turn: fork.get("at_turn").and_then(|v| v.as_bool()).unwrap_or(false),
-        }))
+        Ok(serde_json::from_str(&capabilities_json).ok())
     }
 
     /// Reset a conversation: clear messages and set status back to pending.
@@ -4781,6 +4787,32 @@ fn legacy_cron_trigger_to_artifact(row: MessageRow) -> Result<ConversationArtifa
 }
 
 /// Merge `patch` into `base` (top-level key overwrite).
+/// Project `session_capabilities.fork` out of a parsed
+/// `agent_metadata.agent_capabilities` value. `None` = fork hidden.
+fn fork_capability_view(capabilities: &serde_json::Value) -> Option<ForkCapabilityView> {
+    let fork = capabilities.get("session_capabilities")?.get("fork")?;
+    if fork.is_null() {
+        return None;
+    }
+    Some(ForkCapabilityView {
+        at_turn: fork.get("at_turn").and_then(|v| v.as_bool()).unwrap_or(false),
+    })
+}
+
+/// Project `prompt_capabilities` out of a parsed
+/// `agent_metadata.agent_capabilities` value. `None` = unknown (UI treats
+/// media attachments as path-delivered).
+fn prompt_capability_view(capabilities: &serde_json::Value) -> Option<PromptCapabilityView> {
+    let prompt = capabilities.get("prompt_capabilities")?;
+    if !prompt.is_object() {
+        return None;
+    }
+    Some(PromptCapabilityView {
+        image: prompt.get("image").and_then(|v| v.as_bool()).unwrap_or(false),
+        audio: prompt.get("audio").and_then(|v| v.as_bool()).unwrap_or(false),
+    })
+}
+
 fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
     if let (Some(base_obj), Some(patch_obj)) = (base.as_object_mut(), patch.as_object()) {
         for (key, value) in patch_obj {
@@ -5015,6 +5047,7 @@ mod tests {
             assistant: None,
             project_id: None,
             fork_capability: None,
+            prompt_capability: None,
             created_at: 0,
             modified_at: 0,
             extra: json!({}),
