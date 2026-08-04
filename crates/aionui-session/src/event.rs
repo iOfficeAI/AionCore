@@ -536,6 +536,13 @@ pub enum SessionEvent {
         cost_text: Option<String>,
     },
 
+    /// Agent-generated session title (claude `generate_session_title` reply,
+    /// sniffed off the success control_response; the ACP path never reaches
+    /// this enum — it flows through the legacy bridge's `session_info_update`
+    /// translation). FSM-orthogonal: the reducer no-ops; only the conversation
+    /// layer applies it under the `name_source` guard (spec 2026-08-04).
+    SessionTitle { title: String },
+
     /// Addendum 9 (consumer-driven, conversation Tier-2): the adapter lowers its
     /// current `(session_id → backend_session_id)` binding downstream so the
     /// conversation layer can persist `conversations.backend_session_id` as the
@@ -893,6 +900,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | ItemCompleted { .. }
         | MessageFinalized(..)
         | SessionInfo { .. }
+        | SessionTitle { .. }
         | CheckpointList { .. } => EventClass::BackendProduced,
     }
 }
@@ -925,6 +933,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             CheckpointList { .. } => PersistTier::Ephemeral,                     // query response, not history
             CatalogUpdated { .. } => PersistTier::Ephemeral, // async catalog discovery, re-discovered on open (not history)
             SessionInfo { .. } => PersistTier::Ephemeral, // on-demand query snapshot, re-queryable (not history)
+            SessionTitle { .. } => PersistTier::Ephemeral, // applied to conversations.name by the conversation layer, not history
             SubagentDetail { .. } => PersistTier::Ephemeral, // transient per-agent progress (roster fill, re-derivable)
             // the phase list is re-declared on the next run's first progress frame
             WorkflowPhase { .. } => PersistTier::Ephemeral,
@@ -1186,6 +1195,14 @@ mod additive_tests {
                 SessionEvent::SessionInfo {
                     context_usage: None,
                     cost_text: Some("Total cost: $0".into()),
+                },
+                BackendProduced,
+                Ephemeral,
+            ),
+            (
+                "SessionTitle",
+                SessionEvent::SessionTitle {
+                    title: "Fix login bug".into(),
                 },
                 BackendProduced,
                 Ephemeral,

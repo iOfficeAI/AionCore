@@ -408,6 +408,9 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // SessionInfo is a read-only query reply (context budget / cost) — never a
         // turn signal. The conversation projects it; FSM no-op.
         | SessionEvent::SessionInfo { .. }
+        // SessionTitle is an agent-generated conversation title — applied by the
+        // conversation layer under the name_source guard. Never a turn signal.
+        | SessionEvent::SessionTitle { .. }
         // 009 R6b: SubagentDetail is the rich BACKGROUND-plane roster fill — read
         // ONLY by the orchestrator's workflow_roster, never by the FSM. No-op here.
         | SessionEvent::SubagentDetail { .. }

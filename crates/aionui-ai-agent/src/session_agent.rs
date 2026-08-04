@@ -3965,6 +3965,13 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 params,
             })]
         }
+        // Agent-generated session title (claude generate_session_title, spec
+        // 2026-08-04). Reuse the ACP session_info_update event shape so the
+        // StreamRelay's name_source-guarded consumer handles both paths
+        // identically (translate.rs emits the same frame for real ACP agents).
+        SessionEvent::SessionTitle { title } => {
+            vec![AgentStreamEvent::AcpSessionInfo(serde_json::json!({ "title": title }))]
+        }
         // Events with no origin-side counterpart (or purely internal) are dropped.
         // Cancel folds into the Finish emitted by the resulting terminal; Heartbeat,
         // PromptAccepted, Snapshot, Lagged, item lifecycle, subagent/rewound/etc. are
@@ -5949,6 +5956,34 @@ mod pump_tests {
             AgentStreamEvent::SegmentBreak => "SegmentBreak",
             _ => "other",
         }
+    }
+
+    // SessionTitle (claude generate_session_title, spec 2026-08-04) maps to the
+    // SAME AcpSessionInfo frame the ACP bridge emits for session_info_update, so
+    // the StreamRelay's guarded consumer handles both backends through one path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_title_maps_to_acp_session_info_frame() {
+        let script = vec![
+            env(SessionEvent::SessionTitle {
+                title: "Fix login bug".into(),
+            }),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+        ];
+        let frames = drain_script(script).await;
+        let payload = frames
+            .iter()
+            .find_map(|f| match f {
+                AgentStreamEvent::AcpSessionInfo(v) => Some(v.clone()),
+                _ => None,
+            })
+            .expect("SessionTitle must surface as an AcpSessionInfo frame");
+        assert_eq!(payload["title"], "Fix login bug");
     }
 
     // A ConfigChanged never produces a stream frame (it would fall into origin
