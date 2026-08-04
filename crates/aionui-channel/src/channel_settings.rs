@@ -42,8 +42,9 @@ pub trait ChannelGeneratedAssistantMaterializer: Send + Sync {
 
 /// Resolved agent configuration for a channel platform.
 ///
-/// `backend` is only meaningful for ACP agents (claude, gemini, codex, …).
-/// Non-ACP agent types (aionrs, nanobot, remote, …) have `backend = None`.
+/// `backend` is only meaningful for agent types that identify their runtime by
+/// vendor slug — ACP (claude, gemini, codex, …) and Antigravity. The rest
+/// (aionrs, nanobot, remote, …) have `backend = None`.
 #[derive(Debug, Clone)]
 pub struct ResolvedAgentConfig {
     pub agent_type: String,
@@ -130,7 +131,11 @@ impl ChannelSettingsService {
             }
 
             if let Some(at) = setting.agent_type.as_deref() {
-                let backend = if at == "acp" { setting.backend.clone() } else { None };
+                let backend = if agent_type_carries_backend(at) {
+                    setting.backend.clone()
+                } else {
+                    None
+                };
 
                 debug!(platform = %platform, agent_type = %at, backend = ?backend, "resolved channel agent config (new format)");
 
@@ -143,7 +148,11 @@ impl ChannelSettingsService {
             if let Some(raw_backend) = setting.backend.as_deref() {
                 let raw_backend = raw_backend.to_owned();
                 let agent_type = backend_to_agent_type(&raw_backend);
-                let backend = if agent_type == "acp" { Some(raw_backend) } else { None };
+                let backend = if agent_type_carries_backend(&agent_type) {
+                    Some(raw_backend)
+                } else {
+                    None
+                };
 
                 debug!(
                     platform = %platform,
@@ -306,7 +315,11 @@ impl ChannelSettingsService {
             .unwrap_or(definition.agent_id);
         let agent_backend = self.runtime_backend_for_agent_id(user_id, &agent_id).await?;
         let agent_type = backend_to_agent_type(&agent_backend);
-        let backend = if agent_type == "acp" { Some(agent_backend) } else { None };
+        let backend = if agent_type_carries_backend(&agent_type) {
+            Some(agent_backend)
+        } else {
+            None
+        };
 
         Ok(Some(ResolvedAgentConfig { agent_type, backend }))
     }
@@ -529,11 +542,23 @@ fn backend_to_agent_type(backend: &str) -> String {
         "openclaw-gateway" => "openclaw-gateway".to_owned(),
         "nanobot" => "nanobot".to_owned(),
         "remote" => "remote".to_owned(),
+        // agy is a direct-CLI agent, not an ACP one. Left to the catch-all it
+        // would be typed `acp` and routed into a protocol it does not speak.
+        "antigravity" => "antigravity".to_owned(),
         _ => {
             // All ACP-compatible backends: claude, gemini, codex, codebuddy, opencode, qwen, copilot, droid, kimi, etc.
             "acp".to_owned()
         }
     }
+}
+
+/// Whether this agent type identifies its runtime by a `backend` vendor slug.
+///
+/// Both ACP and Antigravity resolve their catalog row through it and fail
+/// conversation creation outright when it is missing ("requires either
+/// agent_id or backend in extra"), so dropping it is not a cosmetic loss.
+fn agent_type_carries_backend(agent_type: &str) -> bool {
+    agent_type == "acp" || agent_type == "antigravity"
 }
 
 /// Builds a `ProviderWithModel` from the resolved config, or returns
@@ -878,6 +903,21 @@ mod tests {
     #[test]
     fn unknown_backend_defaults_to_acp() {
         assert_eq!(backend_to_agent_type("unknown"), "acp");
+    }
+
+    #[test]
+    fn antigravity_is_not_swept_into_the_acp_catch_all() {
+        assert_eq!(backend_to_agent_type("antigravity"), "antigravity");
+    }
+
+    #[test]
+    fn the_backend_survives_for_every_type_that_resolves_a_catalog_row_by_it() {
+        // Dropping it is not cosmetic: conversation creation then fails with
+        // "requires either agent_id or backend in extra".
+        assert!(agent_type_carries_backend("acp"));
+        assert!(agent_type_carries_backend("antigravity"));
+        assert!(!agent_type_carries_backend("aionrs"));
+        assert!(!agent_type_carries_backend("nanobot"));
     }
 
     // ── get_agent_config ──────────────────────────────────────────────

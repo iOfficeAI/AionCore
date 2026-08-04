@@ -1580,6 +1580,7 @@ async fn reader_task(
                                             SessionEvent::Notice {
                                                 level: crate::event::NoticeLevel::Warning,
                                                 message: format!("Codex logout failed: {msg}"),
+                                                localized: None,
                                             },
                                         );
                                     }
@@ -1695,6 +1696,7 @@ async fn reader_task(
                                         // the message + the error! log above).
                                         level: crate::event::NoticeLevel::Warning,
                                         message: format!("{label} failed: {message}"),
+                                        localized: None,
                                     },
                                 );
                             }
@@ -2491,6 +2493,7 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
             vec![SessionEvent::Notice {
                 level: crate::event::NoticeLevel::Warning,
                 message,
+                localized: None,
             }]
         }
         "configWarning" => {
@@ -2502,6 +2505,7 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
             vec![SessionEvent::Notice {
                 level: crate::event::NoticeLevel::Warning,
                 message,
+                localized: None,
             }]
         }
         "deprecationNotice" => {
@@ -2509,6 +2513,7 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
             vec![SessionEvent::Notice {
                 level: crate::event::NoticeLevel::Info,
                 message,
+                localized: None,
             }]
         }
         // `hook/*` provisioning is a separate concern (not MCP startup) — kept as a
@@ -3354,6 +3359,7 @@ impl SessionBackend for CodexSessionBackend {
                         SessionEvent::Notice {
                             level: crate::event::NoticeLevel::Warning,
                             message: "Logged out of Codex. New turns will require re-authentication.".into(),
+                            localized: None,
                         },
                     );
                     return Ok(CommandReceipt {
@@ -4412,7 +4418,7 @@ mod tests {
             assert!(
                 events.iter().any(|e| matches!(
                     e,
-                    SessionEvent::Notice { level: NoticeLevel::Warning, message } if message == "disk almost full"
+                    SessionEvent::Notice { level: NoticeLevel::Warning, message, .. } if message == "disk almost full"
                 )),
                 "{m} → Notice(Warning), got {events:?}"
             );
@@ -4425,7 +4431,7 @@ mod tests {
         assert!(
             dep.iter().any(|e| matches!(
                 e,
-                SessionEvent::Notice { level: NoticeLevel::Info, message }
+                SessionEvent::Notice { level: NoticeLevel::Info, message, .. }
                     if message == "--foo is deprecated — use --bar"
             )),
             "deprecationNotice → Notice(Info) with joined details, got {dep:?}"
@@ -4437,7 +4443,7 @@ mod tests {
         .await;
         assert!(
             cfg.iter()
-                .any(|e| matches!(e, SessionEvent::Notice { level: NoticeLevel::Warning, message } if message == "unknown key X")),
+                .any(|e| matches!(e, SessionEvent::Notice { level: NoticeLevel::Warning, message, .. } if message == "unknown key X")),
             "configWarning → Notice(Warning), got {cfg:?}"
         );
         let temp_trust = drive_codex(&[
@@ -6475,7 +6481,7 @@ mod tests {
         for _ in 0..40 {
             match tokio::time::timeout(std::time::Duration::from_millis(25), events.next()).await {
                 Ok(Some(env)) => match env.event {
-                    SessionEvent::Notice { level, message } => {
+                    SessionEvent::Notice { level, message, .. } => {
                         notice = Some((level, message));
                         break;
                     }

@@ -2,30 +2,35 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Extension, Json, Multipart, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Json, Multipart, Query, Request, State};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use tower::ServiceExt;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::services::ServeFile;
 
 use aionui_api_types::{
-    ApiResponse, BrowseDirectoryQuery, BrowseDirectoryResponse, CancelZipRequest, CopyFilesRequest, CopyFilesResponse,
-    CreateTempFileRequest, DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse,
-    FileWatchRequest, GetFileMetadataRequest, GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest,
-    ReadFileBufferRequest, ReadFileRequest, RemoveEntryRequest, RenameRequest, RenameResponse, SnapshotBaselineRequest,
-    SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotStageRequest,
-    SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest, ZipRequest,
+    ApiResponse, ContentMetadataRequest, CopyFilesRequest, CopyFilesResponse, DirOrFileResponse,
+    FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, FileWatchRequest, GetFileMetadataRequest,
+    GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest, ReadContentRequest, ReadFileRequest,
+    RevealItemRequest, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse,
+    SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery, WorkspaceFlatFileResponse,
+    WorkspaceOfficeWatchRequest, WriteContentRequest, WriteFileRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_common::constants::UPLOAD_MAX_SIZE;
 
-use crate::browse;
 use crate::error::FileError;
-use crate::traits::{FileServiceRef, FileWatchServiceRef, SnapshotServiceRef};
+use crate::traits::{FileServiceRef, FileWatchServiceRef, ItemRevealerRef, SnapshotServiceRef};
+
+/// Request-body cap for `PUT /api/fs/content`, aligned with the 256 MB read cap
+/// so large files can be saved (the 10 MB global limit would otherwise 413).
+const CONTENT_MAX_SIZE: usize = 256 * 1024 * 1024;
 use crate::types::{
     CompareResult, CopyResult, DirOrFile, FileChangeInfo, FileMetadata, SnapshotInfo, SnapshotMode, WorkspaceFlatFile,
-    ZipEntry,
 };
 
 impl From<FileError> for ApiError {
@@ -44,6 +49,18 @@ impl From<FileError> for ApiError {
             },
             FileError::NotFound(message) => ApiError::NotFound(message),
             FileError::Internal(message) => ApiError::Internal(message),
+            FileError::WatchUnavailable { errno } => ApiError::coded(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "FILE_WATCH_UNAVAILABLE",
+                "File watching is unavailable on this system.",
+                errno.map(|n| serde_json::json!({ "errno": n })),
+            ),
+            FileError::RevealFailed(message) => ApiError::coded(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "REVEAL_FAILED",
+                message,
+                None::<serde_json::Value>,
+            ),
         }
     }
 }
@@ -52,56 +69,19 @@ impl From<FileError> for ApiError {
 // Router state
 // ---------------------------------------------------------------------------
 
-type BrowseRootsResolver = dyn Fn() -> Vec<PathBuf> + Send + Sync;
-
-/// Lazily resolves roots for the shallow `/api/fs/browse` endpoint.
-#[derive(Clone)]
-pub struct BrowseRoots {
-    roots: Arc<OnceLock<Vec<PathBuf>>>,
-    resolver: Arc<BrowseRootsResolver>,
-}
-
-impl BrowseRoots {
-    pub fn new() -> Self {
-        Self {
-            roots: Arc::new(OnceLock::new()),
-            resolver: Arc::new(browse::default_browse_roots),
-        }
-    }
-
-    #[cfg(test)]
-    fn with_resolver(resolver: impl Fn() -> Vec<PathBuf> + Send + Sync + 'static) -> Self {
-        Self {
-            roots: Arc::new(OnceLock::new()),
-            resolver: Arc::new(resolver),
-        }
-    }
-
-    fn get(&self) -> Vec<PathBuf> {
-        self.roots.get_or_init(|| (self.resolver)()).clone()
-    }
-}
-
-impl Default for BrowseRoots {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Shared state for all file-related route handlers.
 #[derive(Clone)]
 pub struct FileRouterState {
     pub file_service: FileServiceRef,
     pub watch_service: FileWatchServiceRef,
     pub snapshot_service: SnapshotServiceRef,
-    /// Resolves pe-addressed copy targets (`/api/fs/copy`) to absolute dirs.
+    /// Resolves pe-addressed copy/reveal targets (`/api/fs/copy`,
+    /// `/api/fs/reveal`) to absolute paths.
     pub project: Arc<aionui_project::ProjectService>,
+    /// Reveals a resolved absolute path in the OS file manager
+    /// (`/api/fs/reveal`). Injected by composition over the shell service.
+    pub revealer: ItemRevealerRef,
     pub allowed_roots: Vec<std::path::PathBuf>,
-    /// Roots permitted by the shallow `/api/fs/browse` endpoint. This is
-    /// typically wider than `allowed_roots` (it includes `cwd`, Windows
-    /// drive letters, and `/` on Unix) because the WebUI host-file picker
-    /// legitimately needs to reach outside any single workspace.
-    pub browse_roots: BrowseRoots,
 }
 
 // ---------------------------------------------------------------------------
@@ -123,30 +103,37 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .layer(RequestBodyLimitLayer::new(UPLOAD_MAX_SIZE))
         .with_state(state.clone());
 
+    // Content endpoint (ChatFileRef identity). PUT carries the full file body,
+    // so — like upload — it disables the 10 MB global `DefaultBodyLimit` and
+    // applies its own `CONTENT_MAX_SIZE` cap aligned with the 256 MB read cap
+    // (otherwise saving a large file would 413 before reaching the handler).
+    // POST (read) shares the sub-router; its body is a tiny ChatFileRef so the
+    // wider limit is harmless.
+    let content_router = Router::new()
+        .route("/api/fs/content", post(read_content).put(write_content))
+        .layer(DefaultBodyLimit::disable())
+        .layer(RequestBodyLimitLayer::new(CONTENT_MAX_SIZE))
+        .with_state(state.clone());
+
     Router::new()
         // A. Core file operations
-        .route("/api/fs/browse", get(browse_directory))
+        .route("/api/fs/content/metadata", post(content_metadata))
+        .route("/api/fs/stream", get(stream_file))
         .route("/api/fs/dir", post(get_files_by_dir))
         .route("/api/fs/list", post(list_workspace_files))
         .route("/api/fs/metadata", post(get_file_metadata))
         .route("/api/fs/read", post(read_file))
-        .route("/api/fs/read-buffer", post(read_file_buffer))
         .route("/api/fs/write", post(write_file))
         .route("/api/fs/copy", post(copy_files))
-        .route("/api/fs/remove", post(remove_entry))
-        .route("/api/fs/rename", post(rename_entry))
-        .route("/api/fs/temp", post(create_temp_file))
+        .route("/api/fs/reveal", post(reveal_item))
         .route("/api/fs/image-base64", post(get_image_base64))
         .route("/api/fs/fetch-remote-image", post(fetch_remote_image))
-        .route("/api/fs/zip", post(create_zip))
-        .route("/api/fs/zip/cancel", post(cancel_zip))
         // D. File watch
         .route("/api/fs/watch/start", post(start_watch))
         .route("/api/fs/watch/stop", post(stop_watch))
         .route("/api/fs/watch/stop-all", post(stop_all_watches))
         .route("/api/fs/office-watch/start", post(start_office_watch))
         .route("/api/fs/office-watch/stop", post(stop_office_watch))
-        .route("/api/fs/office-watch/stop-all", post(stop_all_office_watches))
         // E. Workspace snapshot
         .route("/api/fs/snapshot/init", post(snapshot_init))
         .route("/api/fs/snapshot/info", post(snapshot_info))
@@ -162,32 +149,12 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .route("/api/fs/snapshot/dispose", post(snapshot_dispose))
         .with_state(state)
         .merge(upload_router)
+        .merge(content_router)
 }
 
 // ---------------------------------------------------------------------------
 // A. Core file operations — handlers
 // ---------------------------------------------------------------------------
-
-/// `GET /api/fs/browse` — shallow directory listing for the WebUI host-file
-/// picker. Runs on the Tokio blocking pool because it does synchronous
-/// filesystem I/O.
-async fn browse_directory(
-    State(state): State<FileRouterState>,
-    Query(query): Query<BrowseDirectoryQuery>,
-) -> Result<Json<ApiResponse<BrowseDirectoryResponse>>, ApiError> {
-    let show_files = matches!(query.show_files.as_deref(), Some("true") | Some("1"));
-    let raw_path = query.path.clone();
-    let browse_roots = state.browse_roots.clone();
-
-    let response = tokio::task::spawn_blocking(move || {
-        let roots = browse_roots.get();
-        browse::browse(raw_path.as_deref(), show_files, &roots)
-    })
-    .await
-    .map_err(|e| ApiError::Internal(format!("browse task failed: {}", e)))??;
-
-    Ok(Json(ApiResponse::ok(response)))
-}
 
 async fn get_files_by_dir(
     State(state): State<FileRouterState>,
@@ -241,23 +208,6 @@ async fn read_file(
     Ok(Json(ApiResponse::ok(content)))
 }
 
-async fn read_file_buffer(
-    State(state): State<FileRouterState>,
-    body: Result<Json<ReadFileBufferRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let data = state
-        .file_service
-        .read_file_buffer(&req.path, req.workspace.as_deref().map(Path::new))
-        .await?;
-    // Binary data is base64-encoded for JSON transport.
-    let encoded = data.map(|bytes| {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD.encode(bytes)
-    });
-    Ok(Json(ApiResponse::ok(encoded)))
-}
-
 async fn write_file(
     State(state): State<FileRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -307,50 +257,187 @@ async fn copy_files(
     Ok(Json(ApiResponse::ok(to_copy_response(result))))
 }
 
-async fn remove_entry(
+/// `POST /api/fs/reveal` — reveal a pe-addressed file/dir in the OS file manager
+/// ("open enclosing folder"). Resolves the identity to an absolute path
+/// (containment-checked, op = Read) then hands it to the reveal capability.
+async fn reveal_item(
     State(state): State<FileRouterState>,
     Extension(user): Extension<CurrentUser>,
-    body: Result<Json<RemoveEntryRequest>, JsonRejection>,
+    body: Result<Json<RevealItemRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let workspace = req.workspace.unwrap_or_else(|| {
-        std::path::Path::new(&req.path)
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    });
-    state
-        .file_service
-        .remove_entry_for_user(&user.id, &req.path, &workspace)
-        .await?;
+    let resolved = state
+        .project
+        .resolve_reference(
+            &user.id,
+            aionui_project::ReferenceInput {
+                pe_id: req.pe_id,
+                relative_path: req.relative_path,
+                op: aionui_project::FileOp::Read,
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+    reveal_resolved(state.revealer.as_ref(), resolved.absolute_path).await?;
     Ok(Json(ApiResponse::success()))
 }
 
-async fn rename_entry(
-    State(state): State<FileRouterState>,
-    body: Result<Json<RenameRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<RenameResponse>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let workspace = req.workspace.unwrap_or_else(|| {
-        std::path::Path::new(&req.path)
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    });
-    let new_path = state
-        .file_service
-        .rename_entry_with_extra_root(&req.path, &req.new_name, Some(Path::new(&workspace)))
-        .await?;
-    Ok(Json(ApiResponse::ok(RenameResponse { new_path })))
+/// Reveal the resolved absolute path via the revealer port. Split from the
+/// handler so the resolve → reveal wiring (and its no-local-path / reveal-failed
+/// error mapping) is unit-testable with a mock revealer, independent of the
+/// project service (`resolve_reference` is covered in `aionui-project`).
+async fn reveal_resolved(
+    revealer: &dyn crate::traits::IItemRevealer,
+    absolute_path: Option<String>,
+) -> Result<(), FileError> {
+    let abs = absolute_path.ok_or_else(|| FileError::BadRequest("reveal target is not a local path".to_owned()))?;
+    revealer.reveal(&abs).await
 }
 
-async fn create_temp_file(
+// ---------------------------------------------------------------------------
+// Content endpoint (ChatFileRef identity) — handlers
+// ---------------------------------------------------------------------------
+
+/// Managed upload directory (`<tmp>/aionui`) used to validate `Upload`
+/// ChatFileRef variants — mirrors the chat send-boundary convention.
+fn content_upload_root() -> PathBuf {
+    std::env::temp_dir().join("aionui")
+}
+
+/// Parse the optional `If-Match` header as a last-modified-millisecond stamp.
+fn parse_if_match(headers: &axum::http::HeaderMap) -> Option<i64> {
+    headers
+        .get(axum::http::header::IF_MATCH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<i64>()
+        .ok()
+}
+
+/// `POST /api/fs/content` — read a file addressed by `ChatFileRef` identity.
+/// Collapses the old `read` + `image-base64`: body carries the ref plus an
+/// `encoding` (utf8|base64|dataurl). Resolves per-variant (op = Read) then reads
+/// the trusted absolute path.
+async fn read_content(
     State(state): State<FileRouterState>,
-    body: Result<Json<CreateTempFileRequest>, JsonRejection>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<ReadContentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let path = state.file_service.create_temp_file(&req.file_name).await?;
-    Ok(Json(ApiResponse::ok(path)))
+    let abs = state
+        .project
+        .resolve_chat_file_ref(
+            &user.id,
+            &req.file,
+            &content_upload_root(),
+            aionui_project::FileOp::Read,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    let content = state
+        .file_service
+        .read_resolved_content(Path::new(&abs), req.encoding)
+        .await?;
+    Ok(Json(ApiResponse::ok(content)))
+}
+
+/// `PUT /api/fs/content` — write a file addressed by `ChatFileRef` identity
+/// (op = Write for the Project arm). Optimistic concurrency: when the client
+/// sends `If-Match: <last-modified ms>`, a mismatch against the current on-disk
+/// mtime returns 409 Conflict (guards the "external change silently overwritten"
+/// case). Body cap is `CONTENT_MAX_SIZE` (see the router builder).
+async fn write_content(
+    State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: axum::http::HeaderMap,
+    body: Result<Json<WriteContentRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<bool>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let abs = state
+        .project
+        .resolve_chat_file_ref(
+            &user.id,
+            &req.file,
+            &content_upload_root(),
+            aionui_project::FileOp::Write,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    let path = Path::new(&abs);
+
+    if let Some(expected) = parse_if_match(&headers) {
+        let current = state.file_service.resolved_metadata(path).await?.last_modified;
+        if current != expected {
+            return Err(ApiError::Conflict(format!(
+                "file changed on disk since last read (expected mtime {expected}, found {current})"
+            )));
+        }
+    }
+
+    state
+        .file_service
+        .write_resolved_content(path, req.data.as_bytes())
+        .await?;
+    Ok(Json(ApiResponse::ok(true)))
+}
+
+/// `POST /api/fs/content/metadata` — metadata for a `ChatFileRef`-addressed file.
+async fn content_metadata(
+    State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<ContentMetadataRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<FileMetadataResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let abs = state
+        .project
+        .resolve_chat_file_ref(
+            &user.id,
+            &req.file,
+            &content_upload_root(),
+            aionui_project::FileOp::Read,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    let meta = state.file_service.resolved_metadata(Path::new(&abs)).await?;
+    Ok(Json(ApiResponse::ok(to_metadata_response(meta))))
+}
+
+/// `GET /api/fs/stream` — raw byte range server for a `ChatFileRef`-addressed
+/// file, for `<webview src>` / `<embed>` consumers (pdf) that can only GET.
+///
+/// The identity is a flattened [`StreamQuery`] in the query string (webview src
+/// has no request body). Resolves per-variant (op = Read) to a trusted absolute
+/// path, then hands the request to `tower_http`'s `ServeFile`, which supplies
+/// `Content-Type` (from the extension), `Accept-Ranges`, and full `Range` /
+/// `If-Range` handling (206 Partial Content) — including large-file byte ranges.
+async fn stream_file(
+    State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let Query(params) =
+        Query::<StreamQuery>::try_from_uri(request.uri()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let file_ref = params
+        .to_chat_file_ref()
+        .map_err(|m| ApiError::BadRequest(m.to_owned()))?;
+    let abs = state
+        .project
+        .resolve_chat_file_ref(
+            &user.id,
+            &file_ref,
+            &content_upload_root(),
+            aionui_project::FileOp::Read,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    // ServeFile owns Range/If-Range/Content-Type; the path is already
+    // containment-checked by resolve_chat_file_ref, so no re-sandbox here.
+    let response = ServeFile::new(&abs)
+        .oneshot(request)
+        .await
+        .map_err(|e| ApiError::Internal(format!("stream task failed: {e}")))?;
+    Ok(response.into_response())
 }
 
 /// Fields extracted from a `/api/fs/upload` multipart request.
@@ -471,34 +558,6 @@ async fn fetch_remote_image(
     Ok(Json(ApiResponse::ok(data_url)))
 }
 
-async fn create_zip(
-    State(state): State<FileRouterState>,
-    body: Result<Json<ZipRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<bool>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let entries: Vec<ZipEntry> = req.files.into_iter().map(to_zip_entry).collect();
-    let ok = state
-        .file_service
-        .create_zip_with_extra_roots(
-            &req.path,
-            entries,
-            req.request_id,
-            req.workspace.as_deref().map(Path::new),
-            req.source_root.as_deref().map(Path::new),
-        )
-        .await?;
-    Ok(Json(ApiResponse::ok(ok)))
-}
-
-async fn cancel_zip(
-    State(state): State<FileRouterState>,
-    body: Result<Json<CancelZipRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<bool>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let ok = state.file_service.cancel_zip(&req.request_id).await;
-    Ok(Json(ApiResponse::ok(ok)))
-}
-
 // ---------------------------------------------------------------------------
 // D. File watch — handlers
 // ---------------------------------------------------------------------------
@@ -562,14 +621,6 @@ async fn stop_office_watch(
         .watch_service
         .stop_office_watch_for_user(&user.id, &req.workspace)
         .await?;
-    Ok(Json(ApiResponse::success()))
-}
-
-async fn stop_all_office_watches(
-    State(state): State<FileRouterState>,
-    Extension(user): Extension<CurrentUser>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state.watch_service.stop_all_office_watches_for_user(&user.id).await?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -746,23 +797,6 @@ fn to_copy_response(r: CopyResult) -> CopyFilesResponse {
     }
 }
 
-fn to_zip_entry(e: aionui_api_types::ZipFileEntry) -> ZipEntry {
-    if let Some(content) = e.content {
-        ZipEntry::Text { name: e.name, content }
-    } else if let Some(file_path) = e.file_path {
-        ZipEntry::Disk {
-            name: e.name,
-            file_path,
-        }
-    } else {
-        // Fallback: treat as empty text entry
-        ZipEntry::Text {
-            name: e.name,
-            content: String::new(),
-        }
-    }
-}
-
 fn to_snapshot_info_response(info: SnapshotInfo) -> SnapshotInfoResponse {
     let mode = match info.mode {
         SnapshotMode::GitRepo => aionui_api_types::SnapshotMode::GitRepo,
@@ -792,8 +826,6 @@ fn to_compare_response(r: CompareResult) -> SnapshotCompareResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn file_path_outside_sandbox_maps_to_explicit_api_code() {
@@ -808,24 +840,90 @@ mod tests {
     }
 
     #[test]
-    fn browse_roots_are_resolved_lazily() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let roots = BrowseRoots::with_resolver({
-            let calls = calls.clone();
-            move || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                vec![std::env::current_dir().unwrap()]
+    fn watch_unavailable_maps_to_stable_code_with_errno_details() {
+        // The A contract: the frontend recognizes this exact code to render an
+        // accurate "file watching unavailable" notice (never a reinstall prompt).
+        let api_err = ApiError::from(FileError::WatchUnavailable { errno: Some(24) });
+        assert_eq!(api_err.error_code(), "FILE_WATCH_UNAVAILABLE");
+        assert_eq!(api_err.status_code(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(api_err.error_details().unwrap()["errno"], 24);
+    }
+
+    #[test]
+    fn watch_unavailable_without_errno_omits_details() {
+        let api_err = ApiError::from(FileError::WatchUnavailable { errno: None });
+        assert_eq!(api_err.error_code(), "FILE_WATCH_UNAVAILABLE");
+        assert_eq!(api_err.status_code(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(api_err.error_details().is_none());
+    }
+
+    #[test]
+    fn reveal_failed_maps_to_stable_code() {
+        // Contract for the frontend: distinct from NOT_FOUND so it can tell
+        // "couldn't open the file manager" from "item gone".
+        let api_err = ApiError::from(FileError::RevealFailed("gdbus not available".into()));
+        assert_eq!(api_err.error_code(), "REVEAL_FAILED");
+        assert_eq!(api_err.status_code(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // -- reveal_resolved: resolve → reveal wiring (mock revealer seam) ---------
+
+    /// Records the absolute paths handed to `reveal`, and optionally fails.
+    struct MockRevealer {
+        calls: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+    impl MockRevealer {
+        fn new(fail: bool) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                fail,
             }
-        });
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::traits::IItemRevealer for MockRevealer {
+        async fn reveal(&self, absolute_path: &str) -> Result<(), FileError> {
+            self.calls.lock().unwrap().push(absolute_path.to_owned());
+            if self.fail {
+                Err(FileError::RevealFailed("mock reveal failed".to_owned()))
+            } else {
+                Ok(())
+            }
+        }
+    }
 
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    #[tokio::test]
+    async fn reveal_resolved_passes_absolute_path_to_revealer() {
+        let mock = MockRevealer::new(false);
+        let result = reveal_resolved(&mock, Some("/abs/target.txt".to_owned())).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert_eq!(
+            *mock.calls.lock().unwrap(),
+            vec!["/abs/target.txt".to_owned()],
+            "revealer must receive the resolved absolute path"
+        );
+    }
 
-        let first = roots.get();
-        let second = roots.get();
+    #[tokio::test]
+    async fn reveal_resolved_without_local_path_is_bad_request_and_skips_reveal() {
+        let mock = MockRevealer::new(false);
+        let result = reveal_resolved(&mock, None).await;
+        assert!(
+            matches!(result, Err(FileError::BadRequest(_))),
+            "non-local target must be BadRequest, got {result:?}"
+        );
+        assert!(mock.calls.lock().unwrap().is_empty(), "revealer must not be called");
+    }
 
-        assert!(!first.is_empty());
-        assert_eq!(first, second);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    #[tokio::test]
+    async fn reveal_resolved_propagates_reveal_failure() {
+        let mock = MockRevealer::new(true);
+        let result = reveal_resolved(&mock, Some("/abs/x".to_owned())).await;
+        assert!(
+            matches!(result, Err(FileError::RevealFailed(_))),
+            "reveal failure must propagate, got {result:?}"
+        );
     }
 
     #[test]
@@ -908,57 +1006,6 @@ mod tests {
         };
         let r = to_metadata_response(m);
         assert_eq!(r.is_directory, Some(true));
-    }
-
-    #[test]
-    fn zip_entry_conversion_text() {
-        let e = aionui_api_types::ZipFileEntry {
-            name: "a.txt".into(),
-            content: Some("hello".into()),
-            file_path: None,
-        };
-        let z = to_zip_entry(e);
-        match z {
-            ZipEntry::Text { name, content } => {
-                assert_eq!(name, "a.txt");
-                assert_eq!(content, "hello");
-            }
-            _ => panic!("expected Text variant"),
-        }
-    }
-
-    #[test]
-    fn zip_entry_conversion_disk() {
-        let e = aionui_api_types::ZipFileEntry {
-            name: "b.bin".into(),
-            content: None,
-            file_path: Some("/src/b.bin".into()),
-        };
-        let z = to_zip_entry(e);
-        match z {
-            ZipEntry::Disk { name, file_path } => {
-                assert_eq!(name, "b.bin");
-                assert_eq!(file_path, "/src/b.bin");
-            }
-            _ => panic!("expected Disk variant"),
-        }
-    }
-
-    #[test]
-    fn zip_entry_conversion_empty_fallback() {
-        let e = aionui_api_types::ZipFileEntry {
-            name: "empty.txt".into(),
-            content: None,
-            file_path: None,
-        };
-        let z = to_zip_entry(e);
-        match z {
-            ZipEntry::Text { name, content } => {
-                assert_eq!(name, "empty.txt");
-                assert!(content.is_empty());
-            }
-            _ => panic!("expected Text variant"),
-        }
     }
 
     #[test]

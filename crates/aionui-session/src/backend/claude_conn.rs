@@ -496,6 +496,24 @@ struct DiscoveredCaps {
     slash_commands: Vec<crate::capability::SlashCommandInfo>,
 }
 
+/// Session-cumulative cost ledger. claude's `result.total_cost_usd` is
+/// PROCESS-cumulative (live-captured 2.1.221: a `--resume` respawn restarts the
+/// counter at the new process's own spend), so reporting it raw makes the
+/// "session cost" fall back to one process's spend after every F-4 wake / app
+/// restart. The ledger re-baselines at each process (re)start — `base` absorbs
+/// the finished process's final counter (or, on a fresh backend, the persisted
+/// cumulative seeded via `SessionConfig.initial_cost_usd`) — and every costed
+/// `UsageDelta` is rewritten to `base + raw` before broadcast, so downstream
+/// consumers (the usage indicator, the persisted snapshot's overwrite-merge)
+/// only ever see a monotonic session-cumulative figure.
+#[derive(Debug, Default)]
+struct CostLedger {
+    /// USD the conversation had already spent BEFORE the current process run.
+    base: f64,
+    /// The current process's latest raw `total_cost_usd` report.
+    last_raw: f64,
+}
+
 /// Shared state the reader task drains into — held by the backend, cloned into
 /// each reader (the live one + every post-wake one). Grouped so `spawn` and
 /// `wake_handle` start identical readers without a 7-arg call duplicated twice.
@@ -524,6 +542,10 @@ struct ClaudeReaderState {
     /// `sniff_set_config_reject` can surface a rejection as a `Notice{Warning}`
     /// (shared Arc with `ClaudeSessionBackend.pending_set_config`).
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// Session-cumulative cost ledger (see [`CostLedger`]): survives F-4 wake
+    /// respawns so a new process's restarted `total_cost_usd` counter is reported
+    /// as `base + raw`, never raw alone.
+    cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
 }
 
 /// Spawn a claude stdout reader over `stdout`/`io` using the shared state. Used
@@ -535,6 +557,22 @@ fn start_claude_reader(
     io: Arc<dyn AgentIo>,
 ) -> tokio::task::JoinHandle<()> {
     let state = state.clone();
+    // Every reader start is a process (re)start, where claude's PROCESS-cumulative
+    // `total_cost_usd` counter restarts at zero — fold the finished process's final
+    // counter into the session base so subsequent reports stay session-cumulative.
+    // The initial spawn is a harmless no-op (last_raw is still 0).
+    {
+        let mut ledger = state.cost_ledger.lock().unwrap_or_else(|e| e.into_inner());
+        if ledger.last_raw > 0.0 {
+            ledger.base += ledger.last_raw;
+            ledger.last_raw = 0.0;
+            tracing::debug!(
+                session_id = %state.session_id,
+                cost_base_usd = ledger.base,
+                "claude cost ledger re-baselined for a process respawn"
+            );
+        }
+    }
     tokio::spawn(async move {
         reader_task(
             state.session_id,
@@ -549,6 +587,7 @@ fn start_claude_reader(
             state.turn_in_flight,
             state.current_mode_override,
             state.pending_set_config,
+            state.cost_ledger,
         )
         .await;
     })
@@ -596,6 +635,24 @@ impl ClaudeSessionBackend {
             None => (None, None),
         };
 
+        // Seed the cost ledger with the conversation's persisted cumulative cost
+        // (a resumed conversation on a FRESH backend instance — app restart /
+        // conversation reopen — where the in-memory ledger of the previous
+        // instance is gone). Production-diagnosable at info: one line per open,
+        // and "the indicator jumped down after a restart" hinges on this seed.
+        let initial_cost_usd = config.initial_cost_usd.unwrap_or(0.0);
+        if initial_cost_usd > 0.0 {
+            tracing::info!(
+                session_id = %session_id,
+                cost_base_usd = initial_cost_usd,
+                "claude cost ledger seeded from the persisted session cost"
+            );
+        }
+        let cost_ledger = Arc::new(std::sync::Mutex::new(CostLedger {
+            base: initial_cost_usd,
+            last_raw: 0.0,
+        }));
+
         let reader_state = ClaudeReaderState {
             session_id: session_id.clone(),
             turn_gen: turn_gen.clone(),
@@ -607,6 +664,7 @@ impl ClaudeSessionBackend {
             turn_in_flight: turn_in_flight.clone(),
             current_mode_override: current_mode_override.clone(),
             pending_set_config: pending_set_config.clone(),
+            cost_ledger,
         };
         let reader = start_claude_reader(&reader_state, stdout, io.clone());
 
@@ -1090,6 +1148,7 @@ async fn reader_task(
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
     current_mode_override: Arc<std::sync::Mutex<Option<String>>>,
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
 ) {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
@@ -1227,7 +1286,22 @@ async fn reader_task(
                 // apart at the wire. Done on the RAW frame.
                 sniff_replay_prompt_ack(v, &event_tx, &session_id, cur_gen);
             }
-            for ev in events {
+            for mut ev in events {
+                // Cost ledger: claude's `total_cost_usd` is PROCESS-cumulative, so a
+                // costed report is rewritten to the SESSION-cumulative `base + raw`
+                // (see CostLedger). `last_raw` is recorded on EVERY costed frame —
+                // even ones downstream discards (a zero-token /compact turn) — so the
+                // re-baseline at the next respawn folds in the true final counter.
+                // A frame that carried no cost stays `None`: fabricating `Some(base)`
+                // would masquerade as a fresh agent report downstream.
+                if let SessionEvent::UsageDelta {
+                    cost_usd: Some(raw), ..
+                } = &mut ev
+                {
+                    let mut ledger = cost_ledger.lock().unwrap_or_else(|e| e.into_inner());
+                    ledger.last_raw = *raw;
+                    *raw += ledger.base;
+                }
                 // F-4: a terminal clears the turn-active flag so the idle
                 // timer may suspend the now-idle process (it was held
                 // resident for the whole turn). Cleared BEFORE the broadcast
@@ -1893,6 +1967,7 @@ fn sniff_set_config_reject(
         event: SessionEvent::Notice {
             level: crate::event::NoticeLevel::Warning,
             message: format!("{label} failed: {err}"),
+            localized: None,
         },
     });
 }
@@ -2107,17 +2182,58 @@ fn sniff_task(
 
     // 009 R6b / H1: emit RICH per-agent detail from `workflow_progress[]`. The
     // workflow (task_id) is 1:N over its per-agent children (workflow_agent
-    // entries), each carrying display fields the panel renders. Keyed by `agentId`
-    // (present once running) falling back to `label` (the start frame has only
-    // index/label); parent_ref = task_id (the container). Each child is a
-    // SubagentDetail; the orchestrator folds them into workflow_roster.
+    // entries), each carrying display fields the panel renders. parent_ref =
+    // task_id (the container). Each child is a SubagentDetail; the orchestrator
+    // folds them into workflow_roster.
+    //
+    // KEY = `index`. A dispatch batch describes the SAME agent twice in ONE
+    // array: first with only `index`/`label` (no agentId assigned yet), then
+    // again with `agentId` once it is running (verified: frame 10 of
+    // tests/fixtures/claude_2.1.176_workflow_multiagent_3parallel_1fail.ndjson —
+    // 3 label-only entries followed by the same 3 agents carrying agentId). The
+    // previous `agentId.or(label)` key therefore admitted each agent TWICE (once
+    // under its label, again under its agentId), inflating a 3-agent phase to 6
+    // roster entries and over-counting the background activity `has_activity`
+    // reads. `index` is present on all 48 workflow_agent entries of that capture
+    // and is unique per agent, so it is the only stable key; agentId/label remain
+    // as fallbacks for a shape that omits it.
     if let Some(agents) = frame.get("workflow_progress").and_then(Value::as_array) {
+        // Container-level phase declarations ride the same array. claude emits the
+        // WHOLE list on the first task_progress frame (verified: the 2.1.176
+        // capture declares `1 Run` + `2 Summarize` before any agent is running),
+        // so a consumer learns the workflow's shape up front.
+        for p in agents
+            .iter()
+            .filter(|p| p.get("type").and_then(Value::as_str) == Some("workflow_phase"))
+        {
+            let (Some(index), Some(title)) = (
+                p.get("index").and_then(Value::as_u64),
+                p.get("title").and_then(Value::as_str),
+            ) else {
+                continue; // a phase with no index/title cannot be grouped under
+            };
+            let _ = event_tx.send(SessionEnvelope {
+                session_id: session_id.to_string(),
+                turn_gen,
+                event: SessionEvent::WorkflowPhase {
+                    task_id: task_id.to_string(),
+                    index: index as u32,
+                    title: title.to_string(),
+                },
+            });
+        }
         for a in agents
             .iter()
             .filter(|a| a.get("type").and_then(Value::as_str) == Some("workflow_agent"))
         {
             let label = a.get("label").and_then(Value::as_str);
-            let Some(agent_ref) = a.get("agentId").and_then(Value::as_str).or(label).map(str::to_string) else {
+            let Some(agent_ref) = a
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|i| i.to_string())
+                .or_else(|| a.get("agentId").and_then(Value::as_str).map(str::to_string))
+                .or_else(|| label.map(str::to_string))
+            else {
                 continue; // no stable ref for this agent
             };
             let loop_state = match a.get("state").and_then(Value::as_str) {
@@ -2138,6 +2254,11 @@ fn sniff_task(
                     tokens: a.get("tokens").and_then(Value::as_u64),
                     tool_calls: a.get("toolCalls").and_then(Value::as_u64),
                     last_tool_name: a.get("lastToolName").and_then(Value::as_str).map(str::to_string),
+                    phase_index: a.get("phaseIndex").and_then(Value::as_u64).map(|i| i as u32),
+                    phase_title: a.get("phaseTitle").and_then(Value::as_str).map(str::to_string),
+                    last_tool_summary: a.get("lastToolSummary").and_then(Value::as_str).map(str::to_string),
+                    // Present ONLY on the terminal (`state: "done"`) entry.
+                    duration_ms: a.get("durationMs").and_then(Value::as_u64),
                 },
             });
         }
@@ -2606,6 +2727,26 @@ impl ClaudeSessionBackend {
             cli_program: None,
         };
         Self::spawn(session_id, ClaudeAdapter::new(), io, SessionConfig::default(), wake).await
+    }
+
+    /// Test-support seam: `build_with_io` with a caller-supplied `SessionConfig`
+    /// (e.g. `initial_cost_usd` for the cost-ledger seed tests).
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn build_with_io_config(
+        session_id: impl Into<String>,
+        io: Box<dyn AgentIo>,
+        config: SessionConfig,
+    ) -> Self {
+        let session_id = session_id.into();
+        let wake = ClaudeWakeRecipe {
+            spawner: Arc::new(crate::testing::FakeSpawner::new()),
+            claude_session_id: session_id.clone(),
+            cwd: None,
+            extra_args: Vec::new(),
+            env: Vec::new(),
+            cli_program: None,
+        };
+        Self::spawn(session_id, ClaudeAdapter::new(), io, config, wake).await
     }
 
     /// Test-support seam: build a SUSPENDABLE backend over an injected `AgentIo`,
@@ -4995,6 +5136,107 @@ mod tests {
         drop(backend); // idle timer + (Dormant) controller tear down cleanly
     }
 
+    /// Await the next `UsageDelta` on the event stream and return its `cost_usd`.
+    async fn next_usage_cost(events: &mut BoxStream<'static, SessionEnvelope>) -> Option<f64> {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::UsageDelta { cost_usd, .. } = env.event {
+                    return cost_usd;
+                }
+            }
+            panic!("event stream closed before a UsageDelta arrived");
+        })
+        .await
+        .expect("timed out waiting for a UsageDelta")
+    }
+
+    /// claude's `total_cost_usd` is PROCESS-cumulative, not session-cumulative
+    /// (live-captured 2.1.221: two turns in one process report 0.250686 →
+    /// 0.278994, then a `--resume` respawn reports 0.028596 — the counter
+    /// restarts at the new process's own spend). The backend must re-baseline its
+    /// cost ledger on every process (re)start so the broadcast UsageDelta stays
+    /// SESSION-cumulative — otherwise a wake respawn makes the usage indicator
+    /// (and the persisted snapshot, which merges cost by overwrite) fall from the
+    /// real total to the last turn's own cost.
+    #[tokio::test]
+    async fn usage_cost_accumulates_across_process_respawn() {
+        let frame1 = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":2,"output_tokens":23},"total_cost_usd":0.25}"#,
+            "\n"
+        );
+        // Gate the fixture so the subscription is wired before the frame flows
+        // (broadcast does not replay to late subscribers).
+        let fake1 = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(frame1.as_bytes().to_vec());
+        let release1 = fake1.stdout_releaser();
+        let backend = ClaudeSessionBackend::build_with_io("cost-accum", Box::new(fake1)).await;
+        let mut events = backend.events();
+        release1();
+        let first = next_usage_cost(&mut events).await.expect("first turn carries a cost");
+        assert!(
+            (first - 0.25).abs() < 1e-9,
+            "process 1 reports its own cumulative cost, got {first}"
+        );
+
+        // Simulate the F-4 wake respawn: a NEW process whose counter restarts at
+        // its own spend. Drives the exact reader entry point `wake_handle` uses
+        // (start_claude_reader over the SAME shared reader_state).
+        let frame2 = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":2,"output_tokens":18},"total_cost_usd":0.03}"#,
+            "\n"
+        );
+        let fake2 = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(frame2.as_bytes().to_vec());
+        let release2 = fake2.stdout_releaser();
+        let io2: Arc<dyn AgentIo> = Arc::from(Box::new(fake2) as Box<dyn AgentIo>);
+        let (_stdin2, stdout2) = io2.take_stdio().await.expect("fake stdio");
+        let _reader2 = start_claude_reader(&backend.reader_state, Some(stdout2), io2);
+        release2();
+        let second = next_usage_cost(&mut events).await.expect("second turn carries a cost");
+        assert!(
+            (second - 0.28).abs() < 1e-9,
+            "a respawned process restarts claude's counter; the ledger must report base+raw (0.25+0.03), got {second}"
+        );
+    }
+
+    /// App restart loses the in-memory ledger, so the orchestration layer seeds
+    /// `SessionConfig.initial_cost_usd` from the persisted usage snapshot. The
+    /// backend must (a) add that base to every costed report and (b) NEVER
+    /// fabricate a cost onto a frame that carried none (a fabricated
+    /// `Some(base)` would masquerade as a fresh agent report downstream).
+    #[tokio::test]
+    async fn initial_cost_seed_offsets_reports_and_is_not_fabricated() {
+        let frames = concat!(
+            // frame 1: no total_cost_usd → cost must stay None even with a base
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"a","#,
+            r#""usage":{"input_tokens":2,"output_tokens":3}}"#,
+            "\n",
+            // frame 2: the process's own cumulative cost rides on top of the seed
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"b","#,
+            r#""usage":{"input_tokens":2,"output_tokens":4},"total_cost_usd":0.1}"#,
+            "\n"
+        );
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(frames.as_bytes().to_vec());
+        let release = fake.stdout_releaser();
+        let config = SessionConfig {
+            initial_cost_usd: Some(6.0),
+            ..Default::default()
+        };
+        let backend = ClaudeSessionBackend::build_with_io_config("cost-seed", Box::new(fake), config).await;
+        let mut events = backend.events();
+        release();
+        let first = next_usage_cost(&mut events).await;
+        assert_eq!(
+            first, None,
+            "a costless frame must not have a cost fabricated from the base"
+        );
+        let second = next_usage_cost(&mut events).await.expect("costed frame");
+        assert!(
+            (second - 6.1).abs() < 1e-9,
+            "resume seed must offset the process-local counter (6.0+0.1), got {second}"
+        );
+    }
+
     /// #103: `config.spawn_env` (the cc-switch provider env the app registry fills for
     /// backend == "claude") MUST reach the spawned process's `CommandSpec.env`. Before
     /// this fix the adapter hardcoded `env: Vec::new()`, so a cc-switch third-party
@@ -5318,7 +5560,7 @@ mod tests {
 
         let notice = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(env) = events.next().await {
-                if let SessionEvent::Notice { level, message } = env.event {
+                if let SessionEvent::Notice { level, message, .. } = env.event {
                     return Some((level, message));
                 }
             }
@@ -5440,11 +5682,14 @@ mod tests {
     #[tokio::test]
     async fn sniff_task_emits_rich_subagent_detail_from_workflow_progress() {
         // 009 R6b / H1: a task_progress frame's workflow_progress[] yields a rich
-        // SubagentDetail per workflow_agent — keyed by agentId (the per-agent id,
+        // SubagentDetail per workflow_agent — keyed by `index` (the per-agent slot,
         // distinct from the container task_id), parent_ref = task_id, carrying
         // model/tokens/toolCalls/loop-state/lastToolName for the per-agent panel.
+        // (The key was `agentId` until it was found to double-count every agent of
+        // a dispatch batch — see
+        // `sniff_task_keys_agents_by_index_so_a_dispatch_batch_is_not_double_counted`.)
         // (Real shape from workflow_multiagent_3parallel_1fail.ndjson 'done' frame.)
-        let frame = r#"{"type":"system","subtype":"task_progress","task_id":"wanv3yy20","tool_use_id":"toolu-1","workflow_progress":[{"type":"workflow_phase","index":1,"title":"Run"},{"type":"workflow_agent","index":1,"label":"run:C","agentId":"agent-C","state":"done","model":"opus","tokens":10107,"toolCalls":4,"lastToolName":"StructuredOutput"}]}"#;
+        let frame = r#"{"type":"system","subtype":"task_progress","task_id":"wanv3yy20","tool_use_id":"toolu-1","workflow_progress":[{"type":"workflow_phase","index":1,"title":"Run"},{"type":"workflow_agent","index":1,"label":"run:C","phaseIndex":1,"phaseTitle":"Run","agentId":"agent-C","state":"done","model":"opus","tokens":10107,"toolCalls":4,"lastToolName":"StructuredOutput","lastToolSummary":"exit 1","durationMs":20228}]}"#;
         let bytes = format!("{frame}\n").into_bytes();
         let backend = ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(bytes))).await;
         let mut events = backend.events();
@@ -5469,13 +5714,18 @@ mod tests {
             tokens,
             tool_calls,
             last_tool_name,
+            phase_index,
+            phase_title,
+            last_tool_summary,
+            duration_ms,
         } = detail.expect("a workflow_agent must yield a SubagentDetail")
         else {
             unreachable!()
         };
         assert_eq!(
-            r#ref, "agent-C",
-            "ref = agentId (per-agent id, NOT the container task_id)"
+            r#ref, "1",
+            "ref = the per-agent `index` (NOT the container task_id, and NOT agentId — \
+             which is absent on a batch's first entries and would double-count)"
         );
         assert_eq!(
             parent_ref.as_deref(),
@@ -5488,6 +5738,137 @@ mod tests {
         assert_eq!(tokens, Some(10107));
         assert_eq!(tool_calls, Some(4));
         assert_eq!(last_tool_name.as_deref(), Some("StructuredOutput"));
+        // Display fields for the phase-grouped render.
+        assert_eq!(phase_index, Some(1), "agents group under their declared phase");
+        assert_eq!(phase_title.as_deref(), Some("Run"));
+        assert_eq!(
+            last_tool_summary.as_deref(),
+            Some("exit 1"),
+            "the last tool's one-line summary rides alongside its name"
+        );
+        assert_eq!(
+            duration_ms,
+            Some(20228),
+            "claude reports durationMs only on the terminal `done` entry"
+        );
+    }
+
+    /// The container's declared phase list (`workflow_progress[].workflow_phase`)
+    /// surfaces as `WorkflowPhase`, keyed to the container task_id — so a consumer
+    /// can group agents under phases. Claude declares the WHOLE list on the first
+    /// progress frame, before most agents exist.
+    #[tokio::test]
+    async fn sniff_task_emits_workflow_phase_declarations() {
+        let frame = r#"{"type":"system","subtype":"task_progress","task_id":"wanv3yy20","tool_use_id":"toolu-1","workflow_progress":[{"type":"workflow_phase","index":1,"title":"Run"},{"type":"workflow_phase","index":2,"title":"Summarize"}]}"#;
+        let bytes = format!("{frame}\n").into_bytes();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(bytes))).await;
+        let mut events = backend.events();
+
+        let mut phases: Vec<(String, u32, String)> = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1500), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::WorkflowPhase { task_id, index, title } = &env.event {
+                    phases.push((task_id.clone(), *index, title.clone()));
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            phases,
+            vec![
+                ("wanv3yy20".to_string(), 1, "Run".to_string()),
+                ("wanv3yy20".to_string(), 2, "Summarize".to_string()),
+            ],
+            "both declared phases surface, keyed to the container task_id"
+        );
+    }
+
+    /// The per-agent roster key must be `index`, NOT `agentId.or(label)`.
+    ///
+    /// A single `workflow_progress[]` array can describe the SAME agent twice: the
+    /// dispatch batch first lists each agent with only `index`/`label` (no
+    /// `agentId` is assigned yet), then immediately re-lists the same agents once
+    /// they are running, now carrying `agentId`. Keying on `agentId` with a `label`
+    /// fallback admits each agent TWICE — once under its label, again under its
+    /// agentId — inflating a 3-agent phase to 6 roster entries (and with it the
+    /// background-activity count that `has_activity` reads).
+    ///
+    /// Verified against the real capture: frame 10 of
+    /// `claude_2.1.176_workflow_multiagent_3parallel_1fail.ndjson` carries exactly
+    /// that shape (3 label-only entries + the same 3 agents with agentId). `index`
+    /// is present on all 48 `workflow_agent` entries of that capture and is unique
+    /// per agent, so it is the only stable key.
+    #[tokio::test]
+    async fn sniff_task_keys_agents_by_index_so_a_dispatch_batch_is_not_double_counted() {
+        use serde_json::Value;
+        let fixture = include_str!("../../tests/fixtures/claude_2.1.176_workflow_multiagent_3parallel_1fail.ndjson");
+        // The dispatch frame: the one whose workflow_progress[] repeats agents.
+        let frame = fixture
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .find(|l| {
+                serde_json::from_str::<Value>(l)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("workflow_progress").and_then(Value::as_array).map(|a| {
+                            a.iter()
+                                .filter(|e| e.get("type").and_then(Value::as_str) == Some("workflow_agent"))
+                                .count()
+                                > 3
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("the capture must contain a dispatch frame that repeats agents");
+
+        // Sanity: this frame really does describe the same 3 labels twice, once
+        // without an agentId. Without this the assertion below proves nothing.
+        let parsed: Value = serde_json::from_str(frame).unwrap();
+        let agents: Vec<&Value> = parsed["workflow_progress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e.get("type").and_then(Value::as_str) == Some("workflow_agent"))
+            .collect();
+        let distinct_labels: std::collections::BTreeSet<&str> =
+            agents.iter().filter_map(|a| a["label"].as_str()).collect();
+        assert!(
+            agents.len() > distinct_labels.len(),
+            "fixture frame must repeat agents ({} entries, {} distinct labels)",
+            agents.len(),
+            distinct_labels.len()
+        );
+        assert!(
+            agents.iter().any(|a| a.get("agentId").is_none()),
+            "fixture frame must contain at least one entry with no agentId"
+        );
+
+        let bytes = format!("{frame}\n").into_bytes();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(bytes))).await;
+        let mut events = backend.events();
+
+        let mut refs: Vec<String> = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1500), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::SubagentDetail { r#ref, .. } = &env.event {
+                    refs.push(r#ref.clone());
+                }
+            }
+        })
+        .await;
+
+        let distinct: std::collections::BTreeSet<&String> = refs.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            distinct_labels.len(),
+            "one roster entry per DISTINCT agent (got refs {refs:?} for labels {distinct_labels:?})"
+        );
+        // And the key is the index, not the agentId.
+        assert!(
+            distinct.iter().all(|r| r.parse::<u64>().is_ok()),
+            "refs must be the numeric `index`, got {distinct:?}"
+        );
     }
 
     /// H1 anti-collapse (audit): replay the REAL multi-agent workflow fixture

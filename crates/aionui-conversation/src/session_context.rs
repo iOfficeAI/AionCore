@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{
-    AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, AionrsSessionBuildContext, ConversationContext,
-    WorkspaceContext,
+    AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, AionrsSessionBuildContext,
+    AntigravitySessionBuildContext, ConversationContext, WorkspaceContext,
 };
 use aionui_ai_agent::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, PersistedSessionState};
 use aionui_ai_agent::types::BuildTaskOptions;
@@ -202,6 +202,21 @@ impl<'a> SessionContextBuilder<'a> {
             AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(
                 row, extra, team, seed,
             )))),
+            // Antigravity reuses the ACP build context's SHAPE (a CLI agent with
+            // a workspace, MCP servers, skills and a resume anchor) but never the
+            // ACP factory: agy does not speak ACP.
+            AgentType::Antigravity => {
+                let acp = self.build_acp_context(row, extra, team).await?;
+                Ok(AgentSessionKind::Antigravity(Box::new(
+                    AntigravitySessionBuildContext {
+                        config: acp.config,
+                        team: acp.team,
+                        belongs_to_team: acp.belongs_to_team,
+                        session_id: acp.session_id,
+                        session_snapshot: acp.session_snapshot,
+                    },
+                )))
+            }
             AgentType::Gemini
             | AgentType::Codex
             | AgentType::OpenclawGateway

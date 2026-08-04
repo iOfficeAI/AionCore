@@ -328,6 +328,14 @@ pub struct ConversationService {
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
 
+    /// One background-stream watcher per LIVE Session instance (keyed by
+    /// conversation id; value remembers the instance pointer so a rebuilt
+    /// instance gets a fresh watcher). See `background_stream.rs` for why:
+    /// CLI-initiated turns and between-turn card refreshes have no per-turn
+    /// relay to deliver them.
+    background_watchers:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, crate::background_stream::BackgroundWatcherHandle>>>,
+
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
@@ -401,6 +409,7 @@ impl ConversationService {
             runtime_helper_bin: None,
             runtime_base_url: None,
             runtime_token_service: None,
+            background_watchers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
 
             conversation_repo,
             agent_metadata_repo,
@@ -578,6 +587,46 @@ impl ConversationService {
     /// (or none of the service at all, via re-export) can use it.
     pub fn mint_msg_id() -> String {
         generate_short_id()
+    }
+
+    /// Spawn (or replace) the conversation's background-stream watcher for a
+    /// direct-CLI Session instance. Idempotent per instance: keyed by the Arc
+    /// pointer, so a rebuilt instance (crash/resume respawn) gets a fresh
+    /// watcher on its fresh broadcast channel while the old one exits on
+    /// `Closed`. Non-Session instances (ACP manager, aionrs, teammates) keep
+    /// their existing delivery paths untouched.
+    pub(crate) fn ensure_background_watcher(&self, user_id: &str, conversation_id: &str, agent: &AgentInstance) {
+        let AgentInstance::Session(task) = agent else {
+            return;
+        };
+        let instance_ptr = Arc::as_ptr(task) as usize;
+        let mut map = match self.background_watchers.lock() {
+            Ok(map) => map,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(existing) = map.get(conversation_id)
+            && existing.instance_ptr == instance_ptr
+            && !existing.join.is_finished()
+        {
+            return;
+        }
+        if let Some(stale) = map.remove(conversation_id) {
+            stale.join.abort();
+        }
+        let watcher = crate::background_stream::BackgroundStreamWatcher {
+            conversation_id: conversation_id.to_owned(),
+            user_id: user_id.to_owned(),
+            repo: self.conversation_repo.clone(),
+            broadcaster: self.broadcaster.clone(),
+            persistence: self.runtime_persistence(),
+            runtime_state: Arc::clone(&self.runtime_state),
+        };
+        let rx = agent.subscribe();
+        let join = tokio::spawn(watcher.run(rx));
+        map.insert(
+            conversation_id.to_owned(),
+            crate::background_stream::BackgroundWatcherHandle { instance_ptr, join },
+        );
     }
 
     pub fn mint_turn_id() -> String {
@@ -1016,7 +1065,9 @@ impl ConversationService {
             }
             if let Some(permission) = snapshot.resolved_defaults.permission.as_ref() {
                 obj.insert("session_mode".to_owned(), serde_json::Value::String(permission.clone()));
-                if matches!(effective_type, AgentType::Acp) {
+                // Antigravity carries the same mode axis (agy's `--mode`), so it
+                // needs the seeded current value too or the picker opens blank.
+                if matches!(effective_type, AgentType::Acp | AgentType::Antigravity) {
                     obj.insert(
                         "current_mode_id".to_owned(),
                         serde_json::Value::String(permission.clone()),
@@ -1031,7 +1082,9 @@ impl ConversationService {
             }
             if !snapshot.rules.content.trim().is_empty() {
                 match effective_type {
-                    AgentType::Acp => {
+                    // Antigravity joins ACP here: both carry rules through the
+                    // session-init `preset_context` surface.
+                    AgentType::Acp | AgentType::Antigravity => {
                         obj.insert(
                             "preset_context".to_owned(),
                             serde_json::Value::String(snapshot.rules.content.clone()),
@@ -1336,7 +1389,13 @@ impl ConversationService {
         // ACP conversations own one `acp_session` row (1:1 by
         // conversation_id). Other agent types have no session-level
         // state so we only create it for ACP.
-        if effective_type == AgentType::Acp {
+        //
+        // Antigravity is included because it has exactly that state: a resume
+        // anchor (agy's own conversation id), the observed mode/model, and the
+        // context-usage snapshot the indicator reads back. Without the row those
+        // writes have nowhere to land — the usage indicator stays at zero and a
+        // reopened conversation cannot resume agy's session.
+        if matches!(effective_type, AgentType::Acp | AgentType::Antigravity) {
             self.create_acp_session_row(user_id, &id, &extra, assistant_snapshot.as_ref())
                 .await?;
         }
@@ -2061,7 +2120,11 @@ impl ConversationService {
             });
         }
 
-        if existing_type == AgentType::Acp
+        // Antigravity keeps its runtime mode/model in the same `acp_session`
+        // snapshot ACP does, so `extra` is just as much a second source of
+        // truth here — a client PATCH that set them would diverge from the
+        // snapshot the session actually resolves from.
+        if matches!(existing_type, AgentType::Acp | AgentType::Antigravity)
             && let Some(incoming) = &req.extra
             && (incoming.get("current_model_id").is_some() || incoming.get("current_mode_id").is_some())
         {
@@ -3196,9 +3259,20 @@ impl ConversationService {
         }
 
         let Some(agent) = task_manager.get_task(conversation_id) else {
+            // The turn IS live — its id matched above — but its agent has not
+            // registered yet, because building one runs real work first (an
+            // Antigravity build probes models, checks the CLI version, installs
+            // its permission hook and writes the MCP config). Dropping the
+            // request here loses it: the turn runs to completion while the user
+            // has been told it stopped.
+            //
+            // Record the intent instead. The orchestrator applies it as soon as
+            // the task appears, so a cancel issued during the build behaves like
+            // one issued a second later.
+            self.runtime_state.defer_cancel(conversation_id, turn_id);
             info!(
                 conversation_id,
-                turn_id, "No active agent to cancel; returning runtime summary"
+                turn_id, "Cancel arrived before the agent registered; deferring it to the build"
             );
             return Ok(CancelConversationResponse {
                 runtime: self.runtime_summary_for(conversation_id).await,
@@ -3212,7 +3286,11 @@ impl ConversationService {
             return Err(e.into());
         }
 
-        if agent.agent_type() == AgentType::Acp {
+        // The watchdog is runtime-agnostic — it only checks whether the turn is
+        // still claimed and kills the task. agy cancels by killing its per-turn
+        // child, but nothing guarantees the pump drains, and without this net a
+        // stuck cancel leaves the conversation wedged with no way back.
+        if matches!(agent.agent_type(), AgentType::Acp | AgentType::Antigravity) {
             let runtime_state = self.runtime_state();
             let task_manager = Arc::clone(task_manager);
             let conv_id = conversation_id.to_owned();
@@ -3227,7 +3305,7 @@ impl ConversationService {
                         conversation_id = %conv_id,
                         turn_id = %active_turn,
                         timeout_ms = ACP_CANCEL_DRAIN_TIMEOUT.as_millis() as u64,
-                        "ACP cancel did not drain before timeout; killing task"
+                        "CLI agent cancel did not drain before timeout; killing task"
                     );
                     task_manager
                         .kill_and_wait(&conv_id, Some(AgentKillReason::UserCancelTimeout))
@@ -3360,6 +3438,7 @@ impl ConversationService {
 
         if let Some(agent) = task_manager.get_task(conversation_id) {
             debug!(conversation_id, phase, "Conversation runtime already active");
+            self.ensure_background_watcher(user_id, conversation_id, &agent);
             return Ok((agent, false));
         }
 
@@ -3391,6 +3470,8 @@ impl ConversationService {
                 return Err(err.into());
             }
         };
+
+        self.ensure_background_watcher(user_id, conversation_id, &agent);
 
         // Persist auto-resolved workspace if factory picked a different path.
         self.maybe_persist_workspace(user_id, conversation_id, &stored_workspace, agent.workspace())
@@ -4001,6 +4082,7 @@ fn context_backend_value(context: &AgentSessionContext) -> Option<serde_json::Va
 fn build_options_backend(options: &BuildTaskOptions) -> Option<&str> {
     match &options.context.kind {
         AgentSessionKind::Acp(ctx) => ctx.config.backend.as_deref(),
+        AgentSessionKind::Antigravity(ctx) => ctx.config.backend.as_deref(),
         AgentSessionKind::Aionrs(_) => None,
     }
 }
@@ -4049,6 +4131,16 @@ impl ConversationService {
         match agent_type {
             AgentType::Acp => resolve_acp_mcp_support_policy(&self.agent_metadata_repo, user_id, extra).await,
             AgentType::Aionrs => Ok(McpSupportPolicy::AIONRS),
+            // agy supports exactly two MCP transports: stdio (local command)
+            // and SSE (remote `serverUrl`). Letting it fall through to the
+            // all-true default would let users configure HTTP-transport servers
+            // that write cleanly into agy's config and then never connect.
+            AgentType::Antigravity => Ok(McpSupportPolicy {
+                stdio: true,
+                sse: true,
+                http: false,
+                streamable_http: false,
+            }),
             _ => Ok(McpSupportPolicy::AIONRS),
         }
     }

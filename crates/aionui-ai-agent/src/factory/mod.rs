@@ -3,6 +3,7 @@ pub mod acp_assembler;
 mod acp;
 mod acp_launch_policy;
 pub(crate) mod aionrs;
+mod antigravity;
 mod context;
 
 use std::path::PathBuf;
@@ -44,6 +45,16 @@ pub struct AgentFactoryDeps {
     /// run through `SessionAgentTask` (direct-CLI) instead of the ACP manager, so
     /// the spawner is unconditionally wired — there is no fallback to the ACP path.
     pub session_spawner: Arc<dyn aionui_process::Spawner>,
+    /// Base URL the Antigravity permission hook calls back on (e.g.
+    /// `http://127.0.0.1:25808`). agy cannot prompt for permission in headless
+    /// mode, so AionUi registers its own binary as a PreToolUse hook and
+    /// answers each request itself — the hook process needs this address to
+    /// reach us. `None` disables the bridge, which means agy runs with its gate
+    /// open and NO per-call approval; only acceptable in tests.
+    pub antigravity_hook_base_url: Option<String>,
+    /// Per-conversation tokens authenticating the permission hook's callback.
+    /// Shared with the HTTP endpoint that answers those callbacks.
+    pub antigravity_hook_tokens: Arc<crate::antigravity_hook::HookTokenRegistry>,
 }
 
 /// Build a production agent factory that dispatches to concrete agent types.
@@ -69,6 +80,7 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
     match context.kind {
         AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx).await,
         AgentSessionKind::Aionrs(aionrs_context) => aionrs::build(deps, *aionrs_context, model, ctx).await,
+        AgentSessionKind::Antigravity(agy_context) => antigravity::build(deps, *agy_context, ctx).await,
     }
 }
 

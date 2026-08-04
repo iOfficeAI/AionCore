@@ -296,7 +296,10 @@ pub enum SessionEvent {
     /// Per-turn typed usage/cost (Addendum 5 / U15). Adapter normalizes a
     /// cumulative wire counter to a per-turn DELTA (G6). Reducer no-op (pure
     /// consumer signal). codex `thread/tokenUsage/updated.last`; claude
-    /// `result.usage`; cost_usd may be None.
+    /// `result.usage`; cost_usd may be None. When present, `cost_usd` is the
+    /// SESSION-cumulative spend: claude's wire value (`total_cost_usd`) is only
+    /// process-cumulative, so its conn re-bases it through a cost ledger before
+    /// broadcast (see `claude_conn::CostLedger`).
     UsageDelta {
         input_tokens: u64,
         output_tokens: u64,
@@ -401,6 +404,35 @@ pub enum SessionEvent {
         tokens: Option<u64>,
         tool_calls: Option<u64>,
         last_tool_name: Option<String>,
+        /// Which declared phase this agent belongs to (claude `phaseIndex` /
+        /// `phaseTitle`). Lets a consumer group agents under their phase instead
+        /// of rendering one flat list. Both None on a shape that declares no
+        /// phases.
+        phase_index: Option<u32>,
+        phase_title: Option<String>,
+        /// One-line summary of the agent's last tool call (claude
+        /// `lastToolSummary`) — e.g. the command for a Bash step. Pairs with
+        /// `last_tool_name`.
+        last_tool_summary: Option<String>,
+        /// Wall-clock duration of the agent's run. claude emits it ONLY on the
+        /// terminal (`state: "done"`) entry.
+        duration_ms: Option<u64>,
+    },
+
+    /// One declared phase of a running workflow (claude
+    /// `workflow_progress[].workflow_phase`, `{index, title}`).
+    ///
+    /// Container-level, not per-agent: the whole phase list is declared up front
+    /// on the FIRST `task_progress` frame, so a consumer learns the shape of the
+    /// workflow before most agents have been dispatched. Kept separate from
+    /// `SubagentDetail` (whose subject is an agent) so neither event's fields
+    /// have to be made meaningless for the other. Reducer NO-OP, like
+    /// `SubagentDetail`; only the pump/orchestrator read it.
+    WorkflowPhase {
+        /// The container `task_id` these phases belong to.
+        task_id: String,
+        index: u32,
+        title: String,
     },
 
     /// Out-of-turn diagnostic NOTICE (codex `warning` / `guardianWarning` /
@@ -414,7 +446,15 @@ pub enum SessionEvent {
     /// `{turnId, willRetry}` and is either a transient retry (→ Heartbeat) or the
     /// turn's terminal cause (→ already covered by `turn/completed`). Reducer NO-OP
     /// (an advisory does not move the FSM). Only the conversation layer projects it.
-    Notice { level: NoticeLevel, message: String },
+    Notice {
+        level: NoticeLevel,
+        /// English text, ALWAYS present. It is what the UI shows when
+        /// `localized` is absent or its code has no translation in the active
+        /// locale, so it must stand on its own — never a placeholder.
+        message: String,
+        /// Optional translation handle. `None` renders `message` verbatim.
+        localized: Option<LocalizedText>,
+    },
 
     /// Live tool-OUTPUT delta (codex `item/commandExecution/outputDelta`). The
     /// incremental stdout/stderr of a RUNNING tool, keyed by the owning tool's
@@ -711,6 +751,35 @@ pub enum ProvisioningPhase {
 /// `warning` / `guardianWarning` / `configWarning` (something the user should know
 /// but the turn can still proceed); `Info` covers `deprecationNotice` (advisory,
 /// non-urgent). Backend-neutral so a future backend's advisory maps here too.
+/// A message the UI can translate: a stable code plus its interpolation values.
+///
+/// The emitting backend owns the code; the frontend looks it up under
+/// `conversation.agentTip.codes.<code>.body` and falls back to the `Notice`'s
+/// English `message` when the key is missing. Params are whatever that string
+/// interpolates (e.g. `{"count": 2}`), carried as JSON so a backend can add a
+/// placeholder without changing this type.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LocalizedText {
+    pub code: String,
+    #[serde(default)]
+    pub params: serde_json::Map<String, serde_json::Value>,
+}
+
+impl LocalizedText {
+    pub fn new(code: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            params: serde_json::Map::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        self.params.insert(key.into(), value.into());
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NoticeLevel {
     Info,
@@ -819,6 +888,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | CatalogUpdated { .. }
         | SubagentUpdate { .. }
         | SubagentDetail { .. }
+        | WorkflowPhase { .. }
         | Notice { .. }
         | ToolOutputDelta { .. }
         | TurnDiffUpdated { .. }
@@ -859,6 +929,8 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             CatalogUpdated { .. } => PersistTier::Ephemeral, // async catalog discovery, re-discovered on open (not history)
             SessionInfo { .. } => PersistTier::Ephemeral, // on-demand query snapshot, re-queryable (not history)
             SubagentDetail { .. } => PersistTier::Ephemeral, // transient per-agent progress (roster fill, re-derivable)
+            // the phase list is re-declared on the next run's first progress frame
+            WorkflowPhase { .. } => PersistTier::Ephemeral,
             Plan { .. } => PersistTier::Ephemeral, // LC-8a: live to-do snapshot, full-replace + re-derivable (not history)
             ToolCall { .. }
             | ToolResult { .. }
@@ -1066,6 +1138,7 @@ mod additive_tests {
                 SessionEvent::Notice {
                     level: NoticeLevel::Warning,
                     message: "config key X is deprecated".into(),
+                    localized: None,
                 },
                 BackendProduced,
                 Display,
@@ -1131,6 +1204,10 @@ mod additive_tests {
                     tokens: None,
                     tool_calls: None,
                     last_tool_name: None,
+                    phase_index: None,
+                    phase_title: None,
+                    last_tool_summary: None,
+                    duration_ms: None,
                 },
                 BackendProduced,
                 Ephemeral,
@@ -1473,6 +1550,7 @@ mod additive_tests {
             SessionEvent::Notice {
                 level: NoticeLevel::Info,
                 message: "deprecated: use --foo".into(),
+                localized: None,
             },
             SessionEvent::ToolOutputDelta {
                 item_id: "call_0".into(),

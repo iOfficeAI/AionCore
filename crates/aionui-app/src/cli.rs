@@ -115,6 +115,10 @@ pub(crate) enum Command {
     Diagnose(DiagnoseArgs),
     /// Agent-facing Team collaboration CLI fallback.
     Team(TeamArgs),
+    /// PreToolUse permission gate for the Antigravity CLI (spawned by agy).
+    /// Reads the tool request on stdin, asks the running AionUi backend, and
+    /// writes agy's decision to stdout.
+    AntigravityHook,
     /// Stdio ↔ TCP bridge for the team MCP server (spawned by the ACP agent CLI).
     McpBridge,
     /// MCP stdio server for team tools (spawned by the ACP agent CLI).
@@ -136,6 +140,7 @@ impl Command {
             Self::Config(_) => "config",
             Self::Diagnose(_) => "diagnose",
             Self::Team(_) => "team",
+            Self::AntigravityHook => "antigravity-hook",
             Self::McpBridge => "mcp-bridge",
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
@@ -732,6 +737,7 @@ mod tests {
             ),
             (Command::McpBridge, "mcp-bridge"),
             (Command::McpTeamStdio, "mcp-team-stdio"),
+            (Command::AntigravityHook, "antigravity-hook"),
             (Command::Doctor, "doctor"),
             (
                 Command::PrepareManagedResources(prepare_args),

@@ -952,7 +952,7 @@ impl IConversationRepository for SqliteConversationRepository {
              INNER JOIN conversations c ON c.id = m.conversation_id \
              WHERE m.position = 'left' \
                AND m.status IN ('work', 'pending') \
-               AND m.type IN ('text', 'thinking') \
+               AND m.type IN ('text', 'thinking', 'tool_call', 'tool_group') \
              ORDER BY m.created_at ASC",
         )
         .fetch_all(&self.pool)

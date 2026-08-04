@@ -45,52 +45,10 @@ impl ProjectService {
     ) -> Result<ResolvedChatMessage, ProjectError> {
         let mut paths = Vec::with_capacity(files.len());
         for file in files {
-            match file {
-                ChatFileRef::Project { pe_id, relative_path } => {
-                    let resolved = self
-                        .resolve_reference(
-                            user_id,
-                            ReferenceInput {
-                                pe_id: pe_id.clone(),
-                                relative_path: relative_path.clone(),
-                                op: FileOp::Read,
-                            },
-                        )
-                        .await?;
-                    let abs = resolved.absolute_path.ok_or_else(|| ProjectError::ChatFileMissing {
-                        path: relative_path.clone(),
-                    })?;
-                    // A project ref may point at a file or a folder (the tree
-                    // allows attaching a directory); require only that it exists.
-                    if !Path::new(&abs).exists() {
-                        return Err(ProjectError::ChatFileMissing { path: abs });
-                    }
-                    paths.push(abs);
-                }
-                ChatFileRef::Upload { path } => {
-                    let candidate = Path::new(path);
-                    if !candidate.is_file() {
-                        return Err(ProjectError::ChatFileMissing { path: path.clone() });
-                    }
-                    if !path_within(upload_root, candidate) {
-                        return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
-                    }
-                    paths.push(path.clone());
-                }
-                ChatFileRef::Local { path } => {
-                    // A path the user explicitly picked in the host-file browser,
-                    // which already exposes the whole filesystem. No managed-root
-                    // restriction (that is the upload channel's D2 invariant only);
-                    // just canonicalize (collapsing `..`/symlinks) and require an
-                    // existing regular file.
-                    let canonical = std::fs::canonicalize(path)
-                        .map_err(|_| ProjectError::LocalPathNotReadable { path: path.clone() })?;
-                    if !canonical.is_file() {
-                        return Err(ProjectError::LocalPathNotReadable { path: path.clone() });
-                    }
-                    paths.push(canonical.to_string_lossy().into_owned());
-                }
-            }
+            paths.push(
+                self.resolve_chat_file_ref(user_id, file, upload_root, FileOp::Read)
+                    .await?,
+            );
         }
 
         let content = if paths.is_empty() {
@@ -99,6 +57,75 @@ impl ProjectService {
             format!("{content}\n\n{AIONUI_FILES_MARKER}\n{}", paths.join("\n"))
         };
         Ok(ResolvedChatMessage { content, files: paths })
+    }
+
+    /// Resolve a single [`ChatFileRef`] to an absolute device path.
+    ///
+    /// The per-ref identity→path core shared by [`resolve_chat_message`](Self::resolve_chat_message)
+    /// (send boundary) and the preview content endpoint (`aionui-file`, cross-crate — hence `pub`).
+    /// Guards differ by variant:
+    /// - `Project` → [`resolve_reference`](Self::resolve_reference) with the caller's `op` (lexical +
+    ///   realpath containment; read paths pass `Read`, the write endpoint passes `Write`); must exist
+    ///   (file or folder).
+    /// - `Upload` → an existing regular file under the managed `upload_root` (D2 invariant).
+    /// - `Local` → a canonicalized existing regular file; **no sandbox** (the host picker that
+    ///   produced it already exposes the whole filesystem).
+    ///
+    /// `op` only affects the `Project` arm's containment mode; `Upload`/`Local` are path-based and
+    /// identical regardless of op.
+    pub async fn resolve_chat_file_ref(
+        &self,
+        user_id: &str,
+        file: &ChatFileRef,
+        upload_root: &Path,
+        op: FileOp,
+    ) -> Result<String, ProjectError> {
+        match file {
+            ChatFileRef::Project { pe_id, relative_path } => {
+                let resolved = self
+                    .resolve_reference(
+                        user_id,
+                        ReferenceInput {
+                            pe_id: pe_id.clone(),
+                            relative_path: relative_path.clone(),
+                            op,
+                        },
+                    )
+                    .await?;
+                let abs = resolved.absolute_path.ok_or_else(|| ProjectError::ChatFileMissing {
+                    path: relative_path.clone(),
+                })?;
+                // A project ref may point at a file or a folder (the tree
+                // allows attaching a directory); require only that it exists.
+                if !Path::new(&abs).exists() {
+                    return Err(ProjectError::ChatFileMissing { path: abs });
+                }
+                Ok(abs)
+            }
+            ChatFileRef::Upload { path } => {
+                let candidate = Path::new(path);
+                if !candidate.is_file() {
+                    return Err(ProjectError::ChatFileMissing { path: path.clone() });
+                }
+                if !path_within(upload_root, candidate) {
+                    return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
+                }
+                Ok(path.clone())
+            }
+            ChatFileRef::Local { path } => {
+                // A path the user explicitly picked in the host-file browser,
+                // which already exposes the whole filesystem. No managed-root
+                // restriction (that is the upload channel's D2 invariant only);
+                // just canonicalize (collapsing `..`/symlinks) and require an
+                // existing regular file.
+                let canonical = std::fs::canonicalize(path)
+                    .map_err(|_| ProjectError::LocalPathNotReadable { path: path.clone() })?;
+                if !canonical.is_file() {
+                    return Err(ProjectError::LocalPathNotReadable { path: path.clone() });
+                }
+                Ok(canonical.to_string_lossy().into_owned())
+            }
+        }
     }
 }
 

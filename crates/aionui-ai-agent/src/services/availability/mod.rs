@@ -31,6 +31,11 @@ struct AvailabilitySnapshot {
     kind: &'static str,
     error_code: Option<String>,
     error_message: Option<String>,
+    /// Advisory for an agent that probed ONLINE — currently only an agy whose
+    /// installed version differs from the one this build was verified against.
+    /// Distinct from the guidance derived from `error_code`: there is no error
+    /// here, the agent works, the user just needs to know before relying on it.
+    guidance: Option<String>,
     latency_ms: i64,
     checked_at: i64,
 }
@@ -93,6 +98,7 @@ impl AgentAvailabilityService {
             kind: "session",
             error_code: Some(code.to_owned()),
             error_message: Some(message.to_owned()),
+            guidance: None,
             latency_ms: 0,
             checked_at,
         };
@@ -106,6 +112,7 @@ impl AgentAvailabilityService {
             kind: "session",
             error_code: None,
             error_message: None,
+            guidance: None,
             latency_ms: 0,
             checked_at,
         };
@@ -139,9 +146,11 @@ impl AgentAvailabilityService {
             last_check_kind: Some(snapshot.kind),
             last_check_error_code: snapshot.error_code.as_deref(),
             last_check_error_message: snapshot.error_message.as_deref(),
-            last_check_guidance: snapshot.error_code.as_deref().and_then(|code| {
-                let guidance = guidance_for_snapshot_error_code(code);
-                (!guidance.is_empty()).then_some(guidance)
+            last_check_guidance: snapshot.guidance.as_deref().or_else(|| {
+                snapshot.error_code.as_deref().and_then(|code| {
+                    let guidance = guidance_for_snapshot_error_code(code);
+                    (!guidance.is_empty()).then_some(guidance)
+                })
             }),
             last_check_latency_ms: Some(snapshot.latency_ms),
             last_check_at: Some(snapshot.checked_at),
@@ -174,16 +183,57 @@ async fn run_probe(
 ) -> AvailabilitySnapshot {
     let started_at = now_ms();
     let start = Instant::now();
+    // Advisory for an agent that probes ONLINE; stays None for every path that
+    // has nothing extra to say.
+    let mut guidance: Option<String> = None;
 
     let (status, error_code, error_message) = if meta.agent_source == AgentSource::Builtin
-        && matches!(meta.backend.as_deref(), Some("claude") | Some("codex"))
-    {
-        // Builtin claude/codex are direct CLIs that do not speak ACP, so
-        // their deep check is PATH + `--version` (integrity), never a
-        // session/new-style handshake (#675). Uses the wide recheck budget:
+        && matches!(
+            meta.backend.as_deref(),
+            Some("claude") | Some("codex") | Some("antigravity")
+        ) {
+        // These builtins are direct CLIs that do not speak ACP, so their deep
+        // check is PATH + `--version` (integrity), never a session/new-style
+        // handshake (#675). Without antigravity here, agy falls through to the
+        // `try_connect_custom_agent` branch below and every health check fails
+        // with acp_init_failed. Uses the wide recheck budget:
         // the user is explicitly waiting and large Node CLIs load slowly.
         match crate::cli_probe::validate_with_budget(meta, crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT).await {
-            Ok(_) => (AgentSnapshotCheckStatus::Online, None, None),
+            Ok(success) => {
+                // agy is the only one of these whose version is out of our
+                // hands: claude and codex are pinned into managed-resources, so
+                // which version is installed is our own decision and there is
+                // nothing to warn about. The probe already ran `--version` for
+                // the integrity check and used to discard the output, so this
+                // costs no extra process.
+                //
+                // Reported HERE and not only mid-conversation: this is where the
+                // user is deciding whether to rely on the agent, and the
+                // session-time notice arrives long after that choice is made.
+                let drift = (meta.backend.as_deref() == Some("antigravity"))
+                    .then(|| {
+                        success
+                            .reported_version
+                            .as_deref()
+                            .and_then(aionui_session::version_drift)
+                    })
+                    .flatten();
+                match drift {
+                    // Status stays ONLINE — the agent works. The code rides the
+                    // error_code column because that is what the UI translates,
+                    // and `last_success_at` keys off `status`, not the code, so
+                    // a drifting agent is still recorded as a success.
+                    Some(drift) => {
+                        guidance = Some(drift.guidance);
+                        (
+                            AgentSnapshotCheckStatus::Online,
+                            Some(drift.code.to_owned()),
+                            Some(drift.detail),
+                        )
+                    }
+                    None => (AgentSnapshotCheckStatus::Online, None, None),
+                }
+            }
             Err(failure) => (
                 AgentSnapshotCheckStatus::Offline,
                 Some(failure.error_code().to_owned()),
@@ -277,6 +327,7 @@ async fn run_probe(
         },
         error_code,
         error_message,
+        guidance,
         latency_ms,
         checked_at: started_at,
     }

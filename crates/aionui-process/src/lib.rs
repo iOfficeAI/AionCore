@@ -19,6 +19,7 @@ mod containment;
 mod error;
 mod instance_lock;
 mod proc_control;
+mod proc_tree;
 mod process;
 mod registry_store;
 mod spawner;

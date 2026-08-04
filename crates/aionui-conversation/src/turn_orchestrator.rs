@@ -23,6 +23,7 @@ use aionui_api_types::AgentErrorCode;
 fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
     match &options.context.kind {
         AgentSessionKind::Acp(ctx) => ctx.config.backend.as_deref(),
+        AgentSessionKind::Antigravity(ctx) => ctx.config.backend.as_deref(),
         AgentSessionKind::Aionrs(_) => None,
     }
 }
@@ -202,8 +203,37 @@ impl ConversationTurnOrchestrator {
             "Agent task ready"
         );
 
+        // The send path builds the agent HERE, not through the service's
+        // ensure-runtime fn — without this the out-of-turn watcher only existed
+        // for conversations opened via that other path (found live: a codex e2e
+        // probe ran with no watcher at all, and its post-finish MessageDeltas
+        // were dropped exactly like the pre-watcher days).
+        self.service
+            .ensure_background_watcher(&input.user_id, &input.conv_id, &agent);
+
         let persistence = self.service.runtime_persistence();
         let runtime_state = self.service.runtime_state();
+
+        // A cancel may have arrived while the task was still being built, when
+        // there was no agent to hand it to (see `ConversationService::cancel`).
+        // Honour it here, BEFORE the prompt goes out: the user withdrew this
+        // turn, so the cleanest outcome is that the CLI never runs at all.
+        //
+        // Ends as Completed, not Failed — a turn the user cancelled is not an
+        // error, and reporting one would surface a red bubble for something
+        // they asked for.
+        if runtime_state.take_deferred_cancel(&input.conv_id, &input.turn_id) {
+            info!(
+                conversation_id = %input.conv_id,
+                turn_id = %input.turn_id,
+                "Applying a cancel that arrived while the agent was still being built"
+            );
+            return Err(ConversationTurnResult {
+                status: ConversationTurnStatus::Completed,
+                error_message: None,
+            });
+        }
+
         let mut pending_send = Some((input.send, input.msg_id));
         let mut continuation_count = input.continuation_count;
         let continuation_policy = TurnContinuationPolicy::new(MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN);
@@ -590,6 +620,12 @@ impl ConversationTurnOrchestrator {
 fn availability_agent_id(options: &BuildTaskOptions) -> Option<String> {
     match &options.context.kind {
         AgentSessionKind::Acp(context) => context
+            .config
+            .agent_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        AgentSessionKind::Antigravity(context) => context
             .config
             .agent_id
             .as_deref()
