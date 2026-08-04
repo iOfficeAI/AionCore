@@ -51,6 +51,10 @@ pub(crate) struct BackgroundStreamWatcher {
     pub broadcaster: Arc<dyn EventBroadcaster>,
     pub persistence: RuntimePersistenceCoordinator,
     pub runtime_state: Arc<ConversationRuntimeStateService>,
+    /// True for non-Session (ACP manager) instances: consume ONLY agent
+    /// session titles and leave every other frame to the existing ACP
+    /// delivery paths (orphan turns / card refreshes are Session semantics).
+    pub title_only: bool,
 }
 
 impl BackgroundStreamWatcher {
@@ -96,34 +100,32 @@ impl BackgroundStreamWatcher {
                 // Instance torn down (conversation deleted / process replaced).
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            // While a user turn is active its own relay owns the stream.
-            if self.runtime_state.active_turn_id_for(&self.conversation_id).is_some() {
-                continue;
-            }
-            match &ev {
-                AgentStreamEvent::WorkflowProgress(data) => self.handle_card_refresh(data).await,
-                AgentStreamEvent::AcpSessionInfo(payload) => {
-                    // Agent-proposed session title arriving BETWEEN turns. The
-                    // claude generate_session_title reply lands seconds AFTER the
-                    // first turn's Finish (live 2026-08-04: TurnResult 07:21:33 →
-                    // title frame 07:21:36), when the per-turn relay is already
-                    // gone — without this arm the title was silently dropped.
-                    // Mirrors the relay's arm (which still owns mid-turn frames,
-                    // e.g. ACP session_info_update during a prompt). No stream
-                    // forward: apply_agent_title broadcasts its own events.
-                    if let Some(title) = payload
-                        .get("title")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|t| !t.is_empty())
-                        && let Err(e) = crate::service::apply_agent_title(
-                            &self.repo,
-                            &self.broadcaster,
-                            &self.user_id,
-                            &self.conversation_id,
-                            title,
-                        )
-                        .await
+            // Agent session titles are consumed HERE, unconditionally — the
+            // watcher is the SINGLE consumer for both backend families, and the
+            // active-turn gate below must NOT apply:
+            // - claude: the generate_session_title reply lands seconds AFTER the
+            //   first turn's Finish (live 2026-08-04: TurnResult 07:21:33 →
+            //   title frame 07:21:36) — the per-turn relay is already gone.
+            // - ACP agents (pi/omp, live 2026-08-04): session_info_update fires
+            //   at session-open (no turn yet) and ~1ms BEFORE the turn's Finish
+            //   — racing the relay's exit. Only a gate-free persistent consumer
+            //   catches both. apply_agent_title is guarded (name_source) and
+            //   idempotent (same-title no-op), so timing is never harmful.
+            if let AgentStreamEvent::AcpSessionInfo(payload) = &ev {
+                if let Some(title) = payload
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                {
+                    if let Err(e) = crate::service::apply_agent_title(
+                        &self.repo,
+                        &self.broadcaster,
+                        &self.user_id,
+                        &self.conversation_id,
+                        title,
+                    )
+                    .await
                     {
                         warn!(
                             conversation_id = %self.conversation_id,
@@ -131,7 +133,25 @@ impl BackgroundStreamWatcher {
                             "agent session title apply failed (background)"
                         );
                     }
+                } else {
+                    tracing::debug!(
+                        conversation_id = %self.conversation_id,
+                        "session info frame without title ignored"
+                    );
                 }
+                continue;
+            }
+            // Title-only watchers (ACP manager instances) stop here: orphan
+            // turns and card refreshes are Session-instance semantics.
+            if self.title_only {
+                continue;
+            }
+            // While a user turn is active its own relay owns the stream.
+            if self.runtime_state.active_turn_id_for(&self.conversation_id).is_some() {
+                continue;
+            }
+            match &ev {
+                AgentStreamEvent::WorkflowProgress(data) => self.handle_card_refresh(data).await,
                 ev_ref if Self::is_orphan_turn_content(ev_ref) => {
                     self.run_orphan_turn(ev.clone(), &mut rx).await;
                 }
@@ -346,6 +366,10 @@ mod tests {
     }
 
     async fn rig() -> Rig {
+        rig_with(false).await
+    }
+
+    async fn rig_with(title_only: bool) -> Rig {
         let db = init_database_memory().await.unwrap();
         let user_repo = SqliteUserRepository::new(db.pool().clone());
         let user = user_repo.create_user("user-1", "hash").await.unwrap();
@@ -380,6 +404,7 @@ mod tests {
             broadcaster: bus.clone(),
             persistence: RuntimePersistenceCoordinator::new(Arc::clone(&runtime_state)),
             runtime_state: Arc::clone(&runtime_state),
+            title_only,
         };
         let handle = tokio::spawn(watcher.run(tx.subscribe()));
         Rig {
@@ -639,6 +664,52 @@ mod tests {
         assert!(
             rows_of_type(&rig, "text").await.is_empty(),
             "the watcher must stay out of an active turn"
+        );
+        drop(claim);
+    }
+
+    /// A title-only (ACP manager) watcher applies titles even while a user
+    /// turn is ACTIVE — pi/omp fire session_info_update ~1ms before the turn's
+    /// Finish, racing the per-turn relay's exit; the gate-free consumer is the
+    /// only one that reliably sees it. Non-title frames must stay untouched
+    /// (no orphan turns for ACP instances).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn title_only_watcher_applies_title_even_during_active_turn() {
+        let rig = rig_with(true).await;
+        let claim = rig
+            .runtime_state
+            .try_claim_turn("conv-1", "turn-user")
+            .expect("claimed");
+        rig.tx
+            .send(AgentStreamEvent::AcpSessionInfo(serde_json::json!({
+                "title": "创建带时间戳的JSON文件"
+            })))
+            .unwrap();
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "acp content the manager path owns".into(),
+            }))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let row = rig.repo.get(&rig.user_id, "conv-1").await.unwrap().unwrap();
+            if row.name == "创建带时间戳的JSON文件" {
+                assert_eq!(row.name_source.as_deref(), Some("agent"));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "title-only watcher must apply mid-turn titles, name still {:?}",
+                row.name
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // The stray text frame must NOT spawn an orphan turn on the ACP path.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            rows_of_type(&rig, "text").await.is_empty(),
+            "title-only watcher must never deliver content frames"
         );
         drop(claim);
     }

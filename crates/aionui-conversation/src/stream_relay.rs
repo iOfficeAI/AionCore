@@ -104,9 +104,6 @@ pub struct StreamRelay {
     msg_id: String,
     turn_id: String,
     user_id: String,
-    /// Direct repo handle for the agent-title guard (`apply_agent_title`);
-    /// the persistence adapter owns its own clone for message writes.
-    conversation_repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Option<Arc<dyn SkillResolver>>,
     allowed_skill_names: Vec<String>,
@@ -126,19 +123,13 @@ impl StreamRelay {
         repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
     ) -> Self {
-        let adapter = StreamPersistenceAdapter::new(
-            user_id.clone(),
-            conversation_id.clone(),
-            msg_id.clone(),
-            repo.clone(),
-            None,
-        );
+        let adapter =
+            StreamPersistenceAdapter::new(user_id.clone(), conversation_id.clone(), msg_id.clone(), repo, None);
         Self {
             conversation_id,
             msg_id,
             turn_id,
             user_id,
-            conversation_repo: repo,
             broadcaster,
             skill_resolver: None,
             allowed_skill_names: Vec::new(),
@@ -577,31 +568,12 @@ impl StreamRelay {
                             attempt.saw_tool_or_side_effect = true;
                             self.forward_to_websocket(&event);
                         }
-                        AgentStreamEvent::AcpSessionInfo(payload) => {
-                            // Agent-proposed session title (ACP session_info_update, or
-                            // claude generate_session_title mapped to the same shape).
-                            // Apply it under the name_source guard; a null/absent/empty
-                            // title is ignored (no title clearing by design).
-                            if let Some(title) = payload
-                                .get("title")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::trim)
-                                .filter(|t| !t.is_empty())
-                                && let Err(e) = crate::service::apply_agent_title(
-                                    &self.conversation_repo,
-                                    &self.broadcaster,
-                                    &self.user_id,
-                                    &self.conversation_id,
-                                    title,
-                                )
-                                .await
-                            {
-                                warn!(error = %e, "agent session title apply failed");
-                            }
-                            // Keep the raw frame flowing to the frontend like the
-                            // catch-all did before this dedicated arm existed.
-                            self.forward_to_websocket(&event);
-                        }
+                        // NOTE: AcpSessionInfo (agent session titles) is deliberately
+                        // NOT consumed here. Titles arrive at session-open and at the
+                        // turn's final instant (pi/omp race the relay's exit by ~1ms;
+                        // claude replies seconds after Finish), so the per-instance
+                        // BackgroundStreamWatcher is the single gate-free consumer.
+                        // The frame still reaches the frontend via the catch-all.
                         _ => {
                             self.forward_to_websocket(&event);
                         }
@@ -1120,7 +1092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_session_info_title_renames_conversation_and_broadcasts() {
+    async fn acp_session_info_is_forwarded_but_never_renames_at_relay_level() {
         let repo = Arc::new(RecordingRepo::new());
         *repo.conversation.lock().unwrap() = Some(agent_title_test_row("first message placeholder", None));
         let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
@@ -1144,26 +1116,28 @@ mod tests {
         let outcome = relay.consume(rx).await;
         assert_eq!(outcome.terminal, RelayTerminal::Finish);
 
-        let updates = repo.conversation_updates.lock().unwrap().clone();
-        let (id, update) = updates.iter().find(|(_, u)| u.name.is_some()).expect("rename recorded");
-        assert_eq!(id, "conv-1");
-        assert_eq!(update.name.as_deref(), Some("Fix login bug"));
-        assert_eq!(update.name_source.as_deref(), Some("agent"));
-
-        let mut saw_name_updated = false;
+        // The relay must NOT rename (the BackgroundStreamWatcher is the single
+        // title consumer — relay-side apply raced its own exit and double-applied).
+        assert!(
+            repo.conversation_updates
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, u)| u.name.is_none()),
+            "relay must not rename"
+        );
+        // The raw frame still reaches the frontend via message.stream.
+        let mut saw_forward = false;
         while let Ok(msg) = ws_rx.try_recv() {
-            if msg.name == "conversation.nameUpdated" {
-                saw_name_updated = true;
-                assert_eq!(msg.data["conversation_id"], "conv-1");
-                assert_eq!(msg.data["name"], "Fix login bug");
-                assert_eq!(msg.data["user_id"], "user-1");
+            if msg.name == "message.stream" && msg.data["data"]["title"] == "Fix login bug" {
+                saw_forward = true;
             }
         }
-        assert!(saw_name_updated, "conversation.nameUpdated must be broadcast");
+        assert!(saw_forward, "AcpSessionInfo frame must still be forwarded");
     }
 
     #[tokio::test]
-    async fn acp_session_info_null_title_is_ignored() {
+    async fn acp_session_info_null_title_never_renames() {
         let repo = Arc::new(RecordingRepo::new());
         *repo.conversation.lock().unwrap() = Some(agent_title_test_row("kept name", None));
         let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));

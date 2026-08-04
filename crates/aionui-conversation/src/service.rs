@@ -591,17 +591,24 @@ impl ConversationService {
         generate_short_id()
     }
 
-    /// Spawn (or replace) the conversation's background-stream watcher for a
-    /// direct-CLI Session instance. Idempotent per instance: keyed by the Arc
-    /// pointer, so a rebuilt instance (crash/resume respawn) gets a fresh
-    /// watcher on its fresh broadcast channel while the old one exits on
-    /// `Closed`. Non-Session instances (ACP manager, aionrs, teammates) keep
-    /// their existing delivery paths untouched.
+    /// Spawn (or replace) the conversation's background-stream watcher.
+    /// Idempotent per instance: keyed by the Arc pointer, so a rebuilt instance
+    /// (crash/resume respawn) gets a fresh watcher on its fresh broadcast
+    /// channel while the old one exits on `Closed`.
+    ///
+    /// Direct-CLI Session instances get the FULL watcher (orphan turns + card
+    /// refreshes + agent session titles). ACP manager instances get a
+    /// TITLE-ONLY watcher: pi/omp emit `session_info_update` at session-open
+    /// (no turn running) and ~1ms before the turn's Finish (racing the relay's
+    /// exit), so only a persistent consumer sees them; their other frames keep
+    /// the existing ACP delivery paths untouched. aionrs/test instances emit no
+    /// agent titles and get none.
     pub(crate) fn ensure_background_watcher(&self, user_id: &str, conversation_id: &str, agent: &AgentInstance) {
-        let AgentInstance::Session(task) = agent else {
-            return;
+        let (instance_ptr, title_only) = match agent {
+            AgentInstance::Session(task) => (Arc::as_ptr(task) as usize, false),
+            AgentInstance::Acp(mgr) => (Arc::as_ptr(mgr) as usize, true),
+            _ => return,
         };
-        let instance_ptr = Arc::as_ptr(task) as usize;
         let mut map = match self.background_watchers.lock() {
             Ok(map) => map,
             Err(poisoned) => poisoned.into_inner(),
@@ -622,6 +629,7 @@ impl ConversationService {
             broadcaster: self.broadcaster.clone(),
             persistence: self.runtime_persistence(),
             runtime_state: Arc::clone(&self.runtime_state),
+            title_only,
         };
         let rx = agent.subscribe();
         let join = tokio::spawn(watcher.run(rx));
