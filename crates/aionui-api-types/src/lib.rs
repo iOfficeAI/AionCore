@@ -89,8 +89,9 @@ pub use conversation::{
     CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
     ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery,
+    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind,
+    ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse,
+    ForkCapabilityView, ForkConversationRequest, ListConversationsQuery, ListMessagesQuery,
     MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse, SearchMessagesQuery,
     SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };

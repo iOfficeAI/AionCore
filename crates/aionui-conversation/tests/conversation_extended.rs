@@ -816,3 +816,299 @@ async fn reset_wrong_user_returns_not_found() {
     let err = svc.reset("other_user", &conv.id).await.unwrap_err();
     assert!(matches!(err, ConversationError::NotFound { .. }));
 }
+
+// ── Conversation fork ───────────────────────────────────────────────
+
+async fn setup_fork() -> (
+    ConversationService,
+    Arc<SqliteConversationRepository>,
+    Arc<dyn aionui_db::IAcpSessionRepository>,
+) {
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+    let broadcaster = Arc::new(TestBroadcaster::new());
+    let agent_metadata_repo: Arc<dyn aionui_db::IAgentMetadataRepository> =
+        Arc::new(aionui_db::SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let acp_session_repo: Arc<dyn aionui_db::IAcpSessionRepository> =
+        Arc::new(aionui_db::SqliteAcpSessionRepository::new(db.pool().clone()));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster,
+        Arc::new(EmptySkillResolver),
+        task_mgr,
+        repo.clone(),
+        agent_metadata_repo,
+        acp_session_repo.clone(),
+    );
+    (svc, repo, acp_session_repo)
+}
+
+fn fork_create_req(backend: &str) -> CreateConversationRequest {
+    let workspace = ensure_named_workspace_path(&format!("aionui-fork-test-{backend}"));
+    serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace, "backend": backend }
+    }))
+    .unwrap()
+}
+
+fn fork_req(message_id: &str) -> aionui_api_types::ForkConversationRequest {
+    serde_json::from_value(json!({ "message_id": message_id })).unwrap()
+}
+
+#[tokio::test]
+async fn fork_head_creates_lineage_row_and_copies_messages() {
+    let (svc, repo, acp_repo) = setup_fork().await;
+    let parent = svc.create(USER_ID, fork_create_req("claude")).await.unwrap();
+    acp_repo
+        .update_session_id_for_user(USER_ID, &parent.id, "parent-sid-1")
+        .await
+        .unwrap();
+    let m1 = make_message(&parent.id, "hello", 0);
+    let m2 = make_message(&parent.id, "world", 10);
+    repo.insert_message(USER_ID, &m1).await.unwrap();
+    repo.insert_message(USER_ID, &m2).await.unwrap();
+
+    // HEAD fork (claude is seeded with a head-only fork capability by 036).
+    let fork = svc.fork(USER_ID, &parent.id, fork_req(&m2.id)).await.unwrap();
+    assert_ne!(fork.id, parent.id);
+    assert_eq!(fork.name, parent.name, "name defaults to the parent's");
+    assert_eq!(
+        fork.fork_capability,
+        Some(aionui_api_types::ForkCapabilityView { at_turn: false }),
+        "claude declares a HEAD-only fork capability"
+    );
+    let spec = fork.extra.get("fork").expect("fork lineage in extra");
+    assert_eq!(spec["parent_conversation_id"], parent.id);
+    assert_eq!(spec["parent_message_id"], m2.id);
+    assert_eq!(spec["parent_session_id"], "parent-sid-1");
+    assert!(spec.get("last_turn_id").is_none(), "HEAD fork carries no turn anchor");
+
+    // Copied history, reminted ids, same workspace.
+    let page = repo
+        .list_messages_page(
+            USER_ID,
+            &fork.id,
+            &aionui_db::MessagePageParams {
+                limit: 50,
+                direction: aionui_db::MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(
+        fork.extra.get("workspace"),
+        // The response extra echoes the parent's workspace verbatim.
+        svc.get(USER_ID, &parent.id).await.unwrap().extra.get("workspace"),
+        "fork shares the parent workspace (claude cwd constraint)"
+    );
+
+    // The fork's acp_session row exists, same agent identity, UNBOUND sid.
+    let fork_session = acp_repo.get_for_user(USER_ID, &fork.id).await.unwrap().unwrap();
+    assert_eq!(fork_session.session_id, None, "fork pending until first open");
+    let parent_session = acp_repo.get_for_user(USER_ID, &parent.id).await.unwrap().unwrap();
+    assert_eq!(fork_session.agent_id, parent_session.agent_id);
+    assert_eq!(
+        parent_session.session_id.as_deref(),
+        Some("parent-sid-1"),
+        "the parent's binding is untouched"
+    );
+}
+
+#[tokio::test]
+async fn fork_mid_history_is_refused_for_head_only_backends() {
+    let (svc, repo, acp_repo) = setup_fork().await;
+    let parent = svc.create(USER_ID, fork_create_req("claude")).await.unwrap();
+    acp_repo
+        .update_session_id_for_user(USER_ID, &parent.id, "parent-sid-2")
+        .await
+        .unwrap();
+    let m1 = make_message(&parent.id, "one", 0);
+    let m2 = make_message(&parent.id, "two", 10);
+    repo.insert_message(USER_ID, &m1).await.unwrap();
+    repo.insert_message(USER_ID, &m2).await.unwrap();
+
+    let err = svc.fork(USER_ID, &parent.id, fork_req(&m1.id)).await.unwrap_err();
+    assert!(
+        matches!(&err, ConversationError::Unprocessable { reason } if reason.starts_with("FORK_POINT_UNSUPPORTED")),
+        "claude mid-history fork must be refused, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn fork_mid_history_resolves_codex_turn_anchor() {
+    let (svc, repo, acp_repo) = setup_fork().await;
+    let parent = svc.create(USER_ID, fork_create_req("codex")).await.unwrap();
+    acp_repo
+        .update_session_id_for_user(USER_ID, &parent.id, "th-parent")
+        .await
+        .unwrap();
+    let mut m1 = make_message(&parent.id, "one", 0);
+    m1.backend_turn_id = Some("turn-1".into());
+    let m2 = make_message(&parent.id, "two", 10);
+    repo.insert_message(USER_ID, &m1).await.unwrap();
+    repo.insert_message(USER_ID, &m2).await.unwrap();
+
+    let fork = svc.fork(USER_ID, &parent.id, fork_req(&m1.id)).await.unwrap();
+    assert_eq!(
+        fork.fork_capability,
+        Some(aionui_api_types::ForkCapabilityView { at_turn: true }),
+        "codex declares an at-turn fork capability"
+    );
+    assert_eq!(
+        fork.extra["fork"]["last_turn_id"], "turn-1",
+        "the mid-history fork resolved the stamped codex turn anchor"
+    );
+    // And only the pre-fork-point message was copied.
+    let page = repo
+        .list_messages_page(
+            USER_ID,
+            &fork.id,
+            &aionui_db::MessagePageParams {
+                limit: 50,
+                direction: aionui_db::MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+}
+
+#[tokio::test]
+async fn fork_mid_history_without_anchor_is_refused_not_degraded() {
+    let (svc, repo, acp_repo) = setup_fork().await;
+    let parent = svc.create(USER_ID, fork_create_req("codex")).await.unwrap();
+    acp_repo
+        .update_session_id_for_user(USER_ID, &parent.id, "th-parent")
+        .await
+        .unwrap();
+    // Legacy rows: no backend_turn_id anywhere.
+    let m1 = make_message(&parent.id, "one", 0);
+    let m2 = make_message(&parent.id, "two", 10);
+    repo.insert_message(USER_ID, &m1).await.unwrap();
+    repo.insert_message(USER_ID, &m2).await.unwrap();
+
+    let err = svc.fork(USER_ID, &parent.id, fork_req(&m1.id)).await.unwrap_err();
+    assert!(
+        matches!(&err, ConversationError::Unprocessable { reason } if reason.starts_with("FORK_POINT_UNSUPPORTED")),
+        "an unresolvable anchor must refuse, never silently fork at HEAD, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn fork_rejects_unbound_parent_and_unsupported_agent() {
+    let (svc, repo, acp_repo) = setup_fork().await;
+
+    // Unbound parent (never had a backend session).
+    let unbound = svc.create(USER_ID, fork_create_req("claude")).await.unwrap();
+    let m = make_message(&unbound.id, "hello", 0);
+    repo.insert_message(USER_ID, &m).await.unwrap();
+    let err = svc.fork(USER_ID, &unbound.id, fork_req(&m.id)).await.unwrap_err();
+    assert!(
+        matches!(&err, ConversationError::Busy { reason } if reason.starts_with("FORK_PARENT_UNBOUND")),
+        "got {err:?}"
+    );
+
+    // Agent without a fork declaration (qwen's seeded capabilities carry no fork key).
+    let unsupported = svc.create(USER_ID, fork_create_req("qwen")).await.unwrap();
+    acp_repo
+        .update_session_id_for_user(USER_ID, &unsupported.id, "sid-x")
+        .await
+        .unwrap();
+    let m = make_message(&unsupported.id, "hello", 0);
+    repo.insert_message(USER_ID, &m).await.unwrap();
+    let err = svc.fork(USER_ID, &unsupported.id, fork_req(&m.id)).await.unwrap_err();
+    assert!(
+        matches!(&err, ConversationError::Unprocessable { reason } if reason.starts_with("FORK_UNSUPPORTED")),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_strips_client_supplied_fork_spec() {
+    let (svc, _repo, _acp) = setup_fork().await;
+    let workspace = ensure_named_workspace_path("aionui-fork-test-strip");
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude",
+            "fork": { "parent_conversation_id": "x", "parent_message_id": "y", "parent_session_id": "stolen" }
+        }
+    }))
+    .unwrap();
+    let created = svc.create(USER_ID, req).await.unwrap();
+    assert!(
+        created.extra.get("fork").is_none(),
+        "a client-supplied fork spec must be stripped on the create path"
+    );
+}
+
+#[tokio::test]
+async fn get_projects_fork_capability_on_detail_path() {
+    let (svc, _repo, _acp) = setup_fork().await;
+    let claude_conv = svc.create(USER_ID, fork_create_req("claude")).await.unwrap();
+    let got = svc.get(USER_ID, &claude_conv.id).await.unwrap();
+    assert_eq!(
+        got.fork_capability,
+        Some(aionui_api_types::ForkCapabilityView { at_turn: false })
+    );
+
+    let codex_conv = svc.create(USER_ID, fork_create_req("codex")).await.unwrap();
+    let got = svc.get(USER_ID, &codex_conv.id).await.unwrap();
+    assert_eq!(
+        got.fork_capability,
+        Some(aionui_api_types::ForkCapabilityView { at_turn: true })
+    );
+}
+
+#[tokio::test]
+async fn delete_parent_keeps_workspace_shared_with_fork() {
+    let (svc, repo, acp_repo) = setup_fork().await;
+    // No workspace in extra → create() auto-provisions one under
+    // workspace_root/conversations/... — the deletable kind.
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "backend": "claude" }
+    }))
+    .unwrap();
+    let parent = svc.create(USER_ID, req).await.unwrap();
+    let workspace = parent
+        .extra
+        .get("workspace")
+        .and_then(|v| v.as_str())
+        .expect("auto-provisioned workspace")
+        .to_owned();
+    assert!(std::path::Path::new(&workspace).is_dir());
+
+    acp_repo
+        .update_session_id_for_user(USER_ID, &parent.id, "parent-sid-ws")
+        .await
+        .unwrap();
+    let m = make_message(&parent.id, "hello", 0);
+    repo.insert_message(USER_ID, &m).await.unwrap();
+    let fork = svc.fork(USER_ID, &parent.id, fork_req(&m.id)).await.unwrap();
+    assert_eq!(
+        fork.extra.get("workspace").and_then(|v| v.as_str()),
+        Some(workspace.as_str()),
+        "the fork shares the parent's auto workspace"
+    );
+
+    svc.delete(USER_ID, &parent.id).await.unwrap();
+    assert!(
+        std::path::Path::new(&workspace).is_dir(),
+        "deleting the parent must NOT remove the workspace the fork still uses"
+    );
+
+    // Deleting the fork leaves the directory too: the auto-workspace removal
+    // is keyed on the `-temp-{id}` name suffix, which only the PARENT matches.
+    // An orphaned directory is the accepted trade-off (safety over cleanup).
+    svc.delete(USER_ID, &fork.id).await.unwrap();
+    assert!(
+        std::path::Path::new(&workspace).is_dir(),
+        "the fork's delete never removes a workspace named after the parent"
+    );
+    std::fs::remove_dir_all(&workspace).ok();
+}
