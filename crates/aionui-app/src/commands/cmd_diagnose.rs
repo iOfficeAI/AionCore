@@ -775,7 +775,9 @@ fn cron_summary(data: &Value) -> Value {
         .iter()
         .filter(|job| {
             matches!(
-                job.get("last_status").and_then(Value::as_str),
+                job.get("state")
+                    .and_then(|state| state.get("last_status"))
+                    .and_then(Value::as_str),
                 Some("error") | Some("missed")
             )
         })
@@ -794,7 +796,9 @@ fn cron_overview(data: &Value) -> Value {
         .iter()
         .filter(|job| {
             matches!(
-                job.get("last_status").and_then(Value::as_str),
+                job.get("state")
+                    .and_then(|state| state.get("last_status"))
+                    .and_then(Value::as_str),
                 Some("error") | Some("missed")
             )
         })
@@ -802,8 +806,8 @@ fn cron_overview(data: &Value) -> Value {
             json!({
                 "id": job.get("id").cloned().unwrap_or(Value::Null),
                 "name": job.get("name").cloned().unwrap_or(Value::Null),
-                "last_status": job.get("last_status").cloned().unwrap_or(Value::Null),
-                "last_error": job.get("last_error").cloned().unwrap_or(Value::Null),
+                "last_status": job.pointer("/state/last_status").cloned().unwrap_or(Value::Null),
+                "last_error": job.pointer("/state/last_error").cloned().unwrap_or(Value::Null),
             })
         })
         .collect();
