@@ -514,6 +514,16 @@ impl StreamRelay {
                             self.forward_to_websocket(&event);
                             self.adapter.persist_tool_group(entries).await;
                         }
+                        AgentStreamEvent::WorkflowProgress(data) if data.settle_only => {
+                            // Update-only settle for a card this pump never
+                            // opened (post-resume terminal). Forward ONLY if the
+                            // stored row existed — otherwise the frontend would
+                            // append a junk nameless card for a workflow-internal
+                            // ref that never had one.
+                            if self.adapter.settle_tool_call_if_present(&data.card).await {
+                                self.forward_workflow_progress(data);
+                            }
+                        }
                         AgentStreamEvent::WorkflowProgress(data) => {
                             // A running workflow refreshes its progress roughly once a
                             // second, WHILE the assistant is still streaming its "workflow
@@ -1246,6 +1256,7 @@ mod tests {
                     status: ToolGroupStatus::Executing,
                     description: Some("[P1 Run] · opus-4-8".into()),
                 }],
+                settle_only: false,
             })
         }
 

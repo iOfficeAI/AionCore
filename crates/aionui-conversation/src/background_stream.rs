@@ -120,6 +120,40 @@ impl BackgroundStreamWatcher {
     /// renders, and persist them so a reload shows the truth (the un-persisted
     /// settle was exactly the "View Steps spinner never ends" bug).
     async fn handle_card_refresh(&self, data: &WorkflowProgressData) {
+        if data.settle_only {
+            // Update-only settle for a card the pump has no memory of (see the
+            // field's docs): apply to an EXISTING stored row and forward, or
+            // drop silently. Never insert — the same unknown-terminal shape
+            // fires for workflow-internal refs that never had a row, and
+            // inserting for those would conjure junk cards.
+            let adapter = StreamPersistenceAdapter::new(
+                self.user_id.clone(),
+                self.conversation_id.clone(),
+                String::new(),
+                self.repo.clone(),
+                Some(self.persistence.clone()),
+            );
+            if adapter.settle_tool_call_if_present(&data.card).await {
+                self.forward_card_frames(data);
+            }
+            return;
+        }
+        self.forward_card_frames(data);
+        let adapter = StreamPersistenceAdapter::new(
+            self.user_id.clone(),
+            self.conversation_id.clone(),
+            // Only text segments read the adapter's msg_id; tool rows key by call_id.
+            String::new(),
+            self.repo.clone(),
+            Some(self.persistence.clone()),
+        );
+        adapter.persist_tool_call(&data.card).await;
+        if !data.agents.is_empty() {
+            adapter.persist_tool_group(&data.agents).await;
+        }
+    }
+
+    fn forward_card_frames(&self, data: &WorkflowProgressData) {
         for (kind, msg_id, body) in [
             ("tool_call", data.card.call_id.clone(), serde_json::to_value(&data.card)),
             (
@@ -153,18 +187,6 @@ impl BackgroundStreamWatcher {
                     "hidden": false,
                 }),
             ));
-        }
-        let adapter = StreamPersistenceAdapter::new(
-            self.user_id.clone(),
-            self.conversation_id.clone(),
-            // Only text segments read the adapter's msg_id; tool rows key by call_id.
-            String::new(),
-            self.repo.clone(),
-            Some(self.persistence.clone()),
-        );
-        adapter.persist_tool_call(&data.card).await;
-        if !data.agents.is_empty() {
-            adapter.persist_tool_group(&data.agents).await;
         }
     }
 
@@ -368,6 +390,22 @@ mod tests {
         None
     }
 
+    fn settled_card_with(call_id: &str, status: ToolCallStatus) -> AgentStreamEvent {
+        AgentStreamEvent::WorkflowProgress(WorkflowProgressData {
+            card: ToolCallEventData {
+                call_id: call_id.into(),
+                name: "Bash".into(),
+                args: serde_json::json!({"command": "sleep 30"}),
+                status,
+                input: None,
+                output: None,
+                description: Some("sleep 30 · bg task b1 · 00:01".into()),
+            },
+            agents: vec![],
+            settle_only: false,
+        })
+    }
+
     fn settled_card() -> AgentStreamEvent {
         AgentStreamEvent::WorkflowProgress(WorkflowProgressData {
             card: ToolCallEventData {
@@ -385,6 +423,7 @@ mod tests {
                 status: ToolGroupStatus::Success,
                 description: None,
             }],
+            settle_only: false,
         })
     }
 
@@ -461,6 +500,91 @@ mod tests {
         }
         assert!(saw_content, "the report streams to the live view");
         assert!(saw_completed, "the orphan turn is book-kept like a real turn");
+    }
+
+    /// A `settle_only` frame updates an EXISTING row and forwards; for an
+    /// unknown row it is dropped silently — never inserted, never forwarded
+    /// (the same unknown-terminal shape fires for workflow-internal refs that
+    /// never had a row; inserting would conjure junk cards).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settle_only_updates_existing_rows_and_drops_unknown_ones() {
+        let rig = rig().await;
+        // Seed a live card row the normal way.
+        rig.tx
+            .send(settled_card_with("toolu_seed", ToolCallStatus::Running))
+            .unwrap();
+        eventually(async || {
+            rows_of_type(&rig, "tool_call")
+                .await
+                .into_iter()
+                .find(|m| m.id == "toolu_seed" && m.status.as_deref() == Some("work"))
+        })
+        .await
+        .expect("seed row persisted as running");
+
+        let mut ws = rig.bus.subscribe();
+        // Status-only settle for the seeded row…
+        rig.tx
+            .send(AgentStreamEvent::WorkflowProgress(WorkflowProgressData {
+                card: ToolCallEventData {
+                    call_id: "toolu_seed".into(),
+                    name: String::new(),
+                    args: serde_json::Value::Null,
+                    status: ToolCallStatus::Canceled,
+                    input: None,
+                    output: None,
+                    description: None,
+                },
+                agents: vec![],
+                settle_only: true,
+            }))
+            .unwrap();
+        // …and one for a row that never existed.
+        rig.tx
+            .send(AgentStreamEvent::WorkflowProgress(WorkflowProgressData {
+                card: ToolCallEventData {
+                    call_id: "toolu_ghost".into(),
+                    name: String::new(),
+                    args: serde_json::Value::Null,
+                    status: ToolCallStatus::Canceled,
+                    input: None,
+                    output: None,
+                    description: None,
+                },
+                agents: vec![],
+                settle_only: true,
+            }))
+            .unwrap();
+
+        let row = eventually(async || {
+            rows_of_type(&rig, "tool_call")
+                .await
+                .into_iter()
+                .find(|m| m.id == "toolu_seed" && m.status.as_deref() == Some("finish"))
+        })
+        .await
+        .expect("the existing row must settle to finish");
+        // Merge-patch kept the row's own identity: name survives a status-only frame.
+        assert!(row.content.contains("\"name\":\"Bash\""), "name kept: {}", row.content);
+
+        // The ghost never materialized — no row, no WS frame.
+        assert!(
+            !rows_of_type(&rig, "tool_call")
+                .await
+                .iter()
+                .any(|m| m.id == "toolu_ghost"),
+            "a settle-only frame must never insert"
+        );
+        let mut ghost_forwarded = false;
+        while let Ok(evt) = ws.try_recv() {
+            if evt.name == "message.stream" && evt.data["data"]["call_id"] == "toolu_ghost" {
+                ghost_forwarded = true;
+            }
+        }
+        assert!(
+            !ghost_forwarded,
+            "a settle-only frame for an unknown row must not reach the UI"
+        );
     }
 
     /// While a USER turn is active, its own relay owns every frame — the watcher

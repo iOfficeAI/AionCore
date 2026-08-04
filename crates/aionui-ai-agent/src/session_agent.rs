@@ -2290,6 +2290,7 @@ fn spawn_event_pump(
                         let data = crate::protocol::events::WorkflowProgressData {
                             card: card_frame,
                             agents,
+                            settle_only: false,
                         };
                         // Delivery is uniform: in-turn the per-turn relay consumes
                         // this, between turns the conversation's background stream
@@ -2894,6 +2895,23 @@ fn spawn_event_pump(
                 let _ = runtime.tx.send(ev);
             }
         }
+
+        // The event stream ended: the backend (and its process group) is being
+        // torn down. Settle every card still open and push the frames NOW —
+        // the out-of-turn watcher is still subscribed at this instant and drains
+        // buffered frames before it observes the channel close. Without this an
+        // idle-kill left cards' stored rows on `running` forever (live
+        // 2026-08-04: a load-gate bash's card spun for hours after the reaper
+        // removed the task mid-flight).
+        for data in settle_workflow_cards(
+            &mut workflow_cards,
+            crate::workflow_progress::CardStatus::Cancelled,
+            false,
+            aionui_common::now_ms(),
+            &conversation_id,
+        ) {
+            let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+        }
     });
 }
 
@@ -3373,6 +3391,7 @@ fn update_workflow_cards(
                         out.push(WorkflowProgressData {
                             card: card_frame,
                             agents,
+                            settle_only: false,
                         });
                     }
                     cards.insert(r#ref.clone(), card);
@@ -3380,6 +3399,45 @@ fn update_workflow_cards(
             }
             terminal => {
                 let Some(mut card) = cards.remove(r#ref) else {
+                    // A terminal for a card THIS pump never opened. Real case
+                    // (live 2026-08-04): the conversation was idle-killed while a
+                    // background bash kept working; the RESUMED session reported
+                    // the task terminal, but the rebuilt pump's ledger was empty —
+                    // and the stored row spun forever. Synthesize a STATUS-ONLY
+                    // settle keyed to the launching call. `settle_only` makes the
+                    // consumers update-only: the same unknown-terminal shape also
+                    // fires for workflow-INTERNAL refs that never had a row (the
+                    // 2.1.176 capture's inner bashes), and those must stay
+                    // invisible.
+                    if let Some(call_id) = parent_ref.clone() {
+                        let status = match terminal {
+                            SubagentStatus::Completed => crate::protocol::events::ToolCallStatus::Completed,
+                            SubagentStatus::Errored => crate::protocol::events::ToolCallStatus::Error,
+                            _ => crate::protocol::events::ToolCallStatus::Canceled,
+                        };
+                        tracing::info!(
+                            conv_id = %conversation_id,
+                            task_id = %r#ref,
+                            %call_id,
+                            ?status,
+                            "session-pump: terminal for unknown card — emitting status-only settle"
+                        );
+                        out.push(WorkflowProgressData {
+                            card: crate::protocol::events::ToolCallEventData {
+                                call_id,
+                                // Empty name / null args are SKIPPED at
+                                // serialization, so the stored row keeps its own.
+                                name: String::new(),
+                                args: serde_json::Value::Null,
+                                status,
+                                input: None,
+                                output: None,
+                                description: None,
+                            },
+                            agents: Vec::new(),
+                            settle_only: true,
+                        });
+                    }
                     return out;
                 };
                 let status = match terminal {
@@ -3398,7 +3456,11 @@ fn update_workflow_cards(
                     "session-pump: workflow progress card settled"
                 );
                 if let Some((card, agents)) = card.take_emission(now_ms, true) {
-                    out.push(WorkflowProgressData { card, agents });
+                    out.push(WorkflowProgressData {
+                        card,
+                        agents,
+                        settle_only: false,
+                    });
                 }
             }
         },
@@ -3437,7 +3499,11 @@ fn update_workflow_cards(
                 },
             );
             if let Some((card, agents)) = card.take_emission(now_ms, forced) {
-                out.push(WorkflowProgressData { card, agents });
+                out.push(WorkflowProgressData {
+                    card,
+                    agents,
+                    settle_only: false,
+                });
             }
         }
         SessionEvent::WorkflowPhase { task_id, index, title } => {
@@ -3446,7 +3512,11 @@ fn update_workflow_cards(
             };
             let forced = card.declare_phase(*index, title.clone());
             if let Some((card, agents)) = card.take_emission(now_ms, forced) {
-                out.push(WorkflowProgressData { card, agents });
+                out.push(WorkflowProgressData {
+                    card,
+                    agents,
+                    settle_only: false,
+                });
             }
         }
         _ => {}
@@ -3498,7 +3568,11 @@ fn settle_workflow_cards(
             let mut card = cards.remove(&k)?;
             card.settle(status);
             card.take_emission(now_ms, true)
-                .map(|(card, agents)| WorkflowProgressData { card, agents })
+                .map(|(card, agents)| WorkflowProgressData {
+                    card,
+                    agents,
+                    settle_only: false,
+                })
         })
         .collect()
 }
@@ -6812,6 +6886,104 @@ mod pump_tests {
         assert_eq!(texts, 2, "launch reply AND report both stream, got {seq:?}");
     }
 
+    /// The stream ending (idle-kill teardown, crash) must settle every open
+    /// card ON THE WAY OUT: the ledger dies with the pump, so this is the last
+    /// chance to stop the stored row spinning forever (live 2026-08-04: a
+    /// load-gate bash card spun for hours after the idle reaper removed the
+    /// task mid-flight).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_teardown_settles_open_cards() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_bg".into(),
+                name: "Bash".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"command": "until ...; do sleep 30; done"}),
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-bg".into(),
+                label: None,
+                status: SubagentStatus::Running,
+                parent_ref: Some("toolu_bg".into()),
+                kind: Some(SubagentTaskKind::Other),
+            }),
+            // No terminal, no TurnResult — the stream just ends (teardown).
+        ];
+        let frames = drain_script(script).await;
+        let settled = wf_frames(&frames)
+            .into_iter()
+            .rev()
+            .find(|p| p.card.status == ToolCallStatus::Canceled)
+            .unwrap_or_else(|| {
+                panic!(
+                    "teardown must settle the open card, got {:?}",
+                    frames.iter().map(frame_name).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(settled.card.call_id, "toolu_bg");
+    }
+
+    /// A terminal for a task this pump never opened (post-resume: the old pump —
+    /// and its ledger — died with an idle-kill) synthesizes a STATUS-ONLY settle
+    /// keyed to the launching call, marked `settle_only` so consumers update an
+    /// existing row and never insert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_terminal_synthesizes_a_settle_only_frame() {
+        use aionui_session::SubagentStatus;
+        let script = vec![
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-old".into(),
+                label: None,
+                status: SubagentStatus::Interrupted,
+                parent_ref: Some("toolu_old".into()),
+                kind: None, // task_notification carries no kind
+            }),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+        ];
+        let frames = drain_script(script).await;
+        let synth = wf_frames(&frames)
+            .into_iter()
+            .find(|p| p.settle_only)
+            .unwrap_or_else(|| {
+                panic!(
+                    "unknown terminal must synthesize a settle-only frame, got {:?}",
+                    frames.iter().map(frame_name).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(synth.card.call_id, "toolu_old", "keyed to the launching call");
+        assert_eq!(synth.card.status, ToolCallStatus::Canceled);
+        // Status-only on the wire: empty name / null args are skipped at
+        // serialization so merge-patch keeps the stored row's own fields.
+        let wire = serde_json::to_value(&synth.card).unwrap();
+        assert!(wire.get("name").is_none(), "empty name must not serialize: {wire}");
+        assert!(wire.get("args").is_none(), "null args must not serialize: {wire}");
+        assert!(synth.agents.is_empty());
+    }
+
+    /// An unknown terminal WITHOUT a parent link has nowhere to settle — silence,
+    /// not a junk frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_terminal_without_parent_stays_silent() {
+        use aionui_session::SubagentStatus;
+        let script = vec![env(SessionEvent::SubagentUpdate {
+            r#ref: "task-old".into(),
+            label: None,
+            status: SubagentStatus::Completed,
+            parent_ref: None,
+            kind: None,
+        })];
+        let frames = drain_script(script).await;
+        assert!(wf_frames(&frames).is_empty());
+    }
+
     /// A killed workflow emits NO result frame — only task frames. Its container
     /// card is NOT in `open_tools` (a Workflow's tool_result lands at launch), so
     /// the turn-end drain cannot close it. Without an explicit settle the card and
@@ -6979,8 +7151,16 @@ mod pump_tests {
             finish_count, 1,
             "the Interrupted drain settles the owed Finish exactly once, got {seq:?}"
         );
+        // "Last" among TURN frames: out-of-band WorkflowProgress settles (the
+        // teardown/unknown-terminal bookkeeping added later) legitimately trail
+        // the Finish — the relay is done with the turn and the out-of-turn
+        // watcher owns them.
+        let last_turn_frame = frames
+            .iter()
+            .filter(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
+            .next_back();
         assert!(
-            matches!(frames.last(), Some(AgentStreamEvent::Finish(_))),
+            matches!(last_turn_frame, Some(AgentStreamEvent::Finish(_))),
             "the settled Finish is the turn's terminal frame, got {seq:?}"
         );
         // The Task tool call left open by the kill is closed as Canceled BEFORE the
@@ -7048,7 +7228,11 @@ mod pump_tests {
         let frames = drain_script(script).await;
         let seq: Vec<&str> = frames.iter().map(frame_name).collect();
         assert!(
-            matches!(frames.last(), Some(AgentStreamEvent::Finish(_))),
+            frames
+                .iter()
+                .filter(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
+                .next_back()
+                .is_some_and(|f| matches!(f, AgentStreamEvent::Finish(_))),
             "the clean result's Finish must flow while a background bash is alive, got {seq:?}"
         );
         assert!(

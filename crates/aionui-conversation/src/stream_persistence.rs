@@ -504,6 +504,30 @@ impl StreamPersistenceAdapter {
         }
     }
 
+    /// Apply a STATUS-ONLY settle to an EXISTING tool_call row, if any.
+    ///
+    /// Returns whether the row existed. Never inserts: a `settle_only` frame is
+    /// the pump settling a card it has no memory of (post-resume), and the same
+    /// unknown-terminal shape also fires for workflow-internal refs that never
+    /// had a row — inserting for those would conjure junk cards.
+    #[tracing::instrument(skip_all)]
+    pub async fn settle_tool_call_if_present(
+        &self,
+        data: &aionui_ai_agent::protocol::events::tool_call::ToolCallEventData,
+    ) -> bool {
+        let existing = self
+            .repo
+            .get_message_by_msg_id(&self.user_id, &self.conversation_id, &data.call_id, "tool_call")
+            .await
+            .unwrap_or(None);
+        if existing.is_none() {
+            debug!(call_id = %data.call_id, "settle-only frame for a row that does not exist; dropped");
+            return false;
+        }
+        self.persist_tool_call(data).await;
+        true
+    }
+
     /// Persist a tool_group event (array of tool summaries).
     #[tracing::instrument(skip_all)]
     pub async fn persist_tool_group(&self, entries: &[aionui_ai_agent::protocol::events::tool_call::ToolGroupEntry]) {
