@@ -3946,7 +3946,32 @@ impl SessionBackend for CodexSessionBackend {
 
     fn events(&self) -> BoxStream<'static, SessionEnvelope> {
         let rx = self.event_tx.subscribe();
-        futures_util::stream::unfold(rx, |mut rx| async move {
+        // Replay the current thread binding to every NEW subscriber. codex
+        // answers `thread/start` with `thread/started` in single-digit ms
+        // (local bookkeeping, no LLM call), so on a fresh open the live
+        // BackendBound routinely lands BEFORE the orchestration layer's
+        // subscription and is lost — the conversation then never persists its
+        // resume anchor (and the fork API refuses with FORK_PARENT_UNBOUND).
+        // A synthetic BackendBound is idempotent downstream (same-value
+        // set_session_id + same-value DB write), so replaying to an already-
+        // caught-up subscriber is harmless. try_lock: the binding mutex is
+        // held only for point writes/reads; on contention we just skip the
+        // preface (the caller is racing the live event, which it will get).
+        let preface: Vec<SessionEnvelope> = self
+            .thread_binding
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .map(|tid| SessionEnvelope {
+                session_id: self.session_id.clone(),
+                turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                event: SessionEvent::BackendBound {
+                    backend_session_id: Some(tid),
+                },
+            })
+            .into_iter()
+            .collect();
+        let live = futures_util::stream::unfold(rx, |mut rx| async move {
             loop {
                 match rx.recv().await {
                     Ok(env) => return Some((env, rx)),
@@ -3954,8 +3979,8 @@ impl SessionBackend for CodexSessionBackend {
                     Err(broadcast::error::RecvError::Closed) => return None,
                 }
             }
-        })
-        .boxed()
+        });
+        futures_util::stream::iter(preface).chain(live).boxed()
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -8646,5 +8671,45 @@ mod tests {
         .ok()
         .flatten();
         assert_eq!(bound.as_deref(), Some("turn-7"), "turn/started lowers codex's turn id");
+    }
+
+    /// Late-subscriber self-heal: `thread/started` can land BEFORE the
+    /// orchestration layer subscribes (codex answers thread/start in
+    /// single-digit ms), which used to lose BackendBound forever — the
+    /// conversation never persisted its resume anchor and the fork API
+    /// refused with FORK_PARENT_UNBOUND. `events()` must replay the current
+    /// binding as a synthetic BackendBound to every new subscriber.
+    #[tokio::test]
+    async fn events_replays_binding_to_late_subscribers() {
+        use futures_util::StreamExt as _;
+        let prefix = format!(
+            "{}\n",
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-late-bind"}}}"#
+        )
+        .into_bytes();
+        let fake = FakeAgentIo::never_exits(prefix);
+        let backend = CodexSessionBackend::build_with_io("codex-late-sub", Box::new(fake)).await;
+        // Let the reader consume thread/started BEFORE anyone subscribes —
+        // the live BackendBound broadcast goes to zero receivers.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(
+            backend.thread_binding.lock().await.as_deref(),
+            Some("th-late-bind"),
+            "precondition: the reader already bound the thread"
+        );
+
+        let mut events = backend.events();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+            .await
+            .expect("the synthetic preface arrives immediately")
+            .expect("stream open");
+        assert!(
+            matches!(
+                first.event,
+                SessionEvent::BackendBound { backend_session_id: Some(ref tid) } if tid == "th-late-bind"
+            ),
+            "a late subscriber's first event is the replayed binding, got {:?}",
+            first.event
+        );
     }
 }
