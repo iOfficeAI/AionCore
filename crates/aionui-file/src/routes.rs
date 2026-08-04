@@ -362,7 +362,7 @@ fn chat_file_resolve_error(err: aionui_project::ProjectError) -> ApiError {
 ///
 /// The client addressed this by identity and has no absolute path of its own; the
 /// one resolved here is server-side knowledge. Both failure sources are therefore
-/// narrowed on purpose: [`open_system_resolve_error`] discards the resolver's
+/// narrowed on purpose: [`chat_file_resolve_error`] discards the resolver's
 /// path-bearing context, and the opener adapter logs its cause instead of
 /// returning it ([`FileError::TargetNotFound`] has no payload to fill). The
 /// earlier reveal implementation threaded a shell error's path through
