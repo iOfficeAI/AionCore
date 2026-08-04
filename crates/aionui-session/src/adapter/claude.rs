@@ -2505,25 +2505,31 @@ mod tests {
                 }
             }
         });
-        let events = ClaudeAdapter::parse_control_request(&frame);
+        // 2026-08-04 spec: AskUserQuestion is its OWN Ask event now — asking is
+        // not authorizing. The adapter must route it away from Permission, carry
+        // the bare questions[] array, and remember the request_id so a later
+        // control_cancel_request resolves the QUESTION counter.
+        let mut adapter = ClaudeAdapter::new();
+        let events = adapter.parse_control_request(&frame);
         match events.as_slice() {
-            [
-                SessionEvent::Permission {
-                    request_id,
-                    tool_name,
-                    input,
-                    ..
-                },
-            ] => {
+            [SessionEvent::Ask { request_id, questions }] => {
                 assert_eq!(request_id, "req-q1");
-                assert_eq!(tool_name.as_deref(), Some("AskUserQuestion"));
-                let questions = input.as_ref().expect("AskUserQuestion carries input");
                 assert_eq!(
-                    questions["questions"][0]["question"], "Pick a color",
+                    questions[0]["question"], "Pick a color",
                     "the question text is projected, not dropped"
                 );
+                assert_eq!(
+                    questions[0]["multiSelect"], false,
+                    "multiSelect survives verbatim (the ws relay snake_cases later)"
+                );
             }
-            other => panic!("expected one Permission, got {other:?}"),
+            other => panic!("expected one Ask, got {other:?}"),
+        }
+        // The retract path must resolve the question counter, not the approval one.
+        let cancel = serde_json::json!({ "type": "control_cancel_request", "request_id": "req-q1" });
+        match adapter.parse_control_cancel_request(&cancel).as_slice() {
+            [SessionEvent::AskResolved { request_id }] => assert_eq!(request_id, "req-q1"),
+            other => panic!("expected AskResolved for a retracted ask, got {other:?}"),
         }
     }
 
@@ -2544,7 +2550,7 @@ mod tests {
                 "input": { "command": "rm -rf /" }
             }
         });
-        let events = ClaudeAdapter::parse_control_request(&frame);
+        let events = ClaudeAdapter::new().parse_control_request(&frame);
         match events.as_slice() {
             [SessionEvent::Permission { tool_name, input, .. }] => {
                 assert_eq!(tool_name.as_deref(), Some("Bash"));
@@ -2663,7 +2669,7 @@ mod tests {
     fn parse_control_cancel_request_resolves_permission_or_degrades() {
         // Valid retraction → PermissionResolved.
         let frame = serde_json::json!({ "type": "control_cancel_request", "request_id": "req-9" });
-        match ClaudeAdapter::parse_control_cancel_request(&frame).as_slice() {
+        match ClaudeAdapter::new().parse_control_cancel_request(&frame).as_slice() {
             [SessionEvent::PermissionResolved { request_id, kind }] => {
                 assert_eq!(request_id, "req-9");
                 assert_eq!(
@@ -2681,7 +2687,7 @@ mod tests {
             serde_json::json!({ "type": "control_cancel_request" }),
             serde_json::json!({ "type": "control_cancel_request", "request_id": "" }),
         ] {
-            match ClaudeAdapter::parse_control_cancel_request(&frame).as_slice() {
+            match ClaudeAdapter::new().parse_control_cancel_request(&frame).as_slice() {
                 [SessionEvent::AdapterSpecific { tag, .. }] => {
                     assert_eq!(tag, "control_cancel_request", "unidentifiable cancel stays opaque");
                 }

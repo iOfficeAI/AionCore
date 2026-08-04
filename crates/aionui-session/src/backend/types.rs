@@ -176,7 +176,9 @@ pub struct PendingPermissionView {
     /// The tool the permission gates (used as the recovered card's title). May be
     /// empty if the backend did not name it.
     pub tool_name: String,
-    /// AskUserQuestion recovery: the question payload (`{questions:[…]}`) when
+    /// AskUserQuestion recovery: the BARE `questions[]` array (NOT the
+    /// `{questions:[…]}` wrapper — claude_conn stores `input.get("questions")`;
+    /// consumers re-wrap if they need the tool-input shape) when
     /// `tool_name == "AskUserQuestion"`, else `None`. Lets the REST `/confirmations`
     /// recovery path rebuild a question card symmetric to the live `ConfirmationAdded`
     /// frame (rather than degrading to an Allow/Deny permission card). Only
