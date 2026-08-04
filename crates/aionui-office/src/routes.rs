@@ -288,10 +288,18 @@ fn file_error_to_api_error(error: FileError) -> ApiError {
             errno.map(|n| serde_json::json!({ "errno": n })),
         ),
         // Not reachable from office path-validation; the mapping must be total.
-        FileError::RevealFailed(message) => ApiError::coded(
+        // Mirrors the file crate: the cause is logged at its origin, not forwarded.
+        FileError::RevealFailed(_) => ApiError::coded(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "REVEAL_FAILED",
-            message,
+            "Could not open the system file manager.",
+            None::<serde_json::Value>,
+        ),
+        // Not reachable from office path-validation; the mapping must be total.
+        FileError::TargetNotFound => ApiError::coded(
+            axum::http::StatusCode::NOT_FOUND,
+            "FILE_NOT_FOUND",
+            "The requested file no longer exists.",
             None::<serde_json::Value>,
         ),
     }

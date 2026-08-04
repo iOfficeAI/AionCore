@@ -165,6 +165,23 @@ pub struct RevealItemRequest {
     pub relative_path: String,
 }
 
+/// Request body for `POST /api/fs/open-system` — open a `ChatFileRef`-addressed
+/// file with the OS default application ("open in system editor"). Preview offers
+/// this as the escape hatch for files it will not render itself (oversized or
+/// unsupported formats).
+///
+/// Uses `ChatFileRef` rather than `{pe_id, relative_path}` so all three preview
+/// sources are covered — project files, uploads, and host-picked local files —
+/// whereas [`RevealItemRequest`] serves the project-only Explorer tree.
+///
+/// The response carries no body: the backend resolves the identity to an absolute
+/// path, opens it locally, and never returns that path (see INV-OPEN on the
+/// handler).
+#[derive(Debug, Deserialize)]
+pub struct OpenSystemFileRequest {
+    pub file: ChatFileRef,
+}
+
 /// Request body for `POST /api/fs/image-base64` — get image as base64.
 #[derive(Debug, Deserialize)]
 pub struct GetImageBase64Request {

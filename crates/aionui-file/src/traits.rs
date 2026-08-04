@@ -258,3 +258,24 @@ pub trait IItemRevealer: Send + Sync {
 
 /// Convenience alias for an Arc-wrapped item revealer.
 pub type ItemRevealerRef = Arc<dyn IItemRevealer>;
+
+/// Open an absolute filesystem path with the OS default application (the
+/// "open in system editor" escape hatch preview offers for files it cannot
+/// render itself — oversized or unsupported formats). Sibling port to
+/// [`IItemRevealer`], which reveals the enclosing folder instead of opening the
+/// file; the composition layer supplies an adapter over the shell service so
+/// this crate needs no shell dependency.
+#[async_trait::async_trait]
+pub trait ISystemFileOpener: Send + Sync {
+    /// Open `absolute_path` with the OS default application. The path is the
+    /// resolved, contained absolute path from `resolve_chat_file_ref` — never
+    /// client input.
+    ///
+    /// **INV-OPEN**: implementations must not put the path (nor any string
+    /// derived from it) into the returned error. See the `/api/fs/open-system`
+    /// handler for the full invariant.
+    async fn open(&self, absolute_path: &str) -> Result<(), FileError>;
+}
+
+/// Convenience alias for an Arc-wrapped system file opener.
+pub type SystemFileOpenerRef = Arc<dyn ISystemFileOpener>;

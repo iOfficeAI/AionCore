@@ -476,18 +476,23 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
     // watch service, never a bootstrap abort. See ELECTRON-2PM.
     let watch_service = Arc::new(FileWatchService::new(broadcaster));
     let snapshot_service = Arc::new(SnapshotService::new());
-    // Reveal-in-file-manager for `/api/fs/reveal`: an adapter over the shell
-    // service, injected as the file crate's revealer port (keeps aionui-file
-    // free of a shell dependency).
-    let revealer: aionui_file::ItemRevealerRef = Arc::new(super::item_revealer::ShellItemRevealer::new(Arc::new(
-        aionui_shell::ShellService::new(Arc::new(aionui_shell::DefaultSystemOpener)),
+    // Shell-backed capabilities for `/api/fs/reveal` (open enclosing folder) and
+    // `/api/fs/open-system` (open with the default application): adapters over one
+    // shared shell service, injected as the file crate's ports so aionui-file stays
+    // free of a shell dependency.
+    let shell = Arc::new(aionui_shell::ShellService::new(Arc::new(
+        aionui_shell::DefaultSystemOpener,
     )));
+    let revealer: aionui_file::ItemRevealerRef = Arc::new(super::item_revealer::ShellItemRevealer::new(shell.clone()));
+    let system_opener: aionui_file::SystemFileOpenerRef =
+        Arc::new(super::system_file_opener::ShellSystemFileOpener::new(shell));
     Ok(FileRouterState {
         file_service,
         watch_service,
         snapshot_service,
         project: Arc::new(services.project_service.clone()),
         revealer,
+        system_opener,
         allowed_roots,
     })
 }

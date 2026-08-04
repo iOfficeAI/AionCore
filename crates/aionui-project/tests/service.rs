@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use aionui_api_types::ChatFileRef;
 use aionui_db::{Database, IProjectStore, SqliteProjectStore, init_database_memory};
 use aionui_project::ProjectService;
 use aionui_project::canonical::{canonicalize, to_file_uri};
@@ -510,4 +511,140 @@ async fn cross_user_remove_and_rename_entry_are_not_found() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), "project_explorer_not_found");
+}
+
+// ── resolve_chat_file_ref: the Project variant ─────────────────────────
+//
+// This is the arm that `/api/fs/open-system` (and the content endpoints) depend on
+// when the frontend has only explorer identity — the Explorer payload deliberately
+// carries no absolute path, so `{pe_id, relative_path}` is all the client holds.
+// The variant had no coverage before, which left "does an identity-only ref
+// actually resolve to something openable?" resting on inspection rather than a test.
+
+#[tokio::test]
+async fn resolve_chat_file_ref_project_variant_yields_the_absolute_path() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::create_dir(ws.path().join("docs")).unwrap();
+    let target = ws.path().join("docs/report.xlsx");
+    std::fs::write(&target, b"x").unwrap();
+
+    let (svc, _db) = service().await;
+    let created = svc
+        .create_standard("system_default_user", uri_of(ws.path()))
+        .await
+        .unwrap();
+
+    let abs = svc
+        .resolve_chat_file_ref(
+            "system_default_user",
+            &ChatFileRef::Project {
+                pe_id: created.project_explorer.pe_id.clone(),
+                relative_path: "docs/report.xlsx".to_owned(),
+            },
+            &std::env::temp_dir(),
+            FileOp::Read,
+        )
+        .await
+        .expect("an identity-only ref must resolve");
+
+    // Compare canonicalized: the tempdir may itself sit behind a symlink (on macOS
+    // /var → /private/var), so a raw string compare would fail for the wrong reason.
+    assert_eq!(
+        std::fs::canonicalize(&abs).unwrap(),
+        std::fs::canonicalize(&target).unwrap(),
+        "resolved path must point at the real file"
+    );
+    assert!(std::path::Path::new(&abs).is_absolute(), "must be absolute: {abs}");
+}
+
+#[tokio::test]
+async fn resolve_chat_file_ref_project_variant_works_for_attached_folders() {
+    // Explorer shows workspace and attached roots alike, so opening a file from an
+    // attached folder must resolve the same way.
+    let ws = tempfile::tempdir().unwrap();
+    let att = tempfile::tempdir().unwrap();
+    let target = att.path().join("sheet.xlsx");
+    std::fs::write(&target, b"x").unwrap();
+
+    let (svc, _db) = service().await;
+    let created = svc
+        .create_standard("system_default_user", uri_of(ws.path()))
+        .await
+        .unwrap();
+    let entry = svc
+        .attach_folder(
+            "system_default_user",
+            AttachInput {
+                project_id: created.project.project_id.clone(),
+                uri: uri_of(att.path()),
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let abs = svc
+        .resolve_chat_file_ref(
+            "system_default_user",
+            &ChatFileRef::Project {
+                pe_id: entry.pe_id.clone(),
+                relative_path: "sheet.xlsx".to_owned(),
+            },
+            &std::env::temp_dir(),
+            FileOp::Read,
+        )
+        .await
+        .expect("attached-folder ref must resolve");
+
+    assert_eq!(
+        std::fs::canonicalize(&abs).unwrap(),
+        std::fs::canonicalize(&target).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn resolve_chat_file_ref_project_variant_rejects_missing_and_escaping_paths() {
+    let ws = tempfile::tempdir().unwrap();
+    let (svc, _db) = service().await;
+    let created = svc
+        .create_standard("system_default_user", uri_of(ws.path()))
+        .await
+        .unwrap();
+    let pe_id = created.project_explorer.pe_id.clone();
+
+    // Gone from disk → chat_file_missing, not a path that would then be handed to
+    // the system opener.
+    let err = svc
+        .resolve_chat_file_ref(
+            "system_default_user",
+            &ChatFileRef::Project {
+                pe_id: pe_id.clone(),
+                relative_path: "nope.xlsx".to_owned(),
+            },
+            &std::env::temp_dir(),
+            FileOp::Read,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "chat_file_missing");
+
+    // Traversal must not escape the folder root — otherwise identity addressing
+    // would become a way to open arbitrary files on the backend host.
+    let err = svc
+        .resolve_chat_file_ref(
+            "system_default_user",
+            &ChatFileRef::Project {
+                pe_id,
+                relative_path: "../../etc/passwd".to_owned(),
+            },
+            &std::env::temp_dir(),
+            FileOp::Read,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err.code(), "invalid_relative_path" | "resource_outside_folder"),
+        "traversal must be rejected, got {}",
+        err.code()
+    );
 }
