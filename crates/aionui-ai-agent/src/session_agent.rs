@@ -3317,6 +3317,19 @@ async fn persist_context_usage(
 /// that fails to parse or is empty yields `None` too — falling through to the
 /// legacy single-label path is safer than sending claude an empty answer set.
 fn ask_answer_command(call_id: &str, data: &serde_json::Value) -> Option<aionui_session::Command> {
+    // The frontend confirm bridge sends `data` as a STRING (ipcBridge:
+    // `data: p.confirm_key`), so the question card's JSON payload arrives
+    // stringified. Parse it back to an object first; a non-JSON string (the
+    // legacy option-id confirms: "allow", a label, …) simply fails the parse
+    // and falls through to the legacy path via `None` below.
+    let parsed;
+    let data = match data {
+        serde_json::Value::String(s) => {
+            parsed = serde_json::from_str::<serde_json::Value>(s).ok()?;
+            &parsed
+        }
+        other => other,
+    };
     if data.get("ask_decline").and_then(serde_json::Value::as_bool) == Some(true) {
         return Some(aionui_session::Command::AnswerAsk {
             request_id: call_id.to_string(),
