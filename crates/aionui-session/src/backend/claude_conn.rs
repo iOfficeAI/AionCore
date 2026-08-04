@@ -325,7 +325,8 @@ impl BackendConnection for ClaudeConnection {
             env: config.spawn_env.clone(),
             cli_program: config.cli_program.clone(),
         };
-        let backend = ClaudeSessionBackend::spawn(logical_id, adapter, io, config, wake).await;
+        let fresh = matches!(&spec, SessionSpec::Fresh { .. });
+        let backend = ClaudeSessionBackend::spawn(logical_id, adapter, io, config, wake, fresh).await;
         // #98/#101: ask claude for its discovery catalog (selectable models + slash
         // commands) up-front via `control_request{initialize}`. The response flows
         // back through the reader → `discovered_caps` → `capabilities()`. Best-effort:
@@ -448,6 +449,88 @@ pub struct ClaudeSessionBackend {
     /// `std::sync::Mutex` (NOT tokio) so the sync reader `process_batch` closure can
     /// lock it without awaiting — mirrors `current_mode_override`.
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// One-shot first-turn title generation (spec 2026-08-04). Shared with the
+    /// reader via `reader_state`; `dispatch(Send)` records the first prompt text.
+    title_gen: Arc<TitleGenState>,
+}
+
+/// One-shot first-turn session-title generation state (spec 2026-08-04).
+///
+/// `pending` latches true only for a `SessionSpec::Fresh` open (a brand-new
+/// conversation; a Resume — even one that rebinds a fresh claude session after
+/// a lost backend — belongs to an existing conversation and never fires). The
+/// reader swaps it false on the first successful `TurnResult` and fires a
+/// `control_request{generate_session_title, persist:true}` over the shared
+/// stdin; `sniff_session_title` turns the success control_response into
+/// `SessionEvent::SessionTitle`. Fire-and-forget: any failure is logged and
+/// dropped — title generation must never affect the turn path.
+struct TitleGenState {
+    pending: std::sync::atomic::AtomicBool,
+    /// First user prompt text of the first turn — the generation `description`.
+    /// Prompt content: never logged (see AGENTS.md logging rules).
+    description: std::sync::Mutex<Option<String>>,
+    /// The backend's shared stdin slot (same Arc as `ClaudeSessionBackend.stdin`).
+    stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
+    adapter: Arc<ClaudeAdapter>,
+    /// Shared `ctl-N` counter (same Arc as `ClaudeSessionBackend.control_seq`).
+    control_seq: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl TitleGenState {
+    /// Fire the one-shot `generate_session_title` control_request on a detached
+    /// task (the reader loop must not block on the stdin lock). The reply is
+    /// observed by `sniff_session_title`, not awaited here.
+    ///
+    /// `result_text` is the first successful turn's assistant text
+    /// (`TurnResult.result_text`), appended to the recorded first prompt.
+    /// Live-verified (claude 2.1.221, 2026-08-04): a bare short question as
+    /// the description makes the CLI's structured title generation reliably
+    /// return `{title:null}` ("什么是git ？" → null), while prompt+answer
+    /// titles reliably ("User:…/Assistant:…" → "Git 版本控制系统介绍").
+    fn fire(self: &Arc<Self>, session_id: &str, result_text: &str) {
+        use std::sync::atomic::Ordering;
+        let this = self.clone();
+        let session_id = session_id.to_string();
+        let assistant_part: String = result_text.chars().take(1000).collect();
+        tokio::spawn(async move {
+            let user_part = this
+                .description
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .unwrap_or_default();
+            let mut description = String::new();
+            if !user_part.is_empty() {
+                description.push_str("User: ");
+                description.push_str(&user_part);
+            }
+            if !assistant_part.is_empty() {
+                if !description.is_empty() {
+                    description.push_str("\n\n");
+                }
+                description.push_str("Assistant: ");
+                description.push_str(&assistant_part);
+            }
+            let request_id = format!("{TITLE_PREFIX}{}", this.control_seq.fetch_add(1, Ordering::SeqCst) + 1);
+            let frame = serde_json::json!({
+                "type": "control_request",
+                "request_id": request_id,
+                "request": {
+                    "subtype": "generate_session_title",
+                    "description": description,
+                    "persist": true,
+                },
+            });
+            let mut guard = this.stdin.lock().await;
+            let Some(stdin) = guard.as_mut() else {
+                tracing::debug!(session_id, "generate_session_title not sent: stdin unavailable");
+                return;
+            };
+            if let Err(e) = this.adapter.write_control_response(stdin, &frame).await {
+                tracing::warn!(session_id, error = %e, "generate_session_title control_request write failed");
+            }
+        });
+    }
 }
 
 /// One outstanding claude `can_use_tool` request, stored so `AnswerPermission` can
@@ -546,6 +629,8 @@ struct ClaudeReaderState {
     /// respawns so a new process's restarted `total_cost_usd` counter is reported
     /// as `base + raw`, never raw alone.
     cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
+    /// One-shot first-turn title generation (shared Arc with the backend).
+    title_gen: Arc<TitleGenState>,
 }
 
 /// Spawn a claude stdout reader over `stdout`/`io` using the shared state. Used
@@ -588,6 +673,7 @@ fn start_claude_reader(
             state.current_mode_override,
             state.pending_set_config,
             state.cost_ledger,
+            state.title_gen,
         )
         .await;
     })
@@ -604,6 +690,7 @@ impl ClaudeSessionBackend {
         io: Box<dyn AgentIo>,
         config: SessionConfig,
         wake: ClaudeWakeRecipe,
+        fresh: bool,
     ) -> Self {
         let capabilities = {
             let mut caps = adapter.capabilities();
@@ -634,6 +721,17 @@ impl ClaudeSessionBackend {
             Some((stdin, stdout)) => (Some(stdin), Some(stdout)),
             None => (None, None),
         };
+        let stdin = Arc::new(Mutex::new(stdin));
+        let control_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Spec 2026-08-04: only a Fresh open (brand-new conversation) arms the
+        // one-shot first-turn title generation.
+        let title_gen = Arc::new(TitleGenState {
+            pending: std::sync::atomic::AtomicBool::new(fresh),
+            description: std::sync::Mutex::new(None),
+            stdin: stdin.clone(),
+            adapter: adapter.clone(),
+            control_seq: control_seq.clone(),
+        });
 
         // Seed the cost ledger with the conversation's persisted cumulative cost
         // (a resumed conversation on a FRESH backend instance — app restart /
@@ -665,6 +763,7 @@ impl ClaudeSessionBackend {
             current_mode_override: current_mode_override.clone(),
             pending_set_config: pending_set_config.clone(),
             cost_ledger,
+            title_gen: title_gen.clone(),
         };
         let reader = start_claude_reader(&reader_state, stdout, io.clone());
 
@@ -703,7 +802,7 @@ impl ClaudeSessionBackend {
         Self {
             session_id,
             capabilities,
-            stdin: Arc::new(Mutex::new(stdin)),
+            stdin,
             adapter,
             turn_gen,
             event_tx,
@@ -716,10 +815,11 @@ impl ClaudeSessionBackend {
             discovered_model,
             discovered_caps,
             pending_controls: Arc::new(Mutex::new(Vec::new())),
-            control_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            control_seq,
             current_effort: Arc::new(std::sync::Mutex::new(None)),
             current_mode_override,
             pending_set_config,
+            title_gen,
         }
     }
 
@@ -1149,6 +1249,7 @@ async fn reader_task(
     current_mode_override: Arc<std::sync::Mutex<Option<String>>>,
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
+    title_gen: Arc<TitleGenState>,
 ) {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
@@ -1267,6 +1368,9 @@ async fn reader_task(
                 // Sniff it → SessionEvent::SessionInfo (the cumulative context-budget /
                 // cost snapshot the user asked for). Done on the RAW frame.
                 sniff_session_info(v, &event_tx, &session_id, cur_gen);
+                // First-turn title generation reply (keyed ctl-title-N) →
+                // SessionEvent::SessionTitle. Done on the RAW frame.
+                sniff_session_title(v, &event_tx, &session_id, cur_gen);
                 // Subagent roster: claude emits system/task_* frames for
                 // Task/Workflow subagents (§6b b1). Translate them to
                 // SubagentUpdate so the reducer upserts Running.subagents —
@@ -1308,6 +1412,21 @@ async fn reader_task(
                 // so the flag is already false when subscribers react.
                 if matches!(ev, SessionEvent::TurnResult { .. }) {
                     turn_in_flight.store(false, Ordering::SeqCst);
+                    // Spec 2026-08-04: first SUCCESSFUL turn of a Fresh session
+                    // fires the one-shot generate_session_title (an error turn
+                    // keeps the latch armed for the next successful one). The
+                    // turn's assistant text is passed along — prompt+answer as
+                    // the description keeps the CLI's title generation from
+                    // returning null on short prompts (see TitleGenState::fire).
+                    if let SessionEvent::TurnResult {
+                        is_error: false,
+                        result_text,
+                        ..
+                    } = &ev
+                        && title_gen.pending.swap(false, Ordering::SeqCst)
+                    {
+                        title_gen.fire(&session_id, result_text);
+                    }
                 }
                 // Bug-A: a TurnResult is stamped with the OPEN turn's locked epoch
                 // (set at this turn's system/init), NOT the read-time turn_gen — so a
@@ -1983,6 +2102,9 @@ fn sniff_set_config_reject(
 /// different, so we disambiguate on the id we minted).
 const QSI_USAGE_PREFIX: &str = "ctl-qsi-usage-";
 const QSI_COST_PREFIX: &str = "ctl-qsi-cost-";
+/// Request-id prefix of the one-shot `generate_session_title` control_request
+/// (spec 2026-08-04); `sniff_session_title` routes the reply by it.
+const TITLE_PREFIX: &str = "ctl-title-";
 
 /// The synthetic reasoning-effort level that mirrors the claude CLI's own interactive
 /// effort-picker entry `"ultracode (xhigh + dynamic workflow orchestration; this session
@@ -2113,6 +2235,49 @@ fn sniff_session_info(
         session_id: session_id.to_string(),
         turn_gen,
         event,
+    });
+}
+
+/// Sniff the control_response for our one-shot `generate_session_title` request
+/// (keyed by the `ctl-title-N` request_id we minted, spec 2026-08-04) →
+/// `SessionEvent::SessionTitle`. A success reply with an empty/missing title,
+/// or an error reply, is warn-logged and dropped — title generation is
+/// best-effort and never affects the turn. No-op for any other frame.
+fn sniff_session_title(
+    frame: &serde_json::Value,
+    event_tx: &broadcast::Sender<SessionEnvelope>,
+    session_id: &str,
+    turn_gen: u64,
+) {
+    use serde_json::Value;
+    if frame.get("type").and_then(Value::as_str) != Some("control_response") {
+        return;
+    }
+    let response = frame.get("response").unwrap_or(&Value::Null);
+    let request_id = response.get("request_id").and_then(Value::as_str).unwrap_or("");
+    if !request_id.starts_with(TITLE_PREFIX) {
+        return;
+    }
+    if response.get("subtype").and_then(Value::as_str) != Some("success") {
+        tracing::warn!(session_id, "generate_session_title rejected by claude");
+        return;
+    }
+    let title = response
+        .get("response")
+        .and_then(|r| r.get("title"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if title.is_empty() {
+        tracing::warn!(session_id, "generate_session_title returned no title");
+        return;
+    }
+    let _ = event_tx.send(SessionEnvelope {
+        session_id: session_id.to_string(),
+        turn_gen,
+        event: SessionEvent::SessionTitle {
+            title: title.to_string(),
+        },
     });
 }
 
@@ -2299,6 +2464,26 @@ impl SessionBackend for ClaudeSessionBackend {
                     return Err(BackendError::CommandNotSupported {
                         command: crate::capability::block_kind_name(bad),
                     });
+                }
+                // Spec 2026-08-04: while the first-turn title latch is armed,
+                // record the first prompt's text as the generation description
+                // (bounded; prompt content is never logged).
+                if self.title_gen.pending.load(Ordering::SeqCst) {
+                    let mut description = self.title_gen.description.lock().unwrap_or_else(|e| e.into_inner());
+                    if description.is_none() {
+                        let text = content
+                            .iter()
+                            .filter_map(|b| match b {
+                                super::types::ContentBlock::Text(t) => Some(t.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let bounded: String = text.chars().take(1000).collect();
+                        if !bounded.is_empty() {
+                            *description = Some(bounded);
+                        }
+                    }
                 }
                 // F-4: ensure the process is awake before any wire write. When
                 // idle_ttl=None (default) the slot is always Active → this is a
@@ -2726,7 +2911,40 @@ impl ClaudeSessionBackend {
             env: Vec::new(),
             cli_program: None,
         };
-        Self::spawn(session_id, ClaudeAdapter::new(), io, SessionConfig::default(), wake).await
+        Self::spawn(
+            session_id,
+            ClaudeAdapter::new(),
+            io,
+            SessionConfig::default(),
+            wake,
+            false,
+        )
+        .await
+    }
+
+    /// Test-support seam: like [`build_with_io`] but with the Fresh-open one-shot
+    /// title-generation latch ARMED (`fresh: true`), for tests of the
+    /// generate_session_title fire path.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn build_with_io_fresh(session_id: impl Into<String>, io: Box<dyn AgentIo>) -> Self {
+        let session_id = session_id.into();
+        let wake = ClaudeWakeRecipe {
+            spawner: Arc::new(crate::testing::FakeSpawner::new()),
+            claude_session_id: session_id.clone(),
+            cwd: None,
+            extra_args: Vec::new(),
+            env: Vec::new(),
+            cli_program: None,
+        };
+        Self::spawn(
+            session_id,
+            ClaudeAdapter::new(),
+            io,
+            SessionConfig::default(),
+            wake,
+            true,
+        )
+        .await
     }
 
     /// Test-support seam: `build_with_io` with a caller-supplied `SessionConfig`
@@ -2746,7 +2964,7 @@ impl ClaudeSessionBackend {
             env: Vec::new(),
             cli_program: None,
         };
-        Self::spawn(session_id, ClaudeAdapter::new(), io, config, wake).await
+        Self::spawn(session_id, ClaudeAdapter::new(), io, config, wake, false).await
     }
 
     /// Test-support seam: build a SUSPENDABLE backend over an injected `AgentIo`,
@@ -2777,7 +2995,7 @@ impl ClaudeSessionBackend {
             idle_ttl_ms: Some(idle_ttl_ms),
             ..Default::default()
         };
-        Self::spawn(session_id, ClaudeAdapter::new(), io, config, wake).await
+        Self::spawn(session_id, ClaudeAdapter::new(), io, config, wake, false).await
     }
 }
 
@@ -5619,6 +5837,120 @@ mod tests {
             !saw_config_changed,
             "a bare set_model success ack must NOT trigger a reader-side ConfigChanged \
              (set_model is Optimistic — only dispatch emits it; the reader has no wire to reconcile)"
+        );
+    }
+
+    #[tokio::test]
+    async fn sniff_session_title_success_maps_to_session_title_event() {
+        // Spec 2026-08-04: the generate_session_title success reply (keyed by
+        // ctl-title-N, shape from the CLI's embedded SDK contract
+        // `{response:{title}}`) → SessionEvent::SessionTitle.
+        let frame = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{TITLE_PREFIX}1","response":{{"title":"Fix login bug"}}}}}}"#
+        );
+        let bytes = format!("{frame}\n").into_bytes();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(bytes))).await;
+        let mut events = backend.events();
+
+        let mut got: Option<String> = None;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::SessionTitle { title } = env.event {
+                    got = Some(title);
+                    return;
+                }
+            }
+        })
+        .await;
+        assert_eq!(got.as_deref(), Some("Fix login bug"));
+    }
+
+    #[tokio::test]
+    async fn sniff_session_title_error_and_empty_title_emit_nothing() {
+        // An error reply or a success with an empty title must be dropped
+        // (warn-logged), never surfaced as a SessionTitle event.
+        let frames = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"error","request_id":"{TITLE_PREFIX}1","error":"nope"}}}}
+{{"type":"control_response","response":{{"subtype":"success","request_id":"{TITLE_PREFIX}2","response":{{"title":"   "}}}}}}
+"#
+        );
+        let backend =
+            ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(frames.into_bytes()))).await;
+        let mut events = backend.events();
+
+        let mut saw_title = false;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            while let Some(env) = events.next().await {
+                if matches!(env.event, SessionEvent::SessionTitle { .. }) {
+                    saw_title = true;
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(!saw_title, "error/empty title replies must not emit SessionTitle");
+    }
+
+    #[tokio::test]
+    async fn fresh_backend_fires_generate_session_title_once_after_first_success() {
+        // A Fresh-open backend fires exactly ONE generate_session_title after
+        // the first successful result; a second success must not re-fire.
+        let frames = "\
+{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"hi\"}\n\
+{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"again\"}\n";
+        let fake = FakeAgentIo::never_exits(frames.as_bytes().to_vec());
+        let captured = fake.captured_stdin();
+        let _backend = ClaudeSessionBackend::build_with_io_fresh("s-fresh", Box::new(fake)).await;
+
+        // Give the reader + detached fire task time to run.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        assert_eq!(
+            written.matches("generate_session_title").count(),
+            1,
+            "exactly one title generation request, got wire: {written:?}"
+        );
+        assert!(written.contains("\"persist\":true"), "wire: {written:?}");
+        assert!(written.contains(TITLE_PREFIX), "wire: {written:?}");
+        // The description carries the first turn's assistant text (live-verified:
+        // a bare short prompt makes the CLI's title generation return null).
+        assert!(written.contains("Assistant: hi"), "wire: {written:?}");
+    }
+
+    #[tokio::test]
+    async fn resumed_backend_never_fires_generate_session_title() {
+        // A Resume-open backend (build_with_io arms nothing) must not fire even
+        // on a successful result — the conversation already has a name.
+        let frames = "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"hi\"}\n";
+        let fake = FakeAgentIo::never_exits(frames.as_bytes().to_vec());
+        let captured = fake.captured_stdin();
+        let _backend = ClaudeSessionBackend::build_with_io("s-resume", Box::new(fake)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        assert!(
+            !written.contains("generate_session_title"),
+            "resume must not fire title generation, got wire: {written:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_result_keeps_title_latch_for_next_success() {
+        // An error first turn must NOT consume the latch; the next successful
+        // result fires the (single) title generation.
+        let frames = "\
+{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"boom\"}\n\
+{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}\n";
+        let fake = FakeAgentIo::never_exits(frames.as_bytes().to_vec());
+        let captured = fake.captured_stdin();
+        let _backend = ClaudeSessionBackend::build_with_io_fresh("s-retry", Box::new(fake)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        assert_eq!(
+            written.matches("generate_session_title").count(),
+            1,
+            "the latch survives an error turn and fires on the next success, wire: {written:?}"
         );
     }
 

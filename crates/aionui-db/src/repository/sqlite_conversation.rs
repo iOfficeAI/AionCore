@@ -378,6 +378,10 @@ impl IConversationRepository for SqliteConversationRepository {
             set_parts.push("folder_id = ?".to_string());
             binds.push(BindValue::Str(folder_id.clone()));
         }
+        if let Some(ref name_source) = updates.name_source {
+            set_parts.push("name_source = ?".to_string());
+            binds.push(BindValue::Str(name_source.clone()));
+        }
 
         if set_parts.is_empty() {
             return Ok(());
@@ -1351,6 +1355,7 @@ mod tests {
             updated_at: now,
             project_id: None,
             folder_id: None,
+            name_source: None,
         }
     }
 
@@ -1460,6 +1465,46 @@ mod tests {
         let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
         assert_eq!(found.name, "Updated Name");
         assert!(found.updated_at >= conv.updated_at);
+    }
+
+    #[tokio::test]
+    async fn conversation_name_source_defaults_null_and_round_trips() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+
+        // Create never sets the column: a fresh row reads back NULL.
+        let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
+        assert_eq!(found.name_source, None);
+
+        // Renaming with an origin persists it alongside the name.
+        repo.update(
+            &conv.user_id,
+            &conv.id,
+            &ConversationRowUpdate {
+                name: Some("Fix login bug".to_string()),
+                name_source: Some("agent".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
+        assert_eq!(found.name_source.as_deref(), Some("agent"));
+
+        // An update that does not carry name_source leaves it untouched.
+        repo.update(
+            &conv.user_id,
+            &conv.id,
+            &ConversationRowUpdate {
+                pinned: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
+        assert_eq!(found.name_source.as_deref(), Some("agent"));
     }
 
     #[tokio::test]

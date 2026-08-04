@@ -414,6 +414,7 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 updated_at: now,
                 project_id: None,
                 folder_id: None,
+                name_source: None,
             })
             .await?;
         Ok(TeamConversationCreateResult {
@@ -506,6 +507,7 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                     updated_at: Some(aionui_common::now_ms()),
                     project_id: None,
                     folder_id: None,
+                    name_source: None,
                 },
             )
             .await?;

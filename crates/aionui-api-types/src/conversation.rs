@@ -73,6 +73,13 @@ pub struct CreateConversationRequest {
 #[derive(Debug, Deserialize)]
 pub struct UpdateConversationRequest {
     pub name: Option<String>,
+    /// Intent of a `name` change: `"user"` = explicit rename (agent titles
+    /// will never overwrite it afterwards), `"auto"` = frontend-derived
+    /// default title (keeps the name overwritable by agent titles).
+    /// Absent defaults to `"user"` so old clients' renames stay protected.
+    /// Ignored when `name` is absent.
+    #[serde(default)]
+    pub name_source: Option<String>,
     pub pinned: Option<bool>,
     pub model: Option<ProviderWithModel>,
     pub extra: Option<serde_json::Value>,
@@ -213,6 +220,11 @@ pub struct SearchMessagesQuery {
 pub struct ConversationResponse {
     pub id: String,
     pub name: String,
+    /// Origin of the current `name`: `"user"` (explicit rename, protected),
+    /// `"agent"` (agent-generated title), or absent for a default/placeholder
+    /// name that agents may replace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_source: Option<String>,
     pub r#type: AgentType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ProviderWithModel>,
@@ -301,6 +313,14 @@ pub struct ConversationArtifactResponse {
 
 /// List of conversation artifacts for a single conversation.
 pub type ConversationArtifactListResponse = Vec<ConversationArtifactResponse>;
+
+/// Payload of the `conversation.nameUpdated` websocket event, emitted when an
+/// agent-generated session title is applied to a conversation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationNameUpdatedPayload {
+    pub conversation_id: String,
+    pub name: String,
+}
 
 /// A single item from cross-conversation message search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,9 +461,31 @@ mod tests {
         let raw = json!({ "name": "New Name" });
         let req: UpdateConversationRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.name.as_deref(), Some("New Name"));
+        // Absent name_source deserializes as None (the service treats a
+        // name change without it as an explicit user rename).
+        assert!(req.name_source.is_none());
         assert!(req.pinned.is_none());
         assert!(req.model.is_none());
         assert!(req.extra.is_none());
+    }
+
+    #[test]
+    fn deserialize_update_request_name_source_auto() {
+        let raw = json!({ "name": "Derived title", "name_source": "auto" });
+        let req: UpdateConversationRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.name_source.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn conversation_name_updated_payload_round_trip() {
+        let payload = ConversationNameUpdatedPayload {
+            conversation_id: "conv_1".into(),
+            name: "Fix login bug".into(),
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value, json!({ "conversation_id": "conv_1", "name": "Fix login bug" }));
+        let back: ConversationNameUpdatedPayload = serde_json::from_value(value).unwrap();
+        assert_eq!(back, payload);
     }
 
     #[test]
@@ -575,6 +617,7 @@ mod tests {
         let resp = ConversationResponse {
             id: "conv_1".into(),
             name: "Test".into(),
+            name_source: None,
             r#type: AgentType::Acp,
             model: Some(ProviderWithModel {
                 provider_id: "p1".into(),
@@ -618,6 +661,7 @@ mod tests {
         let resp = ConversationResponse {
             id: "conv_none".into(),
             name: "Test".into(),
+            name_source: None,
             r#type: AgentType::Acp,
             model: None,
             status: ConversationStatus::Pending,
@@ -651,6 +695,7 @@ mod tests {
         let resp = ConversationResponse {
             id: "conv_2".into(),
             name: "Round".into(),
+            name_source: None,
             r#type: AgentType::Acp,
             model: None,
             status: ConversationStatus::Running,
@@ -736,6 +781,7 @@ mod tests {
             conversation: ConversationResponse {
                 id: "conv_1".into(),
                 name: "Code Review".into(),
+                name_source: None,
                 r#type: AgentType::Acp,
                 model: None,
                 status: ConversationStatus::Finished,
@@ -774,6 +820,7 @@ mod tests {
             conversation: ConversationResponse {
                 id: "conv_x".into(),
                 name: "Search Test".into(),
+                name_source: None,
                 r#type: AgentType::Acp,
                 model: None,
                 status: ConversationStatus::Finished,
@@ -864,6 +911,7 @@ mod tests {
             items: vec![ConversationResponse {
                 id: "conv_1".into(),
                 name: "Test".into(),
+                name_source: None,
                 r#type: AgentType::Acp,
                 model: None,
                 status: ConversationStatus::Pending,
@@ -917,6 +965,7 @@ mod tests {
                 conversation: ConversationResponse {
                     id: "c1".into(),
                     name: "Conv".into(),
+                    name_source: None,
                     r#type: AgentType::Acp,
                     model: None,
                     status: ConversationStatus::Finished,

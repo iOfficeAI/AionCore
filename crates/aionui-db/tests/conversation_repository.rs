@@ -40,6 +40,7 @@ fn make_conversation(suffix: &str) -> ConversationRow {
         updated_at: now,
         project_id: None,
         folder_id: None,
+        name_source: None,
     }
 }
 

@@ -2976,6 +2976,7 @@ mod tests {
                 updated_at: 0,
                 project_id: None,
                 folder_id: None,
+                name_source: None,
             }))
         }
 
@@ -3129,6 +3130,7 @@ mod tests {
                     updated_at: 0,
                     project_id: None,
                     folder_id: None,
+                    name_source: None,
                 },
                 updates: Mutex::new(Vec::new()),
                 inserted_messages: Mutex::new(Vec::new()),

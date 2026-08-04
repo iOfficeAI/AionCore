@@ -568,6 +568,12 @@ impl StreamRelay {
                             attempt.saw_tool_or_side_effect = true;
                             self.forward_to_websocket(&event);
                         }
+                        // NOTE: AcpSessionInfo (agent session titles) is deliberately
+                        // NOT consumed here. Titles arrive at session-open and at the
+                        // turn's final instant (pi/omp race the relay's exit by ~1ms;
+                        // claude replies seconds after Finish), so the per-instance
+                        // BackgroundStreamWatcher is the single gate-free consumer.
+                        // The frame still reaches the frontend via the catch-all.
                         _ => {
                             self.forward_to_websocket(&event);
                         }
@@ -1061,6 +1067,106 @@ mod tests {
 
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Hello World");
+    }
+
+    fn agent_title_test_row(name: &str, name_source: Option<&str>) -> aionui_db::models::ConversationRow {
+        let now = aionui_common::now_ms();
+        aionui_db::models::ConversationRow {
+            id: "conv-1".into(),
+            user_id: "user-1".into(),
+            name: name.into(),
+            r#type: "acp".into(),
+            extra: "{}".into(),
+            model: None,
+            status: None,
+            source: None,
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: now,
+            updated_at: now,
+            project_id: None,
+            folder_id: None,
+            name_source: name_source.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_session_info_is_forwarded_but_never_renames_at_relay_level() {
+        let repo = Arc::new(RecordingRepo::new());
+        *repo.conversation.lock().unwrap() = Some(agent_title_test_row("first message placeholder", None));
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::AcpSessionInfo(serde_json::json!({
+            "title": "Fix login bug"
+        })))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+
+        // The relay must NOT rename (the BackgroundStreamWatcher is the single
+        // title consumer — relay-side apply raced its own exit and double-applied).
+        assert!(
+            repo.conversation_updates
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, u)| u.name.is_none()),
+            "relay must not rename"
+        );
+        // The raw frame still reaches the frontend via message.stream.
+        let mut saw_forward = false;
+        while let Ok(msg) = ws_rx.try_recv() {
+            if msg.name == "message.stream" && msg.data["data"]["title"] == "Fix login bug" {
+                saw_forward = true;
+            }
+        }
+        assert!(saw_forward, "AcpSessionInfo frame must still be forwarded");
+    }
+
+    #[tokio::test]
+    async fn acp_session_info_null_title_never_renames() {
+        let repo = Arc::new(RecordingRepo::new());
+        *repo.conversation.lock().unwrap() = Some(agent_title_test_row("kept name", None));
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::AcpSessionInfo(serde_json::json!({ "title": null })))
+            .unwrap();
+        tx.send(AgentStreamEvent::AcpSessionInfo(serde_json::json!({ "title": "   " })))
+            .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+        relay.consume(rx).await;
+
+        assert!(
+            repo.conversation_updates
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, u)| u.name.is_none()),
+            "null/blank titles must not rename"
+        );
     }
 
     #[tokio::test]
@@ -2683,6 +2789,10 @@ mod tests {
     struct RecordingRepo {
         inserts: Mutex<Vec<MessageRow>>,
         updates: Mutex<Vec<(String, aionui_db::MessageRowUpdate)>>,
+        /// Optional conversation row served by `get` (agent-title tests).
+        conversation: Mutex<Option<aionui_db::models::ConversationRow>>,
+        /// Conversation-level updates recorded by `update` (agent-title tests).
+        conversation_updates: Mutex<Vec<(String, aionui_db::ConversationRowUpdate)>>,
         not_found: AtomicBool,
         foreign_key_failure: AtomicBool,
     }
@@ -2692,6 +2802,8 @@ mod tests {
             Self {
                 inserts: Mutex::new(vec![]),
                 updates: Mutex::new(vec![]),
+                conversation: Mutex::new(None),
+                conversation_updates: Mutex::new(vec![]),
                 not_found: AtomicBool::new(false),
                 foreign_key_failure: AtomicBool::new(false),
             }
@@ -2787,7 +2899,7 @@ mod tests {
     #[async_trait::async_trait]
     impl IConversationRepository for RecordingRepo {
         async fn get(&self, _user_id: &str, _id: &str) -> Result<Option<aionui_db::models::ConversationRow>, DbError> {
-            Ok(None)
+            Ok(self.conversation.lock().unwrap().clone())
         }
         async fn owner_user_id(&self, _id: &str) -> Result<Option<String>, DbError> {
             Ok(Some("user-1".into()))
@@ -2798,12 +2910,16 @@ mod tests {
         async fn update(
             &self,
             _user_id: &str,
-            _id: &str,
-            _updates: &aionui_db::ConversationRowUpdate,
+            id: &str,
+            updates: &aionui_db::ConversationRowUpdate,
         ) -> Result<(), DbError> {
             if self.not_found.load(Ordering::Acquire) {
                 return Err(DbError::NotFound("Conversation deleted-conv not found".into()));
             }
+            self.conversation_updates
+                .lock()
+                .unwrap()
+                .push((id.to_string(), updates.clone()));
             Ok(())
         }
         async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {

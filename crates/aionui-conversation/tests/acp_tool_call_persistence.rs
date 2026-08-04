@@ -37,6 +37,7 @@ async fn run_acp_tool_call_update_without_insert_creates_placeholder() {
         updated_at: now_ms(),
         project_id: None,
         folder_id: None,
+        name_source: None,
     })
     .await
     .unwrap();
@@ -115,6 +116,7 @@ async fn run_acp_tool_call_late_initial_event_merges_with_update_placeholder() {
         updated_at: now_ms(),
         project_id: None,
         folder_id: None,
+        name_source: None,
     })
     .await
     .unwrap();
