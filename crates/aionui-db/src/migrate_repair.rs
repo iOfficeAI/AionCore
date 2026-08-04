@@ -28,9 +28,25 @@ pub(crate) struct GuardViolation {
     pub count: i64,
 }
 
-/// True iff migrations 001–029 are all applied and 030 is the next pending
-/// migration (`max applied version == 29`). Returns false when the
-/// `_sqlx_migrations` table does not exist (fresh install) — spec §7 H1.
+/// True iff the database has a migration history (`_sqlx_migrations` exists) and
+/// migration 030 has NOT yet succeeded — i.e. 030 is still pending, so the raw
+/// data must be normalized before the migrator runs it.
+///
+/// Returns false for:
+/// - **fresh installs** (no `_sqlx_migrations` table): the migrator builds the
+///   schema from empty and applies 001–030 on data-free tables, so there is
+///   nothing to repair. At this point in staged init the migrator has not yet
+///   created `_sqlx_migrations`, so this reads false.
+/// - **already-migrated DBs** (030 present with `success = 1`): structurally
+///   excludes migrated databases, so no `VersionMismatch` path exists (F2) and
+///   the irreversible repair never re-runs on a DB already past 030.
+///
+/// Unlike the previous `MAX(version) == 29` gate, this fires for ANY pre-030
+/// start point (e.g. v28 from AionCore 0.1.52 — the ELECTRON-31Z one-step
+/// upgrade that jumped over v29 and so skipped the repair). Repair statements
+/// referencing tables/columns absent from an older schema are skipped as
+/// not-applicable (see [`is_missing_object_error`]); such tables hold no dirty
+/// data yet, and later migrations create them empty.
 async fn should_run_user_scope_repair(conn: &mut sqlx::SqliteConnection) -> Result<bool, DbError> {
     let has_table: bool =
         sqlx::query_scalar("SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'")
@@ -40,11 +56,13 @@ async fn should_run_user_scope_repair(conn: &mut sqlx::SqliteConnection) -> Resu
     if !has_table {
         return Ok(false);
     }
-    let max_version: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(DbError::Query)?;
-    Ok(max_version == Some(USER_SCOPE_MIGRATION_VERSION - 1))
+    let migration_030_applied: bool =
+        sqlx::query_scalar("SELECT COUNT(*) > 0 FROM _sqlx_migrations WHERE version = ? AND success = 1")
+            .bind(USER_SCOPE_MIGRATION_VERSION)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(DbError::Query)?;
+    Ok(!migration_030_applied)
 }
 
 /// Evaluate every named 030 invariant on the raw (pre-030) schema and return
@@ -373,14 +391,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_false_at_version_28_and_30() {
-        let mut c = conn().await;
-        seed_sqlx_migrations(&mut c, 28).await;
-        assert!(!should_run_user_scope_repair(&mut c).await.unwrap());
+    async fn gate_true_at_pre_030_start_points() {
+        // The widened gate fires for ANY pre-030 history, not just v29. v28 is
+        // the ELECTRON-31Z upgrade path (a one-step jump from AionCore 0.1.52,
+        // whose DB stops at 28) that the old `== 29` gate skipped; v20 covers an
+        // even older start point.
+        for v in [20, 28] {
+            let mut c = conn().await;
+            seed_sqlx_migrations(&mut c, v).await;
+            assert!(
+                should_run_user_scope_repair(&mut c).await.unwrap(),
+                "030 is still pending at v{v}; the pre-migration repair must run"
+            );
+        }
+    }
 
-        let mut c2 = conn().await;
-        seed_sqlx_migrations(&mut c2, 30).await;
-        assert!(!should_run_user_scope_repair(&mut c2).await.unwrap());
+    #[tokio::test]
+    async fn gate_false_when_030_already_applied() {
+        // A DB whose 030 already succeeded must skip the repair: this preserves
+        // F2 (no sqlx VersionMismatch on migrated DBs) and never re-runs the
+        // irreversible data repair on a DB that is already past 030.
+        let mut c = conn().await;
+        seed_sqlx_migrations(&mut c, 30).await;
+        assert!(!should_run_user_scope_repair(&mut c).await.unwrap());
     }
 
     async fn create_min_v29_aggregate_tables(c: &mut sqlx::SqliteConnection) {

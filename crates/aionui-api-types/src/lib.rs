@@ -6,6 +6,7 @@ mod acp_prompt_hook;
 mod agent_build_extra;
 mod agent_discovery;
 mod agent_error;
+mod antigravity_hook;
 mod assistant;
 mod auth;
 mod channel;
@@ -52,6 +53,10 @@ pub use agent_discovery::{
 pub use agent_error::{
     AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind, AgentErrorResolutionTarget,
     AgentStreamErrorData,
+};
+pub use antigravity_hook::{
+    AntigravityHookConfig, AntigravityHookDecision, AntigravityHookInput, AntigravityHookOutput,
+    AntigravityHookToolCall,
 };
 pub use assistant::{
     AssistantAgentResponse, AssistantCapabilitiesResponse, AssistantDefaultListRequest, AssistantDefaultListResponse,
@@ -105,13 +110,12 @@ pub use extension::{
     InstallExtensionRequest, PermissionDetailResponse, PermissionSummaryResponse,
 };
 pub use file::{
-    BrowseDirectoryQuery, BrowseDirectoryResponse, BrowseEntry, CancelZipRequest, CopyFailure, CopyFilesRequest,
-    CopyFilesResponse, CopyTarget, CreateTempFileRequest, DirOrFileResponse, FetchRemoteImageRequest,
-    FileChangeInfoResponse, FileMetadataResponse, FileWatchRequest, GetFileMetadataRequest, GetFilesByDirRequest,
-    GetImageBase64Request, ListWorkspaceFilesRequest, ReadFileBufferRequest, ReadFileRequest, RemoveEntryRequest,
-    RenameRequest, RenameResponse, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest,
+    ContentEncoding, ContentMetadataRequest, CopyFailure, CopyFilesRequest, CopyFilesResponse, CopyTarget,
+    DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, FileWatchRequest,
+    GetFileMetadataRequest, GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest, ReadContentRequest,
+    ReadFileRequest, RevealItemRequest, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest,
     SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest, SnapshotWorkspaceRequest, WorkspaceFlatFileResponse,
-    WorkspaceOfficeWatchRequest, WriteFileRequest, ZipFileEntry, ZipRequest,
+    WorkspaceOfficeWatchRequest, WriteContentRequest, WriteFileRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

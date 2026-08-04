@@ -12,8 +12,10 @@ use crate::ProcessError;
 /// Strength of a containment's teardown guarantee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReapGuarantee {
-    /// Process-group SIGKILL: reaps descendants that stay in the group; misses
-    /// any that escaped via `setsid` (documented gap).
+    /// Process-group SIGKILL, plus a sweep of descendants captured before the
+    /// kill — so a child that left the group via `setsid`/`setpgid` is still
+    /// reaped. Best-effort because anything spawned between the snapshot and
+    /// the kill, or whose identity cannot be confirmed, is left alone.
     BestEffort,
 }
 
@@ -47,6 +49,12 @@ impl ProcessGroupContainment {
 
 impl Containment for ProcessGroupContainment {
     fn kill_all(&self) -> Result<ContainmentKillOutcome, ProcessError> {
+        // BEFORE the kill, not after: the parent link is the only thing tying
+        // an escaped child to this tree, and the kernel reparents it to init
+        // the moment the CLI dies. Looked up afterwards, the set is empty and
+        // the child is unreachable forever.
+        let snapshot = crate::proc_tree::escaped_descendants(self.pid, self.process_group_id);
+
         crate::force_kill(self.pid, self.process_group_id)?;
         // SIGKILL is async; give the kernel a brief bounded settle before the
         // confirmation probe, else a clean kill almost always reads alive and
@@ -54,11 +62,18 @@ impl Containment for ProcessGroupContainment {
         // Degraded (escaped grandchild) rather than a false "gone".
         const ATTEMPTS: u32 = 20;
         const STEP: std::time::Duration = std::time::Duration::from_millis(25);
+        let mut group_gone = false;
         for _ in 0..ATTEMPTS {
             if !crate::process_group_alive(self.process_group_id) {
-                return Ok(ContainmentKillOutcome::ProbedGone);
+                group_gone = true;
+                break;
             }
             std::thread::sleep(STEP);
+        }
+
+        let strays = crate::proc_tree::reap(&snapshot);
+        if group_gone && strays == 0 {
+            return Ok(ContainmentKillOutcome::ProbedGone);
         }
         Ok(ContainmentKillOutcome::DegradedBestEffort)
     }

@@ -514,6 +514,25 @@ impl StreamRelay {
                             self.forward_to_websocket(&event);
                             self.adapter.persist_tool_group(entries).await;
                         }
+                        AgentStreamEvent::WorkflowProgress(data) => {
+                            // A running workflow refreshes its progress roughly once a
+                            // second, WHILE the assistant is still streaming its "workflow
+                            // started" reply (claude runs with --include-partial-messages,
+                            // so that reply arrives as deltas). Every other tool-ish arm
+                            // above closes the active text segment first — doing that here
+                            // would shatter that one reply into a fresh bubble per refresh.
+                            //
+                            // So this arm deliberately does NOT touch `active_text` /
+                            // `active_thinking`. It projects the snapshot into the two
+                            // frames the frontend already renders and persists them, and
+                            // is otherwise invisible to the turn: no `saw_tool_or_side_effect`
+                            // either, since a progress refresh is not the turn doing work.
+                            self.forward_workflow_progress(data);
+                            self.adapter.persist_tool_call(&data.card).await;
+                            if !data.agents.is_empty() {
+                                self.adapter.persist_tool_group(&data.agents).await;
+                            }
+                        }
                         AgentStreamEvent::Tips(data) => {
                             // Only a Success tip blocks auto-replay: it can represent
                             // completed work product. Warning/Info tips are system
@@ -640,6 +659,7 @@ impl StreamRelay {
             AgentStreamEvent::RequestTrace(_) => "RequestTrace",
             AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
             AgentStreamEvent::SegmentBreak => "SegmentBreak",
+            AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
             AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
         }
     }
@@ -807,6 +827,45 @@ impl StreamRelay {
                 "type": "system",
                 "data": response,
                 "hidden": true,
+            }));
+        }
+    }
+
+    /// Project a workflow snapshot onto the wire as the two frame types the
+    /// frontend already renders, so no new renderer is needed:
+    ///
+    /// - `tool_call` — the container row, keyed by the Workflow tool call's own
+    ///   `call_id`, so it updates the card the user is already looking at.
+    /// - `tool_group` — one entry per workflow agent, each with its own status
+    ///   badge.
+    ///
+    /// Hand-built rather than routed through `forward_to_websocket`, which derives
+    /// the wire `type` from the event's own serde tag — that would put
+    /// `workflow_progress` on the wire, which no frontend arm handles (it would
+    /// land in `useAcpMessage`'s `default:` and light a spurious turn timer).
+    fn forward_workflow_progress(&self, data: &aionui_ai_agent::protocol::events::WorkflowProgressData) {
+        let mut frames = vec![("tool_call", serde_json::to_value(&data.card))];
+        // A background-task card has no per-agent roster; an EMPTY tool_group
+        // would persist a junk row under a freshly minted id.
+        if !data.agents.is_empty() {
+            frames.push(("tool_group", serde_json::to_value(&data.agents)));
+        }
+        for (kind, body) in frames {
+            let mut body = match body {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %ErrorChain(&e), kind, "Failed to serialize workflow progress frame");
+                    continue;
+                }
+            };
+            normalize_keys_to_snake_case(&mut body);
+            self.broadcast_stream_payload(json!({
+                "conversation_id": self.conversation_id,
+                "msg_id": self.msg_id,
+                "turn_id": self.turn_id,
+                "type": kind,
+                "data": body,
+                "hidden": false,
             }));
         }
     }
@@ -1116,6 +1175,128 @@ mod tests {
             }
         }
         assert!(saw_tip, "the token-limit tip must be forwarded to the WS");
+    }
+
+    /// A workflow refreshes its progress ~1×/s WHILE the assistant is still
+    /// streaming its "workflow started" reply (claude runs with
+    /// `--include-partial-messages`, so that reply arrives as deltas). Every other
+    /// tool-ish arm closes the active text segment first, which would shatter that
+    /// one reply into a fresh bubble per refresh — a worse regression than showing
+    /// nothing at all. This arm must leave the text segment alone.
+    ///
+    /// The `ToolCall` control below proves the test actually exercises the
+    /// splitting path, rather than passing because no split could occur anyway.
+    #[tokio::test]
+    async fn workflow_progress_does_not_split_the_streaming_reply() {
+        use aionui_ai_agent::protocol::events::tool_call::{ToolGroupEntry, ToolGroupStatus};
+        use aionui_ai_agent::protocol::events::{
+            TextEventData, ToolCallEventData, ToolCallStatus, WorkflowProgressData,
+        };
+
+        async fn run_with(interruption: AgentStreamEvent) -> (Vec<MessageRow>, Vec<serde_json::Value>) {
+            let repo = Arc::new(RecordingRepo::new());
+            let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+            let mut ws_rx = bus.subscribe();
+            let (tx, _) = broadcast::channel(64);
+            let relay = StreamRelay::new(
+                "conv-1".into(),
+                "asst-1".into(),
+                "turn-1".into(),
+                "user-1".into(),
+                repo.clone(),
+                bus.clone(),
+            );
+            let rx = tx.subscribe();
+
+            tx.send(AgentStreamEvent::Text(TextEventData {
+                content: "Workflow started, ".into(),
+            }))
+            .unwrap();
+            tx.send(interruption).unwrap();
+            tx.send(AgentStreamEvent::Text(TextEventData {
+                content: "running in the background.".into(),
+            }))
+            .unwrap();
+            tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+            relay.consume(rx).await;
+
+            let mut frames = Vec::new();
+            while let Ok(evt) = ws_rx.try_recv() {
+                if evt.name == "message.stream" {
+                    frames.push(evt.data.clone());
+                }
+            }
+            (repo.take_inserts(), frames)
+        }
+
+        fn progress_event() -> AgentStreamEvent {
+            AgentStreamEvent::WorkflowProgress(WorkflowProgressData {
+                card: ToolCallEventData {
+                    call_id: "toolu_wf".into(),
+                    name: "Workflow".into(),
+                    args: serde_json::json!({"script": "phase('Run')"}),
+                    status: ToolCallStatus::Running,
+                    input: None,
+                    output: Some("Phase 1  Run   [0/1]".into()),
+                    description: Some("Run [0/1] · run:A · 1 agents".into()),
+                },
+                agents: vec![ToolGroupEntry {
+                    call_id: "1".into(),
+                    name: "run:A".into(),
+                    status: ToolGroupStatus::Executing,
+                    description: Some("[P1 Run] · opus-4-8".into()),
+                }],
+            })
+        }
+
+        let (inserts, frames) = run_with(progress_event()).await;
+        let texts = inserts.iter().filter(|m| m.r#type == "text").count();
+        assert_eq!(
+            texts, 1,
+            "the streaming reply must stay ONE message; a progress refresh may not close its segment"
+        );
+
+        // Both projections must still reach the WS, under the frame types the
+        // frontend already renders — never the internal `workflow_progress` tag.
+        let kinds: Vec<&str> = frames.iter().filter_map(|f| f["type"].as_str()).collect();
+        assert!(
+            kinds.contains(&"tool_call"),
+            "container row must be forwarded: {kinds:?}"
+        );
+        assert!(kinds.contains(&"tool_group"), "agent rows must be forwarded: {kinds:?}");
+        assert!(
+            !kinds.contains(&"workflow_progress"),
+            "the internal variant must never hit the wire: {kinds:?}"
+        );
+        let card = frames.iter().find(|f| f["type"] == "tool_call").unwrap();
+        assert_eq!(card["data"]["call_id"], "toolu_wf");
+        assert_eq!(
+            card["data"]["name"], "Workflow",
+            "identity fields survive the projection"
+        );
+        let group = frames.iter().find(|f| f["type"] == "tool_group").unwrap();
+        assert_eq!(
+            group["data"][0]["status"], "Executing",
+            "tool_group's PascalCase vocabulary"
+        );
+
+        // Control: a plain ToolCall DOES split the reply. Without this, the
+        // assertion above could pass simply because nothing ever splits.
+        let (control_inserts, _) = run_with(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "toolu_other".into(),
+            name: "Bash".into(),
+            args: serde_json::Value::Null,
+            status: ToolCallStatus::Running,
+            input: None,
+            output: None,
+            description: None,
+        }))
+        .await;
+        assert_eq!(
+            control_inserts.iter().filter(|m| m.r#type == "text").count(),
+            2,
+            "control: an ordinary tool call splits the reply, so the test does exercise that path"
+        );
     }
 
     // issue 136586749 (B-3): AcpDialectSignal is an internal-only turn/near-window
@@ -2301,7 +2482,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_group_persists_message() {
-        use aionui_ai_agent::protocol::events::tool_call::{ToolCallStatus, ToolGroupEntry};
+        use aionui_ai_agent::protocol::events::tool_call::{ToolGroupEntry, ToolGroupStatus};
 
         let repo = Arc::new(RecordingRepo::new());
         let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
@@ -2322,13 +2503,13 @@ mod tests {
             ToolGroupEntry {
                 call_id: "tg-001".into(),
                 name: "search".into(),
-                status: ToolCallStatus::Completed,
+                status: ToolGroupStatus::Success,
                 description: Some("Web search".into()),
             },
             ToolGroupEntry {
                 call_id: "tg-002".into(),
                 name: "read_file".into(),
-                status: ToolCallStatus::Completed,
+                status: ToolGroupStatus::Success,
                 description: None,
             },
         ]))

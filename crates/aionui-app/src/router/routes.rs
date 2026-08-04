@@ -350,7 +350,18 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     });
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: route groups built");
 
+    // Antigravity permission hook callback. Deliberately NOT behind
+    // auth_middleware: the hook is a local process with no user session and
+    // presents a per-conversation token instead (checked in the handler).
+    let antigravity_hook = crate::router::antigravity_hook::antigravity_hook_routes(
+        crate::router::antigravity_hook::AntigravityHookRouterState {
+            task_manager: services.worker_task_manager.clone(),
+            tokens: services.antigravity_hook_tokens.clone(),
+        },
+    );
+
     let router = Router::new()
+        .merge(antigravity_hook)
         .route("/health", get(health_check))
         .merge(auth_routes(auth_state))
         .merge(system_authenticated)

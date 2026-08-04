@@ -12,6 +12,10 @@ pub enum AgentType {
     Nanobot,
     Remote,
     Aionrs,
+    /// Google Antigravity, driven through the `agy` CLI. A direct-CLI backend
+    /// (one process per turn, `-p --output-format stream-json`) — NOT an ACP
+    /// vendor, and unlike `Aionrs` it does spawn an external process.
+    Antigravity,
     /// Legacy Gemini conversations. Kept solely so that historical rows
     /// with `type='gemini'` remain readable in the conversation list and
     /// message history. Any attempt to run the agent (send a message,
@@ -34,6 +38,7 @@ impl AgentType {
             AgentType::Nanobot => "Nanobot",
             AgentType::Remote => "Remote",
             AgentType::Aionrs => "Aion CLI",
+            AgentType::Antigravity => "Antigravity",
             AgentType::Gemini => "Gemini (legacy)",
             AgentType::Codex => "Codex (legacy)",
         }
@@ -46,13 +51,14 @@ impl AgentType {
             AgentType::Nanobot => "nanobot",
             AgentType::Remote => "remote",
             AgentType::Aionrs => "aionrs",
+            AgentType::Antigravity => "antigravity",
             AgentType::Gemini => "gemini",
             AgentType::Codex => "codex",
         }
     }
 
     pub fn supports_new_conversation(&self) -> bool {
-        matches!(self, AgentType::Acp | AgentType::Aionrs)
+        matches!(self, AgentType::Acp | AgentType::Aionrs | AgentType::Antigravity)
     }
 
     pub fn is_deprecated_runtime(&self) -> bool {
@@ -84,6 +90,11 @@ impl AgentType {
     pub fn native_skills_dirs(&self) -> Option<&'static [&'static str]> {
         match self {
             AgentType::Aionrs => Some(&[".aionrs/skills"]),
+            // Verified 2026-07-31 against agy 1.1.8: a skill at
+            // `.agents/skills/<name>/SKILL.md` is discovered and executed in
+            // headless (`-p`) runs. agy also accepts `.agent/` / `_agents/` /
+            // `_agent/`, but we provision the canonical `.agents/`.
+            AgentType::Antigravity => Some(&[".agents/skills"]),
             AgentType::Acp
             | AgentType::OpenclawGateway
             | AgentType::Nanobot
@@ -115,6 +126,19 @@ impl AgentType {
                 Some("cursor") => "agent",
                 _ => "yolo",
             },
+            // agy has NO full-auto mode: measured against 1.1.9, all three of
+            // its modes (default / accept-edits / plan) are refused the
+            // "command" permission without `--dangerously-skip-permissions` and
+            // all three run commands with it. `accept-edits` only auto-approves
+            // file edits (agy's own wording); `plan` is "research & plan only".
+            //
+            // `yolo` is therefore a SENTINEL, not one of agy's modes. It lets a
+            // caller say "run unattended" through the same channel every other
+            // agent uses; the backend answers it by not installing its approval
+            // hook, and never forwards it as agy's `--mode`. Returning the
+            // neutral `default` here instead would be indistinguishable from a
+            // user who simply picked the default mode.
+            AgentType::Antigravity => "yolo",
             AgentType::Aionrs
             | AgentType::Gemini
             | AgentType::Codex
@@ -486,5 +510,41 @@ mod tests {
         assert_eq!(AgentType::Acp.full_auto_mode_id(None), "yolo");
         assert_eq!(AgentType::Aionrs.full_auto_mode_id(None), "yolo");
         assert_eq!(AgentType::Remote.full_auto_mode_id(None), "yolo");
+    }
+
+    #[test]
+    fn antigravity_agent_type_is_first_class() {
+        let t = AgentType::Antigravity;
+        assert_eq!(t.serde_name(), "antigravity");
+        assert_eq!(t.display_name(), "Antigravity");
+        assert!(t.supports_new_conversation());
+        assert!(!t.is_deprecated_runtime());
+        assert_eq!(serde_json::to_string(&t).unwrap(), "\"antigravity\"");
+        assert_eq!(serde_json::from_str::<AgentType>("\"antigravity\"").unwrap(), t);
+    }
+
+    #[test]
+    fn antigravity_full_auto_is_a_sentinel_not_one_of_agys_modes() {
+        // Measured on agy 1.1.9: default / accept-edits / plan behave IDENTICALLY
+        // on permissions (all refused the "command" permission without
+        // `--dangerously-skip-permissions`, all run commands with it), so agy has
+        // no full-auto mode to name here.
+        //
+        // `yolo` is therefore a sentinel that callers meaning "run unattended"
+        // (team, cron) pass through the normal channel; the backend answers it by
+        // not installing its approval hook and never forwards it as `--mode`.
+        // Returning the neutral "default" instead was indistinguishable from a
+        // user who simply picked the default mode.
+        assert_eq!(AgentType::Antigravity.full_auto_mode_id(None), "yolo");
+    }
+
+    #[test]
+    fn antigravity_discovers_workspace_skills() {
+        // Verified 2026-07-31: a skill at `.agents/skills/<name>/SKILL.md` is
+        // found and executed by `agy -p` (headless).
+        assert_eq!(
+            AgentType::Antigravity.native_skills_dirs(),
+            Some([".agents/skills"].as_slice())
+        );
     }
 }

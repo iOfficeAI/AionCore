@@ -103,10 +103,60 @@ pub fn has_traversal(path: &str) -> bool {
             .any(|component| matches!(component, Component::ParentDir))
 }
 
+/// Strip the Windows extended-length (verbatim) prefix from a path string.
+///
+/// `fs::canonicalize` yields verbatim paths on Windows (`\\?\C:\DEV`,
+/// `\\?\UNC\server\share`). Returning those to the frontend breaks downstream
+/// consumers — cmd.exe-based CLI shims refuse `\\?\` working directories and
+/// the UI treats `C:\DEV` and `\\?\C:\DEV` as two different projects
+/// (iOfficeAI/AionUi#3191). Every non-`browse` path leaving the file service
+/// (flat-list / dir-tree `full_path`, ELECTRON-3TG) must pass through this so
+/// consumers never see verbatim paths. Idempotent on non-verbatim input.
+///
+/// Internal sandbox comparisons keep using the canonical (verbatim) form.
+pub(crate) fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        path.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    // Regression tests for iOfficeAI/AionUi#3191 + ELECTRON-3TG: verbatim
+    // prefixes must be stripped from every path leaving the file service.
+
+    #[test]
+    fn strips_verbatim_disk_prefix() {
+        assert_eq!(strip_verbatim_prefix(r"\\?\C:\DEV\project"), r"C:\DEV\project");
+        assert_eq!(strip_verbatim_prefix(r"\\?\C:\"), r"C:\");
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\G:\国检\detection-flow-web\src\views\index.vue"),
+            r"G:\国检\detection-flow-web\src\views\index.vue"
+        );
+    }
+
+    #[test]
+    fn strips_verbatim_unc_prefix() {
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\server\share\dir"),
+            r"\\server\share\dir"
+        );
+    }
+
+    #[test]
+    fn leaves_non_verbatim_paths_untouched() {
+        assert_eq!(strip_verbatim_prefix(r"C:\DEV\project"), r"C:\DEV\project");
+        assert_eq!(strip_verbatim_prefix(r"\\server\share"), r"\\server\share");
+        assert_eq!(strip_verbatim_prefix("/home/user/project"), "/home/user/project");
+        assert_eq!(strip_verbatim_prefix(""), "");
+    }
 
     #[test]
     fn validate_path_within_sandbox() {

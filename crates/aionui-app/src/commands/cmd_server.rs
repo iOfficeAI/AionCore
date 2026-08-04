@@ -18,6 +18,12 @@ use aionui_team::TeamIdleCleanupCoordinator;
 use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ParentExitSignal, ServerEnvironment};
 
 const LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
+// Bare, payload-less readiness marker emitted once `axum::serve` actually begins
+// serving. The port is already known from the earlier AIONCORE_LISTENING line,
+// so this marker only signals the "now serving" edge. AionUi treats it as the
+// authoritative ready signal, eliminating the "listening early, serving late"
+// false gap.
+const READY_EVENT_MARKER: &str = "AIONCORE_READY";
 const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
 const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -199,6 +205,15 @@ fn emit_listening_event(addr: SocketAddr) {
     let _ = io::stdout().flush();
 }
 
+fn format_ready_event() -> String {
+    READY_EVENT_MARKER.to_string()
+}
+
+fn emit_ready_event() {
+    println!("{}", format_ready_event());
+    let _ = io::stdout().flush();
+}
+
 /// Start the HTTP server with fully constructed services.
 pub(crate) async fn run_server(
     env: ServerEnvironment,
@@ -288,6 +303,12 @@ pub(crate) async fn run_server(
     let conversation_runtime_state = services.conversation_runtime_state.clone();
     let worker_task_manager = services.worker_task_manager.clone();
     let client_pref_service = router_runtime.client_pref_service.clone();
+
+    // All initialization is complete and we are about to begin serving. Emit the
+    // authoritative readiness marker now (never at bind time) so AionUi can treat
+    // it as "ready" without racing the /health poll against the startup clock.
+    emit_ready_event();
+    info!("startup: server ready, emitted AIONCORE_READY");
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -440,6 +461,19 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(payload).expect("payload should be valid JSON");
         assert_eq!(parsed["host"], "127.0.0.1");
         assert_eq!(parsed["port"], 49153);
+    }
+
+    #[test]
+    fn ready_event_line_is_bare_marker() {
+        let line = format_ready_event();
+
+        // Bare marker: exactly the constant, no payload and no whitespace.
+        assert_eq!(line, READY_EVENT_MARKER);
+        assert_eq!(line, "AIONCORE_READY");
+        assert!(!line.contains(' '));
+        // Distinct from the listening event prefix, which carries a JSON payload.
+        assert_ne!(line, LISTENING_EVENT_PREFIX);
+        assert!(!line.starts_with(&format!("{LISTENING_EVENT_PREFIX} ")));
     }
 
     #[test]

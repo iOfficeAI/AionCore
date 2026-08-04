@@ -1,0 +1,490 @@
+//! Out-of-turn stream delivery for direct-CLI (Session) conversations.
+//!
+//! The per-turn [`StreamRelay`] breaks at the turn's Finish — but a claude
+//! session keeps talking after that:
+//!
+//! - **CLI-initiated turns.** When a background task (bash / Task subagent /
+//!   workflow) completes, the CLI starts an UNPROMPTED turn to report the result
+//!   (live 2026-08-03: BackendBound → tool check → MessageDelta ~30s after the
+//!   launch turn ended). With only per-turn relays, that entire report was
+//!   dropped: no WebSocket frames, no DB rows — the conversation looked dead.
+//! - **Progress-card refreshes.** A background task's card ticks and settles
+//!   between turns. Un-persisted settles left the stored row `running` forever,
+//!   so the View Steps spinner never stopped after a reload.
+//!
+//! One watcher per live Session instance closes both gaps. It subscribes to the
+//! instance's broadcast channel permanently and acts ONLY while no user turn is
+//! active (the per-turn relay owns everything else):
+//!
+//! - `WorkflowProgress` → forwarded + persisted inline (a card refresh is not a
+//!   turn).
+//! - Turn content (text / thinking / tool calls / permissions…) → an **orphan
+//!   turn**: a standard [`StreamRelay`] with freshly minted msg/turn ids, fed
+//!   until the unprompted turn's own Finish. Full parity — segments,
+//!   persistence, `turn.completed` — because it IS the normal relay.
+
+use std::sync::Arc;
+
+use aionui_ai_agent::protocol::events::{AgentStreamEvent, WorkflowProgressData};
+use aionui_common::{ErrorChain, normalize_keys_to_snake_case};
+use aionui_db::IConversationRepository;
+use aionui_realtime::EventBroadcaster;
+use serde_json::json;
+use tokio::sync::broadcast;
+use tracing::{info, warn};
+
+use crate::runtime_persistence::RuntimePersistenceCoordinator;
+use crate::runtime_state::ConversationRuntimeStateService;
+use crate::service::ConversationService;
+use crate::stream_persistence::StreamPersistenceAdapter;
+use crate::stream_relay::StreamRelay;
+
+/// An orphan turn with NO frame for this long is presumed abandoned (a stray
+/// content frame with no terminal); the feeder closes and the relay finalizes
+/// with what it has, so the watcher can never be wedged forever.
+const ORPHAN_TURN_IDLE_MS: u64 = 180_000;
+
+pub(crate) struct BackgroundStreamWatcher {
+    pub conversation_id: String,
+    pub user_id: String,
+    pub repo: Arc<dyn IConversationRepository>,
+    pub broadcaster: Arc<dyn EventBroadcaster>,
+    pub persistence: RuntimePersistenceCoordinator,
+    pub runtime_state: Arc<ConversationRuntimeStateService>,
+}
+
+impl BackgroundStreamWatcher {
+    /// Is this frame the start of CLI-initiated turn CONTENT (as opposed to a
+    /// card refresh or bookkeeping noise)?
+    fn is_orphan_turn_content(ev: &AgentStreamEvent) -> bool {
+        matches!(
+            ev,
+            AgentStreamEvent::Text(_)
+                | AgentStreamEvent::Thinking(_)
+                | AgentStreamEvent::ToolCall(_)
+                | AgentStreamEvent::AcpToolCall(_)
+                | AgentStreamEvent::ToolGroup(_)
+                | AgentStreamEvent::Plan(_)
+                | AgentStreamEvent::Permission(_)
+                | AgentStreamEvent::AcpPermission(_)
+                | AgentStreamEvent::Error(_)
+        )
+        // Deliberately absent: Tips. Tips are OUR pump-side diagnostics, never
+        // how a CLI-initiated turn begins (those open with thinking/tool/text) —
+        // a stray out-of-turn tip fabricating a whole orphan turn is exactly how
+        // the duplicate-terminal ACP_EMPTY_TURN bubble reached the user. A tip
+        // INSIDE a running orphan turn still flows: the feeder forwards
+        // everything once a turn is open.
+    }
+
+    pub async fn run(self, mut rx: broadcast::Receiver<AgentStreamEvent>) {
+        info!(
+            conversation_id = %self.conversation_id,
+            "background stream watcher started"
+        );
+        loop {
+            let ev = match rx.recv().await {
+                Ok(ev) => ev,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(
+                        conversation_id = %self.conversation_id,
+                        lagged = n,
+                        "background stream watcher lagged; frames dropped"
+                    );
+                    continue;
+                }
+                // Instance torn down (conversation deleted / process replaced).
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            // While a user turn is active its own relay owns the stream.
+            if self.runtime_state.active_turn_id_for(&self.conversation_id).is_some() {
+                continue;
+            }
+            match &ev {
+                AgentStreamEvent::WorkflowProgress(data) => self.handle_card_refresh(data).await,
+                ev_ref if Self::is_orphan_turn_content(ev_ref) => {
+                    self.run_orphan_turn(ev.clone(), &mut rx).await;
+                }
+                // Start/Finish strays, usage (the pump broadcasts usage itself),
+                // internal signals — nothing to deliver.
+                _ => {}
+            }
+        }
+        info!(
+            conversation_id = %self.conversation_id,
+            "background stream watcher stopped (stream closed)"
+        );
+    }
+
+    /// A between-turns card refresh: forward the two frames the frontend already
+    /// renders, and persist them so a reload shows the truth (the un-persisted
+    /// settle was exactly the "View Steps spinner never ends" bug).
+    async fn handle_card_refresh(&self, data: &WorkflowProgressData) {
+        for (kind, msg_id, body) in [
+            ("tool_call", data.card.call_id.clone(), serde_json::to_value(&data.card)),
+            (
+                "tool_group",
+                data.agents.first().map(|a| a.call_id.clone()).unwrap_or_default(),
+                serde_json::to_value(&data.agents),
+            ),
+        ] {
+            // A background-task card has no roster; an empty tool_group would
+            // persist a junk row under a minted id.
+            if kind == "tool_group" && data.agents.is_empty() {
+                continue;
+            }
+            let mut body = match body {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %ErrorChain(&e), kind, "background stream: serialize failed");
+                    continue;
+                }
+            };
+            normalize_keys_to_snake_case(&mut body);
+            self.broadcaster.broadcast(aionui_api_types::WebSocketMessage::new(
+                "message.stream",
+                json!({
+                    "conversation_id": self.conversation_id,
+                    "user_id": self.user_id,
+                    "msg_id": msg_id,
+                    "turn_id": "",
+                    "type": kind,
+                    "data": body,
+                    "hidden": false,
+                }),
+            ));
+        }
+        let adapter = StreamPersistenceAdapter::new(
+            self.user_id.clone(),
+            self.conversation_id.clone(),
+            // Only text segments read the adapter's msg_id; tool rows key by call_id.
+            String::new(),
+            self.repo.clone(),
+            Some(self.persistence.clone()),
+        );
+        adapter.persist_tool_call(&data.card).await;
+        if !data.agents.is_empty() {
+            adapter.persist_tool_group(&data.agents).await;
+        }
+    }
+
+    /// Run a CLI-initiated turn through a REGULAR relay so it gets everything a
+    /// user turn gets: WS forwarding, text segments, persistence, and the
+    /// `turn.completed` bookkeeping (the relay's default `complete_turn`).
+    async fn run_orphan_turn(&self, first: AgentStreamEvent, rx: &mut broadcast::Receiver<AgentStreamEvent>) {
+        let msg_id = ConversationService::mint_msg_id();
+        let turn_id = ConversationService::mint_turn_id();
+        info!(
+            conversation_id = %self.conversation_id,
+            turn_id = %turn_id,
+            first_frame = frame_kind(&first),
+            "background stream: CLI-initiated turn started"
+        );
+        let relay = StreamRelay::new(
+            self.conversation_id.clone(),
+            msg_id,
+            turn_id.clone(),
+            self.user_id.clone(),
+            self.repo.clone(),
+            self.broadcaster.clone(),
+        )
+        .with_runtime_state(Arc::clone(&self.runtime_state))
+        .with_persistence(self.persistence.clone());
+
+        let (feed_tx, feed_rx) = broadcast::channel::<AgentStreamEvent>(256);
+        let mut relay_task = tokio::spawn(relay.consume(feed_rx));
+        let _ = feed_tx.send(first);
+
+        let idle = std::time::Duration::from_millis(ORPHAN_TURN_IDLE_MS);
+        let outcome = loop {
+            tokio::select! {
+                joined = &mut relay_task => break joined,
+                next = tokio::time::timeout(idle, rx.recv()) => match next {
+                    Ok(Ok(ev)) => {
+                        // A user turn starting mid-orphan-turn takes the stream
+                        // over; stop feeding so two relays never double-process.
+                        if self
+                            .runtime_state
+                            .active_turn_id_for(&self.conversation_id)
+                            .is_some()
+                        {
+                            warn!(
+                                conversation_id = %self.conversation_id,
+                                turn_id = %turn_id,
+                                "background stream: user turn started mid CLI-initiated turn; closing orphan feed"
+                            );
+                            drop(feed_tx);
+                            break relay_task.await;
+                        }
+                        let _ = feed_tx.send(ev);
+                    }
+                    // Source closed (instance torn down) or idle too long: close
+                    // the feed so the relay finalizes with what it has.
+                    Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
+                        drop(feed_tx);
+                        break relay_task.await;
+                    }
+                    Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                        warn!(lagged = n, "background stream: orphan turn feed lagged");
+                        continue;
+                    }
+                },
+            }
+        };
+        match outcome {
+            Ok(outcome) => info!(
+                conversation_id = %self.conversation_id,
+                turn_id = %turn_id,
+                terminal = ?outcome.terminal,
+                "background stream: CLI-initiated turn finished"
+            ),
+            Err(e) => warn!(
+                conversation_id = %self.conversation_id,
+                turn_id = %turn_id,
+                error = %e,
+                "background stream: orphan relay task failed"
+            ),
+        }
+    }
+}
+
+fn frame_kind(ev: &AgentStreamEvent) -> &'static str {
+    match ev {
+        AgentStreamEvent::Text(_) => "text",
+        AgentStreamEvent::Thinking(_) => "thinking",
+        AgentStreamEvent::ToolCall(_) => "tool_call",
+        AgentStreamEvent::AcpToolCall(_) => "acp_tool_call",
+        AgentStreamEvent::ToolGroup(_) => "tool_group",
+        AgentStreamEvent::Plan(_) => "plan",
+        AgentStreamEvent::Permission(_) => "permission",
+        AgentStreamEvent::AcpPermission(_) => "acp_permission",
+        AgentStreamEvent::Tips(_) => "tips",
+        AgentStreamEvent::Error(_) => "error",
+        _ => "other",
+    }
+}
+
+/// Handle for one spawned watcher, used to detect instance replacement.
+pub(crate) struct BackgroundWatcherHandle {
+    pub instance_ptr: usize,
+    pub join: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aionui_ai_agent::protocol::events::tool_call::{
+        ToolCallEventData, ToolCallStatus, ToolGroupEntry, ToolGroupStatus,
+    };
+    use aionui_ai_agent::protocol::events::{FinishEventData, TextEventData};
+    use aionui_common::now_ms;
+    use aionui_db::models::ConversationRow;
+    use aionui_db::{
+        IConversationRepository, IUserRepository, SqliteConversationRepository, SqliteUserRepository,
+        init_database_memory,
+    };
+
+    struct Rig {
+        user_id: String,
+        repo: Arc<SqliteConversationRepository>,
+        bus: Arc<aionui_realtime::BroadcastEventBus>,
+        runtime_state: Arc<ConversationRuntimeStateService>,
+        tx: broadcast::Sender<AgentStreamEvent>,
+        _watcher: tokio::task::JoinHandle<()>,
+    }
+
+    async fn rig() -> Rig {
+        let db = init_database_memory().await.unwrap();
+        let user_repo = SqliteUserRepository::new(db.pool().clone());
+        let user = user_repo.create_user("user-1", "hash").await.unwrap();
+        let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+        repo.create(&ConversationRow {
+            id: "conv-1".into(),
+            user_id: user.id.clone(),
+            name: "test".into(),
+            r#type: "claude".into(),
+            extra: "{}".into(),
+            model: None,
+            status: Some("running".into()),
+            source: Some("aionui".into()),
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            project_id: None,
+            folder_id: None,
+        })
+        .await
+        .unwrap();
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let runtime_state = Arc::new(ConversationRuntimeStateService::default());
+        let (tx, _) = broadcast::channel(64);
+        let watcher = BackgroundStreamWatcher {
+            conversation_id: "conv-1".into(),
+            user_id: user.id.clone(),
+            repo: repo.clone(),
+            broadcaster: bus.clone(),
+            persistence: RuntimePersistenceCoordinator::new(Arc::clone(&runtime_state)),
+            runtime_state: Arc::clone(&runtime_state),
+        };
+        let handle = tokio::spawn(watcher.run(tx.subscribe()));
+        Rig {
+            user_id: user.id,
+            repo,
+            bus,
+            runtime_state,
+            tx,
+            _watcher: handle,
+        }
+    }
+
+    async fn rows_of_type(rig: &Rig, ty: &str) -> Vec<aionui_db::models::MessageRow> {
+        rig.repo
+            .list_messages_page(
+                &rig.user_id,
+                "conv-1",
+                &aionui_db::MessagePageParams {
+                    limit: 100,
+                    direction: aionui_db::MessagePageDirection::InitialLatest,
+                },
+            )
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .filter(|m| m.r#type == ty)
+            .collect()
+    }
+
+    /// Poll until `check` yields Some or ~2s passes.
+    async fn eventually<T>(mut check: impl AsyncFnMut() -> Option<T>) -> Option<T> {
+        for _ in 0..40 {
+            if let Some(v) = check().await {
+                return Some(v);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        None
+    }
+
+    fn settled_card() -> AgentStreamEvent {
+        AgentStreamEvent::WorkflowProgress(WorkflowProgressData {
+            card: ToolCallEventData {
+                call_id: "toolu_bg".into(),
+                name: "Bash".into(),
+                args: serde_json::json!({"command": "sleep 30"}),
+                status: ToolCallStatus::Completed,
+                input: None,
+                output: None,
+                description: Some("sleep 30 · bg task b1 · 00:30".into()),
+            },
+            agents: vec![ToolGroupEntry {
+                call_id: "toolu_bg:1".into(),
+                name: "run:A".into(),
+                status: ToolGroupStatus::Success,
+                description: None,
+            }],
+        })
+    }
+
+    /// The spinner bug: an out-of-turn card settle used to reach only the live
+    /// WebSocket. After a reload the stored row still said `running`, so the
+    /// View Steps spinner never ended. The watcher must PERSIST the settle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn out_of_turn_card_settle_is_persisted_and_forwarded() {
+        let rig = rig().await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx.send(settled_card()).unwrap();
+
+        let row = eventually(async || {
+            rows_of_type(&rig, "tool_call")
+                .await
+                .into_iter()
+                .find(|m| m.id == "toolu_bg")
+        })
+        .await
+        .expect("the settled card must be persisted");
+        assert_eq!(row.status.as_deref(), Some("finish"), "settled → finish, spinner ends");
+        assert!(row.content.contains("00:30"), "latest headline stored: {}", row.content);
+
+        let group = rows_of_type(&rig, "tool_group").await;
+        assert_eq!(group.len(), 1, "agent rows persisted too");
+        assert_eq!(group[0].id, "toolu_bg:1");
+        assert_eq!(group[0].status.as_deref(), Some("finish"));
+
+        // And the live view got both frames.
+        let mut kinds = Vec::new();
+        while let Ok(evt) = ws.try_recv() {
+            if evt.name == "message.stream" {
+                kinds.push(evt.data["type"].as_str().unwrap_or("").to_owned());
+            }
+        }
+        assert!(kinds.contains(&"tool_call".to_owned()), "got {kinds:?}");
+        assert!(kinds.contains(&"tool_group".to_owned()), "got {kinds:?}");
+    }
+
+    /// The dead-conversation bug: after a background task completes, the CLI
+    /// starts an unprompted turn to report the result — previously dropped
+    /// wholesale. The watcher must run it through a REAL relay: text persisted,
+    /// forwarded, and the turn completed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cli_initiated_turn_is_delivered_persisted_and_completed() {
+        let rig = rig().await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "BG_DONE — the sleep finished.".into(),
+            }))
+            .unwrap();
+        rig.tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+
+        let row = eventually(async || rows_of_type(&rig, "text").await.into_iter().next())
+            .await
+            .expect("the report text must be persisted");
+        assert!(row.content.contains("BG_DONE"), "stored: {}", row.content);
+
+        // Live view saw the content, and the turn was properly closed out.
+        let mut saw_content = false;
+        let mut saw_completed = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && !(saw_content && saw_completed) {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), ws.recv()).await {
+                Ok(Ok(evt)) => {
+                    saw_content |= evt.name == "message.stream" && evt.data["type"] == "content";
+                    saw_completed |= evt.name == "turn.completed";
+                }
+                _ => break,
+            }
+        }
+        assert!(saw_content, "the report streams to the live view");
+        assert!(saw_completed, "the orphan turn is book-kept like a real turn");
+    }
+
+    /// While a USER turn is active, its own relay owns every frame — the watcher
+    /// must not double-deliver.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frames_during_an_active_turn_are_left_to_the_turn_relay() {
+        let rig = rig().await;
+        let claim = rig
+            .runtime_state
+            .try_claim_turn("conv-1", "turn-user")
+            .expect("claimed");
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "in-turn text the relay owns".into(),
+            }))
+            .unwrap();
+        rig.tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            rows_of_type(&rig, "text").await.is_empty(),
+            "the watcher must stay out of an active turn"
+        );
+        drop(claim);
+    }
+}

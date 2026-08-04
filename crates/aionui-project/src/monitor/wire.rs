@@ -58,7 +58,7 @@ pub struct ResourceRef {
     pub relative_path: String,
 }
 
-/// Content encoding for `fs/read` / `fs/write`.
+/// Content encoding for `fs/read`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Encoding {
@@ -100,14 +100,6 @@ pub struct ReadParams {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResolveParams {
     pub file: ResourceRef,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct WriteParams {
-    pub file: ResourceRef,
-    pub content: String,
-    #[serde(default)]
-    pub encoding: Option<Encoding>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

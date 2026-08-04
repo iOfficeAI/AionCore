@@ -13,12 +13,17 @@ pub(crate) const CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const CLI_VERSION_RECHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Successful probe evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProbeSuccess {
     /// Wall-clock cost of the `--version` run; 0 when the version step was skipped.
     pub(crate) duration_ms: u64,
     /// Whether `--version` actually ran (false for `skip_version_probe` agents).
     pub(crate) version_checked: bool,
+    /// First non-empty line the CLI printed, when the probe ran and produced
+    /// one. The probe already spends a process launch on `--version` and used
+    /// to discard the output; a caller that cares which version is installed
+    /// would otherwise have to run it a second time.
+    pub(crate) reported_version: Option<String>,
 }
 
 /// Classified probe failure. The split matters: a corrupted install fails
@@ -93,6 +98,7 @@ pub(crate) async fn validate_with_budget(meta: &AgentMetadata, budget: Duration)
         return Ok(ProbeSuccess {
             duration_ms: 0,
             version_checked: false,
+            reported_version: None,
         });
     }
     validate_version_with_timeout(&path, budget).await
@@ -127,6 +133,7 @@ async fn validate_version_with_timeout(path: &std::path::Path, budget: Duration)
         return Ok(ProbeSuccess {
             duration_ms,
             version_checked: true,
+            reported_version: first_nonempty_line(&output.stdout),
         });
     }
 
@@ -170,6 +177,29 @@ mod tests {
             resolve_and_validate_command(path.to_str().unwrap()).await.unwrap(),
             path
         );
+    }
+
+    #[tokio::test]
+    async fn version_probe_carries_the_reported_version() {
+        // The availability path decides agy drift from this. Discarding it
+        // (as the probe used to) would mean a second `--version` launch, or —
+        // as shipped — no drift warning at connection-test time at all.
+        let (_dir, path) = executable_script("agent-cli", "#!/bin/sh\nprintf '1.1.8\\n'\n");
+        let ok = validate_version_with_timeout(&path, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(ok.reported_version.as_deref(), Some("1.1.8"));
+    }
+
+    #[tokio::test]
+    async fn a_silent_cli_reports_no_version_rather_than_an_empty_one() {
+        // Some CLIs exit 0 without printing. `Some("")` would be read as a
+        // parseable version and could produce a bogus drift verdict.
+        let (_dir, path) = executable_script("agent-cli", "#!/bin/sh\nexit 0\n");
+        let ok = validate_version_with_timeout(&path, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(ok.reported_version, None);
     }
 
     #[tokio::test]

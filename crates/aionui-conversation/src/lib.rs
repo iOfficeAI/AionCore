@@ -3,6 +3,7 @@
 //! Conversation and message CRUD with streaming relay and event emission.
 mod acp_error_recovery;
 mod agent_health_policy;
+mod background_stream;
 mod convert;
 pub mod error;
 pub(crate) mod message_cursor;

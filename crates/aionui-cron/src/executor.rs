@@ -344,7 +344,12 @@ impl JobExecutor {
         };
 
         let session_mode = session_mode.map(str::trim).filter(|value| !value.is_empty());
-        let is_acp_conversation = row.r#type == AgentType::Acp.serde_name();
+        // Antigravity included: it too resolves a full-auto mode for scheduled
+        // runs, and dropping it here left the job asking for approval nobody is
+        // there to give — the run then stalls or, worse, proceeds once the CLI
+        // stops waiting for its hook.
+        let persists_runtime_mode =
+            row.r#type == AgentType::Acp.serde_name() || row.r#type == AgentType::Antigravity.serde_name();
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
         if !extra.is_object() {
             extra = serde_json::json!({});
@@ -382,7 +387,7 @@ impl JobExecutor {
                 .map_err(CronError::Database)?;
         }
 
-        if is_acp_conversation && let Some(mode) = session_mode {
+        if persists_runtime_mode && let Some(mode) = session_mode {
             self.conversation_service
                 .save_acp_runtime_mode(&row.user_id, conversation_id, mode)
                 .await?;

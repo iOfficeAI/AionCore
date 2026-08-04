@@ -126,19 +126,6 @@ pub struct CompareResult {
     pub unstaged: Vec<FileChangeInfo>,
 }
 
-// ---------------------------------------------------------------------------
-// ZIP
-// ---------------------------------------------------------------------------
-
-/// A single entry to include in a ZIP archive.
-#[derive(Debug, Clone)]
-pub enum ZipEntry {
-    /// In-memory text content.
-    Text { name: String, content: String },
-    /// Read from a file on disk.
-    Disk { name: String, file_path: String },
-}
-
 /// Result of a batch copy operation.
 #[derive(Debug, Clone)]
 pub struct CopyResult {

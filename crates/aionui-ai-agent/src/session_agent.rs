@@ -187,6 +187,27 @@ struct CatalogPreload {
     current_mode: Option<String>,
 }
 
+/// Per-model reasoning efforts out of the persisted `available_models` column.
+///
+/// The catalog is written by `catalog_partial_from_caps` as
+/// `{available_models:[{id,label,reasoning_efforts?}]}`. Rows written before
+/// that field existed simply have none, so a stale catalog degrades to "no
+/// effort axis" rather than failing to parse.
+fn efforts_for_model(available_models: Option<&serde_json::Value>, model_id: &str) -> Vec<String> {
+    let Some(list) = available_models
+        .and_then(|v| v.get("available_models"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    list.iter()
+        .find(|entry| entry.get("id").and_then(|v| v.as_str()) == Some(model_id))
+        .and_then(|entry| entry.get("reasoning_efforts"))
+        .and_then(|v| v.as_array())
+        .map(|efforts| efforts.iter().filter_map(|e| e.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default()
+}
+
 impl CatalogPreload {
     /// Parse the persisted handshake's `available_models` / `available_modes`
     /// columns into the live-capabilities shape. Reuses the ACP path's
@@ -210,7 +231,13 @@ impl CatalogPreload {
                         id: m.model_id.to_string(),
                         name: m.name.clone(),
                         description: m.description.clone(),
-                        reasoning_efforts: Vec::new(),
+                        // Read straight from the stored JSON: the ACP
+                        // `SessionModelState` this comes from has no effort
+                        // axis, so the parser cannot carry it through.
+                        reasoning_efforts: efforts_for_model(
+                            handshake.available_models.as_ref(),
+                            &m.model_id.to_string(),
+                        ),
                     })
                     .collect::<Vec<_>>();
                 let current = state.current_model_id.to_string();
@@ -490,6 +517,21 @@ impl SessionAgentTask {
     /// live `AcpPermission` frame so a duplicate live+recovered pair de-dups. Options
     /// mirror the live translation: AskUserQuestion → its question options, else the
     /// generic allow/deny.
+    /// Raise a tool approval that came from OUTSIDE the backend's stream and
+    /// block until the user answers.
+    ///
+    /// Only Antigravity uses this: agy cannot prompt in headless mode, so its
+    /// `PreToolUse` hook calls AionUi over HTTP instead, and that request lands
+    /// here. Backends that raise permissions on their own wire return `Denied`
+    /// from the trait default and never reach this path.
+    pub async fn request_external_permission(
+        &self,
+        tool_name: String,
+        input: serde_json::Value,
+    ) -> aionui_session::PermissionDecision {
+        self.backend.request_external_permission(tool_name, input).await
+    }
+
     pub fn get_confirmations(&self) -> Vec<aionui_common::Confirmation> {
         self.backend
             .pending_permission_requests()
@@ -1205,6 +1247,56 @@ pub struct SessionBuildInputs<'a> {
     /// spawn-time `session-cli-config` dump AND threads it (with the vendor
     /// label) into the `SessionAgentTask` for the send-time dump.
     pub prompt_dump_dir: Option<std::path::PathBuf>,
+    /// Antigravity only: the prepared `.agents/hooks.json` body, so a session
+    /// switched out of full auto can restore its approval gate.
+    pub permission_hook_body: Option<String>,
+}
+
+/// The mode a session actually starts on.
+///
+/// The persisted snapshot wins over the create-time seed: it is where a runtime
+/// switch lands (`save_acp_runtime_mode`) and where a scheduled run records the
+/// full-auto mode it resolved. Reading only `config.session_mode` would see the
+/// value the conversation was created with and miss both.
+///
+/// Aliases are normalized to the backend-native id here, so callers compare
+/// against catalog values rather than whatever spelling reached the API.
+/// The reasoning effort a session should open with: what `set_config_option`
+/// persisted, else the create-time seed.
+///
+/// Mirrors the `mode`/`model` precedence — snapshot over seed — and is a free
+/// function so the precedence is testable without standing up a backend.
+///
+/// NOT claude-scoped. It was, on the grounds that "codex effort rides
+/// collaborationMode via SetMode"; measured false — codex accepts
+/// `SetConfigOption{effort|reasoning_effort|thought_level}` and writes
+/// `thread/settings/update {"effort":…}`. The gate meant a codex conversation
+/// persisted its effort and lost it on every rebuild.
+pub(crate) fn resolved_effort(
+    config: &aionui_api_types::AcpBuildExtra,
+    session_snapshot: Option<&PersistedSessionState>,
+) -> Option<String> {
+    session_snapshot
+        .and_then(|s| {
+            s.config_selections
+                .iter()
+                .find(|(k, _)| k.as_str() == EFFORT_CONFIG_KEY)
+                .map(|(_, v)| v.as_str().to_owned())
+        })
+        .or_else(|| config.thought_level.clone())
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn resolved_session_mode(
+    config: &AcpBuildExtra,
+    session_snapshot: Option<&PersistedSessionState>,
+    metadata: &aionui_api_types::AgentMetadata,
+) -> Option<String> {
+    session_snapshot
+        .and_then(|s| s.current_mode_id.as_ref().map(|m| m.as_str().to_owned()))
+        .or_else(|| config.session_mode.clone())
+        .map(|m| crate::manager::acp::mode_normalize::normalize_requested_mode(metadata, &m))
+        .filter(|s| !s.is_empty())
 }
 
 /// The pure spec + mode/model mapping — the sibling of clean-slate's
@@ -1243,11 +1335,7 @@ fn spec_mode_model(
     // the catalog row's `yolo_id` / backend label; a mode without an alias passes
     // through unchanged. Runs BEFORE the codex sandbox/approval derivation downstream
     // (which matches both the alias and the native id, so ordering is safe).
-    let mode = session_snapshot
-        .and_then(|s| s.current_mode_id.as_ref().map(|m| m.as_str().to_owned()))
-        .or_else(|| config.session_mode.clone())
-        .map(|m| crate::manager::acp::mode_normalize::normalize_requested_mode(metadata, &m))
-        .filter(|s| !s.is_empty());
+    let mode = resolved_session_mode(config, session_snapshot, metadata);
     let model = session_snapshot
         .and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned()))
         .or_else(|| config.current_model_id.clone())
@@ -1262,6 +1350,116 @@ fn spec_mode_model(
 /// assembly (`crates/aionui-app/src/session_runtime/mod.rs`): it resolves the
 /// resume spec, the mode/model precedence, the MCP + preset + skills init surface,
 /// the claude cc-switch provider env, and the codex sandbox/approval policy — so a
+/// Build an Antigravity (`agy` CLI) `SessionAgentTask`.
+///
+/// Deliberately SEPARATE from [`build_session_instance`]: that function carries
+/// claude/codex-private assembly — cc-switch provider env, the codex
+/// sandbox/approval derivation, persisted-effort replay, and a binary
+/// `if claude { "claude" } else { "codex" }` label that would silently
+/// mislabel any third backend. Antigravity needs none of it, so it shares this
+/// module's helpers (`spec_mode_model`, the MCP fold, `assemble_spawn_env`,
+/// `spawn_catalog_writeback`) without entering that path.
+pub async fn build_antigravity_instance(
+    inputs: SessionBuildInputs<'_>,
+    spawner: Arc<dyn aionui_process::Spawner>,
+) -> Result<crate::agent_task::AgentInstance, AgentError> {
+    use aionui_session::{AntigravityConnection, BackendConnection, McpServerSpec, SessionConfig, SessionInit};
+
+    let SessionBuildInputs {
+        conversation_id,
+        user_id,
+        workspace,
+        config,
+        metadata,
+        session_snapshot,
+        backend_session_id,
+        mcp_server_repo,
+        runtime_env,
+        broadcaster,
+        catalog_writeback,
+        acp_session_repo,
+        // agy has no prompt-dump lane yet (the dev dump is keyed by a
+        // claude/codex label); skip it rather than mislabel the dump.
+        prompt_dump_dir: _,
+        permission_hook_body,
+    } = inputs;
+
+    let (spec, mode, model) = spec_mode_model(&conversation_id, backend_session_id, config, session_snapshot, metadata);
+
+    // Same MCP init surface and ordering as the claude/codex path: user servers
+    // resolved from the repo, plus the inline snapshot, with the team
+    // coordination server PREPENDED.
+    let mut neutral = match mcp_server_repo {
+        Some(repo) => {
+            crate::mcp_resolve::resolve_session_mcp_servers(
+                repo.as_ref(),
+                &user_id,
+                config.mcp_server_ids.as_deref(),
+                &conversation_id,
+                broadcaster.clone(),
+            )
+            .await
+        }
+        None => Vec::new(),
+    };
+    neutral.extend(config.session_mcp_servers.iter().cloned());
+    let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
+    if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
+        let mut coordination = vec![team_mcp_server_spec(cfg)];
+        coordination.append(&mut mcp_servers);
+        mcp_servers = coordination;
+    }
+
+    let init = SessionInit {
+        mcp_servers,
+        skills: config.skills.clone(),
+        preset_context: config.preset_context.clone(),
+        session_snapshot: None,
+        resume: matches!(spec, aionui_session::SessionSpec::Resume { .. }),
+    };
+
+    let mut session_config = SessionConfig {
+        cwd: Some(workspace.clone()),
+        model,
+        mode,
+        init,
+        permission_hook_body,
+        // agy is NOT shipped with the app: it is a large native binary the user
+        // installs themselves, so there is no bundled path to resolve and the
+        // backend always spawns the `agy` on PATH.
+        cli_program: None,
+        ..Default::default()
+    };
+    session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
+
+    let backend = AntigravityConnection::new(spawner)
+        .open_session(spec, session_config)
+        .await
+        .map_err(|e| match e {
+            aionui_session::BackendError::WorkspaceUnavailable(path) => {
+                AgentError::workspace_path_runtime_unavailable(path)
+            }
+            e => AgentError::bad_gateway(format!("open antigravity session: {e}")),
+        })?;
+
+    if let Some((agent_id, catalog_tx)) = catalog_writeback {
+        spawn_catalog_writeback(agent_id, user_id.clone(), backend.clone(), catalog_tx);
+    }
+
+    let task = SessionAgentTask::new_with_preload(
+        AgentType::Antigravity,
+        conversation_id,
+        user_id,
+        workspace,
+        backend,
+        acp_session_repo,
+        &metadata.handshake,
+        None,
+        Some(broadcaster),
+    );
+    Ok(crate::agent_task::AgentInstance::Session(task))
+}
+
 /// claude/codex session started through the ACP factory is byte-equivalent to one
 /// started through the clean-slate registry.
 pub async fn build_session_instance(
@@ -1293,6 +1491,8 @@ pub async fn build_session_instance(
         catalog_writeback,
         acp_session_repo,
         prompt_dump_dir,
+        // claude/codex gate through CLI flags, not an installed hook file.
+        permission_hook_body: _,
     } = inputs;
 
     // GAP #1/#2 — the pure spec + mode/model mapping (resume anchor → Resume/Fresh,
@@ -1419,20 +1619,22 @@ pub async fn build_session_instance(
     // #4 — the persisted reasoning-effort level (claude only). There is no spawn-time
     // effort flag (effort rides a post-open control_request, NOT `--`args like
     // model/mode), so it cannot go into `SessionConfig`; instead we re-apply it AFTER
-    // open. codex effort is not a standalone selection (it rides collaborationMode via
-    // SetMode), so this is claude-scoped. Read from the snapshot's config_selections
-    // (the map `set_config_option` persisted under EFFORT_CONFIG_KEY).
-    let persisted_effort = (backend_label == "claude")
-        .then(|| {
-            session_snapshot.and_then(|s| {
-                s.config_selections
-                    .iter()
-                    .find(|(k, _)| k.as_str() == EFFORT_CONFIG_KEY)
-                    .map(|(_, v)| v.as_str().to_owned())
-            })
-        })
-        .flatten()
-        .filter(|s| !s.is_empty());
+    // open. Snapshot first (what `set_config_option` persisted under
+    // EFFORT_CONFIG_KEY), then the create-time seed — the same precedence
+    // `mode` and `model` above already use.
+    //
+    // NOT claude-scoped. It was, on the grounds that "codex effort rides
+    // collaborationMode via SetMode" — measured false: codex accepts
+    // `SetConfigOption{effort|reasoning_effort|thought_level}` and writes
+    // `thread/settings/update {"effort":"high"}` (codex_conn.rs, and confirmed
+    // live through the HTTP config-options endpoint). The gate meant a codex
+    // conversation persisted its effort and then silently lost it on every
+    // rebuild.
+    //
+    // The seed leg closes the other half: `extra.thought_level` has been
+    // carried from the new-conversation screen all along and nothing ever read
+    // it, so an effort chosen before the first turn was dropped.
+    let persisted_effort = resolved_effort(config, session_snapshot);
 
     // DEV (`--dump-prompts`): dump the resolved SessionConfig BEFORE it moves
     // into open_session. Best-effort — a failure only warns, never fails open.
@@ -1688,6 +1890,17 @@ fn team_mcp_server_spec(cfg: &aionui_api_types::TeamMcpStdioConfig) -> aionui_se
 /// Verbatim port of clean-slate `session_runtime::spawn_catalog_writeback`: wait
 /// for MODELS specifically before committing (codex answers modes before models),
 /// forwarding the best model-less partial only if the window elapses.
+/// How often the write-back re-reads `capabilities()`.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+/// When to publish modes/commands even though no models have shown up (5s).
+/// A backend that never reports models must not be held back by the longer
+/// window below.
+const INTERIM_PUBLISH_TICKS: usize = 100;
+/// How long to keep watching for a LATE model list (35s). agy discovers models
+/// by running `agy models` off the open path — ~3s cold and slower on a bad
+/// network, which the 5s deadline alone could not cover.
+const MODEL_WINDOW_TICKS: usize = 700;
+
 pub fn spawn_catalog_writeback(
     agent_id: String,
     user_id: String,
@@ -1696,7 +1909,8 @@ pub fn spawn_catalog_writeback(
 ) {
     tokio::spawn(async move {
         let mut best_partial = None;
-        for _ in 0..100 {
+        let mut interim_sent = false;
+        for tick in 0..MODEL_WINDOW_TICKS {
             let caps = backend.capabilities();
             if let Some(partial) = catalog_partial_from_caps(&caps) {
                 if !caps.available_models.is_empty() {
@@ -1707,9 +1921,18 @@ pub fn spawn_catalog_writeback(
                 // Modes/commands only so far — remember it, keep waiting for models.
                 best_partial = Some(partial);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Publish what we have at the original deadline so a backend that
+            // legitimately has no model list (claude/codex fill capabilities
+            // from the handshake) is not held back by the longer model window.
+            if tick + 1 == INTERIM_PUBLISH_TICKS
+                && let Some(partial) = best_partial.clone()
+            {
+                catalog_tx.send_partial(user_id.clone(), agent_id.clone(), partial);
+                interim_sent = true;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
-        if let Some(partial) = best_partial {
+        if !interim_sent && let Some(partial) = best_partial {
             catalog_tx.send_partial(user_id, agent_id, partial);
         }
     });
@@ -1742,6 +1965,36 @@ fn catalog_partial_from_caps(caps: &aionui_session::Capabilities) -> Option<aion
             "currentValue": caps.current_model,
             "options": caps.available_models.iter().map(|m| serde_json::json!({
                 "value": m.id, "name": m.name, "description": m.description,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    // Reasoning-effort ("thought level") select. The new-conversation screen
+    // builds its effort picker from `config_options` ALONE —
+    // `buildAgentRuntimeThoughtLevelOption` looks up category `thought_level`
+    // and, unlike mode, has no fallback to a top-level column. Without this the
+    // control is simply absent exactly where the choice is made.
+    //
+    // Offered for any backend whose models advertise efforts: claude and codex
+    // both do, and both accept `SetConfigOption{reasoning_effort}` (verified
+    // live). A backend with no effort axis — agy folds it into the model id —
+    // yields an empty list and no option, rather than a dead control.
+    let efforts = resolve_current_model_efforts(&caps.available_models, caps.current_model.as_deref());
+    if !efforts.is_empty() {
+        config_options.push(serde_json::json!({
+            "id": "reasoning_effort",
+            "category": "thought_level",
+            "type": "select",
+            // Deliberately NOT `caps.current_effort`. That field means "the
+            // level THIS session last set" — claude remembers it because the
+            // CLI never echoes effort back (capability.rs), and codex does not
+            // track it at all. This catalog is agent-level and shared by every
+            // conversation, so writing a session's level here would make one
+            // conversation's choice the default for all of them. The picker
+            // offers the levels; the chosen one travels per-conversation via
+            // `extra.thought_level`.
+            "currentValue": serde_json::Value::Null,
+            "options": efforts.iter().map(|e| serde_json::json!({
+                "value": e, "name": e,
             })).collect::<Vec<_>>(),
         }));
     }
@@ -1779,9 +2032,20 @@ fn catalog_partial_from_caps(caps: &aionui_session::Capabilities) -> Option<aion
     });
     let available_models = (!caps.available_models.is_empty()).then(|| {
         serde_json::json!({
-            "available_models": caps.available_models.iter().map(|m| serde_json::json!({
-                "id": m.id, "label": m.name,
-            })).collect::<Vec<_>>(),
+            "available_models": caps.available_models.iter().map(|m| {
+                let mut entry = serde_json::json!({ "id": m.id, "label": m.name });
+                // Per-model reasoning efforts (claude's `supportedEffortLevels`).
+                // Dropped here until now, so the persisted catalog carried only
+                // {id,label} and the thought-level picker could not be rebuilt
+                // from it — see `CatalogPreload::from_handshake`. Omitted rather
+                // than written empty for models that have none, keeping the
+                // column byte-identical for every backend that has no effort
+                // axis (agy folds effort into the model id; codex has none).
+                if !m.reasoning_efforts.is_empty() {
+                    entry["reasoning_efforts"] = serde_json::json!(m.reasoning_efforts);
+                }
+                entry
+            }).collect::<Vec<_>>(),
             "current_model_id": caps.current_model,
         })
     });
@@ -1961,6 +2225,18 @@ fn spawn_event_pump(
         // terminal arm below closes every remaining entry with a `Canceled` frame
         // BEFORE the Finish (the relay stops forwarding a turn at Finish).
         let mut open_tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // Live progress ledgers for running workflows (container task_id → card).
+        // A Workflow's tool_result lands the instant it is LAUNCHED, so its call is
+        // never in `open_tools` and the terminal arms below cannot settle it; these
+        // cards are settled explicitly alongside them (search: settle_workflow_cards).
+        let mut workflow_cards: std::collections::HashMap<String, crate::workflow_progress::WorkflowCard> =
+            std::collections::HashMap::new();
+        // Arguments of each tool call, kept so a workflow progress frame can re-send
+        // them. The persisted row is merged with JSON merge-patch and `args` has no
+        // `skip_serializing_if`, so emitting it as null would DELETE the stored
+        // arguments; and a workflow outlives the turn whose `tool_name` map is
+        // cleared at settlement, so it cannot rely on `stamp_tool_name` either.
+        let mut tool_args: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
         // Did the CURRENT turn emit any user-visible output (text / thinking / tool /
         // plan / permission)? Mirrors the ACP path's `is_empty_turn` (agent_session_flow.rs):
         // a clean terminal with this still `false` is a "blank reply" (ELECTRON-1JG) and
@@ -1990,7 +2266,40 @@ fn spawn_event_pump(
         // window precisely: a trailing result rides the OLD gen (FIFO stdout), the
         // next turn's frames ride the new gen.
         let mut last_seen_turn_gen: u64 = 0;
-        while let Some(env) = events.next().await {
+        // 1s heartbeat for live progress cards. A background task has NO frames
+        // between task_started and its terminal notification (verified: the
+        // 2.1.220 bg capture goes 27 task_started → 41 task_updated with nothing
+        // in between), so without this the card's clock froze at 00:00 for the
+        // whole runtime. Each tick re-renders open cards; the throttle/dedup in
+        // `take_emission` keeps this to at most ~1 frame/s per card, and the
+        // select arm is disabled entirely while no card is open.
+        let mut progress_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let env = tokio::select! {
+                maybe_env = events.next() => match maybe_env {
+                    Some(env) => env,
+                    None => break,
+                },
+                _ = progress_tick.tick(), if !workflow_cards.is_empty() => {
+                    let now = aionui_common::now_ms();
+                    for card in workflow_cards.values_mut() {
+                        let Some((card_frame, agents)) = card.take_emission(now, false) else {
+                            continue;
+                        };
+                        let data = crate::protocol::events::WorkflowProgressData {
+                            card: card_frame,
+                            agents,
+                        };
+                        // Delivery is uniform: in-turn the per-turn relay consumes
+                        // this, between turns the conversation's background stream
+                        // watcher does (forward + persist). The pump no longer
+                        // broadcasts directly — that produced un-persisted frames.
+                        let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+                    }
+                    continue;
+                }
+            };
             runtime.touch();
             tracing::debug!(conv_id = %conversation_id, event = session_event_name(&env.event), "session-pump: backend event");
 
@@ -2012,6 +2321,50 @@ fn spawn_event_pump(
                 workflow_inflight.clear();
                 finish_suppressed_pending = false;
                 synthetic_finish_emitted = false;
+            }
+
+            // The deferred DUPLICATE terminal: claude ends a turn twice — the
+            // real-time `--include-partial-messages` boundary first, then the
+            // `result` frame (often ~1s later, or minutes later when background
+            // tasks defer it). The first one settled the turn: per-turn
+            // accumulators were reset, so processing the second would fabricate
+            // an empty-turn `ACP_EMPTY_TURN` tip and a stray Finish. Before the
+            // background-stream watcher those landed in a dead channel and were
+            // invisible; with out-of-turn delivery they became a spurious notice
+            // bubble in the conversation (live 2026-08-03, conv 0be95fea).
+            // Swallow the whole envelope. `terminal_result_seen` resets on
+            // turn_gen advance/TurnStarted, so a NEW turn's terminal is never
+            // confused with a duplicate of the old one.
+            if terminal_result_seen {
+                match &env.event {
+                    SessionEvent::TurnResult { .. } => {
+                        tracing::info!(
+                            conv_id = %conversation_id,
+                            "session-pump: swallowing deferred duplicate terminal (turn already settled)"
+                        );
+                        continue;
+                    }
+                    // CONTENT after a settled terminal means a CLI-INITIATED turn
+                    // is starting (claude never sends TurnStarted and no Send
+                    // bumps turn_gen for it) — re-arm so that turn's own real
+                    // terminal is processed instead of being mistaken for the
+                    // deferred duplicate. Bookkeeping frames (usage, task roster,
+                    // BackendBound/Provisioning) deliberately do NOT re-arm: they
+                    // routinely trail a settled turn.
+                    SessionEvent::MessageDelta { .. }
+                    | SessionEvent::ThoughtDelta { .. }
+                    | SessionEvent::ToolCall { .. }
+                    | SessionEvent::ToolResult { .. }
+                    | SessionEvent::Permission { .. } => {
+                        tracing::info!(
+                            conv_id = %conversation_id,
+                            event = session_event_name(&env.event),
+                            "session-pump: content after settled terminal — CLI-initiated turn begins"
+                        );
+                        terminal_result_seen = false;
+                    }
+                    _ => {}
+                }
             }
 
             // Empty-turn diagnostic Tip to emit for THIS terminal, if the turn was a
@@ -2163,6 +2516,23 @@ fn spawn_event_pump(
                 continue;
             }
 
+            // Project a running workflow's roster to the UI. Everything a workflow
+            // does after launch arrives ONLY as these task frames, so without this
+            // the conversation shows nothing at all for the whole flight.
+            for data in update_workflow_cards(
+                &mut workflow_cards,
+                &tool_name,
+                &tool_args,
+                &env.event,
+                aionui_common::now_ms(),
+                &conversation_id,
+            ) {
+                // Uniform delivery: the per-turn relay consumes this in-turn; the
+                // conversation's background stream watcher consumes it between
+                // turns (forward + persist), so no pump-side broadcast bypass.
+                let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+            }
+
             // Track in-flight workflow/subagent refs so a non-blocking Workflow's
             // intermediate `result` frame does not prematurely terminate the turn.
             // Mirrors `state::background_active`: a ref is in-flight while its status
@@ -2248,6 +2618,21 @@ fn spawn_event_pump(
                             // absorbed teardown, not a mid-turn crash (see
                             // `crash_outcome`).
                             terminal_result_seen = true;
+                            // The workflow was killed: close its progress card too.
+                            // It is NOT in `open_tools` — a Workflow's tool_result
+                            // lands at launch — so the drain below cannot reach it.
+                            // keep_background=false: the interrupt kills background
+                            // tasks silently (no task frames follow), so their
+                            // cards must settle NOW or spin forever.
+                            for data in settle_workflow_cards(
+                                &mut workflow_cards,
+                                crate::workflow_progress::CardStatus::Cancelled,
+                                false,
+                                aionui_common::now_ms(),
+                                &conversation_id,
+                            ) {
+                                let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+                            }
                             // Same per-turn closure the real terminal arm performs:
                             // close every tool call left open as Canceled BEFORE the
                             // Finish (the relay stops forwarding the turn at Finish).
@@ -2309,9 +2694,16 @@ fn spawn_event_pump(
                 // Track the call's open/closed lifecycle. Also remember the name for
                 // `stamp_tool_name` — the map was previously never populated, so
                 // ToolOutputDelta/ToolResult follow-up frames went out nameless.
-                SessionEvent::ToolCall { tool_use_id, name, .. } => {
+                SessionEvent::ToolCall {
+                    tool_use_id,
+                    name,
+                    input,
+                    ..
+                } => {
                     tool_name.insert(tool_use_id.clone(), name.clone());
                     open_tools.insert(tool_use_id.clone(), name.clone());
+                    // Kept for a workflow progress frame to re-send (see `tool_args`).
+                    tool_args.insert(tool_use_id.clone(), input.clone());
                 }
                 SessionEvent::ToolResult { tool_use_id, .. } => {
                     open_tools.remove(tool_use_id);
@@ -2325,6 +2717,28 @@ fn spawn_event_pump(
                     // result): emit a terminal `Canceled` frame per call so the
                     // persisted row leaves "work" and the frontend spinner stops.
                     // Must precede the Finish emitted by the translate loop below.
+                    // Same reasoning as the cancel-drain above: a workflow still
+                    // running when the turn ends (crash, dropped result) would
+                    // otherwise spin forever, since its call left `open_tools` at
+                    // launch. Background-task cards are DIFFERENT: outliving a
+                    // CLEAN turn end is their normal life (they settle on their own
+                    // task_notification, possibly during a later turn) — but a
+                    // cancelled/errored turn or a dead process takes them down too,
+                    // since no notification will ever follow those.
+                    let keep_background = matches!(
+                        &env.event,
+                        SessionEvent::TurnResult { is_error: false, outcome, .. }
+                            if !matches!(outcome, aionui_session::TurnOutcome::Cancelled { .. })
+                    );
+                    for data in settle_workflow_cards(
+                        &mut workflow_cards,
+                        crate::workflow_progress::CardStatus::Cancelled,
+                        keep_background,
+                        aionui_common::now_ms(),
+                        &conversation_id,
+                    ) {
+                        let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+                    }
                     for (call_id, name) in open_tools.drain() {
                         tracing::info!(
                             conv_id = %conversation_id,
@@ -2401,6 +2815,15 @@ fn spawn_event_pump(
                 // the row's name to "". Runs before any routing decision below;
                 // no-op on non-ToolCall frames (e.g. the suppressed Finish).
                 stamp_tool_name(&mut tool_name, &mut ev);
+                // While a progress card is LIVE on a tool call, no translated
+                // frame may repaint that call terminal. The launching call's own
+                // tool_result lands one frame AFTER task_started (verified:
+                // claude_2.1.220_background_bash_turn.ndjsonl frames 27→28), and
+                // its `completed` status was flipping the card green at 00:00 for
+                // the task's whole runtime (live 2026-08-03, the local_agent
+                // test). The card's own settle frame carries the real terminal
+                // once the task actually ends.
+                shield_live_card_status(&workflow_cards, &mut ev);
                 // Record whether this turn produced user-visible output, so a clean
                 // terminal with none is detected as a blank reply (see the terminal
                 // match arm above). Checked against the translated frame so the
@@ -2832,6 +3255,254 @@ fn ask_user_question_options(
 /// onto any later empty-name frame for the same `call_id`, mirroring the reference
 /// `BackendOutputSink::emit_tool_result`, which re-sends the name on completion.
 /// `names` is the pump-local map (cleared per turn); non-`ToolCall` events are inert.
+/// Fold one workflow event into its container's ledger, returning any progress
+/// frames that should go out now.
+///
+/// A card is created ONLY for a `local_workflow` container. A background bash's
+/// task frames carry a `tool_use_id` belonging to a tool call INSIDE a workflow
+/// agent, which never appeared as a `tool_use` on the main stream — keying a card
+/// on it would conjure a blank tool card out of nowhere.
+/// Keep a live progress card's tool call visually RUNNING against later frames.
+///
+/// The launching call's own terminal (`tool_result`, or a turn-end Canceled
+/// close) arrives while the background task is still going; forwarding its
+/// status verbatim repaints the card terminal with nothing left to flip it back
+/// — a background task has no mid-flight frames to re-assert itself (unlike a
+/// workflow's ~1/s progress stream). Only the status is rewritten: the frame's
+/// output (e.g. the task-id text) still flows through.
+fn shield_live_card_status(
+    cards: &std::collections::HashMap<String, crate::workflow_progress::WorkflowCard>,
+    ev: &mut AgentStreamEvent,
+) {
+    let AgentStreamEvent::ToolCall(data) = ev else {
+        return;
+    };
+    if data.status == ToolCallStatus::Running {
+        return;
+    }
+    if cards.values().any(|c| c.call_id() == data.call_id) {
+        data.status = ToolCallStatus::Running;
+    }
+}
+
+fn update_workflow_cards(
+    cards: &mut std::collections::HashMap<String, crate::workflow_progress::WorkflowCard>,
+    tool_name: &std::collections::HashMap<String, String>,
+    tool_args: &std::collections::HashMap<String, serde_json::Value>,
+    event: &SessionEvent,
+    now_ms: i64,
+    conversation_id: &str,
+) -> Vec<crate::protocol::events::WorkflowProgressData> {
+    use crate::protocol::events::WorkflowProgressData;
+    use crate::workflow_progress::{AgentDetail, CardStatus, WorkflowCard};
+    use aionui_session::{SubagentStatus, SubagentTaskKind};
+
+    let mut out = Vec::new();
+    match event {
+        SessionEvent::SubagentUpdate {
+            r#ref,
+            status,
+            kind,
+            parent_ref,
+            ..
+        } => match status {
+            SubagentStatus::PendingInit | SubagentStatus::Running => {
+                // Admission: only a DECLARED container (`kind` rides task_started
+                // alone) that has not been seen yet.
+                if kind.is_none() || cards.contains_key(r#ref) {
+                    return out;
+                }
+                let is_workflow = matches!(kind, Some(SubagentTaskKind::WorkflowContainer));
+                let Some(call_id) = parent_ref.clone() else {
+                    if is_workflow {
+                        // Never seen in any capture; without the launching tool
+                        // call's id there is no card to attach progress to.
+                        tracing::warn!(
+                            conv_id = %conversation_id,
+                            task_id = %r#ref,
+                            "session-pump: workflow container has no parent tool call; progress will not render"
+                        );
+                    }
+                    return out;
+                };
+                if is_workflow {
+                    let name = tool_name
+                        .get(&call_id)
+                        .cloned()
+                        .unwrap_or_else(|| "Workflow".to_owned());
+                    let args = tool_args.get(&call_id).cloned().unwrap_or(serde_json::Value::Null);
+                    cards.insert(r#ref.clone(), WorkflowCard::new(call_id.clone(), name, args, now_ms));
+                    tracing::info!(
+                        conv_id = %conversation_id,
+                        task_id = %r#ref,
+                        %call_id,
+                        "session-pump: workflow progress card opened"
+                    );
+                } else {
+                    // Background bash / background Task subagent. The card is only
+                    // opened when the parent is a tool call SEEN ON THE MAIN
+                    // STREAM: a workflow-INTERNAL bash also declares `local_bash`,
+                    // but its tool_use_id belongs to a call inside a workflow
+                    // agent that never surfaced as a main-stream tool_use —
+                    // opening a card for it would conjure a blank tool card.
+                    // (Main-agent linkage verified: task_started.tool_use_id ==
+                    // the main-stream Bash/Agent tool_use id — see the fixture
+                    // citations on `CardKind`.)
+                    let Some(name) = tool_name.get(&call_id).cloned() else {
+                        return out;
+                    };
+                    let args = tool_args.get(&call_id).cloned().unwrap_or(serde_json::Value::Null);
+                    // The launching call's own words for what it started.
+                    let desc = args
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| args.get("command").and_then(|v| v.as_str()))
+                        .map(str::to_string);
+                    let mut card = WorkflowCard::new_background(call_id.clone(), name, args, r#ref, desc, now_ms);
+                    tracing::info!(
+                        conv_id = %conversation_id,
+                        task_id = %r#ref,
+                        %call_id,
+                        "session-pump: background task card opened"
+                    );
+                    // No roster will ever arrive to trigger a first emission, so
+                    // the card must emit the moment it opens — this is the frame
+                    // that flips the already-completed launching call back to a
+                    // live running row.
+                    if let Some((card_frame, agents)) = card.take_emission(now_ms, true) {
+                        out.push(WorkflowProgressData {
+                            card: card_frame,
+                            agents,
+                        });
+                    }
+                    cards.insert(r#ref.clone(), card);
+                }
+            }
+            terminal => {
+                let Some(mut card) = cards.remove(r#ref) else {
+                    return out;
+                };
+                let status = match terminal {
+                    SubagentStatus::Completed => CardStatus::Completed,
+                    SubagentStatus::Errored => CardStatus::Errored,
+                    _ => CardStatus::Cancelled,
+                };
+                card.settle(status);
+                tracing::info!(
+                    conv_id = %conversation_id,
+                    task_id = %r#ref,
+                    call_id = %card.call_id(),
+                    ?status,
+                    agents = card.agent_count(),
+                    elapsed_ms = card.elapsed_ms(now_ms),
+                    "session-pump: workflow progress card settled"
+                );
+                if let Some((card, agents)) = card.take_emission(now_ms, true) {
+                    out.push(WorkflowProgressData { card, agents });
+                }
+            }
+        },
+        SessionEvent::SubagentDetail {
+            r#ref,
+            parent_ref,
+            label,
+            loop_state,
+            model,
+            tokens,
+            tool_calls,
+            last_tool_name,
+            phase_index,
+            phase_title,
+            last_tool_summary,
+            duration_ms,
+        } => {
+            // parent_ref is the container task_id; a detail for an unknown container
+            // has no card (e.g. it arrived after settlement).
+            let Some(card) = parent_ref.as_ref().and_then(|t| cards.get_mut(t)) else {
+                return out;
+            };
+            let forced = card.upsert_agent(
+                r#ref,
+                AgentDetail {
+                    label: label.clone(),
+                    phase_index: *phase_index,
+                    phase_title: phase_title.clone(),
+                    model: model.clone(),
+                    loop_state: *loop_state,
+                    tokens: *tokens,
+                    tool_calls: *tool_calls,
+                    last_tool_name: last_tool_name.clone(),
+                    last_tool_summary: last_tool_summary.clone(),
+                    duration_ms: *duration_ms,
+                },
+            );
+            if let Some((card, agents)) = card.take_emission(now_ms, forced) {
+                out.push(WorkflowProgressData { card, agents });
+            }
+        }
+        SessionEvent::WorkflowPhase { task_id, index, title } => {
+            let Some(card) = cards.get_mut(task_id) else {
+                return out;
+            };
+            let forced = card.declare_phase(*index, title.clone());
+            if let Some((card, agents)) = card.take_emission(now_ms, forced) {
+                out.push(WorkflowProgressData { card, agents });
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Close out every open workflow card, e.g. because the turn is ending or the
+/// backend died.
+///
+/// The companion to the `open_tools` drain at each terminal — and NOT covered by
+/// it: a Workflow's `tool_result` arrives at LAUNCH, so its call left `open_tools`
+/// long ago. Without this a killed or crashed workflow leaves its container card
+/// and every agent row spinning forever, and `hasRunningToolMessages` keeps the
+/// conversation's running indicator lit with nothing left to clear it.
+fn settle_workflow_cards(
+    cards: &mut std::collections::HashMap<String, crate::workflow_progress::WorkflowCard>,
+    status: crate::workflow_progress::CardStatus,
+    // Background tasks legitimately OUTLIVE their turn (that is their whole
+    // point, and #732 made sure they no longer hold the turn open), so a clean
+    // turn end must NOT settle them — they settle on their own task_notification.
+    // A cancelled/errored turn or a dead process settles everything: after an
+    // interrupt the CLI emits no task frames for a plain background bash
+    // (samples/claude-cli/2.1.220/_all_workflow_interrupt.jsonl, per #732), so
+    // waiting for a notification that never comes would strand the card spinning.
+    keep_background: bool,
+    now_ms: i64,
+    conversation_id: &str,
+) -> Vec<crate::protocol::events::WorkflowProgressData> {
+    use crate::protocol::events::WorkflowProgressData;
+    let doomed: Vec<String> = cards
+        .iter()
+        .filter(|(_, c)| !(keep_background && c.is_background()))
+        .map(|(k, _)| k.clone())
+        .collect();
+    if doomed.is_empty() {
+        return Vec::new();
+    }
+    tracing::info!(
+        conv_id = %conversation_id,
+        open_cards = doomed.len(),
+        kept_background = cards.len() - doomed.len(),
+        ?status,
+        "session-pump: settling workflow progress cards at turn end"
+    );
+    doomed
+        .into_iter()
+        .filter_map(|k| {
+            let mut card = cards.remove(&k)?;
+            card.settle(status);
+            card.take_emission(now_ms, true)
+                .map(|(card, agents)| WorkflowProgressData { card, agents })
+        })
+        .collect()
+}
+
 fn stamp_tool_name(names: &mut std::collections::HashMap<String, String>, ev: &mut AgentStreamEvent) {
     let AgentStreamEvent::ToolCall(data) = ev else {
         return;
@@ -2864,6 +3535,10 @@ fn event_is_user_visible_output(event: &AgentStreamEvent) -> bool {
             | AgentStreamEvent::Permission(_)
             | AgentStreamEvent::AcpPermission(_)
     )
+    // Deliberately absent: WorkflowProgress. It is an out-of-band refresh of a
+    // card the turn already produced, not the turn saying something — counting it
+    // would suppress the blank-reply tip on a turn that only launched a workflow
+    // and then said nothing.
 }
 
 /// Build the empty-turn diagnostic Tip for a clean terminal that produced no
@@ -3192,16 +3867,28 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         // turn that is already running (or immediately re-settled by the turn's terminal
         // Finish), so it does not manufacture a spurious idle timer the way a config frame
         // would. `NoticeLevel` has only Info/Warning (no Error tier), matching TipType.
-        SessionEvent::Notice { level, message } => {
+        SessionEvent::Notice {
+            level,
+            message,
+            localized,
+        } => {
             let tip_type = match level {
                 aionui_session::NoticeLevel::Info => TipType::Info,
                 aionui_session::NoticeLevel::Warning => TipType::Warning,
             };
+            // `content` stays the English text even when a code travels with it:
+            // the frontend passes it as i18next's `defaultValue`, so a locale
+            // that has not translated the key yet shows real prose instead of a
+            // raw key.
+            let (code, params) = match localized {
+                Some(l) => (Some(l.code), Some(serde_json::Value::Object(l.params))),
+                None => (None, None),
+            };
             vec![AgentStreamEvent::Tips(TipsEventData {
                 content: message,
                 tip_type,
-                code: None,
-                params: None,
+                code,
+                params,
             })]
         }
         // Events with no origin-side counterpart (or purely internal) are dropped.
@@ -3238,6 +3925,66 @@ mod build_mapping_tests {
     use super::*;
     use crate::shared_kernel::{ModeId, ModelId};
     use aionui_session::SessionSpec;
+
+    fn snapshot_with_effort(effort: &str) -> PersistedSessionState {
+        let mut s = PersistedSessionState::default();
+        s.config_selections.insert(
+            crate::shared_kernel::ConfigKey::new(EFFORT_CONFIG_KEY),
+            crate::shared_kernel::ConfigValue::new(effort),
+        );
+        s
+    }
+
+    fn extra_with_thought_level(level: Option<&str>) -> aionui_api_types::AcpBuildExtra {
+        aionui_api_types::AcpBuildExtra {
+            backend: Some("codex".into()),
+            thought_level: level.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_codex_session_restores_its_persisted_effort() {
+        // Was gated on `backend_label == "claude"` because "codex effort rides
+        // collaborationMode via SetMode". Measured false: codex accepts
+        // SetConfigOption{effort} and writes thread/settings/update. The gate
+        // meant codex persisted an effort and lost it on every rebuild.
+        assert_eq!(
+            resolved_effort(&extra_with_thought_level(None), Some(&snapshot_with_effort("high"))),
+            Some("high".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_create_time_effort_seed_is_applied() {
+        // `extra.thought_level` has been carried from the new-conversation
+        // screen all along and nothing read it, so an effort chosen before the
+        // first turn was silently dropped.
+        assert_eq!(
+            resolved_effort(&extra_with_thought_level(Some("xhigh")), None),
+            Some("xhigh".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_persisted_effort_outranks_the_seed() {
+        // Same precedence as mode/model: what the user changed mid-session wins
+        // over what they picked when creating it.
+        assert_eq!(
+            resolved_effort(
+                &extra_with_thought_level(Some("low")),
+                Some(&snapshot_with_effort("max"))
+            ),
+            Some("max".to_owned())
+        );
+    }
+
+    #[test]
+    fn no_effort_anywhere_stays_none() {
+        assert_eq!(resolved_effort(&extra_with_thought_level(None), None), None);
+        // An empty seed is not a choice.
+        assert_eq!(resolved_effort(&extra_with_thought_level(Some("")), None), None);
+    }
 
     fn snapshot(mode: Option<&str>, model: Option<&str>) -> PersistedSessionState {
         PersistedSessionState {
@@ -3917,6 +4664,7 @@ mod translate_tests {
                 SessionEvent::Notice {
                     level,
                     message: "set effort: rejected by agent".into(),
+                    localized: None,
                 },
                 "conv-1",
                 false,
@@ -5663,6 +6411,468 @@ mod pump_tests {
         );
     }
 
+    fn wf_frames(frames: &[AgentStreamEvent]) -> Vec<&crate::protocol::events::WorkflowProgressData> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                AgentStreamEvent::WorkflowProgress(d) => Some(d),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn wf_detail(r#ref: &str, label: &str, state: aionui_session::WorkflowLoopState) -> aionui_session::SessionEvent {
+        SessionEvent::SubagentDetail {
+            r#ref: r#ref.into(),
+            parent_ref: Some("task-wf".into()),
+            label: Some(label.into()),
+            loop_state: Some(state),
+            model: Some("global.anthropic.claude-opus-4-8".into()),
+            tokens: Some(8_600),
+            tool_calls: Some(1),
+            last_tool_name: Some("Bash".into()),
+            last_tool_summary: Some("sleep 8".into()),
+            duration_ms: None,
+            phase_index: Some(1),
+            phase_title: Some("Run".into()),
+        }
+    }
+
+    fn wf_container(
+        status: aionui_session::SubagentStatus,
+        kind: Option<aionui_session::SubagentTaskKind>,
+    ) -> SessionEvent {
+        SessionEvent::SubagentUpdate {
+            r#ref: "task-wf".into(),
+            label: Some("wf".into()),
+            status,
+            parent_ref: Some("toolu_wf".into()),
+            kind,
+        }
+    }
+
+    /// Everything a workflow does after launch arrives ONLY as task frames, which
+    /// the pump used to consume silently — the conversation showed nothing for the
+    /// entire flight. The pump must now project that roster as it moves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workflow_progress_streams_while_the_workflow_runs() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind, WorkflowLoopState};
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_wf".into(),
+                name: "Workflow".into(),
+                subagent: aionui_session::SubagentKind::Workflow,
+                input: serde_json::json!({"script": "phase('Run')"}),
+                parent_tool_use_id: None,
+            }),
+            env(wf_container(
+                SubagentStatus::Running,
+                Some(SubagentTaskKind::WorkflowContainer),
+            )),
+            env(SessionEvent::WorkflowPhase {
+                task_id: "task-wf".into(),
+                index: 1,
+                title: "Run".into(),
+            }),
+            env(wf_detail("1", "run:A", WorkflowLoopState::Progress)),
+            env(wf_detail("2", "run:B", WorkflowLoopState::Progress)),
+            env(wf_detail("1", "run:A", WorkflowLoopState::Done)),
+            env(wf_container(SubagentStatus::Completed, None)),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+        ];
+        let frames = drain_script(script).await;
+        let progress = wf_frames(&frames);
+        assert!(
+            progress.len() >= 2,
+            "the roster must stream as it moves, got {} frame(s)",
+            progress.len()
+        );
+
+        // Every frame updates the card the user already sees, and re-sends the
+        // identity fields the persisted row would otherwise lose.
+        for p in &progress {
+            assert_eq!(p.card.call_id, "toolu_wf", "keyed to the Workflow tool call");
+            assert_eq!(p.card.name, "Workflow", "name must survive the merge-patch");
+            assert_eq!(
+                p.card.args,
+                serde_json::json!({"script": "phase('Run')"}),
+                "args must be re-sent or the persisted row loses them"
+            );
+            assert!(p.card.description.is_some(), "headline is always visible");
+        }
+
+        // The last frame is the settled one: container Completed, every agent row
+        // terminal, and the FULL roster present.
+        let last = progress.last().unwrap();
+        assert_eq!(last.card.status, ToolCallStatus::Completed);
+        assert_eq!(last.agents.len(), 2, "full roster, not a delta: {:?}", last.agents);
+        assert!(
+            last.agents.iter().all(|a| a.status.is_terminal()),
+            "no agent row may keep spinning after the workflow completes: {:?}",
+            last.agents
+        );
+        let names: Vec<&str> = last.agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["run:A", "run:B"],
+            "stable insertion order keys the group row"
+        );
+    }
+
+    /// A WORKFLOW-INTERNAL background bash's `task_started` carries a
+    /// `tool_use_id` belonging to a tool call INSIDE a workflow agent — it never
+    /// appeared as a tool_use on the main stream. Opening a card for it would
+    /// conjure a blank tool card. This is what separates it from a MAIN-AGENT
+    /// background task (below): the admission rule is main-stream parent
+    /// membership, not the task kind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workflow_internal_task_opens_no_progress_card() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let script = vec![
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-bash".into(),
+                label: Some("local_bash".into()),
+                status: SubagentStatus::Running,
+                parent_ref: Some("toolu_inner_never_seen".into()),
+                kind: Some(SubagentTaskKind::Other),
+            }),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+        ];
+        let frames = drain_script(script).await;
+        assert!(
+            wf_frames(&frames).is_empty(),
+            "a container whose parent never surfaced on the main stream gets no card, got {:?}",
+            frames.iter().map(frame_name).collect::<Vec<_>>()
+        );
+    }
+
+    /// A MAIN-AGENT background task (bash `run_in_background` or a background
+    /// Task subagent) is background work exactly like a workflow — it used to be
+    /// completely invisible after launch. Its `task_started.tool_use_id` points at
+    /// the main-stream launching call (verified:
+    /// `claude_2.1.220_background_bash_turn.ndjsonl` for local_bash,
+    /// `claude_2.1.169_single_tool_turn.ndjson` for local_agent), so its card
+    /// rides that call. Shape mirrors the local_bash capture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_bash_gets_a_live_card_and_settles_on_notification() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let bg_update = |status: SubagentStatus, kind: Option<SubagentTaskKind>| {
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "bu9nidbf6".into(),
+                label: None,
+                status,
+                parent_ref: Some("toolu_bg".into()),
+                kind,
+            })
+        };
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_bg".into(),
+                name: "Bash".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({
+                    "command": "sleep 15 && echo BG_DONE",
+                    "description": "Sleep 15 seconds then echo BG_DONE",
+                    "run_in_background": true
+                }),
+                parent_tool_use_id: None,
+            }),
+            // task_started declares the container (kind rides only this frame).
+            bg_update(SubagentStatus::Running, Some(SubagentTaskKind::Other)),
+            // The launching call's own terminal lands one frame AFTER
+            // task_started (capture frames 27→28). Untranslated it would repaint
+            // the live card completed/green; the shield must keep it Running.
+            env(SessionEvent::ToolResult {
+                tool_use_id: "toolu_bg".into(),
+                is_error: false,
+                content: vec![aionui_session::ToolResultContent::Text(
+                    "Command running in background with ID: bu9nidbf6".into(),
+                )],
+                parent_tool_use_id: None,
+            }),
+            // The launch turn ends CLEANLY while the task still runs — its card
+            // must survive (outliving the turn is a background task's whole
+            // point).
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+            // The task's own terminal, arriving AFTER the turn (capture: the
+            // notification carries no kind; success reported as "stopped").
+            bg_update(SubagentStatus::Interrupted, None),
+        ];
+        let frames = drain_script(script).await;
+        let progress = wf_frames(&frames);
+        assert!(
+            progress.len() >= 2,
+            "open + settle must both emit, got {:?}",
+            frames.iter().map(frame_name).collect::<Vec<_>>()
+        );
+
+        let open = progress.first().unwrap();
+        assert_eq!(open.card.call_id, "toolu_bg", "card rides the launching Bash call");
+        assert_eq!(open.card.name, "Bash");
+        assert_eq!(
+            open.card.status,
+            ToolCallStatus::Running,
+            "flips the completed call live"
+        );
+        let desc = open.card.description.as_deref().unwrap_or_default();
+        assert!(
+            desc.contains("Sleep 15 seconds") && desc.contains("bu9nidbf6"),
+            "headline carries the call's own description and the task id (to name when stopping): {desc}"
+        );
+        assert!(
+            open.card.output.is_none(),
+            "no output — it would clobber the persisted task-id text via merge-patch"
+        );
+        assert!(open.agents.is_empty(), "a background task has no roster rows");
+
+        // The shield: after the card opened, NO translated tool_call frame may
+        // carry a terminal status for the launching call — the tool_result's
+        // `completed` (and any turn-end close) is rewritten to Running while the
+        // card lives. (live 2026-08-03: without this the card sat green at 00:00
+        // for the task's whole runtime.)
+        let first_progress = frames
+            .iter()
+            .position(|f| matches!(f, AgentStreamEvent::WorkflowProgress(_)))
+            .unwrap();
+        for f in &frames[first_progress..] {
+            if let AgentStreamEvent::ToolCall(d) = f
+                && d.call_id == "toolu_bg"
+            {
+                assert_eq!(
+                    d.status,
+                    ToolCallStatus::Running,
+                    "a live card's launching call must stay Running on the wire"
+                );
+            }
+        }
+
+        // The clean turn end must NOT have cancelled it; the settle comes from the
+        // task's own notification, after the turn.
+        let last = progress.last().unwrap();
+        assert_eq!(
+            last.card.status,
+            ToolCallStatus::Canceled,
+            "wire 'stopped' maps to canceled (neutral badge)"
+        );
+        let finish = frames
+            .iter()
+            .position(|f| matches!(f, AgentStreamEvent::Finish(_)))
+            .expect("the clean turn's Finish");
+        let settle = frames
+            .iter()
+            .rposition(|f| matches!(f, AgentStreamEvent::WorkflowProgress(_)))
+            .unwrap();
+        assert!(
+            settle > finish,
+            "the card settles AFTER the turn's Finish — it survived the turn end"
+        );
+    }
+
+    /// A CANCELLED turn takes background-task cards down with it: the interrupt
+    /// kills background tasks silently (no task frames follow — per the #732
+    /// capture), so waiting for a notification would strand the card spinning.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_turn_settles_background_cards() {
+        use aionui_session::{CancelReason, SubagentStatus, SubagentTaskKind};
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_bg".into(),
+                name: "Bash".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"command": "sleep 60", "run_in_background": true}),
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-bg".into(),
+                label: None,
+                status: SubagentStatus::Running,
+                parent_ref: Some("toolu_bg".into()),
+                kind: Some(SubagentTaskKind::Other),
+            }),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::Cancelled {
+                    reason: CancelReason::UserCancel,
+                },
+            }),
+        ];
+        let frames = drain_script(script).await;
+        let settled = wf_frames(&frames)
+            .into_iter()
+            .rev()
+            .find(|p| p.card.status == ToolCallStatus::Canceled);
+        assert!(
+            settled.is_some(),
+            "a cancelled turn must settle the background card, got {:?}",
+            frames.iter().map(frame_name).collect::<Vec<_>>()
+        );
+    }
+
+    /// claude ends a turn TWICE: the real-time partial-messages boundary, then
+    /// the deferred `result` frame. The second is a duplicate of an already
+    /// settled turn — reprocessing it fabricated an `ACP_EMPTY_TURN` tip (the
+    /// per-turn output flag was reset at the first terminal) plus a stray
+    /// Finish, which the out-of-turn watcher then faithfully delivered as a
+    /// spurious notice bubble (live 2026-08-03, conv 0be95fea).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_duplicate_terminal_is_swallowed_whole() {
+        let clean_result = || {
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            })
+        };
+        let script = vec![
+            env(SessionEvent::MessageDelta {
+                item_id: "m".into(),
+                text: "已启动".into(),
+            }),
+            clean_result(), // real-time boundary — settles the turn
+            clean_result(), // deferred `result` duplicate — must vanish entirely
+        ];
+        let frames = drain_script(script).await;
+        let seq: Vec<&str> = frames.iter().map(frame_name).collect();
+        let finishes = frames
+            .iter()
+            .filter(|f| matches!(f, AgentStreamEvent::Finish(_)))
+            .count();
+        assert_eq!(finishes, 1, "one turn, one Finish, got {seq:?}");
+        assert!(
+            !frames.iter().any(|f| matches!(f, AgentStreamEvent::Tips(_))),
+            "the duplicate must not fabricate an empty-turn tip, got {seq:?}"
+        );
+    }
+
+    /// The counterpart: content AFTER a settled terminal is a CLI-INITIATED turn
+    /// (the background-task report). Its own real terminal must be processed —
+    /// an over-eager duplicate guard would swallow it and leave the orphan turn
+    /// to die on the 180s idle valve instead of finishing cleanly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cli_initiated_turn_after_settled_terminal_gets_its_own_finish() {
+        let clean_result = || {
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            })
+        };
+        let script = vec![
+            env(SessionEvent::MessageDelta {
+                item_id: "m1".into(),
+                text: "已启动".into(),
+            }),
+            clean_result(), // launch turn settles
+            clean_result(), // deferred duplicate — swallowed
+            // …30s later the CLI starts its report turn: content re-arms.
+            env(SessionEvent::MessageDelta {
+                item_id: "m2".into(),
+                text: "BG_DONE".into(),
+            }),
+            clean_result(), // the report turn's own terminal — must be honoured
+        ];
+        let frames = drain_script(script).await;
+        let seq: Vec<&str> = frames.iter().map(frame_name).collect();
+        let finishes = frames
+            .iter()
+            .filter(|f| matches!(f, AgentStreamEvent::Finish(_)))
+            .count();
+        assert_eq!(finishes, 2, "launch turn + report turn, got {seq:?}");
+        assert!(
+            !frames.iter().any(|f| matches!(f, AgentStreamEvent::Tips(_))),
+            "neither turn is blank — no empty-turn tip, got {seq:?}"
+        );
+        // Both text segments made it out.
+        let texts = frames.iter().filter(|f| matches!(f, AgentStreamEvent::Text(_))).count();
+        assert_eq!(texts, 2, "launch reply AND report both stream, got {seq:?}");
+    }
+
+    /// A killed workflow emits NO result frame — only task frames. Its container
+    /// card is NOT in `open_tools` (a Workflow's tool_result lands at launch), so
+    /// the turn-end drain cannot close it. Without an explicit settle the card and
+    /// every agent row spin forever, and `hasRunningToolMessages` keeps the
+    /// conversation's running indicator lit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interrupted_workflow_settles_its_progress_card_before_finish() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind, WorkflowLoopState};
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_wf".into(),
+                name: "Workflow".into(),
+                subagent: aionui_session::SubagentKind::Workflow,
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+            }),
+            env(wf_container(
+                SubagentStatus::Running,
+                Some(SubagentTaskKind::WorkflowContainer),
+            )),
+            env(wf_detail("1", "run:A", WorkflowLoopState::Progress)),
+            // Launch result — suppressed, so the turn owes a Finish.
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+            // The kill: task frames only, no result ever follows.
+            env(wf_container(SubagentStatus::Interrupted, None)),
+        ];
+        let frames = drain_script(script).await;
+        let seq: Vec<&str> = frames.iter().map(frame_name).collect();
+
+        let settled = wf_frames(&frames)
+            .into_iter()
+            .rev()
+            .find(|p| p.card.status == ToolCallStatus::Canceled)
+            .unwrap_or_else(|| panic!("the killed workflow's card must be settled, got {seq:?}"));
+        assert!(
+            settled.agents.iter().all(|a| a.status.is_terminal()),
+            "every agent row must stop spinning on interrupt: {:?}",
+            settled.agents
+        );
+
+        // And it must precede the Finish: the relay stops forwarding at Finish.
+        let last_progress = frames
+            .iter()
+            .rposition(|f| matches!(f, AgentStreamEvent::WorkflowProgress(_)))
+            .expect("a progress frame");
+        let finish = frames
+            .iter()
+            .position(|f| matches!(f, AgentStreamEvent::Finish(_)))
+            .expect("the owed Finish");
+        assert!(
+            last_progress < finish,
+            "the settled card must be forwarded before the turn's Finish, got {seq:?}"
+        );
+    }
+
     // A workflow-launch result that is itself an ERROR is NOT suppressed — the user
     // must see a genuine failure even mid-workflow (suppression covers only clean
     // completion ordering, per the fixture invariant).
@@ -6864,5 +8074,265 @@ mod force_kill_tests {
             "non-UserCancel kill must not broadcast Finish/Error, got {terminal:?}"
         );
         assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Running));
+    }
+}
+
+#[cfg(test)]
+mod cold_start_effort_tests {
+    //! A resumed conversation rebuilds its pickers from the persisted catalog
+    //! before the live handshake lands. That catalog carried only `{id,label}`,
+    //! so the thought-level group was missing until the user left the
+    //! conversation and came back — nothing re-publishes config options when
+    //! the handshake arrives. Present since #609 moved claude/codex onto the
+    //! direct-CLI path.
+    use super::*;
+
+    fn handshake_with(models: serde_json::Value) -> aionui_api_types::AgentHandshake {
+        aionui_api_types::AgentHandshake {
+            available_models: Some(models),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_persisted_catalog_round_trips_per_model_efforts() {
+        let caps = aionui_session::Capabilities {
+            available_models: vec![aionui_session::ModelInfo {
+                id: "opus".into(),
+                name: "Opus".into(),
+                description: None,
+                reasoning_efforts: vec!["low".into(), "high".into()],
+            }],
+            current_model: Some("opus".into()),
+            ..Default::default()
+        };
+        let partial = catalog_partial_from_caps(&caps).expect("catalog");
+        let preload = CatalogPreload::from_handshake(&partial);
+
+        assert_eq!(
+            preload.available_models[0].reasoning_efforts,
+            vec!["low".to_owned(), "high".to_owned()],
+            "efforts must survive the write/read round trip, or a resumed \
+             conversation opens without a thought-level picker"
+        );
+        // The whole point: this is what feeds the picker.
+        assert_eq!(
+            resolve_current_model_efforts(&preload.available_models, Some("opus")),
+            vec!["low".to_owned(), "high".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_catalog_offers_an_effort_option() {
+        // The new-conversation screen builds its effort picker from
+        // `config_options` alone — `buildAgentRuntimeThoughtLevelOption` has no
+        // fallback to a top-level column the way mode does, so without this the
+        // control is absent exactly where the choice is made.
+        let caps = aionui_session::Capabilities {
+            available_models: vec![aionui_session::ModelInfo {
+                id: "gpt-5.6-sol".into(),
+                name: "GPT-5.6-Sol".into(),
+                description: None,
+                reasoning_efforts: vec!["low".into(), "high".into()],
+            }],
+            current_model: Some("gpt-5.6-sol".into()),
+            current_effort: Some("high".into()),
+            ..Default::default()
+        };
+        let partial = catalog_partial_from_caps(&caps).expect("catalog");
+        let effort = partial
+            .config_options
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .and_then(|a| {
+                a.iter()
+                    .find(|o| o.get("category").and_then(|v| v.as_str()) == Some("thought_level"))
+            })
+            .expect("an effort option must be offered")
+            .clone();
+        assert_eq!(effort["id"], "reasoning_effort");
+        // Agent-level catalog: a session's current level must not leak into it
+        // as everyone's default.
+        assert!(effort["currentValue"].is_null(), "{effort}");
+        assert_eq!(effort["options"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_backend_with_no_effort_axis_offers_no_option() {
+        // agy folds effort into the model id; an empty select renders a dead
+        // control.
+        let caps = aionui_session::Capabilities {
+            available_models: vec![aionui_session::ModelInfo {
+                id: "gemini-3.6-flash-low".into(),
+                name: "gemini-3.6-flash-low".into(),
+                description: None,
+                reasoning_efforts: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let partial = catalog_partial_from_caps(&caps).expect("catalog");
+        let has_effort = partial
+            .config_options
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .any(|o| o.get("category").and_then(|v| v.as_str()) == Some("thought_level"))
+            })
+            .unwrap_or(false);
+        assert!(!has_effort, "{:?}", partial.config_options);
+    }
+
+    #[test]
+    fn a_model_without_efforts_writes_no_key() {
+        // agy folds effort into the model id and codex has no effort axis;
+        // writing an empty array for them would change the stored column for
+        // every backend to fix one.
+        let caps = aionui_session::Capabilities {
+            available_models: vec![aionui_session::ModelInfo {
+                id: "gemini-3.6-flash-low".into(),
+                name: "gemini-3.6-flash-low".into(),
+                description: None,
+                reasoning_efforts: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let partial = catalog_partial_from_caps(&caps).expect("catalog");
+        let entry = &partial.available_models.as_ref().unwrap()["available_models"][0];
+        assert!(entry.get("reasoning_efforts").is_none(), "{entry}");
+    }
+
+    #[test]
+    fn a_catalog_written_before_this_field_still_loads() {
+        // Every row already in the database predates the field.
+        let preload = CatalogPreload::from_handshake(&handshake_with(serde_json::json!({
+            "available_models": [{"id": "opus", "label": "Opus"}],
+            "current_model_id": "opus",
+        })));
+        assert_eq!(preload.available_models.len(), 1);
+        assert!(preload.available_models[0].reasoning_efforts.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod catalog_writeback_tests {
+    //! When a backend discovers models LATE. agy runs `agy models` off the open
+    //! path (~3s cold, slower on a bad network), so the write-back must keep
+    //! watching well past the point where modes are already known.
+    use super::*;
+    use aionui_session::{Admission, Capabilities, CommandReceipt, ModeInfo, ModelInfo};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `catalog_partial_from_caps` nests the list under its own key alongside
+    /// `current_*`, so reach through that wrapper rather than the outer value.
+    fn nested_len(field: Option<&serde_json::Value>, key: &str) -> usize {
+        field
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    }
+
+    /// Reports modes immediately and models only after `polls_before_models`
+    /// calls to `capabilities()` — the write-back polls every 50ms, so the
+    /// count sets how late discovery lands.
+    struct LateModelsBackend {
+        polls: AtomicUsize,
+        polls_before_models: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for LateModelsBackend {
+        async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::NoTurn,
+                turn_gen: 0,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            let n = self.polls.fetch_add(1, Ordering::SeqCst);
+            let available_models = if n >= self.polls_before_models {
+                vec![ModelInfo {
+                    id: "gemini-3.6-flash-high".into(),
+                    name: "gemini-3.6-flash-high".into(),
+                    description: None,
+                    reasoning_efforts: Vec::new(),
+                }]
+            } else {
+                Vec::new()
+            };
+            Capabilities {
+                available_modes: vec![ModeInfo {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    description: None,
+                }],
+                available_models,
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Drain the channel until a message carrying models arrives, or the
+    /// write-back gives up. Returns every message it saw.
+    async fn collect_until_models(
+        rx: &mut tokio::sync::mpsc::Receiver<crate::registry::CatalogSyncMessage>,
+    ) -> Vec<crate::registry::CatalogSyncMessage> {
+        let mut seen = Vec::new();
+        while let Some(msg) = rx.recv().await {
+            let has_models = nested_len(msg.handshake.available_models.as_ref(), "available_models") > 0;
+            seen.push(msg);
+            if has_models {
+                break;
+            }
+        }
+        seen
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn models_discovered_after_the_interim_publish_still_reach_the_catalog() {
+        // 200 polls ≈ 10s: past the interim publish, well inside the model
+        // window. Before this fix the write-back stopped at 5s and the model
+        // picker stayed empty for the whole session with no error anywhere.
+        let backend = Arc::new(LateModelsBackend {
+            polls: AtomicUsize::new(0),
+            polls_before_models: 200,
+        });
+        let (tx, mut rx) = crate::registry::catalog_channel_for_test(16);
+        spawn_catalog_writeback("agent-1".into(), "user-1".into(), backend, tx);
+
+        let seen = collect_until_models(&mut rx).await;
+        let last = seen.last().expect("write-back published nothing at all");
+        assert_eq!(
+            nested_len(last.handshake.available_models.as_ref(), "available_models"),
+            1,
+            "late-discovered models never reached the catalog; saw {} message(s)",
+            seen.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backend_that_never_reports_models_still_publishes_its_modes() {
+        // claude/codex fill capabilities from the handshake and may legitimately
+        // have no model list. Waiting for the longer model window must not stop
+        // their modes from landing.
+        let backend = Arc::new(LateModelsBackend {
+            polls: AtomicUsize::new(0),
+            polls_before_models: usize::MAX,
+        });
+        let (tx, mut rx) = crate::registry::catalog_channel_for_test(16);
+        spawn_catalog_writeback("agent-2".into(), "user-2".into(), backend, tx);
+
+        let msg = rx.recv().await.expect("modes were never published");
+        assert_eq!(msg.agent_metadata_id, "agent-2");
+        assert!(
+            nested_len(msg.handshake.available_modes.as_ref(), "available_modes") > 0,
+            "expected the modes-only partial to be published"
+        );
     }
 }

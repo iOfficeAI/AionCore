@@ -25,6 +25,16 @@ const MANAGED_NODE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const MANAGED_NODE_DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MANAGED_NODE_DOWNLOAD_ATTEMPTS: usize = 2;
 const MANAGED_NODE_PROGRESS_STEP_BYTES: u64 = 5 * 1024 * 1024;
+// Local-copy activation retry budget. Kept separate from MANAGED_NODE_DOWNLOAD_ATTEMPTS:
+// download retries rely on HTTP reconnect delay, whereas a local copy retried with no
+// backoff would just re-hit the same file lock. 3 attempts with 250/500/1000ms backoff
+// adds worst-case ~1.75s before the final failure verdict.
+const MANAGED_NODE_ACTIVATION_COPY_ATTEMPTS: usize = 3;
+const MANAGED_NODE_ACTIVATION_COPY_BACKOFFS: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_millis(1000),
+];
 
 #[derive(Debug, Clone, Copy)]
 struct PlatformSpec {
@@ -412,22 +422,45 @@ async fn activate_local_runtime_source(
             )),
         );
 
-        if let Err(error) = managed_resources::materialize_directory(&source.root, &version_dir) {
-            warn!(
-                source = source_kind_label(source.kind),
-                source_root = %source.root.display(),
-                target_root = %version_dir.display(),
-                error = %error,
-                "failed to activate local node runtime source"
-            );
-            if matches!(source.kind, ManagedResourceSourceKind::Bundled) {
-                return Err(NodeRuntimeError::managed_invalid(format!(
-                    "bundled Node runtime is invalid under {}: {}",
-                    source.root.display(),
-                    error
-                )));
+        match activate_copy_with_retry(|| managed_resources::materialize_directory(&source.root, &version_dir)).await {
+            Ok(()) => {}
+            Err(ActivationCopyError::NonTransient(error)) => {
+                warn!(
+                    source = source_kind_label(source.kind),
+                    source_root = %source.root.display(),
+                    target_root = %version_dir.display(),
+                    error = %error,
+                    "failed to activate local node runtime source"
+                );
+                if matches!(source.kind, ManagedResourceSourceKind::Bundled) {
+                    // Non-transient copy failure (e.g. PermissionDenied) keeps the
+                    // existing hard-failure semantics so real problems still surface.
+                    return Err(NodeRuntimeError::managed_invalid(format!(
+                        "bundled Node runtime is invalid under {}: {}",
+                        source.root.display(),
+                        error
+                    )));
+                }
+                continue;
             }
-            continue;
+            Err(ActivationCopyError::Transient(error)) => {
+                warn!(
+                    source = source_kind_label(source.kind),
+                    source_root = %source.root.display(),
+                    target_root = %version_dir.display(),
+                    error = %error,
+                    "node activation copy failed after bounded retries; classifying as transient I/O"
+                );
+                if matches!(source.kind, ManagedResourceSourceKind::Bundled) {
+                    return Err(NodeRuntimeError::activation_io_failed(format!(
+                        "bundled Node runtime activation copy failed after {} attempts under {}: {}",
+                        MANAGED_NODE_ACTIVATION_COPY_ATTEMPTS,
+                        source.root.display(),
+                        error
+                    )));
+                }
+                continue;
+            }
         }
 
         match validate_managed_runtime(&version_dir, reporter).await {
@@ -861,7 +894,66 @@ fn http_status_error(stage: &str, url: &str, status: reqwest::StatusCode) -> Nod
     NodeRuntimeError::managed_invalid(format!("{stage} returned HTTP {} for {url}", status.as_u16()))
 }
 
+fn is_transient_activation_io_error(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::Interrupted {
+        return true;
+    }
+    // Windows-only transient copy errors: ERROR_NO_SYSTEM_RESOURCES (1450),
+    // ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33). These raw codes
+    // are meaningful only on Windows; do not treat the same integers as transient
+    // on other platforms.
+    #[cfg(windows)]
+    if let Some(code) = error.raw_os_error() {
+        return matches!(code, 1450 | 32 | 33);
+    }
+    false
+}
+
+enum ActivationCopyError {
+    /// All attempts failed with whitelisted transient errors (retries exhausted).
+    Transient(std::io::Error),
+    /// A non-whitelisted error stopped retries immediately.
+    NonTransient(std::io::Error),
+}
+
+/// Run the activation copy up to `MANAGED_NODE_ACTIVATION_COPY_ATTEMPTS` times.
+/// Retries only whitelisted transient I/O errors, sleeping the backoff between
+/// attempts. Non-transient errors return immediately without retry.
+async fn activate_copy_with_retry<C>(mut copy: C) -> Result<(), ActivationCopyError>
+where
+    C: FnMut() -> std::io::Result<()>,
+{
+    for attempt in 1..=MANAGED_NODE_ACTIVATION_COPY_ATTEMPTS {
+        match copy() {
+            Ok(()) => return Ok(()),
+            Err(error) if !is_transient_activation_io_error(&error) => {
+                return Err(ActivationCopyError::NonTransient(error));
+            }
+            Err(error) => {
+                warn!(
+                    attempt,
+                    max_attempts = MANAGED_NODE_ACTIVATION_COPY_ATTEMPTS,
+                    error = %error,
+                    "transient node activation copy failure; will retry after backoff"
+                );
+                tokio::time::sleep(MANAGED_NODE_ACTIVATION_COPY_BACKOFFS[attempt - 1]).await;
+                if attempt == MANAGED_NODE_ACTIVATION_COPY_ATTEMPTS {
+                    return Err(ActivationCopyError::Transient(error));
+                }
+            }
+        }
+    }
+    // The loop always returns on the final attempt.
+    unreachable!("activation copy retry loop always returns on the final attempt")
+}
+
 fn classify_error(error: &NodeRuntimeError) -> (NodeRuntimeFailureKind, Option<u16>) {
+    // An explicitly tagged failure kind is decided at the io::Error layer (e.g. a
+    // retry-exhausted transient copy failure) and must not be re-derived from the
+    // stringified message, which cannot distinguish copy vs validation failures.
+    if let Some(kind) = error.failure_kind() {
+        return (kind, None);
+    }
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("timed out") {
         return (NodeRuntimeFailureKind::Timeout, None);

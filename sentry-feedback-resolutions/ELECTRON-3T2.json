@@ -1,0 +1,17 @@
+{
+  "case": "ELECTRON-3T2",
+  "sentry_link": "https://iofficeai.sentry.io/issues/137518446/",
+  "status": "candidate-fixed",
+  "duplicate_of": "ELECTRON-3T0",
+  "fixed_by": [
+    "https://github.com/iOfficeAI/AionCore/pull/722"
+  ],
+  "fix_version": "aioncore next release after 0.1.54 (NOT in the user's AionUi 2.1.43)",
+  "verification": "log-confirmed second victim of the 3T0 encryption-key bug. Attachments (logs.gz 4MB, db-diagnostics.json) inspected: GET /api/providers repeatedly returns 400 'Decryption failed: invalid key or corrupted data' across the 04:00 session that produced the feedback. User is an upgrade user (startup-log-report 2026-07-29 on AionUi@2.1.42; feedback 2026-07-30 on 2.1.43). DB has 5 providers -> any one undecryptable row makes the whole list 400 (2.1.43 lacks #722's per-item lenient decrypt).",
+  "root_cause_summary": "Same root cause as ELECTRON-3T0 (silent encryption-key rotation on migration). User-visible symptom '添加模型连接不了' decoded from logs: POST /api/providers returns 201 (add succeeds) but the immediately-following GET /api/providers returns 400 (list decrypt fails for the pre-existing rows), so the newly-added model never renders / appears unusable. fetch-models and detect-protocol both 200 => network path is fine; the failure is local list decryption. Timeline shows 2026-07-30 00:39 startup served providers 200 (a non-race startup: same DB decrypts fine, data NOT permanently lost), then 01:01 startup onward stayed 400 across 04:00/05:44/07:00 restarts (high per-machine race hit-rate). CAVEAT confirmed against 3T0 note: providers created DURING a broken session (this user POSTed 201 several times while the list was 400) are encrypted under the in-memory wrong key and become permanently undecryptable even after a good restart; those rows must be deleted and re-added.",
+  "diagnostics_changed": false,
+  "report_path": "unknown",
+  "ledger_sidecar": "unknown",
+  "updated_at": "2026-07-30",
+  "needs_report_reconcile": false
+}

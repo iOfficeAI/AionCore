@@ -116,12 +116,50 @@ pub enum ToolCallStatus {
     Canceled,
 }
 
+/// Status vocabulary of a `tool_group` ENTRY.
+///
+/// Deliberately NOT [`ToolCallStatus`]: the two channels have different wire
+/// vocabularies on the frontend, and mixing them silently breaks the group.
+///
+/// - `tool_call` entries go through `normalizeToolCallStatus`, whose arms are
+///   lowercase (`running` / `completed` / `error` / `canceled`) — matching
+///   `ToolCallStatus`'s `rename_all = "snake_case"`.
+/// - `tool_group` entries go through `normalizeToolGroupStatus`, whose arms are
+///   the Gemini PascalCase set below, and whose `default:` arm returns
+///   **`running`**.
+///
+/// So a snake_case value here does not merely render oddly — it misses every arm,
+/// falls to `default:`, and pins the entry to a permanent spinner. It also keeps
+/// `hasRunningToolMessages` true forever, which lights the conversation's running
+/// indicator with nothing to ever clear it. (The frontend type is
+/// `IMessageToolGroup['content'][number]['status']`.)
+///
+/// `ToolGroupEntry` previously reused `ToolCallStatus`; that was latent because no
+/// production code emitted a `ToolGroup` — only a relay test did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolGroupStatus {
+    Pending,
+    Confirming,
+    Executing,
+    Success,
+    Error,
+    Canceled,
+}
+
+impl ToolGroupStatus {
+    /// Terminal = the entry will not change again (drives the group row's
+    /// persisted `finish` status).
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Success | Self::Error | Self::Canceled)
+    }
+}
+
 /// A single entry in a `ToolGroup` event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolGroupEntry {
     pub call_id: String,
     pub name: String,
-    pub status: ToolCallStatus,
+    pub status: ToolGroupStatus,
     #[serde(default)]
     pub description: Option<String>,
 }

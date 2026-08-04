@@ -18,7 +18,7 @@ pub use session_updates::{
 pub use tool_call::{
     AcpToolCallContentItem, AcpToolCallEventData, AcpToolCallKind, AcpToolCallLocationItem,
     AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallTextBlock, AcpToolCallTextBlockType,
-    AcpToolCallUpdateData, ToolCallEventData, ToolCallStatus, ToolGroupEntry,
+    AcpToolCallUpdateData, ToolCallEventData, ToolCallStatus, ToolGroupEntry, ToolGroupStatus,
 };
 pub(crate) use translate::{permission_request_to_event_data, session_notification_to_events};
 
@@ -64,6 +64,25 @@ pub enum AgentStreamEvent {
     /// under one turn). The relay consumes it internally and never forwards it
     /// to the WebSocket, so no frontend renderer is required.
     SegmentBreak,
+    /// Internal-only: one snapshot of a running workflow's progress.
+    ///
+    /// NOT forwarded to the WebSocket as-is. The relay projects it into the two
+    /// frames the frontend ALREADY renders — a `tool_call` (the container row:
+    /// headline in `description`, full phase tree in `output`) and a `tool_group`
+    /// (one entry per workflow agent, each with its own status badge) — so no new
+    /// frontend renderer is required.
+    ///
+    /// It exists as its own variant purely so the relay can special-case it:
+    /// a plain `ToolCall`/`ToolGroup` makes the relay close the active text
+    /// segment, and a workflow emits progress WHILE the assistant is streaming
+    /// its "workflow started" reply (claude runs with `--include-partial-messages`,
+    /// so that reply arrives as deltas). Reusing those variants would therefore
+    /// shatter that reply into one bubble per progress frame. The relay's arm for
+    /// this variant leaves `active_text`/`active_thinking` untouched.
+    ///
+    /// Never counts as user-visible turn output (see `event_is_user_visible_output`):
+    /// it is an out-of-band status refresh, not the turn "saying something".
+    WorkflowProgress(WorkflowProgressData),
     /// Internal-only signal: the tolerant transport layer absorbed a CodeBuddy
     /// dialect notification (`session_end` / `compact-maxtoken`) that the stock
     /// ACP schema hard-rejects as `-32602`. Consumed by the empty-turn judgment
@@ -131,6 +150,24 @@ pub enum AcpDialectSignalKind {
     /// Emergency auto-compaction / max-token pressure notification
     /// (`compact-maxtoken` message id or `codebuddy.ai/compactType` meta marker).
     TokenPressure,
+}
+
+/// Data for the internal-only [`AgentStreamEvent::WorkflowProgress`] event.
+///
+/// Carries both projections precomputed by the pump, so the relay stays a dumb
+/// forwarder: it never has to know how a workflow renders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowProgressData {
+    /// The container row, keyed by the Workflow tool call's `call_id` so it
+    /// updates the card the user already sees. Emitted as a `tool_call` frame.
+    pub card: ToolCallEventData,
+    /// One entry per workflow agent. Emitted as a `tool_group` frame.
+    ///
+    /// ALWAYS the FULL roster, never a delta: `persist_tool_group` replaces the
+    /// whole row's content and keys it by the FIRST entry's `call_id`, so a
+    /// partial list would erase the agents left out, and a reordered list would
+    /// insert a second row.
+    pub agents: Vec<ToolGroupEntry>,
 }
 
 /// Data for the internal-only [`AgentStreamEvent::AcpDialectSignal`] event.
@@ -288,13 +325,13 @@ mod tests {
             ToolGroupEntry {
                 call_id: "c1".into(),
                 name: "read".into(),
-                status: ToolCallStatus::Completed,
+                status: ToolGroupStatus::Success,
                 description: Some("Read file".into()),
             },
             ToolGroupEntry {
                 call_id: "c2".into(),
                 name: "write".into(),
-                status: ToolCallStatus::Running,
+                status: ToolGroupStatus::Executing,
                 description: None,
             },
         ];

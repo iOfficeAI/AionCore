@@ -14,7 +14,7 @@ use crate::mcp::TeamMcpStdioConfig;
 use crate::ports::TeamAssistantCatalogPort;
 use crate::ports::TeamConversationBindingLookup;
 use crate::service::inherit_team_workspace;
-use crate::service::spawn_support::{acp_backend_metadata, parse_agent_type, session_mode_for_backend};
+use crate::service::spawn_support::{agent_type_for_backend, cli_backend_metadata, session_mode_for_backend};
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::workspace::TeamWorkspaceResolver;
 
@@ -443,7 +443,7 @@ impl TeamAgentProvisioner {
     }
 
     async fn agent_capabilities(&self, user_id: &str, backend: &str) -> Result<Option<serde_json::Value>, TeamError> {
-        let Some(metadata) = acp_backend_metadata(&self.agent_metadata_repo, user_id, backend).await? else {
+        let Some(metadata) = cli_backend_metadata(&self.agent_metadata_repo, user_id, backend).await? else {
             return Ok(None);
         };
         let Some(raw) = metadata
@@ -463,13 +463,9 @@ impl TeamAgentProvisioner {
         agent: &TeamAgent,
         mcp_stdio_cfg: TeamMcpStdioConfig,
     ) -> Result<(), TeamError> {
-        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
-        let agent_type = if acp_metadata.is_some() {
-            AgentType::Acp
-        } else {
-            parse_agent_type(&agent.backend)?
-        };
-        let session_mode = session_mode_for_backend(&agent.backend, agent_type, acp_metadata.as_ref());
+        let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
+        let agent_type = agent_type_for_backend(cli_metadata.as_ref(), &agent.backend)?;
+        let session_mode = session_mode_for_backend(&agent.backend, agent_type, cli_metadata.as_ref());
         let patch = serde_json::json!({
             "team_mcp_stdio_config": mcp_stdio_cfg,
             "session_mode": session_mode,
@@ -490,13 +486,9 @@ impl TeamAgentProvisioner {
         user_id: &str,
         agent: &TeamAgent,
     ) -> Result<(), TeamError> {
-        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
-        let agent_type = if acp_metadata.is_some() {
-            AgentType::Acp
-        } else {
-            parse_agent_type(&agent.backend)?
-        };
-        let session_mode = session_mode_for_backend(&agent.backend, agent_type, acp_metadata.as_ref());
+        let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
+        let agent_type = agent_type_for_backend(cli_metadata.as_ref(), &agent.backend)?;
+        let session_mode = session_mode_for_backend(&agent.backend, agent_type, cli_metadata.as_ref());
         let patch = serde_json::json!({
             "team_mcp_stdio_config": null,
             "session_mode": session_mode,
@@ -571,12 +563,8 @@ impl TeamAgentProvisioner {
         workspace: Option<&str>,
         session_mode: Option<&str>,
     ) -> Result<ProvisionedConversation, TeamError> {
-        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, user_id, backend).await?;
-        let agent_type = if acp_metadata.is_some() {
-            AgentType::Acp
-        } else {
-            parse_agent_type(backend)?
-        };
+        let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, backend).await?;
+        let agent_type = agent_type_for_backend(cli_metadata.as_ref(), backend)?;
         let extra = self.build_team_extra(
             team_id,
             slot_id,
@@ -586,7 +574,7 @@ impl TeamAgentProvisioner {
             assistant_id,
             workspace,
             agent_type,
-            acp_metadata.as_ref(),
+            cli_metadata.as_ref(),
             session_mode,
         );
         let provider_id = if agent_type == AgentType::Aionrs {
@@ -692,14 +680,14 @@ impl TeamAgentProvisioner {
         assistant_id: Option<&str>,
         workspace: Option<&str>,
         agent_type: AgentType,
-        acp_metadata: Option<&AgentMetadataRow>,
+        cli_metadata: Option<&AgentMetadataRow>,
         session_mode: Option<&str>,
     ) -> serde_json::Value {
         let session_mode = session_mode
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
-            .unwrap_or_else(|| session_mode_for_backend(backend, agent_type, acp_metadata));
+            .unwrap_or_else(|| session_mode_for_backend(backend, agent_type, cli_metadata));
         let mut extra = serde_json::json!({
             "teamId": team_id,
             "slot_id": slot_id,

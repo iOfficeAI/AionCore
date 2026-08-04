@@ -411,6 +411,9 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // 009 R6b: SubagentDetail is the rich BACKGROUND-plane roster fill — read
         // ONLY by the orchestrator's workflow_roster, never by the FSM. No-op here.
         | SessionEvent::SubagentDetail { .. }
+        // WorkflowPhase is the container's declared phase list — display grouping
+        // only, same background plane as SubagentDetail. Never a turn signal.
+        | SessionEvent::WorkflowPhase { .. }
         // Addendum 9: BackendBound is a pure pass-through for the conversation
         // (persist backend_session_id). The reducer NEVER touches SessionState for
         // it — it is not a turn signal, not a requires-action, not a roster update.
@@ -1057,6 +1060,7 @@ mod tests {
             SessionEvent::Notice {
                 level: crate::event::NoticeLevel::Warning,
                 message: "advisory".into(),
+                localized: None,
             },
             SessionEvent::ItemStarted {
                 item_id: "i".into(),
@@ -1104,6 +1108,10 @@ mod tests {
                 tokens: None,
                 tool_calls: None,
                 last_tool_name: None,
+                phase_index: None,
+                phase_title: None,
+                last_tool_summary: None,
+                duration_ms: None,
             },
             SessionEvent::BackendSuspended,
         ];
@@ -1205,6 +1213,10 @@ mod tests {
                 tokens: None,
                 tool_calls: None,
                 last_tool_name: None,
+                phase_index: None,
+                phase_title: None,
+                last_tool_summary: None,
+                duration_ms: None,
             },
             SessionEvent::ToolOutputDelta {
                 item_id: "call_0".into(),
@@ -1216,6 +1228,7 @@ mod tests {
             SessionEvent::Notice {
                 level: crate::event::NoticeLevel::Warning,
                 message: "advisory".into(),
+                localized: None,
             },
             SessionEvent::ItemStarted {
                 item_id: "i".into(),
@@ -2241,6 +2254,10 @@ mod proptest_totality {
                 tokens: None,
                 tool_calls: None,
                 last_tool_name: None,
+                phase_index: None,
+                phase_title: None,
+                last_tool_summary: None,
+                duration_ms: None,
             }),
             // newer additive no-op signals — keep the no-panic/determinism sweep
             // touching them too.
@@ -2254,6 +2271,7 @@ mod proptest_totality {
             Just(SessionEvent::Notice {
                 level: crate::event::NoticeLevel::Warning,
                 message: "advisory".into(),
+                localized: None,
             }),
             Just(SessionEvent::SessionInfo {
                 context_usage: None,
