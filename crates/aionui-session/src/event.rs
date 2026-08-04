@@ -1389,13 +1389,14 @@ mod additive_tests {
             ("Rewound", SessionEvent::Rewound { to_turn: 1 }, BackendProduced, State),
         ];
 
-        // Tripwire: every SessionEvent variant must appear. 32 variants today
-        // (7 orchestration-lowered + 25 backend-produced, incl. Notice +
-        // ToolOutputDelta + TurnDiffUpdated + SessionInfo); AdapterSpecific appears
-        // twice for its raw-timing vs structured split → 33 rows. A new variant trips.
+        // Tripwire: every SessionEvent variant must appear. 33 variants today
+        // (7 orchestration-lowered + 26 backend-produced, incl. Notice +
+        // ToolOutputDelta + TurnDiffUpdated + SessionInfo + SessionTitle);
+        // AdapterSpecific appears twice for its raw-timing vs structured split
+        // → 34 rows. A new variant trips.
         assert_eq!(
             table.len(),
-            33,
+            34,
             "every SessionEvent variant (+ the AdapterSpecific timing split) must be routed here"
         );
 
