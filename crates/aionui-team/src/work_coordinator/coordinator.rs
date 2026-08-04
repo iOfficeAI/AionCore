@@ -964,6 +964,8 @@ impl SlotWorkCoordinator {
             turn_id: active.turn_id.clone(),
         });
         let snapshot = Self::slot_snapshot_locked(&state, slot_id).expect("paused slot exists");
+        drop(state);
+        self.publish_slot_work_snapshot(Some(snapshot.clone()));
         PauseWorkResult {
             cancel_target,
             slot: snapshot,

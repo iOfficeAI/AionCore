@@ -607,7 +607,7 @@ fn active_batch_prevents_unread_projection_from_being_rebuilt() {
 
 #[test]
 fn pause_cancels_running_batch_and_retains_queued_work() {
-    let coordinator = coordinator();
+    let (coordinator, recorder) = coordinator_with_recorder();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
     enqueue(&coordinator, WorkSource::UserMessage, "running");
     let ReconcileDecision::Claim(running) = coordinator.next("lead-1") else {
@@ -618,15 +618,45 @@ fn pause_cancels_running_batch_and_retains_queued_work() {
         StartCommitResult::Accepted
     );
     enqueue(&coordinator, WorkSource::McpSendMessage, "retained");
+    recorder.slot_work.lock().unwrap().clear();
 
     let paused = coordinator.pause_slot("lead-1");
     assert_eq!(paused.cancel_target.unwrap().batch, running);
+    {
+        let snapshots = recorder.slot_work.lock().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].state, SlotPhase::Paused);
+        assert_eq!(snapshots[0].active_turn_id.as_deref(), Some("turn-1"));
+    }
     assert_eq!(
         coordinator.cancel_batch(&running, "slot_paused"),
         CommitResult::Committed
     );
+    {
+        let snapshots = recorder.slot_work.lock().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[1].state, SlotPhase::Paused);
+        assert_eq!(snapshots[1].active_turn_id, None);
+    }
     assert_eq!(coordinator.next("lead-1"), ReconcileDecision::Quiescent);
     assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().queued_background_count, 1);
+}
+
+#[test]
+fn pause_queued_only_slot_publishes_paused_snapshot() {
+    let (coordinator, recorder) = coordinator_with_recorder();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::McpSendMessage, "queued");
+    recorder.slot_work.lock().unwrap().clear();
+
+    let paused = coordinator.pause_slot("lead-1");
+
+    assert!(paused.cancel_target.is_none());
+    let snapshots = recorder.slot_work.lock().unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].state, SlotPhase::Paused);
+    assert_eq!(snapshots[0].active_turn_id, None);
+    assert_eq!(snapshots[0].queued_background_count, 1);
 }
 
 #[test]
