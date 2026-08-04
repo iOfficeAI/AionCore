@@ -128,6 +128,7 @@ pub(super) async fn build(
             conversation_id: ctx.conversation_id.clone(),
             user_id: ctx.user_id.clone(),
             workspace: ctx.workspace.clone(),
+            is_custom_workspace: ctx.is_custom_workspace,
             config: &config,
             metadata: &meta,
             session_snapshot: build_context.session_snapshot.as_ref(),

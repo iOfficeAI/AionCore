@@ -1381,6 +1381,8 @@ pub async fn build_antigravity_instance(
         conversation_id,
         user_id,
         workspace,
+        // Workspace provenance only affects the Codex trust override.
+        is_custom_workspace: _,
         config,
         metadata,
         session_snapshot,
