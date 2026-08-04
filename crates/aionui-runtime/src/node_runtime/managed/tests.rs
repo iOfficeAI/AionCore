@@ -9,6 +9,215 @@ fn write_file(path: &Path) {
     std::fs::write(path, b"").expect("write file");
 }
 
+/// Resolve the bundled root the parent process handed down. The fixture must be
+/// built at exactly this path — the child gets a fresh `tempfile::tempdir()`, so
+/// re-deriving the path locally would point somewhere the env var never named.
+/// The directory itself lives under the parent's tempdir, so the parent's
+/// `TempDir` drop removes the fixture once the child exits.
+#[cfg(unix)]
+fn bundled_root_from_parent() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("AIONUI_BUNDLED_MANAGED_RESOURCES").expect("parent must pass the bundled resources root"),
+    )
+}
+
+/// Build a minimal bundled managed-Node source tree under `bundled_root` whose
+/// `bin/npm` reproduces the exact transient failure this issue latched: the
+/// first `fail_times` invocations exit 7 (as the real npm did on the reporter's
+/// machine), every later one prints the version. `node` and `npx` always
+/// succeed, so the verdict is driven solely by the npm probe.
+///
+/// Pass `fail_times` larger than `VERSION_PROBE_ATTEMPTS` to model a persistent
+/// failure instead of a transient one.
+///
+/// The failure counter lives in a file (not a process-local variable) because
+/// each probe attempt is a fresh `node.exe`-equivalent process — exactly like
+/// production, where nothing in-process survives between attempts.
+#[cfg(unix)]
+fn write_bundled_node_source_with_flaky_npm(bundled_root: &Path, directory_name: &str, fail_times: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source_root = bundled_root.join("node").join(directory_name);
+    let bin = source_root.join("bin");
+    std::fs::create_dir_all(&bin).expect("create bundled bin");
+    let counter = source_root.join("npm-attempts");
+
+    let write_script = |path: PathBuf, body: String| {
+        std::fs::write(&path, body).expect("write script");
+        let mut perms = std::fs::metadata(&path).expect("script metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod script");
+    };
+
+    write_script(bin.join("node"), "#!/bin/sh\necho v24.11.0\n".to_string());
+    write_script(bin.join("npx"), "#!/bin/sh\necho 11.6.2\n".to_string());
+    // `attempts` is read-modify-written per invocation; the probe is sequential
+    // (one command at a time in validate_runtime) so no locking is needed.
+    write_script(
+        bin.join("npm"),
+        format!(
+            "#!/bin/sh\n\
+             counter='{counter}'\n\
+             attempts=$(cat \"$counter\" 2>/dev/null || echo 0)\n\
+             attempts=$((attempts + 1))\n\
+             echo \"$attempts\" > \"$counter\"\n\
+             if [ \"$attempts\" -le {fail_times} ]; then\n\
+             \x20 exit 7\n\
+             fi\n\
+             echo 11.6.2\n",
+            counter = counter.display(),
+            fail_times = fail_times,
+        ),
+    );
+
+    counter
+}
+
+/// A transient `npm --version` failure inside the retry budget must be absorbed:
+/// `install_and_validate_with_reporter` succeeds and never reports a `Failed`
+/// phase, so AionUi is never told the installation is broken (spec AC1).
+///
+/// Unlike the `version_probe_*` unit tests — which inject a closure and so never
+/// execute `command_version_once` — this drives the real chain: spawn a real
+/// process, get a real exit code 7, through `command_version` →
+/// `validate_runtime` → `validate_managed_runtime` → the bundled activation path.
+///
+/// Unix-only: the fixture needs executable shell scripts as stand-ins for
+/// node/npm/npx. The retry logic itself is platform-independent, and the
+/// `version_probe_*` tests cover it on every platform.
+#[cfg(unix)]
+#[tokio::test]
+async fn transient_npm_version_failure_is_absorbed_without_failed_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bundled_root = tmp.path().join("bundled");
+    if !crate::test_support::run_in_env_child(
+        "node_runtime::managed::tests::transient_npm_version_failure_is_absorbed_without_failed_report",
+        |command| {
+            command.env("AIONUI_BUNDLED_MANAGED_RESOURCES", &bundled_root);
+        },
+    ) {
+        return;
+    }
+
+    let spec = platform_spec().expect("supported platform");
+    // Two failures then success: inside the 3-attempt budget.
+    let bundled_root = bundled_root_from_parent();
+    let counter = write_bundled_node_source_with_flaky_npm(&bundled_root, &spec.directory_name(), 2);
+
+    crate::cache::init(tmp.path().join("data"));
+    managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Bundled);
+
+    let updates = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reporter_updates = updates.clone();
+    let reporter = move |update: NodeRuntimeProgress| {
+        reporter_updates.lock().unwrap().push(update);
+    };
+
+    let result = install_and_validate_with_reporter(Some(&reporter)).await;
+    managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Download);
+
+    let runtime = result.expect("transient npm exit 7 must be absorbed by the probe retry");
+    assert_eq!(runtime.version, semver::Version::new(24, 11, 0));
+    assert_eq!(runtime.source, ResolvedNodeSource::Bundled);
+
+    // The activated copy carries its own counter file; the probe must really
+    // have failed before succeeding, otherwise this test would also pass
+    // against a build with no retry at all.
+    let activated_counter = runtime.root.join("npm-attempts");
+    let attempts: u32 = std::fs::read_to_string(&activated_counter)
+        .or_else(|_| std::fs::read_to_string(&counter))
+        .expect("npm attempt counter")
+        .trim()
+        .parse()
+        .expect("counter is a number");
+    assert_eq!(attempts, 3, "expected 2 failed npm probes then 1 success");
+
+    let updates = updates.lock().unwrap();
+    let failed: Vec<_> = updates
+        .iter()
+        .filter(|update| update.phase == crate::NodeRuntimeProgressPhase::Failed)
+        .map(|update| format!("{:?}/{:?}", update.failure_kind, update.message))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "a transient probe failure must not surface any Failed phase, got: {failed:?}"
+    );
+}
+
+/// The mirror of the test above: once the failure outlasts the retry budget it
+/// is a real failure and must still be reported as `bundled_resource_invalid`,
+/// so the fix cannot silently swallow a genuinely broken install (spec AC2/AC3).
+///
+/// `classify_error_still_detects_bundled_invalid_by_message` asserts the same
+/// classification from a hand-built error string; this one earns it through the
+/// real subprocess chain and checks what the reporter actually emits.
+#[cfg(unix)]
+#[tokio::test]
+async fn persistent_npm_version_failure_still_reports_bundled_resource_invalid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bundled_root = tmp.path().join("bundled");
+    if !crate::test_support::run_in_env_child(
+        "node_runtime::managed::tests::persistent_npm_version_failure_still_reports_bundled_resource_invalid",
+        |command| {
+            command.env("AIONUI_BUNDLED_MANAGED_RESOURCES", &bundled_root);
+        },
+    ) {
+        return;
+    }
+
+    let spec = platform_spec().expect("supported platform");
+    // Far beyond the 3-attempt budget: every probe fails.
+    let bundled_root = bundled_root_from_parent();
+    let counter = write_bundled_node_source_with_flaky_npm(&bundled_root, &spec.directory_name(), 1_000);
+
+    crate::cache::init(tmp.path().join("data"));
+    managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Bundled);
+
+    let updates = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reporter_updates = updates.clone();
+    let reporter = move |update: NodeRuntimeProgress| {
+        reporter_updates.lock().unwrap().push(update);
+    };
+
+    let result = install_and_validate_with_reporter(Some(&reporter)).await;
+    managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Download);
+
+    let error = result.expect_err("a persistent npm failure must still fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("bundled Node runtime failed validation"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("exit"),
+        "error should carry npm's exit status: {message}"
+    );
+
+    let attempts: u32 = std::fs::read_to_string(&counter)
+        .expect("npm attempt counter")
+        .trim()
+        .parse()
+        .expect("counter is a number");
+    assert_eq!(
+        attempts,
+        crate::node_runtime::VERSION_PROBE_ATTEMPTS as u32,
+        "a persistent failure must spend exactly the probe budget, no more"
+    );
+
+    let updates = updates.lock().unwrap();
+    assert!(
+        updates.iter().any(|update| {
+            update.phase == crate::NodeRuntimeProgressPhase::Failed
+                && update.failure_kind == Some(NodeRuntimeFailureKind::BundledResourceInvalid)
+        }),
+        "a persistent failure must still report bundled_resource_invalid, got: {:?}",
+        updates
+            .iter()
+            .map(|update| (update.phase, update.failure_kind))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test]
 async fn managed_runtime_validation_uses_real_commands() {
     let tmp = tempfile::tempdir().unwrap();
