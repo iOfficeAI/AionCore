@@ -1082,6 +1082,20 @@ impl IAgentTask for SessionAgentTask {
                 }),
             }
         }
+        if !partition.media.is_empty() {
+            let (images, audios) = content.iter().fold((0usize, 0usize), |(i, a), b| match b {
+                ContentBlock::Image { .. } => (i + 1, a),
+                ContentBlock::Audio { .. } => (i, a + 1),
+                _ => (i, a),
+            });
+            tracing::info!(
+                conversation_id = %self.conversation_id,
+                msg_id = %data.msg_id,
+                images,
+                audios,
+                "session prompt carries native media content blocks"
+            );
+        }
         // DEV (`--dump-prompts`): borrow the final blocks BEFORE they move into
         // Command::Send. No-op / best-effort — never affects the dispatch.
         self.dump_session_cli_final_input(&content, Some(data.msg_id.as_str()));

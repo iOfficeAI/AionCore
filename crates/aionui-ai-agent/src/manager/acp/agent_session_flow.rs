@@ -523,6 +523,18 @@ async fn build_prompt_blocks(data: &SendMessageData, caps: crate::types::PromptM
         });
     }
 
+    let (images, audios) = partition.media.iter().fold((0usize, 0usize), |(i, a), m| match m.kind {
+        crate::media::MediaKind::Image => (i + 1, a),
+        crate::media::MediaKind::Audio => (i, a + 1),
+    });
+    tracing::info!(
+        msg_id = %data.msg_id,
+        images,
+        audios,
+        path_files = partition.path_files.len(),
+        "ACP prompt carries native media content blocks"
+    );
+
     let mut blocks = Vec::with_capacity(media_blocks.len() + 1);
     blocks.push(ContentBlock::from(partition.content));
     blocks.extend(media_blocks);
