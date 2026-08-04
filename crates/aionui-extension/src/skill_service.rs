@@ -998,7 +998,18 @@ async fn replace_existing_path(path: &Path) -> Result<(), ExtensionError> {
         Err(e) => return Err(e.into()),
     };
 
-    if metadata.file_type().is_symlink() || metadata.is_file() {
+    if metadata.file_type().is_symlink() {
+        #[cfg(windows)]
+        {
+            let junction_path = path.to_path_buf();
+            tokio::task::spawn_blocking(move || junction::delete(&junction_path))
+                .await
+                .map_err(|e| ExtensionError::Io(std::io::Error::other(format!("junction::delete join error: {e}"))))?
+                .map_err(ExtensionError::Io)?;
+        }
+        #[cfg(not(windows))]
+        tokio::fs::remove_file(path).await?;
+    } else if metadata.is_file() {
         tokio::fs::remove_file(path).await?;
     } else {
         tokio::fs::remove_dir_all(path).await?;

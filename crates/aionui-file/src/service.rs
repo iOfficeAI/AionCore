@@ -144,7 +144,7 @@ fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileEr
         let name = entry.file_name().to_string_lossy().into_owned();
 
         let full_path = path.to_string_lossy().into_owned();
-        let relative_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+        let relative_path = api_relative_path(&path, root);
 
         let is_dir = metadata.is_dir();
 
@@ -191,7 +191,7 @@ fn read_children_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileErr
         let name = entry.file_name().to_string_lossy().into_owned();
 
         let full_path = path.to_string_lossy().into_owned();
-        let relative_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+        let relative_path = api_relative_path(&path, root);
 
         children.push(DirOrFile {
             name,
@@ -248,7 +248,7 @@ fn list_workspace_files_sync(root: &Path) -> Result<Vec<WorkspaceFlatFile>, File
             .unwrap_or_default();
 
         let full_path = path.to_string_lossy().into_owned();
-        let relative_path = path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned();
+        let relative_path = api_relative_path(path, root);
 
         files.push(WorkspaceFlatFile {
             name,
@@ -262,6 +262,13 @@ fn list_workspace_files_sync(root: &Path) -> Result<Vec<WorkspaceFlatFile>, File
     }
 
     Ok(files)
+}
+
+fn api_relative_path(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// Validate that a file exists and is within the size limit.
@@ -709,11 +716,8 @@ impl crate::traits::IFileService for FileService {
 
         // Compute relative path from workspace
         let workspace_path = Path::new(workspace);
-        let relative_path = canonical
-            .strip_prefix(std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf()))
-            .unwrap_or(&canonical)
-            .to_string_lossy()
-            .into_owned();
+        let workspace_root = std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf());
+        let relative_path = api_relative_path(&canonical, &workspace_root);
 
         // Build and broadcast contentUpdate event
         let content = String::from_utf8(data.to_vec()).ok();
@@ -817,11 +821,8 @@ impl crate::traits::IFileService for FileService {
 
         // Compute relative path from workspace
         let workspace_path = Path::new(workspace);
-        let relative_path = canonical
-            .strip_prefix(std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf()))
-            .unwrap_or(&canonical)
-            .to_string_lossy()
-            .into_owned();
+        let workspace_root = std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf());
+        let relative_path = api_relative_path(&canonical, &workspace_root);
 
         // Broadcast contentUpdate delete event
         let event = ContentUpdateEvent {

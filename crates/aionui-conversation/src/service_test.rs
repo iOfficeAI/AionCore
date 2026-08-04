@@ -1543,6 +1543,7 @@ fn create_team_temp_workspace_uses_date_partition() {
     assert!(workspace.is_dir());
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn create_rejects_unavailable_workspace_with_trailing_whitespace_in_request() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
@@ -1566,6 +1567,7 @@ async fn create_rejects_unavailable_workspace_with_trailing_whitespace_in_reques
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn create_accepts_existing_workspace_with_trailing_whitespace_in_name() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
@@ -1581,6 +1583,26 @@ async fn create_accepts_existing_workspace_with_trailing_whitespace_in_name() {
     .unwrap();
     let resp = svc.create("user_1", req).await.unwrap();
     assert_eq!(resp.extra["workspace"], workspace.to_string_lossy().to_string());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn create_accepts_trailing_whitespace_alias_when_windows_resolves_existing_workspace() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
+    std::fs::create_dir(&dir).unwrap();
+    let workspace = dir.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace_with_trailing_space = format!("{} ", workspace.to_string_lossy());
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace_with_trailing_space }
+    }))
+    .unwrap();
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert_eq!(resp.extra["workspace"], workspace_with_trailing_space);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
