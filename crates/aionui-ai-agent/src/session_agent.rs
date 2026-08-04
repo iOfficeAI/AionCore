@@ -1044,17 +1044,43 @@ impl IAgentTask for SessionAgentTask {
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.runtime.touch();
+        // Partition attachments by the backend's declared prompt blocks:
+        // capable media becomes native Image/Audio blocks; everything else
+        // keeps the pre-multimodal form (path in the [[AION_FILES]] text +
+        // resource link). A read failure degrades that attachment back to a
+        // resource link — the path also remains in the original text because
+        // partition already ran, which the adapters tolerate (they resolve
+        // links independently of the text).
+        let partition = crate::media::partition_media(&data.content, &data.files, self.prompt_media_caps());
         let mut content: Vec<ContentBlock> = Vec::new();
-        if !data.content.is_empty() {
-            content.push(ContentBlock::Text(data.content));
+        if !partition.content.is_empty() {
+            content.push(ContentBlock::Text(partition.content));
         }
-        for path in data.files {
+        for path in partition.path_files {
             // File paths ride as resource links; the claude/codex adapters resolve
             // them (Read tool / base64) at dispatch time.
             content.push(ContentBlock::ResourceLink {
                 uri: path,
                 mime_type: None,
             });
+        }
+        for attachment in &partition.media {
+            match crate::media::read_media_bytes(attachment).await {
+                Some(bytes) => content.push(match attachment.kind {
+                    crate::media::MediaKind::Image => ContentBlock::Image {
+                        data: bytes,
+                        media_type: attachment.mime.clone(),
+                    },
+                    crate::media::MediaKind::Audio => ContentBlock::Audio {
+                        data: bytes,
+                        media_type: attachment.mime.clone(),
+                    },
+                }),
+                None => content.push(ContentBlock::ResourceLink {
+                    uri: attachment.path.clone(),
+                    mime_type: Some(attachment.mime.clone()),
+                }),
+            }
         }
         // DEV (`--dump-prompts`): borrow the final blocks BEFORE they move into
         // Command::Send. No-op / best-effort — never affects the dispatch.
@@ -6008,6 +6034,106 @@ mod pump_tests {
         fn capabilities(&self) -> Capabilities {
             Capabilities::default()
         }
+    }
+
+    /// Backend that records every dispatched Command and advertises
+    /// image-capable prompt blocks — for asserting the media partition at
+    /// the Command::Send boundary.
+    struct RecordingBackend {
+        commands: std::sync::Mutex<Vec<Command>>,
+        blocks: aionui_session::BlockSet,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for RecordingBackend {
+        async fn dispatch(&self, c: Command) -> Result<CommandReceipt, BackendError> {
+            let admission = match c {
+                Command::Send { .. } => Admission::Started,
+                _ => Admission::NoTurn,
+            };
+            self.commands.lock().unwrap().push(c);
+            Ok(CommandReceipt {
+                accepted: true,
+                admission,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::iter(Vec::new()).boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                prompt_blocks: self.blocks,
+                ..Capabilities::default()
+            }
+        }
+    }
+
+    // Image-capable backend: an image attachment leaves the [[AION_FILES]]
+    // text and rides as a native Image block; non-media files keep the
+    // path-text + resource-link form.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_message_partitions_image_into_native_block() {
+        let dir = std::env::temp_dir().join("aionui-session-media-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("cat.png");
+        std::fs::write(&img, b"catbytes").unwrap();
+        let img = img.to_string_lossy().into_owned();
+        let pdf = dir.join("doc.pdf");
+        std::fs::write(&pdf, b"pdfbytes").unwrap();
+        let pdf = pdf.to_string_lossy().into_owned();
+
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet {
+                text: true,
+                image: true,
+                audio: false,
+                resource: true,
+                at_mention: false,
+            },
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend.clone() as Arc<dyn SessionBackend>,
+            None,
+        );
+        let marker = aionui_common::constants::AIONUI_FILES_MARKER;
+        crate::agent_task::IAgentTask::send_message(
+            task.as_ref(),
+            SendMessageData {
+                content: format!("see\n\n{marker}\n{img}\n{pdf}"),
+                msg_id: "m-media".into(),
+                turn_id: None,
+                files: vec![img.clone(), pdf.clone()],
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let commands = backend.commands.lock().unwrap();
+        let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
+            panic!("expected a Send command");
+        };
+        assert_eq!(content.len(), 3, "text + pdf link + image block: {content:?}");
+        let ContentBlock::Text(text) = &content[0] else {
+            panic!("expected text first: {content:?}");
+        };
+        assert_eq!(text, &format!("see\n\n{marker}\n{pdf}"));
+        let ContentBlock::ResourceLink { uri, .. } = &content[1] else {
+            panic!("expected resource link second: {content:?}");
+        };
+        assert_eq!(uri, &pdf);
+        let ContentBlock::Image { data, media_type } = &content[2] else {
+            panic!("expected image block third: {content:?}");
+        };
+        assert_eq!(data, b"catbytes");
+        assert_eq!(media_type, "image/png");
     }
 
     fn env(event: SessionEvent) -> SessionEnvelope {
