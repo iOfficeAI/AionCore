@@ -824,6 +824,28 @@ pub(crate) mod workspace_harness {
             Ok(())
         }
 
+        async fn conversation_model_facts(
+            &self,
+            conversation_id: &str,
+        ) -> Result<crate::TeamConversationModelFacts, TeamError> {
+            let extra = self
+                .repo
+                .get_extra(conversation_id)
+                .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+            let value = |key: &str| {
+                extra
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            };
+            Ok(crate::TeamConversationModelFacts {
+                confirmed_model_id: value("confirmed_model_id").or_else(|| value("current_model_id")),
+                runtime_seed_model_id: value("current_model_id"),
+            })
+        }
+
         async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError> {
             self.patch_runtime_config(conversation_id, serde_json::json!({ "session_mode": mode }))
                 .await

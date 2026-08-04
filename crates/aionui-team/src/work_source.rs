@@ -10,6 +10,7 @@ pub(crate) enum WorkSource {
     /// a single-message turn and the wake path sends the bare command (ELECTRON-3RN).
     UserCommand,
     UserIntervention,
+    LeadIntervention,
     McpSendMessage,
     McpShutdownRequest,
     SpawnWelcome,
@@ -24,7 +25,9 @@ pub(crate) enum WorkSource {
 impl WorkSource {
     pub(crate) fn priority(self) -> WorkPriority {
         match self {
-            Self::UserMessage | Self::UserCommand | Self::UserIntervention => WorkPriority::Foreground,
+            Self::UserMessage | Self::UserCommand | Self::UserIntervention | Self::LeadIntervention => {
+                WorkPriority::Foreground
+            }
             Self::McpSendMessage => WorkPriority::Directed,
             Self::McpShutdownRequest | Self::ShutdownRejected => WorkPriority::Control,
             Self::SpawnWelcome
@@ -37,7 +40,10 @@ impl WorkSource {
     }
 
     pub(crate) fn resumes_paused_slot(self) -> bool {
-        matches!(self, Self::UserMessage | Self::UserCommand | Self::UserIntervention)
+        matches!(
+            self,
+            Self::UserMessage | Self::UserCommand | Self::UserIntervention | Self::LeadIntervention
+        )
     }
 
     pub(crate) fn requires_mailbox_message(self) -> bool {
@@ -46,6 +52,7 @@ impl WorkSource {
             Self::UserMessage
                 | Self::UserCommand
                 | Self::UserIntervention
+                | Self::LeadIntervention
                 | Self::McpSendMessage
                 | Self::McpShutdownRequest
                 | Self::SpawnWelcome
@@ -63,6 +70,7 @@ impl fmt::Display for WorkSource {
             Self::UserMessage => "user_message",
             Self::UserCommand => "user_command",
             Self::UserIntervention => "user_intervention",
+            Self::LeadIntervention => "lead_intervention",
             Self::McpSendMessage => "mcp_send_message",
             Self::McpShutdownRequest => "mcp_shutdown_request",
             Self::SpawnWelcome => "spawn_welcome",
@@ -96,5 +104,12 @@ mod tests {
     #[test]
     fn mcp_send_message_uses_the_directed_lane() {
         assert_eq!(WorkSource::McpSendMessage.priority(), WorkPriority::Directed);
+    }
+
+    #[test]
+    fn lead_intervention_is_foreground_mailbox_work_that_resumes_pause() {
+        assert_eq!(WorkSource::LeadIntervention.priority(), WorkPriority::Foreground);
+        assert!(WorkSource::LeadIntervention.resumes_paused_slot());
+        assert!(WorkSource::LeadIntervention.requires_mailbox_message());
     }
 }

@@ -248,7 +248,7 @@ async fn mc1_correct_token_connects() {
     send_request(&mut stream, &req).await;
     let resp = read_response(&mut stream).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 12);
+    assert_eq!(tools.len(), 13);
     let names: Vec<&str> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
     assert!(!names.contains(&"team_list_models"));
 
@@ -315,7 +315,7 @@ async fn tools_list_returns_all_12_tools() {
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
     let names = list_tools(&mut stream, 10).await;
-    assert_eq!(names.len(), 12);
+    assert_eq!(names.len(), 13);
 
     assert!(names.contains(&"team_read_messages".to_owned()));
     assert!(names.contains(&"team_send_message".to_owned()));

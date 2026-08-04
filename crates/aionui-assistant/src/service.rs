@@ -3,16 +3,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use aionui_api_types::{
-    AgentManagementRow, AgentManagementStatus, AgentSource, AssistantAgentResponse, AssistantCapabilitiesResponse,
-    AssistantDefaultListRequest, AssistantDefaultListResponse, AssistantDefaultScalarRequest,
-    AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse, AssistantDetailResponse,
-    AssistantEngineResponse, AssistantPreferencesResponse, AssistantProfileResponse, AssistantPromptsResponse,
-    AssistantResponse, AssistantRulesResponse, AssistantSource, AssistantStateResponse, CreateAssistantRequest,
-    ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest, UpdateAssistantRequest,
-    assistant_avatar_response_value_with_version, is_local_avatar_value,
+    ASSISTANT_MCP_BINDING_CHANGED_EVENT, AgentManagementRow, AgentManagementStatus, AgentSource,
+    AssistantAgentResponse, AssistantCapabilitiesResponse, AssistantDefaultListRequest, AssistantDefaultListResponse,
+    AssistantDefaultScalarRequest, AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse,
+    AssistantDetailResponse, AssistantEngineResponse, AssistantMcpBindingChanged, AssistantPreferencesResponse,
+    AssistantProfileResponse, AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource,
+    AssistantStateResponse, CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError,
+    SetAssistantStateRequest, UpdateAssistantRequest, WebSocketMessage, assistant_avatar_response_value_with_version,
+    assistant_mcp_binding_fingerprint, is_local_avatar_value,
 };
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::{
@@ -22,6 +23,7 @@ use aionui_db::{
     UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, resolve_agent_binding_for_user,
 };
 use aionui_extension::{AssistantClassifier, AssistantRuleDispatcher, ExtensionError};
+use aionui_realtime::EventBroadcaster;
 use serde_json;
 use tracing::{debug, info, warn};
 
@@ -118,6 +120,7 @@ pub struct AssistantService {
     provider_repo: Arc<dyn IProviderRepository>,
     builtin: Arc<BuiltinAssistantRegistry>,
     agent_catalog: Option<Arc<dyn AssistantAgentCatalogPort>>,
+    event_broadcaster: RwLock<Option<Arc<dyn EventBroadcaster>>>,
     /// Root directory holding user-authored rule/skill md files and avatars.
     /// Defaults to `~/.aionui/` but can be overridden for tests.
     user_data_dir: PathBuf,
@@ -179,7 +182,14 @@ impl AssistantService {
             provider_repo,
             builtin,
             agent_catalog,
+            event_broadcaster: RwLock::new(None),
             user_data_dir,
+        }
+    }
+
+    pub fn with_event_broadcaster(&self, broadcaster: Arc<dyn EventBroadcaster>) {
+        if let Ok(mut guard) = self.event_broadcaster.write() {
+            *guard = Some(broadcaster);
         }
     }
 
@@ -1053,6 +1063,63 @@ impl AssistantService {
     // Create / Update / Delete
     // -----------------------------------------------------------------------
 
+    async fn finish_assistant_mutation(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+        publish_mcp_change: bool,
+    ) -> Result<AssistantResponse, AssistantError> {
+        let response = self.get_for_user(user_id, assistant_id).await?;
+        if publish_mcp_change
+            && let Err(error) = self.publish_assistant_mcp_binding_changed(user_id, assistant_id).await
+        {
+            warn!(user_id, assistant_id, error = %error, "failed to publish assistant MCP binding change");
+        }
+        Ok(response)
+    }
+
+    async fn publish_assistant_mcp_binding_changed(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<(), AssistantError> {
+        let Some(definition) = self
+            .definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        let selected_ids = if definition.default_mcps_mode == "fixed" {
+            decode_str_list(Some(definition.default_mcp_ids.as_str()))?
+        } else {
+            self.preference_repo
+                .get_for_user(user_id, &definition.id)
+                .await?
+                .map(|row| decode_str_list(Some(row.last_mcp_ids.as_str())))
+                .transpose()?
+                .unwrap_or_default()
+        };
+        let broadcaster = self
+            .event_broadcaster
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        if let Some(broadcaster) = broadcaster {
+            let payload = AssistantMcpBindingChanged {
+                user_id: user_id.to_owned(),
+                assistant_id: assistant_id.to_owned(),
+                fingerprint: assistant_mcp_binding_fingerprint(&selected_ids),
+            };
+            broadcaster.broadcast(WebSocketMessage::new(
+                ASSISTANT_MCP_BINDING_CHANGED_EVENT,
+                serde_json::to_value(payload)
+                    .map_err(|error| AssistantError::Internal(format!("encode MCP binding event: {error}")))?,
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn create(&self, req: CreateAssistantRequest) -> Result<AssistantResponse, AssistantError> {
         self.create_for_user(DEFAULT_USER_ID, req).await
     }
@@ -1120,7 +1187,7 @@ impl AssistantService {
             self.sync_preferences_from_defaults_request_for_user(user_id, &definition, None, req.defaults.as_ref())
                 .await?;
         }
-        self.get_for_user(user_id, &id).await
+        self.finish_assistant_mutation(user_id, &id, true).await
     }
 
     pub async fn update(&self, id: &str, req: UpdateAssistantRequest) -> Result<AssistantResponse, AssistantError> {
@@ -1133,6 +1200,7 @@ impl AssistantService {
         id: &str,
         req: UpdateAssistantRequest,
     ) -> Result<AssistantResponse, AssistantError> {
+        let mcp_binding_changed = req.defaults.as_ref().is_some_and(|defaults| defaults.mcps.is_some());
         match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => {
                 let detail_overrides = SerializedDetailOverrides::from_update(&req)?;
@@ -1220,7 +1288,7 @@ impl AssistantService {
                     req.defaults.as_ref(),
                 )
                 .await?;
-                return self.get_for_user(user_id, id).await;
+                return self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await;
             }
             AssistantSource::Generated => {
                 if req.name.is_some()
@@ -1281,7 +1349,7 @@ impl AssistantService {
                     req.defaults.as_ref(),
                 )
                 .await?;
-                return self.get_for_user(user_id, id).await;
+                return self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await;
             }
             AssistantSource::User => {}
         }
@@ -1341,7 +1409,7 @@ impl AssistantService {
             )
             .await?;
         }
-        self.get_for_user(user_id, id).await
+        self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await
     }
 
     async fn sync_preferences_from_defaults_request_for_user(
@@ -3399,6 +3467,7 @@ mod tests {
         SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
         SqliteProviderRepository, UpsertOverrideParams, init_database_memory,
     };
+    use aionui_realtime::BroadcastEventBus;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -5941,6 +6010,53 @@ mod tests {
         assert_eq!(detail.defaults.skills.value, vec!["skill-a", "skill-b"]);
         assert_eq!(detail.defaults.mcps.mode, "fixed");
         assert_eq!(detail.defaults.mcps.value, vec!["mcp-a"]);
+    }
+
+    #[tokio::test]
+    async fn create_and_update_publish_effective_mcp_binding_fingerprints() {
+        let fx = fixture().await;
+        let event_bus = Arc::new(BroadcastEventBus::new(8));
+        let mut events = event_bus.subscribe();
+        fx.service.with_event_broadcaster(event_bus);
+
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("mcp-events".into()),
+                name: "MCP Events".into(),
+                defaults: Some(AssistantDefaultsRequest {
+                    mcps: Some(AssistantDefaultListRequest {
+                        mode: "fixed".into(),
+                        value: Vec::new(),
+                    }),
+                    ..Default::default()
+                }),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let created = events.recv().await.unwrap();
+        let created: AssistantMcpBindingChanged = serde_json::from_value(created.data).unwrap();
+        assert_eq!(created.fingerprint, "[]");
+
+        fx.service
+            .update(
+                "mcp-events",
+                UpdateAssistantRequest {
+                    defaults: Some(AssistantDefaultsRequest {
+                        mcps: Some(AssistantDefaultListRequest {
+                            mode: "fixed".into(),
+                            value: vec!["mcp-b".into(), "mcp-a".into()],
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let updated = events.recv().await.unwrap();
+        let updated: AssistantMcpBindingChanged = serde_json::from_value(updated.data).unwrap();
+        assert_eq!(updated.fingerprint, r#"["mcp-a","mcp-b"]"#);
     }
 
     #[tokio::test]

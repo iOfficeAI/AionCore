@@ -7,6 +7,7 @@
 //! Kept in a separate file from service.rs to avoid pushing that file
 //! over 2000 lines.
 
+use std::collections::HashMap;
 use std::path::Component;
 
 use aionui_ai_agent::{AcpError, AgentError};
@@ -15,6 +16,7 @@ use aionui_api_types::{
     SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_common::{AgentKillReason, ErrorChain};
+use aionui_db::SaveRuntimeStateParams;
 use tracing::warn;
 
 use crate::ConversationError;
@@ -35,6 +37,109 @@ impl ConversationService {
             .get_config_options()
             .await
             .map_err(ConversationError::from)
+    }
+
+    /// Return the last model selection that was confirmed by the runtime.
+    ///
+    /// Generic config selections and the assistant snapshot are checked before
+    /// the legacy ACP current-model field. Older Team builds could persist the
+    /// first two after an observed switch while leaving that field stale.
+    pub async fn confirmed_model_id(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<String>, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        let runtime_state = self
+            .acp_session_repo()
+            .load_runtime_state_for_user(user_id, conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load runtime model state: {e}")))?;
+        let config_selection = runtime_state
+            .as_ref()
+            .and_then(|state| state.config_selections_json.as_deref())
+            .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(raw).ok())
+            .and_then(|selections| selections.get("model").cloned())
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if config_selection.is_some() {
+            return Ok(config_selection);
+        }
+
+        let snapshot_model = self
+            .conversation_repo()
+            .get_assistant_snapshot(user_id, conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load assistant model snapshot: {e}")))?
+            .and_then(|snapshot| snapshot.resolved_model_id)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if snapshot_model.is_some() {
+            return Ok(snapshot_model);
+        }
+
+        Ok(runtime_state
+            .and_then(|state| state.current_model_id)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()))
+    }
+
+    /// Persist an already-observed model selection into every conversation
+    /// source used when a Team member runtime is rebuilt.
+    pub async fn persist_confirmed_model(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        model: &str,
+    ) -> Result<(), ConversationError> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(ConversationError::BadRequest {
+                reason: "model must not be empty".into(),
+            });
+        }
+        self.update_extra(
+            user_id,
+            conversation_id,
+            serde_json::json!({ "current_model_id": model }),
+        )
+        .await?;
+
+        let runtime_state = self
+            .acp_session_repo()
+            .load_runtime_state_for_user(user_id, conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load runtime model state: {e}")))?;
+        let mut selections = runtime_state
+            .and_then(|state| state.config_selections_json)
+            .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(&raw).ok())
+            .unwrap_or_default();
+        selections.insert("model".to_owned(), model.to_owned());
+        let selections_json = serde_json::to_string(&selections)
+            .map_err(|e| ConversationError::internal(format!("Failed to serialize runtime model selection: {e}")))?;
+        self.acp_session_repo()
+            .save_runtime_state_for_user(
+                user_id,
+                conversation_id,
+                &SaveRuntimeStateParams {
+                    current_model_id: Some(Some(model)),
+                    config_selections_json: Some(Some(&selections_json)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to persist runtime model: {e}")))?;
+        self.persist_runtime_assistant_snapshot(
+            user_id,
+            conversation_id,
+            AssistantRuntimePreferenceUpdate {
+                model: Some(model),
+                permission: None,
+                thought_level: None,
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn set_config_option(

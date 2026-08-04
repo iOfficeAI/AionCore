@@ -11,6 +11,15 @@ use aionui_common::AgentType;
 
 use crate::{AgentManagementStatus, AgentSource};
 
+pub const ASSISTANT_MCP_BINDING_CHANGED_EVENT: &str = "assistant.mcpBindingChanged";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssistantMcpBindingChanged {
+    pub user_id: String,
+    pub assistant_id: String,
+    pub fingerprint: String,
+}
+
 // ---------------------------------------------------------------------------
 // Response + source enum
 // ---------------------------------------------------------------------------

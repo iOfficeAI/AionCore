@@ -5,8 +5,9 @@ use std::time::Instant;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamMessageEnqueueStatus, TeamRunAckResponse, TeamRunPayload,
-    TeamRunSource, TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
+    TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamInterruptAgentResponse, TeamInterruptOutcome,
+    TeamMessageEnqueueStatus, TeamQueuedPolicy, TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStatus,
+    TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
 };
 use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::ITeamRepository;
@@ -328,6 +329,9 @@ impl TeamSession {
     }
 
     pub(crate) async fn prepare_next_batch(&self, slot_id: &str) -> Result<PrepareBatchResult, TeamError> {
+        if self.start_pending_mcp_refresh(slot_id) {
+            return Ok(PrepareBatchResult::Blocked);
+        }
         let agent = self.scheduler.get_agent(slot_id).await?;
         let runtime_constraint = match self.member_runtimes.snapshot(slot_id) {
             MemberRuntimeSnapshot::Absent if self.event_loops.has(slot_id) => RuntimeConstraint::Ready,
@@ -1251,6 +1255,8 @@ impl TeamSession {
                     conversation_id: agent.conversation_id,
                     turn_id,
                     status: TeamRunStatus::Cancelled,
+                    reason: None,
+                    replacement_message_id: None,
                 },
             );
         }
@@ -1291,6 +1297,8 @@ impl TeamSession {
                     conversation_id: agent.conversation_id,
                     turn_id,
                     status: TeamRunStatus::Cancelled,
+                    reason: None,
+                    replacement_message_id: None,
                 },
             );
         }
@@ -1330,6 +1338,8 @@ impl TeamSession {
                         conversation_id: agent.conversation_id,
                         turn_id,
                         status: TeamRunStatus::Cancelled,
+                        reason: None,
+                        replacement_message_id: None,
                     },
                 );
             }
@@ -1586,6 +1596,267 @@ impl TeamSession {
         self.scheduler.rename_agent(slot_id, new_name).await
     }
 
+    fn start_pending_mcp_refresh(&self, slot_id: &str) -> bool {
+        let Some(fingerprint) = self.work_coordinator.claim_pending_mcp_refresh(slot_id) else {
+            return false;
+        };
+        let Some(service) = self.service.upgrade() else {
+            self.work_coordinator.release_mcp_refresh(slot_id, &fingerprint);
+            return false;
+        };
+        let Some(session) = service.capture_published_session(self) else {
+            self.work_coordinator.release_mcp_refresh(slot_id, &fingerprint);
+            return false;
+        };
+        let user_id = self.user_id.clone();
+        let team_id = self.team.id.clone();
+        let slot_id = slot_id.to_owned();
+        tokio::spawn(async move {
+            match service
+                .restart_agent_runtime_for_mcp_refresh(&user_id, &team_id, &slot_id)
+                .await
+            {
+                Ok(()) => session
+                    .work_coordinator
+                    .settle_mcp_refresh_claim(&slot_id, &fingerprint),
+                Err(error) => {
+                    session.work_coordinator.release_mcp_refresh(&slot_id, &fingerprint);
+                    warn!(team_id, slot_id, error = %error, "deferred assistant MCP refresh failed");
+                }
+            }
+        });
+        true
+    }
+
+    pub async fn interrupt_agent_from_user(
+        &self,
+        to_slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+        reason: Option<String>,
+        queued_policy: TeamQueuedPolicy,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        self.interrupt_agent_message(None, to_slot_id, content, files, reason, queued_policy)
+            .await
+    }
+
+    pub(crate) async fn interrupt_agent_from_agent(
+        &self,
+        from_slot_id: &str,
+        to_slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+        reason: Option<String>,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        let caller = self.scheduler.get_agent(from_slot_id).await?;
+        if caller.role != TeammateRole::Lead {
+            return Err(TeamError::LeaderOnly("team_interrupt_agent".into()));
+        }
+        self.interrupt_agent_message(
+            Some(from_slot_id),
+            to_slot_id,
+            content,
+            files,
+            reason,
+            TeamQueuedPolicy::Retain,
+        )
+        .await
+    }
+
+    async fn interrupt_agent_message(
+        &self,
+        from_slot_id: Option<&str>,
+        to_slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+        reason: Option<String>,
+        queued_policy: TeamQueuedPolicy,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        if content.trim().is_empty() {
+            return Err(TeamError::InvalidRequest("interrupt message must not be empty".into()));
+        }
+        if to_slot_id == "*" {
+            return Err(TeamError::InvalidRequest(
+                "team_interrupt_agent does not support wildcard targets".into(),
+            ));
+        }
+        let target_agent = self.scheduler.get_agent(to_slot_id).await?;
+        if target_agent.role == TeammateRole::Lead {
+            return Err(TeamError::InvalidRequest("cannot interrupt the team lead".into()));
+        }
+        self.ensure_member_runtime_lazy(to_slot_id, from_slot_id.is_some())
+            .await?;
+        self.publish_runtime_constraint(to_slot_id).await?;
+        let active_before = self
+            .work_coordinator
+            .slot_snapshot(to_slot_id)
+            .and_then(|snapshot| snapshot.active_batch.map(|batch| (batch, snapshot.active_turn_id)));
+        let lease = self.work_coordinator.acquire_enqueue(EnqueueRequest {
+            slot_id: to_slot_id.to_owned(),
+            role: target_role_for(target_agent.role),
+            source: WorkSource::LeadIntervention,
+            binding: from_slot_id.map_or(CausalBinding::UserVisible, |caller_slot_id| {
+                CausalBinding::InheritRunningBatch {
+                    caller_slot_id: caller_slot_id.to_owned(),
+                }
+            }),
+        })?;
+        let sender = from_slot_id.unwrap_or("user");
+        let mailbox_message = match self
+            .mailbox
+            .write_with_files(
+                &self.team.id,
+                to_slot_id,
+                sender,
+                MailboxMessageType::Message,
+                content,
+                None,
+                files.as_deref(),
+            )
+            .await
+        {
+            Ok(message) => message,
+            Err(error) => {
+                self.work_coordinator.abort_enqueue(&lease, "mailbox_write_failed");
+                return Err(error);
+            }
+        };
+
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
+        let projection_request = if let Some(from_slot_id) = from_slot_id {
+            let from_agent = self.scheduler.get_agent(from_slot_id).await?;
+            TeamProjectionRequest {
+                user_id: self.user_id.clone(),
+                team_id: self.team.id.clone(),
+                slot_id: to_slot_id.to_owned(),
+                conversation_id: target_agent.conversation_id.clone(),
+                source: TeamProjectionSource::Teammate {
+                    from_slot_id: from_slot_id.to_owned(),
+                    from_name: from_agent.name,
+                    sender_backend: Some(from_agent.backend),
+                    sender_conversation_id: Some(from_agent.conversation_id),
+                },
+                content: content.to_owned(),
+                files: files.clone().unwrap_or_default(),
+                visibility: crate::visibility::TeamVisibilityPolicy::teammate_message(),
+                dedupe_key: Some(teammate_dedupe_key(
+                    &self.team.id,
+                    &mailbox_message.id,
+                    &target_agent.conversation_id,
+                )),
+            }
+        } else {
+            TeamProjectionRequest::user_visible(
+                &self.user_id,
+                &self.team.id,
+                to_slot_id,
+                &target_agent.conversation_id,
+                content,
+                files.clone().unwrap_or_default(),
+            )
+        };
+        if let Err(error) = projection.project(projection_request).await {
+            warn!(
+                team_id = %self.team.id,
+                slot_id = to_slot_id,
+                error = %error,
+                "failed to project lead intervention (non-fatal)"
+            );
+        }
+
+        let commit = self
+            .commit_persisted_enqueue(&lease, mailbox_message.id.clone())
+            .await?;
+        if queued_policy == TeamQueuedPolicy::Discard {
+            let discarded = self
+                .work_coordinator
+                .discard_queued_except(to_slot_id, &mailbox_message.id);
+            if !discarded.is_empty() {
+                self.mailbox.mark_read_batch(&self.team.id, &discarded).await?;
+            }
+        }
+
+        let (outcome, interrupted_turn_id) = if let Some((batch, turn_id)) = active_before {
+            let still_active = self.work_coordinator.is_active_batch(&batch, turn_id.as_deref());
+            let cancellation_result = if still_active {
+                if let Some(turn_id) = &turn_id {
+                    self.cancellation_port
+                        .cancel_agent_turn(&self.user_id, &target_agent.conversation_id, turn_id)
+                        .await
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            };
+            if let Err(error) = cancellation_result
+                && self.work_coordinator.is_active_batch(&batch, turn_id.as_deref())
+            {
+                return Err(TeamError::InvalidRequest(error.to_string()));
+            }
+            let interrupted = still_active.then(|| {
+                self.work_coordinator
+                    .interrupt_batch(&batch, reason.clone(), mailbox_message.id.clone())
+            });
+            if interrupted
+                .as_ref()
+                .is_some_and(|value| value.commit_result == CommitResult::Committed)
+            {
+                let interrupted = interrupted.expect("committed interrupt result exists");
+                if !interrupted.terminal_message_ids.is_empty() {
+                    self.mailbox
+                        .mark_read_batch(&self.team.id, &interrupted.terminal_message_ids)
+                        .await?;
+                }
+                if let Some(turn_id) = &turn_id {
+                    let metadata = self.work_coordinator.take_interrupt_metadata(&batch.batch_id);
+                    for team_run_id in &batch.team_run_ids {
+                        self.team_event_emitter().broadcast_child_turn(
+                            TEAM_CHILD_TURN_CANCELLED_EVENT,
+                            TeamChildTurnPayload {
+                                team_id: self.team.id.clone(),
+                                team_run_id: team_run_id.clone(),
+                                slot_id: to_slot_id.to_owned(),
+                                role: target_role_for(target_agent.role),
+                                conversation_id: target_agent.conversation_id.clone(),
+                                turn_id: turn_id.clone(),
+                                status: TeamRunStatus::Cancelled,
+                                reason: metadata.as_ref().and_then(|value| value.reason.clone()),
+                                replacement_message_id: metadata
+                                    .as_ref()
+                                    .map(|value| value.replacement_message_id.clone()),
+                            },
+                        );
+                    }
+                }
+                (TeamInterruptOutcome::Interrupted, turn_id)
+            } else {
+                (TeamInterruptOutcome::CompletedRace, turn_id)
+            }
+        } else {
+            (TeamInterruptOutcome::QueuedNoActiveTurn, None)
+        };
+        self.event_loops.notify(to_slot_id);
+        let target = self.work_coordinator.slot_snapshot(to_slot_id).unwrap_or(commit.slot);
+        info!(
+            team_id = %self.team.id,
+            slot_id = to_slot_id,
+            replacement_message_id = %mailbox_message.id,
+            ?outcome,
+            "team agent interruption committed"
+        );
+        Ok(TeamInterruptAgentResponse {
+            outcome,
+            interrupted_turn_id,
+            message_id: mailbox_message.id,
+            target: TeamRunManager::slot_payload(&target),
+        })
+    }
+
+    pub async fn update_agent_model(&self, slot_id: &str, model: &str) -> Result<(), TeamError> {
+        self.scheduler.update_agent_model(slot_id, model).await
+    }
+
     /// Spawn a new teammate at the Lead's request (backing of `team_spawn_agent`).
     ///
     /// Validation chain mirrors the assistant-first team contract:
@@ -1742,7 +2013,7 @@ impl TeamSession {
         user_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
         kill_existing: bool,
-    ) -> Result<(), TeamError> {
+    ) -> Result<Option<String>, TeamError> {
         service
             .provisioner()
             .attach_agent_process(user_id, agent, mcp_stdio_cfg, task_manager, kill_existing)
@@ -1922,6 +2193,7 @@ async fn attach_member_runtime_inner(
         kill_existing,
     )
     .await;
+    let mcp_fingerprint = attach_result.as_ref().ok().and_then(|value| value.clone());
     if let Err(error) = attach_result {
         service
             .cleanup_stale_member_runtime_task(&session, &agent.conversation_id)
@@ -2064,6 +2336,11 @@ async fn attach_member_runtime_inner(
     session
         .work_coordinator
         .set_runtime_constraint(&agent.slot_id, RuntimeConstraint::Ready);
+    if let Some(fingerprint) = mcp_fingerprint {
+        session
+            .work_coordinator
+            .complete_mcp_refresh(&agent.slot_id, &fingerprint);
+    }
     session.event_loops.notify(&agent.slot_id);
 
     if !service.publish_member_runtime_ready_if_current(&session, &agent) {
@@ -2244,6 +2521,22 @@ mod tests {
 
     fn noop_cancellation_port() -> Arc<dyn crate::ports::AgentTurnCancellationPort> {
         Arc::new(NoopCancellationPort)
+    }
+
+    struct FailingCancellationPort;
+
+    #[async_trait::async_trait]
+    impl crate::ports::AgentTurnCancellationPort for FailingCancellationPort {
+        async fn cancel_agent_turn(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _turn_id: &str,
+        ) -> Result<(), crate::ports::AgentTurnExecutionError> {
+            Err(crate::ports::AgentTurnExecutionError::Failed {
+                reason: "forced cancellation failure".into(),
+            })
+        }
     }
 
     #[derive(Default)]
@@ -3247,6 +3540,128 @@ mod tests {
                 .iter()
                 .any(|message| message.id == queued.message_id)
         );
+        release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn interrupt_agent_marks_claimed_input_read_and_retains_older_queue() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(BlockingRunningTurnPort::new(started_tx, release_rx)),
+                noop_cancellation_port(),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+
+        let first = session
+            .send_message_to_agent("worker-1", "old claimed input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("worker turn should start")
+            .expect("start signal should be sent");
+        session
+            .send_message_to_agent("worker-1", "older queued input", None)
+            .await
+            .unwrap();
+
+        let response = session
+            .interrupt_agent_from_user(
+                "worker-1",
+                "replacement instruction",
+                None,
+                Some("requirements changed".into()),
+                TeamQueuedPolicy::Retain,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.outcome, TeamInterruptOutcome::Interrupted);
+        assert_eq!(response.interrupted_turn_id.as_deref(), Some("turn-background"));
+        let unread = session.mailbox.peek_unread("t1", "worker-1").await.unwrap();
+        assert!(!unread.iter().any(|message| message.id == first.message_id));
+        assert!(unread.iter().any(|message| message.content == "older queued input"));
+        assert!(
+            unread
+                .iter()
+                .any(|message| message.content == "replacement instruction")
+        );
+
+        release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancellation_failure_keeps_active_batch_and_durable_replacement() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(BlockingRunningTurnPort::new(started_tx, release_rx)),
+                Arc::new(FailingCancellationPort),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+        session
+            .send_message_to_agent("worker-1", "active input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("worker turn should start")
+            .expect("start signal should be sent");
+
+        let error = session
+            .interrupt_agent_from_user("worker-1", "durable replacement", None, None, TeamQueuedPolicy::Retain)
+            .await
+            .expect_err("cancellation failure must surface");
+        assert!(error.to_string().contains("forced cancellation failure"));
+        assert_eq!(
+            session
+                .work_coordinator
+                .slot_snapshot("worker-1")
+                .unwrap()
+                .active_turn_id
+                .as_deref(),
+            Some("turn-background")
+        );
+        assert!(
+            session
+                .mailbox
+                .peek_unread("t1", "worker-1")
+                .await
+                .unwrap()
+                .iter()
+                .any(|message| message.content == "durable replacement")
+        );
+
         release_tx.send(()).unwrap();
         session.stop();
     }

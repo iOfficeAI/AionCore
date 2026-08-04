@@ -75,4 +75,14 @@ impl TeammateManager {
         debug!(team_id = %self.team_id, slot_id, new_name, "agent renamed");
         Ok(())
     }
+
+    pub async fn update_agent_model(&self, slot_id: &str, model: &str) -> Result<(), TeamError> {
+        let mut slots = self.slots.lock().await;
+        let slot = slots
+            .get_mut(slot_id)
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        slot.agent.model = model.to_owned();
+        debug!(team_id = %self.team_id, slot_id, model, "agent model updated");
+        Ok(())
+    }
 }

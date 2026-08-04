@@ -50,6 +50,17 @@ pub struct SendMessageInput {
     pub files: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterruptAgentInput {
+    pub slot_id: String,
+    pub message: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// Arguments for the `team_spawn_agent` MCP tool call.
 ///
 /// Team spawning is assistant-first. The MCP tool accepts an assistant identity;
@@ -146,6 +157,7 @@ pub fn parse_tool_call(
             })
         }
         "team_spawn_agent" => Err("handled directly by server".into()),
+        "team_interrupt_agent" => Err("handled directly by server".into()),
         "team_task_create" => {
             let input: TaskCreateInput = serde_json::from_value(arguments.clone())
                 .map_err(|e| format!("Invalid arguments for team_task_create: {e}"))?;
@@ -189,8 +201,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn interrupt_agent_is_lead_only() {
+        assert!(authorize_tool(TeammateRole::Lead, "team_interrupt_agent").is_ok());
+        assert!(authorize_tool(TeammateRole::Teammate, "team_interrupt_agent").is_err());
+    }
+
+    #[test]
     fn all_descriptors_count() {
-        assert_eq!(all_tool_descriptors().len(), 12);
+        assert_eq!(all_tool_descriptors().len(), 13);
     }
 
     #[test]
@@ -199,7 +217,7 @@ mod tests {
         let mut names: Vec<&str> = descs.iter().map(|d| d.name.as_str()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 13);
     }
 
     #[test]

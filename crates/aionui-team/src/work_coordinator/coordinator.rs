@@ -34,6 +34,9 @@ pub(super) struct SlotState {
     pub(super) runtime_constraint: RuntimeConstraint,
     known_unread_message_ids: HashSet<String>,
     delivery_failure_counts: HashMap<String, u8>,
+    applied_mcp_fingerprint: Option<String>,
+    pending_mcp_fingerprint: Option<String>,
+    mcp_refresh_in_progress: bool,
     removed: bool,
 }
 
@@ -50,6 +53,9 @@ impl SlotState {
             runtime_constraint: RuntimeConstraint::Starting { operation_id: 0 },
             known_unread_message_ids: HashSet::new(),
             delivery_failure_counts: HashMap::new(),
+            applied_mcp_fingerprint: None,
+            pending_mcp_fingerprint: None,
+            mcp_refresh_in_progress: false,
             removed: false,
         }
     }
@@ -97,6 +103,7 @@ pub(super) struct CoordinatorState {
     pub(super) slots: BTreeMap<String, SlotState>,
     pub(super) intents: HashMap<String, WorkIntent>,
     pub(super) enqueue_leases: HashMap<String, EnqueueLeaseRecord>,
+    interrupted_batches: HashMap<String, BatchInterruptMetadata>,
     next_operation_id: u64,
 }
 
@@ -253,7 +260,11 @@ impl SlotWorkCoordinator {
         if let Some(message_id) = mailbox_message_id {
             slot.known_unread_message_ids.insert(message_id);
         }
-        slot.queue_mut(intent.priority).push_back(intent_id.clone());
+        if lease.source == WorkSource::LeadIntervention {
+            slot.queue_mut(intent.priority).push_front(intent_id.clone());
+        } else {
+            slot.queue_mut(intent.priority).push_back(intent_id.clone());
+        }
         let slot_snapshot = Self::slot_snapshot_locked(&state, &lease.slot_id).expect("committed slot exists");
         let summaries = Self::run_summaries_locked(&state, lease.team_run_id.iter().cloned());
         drop(state);
@@ -493,20 +504,26 @@ impl SlotWorkCoordinator {
         // - head is an ordinary message → merge the leading run of ordinary
         //   messages but STOP at the first `UserCommand` so a command is never
         //   folded into a plain batch (existing multi-message merge, bounded).
-        let head_is_command = state
+        let head_source = state
             .intents
             .get(&fifo_message_intent_ids[0])
-            .is_some_and(|intent| intent.source == WorkSource::UserCommand);
-        let (message_intent_ids, is_command) = if head_is_command {
-            (vec![fifo_message_intent_ids[0].clone()], true)
+            .map(|intent| intent.source);
+        let head_is_isolated = matches!(
+            head_source,
+            Some(WorkSource::UserCommand | WorkSource::LeadIntervention)
+        );
+        let (message_intent_ids, is_command) = if head_is_isolated {
+            (
+                vec![fifo_message_intent_ids[0].clone()],
+                head_source == Some(WorkSource::UserCommand),
+            )
         } else {
             let mut selected = Vec::new();
             for intent_id in &fifo_message_intent_ids {
-                let is_command_intent = state
-                    .intents
-                    .get(intent_id)
-                    .is_some_and(|intent| intent.source == WorkSource::UserCommand);
-                if is_command_intent {
+                let is_batch_barrier = state.intents.get(intent_id).is_some_and(|intent| {
+                    matches!(intent.source, WorkSource::UserCommand | WorkSource::LeadIntervention)
+                });
+                if is_batch_barrier {
                     break;
                 }
                 selected.push(intent_id.clone());
@@ -709,6 +726,109 @@ impl SlotWorkCoordinator {
 
     pub(crate) fn cancel_batch(&self, batch: &WorkBatch, classification: &'static str) -> CommitResult {
         self.terminalize_batch(batch, WorkIntentState::Cancelled { classification }, classification)
+    }
+
+    pub(crate) fn interrupt_batch(
+        &self,
+        batch: &WorkBatch,
+        reason: Option<String>,
+        replacement_message_id: String,
+    ) -> InterruptBatchResult {
+        let mut state = self.lock_state();
+        if !self.is_current_batch(&state, batch) {
+            self.log_stale_batch(batch, "interrupt_batch");
+            return InterruptBatchResult {
+                commit_result: CommitResult::StaleOwner,
+                terminal_message_ids: Vec::new(),
+            };
+        }
+        for intent_id in &batch.intent_ids {
+            if let Some(intent) = state.intents.get_mut(intent_id) {
+                intent.state = WorkIntentState::Cancelled {
+                    classification: "lead_interrupted",
+                };
+            }
+        }
+        let slot = state.slots.get_mut(&batch.slot_id).expect("current batch slot exists");
+        slot.active = None;
+        for message_id in &batch.mailbox_message_ids {
+            slot.delivery_failure_counts.remove(message_id);
+        }
+        state.interrupted_batches.insert(
+            batch.batch_id.clone(),
+            BatchInterruptMetadata {
+                reason,
+                replacement_message_id,
+            },
+        );
+        let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
+        let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
+        drop(state);
+        self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
+        InterruptBatchResult {
+            commit_result: CommitResult::Committed,
+            terminal_message_ids: batch.mailbox_message_ids.clone(),
+        }
+    }
+
+    pub(crate) fn take_interrupt_metadata(&self, batch_id: &str) -> Option<BatchInterruptMetadata> {
+        self.lock_state().interrupted_batches.remove(batch_id)
+    }
+
+    pub(crate) fn is_batch_cancelled(&self, batch: &WorkBatch) -> bool {
+        let state = self.lock_state();
+        batch.intent_ids.iter().all(|intent_id| {
+            state
+                .intents
+                .get(intent_id)
+                .is_some_and(|intent| matches!(intent.state, WorkIntentState::Cancelled { .. }))
+        })
+    }
+
+    pub(crate) fn is_active_batch(&self, batch: &WorkBatch, turn_id: Option<&str>) -> bool {
+        let state = self.lock_state();
+        self.is_current_batch(&state, batch)
+            && state
+                .slots
+                .get(&batch.slot_id)
+                .and_then(|slot| slot.active.as_ref())
+                .is_some_and(|active| active.turn_id.as_deref() == turn_id)
+    }
+
+    pub(crate) fn discard_queued_except(&self, slot_id: &str, retained_message_id: &str) -> Vec<String> {
+        let mut state = self.lock_state();
+        let queued_ids = state
+            .slots
+            .get(slot_id)
+            .map(|slot| slot.queued_ids().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut terminal_message_ids = Vec::new();
+        let mut discard_ids = Vec::new();
+        for intent_id in queued_ids {
+            let Some(intent) = state.intents.get_mut(&intent_id) else {
+                continue;
+            };
+            if intent.mailbox_message_id.as_deref() == Some(retained_message_id) {
+                continue;
+            }
+            if let Some(message_id) = &intent.mailbox_message_id {
+                terminal_message_ids.push(message_id.clone());
+            }
+            intent.state = WorkIntentState::Cancelled {
+                classification: "lead_interrupt_discarded",
+            };
+            discard_ids.push(intent_id);
+        }
+        if let Some(slot) = state.slots.get_mut(slot_id) {
+            for intent_id in discard_ids {
+                slot.remove_queued(&intent_id);
+            }
+        }
+        let slot_snapshot = Self::slot_snapshot_locked(&state, slot_id);
+        drop(state);
+        self.publish_slot_work_snapshot(slot_snapshot);
+        terminal_message_ids
     }
 
     pub(crate) fn cancel_run(&self, team_run_id: &str) -> CancelRunWorkResult {
@@ -931,12 +1051,27 @@ impl SlotWorkCoordinator {
     /// and the restart is rejected, or the restart gate wins and no new batch
     /// can be claimed until the runtime becomes ready again.
     pub(crate) fn begin_runtime_restart(&self, slot_id: &str) -> Result<RuntimeRestartGate, RuntimeRestartRejection> {
+        self.begin_runtime_restart_inner(slot_id, false)
+    }
+
+    pub(crate) fn begin_mcp_runtime_restart(
+        &self,
+        slot_id: &str,
+    ) -> Result<RuntimeRestartGate, RuntimeRestartRejection> {
+        self.begin_runtime_restart_inner(slot_id, true)
+    }
+
+    fn begin_runtime_restart_inner(
+        &self,
+        slot_id: &str,
+        allow_queued: bool,
+    ) -> Result<RuntimeRestartGate, RuntimeRestartRejection> {
         let mut state = self.lock_state();
         let slot = state
             .slots
             .entry(slot_id.to_owned())
             .or_insert_with(|| SlotState::new(TeamRunTargetRole::Teammate));
-        if slot.active.is_some() || slot.queued_ids().next().is_some() {
+        if slot.active.is_some() || (!allow_queued && slot.queued_ids().next().is_some()) {
             return Err(RuntimeRestartRejection::Busy);
         }
         match slot.runtime_constraint {
@@ -959,6 +1094,84 @@ impl SlotWorkCoordinator {
             operation_id,
             previous_constraint,
         })
+    }
+
+    pub(crate) fn request_mcp_refresh(&self, slot_id: &str, fingerprint: &str) -> McpRefreshDisposition {
+        let mut state = self.lock_state();
+        let slot = state
+            .slots
+            .entry(slot_id.to_owned())
+            .or_insert_with(|| SlotState::new(TeamRunTargetRole::Teammate));
+        if slot.applied_mcp_fingerprint.as_deref() == Some(fingerprint)
+            || slot.pending_mcp_fingerprint.as_deref() == Some(fingerprint)
+        {
+            return McpRefreshDisposition::Unchanged;
+        }
+        if slot.active.is_some()
+            || slot.queued_ids().next().is_some()
+            || !matches!(slot.runtime_constraint, RuntimeConstraint::Ready)
+        {
+            slot.pending_mcp_fingerprint = Some(fingerprint.to_owned());
+            slot.mcp_refresh_in_progress = false;
+            return McpRefreshDisposition::Deferred;
+        }
+        McpRefreshDisposition::RestartNow
+    }
+
+    pub(crate) fn defer_mcp_refresh(&self, slot_id: &str, fingerprint: &str) {
+        let mut state = self.lock_state();
+        let slot = state
+            .slots
+            .entry(slot_id.to_owned())
+            .or_insert_with(|| SlotState::new(TeamRunTargetRole::Teammate));
+        if slot.applied_mcp_fingerprint.as_deref() != Some(fingerprint) {
+            slot.pending_mcp_fingerprint = Some(fingerprint.to_owned());
+            slot.mcp_refresh_in_progress = false;
+        }
+    }
+
+    pub(crate) fn claim_pending_mcp_refresh(&self, slot_id: &str) -> Option<String> {
+        let mut state = self.lock_state();
+        let slot = state.slots.get_mut(slot_id)?;
+        if slot.active.is_some() || slot.mcp_refresh_in_progress {
+            return None;
+        }
+        let fingerprint = slot.pending_mcp_fingerprint.clone()?;
+        slot.mcp_refresh_in_progress = true;
+        Some(fingerprint)
+    }
+
+    pub(crate) fn complete_mcp_refresh(&self, slot_id: &str, fingerprint: &str) {
+        let mut state = self.lock_state();
+        let Some(slot) = state.slots.get_mut(slot_id) else {
+            return;
+        };
+        slot.applied_mcp_fingerprint = Some(fingerprint.to_owned());
+        if slot.pending_mcp_fingerprint.as_deref() == Some(fingerprint) {
+            slot.pending_mcp_fingerprint = None;
+        }
+        slot.mcp_refresh_in_progress = false;
+    }
+
+    pub(crate) fn release_mcp_refresh(&self, slot_id: &str, fingerprint: &str) {
+        let mut state = self.lock_state();
+        let Some(slot) = state.slots.get_mut(slot_id) else {
+            return;
+        };
+        if slot.pending_mcp_fingerprint.as_deref() == Some(fingerprint) {
+            slot.mcp_refresh_in_progress = false;
+        }
+    }
+
+    pub(crate) fn settle_mcp_refresh_claim(&self, slot_id: &str, fingerprint: &str) {
+        let mut state = self.lock_state();
+        let Some(slot) = state.slots.get_mut(slot_id) else {
+            return;
+        };
+        if slot.pending_mcp_fingerprint.as_deref() == Some(fingerprint) {
+            slot.pending_mcp_fingerprint = None;
+            slot.mcp_refresh_in_progress = false;
+        }
     }
 
     /// Roll back an unused restart gate without overwriting a newer runtime

@@ -68,6 +68,7 @@ pub enum TeamToolName {
     TeamMembers,
     TeamReadMessages,
     TeamSendMessage,
+    TeamInterruptAgent,
     TeamTaskCreate,
     TeamTaskUpdate,
     TeamTaskList,
@@ -85,6 +86,7 @@ impl TeamToolName {
             Self::TeamMembers => "team_members",
             Self::TeamReadMessages => "team_read_messages",
             Self::TeamSendMessage => "team_send_message",
+            Self::TeamInterruptAgent => "team_interrupt_agent",
             Self::TeamTaskCreate => "team_task_create",
             Self::TeamTaskUpdate => "team_task_update",
             Self::TeamTaskList => "team_task_list",
@@ -102,6 +104,7 @@ impl TeamToolName {
             "team_members" => Self::TeamMembers,
             "team_read_messages" => Self::TeamReadMessages,
             "team_send_message" => Self::TeamSendMessage,
+            "team_interrupt_agent" => Self::TeamInterruptAgent,
             "team_task_create" => Self::TeamTaskCreate,
             "team_task_update" => Self::TeamTaskUpdate,
             "team_task_list" => Self::TeamTaskList,
@@ -361,6 +364,25 @@ fn tool_specs() -> Vec<TeamToolSpec> {
             input_summary: "to, message",
         },
         TeamToolSpec {
+            name: TeamToolName::TeamInterruptAgent,
+            permission: TeamToolPermission::LeadOnly,
+            description: "Immediately stop a teammate's active turn and durably deliver a replacement instruction as its next highest-priority message.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "slot_id": { "type": "string", "description": "Exact teammate slot_id; wildcard is not supported" },
+                    "message": { "type": "string", "description": "Replacement instruction delivered after interruption" },
+                    "files": { "type": "array", "items": { "type": "string" }, "description": "Absolute attachment paths" },
+                    "reason": { "type": "string", "description": "Optional interruption reason" }
+                },
+                "required": ["slot_id", "message"]
+            }),
+            cli_command: &["interrupt-agent"],
+            when: "Interrupt teammate turn",
+            input_summary: "slot_id, message, optional files/reason",
+        },
+        TeamToolSpec {
             name: TeamToolName::TeamTaskCreate,
             permission: TeamToolPermission::AnyTeamAgent,
             description: "Create a new task on the team task board.",
@@ -551,7 +573,7 @@ mod tests {
     #[test]
     fn descriptor_count_and_names_are_unique() {
         let descriptors = team_tool_descriptors();
-        assert_eq!(descriptors.len(), 12);
+        assert_eq!(descriptors.len(), 13);
         let names = descriptors
             .iter()
             .map(|descriptor| descriptor.name.as_str())
@@ -577,6 +599,7 @@ mod tests {
             ("team_members", vec!["members"]),
             ("team_read_messages", vec!["read-messages"]),
             ("team_send_message", vec!["send-message"]),
+            ("team_interrupt_agent", vec!["interrupt-agent"]),
             ("team_task_create", vec!["task", "create"]),
             ("team_task_update", vec!["task", "update"]),
             ("team_task_list", vec!["task", "list"]),
@@ -604,8 +627,24 @@ mod tests {
         assert!(!names.contains(&"team_rename_agent".to_owned()));
         assert!(!names.contains(&"team_clear_agent_context".to_owned()));
         assert!(!names.contains(&"team_shutdown_agent".to_owned()));
+        assert!(!names.contains(&"team_interrupt_agent".to_owned()));
         assert!(names.contains(&"team_read_messages".to_owned()));
         assert!(names.contains(&"team_send_message".to_owned()));
+    }
+
+    #[test]
+    fn interrupt_schema_is_lead_only_and_requires_exact_target_and_message() {
+        let descriptor = team_tool_descriptor("team_interrupt_agent").expect("interrupt descriptor");
+        assert_eq!(descriptor.permission, TeamToolPermission::LeadOnly);
+        let required = descriptor.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("slot_id")));
+        assert!(required.contains(&json!("message")));
+        assert!(
+            !descriptor.input_schema["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("target")
+        );
     }
 
     #[test]

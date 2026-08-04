@@ -398,6 +398,7 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
         },
         services.data_dir.clone(),
     ));
+    service.with_event_broadcaster(services.event_bus.clone());
     AssistantRouterState { service }
 }
 
@@ -759,6 +760,26 @@ pub fn build_team_state(
         backend_binary_path,
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
+    let mut assistant_event_rx = services.event_bus.subscribe();
+    let assistant_event_service = Arc::clone(&service);
+    tokio::spawn(async move {
+        loop {
+            match assistant_event_rx.recv().await {
+                Ok(event) if event.name == aionui_api_types::ASSISTANT_MCP_BINDING_CHANGED_EVENT => {
+                    match serde_json::from_value::<aionui_api_types::AssistantMcpBindingChanged>(event.data) {
+                        Ok(payload) => {
+                            assistant_event_service
+                                .handle_assistant_mcp_binding_changed(payload)
+                                .await;
+                        }
+                        Err(error) => tracing::warn!(error = %error, "invalid assistant MCP binding event"),
+                    }
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
     service.with_project_service(Arc::new(services.project_service.clone()));
     TeamRouterState {
         service,

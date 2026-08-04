@@ -352,6 +352,47 @@ fn runtime_restart_gate_rejects_queued_work() {
 }
 
 #[test]
+fn mcp_refresh_defers_active_work_and_deduplicates_applied_fingerprint() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("message must be claimable");
+    };
+    assert_eq!(
+        coordinator.request_mcp_refresh("lead-1", "revision-2"),
+        McpRefreshDisposition::Deferred
+    );
+    assert_eq!(coordinator.complete_batch(&batch), CommitResult::Committed);
+    assert_eq!(
+        coordinator.claim_pending_mcp_refresh("lead-1").as_deref(),
+        Some("revision-2")
+    );
+    coordinator.complete_mcp_refresh("lead-1", "revision-2");
+    assert_eq!(
+        coordinator.request_mcp_refresh("lead-1", "revision-2"),
+        McpRefreshDisposition::Unchanged
+    );
+    assert!(coordinator.claim_pending_mcp_refresh("lead-1").is_none());
+}
+
+#[test]
+fn mcp_restart_gate_runs_before_queued_work() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    assert_eq!(
+        coordinator.request_mcp_refresh("lead-1", "revision-2"),
+        McpRefreshDisposition::Deferred
+    );
+    assert!(coordinator.begin_mcp_runtime_restart("lead-1").is_ok());
+    assert_eq!(
+        coordinator.next("lead-1"),
+        ReconcileDecision::Blocked(RuntimeConstraint::Starting { operation_id: 1 })
+    );
+}
+
+#[test]
 fn runtime_restart_gate_and_batch_claim_have_one_atomic_winner() {
     for _ in 0..64 {
         let coordinator = Arc::new(coordinator());
@@ -736,6 +777,97 @@ fn system_initiated_none_delegates_to_port() {
         1,
         "a None inherit must delegate to bind_system_enqueue"
     );
+}
+
+#[test]
+fn lead_intervention_interrupts_active_batch_and_runs_before_retained_queue() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "active");
+    let ReconcileDecision::Claim(active) = coordinator.next("lead-1") else {
+        panic!("active work must be claimed");
+    };
+    assert_eq!(coordinator.mark_started(&active, "turn-1"), StartCommitResult::Accepted);
+    enqueue(&coordinator, WorkSource::UserIntervention, "older-queued");
+    enqueue(&coordinator, WorkSource::LeadIntervention, "replacement");
+
+    let interrupted = coordinator.interrupt_batch(&active, Some("requirements changed".into()), "replacement".into());
+    assert_eq!(interrupted.commit_result, CommitResult::Committed);
+    assert_eq!(interrupted.terminal_message_ids, vec!["active"]);
+    assert!(coordinator.is_batch_cancelled(&active));
+    assert_eq!(
+        coordinator.take_interrupt_metadata(&active.batch_id),
+        Some(BatchInterruptMetadata {
+            reason: Some("requirements changed".into()),
+            replacement_message_id: "replacement".into(),
+        })
+    );
+
+    let ReconcileDecision::Claim(replacement) = coordinator.next("lead-1") else {
+        panic!("replacement must be next");
+    };
+    assert_eq!(replacement.mailbox_message_ids, vec!["replacement"]);
+    coordinator.complete_batch(&replacement);
+    let ReconcileDecision::Claim(retained) = coordinator.next("lead-1") else {
+        panic!("older queued work must be retained");
+    };
+    assert_eq!(retained.mailbox_message_ids, vec!["older-queued"]);
+}
+
+#[test]
+fn interrupt_compare_and_set_reports_completion_race() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "active");
+    let ReconcileDecision::Claim(active) = coordinator.next("lead-1") else {
+        panic!("active work must be claimed");
+    };
+    assert_eq!(coordinator.complete_batch(&active), CommitResult::Committed);
+
+    let result = coordinator.interrupt_batch(&active, None, "replacement".into());
+    assert_eq!(result.commit_result, CommitResult::StaleOwner);
+    assert!(result.terminal_message_ids.is_empty());
+}
+
+#[test]
+fn starting_batch_interrupt_defers_stream_cancel_until_late_start_callback() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "active");
+    let ReconcileDecision::Claim(starting) = coordinator.next("lead-1") else {
+        panic!("active work must be claimed");
+    };
+    let result = coordinator.interrupt_batch(&starting, None, "replacement".into());
+    assert_eq!(result.commit_result, CommitResult::Committed);
+    assert_eq!(
+        coordinator.mark_started(&starting, "late-turn"),
+        StartCommitResult::CancelImmediately
+    );
+    assert_eq!(
+        coordinator.take_interrupt_metadata(&starting.batch_id),
+        Some(BatchInterruptMetadata {
+            reason: None,
+            replacement_message_id: "replacement".into(),
+        })
+    );
+}
+
+#[test]
+fn discard_policy_terminalizes_unclaimed_queue_but_keeps_replacement() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserIntervention, "old-1");
+    enqueue(&coordinator, WorkSource::McpSendMessage, "old-2");
+    enqueue(&coordinator, WorkSource::LeadIntervention, "replacement");
+
+    let discarded = coordinator.discard_queued_except("lead-1", "replacement");
+    assert_eq!(discarded.len(), 2);
+    assert!(discarded.contains(&"old-1".to_owned()));
+    assert!(discarded.contains(&"old-2".to_owned()));
+    let ReconcileDecision::Claim(replacement) = coordinator.next("lead-1") else {
+        panic!("replacement must remain queued");
+    };
+    assert_eq!(replacement.mailbox_message_ids, vec!["replacement"]);
 }
 
 // ── ELECTRON-3RN: recognized slash commands batch alone (FIFO, no preempt) ──

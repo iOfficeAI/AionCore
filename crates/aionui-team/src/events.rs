@@ -385,6 +385,8 @@ mod tests {
                 conversation_id: "conv-1".into(),
                 turn_id: "turn-1".into(),
                 status: aionui_api_types::TeamRunStatus::Running,
+                reason: None,
+                replacement_message_id: None,
             },
         );
 

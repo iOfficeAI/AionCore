@@ -13,24 +13,31 @@ use crate::{ConversationMcpStatus, SessionMcpServer};
 // B. Team MCP selection
 // ---------------------------------------------------------------------------
 
-/// The operator's globally enabled MCP servers, ready to freeze into a team
-/// member conversation's final runtime snapshot fields.
-///
-/// Team provisioning resolves this once per team creation and injects it into
-/// every member conversation's `extra`, so the builtin rows (e.g.
-/// `chrome-devtools`) that the generic enabled-set fallback hard-excludes still
-/// reach member sessions.
+/// One assistant's explicitly selected MCP servers, ready to freeze into a
+/// team member conversation's final runtime snapshot fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamMcpSelection {
-    /// Enabled non-builtin MCP row ids.
+    /// Complete explicit selection, including builtin ids. This preserves the
+    /// assistant binding fingerprint even when a selected row is malformed or
+    /// currently unavailable.
+    pub selected_ids: Vec<String>,
+    /// Selected non-builtin MCP row ids.
     pub mcp_server_ids: Vec<String>,
-    /// Enabled builtin MCP servers in neutral form (stdio launch commands
+    /// Selected builtin MCP servers in neutral form (stdio launch commands
     /// already resolved).
     pub session_mcp_servers: Vec<SessionMcpServer>,
-    /// Preclassified failures for enabled builtin rows that could not be
+    /// Preclassified failures for selected builtin rows that could not be
     /// converted into a runtime server. Valid rows are classified per agent
     /// when the full runtime snapshot is built.
     pub mcp_statuses: Vec<ConversationMcpStatus>,
+}
+
+/// Stable representation used to deduplicate assistant MCP binding refreshes.
+pub fn assistant_mcp_binding_fingerprint(ids: &[String]) -> String {
+    let mut ids = ids.to_vec();
+    ids.sort();
+    ids.dedup();
+    serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_owned())
 }
 
 /// Input for a single agent when creating a team or adding an agent.
@@ -291,6 +298,33 @@ pub struct SendAgentMessageRequest {
     pub files: Option<Vec<ChatFileRef>>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamQueuedPolicy {
+    #[default]
+    Retain,
+    Discard,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InterruptTeamAgentRequest {
+    pub message: String,
+    #[serde(default)]
+    pub files: Option<Vec<ChatFileRef>>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub queued_policy: TeamQueuedPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamInterruptOutcome {
+    Interrupted,
+    QueuedNoActiveTurn,
+    CompletedRace,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TeamRunTargetRole {
@@ -423,6 +457,19 @@ pub struct TeamChildTurnPayload {
     pub conversation_id: String,
     pub turn_id: String,
     pub status: TeamRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamInterruptAgentResponse {
+    pub outcome: TeamInterruptOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupted_turn_id: Option<String>,
+    pub message_id: String,
+    pub target: TeamSlotWorkPayload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1552,5 +1599,16 @@ mod tests {
         );
         let parsed: TeamAgentRuntimeStatus = serde_json::from_value(json!("dormant")).unwrap();
         assert_eq!(parsed, TeamAgentRuntimeStatus::Dormant);
+    }
+
+    #[test]
+    fn interrupt_request_defaults_to_retaining_the_existing_queue() {
+        let request: InterruptTeamAgentRequest = serde_json::from_value(json!({
+            "message": "corrected requirement"
+        }))
+        .unwrap();
+        assert_eq!(request.queued_policy, TeamQueuedPolicy::Retain);
+        assert!(request.files.is_none());
+        assert!(request.reason.is_none());
     }
 }

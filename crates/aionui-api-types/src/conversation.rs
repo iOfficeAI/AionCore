@@ -36,9 +36,9 @@ pub struct ConversationMcpStatus {
 /// refresh path never has to reason about raw JSON or raw DB rows.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct McpRuntimeSnapshot {
-    /// Enabled non-builtin MCP row ids (the `mcp_server_ids` extra field).
+    /// Selected non-builtin MCP row ids (the `mcp_server_ids` extra field).
     pub mcp_server_ids: Vec<String>,
-    /// Enabled builtin MCP servers in neutral form (the `session_mcp_servers`
+    /// Selected builtin MCP servers in neutral form (the `session_mcp_servers`
     /// extra field); stdio launch commands are already resolved.
     pub session_mcp_servers: Vec<SessionMcpServer>,
     /// Merged display names, deduped by name (the `mcp_servers` extra field).

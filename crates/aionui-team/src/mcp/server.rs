@@ -22,8 +22,8 @@ use super::protocol::{
     read_request, write_response,
 };
 use super::tools::{
-    ClearAgentContextInput, RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput,
-    TaskListInput, TaskListStatusInput, TaskUpdateInput,
+    ClearAgentContextInput, InterruptAgentInput, RenameAgentInput, SendMessageInput, ShutdownAgentInput,
+    SpawnAgentInput, TaskCreateInput, TaskListInput, TaskListStatusInput, TaskUpdateInput,
 };
 
 // ---------------------------------------------------------------------------
@@ -525,6 +525,9 @@ pub(crate) async fn dispatch_tool(
     match tool_name {
         "team_read_messages" => exec_read_messages(arguments, service, team_id, caller_slot_id).await,
         "team_send_message" => exec_send_message(arguments, scheduler, service, team_id, caller_slot_id).await,
+        "team_interrupt_agent" => {
+            exec_interrupt_agent(arguments, scheduler, service, team_id, caller_slot_id, caller_role).await
+        }
         "team_spawn_agent" => exec_spawn_agent(arguments, service, team_id, caller_slot_id, caller_role).await,
         "team_task_create" => exec_task_create(arguments, scheduler).await,
         "team_task_update" => exec_task_update(arguments, scheduler).await,
@@ -785,6 +788,48 @@ async fn exec_send_message(
     let response = build_send_message_queued_response(target_results).map_err(ToolCallError::from_message)?;
 
     serde_json::to_string(&response).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
+}
+
+async fn exec_interrupt_agent(
+    args: &Value,
+    scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    caller_slot_id: &str,
+    caller_role: TeammateRole,
+) -> Result<String, ToolCallError> {
+    if caller_role != TeammateRole::Lead {
+        return Err(ToolCallError::from_message("Only Lead can use team_interrupt_agent"));
+    }
+    let input: InterruptAgentInput = serde_json::from_value(args.clone())
+        .map_err(|error| ToolCallError::from_message(format!("Invalid params: {error}")))?;
+    if input.slot_id == "*" {
+        return Err(ToolCallError::from_message(
+            "team_interrupt_agent requires an exact slot_id; wildcard is not supported",
+        ));
+    }
+    if input.message.trim().is_empty() {
+        return Err(ToolCallError::from_message("message must not be empty"));
+    }
+    let target = resolve_agent_target(scheduler, &input.slot_id, false)
+        .await
+        .map_err(ToolCallError::from_message)?;
+    let service = service
+        .upgrade()
+        .ok_or_else(|| ToolCallError::from_message("Team service not available"))?;
+    let response = service
+        .interrupt_agent_from_agent(
+            team_id,
+            caller_slot_id,
+            &target,
+            &input.message,
+            (!input.files.is_empty()).then_some(input.files),
+            input.reason,
+        )
+        .await
+        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+    serde_json::to_string_pretty(&response)
+        .map_err(|error| ToolCallError::from_message(format!("Serialization error: {error}")))
 }
 
 fn build_send_message_queued_response(

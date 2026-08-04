@@ -12,8 +12,9 @@ use aionui_ai_agent::task_manager::AgentFactory;
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{
-    AcpBuildExtra, AcpConfigOptionDto, AcpConfigSelectOptionDto, AddAgentRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, SessionMcpServer, TeamAgentInput, TeamMcpSelection, TeamRunSource, WebSocketMessage,
+    AcpBuildExtra, AcpConfigOptionDto, AcpConfigSelectOptionDto, AddAgentRequest, AssistantMcpBindingChanged,
+    CreateTeamRequest, GetConfigOptionsResponse, McpRuntimeSnapshot, SessionMcpServer, TeamAgentInput,
+    TeamMcpSelection, TeamRunSource, WebSocketMessage, assistant_mcp_binding_fingerprint,
 };
 use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
@@ -36,7 +37,7 @@ use aionui_team::ports::{
 use aionui_team::session::SpawnAgentRequest;
 use aionui_team::{
     TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationProvisioningPort,
-    TeamProjectionMessageStore,
+    TeamMcpSnapshotResolution, TeamProjectionMessageStore,
 };
 use aionui_team::{TeamError, TeamSessionService};
 use common::MockTeamRepo;
@@ -314,9 +315,7 @@ struct FakeConversationPorts {
     repo: Arc<MockConversationRepo>,
     workspace_root: std::path::PathBuf,
     preset_snapshots: Mutex<HashMap<String, FakePresetAssistantSnapshot>>,
-    /// Canned global MCP selection returned by `resolve_global_mcp_selection`;
-    /// `None` means "no MCP configured" (empty selection).
-    global_mcp_selection: Mutex<Option<TeamMcpSelection>>,
+    assistant_mcp_selections: Mutex<HashMap<String, TeamMcpSelection>>,
     fail_team_temp_create: std::sync::atomic::AtomicBool,
     fail_leader_workspace_patch: std::sync::atomic::AtomicBool,
 }
@@ -336,14 +335,17 @@ impl FakeConversationPorts {
             repo,
             workspace_root,
             preset_snapshots: Mutex::new(HashMap::new()),
-            global_mcp_selection: Mutex::new(None),
+            assistant_mcp_selections: Mutex::new(HashMap::new()),
             fail_team_temp_create: std::sync::atomic::AtomicBool::new(false),
             fail_leader_workspace_patch: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    fn set_global_mcp_selection(&self, selection: TeamMcpSelection) {
-        *self.global_mcp_selection.lock().unwrap() = Some(selection);
+    fn set_assistant_mcp_selection(&self, assistant_id: &str, selection: TeamMcpSelection) {
+        self.assistant_mcp_selections
+            .lock()
+            .unwrap()
+            .insert(assistant_id.to_owned(), selection);
     }
 
     fn upsert_preset_snapshot(&self, id: &str, snapshot: FakePresetAssistantSnapshot) {
@@ -471,8 +473,62 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         }))
     }
 
-    async fn resolve_global_mcp_selection(&self, _user_id: &str) -> Result<TeamMcpSelection, aionui_team::TeamError> {
-        Ok(self.global_mcp_selection.lock().unwrap().clone().unwrap_or_default())
+    async fn resolve_assistant_mcp_selection(
+        &self,
+        _user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<TeamMcpSelection>, aionui_team::TeamError> {
+        Ok(Some(
+            self.assistant_mcp_selections
+                .lock()
+                .unwrap()
+                .get(assistant_id)
+                .cloned()
+                .unwrap_or_default(),
+        ))
+    }
+
+    async fn resolve_conversation_mcp_snapshot(
+        &self,
+        _user_id: &str,
+        conversation_id: &str,
+        assistant_id: Option<&str>,
+    ) -> Result<TeamMcpSnapshotResolution, aionui_team::TeamError> {
+        let Some(assistant_id) = assistant_id else {
+            let extra = self.repo.get_extra(conversation_id).unwrap_or_default();
+            return Ok(TeamMcpSnapshotResolution {
+                snapshot: McpRuntimeSnapshot {
+                    mcp_server_ids: serde_json::from_value(extra["mcp_server_ids"].clone()).unwrap_or_default(),
+                    session_mcp_servers: serde_json::from_value(extra["session_mcp_servers"].clone())
+                        .unwrap_or_default(),
+                    mcp_servers: serde_json::from_value(extra["mcp_servers"].clone()).unwrap_or_default(),
+                    mcp_statuses: serde_json::from_value(extra["mcp_statuses"].clone()).unwrap_or_default(),
+                },
+                fingerprint: None,
+            });
+        };
+        let selection = self
+            .assistant_mcp_selections
+            .lock()
+            .unwrap()
+            .get(assistant_id)
+            .cloned()
+            .unwrap_or_default();
+        let names = selection
+            .mcp_server_ids
+            .iter()
+            .cloned()
+            .chain(selection.session_mcp_servers.iter().map(|server| server.name.clone()))
+            .collect();
+        Ok(TeamMcpSnapshotResolution {
+            fingerprint: Some(assistant_mcp_binding_fingerprint(&selection.selected_ids)),
+            snapshot: McpRuntimeSnapshot {
+                mcp_server_ids: selection.mcp_server_ids,
+                session_mcp_servers: selection.session_mcp_servers,
+                mcp_servers: names,
+                mcp_statuses: selection.mcp_statuses,
+            },
+        })
     }
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, aionui_team::TeamError> {
@@ -554,6 +610,28 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
             )
             .await?;
         Ok(())
+    }
+
+    async fn conversation_model_facts(
+        &self,
+        conversation_id: &str,
+    ) -> Result<aionui_team::TeamConversationModelFacts, aionui_team::TeamError> {
+        let extra = self
+            .repo
+            .get_extra(conversation_id)
+            .ok_or_else(|| aionui_team::TeamError::AgentNotFound(conversation_id.to_owned()))?;
+        let value = |key: &str| {
+            extra
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        Ok(aionui_team::TeamConversationModelFacts {
+            confirmed_model_id: value("confirmed_model_id").or_else(|| value("current_model_id")),
+            runtime_seed_model_id: value("current_model_id"),
+        })
     }
 
     async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), aionui_team::TeamError> {
@@ -1752,6 +1830,112 @@ impl IAssistantDefinitionRepository for SingleAssistantDefinitionRepo {
     }
 }
 
+struct PairAssistantDefinitionRepo {
+    rows: Vec<AssistantDefinitionRow>,
+}
+
+#[async_trait::async_trait]
+impl IAssistantDefinitionRepository for PairAssistantDefinitionRepo {
+    async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        Ok(self.rows.clone())
+    }
+
+    async fn list_for_user(&self, _user_id: &str) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        self.list().await
+    }
+
+    async fn list_including_deleted_for_user(&self, _user_id: &str) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        self.list().await
+    }
+
+    async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(self.rows.iter().find(|row| row.assistant_id == assistant_id).cloned())
+    }
+
+    async fn get_by_assistant_id_for_user(
+        &self,
+        _user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_assistant_id(assistant_id).await
+    }
+
+    async fn get_by_assistant_id_including_deleted_for_user(
+        &self,
+        _user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_assistant_id(assistant_id).await
+    }
+
+    async fn get_by_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(self.rows.iter().find(|row| row.id == definition_id).cloned())
+    }
+
+    async fn get_by_id_for_user(
+        &self,
+        _user_id: &str,
+        definition_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_id(definition_id).await
+    }
+
+    async fn get_by_source_ref(
+        &self,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(self
+            .rows
+            .iter()
+            .find(|row| row.source == source && row.source_ref.as_deref() == Some(source_ref))
+            .cloned())
+    }
+
+    async fn get_by_source_ref_for_user(
+        &self,
+        _user_id: &str,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_source_ref(source, source_ref).await
+    }
+
+    async fn get_by_source_ref_including_deleted_for_user(
+        &self,
+        _user_id: &str,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_source_ref(source, source_ref).await
+    }
+
+    async fn upsert(&self, _params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError> {
+        Err(DbError::Init("not implemented".into()))
+    }
+
+    async fn upsert_for_user(
+        &self,
+        _user_id: &str,
+        params: &UpsertAssistantDefinitionParams<'_>,
+    ) -> Result<AssistantDefinitionRow, DbError> {
+        self.upsert(params).await
+    }
+
+    async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
+        Ok(false)
+    }
+
+    async fn soft_delete_for_user(
+        &self,
+        _user_id: &str,
+        definition_id: &str,
+        deleted_at: i64,
+    ) -> Result<bool, DbError> {
+        self.soft_delete(definition_id, deleted_at).await
+    }
+}
+
 struct SingleAssistantOverlayRepo {
     row: AssistantOverlayRow,
 }
@@ -1912,25 +2096,29 @@ fn setup_with_ports_team_repo_and_conversation_repo(
     Arc<FakeConversationPorts>,
     Arc<MockConversationRepo>,
 ) {
-    setup_with_ports_metadata_assistants_and_conversation_repo(
+    let (service, repo, ports, conversations, _) = setup_with_ports_metadata_assistants_and_conversation_repo(
         factory,
         agent_metadata_repo,
         Arc::new(EmptyAssistantDefinitionRepo),
         Arc::new(EmptyAssistantOverlayRepo),
-    )
+    );
+    (service, repo, ports, conversations)
 }
+
+type PortsServiceHarness = (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<FakeConversationPorts>,
+    Arc<MockConversationRepo>,
+    Arc<CountingTaskManager>,
+);
 
 fn setup_with_ports_metadata_assistants_and_conversation_repo(
     factory: AgentFactory,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
-) -> (
-    Arc<TeamSessionService>,
-    Arc<FullMockTeamRepo>,
-    Arc<FakeConversationPorts>,
-    Arc<MockConversationRepo>,
-) {
+) -> PortsServiceHarness {
     let team_repo = Arc::new(FullMockTeamRepo::new());
     let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
     let conv_repo = Arc::new(MockConversationRepo::new());
@@ -1938,7 +2126,8 @@ fn setup_with_ports_metadata_assistants_and_conversation_repo(
     let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
     let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
     let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
-    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(factory));
+    let task_manager = Arc::new(CountingTaskManager::new(factory));
+    let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
     let assistant_catalog: Arc<dyn TeamAssistantCatalogPort> = Arc::new(TestTeamAssistantCatalog {
@@ -1956,12 +2145,12 @@ fn setup_with_ports_metadata_assistants_and_conversation_repo(
         conversation_port,
         projection_store,
         broadcaster,
-        task_manager,
+        task_manager_dyn,
         noop_turn_port(),
         noop_cancellation_port(),
         backend_binary_path,
     );
-    (svc, team_repo, conversation_ports, conv_repo)
+    (svc, team_repo, conversation_ports, conv_repo, task_manager)
 }
 
 fn setup_with_recording_turn_port() -> (
@@ -2348,6 +2537,15 @@ fn word_creator_definition() -> AssistantDefinitionRow {
         updated_at: 0,
         deleted_at: None,
     }
+}
+
+fn reviewer_definition() -> AssistantDefinitionRow {
+    let mut row = word_creator_definition();
+    row.id = "def-reviewer".into();
+    row.assistant_id = "reviewer".into();
+    row.source_ref = Some("reviewer".into());
+    row.name = "Reviewer".into();
+    row
 }
 
 fn setup_with_metadata_rows(rows: Vec<AgentMetadataRow>) -> Arc<TeamSessionService> {
@@ -3099,12 +3297,13 @@ async fn team_preset_assistant_snapshot_is_frozen() {
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: word_creator_definition(),
     });
-    let (svc, _team_repo, conversation_ports, conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
-        success_factory(),
-        seeded_agent_metadata_repo(),
-        definition_repo,
-        Arc::new(EmptyAssistantOverlayRepo),
-    );
+    let (svc, _team_repo, conversation_ports, conv_repo, _task_manager) =
+        setup_with_ports_metadata_assistants_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            definition_repo,
+            Arc::new(EmptyAssistantOverlayRepo),
+        );
     conversation_ports.upsert_preset_snapshot(
         "word-creator",
         fake_preset_snapshot("assistant rule body", &["pdf", "cron"], &["mcp-docs"]),
@@ -3142,43 +3341,48 @@ async fn team_preset_assistant_snapshot_is_frozen() {
 }
 
 #[tokio::test]
-async fn team_global_mcp_selection_wins_over_preset_defaults() {
+async fn team_assistant_mcp_selection_wins_over_frozen_preset_defaults() {
     use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: word_creator_definition(),
     });
-    let (svc, _team_repo, conversation_ports, conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
-        success_factory(),
-        seeded_agent_metadata_repo(),
-        definition_repo,
-        Arc::new(EmptyAssistantOverlayRepo),
-    );
-    // The preset assistant defaults to `mcp-docs`, but the user's global
-    // selection is different (and includes a builtin): the explicit global
-    // selection must win, so the member conversation carries it exactly.
+    let (svc, _team_repo, conversation_ports, conv_repo, _task_manager) =
+        setup_with_ports_metadata_assistants_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            definition_repo,
+            Arc::new(EmptyAssistantOverlayRepo),
+        );
+    // The frozen preset snapshot says `mcp-docs`, while the live assistant
+    // binding is different and includes a builtin. The explicit assistant
+    // binding must win.
     conversation_ports.upsert_preset_snapshot(
         "word-creator",
         fake_preset_snapshot("assistant rule body", &["pdf", "cron"], &["mcp-docs"]),
     );
-    conversation_ports.set_global_mcp_selection(TeamMcpSelection {
-        mcp_server_ids: vec!["mcp-global".into()],
-        session_mcp_servers: vec![SessionMcpServer {
-            id: "mcp-chrome".into(),
-            name: "chrome-devtools".into(),
-            transport: SessionMcpTransport::Stdio {
-                command: "/runtime/npx".into(),
-                args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
-                env: Default::default(),
-            },
-        }],
-        mcp_statuses: Vec::new(),
-    });
+    conversation_ports.set_assistant_mcp_selection(
+        "word-creator",
+        TeamMcpSelection {
+            selected_ids: vec!["mcp-global".into(), "mcp-chrome".into()],
+            mcp_server_ids: vec!["mcp-global".into()],
+            session_mcp_servers: vec![SessionMcpServer {
+                id: "mcp-chrome".into(),
+                name: "chrome-devtools".into(),
+                transport: SessionMcpTransport::Stdio {
+                    command: "/runtime/npx".into(),
+                    args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
+                    env: Default::default(),
+                },
+            }],
+            mcp_statuses: Vec::new(),
+        },
+    );
 
     let resp = svc
         .create_team(
             "user1",
             CreateTeamRequest {
-                name: "Global MCP Wins".into(),
+                name: "Assistant MCP Wins".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
@@ -3197,7 +3401,7 @@ async fn team_global_mcp_selection_wins_over_preset_defaults() {
     // Rules/skills still frozen from the preset...
     assert_eq!(extra["preset_rules"], serde_json::json!("assistant rule body"));
     assert_eq!(extra["skills"], serde_json::json!(["pdf", "cron"]));
-    // ...but MCP comes from the explicit global selection, preset default
+    // ...but MCP comes from the explicit assistant selection, preset default
     // `mcp-docs` must NOT leak.
     assert_eq!(extra["mcp_server_ids"], serde_json::json!(["mcp-global"]));
     assert_eq!(
@@ -3211,17 +3415,215 @@ async fn team_global_mcp_selection_wins_over_preset_defaults() {
     assert!(extra.get("selected_mcp_server_ids").is_none());
     assert!(extra.get("selected_session_mcp_servers").is_none());
 }
+
+#[tokio::test]
+async fn team_members_receive_only_their_own_assistant_mcp_binding() {
+    let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(PairAssistantDefinitionRepo {
+        rows: vec![word_creator_definition(), reviewer_definition()],
+    });
+    let (svc, _team_repo, conversation_ports, conv_repo, _task_manager) =
+        setup_with_ports_metadata_assistants_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            definition_repo,
+            Arc::new(EmptyAssistantOverlayRepo),
+        );
+    conversation_ports.set_assistant_mcp_selection(
+        "word-creator",
+        TeamMcpSelection {
+            selected_ids: vec!["mcp-a".into()],
+            mcp_server_ids: vec!["mcp-a".into()],
+            ..Default::default()
+        },
+    );
+    conversation_ports.set_assistant_mcp_selection(
+        "reviewer",
+        TeamMcpSelection {
+            selected_ids: vec!["mcp-b".into()],
+            mcp_server_ids: vec!["mcp-b".into()],
+            ..Default::default()
+        },
+    );
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Per Assistant MCP".into(),
+                agents: vec![
+                    TeamAgentInput {
+                        name: "Lead".into(),
+                        role: "lead".into(),
+                        backend: None,
+                        model: "claude-sonnet-4".into(),
+                        assistant_id: Some("word-creator".into()),
+                        conversation_id: None,
+                    },
+                    TeamAgentInput {
+                        name: "Review".into(),
+                        role: "teammate".into(),
+                        backend: None,
+                        model: "claude-sonnet-4".into(),
+                        assistant_id: Some("reviewer".into()),
+                        conversation_id: None,
+                    },
+                ],
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+
+    for member in &created.assistants {
+        let extra = conv_repo.get_extra(&member.conversation_id).unwrap();
+        let expected = match member.assistant_id.as_deref() {
+            Some("word-creator") => serde_json::json!(["mcp-a"]),
+            Some("reviewer") => serde_json::json!(["mcp-b"]),
+            other => panic!("unexpected assistant id: {other:?}"),
+        };
+        assert_eq!(extra["mcp_server_ids"], expected);
+    }
+}
+
+#[tokio::test]
+async fn assistant_mcp_change_refreshes_dormant_idle_and_duplicate_revisions() {
+    let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(PairAssistantDefinitionRepo {
+        rows: vec![word_creator_definition(), reviewer_definition()],
+    });
+    let (svc, _team_repo, conversation_ports, conv_repo, task_manager) =
+        setup_with_ports_metadata_assistants_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            definition_repo,
+            Arc::new(EmptyAssistantOverlayRepo),
+        );
+    for (assistant_id, mcp_id) in [("word-creator", "mcp-a"), ("reviewer", "mcp-b")] {
+        conversation_ports.set_assistant_mcp_selection(
+            assistant_id,
+            TeamMcpSelection {
+                selected_ids: vec![mcp_id.into()],
+                mcp_server_ids: vec![mcp_id.into()],
+                ..Default::default()
+            },
+        );
+    }
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Live MCP".into(),
+                agents: vec![
+                    TeamAgentInput {
+                        name: "Lead".into(),
+                        role: "lead".into(),
+                        backend: None,
+                        model: "claude-sonnet-4".into(),
+                        assistant_id: Some("word-creator".into()),
+                        conversation_id: None,
+                    },
+                    TeamAgentInput {
+                        name: "Review".into(),
+                        role: "teammate".into(),
+                        backend: None,
+                        model: "claude-sonnet-4".into(),
+                        assistant_id: Some("reviewer".into()),
+                        conversation_id: None,
+                    },
+                ],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let lead = created
+        .assistants
+        .iter()
+        .find(|agent| agent.assistant_id.as_deref() == Some("word-creator"))
+        .unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|agent| agent.assistant_id.as_deref() == Some("reviewer"))
+        .unwrap();
+
+    task_manager.reset_calls();
+    conversation_ports.set_assistant_mcp_selection(
+        "reviewer",
+        TeamMcpSelection {
+            selected_ids: vec!["mcp-b2".into()],
+            mcp_server_ids: vec!["mcp-b2".into()],
+            ..Default::default()
+        },
+    );
+    svc.handle_assistant_mcp_binding_changed(AssistantMcpBindingChanged {
+        user_id: "user1".into(),
+        assistant_id: "reviewer".into(),
+        fingerprint: assistant_mcp_binding_fingerprint(&["mcp-b2".into()]),
+    })
+    .await;
+    assert!(
+        task_manager.snapshot().build.is_empty(),
+        "dormant member must not start eagerly"
+    );
+    assert_eq!(
+        conv_repo.get_extra(&worker.conversation_id).unwrap()["mcp_server_ids"],
+        serde_json::json!(["mcp-b2"])
+    );
+
+    svc.attach_agent_runtime("user1", &created.id, &worker.slot_id)
+        .await
+        .unwrap();
+    for _ in 0..50 {
+        if task_manager.get_task(&worker.conversation_id).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(task_manager.get_task(&worker.conversation_id).is_some());
+
+    task_manager.reset_calls();
+    conversation_ports.set_assistant_mcp_selection(
+        "word-creator",
+        TeamMcpSelection {
+            selected_ids: vec!["mcp-a2".into()],
+            mcp_server_ids: vec!["mcp-a2".into()],
+            ..Default::default()
+        },
+    );
+    let lead_event = AssistantMcpBindingChanged {
+        user_id: "user1".into(),
+        assistant_id: "word-creator".into(),
+        fingerprint: assistant_mcp_binding_fingerprint(&["mcp-a2".into()]),
+    };
+    svc.handle_assistant_mcp_binding_changed(lead_event.clone()).await;
+    let calls = task_manager.snapshot();
+    assert!(calls.build.contains(&lead.conversation_id));
+    assert!(
+        calls
+            .kill
+            .iter()
+            .any(|(id, reason)| { id == &lead.conversation_id && *reason == Some(AgentKillReason::TeamMcpRebuild) })
+    );
+
+    task_manager.reset_calls();
+    svc.handle_assistant_mcp_binding_changed(lead_event).await;
+    let duplicate_calls = task_manager.snapshot();
+    assert!(duplicate_calls.build.is_empty());
+    assert!(duplicate_calls.kill.is_empty());
+}
 #[tokio::test]
 async fn spawned_preset_assistant_snapshot_is_frozen() {
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: word_creator_definition(),
     });
-    let (svc, _team_repo, conversation_ports, conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
-        success_factory(),
-        seeded_agent_metadata_repo(),
-        definition_repo,
-        Arc::new(EmptyAssistantOverlayRepo),
-    );
+    let (svc, _team_repo, conversation_ports, conv_repo, _task_manager) =
+        setup_with_ports_metadata_assistants_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            definition_repo,
+            Arc::new(EmptyAssistantOverlayRepo),
+        );
     conversation_ports.upsert_preset_snapshot(
         "word-creator",
         fake_preset_snapshot("assistant rule body", &["pdf", "cron"], &["mcp-docs"]),
@@ -4079,12 +4481,13 @@ async fn add_agent_allows_same_assistant_id_multiple_times() {
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: word_creator_definition(),
     });
-    let (svc, _team_repo, _conversation_ports, _conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
-        success_factory(),
-        seeded_agent_metadata_repo(),
-        definition_repo,
-        Arc::new(EmptyAssistantOverlayRepo),
-    );
+    let (svc, _team_repo, _conversation_ports, _conv_repo, _task_manager) =
+        setup_with_ports_metadata_assistants_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            definition_repo,
+            Arc::new(EmptyAssistantOverlayRepo),
+        );
     let created = svc
         .create_team(
             "user1",
@@ -5305,6 +5708,146 @@ async fn an1_rename_agent() {
     let got = svc.get_team("user1", &created.id).await.unwrap();
     let agent = got.assistants.iter().find(|a| a.slot_id == slot_id).unwrap();
     assert_eq!(agent.name, "Senior Worker");
+}
+
+#[tokio::test]
+async fn observed_model_switch_updates_all_model_facts_and_survives_rebuild() {
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), seeded_agent_metadata_repo());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|agent| agent.role == "teammate")
+        .unwrap();
+
+    svc.update_agent_model("user1", &created.id, &worker.slot_id, "gpt-5.6-sol")
+        .await
+        .unwrap();
+
+    let persisted = svc.get_team("user1", &created.id).await.unwrap();
+    let persisted_worker = persisted
+        .assistants
+        .iter()
+        .find(|agent| agent.slot_id == worker.slot_id)
+        .unwrap();
+    assert_eq!(persisted_worker.model, "gpt-5.6-sol");
+    let extra = conv_repo.get_extra(&worker.conversation_id).unwrap();
+    assert_eq!(extra["current_model_id"], "gpt-5.6-sol");
+    let live_worker = svc
+        .get_session_scheduler(&created.id)
+        .unwrap()
+        .get_agent(&worker.slot_id)
+        .await
+        .unwrap();
+    assert_eq!(live_worker.model, "gpt-5.6-sol");
+
+    svc.stop_session("user1", &created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let rebuilt_worker = svc
+        .get_session_scheduler(&created.id)
+        .unwrap()
+        .get_agent(&worker.slot_id)
+        .await
+        .unwrap();
+    assert_eq!(rebuilt_worker.model, "gpt-5.6-sol");
+}
+
+#[tokio::test]
+async fn ensure_session_repairs_legacy_model_facts_from_confirmed_selection() {
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), seeded_agent_metadata_repo());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|agent| agent.role == "teammate")
+        .unwrap();
+    let mut extra = conv_repo.get_extra(&worker.conversation_id).unwrap();
+    extra["confirmed_model_id"] = serde_json::json!("gpt-5.7-confirmed");
+    extra["current_model_id"] = serde_json::json!("gpt-5.5-stale");
+    conv_repo
+        .update(
+            "user1",
+            &worker.conversation_id,
+            &ConversationRowUpdate {
+                extra: Some(serde_json::to_string(&extra).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    let persisted = svc.get_team("user1", &created.id).await.unwrap();
+    let persisted_worker = persisted
+        .assistants
+        .iter()
+        .find(|agent| agent.slot_id == worker.slot_id)
+        .unwrap();
+    assert_eq!(persisted_worker.model, "gpt-5.7-confirmed");
+    let repaired_extra = conv_repo.get_extra(&worker.conversation_id).unwrap();
+    assert_eq!(repaired_extra["current_model_id"], "gpt-5.7-confirmed");
+    let live_worker = svc
+        .get_session_scheduler(&created.id)
+        .unwrap()
+        .get_agent(&worker.slot_id)
+        .await
+        .unwrap();
+    assert_eq!(live_worker.model, "gpt-5.7-confirmed");
+}
+
+#[tokio::test]
+async fn update_agent_model_rejects_an_empty_model_without_changing_the_roster() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker = &created.assistants[1];
+
+    let error = svc
+        .update_agent_model("user1", &created.id, &worker.slot_id, "  ")
+        .await
+        .expect_err("empty model must be rejected");
+
+    assert!(error.to_string().contains("model must not be empty"));
+    let persisted = svc.get_team("user1", &created.id).await.unwrap();
+    let persisted_worker = persisted
+        .assistants
+        .iter()
+        .find(|agent| agent.slot_id == worker.slot_id)
+        .unwrap();
+    assert_eq!(persisted_worker.model, worker.model);
 }
 
 #[tokio::test]

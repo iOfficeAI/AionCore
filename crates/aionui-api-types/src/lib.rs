@@ -59,9 +59,10 @@ pub use antigravity_hook::{
     AntigravityHookToolCall,
 };
 pub use assistant::{
-    AssistantAgentResponse, AssistantCapabilitiesResponse, AssistantDefaultListRequest, AssistantDefaultListResponse,
-    AssistantDefaultScalarRequest, AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse,
-    AssistantDetailResponse, AssistantEngineResponse, AssistantPreferencesResponse, AssistantProfileResponse,
+    ASSISTANT_MCP_BINDING_CHANGED_EVENT, AssistantAgentResponse, AssistantCapabilitiesResponse,
+    AssistantDefaultListRequest, AssistantDefaultListResponse, AssistantDefaultScalarRequest,
+    AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse, AssistantDetailResponse,
+    AssistantEngineResponse, AssistantMcpBindingChanged, AssistantPreferencesResponse, AssistantProfileResponse,
     AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource, AssistantStateResponse,
     CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest,
     UpdateAssistantRequest, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
@@ -168,15 +169,16 @@ pub use system::{
     UpdateClientPreferencesRequest, UpdateSettingsRequest,
 };
 pub use team::{
-    AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, PauseTeamSlotRequest,
-    RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, TeamAgentInput,
-    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentRuntimeStatus,
+    AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, InterruptTeamAgentRequest,
+    PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest,
+    TeamAgentInput, TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentRuntimeStatus,
     TeamAgentRuntimeStatusPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload,
-    TeamListResponse, TeamMcpRuntimeConfig, TeamMcpSelection, TeamMessageEnqueueStatus, TeamResponse,
-    TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStateResponse, TeamRunStatus, TeamRunTargetRole,
-    TeamRuntimeSeed, TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus,
-    TeamSessionStatusPayload, TeamSlotBlockedReason, TeamSlotWorkChangedPayload, TeamSlotWorkPayload,
-    TeamSlotWorkState, TeammateMessagePayload,
+    TeamInterruptAgentResponse, TeamInterruptOutcome, TeamListResponse, TeamMcpRuntimeConfig, TeamMcpSelection,
+    TeamMessageEnqueueStatus, TeamQueuedPolicy, TeamResponse, TeamRunAckResponse, TeamRunPayload, TeamRunSource,
+    TeamRunStateResponse, TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageQueuedResponse,
+    TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamSlotBlockedReason,
+    TeamSlotWorkChangedPayload, TeamSlotWorkPayload, TeamSlotWorkState, TeammateMessagePayload,
+    assistant_mcp_binding_fingerprint,
 };
 pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use team_tools::{

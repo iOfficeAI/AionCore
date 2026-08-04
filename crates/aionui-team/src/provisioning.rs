@@ -3,6 +3,7 @@ use std::sync::Arc;
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
     AddAgentRequest, GetConfigOptionsResponse, McpRuntimeSnapshot, TeamAgentInput, TeamMcpSelection, TeamToolTransport,
+    assistant_mcp_binding_fingerprint,
 };
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
 use aionui_db::models::{AgentMetadataRow, TeamRow};
@@ -78,6 +79,18 @@ pub struct TeamConversationCreateResult {
     pub workspace: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TeamMcpSnapshotResolution {
+    pub snapshot: McpRuntimeSnapshot,
+    pub fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TeamConversationModelFacts {
+    pub confirmed_model_id: Option<String>,
+    pub runtime_seed_model_id: Option<String>,
+}
+
 #[async_trait]
 pub trait TeamConversationProvisioningPort: Send + Sync {
     async fn create_team_conversation(
@@ -92,6 +105,15 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError>;
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;
+
+    async fn persist_confirmed_model(&self, conversation_id: &str, model: &str) -> Result<(), TeamError> {
+        self.patch_runtime_config(conversation_id, serde_json::json!({ "current_model_id": model }))
+            .await
+    }
+
+    async fn conversation_model_facts(&self, _conversation_id: &str) -> Result<TeamConversationModelFacts, TeamError> {
+        Ok(TeamConversationModelFacts::default())
+    }
 
     async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError>;
 
@@ -120,9 +142,13 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
     ///
     /// A repo read failure is an error — never a silently empty set — so
     /// provisioning aborts instead of dropping every user MCP.
-    async fn resolve_global_mcp_selection(&self, user_id: &str) -> Result<TeamMcpSelection, TeamError> {
-        let _ = user_id;
-        Ok(TeamMcpSelection::default())
+    async fn resolve_assistant_mcp_selection(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<TeamMcpSelection>, TeamError> {
+        let _ = (user_id, assistant_id);
+        Ok(Some(TeamMcpSelection::default()))
     }
 
     /// Resolve the user's globally enabled MCP servers into the full typed
@@ -133,9 +159,10 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
         &self,
         user_id: &str,
         conversation_id: &str,
-    ) -> Result<McpRuntimeSnapshot, TeamError> {
-        let _ = (user_id, conversation_id);
-        Ok(McpRuntimeSnapshot::default())
+        assistant_id: Option<&str>,
+    ) -> Result<TeamMcpSnapshotResolution, TeamError> {
+        let _ = (user_id, conversation_id, assistant_id);
+        Ok(TeamMcpSnapshotResolution::default())
     }
 
     async fn delete_team_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), TeamError>;
@@ -218,7 +245,9 @@ impl TeamAgentProvisioner {
         // teammates): N queries would be redundant and could observe an
         // inconsistent toggle state mid-provisioning. A read failure aborts
         // here, before any orphan conversation can be created.
-        let mcp_selection = self.conversation_port.resolve_global_mcp_selection(user_id).await?;
+        let leader_mcp_selection = self
+            .resolve_assistant_mcp_selection(user_id, leader_assistant_id.as_deref())
+            .await?;
         let leader_backend = self
             .resolve_requested_backend(user_id, leader_input.backend.as_deref(), leader_assistant_id.as_deref())
             .await?;
@@ -234,7 +263,7 @@ impl TeamAgentProvisioner {
                 leader_assistant_id.as_deref(),
                 shared_workspace,
                 None,
-                Some(&mcp_selection),
+                Some(&leader_mcp_selection),
             )
             .await?;
 
@@ -274,6 +303,9 @@ impl TeamAgentProvisioner {
             let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
             let backend = self
                 .resolve_requested_backend(user_id, input.backend.as_deref(), assistant_id.as_deref())
+                .await?;
+            let mcp_selection = self
+                .resolve_assistant_mcp_selection(user_id, assistant_id.as_deref())
                 .await?;
             let conversation = self
                 .create_team_conversation_for_agent(
@@ -342,7 +374,9 @@ impl TeamAgentProvisioner {
             .resolve_requested_backend(user_id, req.backend.as_deref(), assistant_id.as_deref())
             .await?;
         // Resolve the global MCP selection once for this agent.
-        let mcp_selection = self.conversation_port.resolve_global_mcp_selection(user_id).await?;
+        let mcp_selection = self
+            .resolve_assistant_mcp_selection(user_id, assistant_id.as_deref())
+            .await?;
         let agent = self
             .provision_new_agent(
                 NewAgentProvisioning {
@@ -401,8 +435,7 @@ impl TeamAgentProvisioner {
         let workspace = self.workspace_resolver().resolve_for_new_agent(&row, &team).await?;
         // Resolve the global MCP selection once for this spawned agent.
         let mcp_selection = self
-            .conversation_port
-            .resolve_global_mcp_selection(&req.user_id)
+            .resolve_assistant_mcp_selection(&req.user_id, req.assistant_id.as_deref())
             .await?;
         let agent = self
             .provision_new_agent(
@@ -433,7 +466,7 @@ impl TeamAgentProvisioner {
         mcp_stdio_cfg: TeamMcpStdioConfig,
         task_manager: &Arc<dyn IWorkerTaskManager>,
         kill_existing: bool,
-    ) -> Result<(), TeamError> {
+    ) -> Result<Option<String>, TeamError> {
         let team_id = mcp_stdio_cfg.team_id.clone();
         let transport = self.team_tool_transport(user_id, agent).await?;
         // Refresh the user's globally enabled MCP snapshot (including builtin
@@ -441,17 +474,17 @@ impl TeamAgentProvisioner {
         // the current selection. A repo read failure aborts the attach — it is
         // never treated as "enabled set is empty", which would clear the
         // stored snapshot.
-        let mcp_snapshot = self
+        let mcp_resolution = self
             .conversation_port
-            .resolve_conversation_mcp_snapshot(user_id, &agent.conversation_id)
+            .resolve_conversation_mcp_snapshot(user_id, &agent.conversation_id, agent.assistant_id.as_deref())
             .await?;
         match transport {
             TeamToolTransport::Mcp => {
-                self.write_team_mcp_runtime_config(user_id, agent, mcp_stdio_cfg, !kill_existing, &mcp_snapshot)
+                self.write_team_mcp_runtime_config(user_id, agent, mcp_stdio_cfg, !kill_existing, &mcp_resolution)
                     .await?
             }
             TeamToolTransport::CliAssumed => {
-                self.write_team_cli_runtime_config(user_id, agent, !kill_existing, &mcp_snapshot)
+                self.write_team_cli_runtime_config(user_id, agent, !kill_existing, &mcp_resolution)
                     .await?
             }
         }
@@ -475,7 +508,45 @@ impl TeamAgentProvisioner {
             outcome = "attached",
             "Team agent provisioner attached runtime process"
         );
-        Ok(())
+        Ok(mcp_resolution.fingerprint)
+    }
+
+    async fn resolve_assistant_mcp_selection(
+        &self,
+        user_id: &str,
+        assistant_id: Option<&str>,
+    ) -> Result<TeamMcpSelection, TeamError> {
+        let Some(assistant_id) = assistant_id else {
+            return Ok(TeamMcpSelection::default());
+        };
+        self.conversation_port
+            .resolve_assistant_mcp_selection(user_id, assistant_id)
+            .await?
+            .ok_or_else(|| TeamError::InvalidRequest(format!("Assistant MCP binding is unavailable: {assistant_id}")))
+    }
+
+    /// Persist the latest assistant MCP snapshot without disturbing a dormant
+    /// or currently working runtime.
+    pub(crate) async fn refresh_agent_mcp_snapshot(
+        &self,
+        user_id: &str,
+        agent: &TeamAgent,
+    ) -> Result<Option<String>, TeamError> {
+        let resolution = self
+            .conversation_port
+            .resolve_conversation_mcp_snapshot(user_id, &agent.conversation_id, agent.assistant_id.as_deref())
+            .await?;
+        let patch = serde_json::json!({
+            "mcp_server_ids": resolution.snapshot.mcp_server_ids,
+            "session_mcp_servers": resolution.snapshot.session_mcp_servers,
+            "mcp_servers": resolution.snapshot.mcp_servers,
+            "mcp_statuses": resolution.snapshot.mcp_statuses,
+            "assistant_mcp_fingerprint": resolution.fingerprint,
+        });
+        self.conversation_port
+            .patch_runtime_config(&agent.conversation_id, patch)
+            .await?;
+        Ok(resolution.fingerprint)
     }
 
     /// Pick how team tools reach this agent. Deliberately a DIFFERENT question
@@ -535,8 +606,9 @@ impl TeamAgentProvisioner {
         agent: &TeamAgent,
         mcp_stdio_cfg: TeamMcpStdioConfig,
         preserve_session_mode: bool,
-        mcp_snapshot: &McpRuntimeSnapshot,
+        mcp_resolution: &TeamMcpSnapshotResolution,
     ) -> Result<(), TeamError> {
+        let mcp_snapshot = &mcp_resolution.snapshot;
         let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
         let agent_type = agent_type_for_backend(cli_metadata.as_ref(), &agent.backend)?;
         let session_mode = session_mode_for_backend(&agent.backend, agent_type, cli_metadata.as_ref());
@@ -547,6 +619,7 @@ impl TeamAgentProvisioner {
                 "session_mcp_servers": mcp_snapshot.session_mcp_servers,
                 "mcp_servers": mcp_snapshot.mcp_servers,
                 "mcp_statuses": mcp_snapshot.mcp_statuses,
+                "assistant_mcp_fingerprint": mcp_resolution.fingerprint,
             })
         } else {
             serde_json::json!({
@@ -556,6 +629,7 @@ impl TeamAgentProvisioner {
                 "session_mcp_servers": mcp_snapshot.session_mcp_servers,
                 "mcp_servers": mcp_snapshot.mcp_servers,
                 "mcp_statuses": mcp_snapshot.mcp_statuses,
+                "assistant_mcp_fingerprint": mcp_resolution.fingerprint,
             })
         };
         self.conversation_port
@@ -574,8 +648,9 @@ impl TeamAgentProvisioner {
         user_id: &str,
         agent: &TeamAgent,
         preserve_session_mode: bool,
-        mcp_snapshot: &McpRuntimeSnapshot,
+        mcp_resolution: &TeamMcpSnapshotResolution,
     ) -> Result<(), TeamError> {
+        let mcp_snapshot = &mcp_resolution.snapshot;
         let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
         let agent_type = agent_type_for_backend(cli_metadata.as_ref(), &agent.backend)?;
         let session_mode = session_mode_for_backend(&agent.backend, agent_type, cli_metadata.as_ref());
@@ -586,6 +661,7 @@ impl TeamAgentProvisioner {
                 "session_mcp_servers": mcp_snapshot.session_mcp_servers,
                 "mcp_servers": mcp_snapshot.mcp_servers,
                 "mcp_statuses": mcp_snapshot.mcp_statuses,
+                "assistant_mcp_fingerprint": mcp_resolution.fingerprint,
             })
         } else {
             serde_json::json!({
@@ -595,6 +671,7 @@ impl TeamAgentProvisioner {
                 "session_mcp_servers": mcp_snapshot.session_mcp_servers,
                 "mcp_servers": mcp_snapshot.mcp_servers,
                 "mcp_statuses": mcp_snapshot.mcp_statuses,
+                "assistant_mcp_fingerprint": mcp_resolution.fingerprint,
             })
         };
         self.conversation_port
@@ -833,6 +910,8 @@ impl TeamAgentProvisioner {
                 serde_json::to_value(&selection.session_mcp_servers).unwrap_or(serde_json::Value::Array(Vec::new()));
             extra["mcp_statuses"] =
                 serde_json::to_value(&selection.mcp_statuses).unwrap_or(serde_json::Value::Array(Vec::new()));
+            extra["assistant_mcp_fingerprint"] =
+                serde_json::Value::String(assistant_mcp_binding_fingerprint(&selection.selected_ids));
         }
         extra
     }
@@ -905,30 +984,45 @@ mod tests {
             Err(TeamError::InvalidRequest("unused".into()))
         }
 
-        async fn resolve_global_mcp_selection(&self, _user_id: &str) -> Result<TeamMcpSelection, TeamError> {
+        async fn resolve_assistant_mcp_selection(
+            &self,
+            _user_id: &str,
+            _assistant_id: &str,
+        ) -> Result<Option<TeamMcpSelection>, TeamError> {
             if let Some(message) = self.mcp_error {
                 return Err(TeamError::InvalidRequest(message.into()));
             }
-            Ok(self
-                .mcp_snapshot
-                .as_ref()
-                .map(|snapshot| TeamMcpSelection {
-                    mcp_server_ids: snapshot.mcp_server_ids.clone(),
-                    session_mcp_servers: snapshot.session_mcp_servers.clone(),
-                    mcp_statuses: snapshot.mcp_statuses.clone(),
-                })
-                .unwrap_or_default())
+            Ok(Some(
+                self.mcp_snapshot
+                    .as_ref()
+                    .map(|snapshot| TeamMcpSelection {
+                        selected_ids: snapshot
+                            .mcp_server_ids
+                            .iter()
+                            .cloned()
+                            .chain(snapshot.session_mcp_servers.iter().map(|server| server.id.clone()))
+                            .collect(),
+                        mcp_server_ids: snapshot.mcp_server_ids.clone(),
+                        session_mcp_servers: snapshot.session_mcp_servers.clone(),
+                        mcp_statuses: snapshot.mcp_statuses.clone(),
+                    })
+                    .unwrap_or_default(),
+            ))
         }
 
         async fn resolve_conversation_mcp_snapshot(
             &self,
             _user_id: &str,
             _conversation_id: &str,
-        ) -> Result<McpRuntimeSnapshot, TeamError> {
+            _assistant_id: Option<&str>,
+        ) -> Result<TeamMcpSnapshotResolution, TeamError> {
             if let Some(message) = self.mcp_error {
                 return Err(TeamError::InvalidRequest(message.into()));
             }
-            Ok(self.mcp_snapshot.clone().unwrap_or_default())
+            Ok(TeamMcpSnapshotResolution {
+                snapshot: self.mcp_snapshot.clone().unwrap_or_default(),
+                fingerprint: Some("test-fingerprint".to_owned()),
+            })
         }
 
         async fn conversation_workspace(&self, _conversation_id: &str) -> Result<Option<String>, TeamError> {
@@ -1350,7 +1444,7 @@ mod tests {
         let provisioner = test_provisioner_with_patches(events, Arc::clone(&patches));
 
         provisioner
-            .write_team_cli_runtime_config("user-test", &test_agent(), false, &McpRuntimeSnapshot::default())
+            .write_team_cli_runtime_config("user-test", &test_agent(), false, &TeamMcpSnapshotResolution::default())
             .await
             .unwrap();
 
@@ -1473,6 +1567,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_only_refresh_preserves_team_coordination_config() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let patches = Arc::new(Mutex::new(Vec::new()));
+        let persisted_extra = Arc::new(Mutex::new(serde_json::json!({
+            "team_mcp_stdio_config": {"team_id": "team-1", "slot_id": "slot-1"},
+        })));
+        let provisioner = test_provisioner_with_port_state(
+            events,
+            patches,
+            Some(test_mcp_snapshot()),
+            None,
+            Arc::clone(&persisted_extra),
+        );
+
+        provisioner
+            .refresh_agent_mcp_snapshot("user-1", &test_agent())
+            .await
+            .unwrap();
+
+        let extra = persisted_extra.lock().unwrap();
+        assert_eq!(extra["team_mcp_stdio_config"]["team_id"], "team-1");
+        assert_eq!(extra["mcp_server_ids"], serde_json::json!(["mcp-docs"]));
+    }
+
+    #[tokio::test]
     async fn provision_initial_agents_stops_before_conversation_creation_when_mcp_repo_is_unavailable() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let provisioner = test_provisioner_with_port_state(
@@ -1487,7 +1606,7 @@ mod tests {
             role: "lead".into(),
             backend: Some("aionrs".into()),
             model: "test-model".into(),
-            assistant_id: None,
+            assistant_id: Some("assistant-1".into()),
             conversation_id: None,
         }];
 
@@ -1559,6 +1678,7 @@ mod tests {
     async fn build_team_extra_injects_explicit_mcp_selection() {
         let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
         let selection = TeamMcpSelection {
+            selected_ids: vec!["mcp-docs".into(), "builtin-1".into()],
             mcp_server_ids: vec!["mcp-docs".into()],
             session_mcp_servers: test_mcp_snapshot().session_mcp_servers,
             mcp_statuses: Vec::new(),

@@ -136,6 +136,21 @@ struct SendMessageParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct InterruptAgentParams {
+    /// Exact teammate slot_id; wildcard is not supported.
+    slot_id: String,
+    /// Replacement instruction delivered after interruption.
+    message: String,
+    /// Absolute attachment paths to forward to the target agent.
+    #[serde(default)]
+    files: Vec<String>,
+    /// Optional interruption reason.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SpawnAgentParams {
     /// Agent display name.
     name: String,
@@ -230,6 +245,13 @@ struct RenameAgentParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ClearAgentContextParams {
+    /// Agent slot_id whose context should be cleared.
+    slot_id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct ShutdownAgentParams {
     /// Agent slot_id to shut down.
     slot_id: String,
@@ -273,6 +295,23 @@ impl TeamStdioServer {
                 "to": params.to,
                 "message": params.message,
                 "files": params.files,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_interrupt_agent",
+        description = "Immediately stop a teammate's active turn and durably deliver a replacement instruction as its next highest-priority message."
+    )]
+    async fn interrupt_agent(&self, Parameters(params): Parameters<InterruptAgentParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_interrupt_agent",
+            &serde_json::json!({
+                "slot_id": params.slot_id,
+                "message": params.message,
+                "files": params.files,
+                "reason": params.reason,
             }),
         )
         .await
@@ -346,6 +385,18 @@ impl TeamStdioServer {
         self.forward_to_tcp(
             "team_rename_agent",
             &serde_json::json!({ "slot_id": params.slot_id, "new_name": params.new_name }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_clear_agent_context",
+        description = "Clear a team member's backend conversation context while preserving team membership, settings, and visible chat history. Lead only."
+    )]
+    async fn clear_agent_context(&self, Parameters(params): Parameters<ClearAgentContextParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_clear_agent_context",
+            &serde_json::json!({ "slot_id": params.slot_id }),
         )
         .await
     }
@@ -806,6 +857,7 @@ mod tests {
     fn team_stdio_descriptions_match_prompt_registry() {
         let router = TeamStdioServer::tool_router();
         let tools = router.list_all();
+        assert_eq!(tools.len(), 13, "stdio must expose the complete shared registry");
         let mut actual_names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         actual_names.sort_unstable();
         let mut expected_names: Vec<_> = aionui_team_prompts::tools::team_tool_specs()
@@ -831,6 +883,30 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn team_stdio_interrupt_and_clear_context_schemas_match_registry_shape() {
+        let router = TeamStdioServer::tool_router();
+        let tools = router.list_all();
+        let interrupt = tools
+            .iter()
+            .find(|tool| tool.name == "team_interrupt_agent")
+            .expect("team_interrupt_agent tool missing");
+        let interrupt_properties = interrupt.input_schema["properties"].as_object().unwrap();
+        assert_eq!(interrupt_properties.len(), 4);
+        assert!(interrupt_properties.contains_key("slot_id"));
+        assert!(interrupt_properties.contains_key("message"));
+        assert!(interrupt_properties.contains_key("files"));
+        assert!(interrupt_properties.contains_key("reason"));
+
+        let clear = tools
+            .iter()
+            .find(|tool| tool.name == "team_clear_agent_context")
+            .expect("team_clear_agent_context tool missing");
+        let clear_properties = clear.input_schema["properties"].as_object().unwrap();
+        assert_eq!(clear_properties.len(), 1);
+        assert!(clear_properties.contains_key("slot_id"));
     }
 
     #[tokio::test]

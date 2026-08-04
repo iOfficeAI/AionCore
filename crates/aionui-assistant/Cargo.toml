@@ -10,6 +10,7 @@ aionui-api-types = { workspace = true }
 aionui-db = { workspace = true }
 aionui-auth = { workspace = true }
 aionui-extension = { workspace = true }
+aionui-realtime = { workspace = true }
 axum = { workspace = true }
 dirs = { workspace = true }
 include_dir = "0.7"
@@ -23,7 +24,6 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-aionui-realtime = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 http-body-util = { workspace = true }

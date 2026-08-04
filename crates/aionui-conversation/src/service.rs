@@ -24,13 +24,15 @@ use aionui_api_types::{
     MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
     SendMessageResponse, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection,
     TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
-    assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    assistant_avatar_response_value, assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
     PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
 };
-use aionui_db::models::{AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow};
+use aionui_db::models::{
+    AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
+};
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
@@ -1163,7 +1165,6 @@ impl ConversationService {
                     assistant_snapshot
                         .as_ref()
                         .map(|snapshot| snapshot.resolved_defaults.mcp_ids.clone())
-                        .filter(|ids| !ids.is_empty())
                 }
             }
             None => None,
@@ -4295,10 +4296,123 @@ impl ConversationService {
             }
         }
         Ok(TeamMcpSelection {
+            selected_ids: mcp_server_ids
+                .iter()
+                .cloned()
+                .chain(session_mcp_servers.iter().map(|server| server.id.clone()))
+                .collect(),
             mcp_server_ids,
             session_mcp_servers,
             mcp_statuses,
         })
+    }
+
+    /// Resolve one assistant's effective MCP binding using the same fixed/auto
+    /// precedence as ordinary conversation creation. Explicit ids are loaded
+    /// regardless of the MCP row's global `enabled` flag.
+    pub async fn resolve_assistant_mcp_selection(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<TeamMcpSelection>, ConversationError> {
+        let definition_repo = self
+            .assistant_definition_repo()
+            .ok_or_else(|| ConversationError::internal("Assistant definition repository is unavailable"))?;
+        let preference_repo = self
+            .assistant_preference_repo()
+            .ok_or_else(|| ConversationError::internal("Assistant preference repository is unavailable"))?;
+        let Some(definition) = definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load assistant definition: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let preference = preference_repo
+            .get_for_user(user_id, &definition.id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load assistant MCP preference: {e}")))?;
+        let selected_ids = resolve_effective_assistant_mcp_ids(
+            &definition.default_mcps_mode,
+            &definition.default_mcp_ids,
+            preference.as_ref().map(|row| row.last_mcp_ids.as_str()),
+        )?;
+
+        let repo = {
+            let guard = self
+                .mcp_server_repo
+                .read()
+                .map_err(|_| ConversationError::internal("MCP server repository lock is poisoned"))?;
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| ConversationError::internal("MCP server repository is unavailable"))?
+        };
+        let rows = repo
+            .list_by_ids_any(user_id, &selected_ids)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?;
+        let mut rows_by_id = rows
+            .into_iter()
+            .map(|row| (row.id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        let mut mcp_server_ids = Vec::new();
+        let mut session_mcp_servers = Vec::new();
+        let mut mcp_statuses = Vec::new();
+        for id in &selected_ids {
+            let Some(row) = rows_by_id.remove(id) else {
+                continue;
+            };
+            if !assistant_mcp_row_is_injectable(&row) {
+                continue;
+            }
+            if row.builtin {
+                match aionui_ai_agent::mcp_resolve::row_to_session_mcp_server(&row).await {
+                    Ok(server) => session_mcp_servers.push(server),
+                    Err(err) => mcp_statuses.push(ConversationMcpStatus {
+                        id: row.id,
+                        name: row.name,
+                        status: ConversationMcpStatusKind::Failed,
+                        reason: Some(err),
+                    }),
+                }
+            } else {
+                mcp_server_ids.push(row.id);
+            }
+        }
+        Ok(Some(TeamMcpSelection {
+            selected_ids,
+            mcp_server_ids,
+            session_mcp_servers,
+            mcp_statuses,
+        }))
+    }
+
+    /// Resolve and classify one assistant's current MCP binding for an existing
+    /// conversation. `None` means the assistant no longer exists; an empty
+    /// snapshot is still `Some` and therefore remains an explicit no-MCP bind.
+    pub async fn resolve_assistant_mcp_snapshot(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+        agent_type: &AgentType,
+        extra: &serde_json::Value,
+    ) -> Result<Option<(McpRuntimeSnapshot, String)>, ConversationError> {
+        let Some(selection) = self.resolve_assistant_mcp_selection(user_id, assistant_id).await? else {
+            return Ok(None);
+        };
+        let fingerprint = assistant_mcp_binding_fingerprint(&selection.selected_ids);
+        let snapshot = self
+            .build_runtime_mcp_snapshot(
+                user_id,
+                Some(&selection.mcp_server_ids),
+                &selection.session_mcp_servers,
+                &selection.mcp_statuses,
+                agent_type,
+                extra,
+            )
+            .await?;
+        Ok(Some((snapshot, fingerprint)))
     }
 
     /// Resolve the operator's globally enabled MCP servers into a full typed
@@ -4628,6 +4742,25 @@ fn parse_json_string_list(raw: Option<&str>, field: &str) -> Result<Vec<String>,
     }
 }
 
+fn resolve_effective_assistant_mcp_ids(
+    mode: &str,
+    default_mcp_ids: &str,
+    last_mcp_ids: Option<&str>,
+) -> Result<Vec<String>, ConversationError> {
+    if mode == "fixed" {
+        parse_json_string_list(Some(default_mcp_ids), "default_mcp_ids")
+    } else {
+        last_mcp_ids
+            .map(|value| parse_json_string_list(Some(value), "last_mcp_ids"))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+}
+
+fn assistant_mcp_row_is_injectable(row: &McpServerRow) -> bool {
+    row.name != TEAM_MCP_SERVER_NAME
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct AssistantLineage<'a> {
     agent_type: &'a str,
@@ -4894,5 +5027,33 @@ mod tests {
         );
 
         assert_eq!(status.status, ConversationMcpStatusKind::Failed);
+    }
+
+    #[test]
+    fn fixed_empty_mcp_binding_stays_explicitly_empty() {
+        let ids = resolve_effective_assistant_mcp_ids("fixed", "[]", Some(r#"["globally-enabled"]"#)).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn explicitly_selected_disabled_mcp_row_remains_injectable() {
+        let row = McpServerRow {
+            id: "mcp-disabled".into(),
+            user_id: "user-1".into(),
+            name: "selected-disabled".into(),
+            description: None,
+            enabled: false,
+            transport_type: "stdio".into(),
+            transport_config: r#"{"command":"node"}"#.into(),
+            tools: None,
+            last_test_status: "disconnected".into(),
+            last_connected: None,
+            original_json: None,
+            builtin: false,
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(assistant_mcp_row_is_injectable(&row));
     }
 }

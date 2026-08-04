@@ -1135,11 +1135,10 @@ async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
     assert_eq!(stop_resp.status(), StatusCode::OK);
 }
 
-// ES-1c: member conversations carry the user's globally enabled MCP snapshot
-// (non-builtin row ids + builtin session servers, e.g. chrome-devtools), and a
-// runtime restart self-heals the snapshot after toggle changes.
+// ES-1c: each member conversation carries only its assistant's explicit MCP
+// binding. A fixed empty binding must not inherit globally enabled servers.
 #[tokio::test]
-async fn es1c_team_conversations_carry_global_mcp_snapshot_including_builtin() {
+async fn es1c_team_conversations_carry_assistant_bound_mcp_snapshot() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
@@ -1224,52 +1223,113 @@ async fn es1c_team_conversations_carry_global_mcp_snapshot_including_builtin() {
     .await
     .expect("seed reserved-name mcp");
 
-    let data = create_team(&mut app, &services, &token, &csrf).await;
+    ensure_default_team_agent_installed(&services).await;
+    let bound_assistant_req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": DEFAULT_TEAM_ASSISTANT_ID,
+            "name": "Team E2E MCP Assistant",
+            "agent_id": DEFAULT_TEAM_AGENT_ID,
+            "defaults": {
+                "mcps": {
+                    "mode": "fixed",
+                    "value": ["mcp-e2e-docs", "mcp-e2e-chrome", "mcp-e2e-broken"]
+                }
+            }
+        }),
+        &token,
+        &csrf,
+    );
+    let bound_assistant_resp = app.clone().oneshot(bound_assistant_req).await.unwrap();
+    assert_eq!(bound_assistant_resp.status(), StatusCode::CREATED);
+
+    let unbound_assistant_id = "team-e2e-empty-mcp-assistant";
+    let unbound_assistant_req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": unbound_assistant_id,
+            "name": "Team E2E Empty MCP Assistant",
+            "agent_id": DEFAULT_TEAM_AGENT_ID,
+            "defaults": { "mcps": { "mode": "fixed", "value": [] } }
+        }),
+        &token,
+        &csrf,
+    );
+    let unbound_assistant_resp = app.clone().oneshot(unbound_assistant_req).await.unwrap();
+    assert_eq!(unbound_assistant_resp.status(), StatusCode::CREATED);
+
+    let create_req = json_with_token(
+        "POST",
+        "/api/teams",
+        json!({
+            "name": "Alpha",
+            "agents": [
+                {
+                    "name": "Lead",
+                    "role": "lead",
+                    "model": "claude",
+                    "assistant_id": DEFAULT_TEAM_ASSISTANT_ID
+                },
+                {
+                    "name": "Worker",
+                    "role": "teammate",
+                    "model": "claude",
+                    "assistant_id": unbound_assistant_id
+                }
+            ]
+        }),
+        &token,
+        &csrf,
+    );
+    let create_resp = app.clone().oneshot(create_req).await.unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    let create_body = body_json(create_resp).await;
+    let data = &create_body["data"];
     let team_id = data["id"].as_str().unwrap();
     let lead = &data["assistants"][0];
     let lead_conversation_id = lead["conversation_id"].as_str().unwrap();
     let lead_slot_id = lead["slot_id"].as_str().unwrap();
     let worker_conversation_id = data["assistants"][1]["conversation_id"].as_str().unwrap();
 
-    for conversation_id in [lead_conversation_id, worker_conversation_id] {
-        let extra = conversation_extra(&services, conversation_id).await;
-        assert_eq!(extra["mcp_server_ids"], json!(["mcp-e2e-docs"]), "{conversation_id}");
-        assert_eq!(
-            extra["session_mcp_servers"][0]["name"],
-            json!("chrome-devtools"),
-            "{conversation_id}"
-        );
-        assert_eq!(
-            extra["session_mcp_servers"][0]["transport"]["command"],
-            json!(stdio_command),
-            "{conversation_id}"
-        );
-        assert_eq!(
-            extra["mcp_servers"],
-            json!(["mcp-e2e-docs", "chrome-devtools", "broken-builtin"]),
-            "{conversation_id}"
-        );
-        let statuses = extra["mcp_statuses"].as_array().unwrap();
-        assert_eq!(statuses.len(), 3, "{conversation_id}");
-        assert!(
-            statuses
-                .iter()
-                .any(|status| { status["name"] == json!("broken-builtin") && status["status"] == json!("failed") })
-        );
-        assert!(
-            !extra["mcp_servers"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|name| name == "aionui-team")
-        );
-        // Request-only fields must never leak into the stored row.
-        assert!(extra.get("selected_mcp_server_ids").is_none(), "{conversation_id}");
-        assert!(extra.get("selected_session_mcp_servers").is_none(), "{conversation_id}");
-    }
+    let lead_extra = conversation_extra(&services, lead_conversation_id).await;
+    assert_eq!(lead_extra["mcp_server_ids"], json!(["mcp-e2e-docs"]));
+    assert_eq!(lead_extra["session_mcp_servers"][0]["name"], json!("chrome-devtools"));
+    assert_eq!(
+        lead_extra["session_mcp_servers"][0]["transport"]["command"],
+        json!(stdio_command)
+    );
+    assert_eq!(
+        lead_extra["mcp_servers"],
+        json!(["mcp-e2e-docs", "chrome-devtools", "broken-builtin"])
+    );
+    let statuses = lead_extra["mcp_statuses"].as_array().unwrap();
+    assert_eq!(statuses.len(), 3);
+    assert!(
+        statuses
+            .iter()
+            .any(|status| { status["name"] == json!("broken-builtin") && status["status"] == json!("failed") })
+    );
+    assert!(
+        !lead_extra["mcp_servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "aionui-team")
+    );
+    // Request-only fields must never leak into the stored row.
+    assert!(lead_extra.get("selected_mcp_server_ids").is_none());
+    assert!(lead_extra.get("selected_session_mcp_servers").is_none());
 
-    // Self-heal: toggle enabled flags, then force a runtime restart; the
-    // refreshed snapshot must drop the disabled row and pick up the new one.
+    let worker_extra = conversation_extra(&services, worker_conversation_id).await;
+    assert_eq!(worker_extra["mcp_server_ids"], json!([]));
+    assert_eq!(worker_extra["session_mcp_servers"], json!([]));
+    assert_eq!(worker_extra["mcp_servers"], json!([]));
+    assert_eq!(worker_extra["mcp_statuses"], json!([]));
+
+    // Global enabled flags do not override an assistant's explicit binding.
+    // A runtime restart must resolve the same assistant-bound snapshot.
     sqlx::query("UPDATE mcp_servers SET enabled = 0 WHERE id = 'mcp-e2e-docs'")
         .execute(&pool)
         .await
@@ -1318,11 +1378,11 @@ async fn es1c_team_conversations_carry_global_mcp_snapshot_including_builtin() {
         "member runtime restart should succeed: {restart_body}"
     );
     let extra = conversation_extra(&services, lead_conversation_id).await;
-    assert_eq!(extra["mcp_server_ids"], json!(["mcp-e2e-off"]));
+    assert_eq!(extra["mcp_server_ids"], json!(["mcp-e2e-docs"]));
     assert_eq!(extra["session_mcp_servers"][0]["name"], json!("chrome-devtools"));
     assert_eq!(
         extra["mcp_servers"],
-        json!(["mcp-e2e-off", "chrome-devtools", "broken-builtin"])
+        json!(["mcp-e2e-docs", "chrome-devtools", "broken-builtin"])
     );
     assert_eq!(extra["mcp_statuses"].as_array().unwrap().len(), 3);
 
@@ -1349,11 +1409,11 @@ async fn es1c_team_conversations_carry_global_mcp_snapshot_including_builtin() {
         "second member runtime restart should succeed: {restart_body}"
     );
     let extra = conversation_extra(&services, lead_conversation_id).await;
-    assert_eq!(extra["mcp_server_ids"], json!(["mcp-e2e-off"]));
+    assert_eq!(extra["mcp_server_ids"], json!(["mcp-e2e-docs"]));
     assert_eq!(extra["session_mcp_servers"].as_array().unwrap().len(), 1);
     assert_eq!(
         extra["mcp_servers"],
-        json!(["mcp-e2e-off", "chrome-devtools", "broken-builtin"])
+        json!(["mcp-e2e-docs", "chrome-devtools", "broken-builtin"])
     );
 }
 

@@ -12,9 +12,10 @@ Slot ID: {{AGENT_SLOT_ID}}
 Role: lead
 
 ## Your Role
-You coordinate a team of AI agents. You do NOT do implementation work
-yourself. You break down tasks, assign them to teammates, and synthesize
-results.${workspaceSection}
+You coordinate a team of AI agents. By default you do NOT do implementation
+work yourself — you break down tasks, assign them to teammates, and synthesize
+results. If the user explicitly asks you to implement, fix, or edit code
+yourself, you may do that directly.${workspaceSection}
 
 ## Conversation Style
 - If the user greets you, starts a new chat, or asks what you can do without giving a concrete task yet, reply warmly and naturally
@@ -360,6 +361,7 @@ mod tests {
         assert!(prompt.contains("team_members"));
         assert!(prompt.contains("team_list_assistants"));
         assert!(prompt.contains("call `team_read_messages` to check for queued messages"));
+        assert!(prompt.contains("If the user explicitly asks you to implement, fix, or edit code"));
         assert!(!prompt.contains("${"));
     }
 

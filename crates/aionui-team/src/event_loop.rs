@@ -237,11 +237,14 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                                 conversation_id: started.conversation_id,
                                 turn_id: started.turn_id,
                                 status: TeamRunStatus::Running,
+                                reason: None,
+                                replacement_message_id: None,
                             },
                         );
                     }
                 }
                 StartCommitResult::CancelImmediately => {
+                    let interrupt = coordinator.take_interrupt_metadata(&batch.batch_id);
                     if let Err(error) = cancellation_port
                         .cancel_agent_turn(&user_id, &conversation_id, &started.turn_id)
                         .await
@@ -266,6 +269,8 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                                 conversation_id: started.conversation_id,
                                 turn_id: started.turn_id,
                                 status: TeamRunStatus::Cancelled,
+                                reason: interrupt.as_ref().and_then(|metadata| metadata.reason.clone()),
+                                replacement_message_id: interrupt.map(|metadata| metadata.replacement_message_id),
                             },
                         );
                     }
@@ -298,6 +303,11 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
             return ExecuteResult::WaitForSignal;
         }
         Err(error) => {
+            if ctx.session.work_coordinator().is_batch_cancelled(&batch) {
+                let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
+                finalize_scheduler_turn(ctx).await;
+                return ExecuteResult::ContinueDraining;
+            }
             warn!(
                 team_id = %ctx.team_id,
                 slot_id = %ctx.slot_id,
@@ -312,7 +322,10 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
         }
     };
 
-    let terminal_status = if outcome.status.is_success() {
+    let terminal_status = if ctx.session.work_coordinator().is_batch_cancelled(&batch) {
+        let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
+        None
+    } else if outcome.status.is_success() {
         mark_message_ids_read(ctx, &batch, &batch.mailbox_message_ids).await;
         (ctx.session.work_coordinator().complete_batch(&batch) == CommitResult::Committed)
             .then_some(TeamRunStatus::Completed)
@@ -335,11 +348,18 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                     conversation_id: outcome.conversation_id.clone(),
                     turn_id: outcome.turn_id.clone(),
                     status: status.clone(),
+                    reason: None,
+                    replacement_message_id: None,
                 },
             );
         }
     }
 
+    finalize_scheduler_turn(ctx).await;
+    ExecuteResult::ContinueDraining
+}
+
+async fn finalize_scheduler_turn(ctx: &AgentLoopContext) {
     match ctx.scheduler.finalize_turn(&ctx.slot_id, &[]).await {
         Ok(Some(wake_target)) if wake_target != ctx.slot_id => {
             if let Err(error) = ctx
@@ -364,7 +384,6 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
             "scheduler turn finalization failed"
         ),
     }
-    ExecuteResult::ContinueDraining
 }
 
 async fn finalize_failed_delivery(ctx: &AgentLoopContext, batch: &WorkBatch, failure: &BatchFailureResult) {

@@ -16,7 +16,8 @@ use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
     AgentTurnStarted, AgentTurnStatus, NativeSlashCommandPort, SlashCatalogSource, SlashCommandRecognition,
     TeamConversationBindingLookup, TeamConversationCreateRequest, TeamConversationCreateResult,
-    TeamConversationLookupPort, TeamConversationProvisioningPort, TeamError, TeamProjectionMessageStore,
+    TeamConversationLookupPort, TeamConversationModelFacts, TeamConversationProvisioningPort, TeamError,
+    TeamMcpSnapshotResolution, TeamProjectionMessageStore,
 };
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
@@ -498,9 +499,13 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map_err(map_conversation_update_error)
     }
 
-    async fn resolve_global_mcp_selection(&self, user_id: &str) -> Result<TeamMcpSelection, TeamError> {
+    async fn resolve_assistant_mcp_selection(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<TeamMcpSelection>, TeamError> {
         self.conversation_service
-            .resolve_global_mcp_selection(user_id)
+            .resolve_assistant_mcp_selection(user_id, assistant_id)
             .await
             .map_err(map_conversation_update_error)
     }
@@ -509,7 +514,8 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
         &self,
         user_id: &str,
         conversation_id: &str,
-    ) -> Result<McpRuntimeSnapshot, TeamError> {
+        assistant_id: Option<&str>,
+    ) -> Result<TeamMcpSnapshotResolution, TeamError> {
         let Some(row) = self.conversation_repo.get(user_id, conversation_id).await? else {
             return Err(TeamError::InvalidRequest(format!(
                 "conversation {conversation_id} not found"
@@ -523,10 +529,45 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
                 ))
             })?;
         let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
-        self.conversation_service
-            .resolve_global_mcp_snapshot(user_id, &agent_type, &extra)
+        let Some(assistant_id) = assistant_id else {
+            return Ok(TeamMcpSnapshotResolution {
+                snapshot: McpRuntimeSnapshot {
+                    mcp_server_ids: extra
+                        .get("mcp_server_ids")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .unwrap_or_default(),
+                    session_mcp_servers: extra
+                        .get("session_mcp_servers")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .unwrap_or_default(),
+                    mcp_servers: extra
+                        .get("mcp_servers")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .unwrap_or_default(),
+                    mcp_statuses: extra
+                        .get("mcp_statuses")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .unwrap_or_default(),
+                },
+                fingerprint: None,
+            });
+        };
+        let resolved = self
+            .conversation_service
+            .resolve_assistant_mcp_snapshot(user_id, assistant_id, &agent_type, &extra)
             .await
-            .map_err(map_conversation_update_error)
+            .map_err(map_conversation_update_error)?
+            .ok_or_else(|| {
+                TeamError::InvalidRequest(format!("Assistant MCP binding is unavailable: {assistant_id}"))
+            })?;
+        Ok(TeamMcpSnapshotResolution {
+            snapshot: resolved.0,
+            fingerprint: Some(resolved.1),
+        })
     }
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError> {
@@ -538,6 +579,39 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             )
             .await
             .map_err(map_conversation_update_error)
+    }
+
+    async fn persist_confirmed_model(&self, conversation_id: &str, model: &str) -> Result<(), TeamError> {
+        let user_id = self.require_owner_user_id(conversation_id).await?;
+        self.conversation_service
+            .persist_confirmed_model(&user_id, conversation_id, model)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn conversation_model_facts(&self, conversation_id: &str) -> Result<TeamConversationModelFacts, TeamError> {
+        let user_id = self.require_owner_user_id(conversation_id).await?;
+        let row = self
+            .conversation_repo
+            .get(&user_id, conversation_id)
+            .await?
+            .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        let runtime_seed_model_id = extra
+            .get("current_model_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let confirmed_model_id = self
+            .conversation_service
+            .confirmed_model_id(&user_id, conversation_id)
+            .await
+            .map_err(map_conversation_update_error)?;
+        Ok(TeamConversationModelFacts {
+            confirmed_model_id,
+            runtime_seed_model_id,
+        })
     }
 
     async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError> {
