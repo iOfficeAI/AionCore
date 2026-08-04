@@ -567,6 +567,16 @@ mod tests {
     }
 
     #[test]
+    fn lark_work_assistant_ships_with_an_svg_avatar() {
+        let reg = BuiltinAssistantRegistry::load_embedded();
+        let asset = reg
+            .avatar_asset("lark-work-assistant")
+            .expect("Lark Work Assistant avatar should resolve from the embedded bundle");
+        assert!(!asset.bytes.is_empty());
+        assert_eq!(asset.extension.as_deref(), Some("svg"));
+    }
+
+    #[test]
     fn avatar_asset_returns_bytes_and_extension_for_file_avatar() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("duck.svg"), b"<svg/>").unwrap();
