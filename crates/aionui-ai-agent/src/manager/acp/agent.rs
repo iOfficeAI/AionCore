@@ -1375,6 +1375,11 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
         self.runtime.subscribe()
     }
 
+    fn prompt_media_caps(&self) -> crate::types::PromptMediaCaps {
+        let caps = self.protocol.agent_capabilities().map(|c| c.prompt_capabilities).unwrap_or_default();
+        crate::types::PromptMediaCaps { image: caps.image, audio: caps.audio }
+    }
+
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id, msg_id = %data.msg_id))]
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.runtime.bump_activity();

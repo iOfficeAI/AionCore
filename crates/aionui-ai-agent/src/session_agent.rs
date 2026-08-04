@@ -30,7 +30,7 @@ use crate::protocol::events::{
 };
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::PersistedSessionState;
-use crate::types::SendMessageData;
+use crate::types::{PromptMediaCaps, SendMessageData};
 use aionui_api_types::AcpBuildExtra;
 use aionui_common::AgentType;
 use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStateParams};
@@ -1032,6 +1032,14 @@ impl IAgentTask for SessionAgentTask {
 
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.runtime.tx.subscribe()
+    }
+
+    fn prompt_media_caps(&self) -> PromptMediaCaps {
+        let blocks = self.backend.capabilities().prompt_blocks;
+        PromptMediaCaps {
+            image: blocks.image,
+            audio: blocks.audio,
+        }
     }
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
