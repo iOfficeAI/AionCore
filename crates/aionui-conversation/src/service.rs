@@ -4565,6 +4565,19 @@ pub(crate) async fn apply_agent_title(
         obj.insert("user_id".to_owned(), serde_json::Value::String(user_id.to_owned()));
     }
     broadcaster.broadcast(WebSocketMessage::new("conversation.nameUpdated", value));
+    // Also emit the generic list-refresh event: the existing frontend already
+    // refetches the sidebar list AND the open conversation on
+    // `conversation.listChanged(updated)`, so an agent rename propagates
+    // without any new frontend subscription (mirrors `broadcast_list_changed`).
+    broadcaster.broadcast(WebSocketMessage::new(
+        "conversation.listChanged",
+        serde_json::json!({
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "action": "updated",
+            "source": existing.source,
+        }),
+    ));
 
     info!(
         conversation_id,
