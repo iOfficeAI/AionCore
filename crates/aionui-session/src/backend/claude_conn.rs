@@ -480,17 +480,37 @@ impl TitleGenState {
     /// Fire the one-shot `generate_session_title` control_request on a detached
     /// task (the reader loop must not block on the stdin lock). The reply is
     /// observed by `sniff_session_title`, not awaited here.
-    fn fire(self: &Arc<Self>, session_id: &str) {
+    ///
+    /// `result_text` is the first successful turn's assistant text
+    /// (`TurnResult.result_text`), appended to the recorded first prompt.
+    /// Live-verified (claude 2.1.221, 2026-08-04): a bare short question as
+    /// the description makes the CLI's structured title generation reliably
+    /// return `{title:null}` ("什么是git ？" → null), while prompt+answer
+    /// titles reliably ("User:…/Assistant:…" → "Git 版本控制系统介绍").
+    fn fire(self: &Arc<Self>, session_id: &str, result_text: &str) {
         use std::sync::atomic::Ordering;
         let this = self.clone();
         let session_id = session_id.to_string();
+        let assistant_part: String = result_text.chars().take(1000).collect();
         tokio::spawn(async move {
-            let description = this
+            let user_part = this
                 .description
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
                 .unwrap_or_default();
+            let mut description = String::new();
+            if !user_part.is_empty() {
+                description.push_str("User: ");
+                description.push_str(&user_part);
+            }
+            if !assistant_part.is_empty() {
+                if !description.is_empty() {
+                    description.push_str("\n\n");
+                }
+                description.push_str("Assistant: ");
+                description.push_str(&assistant_part);
+            }
             let request_id = format!("{TITLE_PREFIX}{}", this.control_seq.fetch_add(1, Ordering::SeqCst) + 1);
             let frame = serde_json::json!({
                 "type": "control_request",
@@ -1320,11 +1340,18 @@ async fn reader_task(
                     turn_in_flight.store(false, Ordering::SeqCst);
                     // Spec 2026-08-04: first SUCCESSFUL turn of a Fresh session
                     // fires the one-shot generate_session_title (an error turn
-                    // keeps the latch armed for the next successful one).
-                    if matches!(ev, SessionEvent::TurnResult { is_error: false, .. })
+                    // keeps the latch armed for the next successful one). The
+                    // turn's assistant text is passed along — prompt+answer as
+                    // the description keeps the CLI's title generation from
+                    // returning null on short prompts (see TitleGenState::fire).
+                    if let SessionEvent::TurnResult {
+                        is_error: false,
+                        result_text,
+                        ..
+                    } = &ev
                         && title_gen.pending.swap(false, Ordering::SeqCst)
                     {
-                        title_gen.fire(&session_id);
+                        title_gen.fire(&session_id, result_text);
                     }
                 }
                 // Bug-A: a TurnResult is stamped with the OPEN turn's locked epoch
@@ -5690,6 +5717,9 @@ mod tests {
         );
         assert!(written.contains("\"persist\":true"), "wire: {written:?}");
         assert!(written.contains(TITLE_PREFIX), "wire: {written:?}");
+        // The description carries the first turn's assistant text (live-verified:
+        // a bare short prompt makes the CLI's title generation return null).
+        assert!(written.contains("Assistant: hi"), "wire: {written:?}");
     }
 
     #[tokio::test]
