@@ -7572,8 +7572,7 @@ mod pump_tests {
         // watcher owns them.
         let last_turn_frame = frames
             .iter()
-            .filter(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
-            .next_back();
+            .rfind(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)));
         assert!(
             matches!(last_turn_frame, Some(AgentStreamEvent::Finish(_))),
             "the settled Finish is the turn's terminal frame, got {seq:?}"
@@ -7645,8 +7644,7 @@ mod pump_tests {
         assert!(
             frames
                 .iter()
-                .filter(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
-                .next_back()
+                .rfind(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
                 .is_some_and(|f| matches!(f, AgentStreamEvent::Finish(_))),
             "the clean result's Finish must flow while a background bash is alive, got {seq:?}"
         );
