@@ -72,6 +72,12 @@ fn resolve_known_officecli_install_path_from_env(
 
     if let Some(local_app_data) = local_app_data {
         candidates.push(PathBuf::from(local_app_data).join("OfficeCli").join("officecli.exe"));
+        candidates.push(
+            PathBuf::from(local_app_data)
+                .join("Programs")
+                .join("officecli")
+                .join("officecli.exe"),
+        );
     }
 
     if let Some(home) = home {
@@ -147,6 +153,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let local_app_data = tmp.path().join("LocalAppData");
         let officecli_exe = local_app_data.join("OfficeCli").join("officecli.exe");
+        std::fs::create_dir_all(officecli_exe.parent().unwrap()).unwrap();
+        std::fs::write(&officecli_exe, b"fake exe").unwrap();
+
+        let resolved = resolve_officecli_path_from_env_for_test(None, None, Some(&local_app_data));
+
+        assert_eq!(resolved, Some(officecli_exe));
+    }
+
+    #[test]
+    fn officecli_resolution_discovers_legacy_windows_programs_location() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_app_data = tmp.path().join("LocalAppData");
+        let officecli_exe = local_app_data.join("Programs").join("officecli").join("officecli.exe");
         std::fs::create_dir_all(officecli_exe.parent().unwrap()).unwrap();
         std::fs::write(&officecli_exe, b"fake exe").unwrap();
 

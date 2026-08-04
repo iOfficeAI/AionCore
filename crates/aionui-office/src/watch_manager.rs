@@ -430,8 +430,19 @@ impl ProcessSpawner for DefaultProcessSpawner {
             .map_err(|e| OfficeError::InstallFailed(e.to_string()))?;
 
         if !output.status.success() {
+            const MAX_INSTALLER_LOG_CHARS: usize = 2_000;
+            let stdout = String::from_utf8_lossy(&output.stdout)
+                .chars()
+                .take(MAX_INSTALLER_LOG_CHARS)
+                .collect::<String>();
+            let stderr = String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(MAX_INSTALLER_LOG_CHARS)
+                .collect::<String>();
             tracing::warn!(
                 status = ?output.status.code(),
+                stdout,
+                stderr,
                 "officecli official installer failed"
             );
             return Err(OfficeError::InstallFailed("official OfficeCLI installer failed".into()));
