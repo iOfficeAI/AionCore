@@ -179,6 +179,7 @@ fn event_type_name(event: &AgentStreamEvent) -> &'static str {
         AgentStreamEvent::Plan(_) => "Plan",
         AgentStreamEvent::Permission(_) => "Permission",
         AgentStreamEvent::AcpPermission(_) => "AcpPermission",
+        AgentStreamEvent::Ask(_) => "Ask",
         AgentStreamEvent::AcpToolCall(_) => "AcpToolCall",
         AgentStreamEvent::AvailableCommands(_) => "AvailableCommands",
         AgentStreamEvent::SkillSuggest(_) => "SkillSuggest",

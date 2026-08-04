@@ -2101,7 +2101,7 @@ mod proptest_totality {
                     requires_action: RequiresActionSet {
                         waiting_on_approval: appr,
                         waiting_on_auth: auth,
-                waiting_on_question: 0,
+                        waiting_on_question: 0,
                     },
                     subagents: sub
                         .map(|st| {

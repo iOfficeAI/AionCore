@@ -950,7 +950,9 @@ impl ClaudeAdapter {
             // A retracted AskUserQuestion resolves the QUESTION counter — emitting
             // PermissionResolved here would wedge waiting_on_question at >0 forever.
             Some(id) if !id.is_empty() && self.ask_requests.remove(id) => {
-                vec![SessionEvent::AskResolved { request_id: id.to_string() }]
+                vec![SessionEvent::AskResolved {
+                    request_id: id.to_string(),
+                }]
             }
             Some(id) if !id.is_empty() => vec![SessionEvent::PermissionResolved {
                 request_id: id.to_string(),
