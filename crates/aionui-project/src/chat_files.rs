@@ -13,6 +13,7 @@ use std::path::Path;
 use aionui_api_types::ChatFileRef;
 use aionui_common::constants::AIONUI_FILES_MARKER;
 
+use crate::canonical;
 use crate::service::ProjectService;
 use crate::types::{FileOp, ProjectError, ReferenceInput};
 
@@ -126,6 +127,109 @@ impl ProjectService {
                 Ok(canonical.to_string_lossy().into_owned())
             }
         }
+    }
+
+    /// Upgrade a [`ChatFileRef`] to its strongest identity for `project_id`.
+    ///
+    /// A file opened from the explorer arrives as `Project{pe_id, relative_path}`,
+    /// but the same file opened from a chat link arrives as `Local{path}` — two
+    /// unequal refs for one file, so anything keyed on the ref (tab dedupe, the
+    /// `fs` channel's change signal) treats them as different files. This turns a
+    /// `Local` path that happens to live under one of the project's roots into the
+    /// `Project` form, so equality reduces to comparing ref keys.
+    ///
+    /// Best-effort by design: a ref that cannot be upgraded is returned unchanged
+    /// rather than rejected. Callers use the result for addressing, so "no stronger
+    /// identity available" is a normal outcome, not an error.
+    ///
+    /// # Platform casing
+    ///
+    /// Path comparison goes through [`canonical::canonicalize`], whose case folding
+    /// is a compile-time platform fork ([`canonical::IGNORE_PATH_CASING`]: on for
+    /// macOS/Windows, off for Linux). A caller doing its own `starts_with` on raw
+    /// strings would miss matches on macOS and — worse — conflate distinct files on
+    /// Linux, which is why this lives on the backend.
+    pub async fn upgrade_chat_file_ref(
+        &self,
+        user_id: &str,
+        project_id: &str,
+        file: &ChatFileRef,
+    ) -> Result<ChatFileRef, ProjectError> {
+        // `Project` is already terminal, and `Upload` lives in a managed directory
+        // that belongs to no root. Returning early also keeps the explorer's own
+        // open path (already `Project`) from paying for a lookup it cannot use.
+        let ChatFileRef::Local { path } = file else {
+            return Ok(file.clone());
+        };
+
+        // Resolve symlinks and `..` before comparing, matching `path_within` and
+        // `realpath_within`. A path that does not exist cannot be placed under a
+        // root, and the caller still has a missing-file state to render, so keep the
+        // local ref rather than failing.
+        let Ok(absolute) = std::fs::canonicalize(path) else {
+            return Ok(file.clone());
+        };
+
+        match self.find_owning_entry(user_id, project_id, &absolute).await? {
+            Some((pe_id, relative_path)) => Ok(ChatFileRef::Project { pe_id, relative_path }),
+            None => Ok(file.clone()),
+        }
+    }
+
+    /// Find which of `project_id`'s roots contains `target`, with the path relative
+    /// to it. `None` when the file sits outside every root. `target` must already be
+    /// a realpath.
+    ///
+    /// The inverse of [`containment::resolve_relative`], which the codebase only had
+    /// in the forward direction (given a root, is this path inside it). A project
+    /// holds a handful of roots, so this walks them rather than indexing.
+    ///
+    /// At most one root can contain the file, so the first match is the answer:
+    /// `attach_folder` focuses the existing entry when a descendant of a root is
+    /// attached and rejects an ancestor as an overlap, which leaves the roots of a
+    /// project mutually non-nesting.
+    async fn find_owning_entry(
+        &self,
+        user_id: &str,
+        project_id: &str,
+        target: &Path,
+    ) -> Result<Option<(String, String)>, ProjectError> {
+        // Via the public project view rather than the store directly: this module
+        // sits outside `service`, and widening the store's visibility to save one
+        // hop would expose the whole data layer to every sibling module.
+        let detail = self.get_project(user_id, project_id).await?;
+
+        for entry in detail.explorer.entries {
+            // Both sides must be realpaths for the prefix test to mean anything: a
+            // stored root can be lexical while the target came back from
+            // `fs::canonicalize`, and on macOS that alone is the difference between
+            // `/var/...` and `/private/var/...`.
+            let Ok(root) = canonical::canonicalize(&entry.folder.resource_canonical) else {
+                continue;
+            };
+            let Ok(root_path) = canonical::fs_path(&root) else {
+                continue;
+            };
+            let Ok(root_path) = std::fs::canonicalize(&root_path) else {
+                // A root whose folder is gone (unmounted, deleted) cannot own
+                // anything; skip it instead of failing the whole lookup.
+                continue;
+            };
+            let Ok(relative) = target.strip_prefix(&root_path) else {
+                continue;
+            };
+
+            // Forward slashes on every platform: `relative_path` is a wire value
+            // (protocol.md), not a host path.
+            let relative_path = relative
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            return Ok(Some((entry.pe_id, relative_path)));
+        }
+
+        Ok(None)
     }
 }
 

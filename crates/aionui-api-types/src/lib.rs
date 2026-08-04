@@ -130,7 +130,9 @@ pub use office::{
     ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, PptJsonData, PptSlideData, PreviewState, PreviewStatusEvent,
     PreviewUrlResponse, StartPreviewRequest, StopPreviewRequest,
 };
-pub use project::{AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer};
+pub use project::{
+    AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest, ResolveRefResponse,
+};
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest, DetectionSuggestion,
     FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, HealthStatus, KeyTestResult, ModelCapability,
