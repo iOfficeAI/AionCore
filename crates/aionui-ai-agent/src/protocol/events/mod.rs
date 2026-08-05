@@ -45,6 +45,11 @@ pub enum AgentStreamEvent {
     AcpConfigOption(serde_json::Value),
     AcpSessionInfo(serde_json::Value),
     AcpContextUsage(serde_json::Value),
+    /// Live snapshot of a client-hosted terminal (ACP `terminal/*`):
+    /// `{terminal_id, command, output(cumulative), truncated, exit_status?}`.
+    /// Emitted throttled while the delegated command runs, plus one final
+    /// frame when it exits.
+    AcpTerminalOutput(serde_json::Value),
     AcpPromptHookWarning(serde_json::Value),
     SlashCommandsUpdated(serde_json::Value),
     AvailableCommands(AvailableCommandsEventData),

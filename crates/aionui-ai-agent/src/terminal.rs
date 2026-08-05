@@ -71,6 +71,17 @@ impl OutputBuffer {
 pub struct TerminalRegistry {
     entries: Mutex<HashMap<String, TerminalEntry>>,
     next_id: AtomicU64,
+    /// Log correlation label (the owning conversation id; empty for probes).
+    label: String,
+}
+
+impl TerminalRegistry {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            ..Self::default()
+        }
+    }
 }
 
 /// Parameters for [`TerminalRegistry::create`] (decoded from
@@ -85,7 +96,7 @@ pub struct CreateTerminalParams {
 
 impl TerminalRegistry {
     /// Spawn the command and register a terminal for it.
-    pub async fn create(&self, conversation_id: &str, params: CreateTerminalParams) -> Result<String, String> {
+    pub async fn create(&self, params: CreateTerminalParams) -> Result<String, String> {
         let mut builder = aionui_runtime::Builder::new(&params.command);
         builder
             .args(&params.args)
@@ -106,7 +117,7 @@ impl TerminalRegistry {
             .collect::<Vec<_>>()
             .join(" ");
         info!(
-            conversation_id,
+            conversation_id = %self.label,
             terminal_id = %id,
             command = %command_line,
             "client terminal created"
@@ -303,8 +314,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_runs_command_and_reports_output_and_exit() {
-        let reg = TerminalRegistry::default();
-        let id = reg.create("conv-t", params("echo", &["hello_term"])).await.unwrap();
+        let reg = TerminalRegistry::new("conv-t");
+        let id = reg.create(params("echo", &["hello_term"])).await.unwrap();
         let exit = reg.wait_for_exit(&id).await.unwrap();
         assert_eq!(exit.exit_code, Some(0));
         assert!(!exit.signaled);
@@ -316,10 +327,10 @@ mod tests {
 
     #[tokio::test]
     async fn output_byte_limit_truncates_from_front() {
-        let reg = TerminalRegistry::default();
+        let reg = TerminalRegistry::new("conv-t");
         let mut p = params("sh", &["-c", "printf 'AAAA'; printf 'BBBB'"]);
         p.output_byte_limit = Some(4);
-        let id = reg.create("conv-t", p).await.unwrap();
+        let id = reg.create(p).await.unwrap();
         reg.wait_for_exit(&id).await.unwrap();
         let snap = reg.output(&id).await.unwrap();
         assert_eq!(snap.output, "BBBB");
@@ -328,8 +339,8 @@ mod tests {
 
     #[tokio::test]
     async fn kill_terminates_long_command_with_signal() {
-        let reg = TerminalRegistry::default();
-        let id = reg.create("conv-t", params("sleep", &["30"])).await.unwrap();
+        let reg = TerminalRegistry::new("conv-t");
+        let id = reg.create(params("sleep", &["30"])).await.unwrap();
         assert!(reg.kill(&id, "test").await);
         let exit = reg.wait_for_exit(&id).await.unwrap();
         assert!(exit.signaled || exit.exit_code.is_none() || exit.exit_code != Some(0));
@@ -341,9 +352,9 @@ mod tests {
 
     #[tokio::test]
     async fn release_is_idempotent_and_kill_all_clears() {
-        let reg = TerminalRegistry::default();
-        let id1 = reg.create("conv-t", params("sleep", &["30"])).await.unwrap();
-        let _id2 = reg.create("conv-t", params("sleep", &["30"])).await.unwrap();
+        let reg = TerminalRegistry::new("conv-t");
+        let id1 = reg.create(params("sleep", &["30"])).await.unwrap();
+        let _id2 = reg.create(params("sleep", &["30"])).await.unwrap();
         assert!(reg.release(&id1).await);
         assert!(!reg.release(&id1).await);
         reg.kill_all().await;
@@ -352,7 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_terminal_id_is_none_or_false() {
-        let reg = TerminalRegistry::default();
+        let reg = TerminalRegistry::new("conv-t");
         assert!(reg.output("nope").await.is_none());
         assert!(reg.wait_for_exit("nope").await.is_none());
         assert!(!reg.kill("nope", "test").await);
