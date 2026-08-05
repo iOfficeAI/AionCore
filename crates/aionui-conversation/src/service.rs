@@ -3929,10 +3929,13 @@ fn map_create_workspace_validation_error(error: WorkspacePathValidationError) ->
 /// Compute the label used in auto-provisioned workspace directory names.
 ///
 /// For ACP conversations the label is the vendor string from
-/// `extra.backend` (e.g. `"claude"`); otherwise the `AgentType` serde
-/// name (e.g. `"aionrs"`). Falls back to the agent type's serde name
-/// when the backend field is missing or not a string.
+/// `extra.backend` (e.g. `"claude"`). Aionrs conversations use the
+/// product-facing `"csbu-workmate"` label. Other types fall back to the
+/// agent type's serde name when the backend field is missing or invalid.
 fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value>) -> String {
+    if *agent_type == AgentType::Aionrs {
+        return "csbu-workmate".to_owned();
+    }
     if *agent_type == AgentType::Acp
         && let Some(serde_json::Value::String(s)) = backend
         && !s.is_empty()

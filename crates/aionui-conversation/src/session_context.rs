@@ -644,6 +644,7 @@ fn is_auto_workspace(
     candidate: &Path,
 ) -> bool {
     let expected_leaf = format!("{}-temp-{conversation_id}", conversation_label(agent_type, backend));
+    let legacy_aionrs_leaf = (*agent_type == AgentType::Aionrs).then(|| format!("aionrs-temp-{conversation_id}"));
     let Ok(relative) = candidate.strip_prefix(workspace_root.join("conversations")) else {
         return false;
     };
@@ -658,14 +659,18 @@ fn is_auto_workspace(
             && month.chars().all(|ch| ch.is_ascii_digit())
             && day.chars().all(|ch| ch.is_ascii_digit())
     };
+    let leaf_matches = |leaf: &str| leaf == expected_leaf || legacy_aionrs_leaf.as_deref() == Some(leaf);
     match parts.as_slice() {
-        [year, month, day, leaf] => dated(year, month, day) && *leaf == expected_leaf,
-        ["users", _user_dir, year, month, day, leaf] => dated(year, month, day) && *leaf == expected_leaf,
+        [year, month, day, leaf] => dated(year, month, day) && leaf_matches(leaf),
+        ["users", _user_dir, year, month, day, leaf] => dated(year, month, day) && leaf_matches(leaf),
         _ => false,
     }
 }
 
 fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value>) -> String {
+    if *agent_type == AgentType::Aionrs {
+        return "csbu-workmate".to_owned();
+    }
     if *agent_type == AgentType::Acp
         && let Some(serde_json::Value::String(s)) = backend
         && !s.is_empty()
@@ -1238,7 +1243,17 @@ mod tests {
         let context = repos.builder().build(&row).await.unwrap();
         assert!(!context.workspace.is_custom);
         assert!(context.workspace.stored_path.is_empty());
-        assert!(context.workspace.path.ends_with("aionrs-temp-conv-1"));
+        assert!(context.workspace.path.ends_with("csbu-workmate-temp-conv-1"));
+    }
+
+    #[test]
+    fn is_auto_workspace_accepts_current_and_legacy_aionrs_labels() {
+        let root = std::path::Path::new("/w");
+        let current = root.join("conversations/2026/08/05/csbu-workmate-temp-conv-1");
+        let legacy = root.join("conversations/2026/08/05/aionrs-temp-conv-1");
+
+        assert!(is_auto_workspace(root, "conv-1", &AgentType::Aionrs, None, &current));
+        assert!(is_auto_workspace(root, "conv-1", &AgentType::Aionrs, None, &legacy));
     }
 
     #[tokio::test]
