@@ -76,6 +76,38 @@ async fn resolves_project_directory_ref() {
 }
 
 #[tokio::test]
+async fn resolves_project_root_ref_empty_relative_path() {
+    // bug2 (add a pe ROOT to chat): the root node's relative_path is "", which
+    // must resolve to the pe root directory itself — not error, not resolve to
+    // some parent. Guards the empty-path root case specifically (the sibling
+    // test above only covers a named subdirectory).
+    let (service, pe_id, dir, upload_root) = setup().await;
+
+    let out = service
+        .resolve_chat_message(
+            "system_default_user",
+            "review this project",
+            &[ChatFileRef::Project {
+                pe_id,
+                relative_path: String::new(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.files.len(), 1);
+    let abs = std::path::Path::new(&out.files[0]);
+    assert!(abs.exists(), "root ref must resolve to an existing path");
+    assert!(abs.is_dir(), "a pe root resolves to a directory");
+    // The resolved path is the canonicalized pe root itself.
+    assert_eq!(
+        std::fs::canonicalize(abs).unwrap(),
+        std::fs::canonicalize(dir.path()).unwrap()
+    );
+}
+
+#[tokio::test]
 async fn empty_files_leaves_content_unchanged() {
     let (service, _pe, _dir, upload_root) = setup().await;
     let out = service
