@@ -150,6 +150,7 @@ mod tests {
             action: None,
             description: "Execute shell command".into(),
             command_type: Some("bash".into()),
+            questions: None,
             options: vec![ConfirmationOption {
                 label: "Allow".into(),
                 value: serde_json::json!(true),
@@ -159,6 +160,10 @@ mod tests {
         let json = serde_json::to_value(&c).unwrap();
         assert_eq!(json["call_id"], "call1");
         assert_eq!(json["command_type"], "bash");
+        assert!(
+            json.get("questions").is_none(),
+            "an ordinary approval must not put a null questions key on the wire"
+        );
     }
 
     #[test]
