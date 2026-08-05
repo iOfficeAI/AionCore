@@ -116,15 +116,26 @@ pub(crate) fn unregister_agent_process(data_dir: &Path, pid: u32) -> io::Result<
 }
 
 fn read_registry_file(path: &Path) -> io::Result<ProcessRegistry> {
-    match fs::read_to_string(path) {
-        Ok(contents) => serde_json::from_str(&contents).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to parse process registry {}: {e}", path.display()),
-            )
-        }),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(ProcessRegistry::default()),
-        Err(e) => Err(e),
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ProcessRegistry::default()),
+        Err(e) => return Err(e),
+    };
+    match serde_json::from_str(&contents) {
+        Ok(registry) => Ok(registry),
+        Err(e) => {
+            // Fail-safe on corruption: this registry is pure bookkeeping for
+            // orphan reaping, so a torn/empty file must not abort agent
+            // startup. Quarantine the bad file for forensics and degrade to
+            // an empty registry; the next successful write self-heals.
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "agent process registry is corrupt; quarantining and degrading to empty registry"
+            );
+            quarantine_corrupt_registry(path);
+            Ok(ProcessRegistry::default())
+        }
     }
 }
 
@@ -147,6 +158,31 @@ fn write_registry_file(path: &Path, registry: &ProcessRegistry) -> io::Result<()
     }
     fs::rename(tmp_path, path)?;
     Ok(())
+}
+
+/// Best-effort rename the corrupt registry aside so it is preserved for
+/// forensics and a fresh one can be written. Failure is non-fatal — we still
+/// degrade to an empty registry.
+fn quarantine_corrupt_registry(path: &Path) {
+    let Some(parent) = path.parent() else { return };
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("agent-process-registry.json");
+    let dst = parent.join(format!(".{stem}.corrupt.{}.{}", std::process::id(), next_counter()));
+    if let Err(e) = fs::rename(path, &dst) {
+        warn!(
+            path = %path.display(),
+            error = %e,
+            "failed to quarantine corrupt agent process registry (will be overwritten on next write)"
+        );
+    }
+}
+
+fn next_counter() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static C: AtomicU64 = AtomicU64::new(0);
+    C.fetch_add(1, Ordering::Relaxed)
 }
 
 fn with_registry_lock<T>(f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
@@ -214,6 +250,30 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn test_entry(pid: u32) -> RegisteredAgentProcess {
+        RegisteredAgentProcess {
+            pid,
+            process_group_id: None,
+            conversation_id: format!("conv-{pid}"),
+            agent_type: AgentType::Acp.serde_name().into(),
+            backend: None,
+            command_preview: None,
+            registered_at_ms: 1,
+        }
+    }
+
+    fn quarantine_file_names(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+                    .filter(|name| name.contains(".corrupt."))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
     fn registry_path_is_scoped_under_runtime_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -250,5 +310,59 @@ mod tests {
         unregister_agent_process(dir.path(), 42).unwrap();
         let registry = read_registry_file(&path).unwrap();
         assert!(registry.processes.is_empty());
+    }
+
+    #[test]
+    fn register_degrades_and_quarantines_on_empty_registry_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = agent_process_registry_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"").unwrap();
+
+        register_agent_process(dir.path(), test_entry(42)).unwrap();
+
+        let registry = read_registry_file(&path).unwrap();
+        assert_eq!(registry.processes.len(), 1);
+        assert_eq!(registry.processes[0].pid, 42);
+        assert_eq!(quarantine_file_names(path.parent().unwrap()).len(), 1);
+    }
+
+    #[test]
+    fn register_degrades_and_quarantines_on_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = agent_process_registry_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, br#"{"version":"#).unwrap();
+
+        register_agent_process(dir.path(), test_entry(7)).unwrap();
+
+        let registry = read_registry_file(&path).unwrap();
+        assert_eq!(registry.processes.len(), 1);
+        assert_eq!(quarantine_file_names(path.parent().unwrap()).len(), 1);
+    }
+
+    #[test]
+    fn unregister_degrades_on_corrupt_registry_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = agent_process_registry_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, br#"{"version":"#).unwrap();
+
+        unregister_agent_process(dir.path(), 42).unwrap();
+        assert_eq!(quarantine_file_names(path.parent().unwrap()).len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_propagates_real_io_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = agent_process_registry_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, br#"{"version":1,"processes":[]}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = read_registry_file(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 }
