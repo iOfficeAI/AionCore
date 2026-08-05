@@ -20,7 +20,6 @@ pub mod manager;
 /// shape the `SessionBackend` stack carries in `SessionConfig.init.mcp_servers`.
 pub(crate) mod mcp_resolve;
 pub mod media;
-pub mod terminal;
 pub(crate) mod persistence;
 pub mod protocol;
 pub mod registry;
@@ -32,6 +31,7 @@ pub mod session_agent;
 pub mod session_context;
 pub mod shared_kernel;
 pub mod task_manager;
+pub mod terminal;
 pub mod types;
 mod workflow_progress;
 

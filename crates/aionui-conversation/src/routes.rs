@@ -120,6 +120,10 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
+        .route(
+            "/api/conversations/{id}/terminals/{terminalId}/kill",
+            post(kill_terminal),
+        )
         .route("/api/conversations/{id}/runtime/ensure", post(ensure_runtime))
         .route("/api/conversations/{id}/active-lease", post(active_lease))
         // Confirmation system
@@ -315,6 +319,19 @@ async fn update_artifact(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(artifact)))
+}
+
+async fn kill_terminal(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, terminal_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .kill_terminal(&user.id, &id, &terminal_id, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(())))
 }
 
 async fn cancel(

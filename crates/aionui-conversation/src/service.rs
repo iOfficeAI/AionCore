@@ -3596,6 +3596,40 @@ impl ConversationService {
 
     /// Stop the current streaming response for a conversation.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
+    /// Stop ONE client-hosted terminal command (ACP `terminal/*`) without
+    /// touching the turn: the agent observes the signal exit and continues.
+    pub async fn kill_terminal(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        terminal_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), ConversationError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        let Some(agent) = task_manager.get_task(conversation_id) else {
+            return Err(ConversationError::BadRequest {
+                reason: "no running agent for conversation".to_owned(),
+            });
+        };
+        let killed = match &agent {
+            AgentInstance::Acp(mgr) => mgr.kill_client_terminal(terminal_id).await,
+            // Client-hosted terminals only exist on the ACP path.
+            _ => false,
+        };
+        if !killed {
+            return Err(ConversationError::NotFound {
+                id: format!("terminal {terminal_id}"),
+            });
+        }
+        info!(conversation_id, terminal_id, "client terminal killed by user");
+        Ok(())
+    }
+
     pub async fn cancel(
         &self,
         user_id: &str,

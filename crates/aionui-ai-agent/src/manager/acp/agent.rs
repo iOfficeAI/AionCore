@@ -664,6 +664,13 @@ impl AcpAgentManager {
         runtime.bump_activity();
     }
 
+    /// User-initiated stop of one client-hosted terminal (the terminal
+    /// card's stop button). Returns false when the id is unknown (already
+    /// released or never ours).
+    pub async fn kill_client_terminal(&self, terminal_id: &str) -> bool {
+        self.protocol.terminal_registry().kill(terminal_id, "user").await
+    }
+
     fn ensure_protocol_connected_for_operation(&self, operation: &'static str) -> Result<(), AgentError> {
         if self.protocol.is_connected() {
             return Ok(());
