@@ -88,7 +88,7 @@ if [[ -n "${AIONRS:-}" ]]; then
 
         toml_path=${crate_dir//\\/\\\\}
         toml_path=${toml_path//\"/\\\"}
-        cargo_config+=(--config "patch.'https://github.com/iOfficeAI/aionrs.git'.$crate.path = \"$toml_path\"")
+        cargo_config+=(--config "patch.'https://github.com/suoak/aionrs.git'.$crate.path = \"$toml_path\"")
     done
 
     echo "Using local aionrs SDK: $aionrs_root" >&2

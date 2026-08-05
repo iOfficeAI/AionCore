@@ -4,8 +4,8 @@ $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "../..")).ProviderPath
 $footerScript = Join-Path $scriptDir "aionrs-changelog-footer.ps1"
-$aionrsRepo = "https://github.com/iOfficeAI/aionrs.git"
-$aionrsSlug = "iOfficeAI/aionrs"
+$aionrsRepo = "https://github.com/suoak/aionrs.git"
+$aionrsSlug = "suoak/aionrs"
 
 function Fail($msg) { Write-Error $msg; exit 1 }
 
@@ -30,21 +30,21 @@ if ([string]::IsNullOrWhiteSpace($Tag)) {
     Write-Output "Using latest tag: $Tag"
 }
 
-# read OLD tag from Cargo.toml, assert consistency
+# read the current ref from Cargo.toml, assert consistency
 $cargo = Get-Content -LiteralPath "Cargo.toml" -Raw
-$readPattern = 'git = "https://github\.com/iOfficeAI/aionrs\.git", tag = "([^"]*)"'
+$readPattern = 'git = "https://github\.com/suoak/aionrs\.git", (?:tag|branch|rev) = "([^"]*)"'
 $found = [regex]::Matches($cargo, $readPattern) | ForEach-Object { $_.Groups[1].Value }
-if ($found.Count -eq 0) { Fail "No aionrs git dependency tags found in Cargo.toml" }
+if ($found.Count -eq 0) { Fail "No aionrs git dependency refs found in Cargo.toml" }
 $uniq = @($found | Select-Object -Unique)
-if ($uniq.Count -ne 1) { Fail "aionrs tags in Cargo.toml are inconsistent: $($uniq -join ', ')" }
+if ($uniq.Count -ne 1) { Fail "aionrs refs in Cargo.toml are inconsistent: $($uniq -join ', ')" }
 $oldTag = $uniq[0]
 
 if ($oldTag -eq $Tag) { Write-Output "already on $Tag; nothing to do"; exit 0 }
 Write-Output "Updating aionrs $oldTag -> $Tag"
 
 # rewrite Cargo.toml
-$replacePattern = 'git = "https://github\.com/iOfficeAI/aionrs\.git", tag = "[^"]*"'
-$replacement = "git = `"https://github.com/iOfficeAI/aionrs.git`", tag = `"$Tag`""
+$replacePattern = 'git = "https://github\.com/suoak/aionrs\.git", (?:tag|branch|rev) = "[^"]*"'
+$replacement = "git = `"https://github.com/suoak/aionrs.git`", tag = `"$Tag`""
 $updated = [regex]::Replace($cargo, $replacePattern, $replacement)
 [System.IO.File]::WriteAllText((Resolve-Path -LiteralPath "Cargo.toml").ProviderPath, $updated, [System.Text.UTF8Encoding]::new($false))
 

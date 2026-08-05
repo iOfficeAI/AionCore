@@ -5,8 +5,8 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 footer_script="$script_dir/aionrs-changelog-footer.sh"
 
-aionrs_repo="https://github.com/iOfficeAI/aionrs.git"
-aionrs_slug="iOfficeAI/aionrs"
+aionrs_repo="https://github.com/suoak/aionrs.git"
+aionrs_slug="suoak/aionrs"
 
 fail() { echo "error: $*" >&2; exit 1; }
 
@@ -28,17 +28,17 @@ if [[ -z "$tag" ]]; then
     echo "Using latest tag: $tag"
 fi
 
-# --- read current (OLD) tag from Cargo.toml, assert consistency ---
+# --- read current ref from Cargo.toml, assert consistency ---
 old_tag=$(
     python3 /dev/fd/3 3<<'PY'
 import re, sys
 from pathlib import Path
 text = Path("Cargo.toml").read_text()
-tags = re.findall(r'git = "https://github\.com/iOfficeAI/aionrs\.git", tag = "([^"]*)"', text)
+tags = re.findall(r'git = "https://github\.com/suoak/aionrs\.git", (?:tag|branch|rev) = "([^"]*)"', text)
 if not tags:
-    sys.exit("no aionrs git dependency tags found in Cargo.toml")
+    sys.exit("no aionrs git dependency refs found in Cargo.toml")
 if len(set(tags)) != 1:
-    sys.exit("aionrs tags in Cargo.toml are inconsistent: %s" % sorted(set(tags)))
+    sys.exit("aionrs refs in Cargo.toml are inconsistent: %s" % sorted(set(tags)))
 print(tags[0])
 PY
 ) || fail "failed to read current aionrs tag"
@@ -56,11 +56,11 @@ import re, sys
 tag = sys.argv[1]
 path = Path("Cargo.toml")
 text = path.read_text()
-if not re.search(r'git = "https://github\.com/iOfficeAI/aionrs\.git", tag = "[^"]*"', text):
-    raise SystemExit("No aionrs git dependency tags found in Cargo.toml")
+if not re.search(r'git = "https://github\.com/suoak/aionrs\.git", (?:tag|branch|rev) = "[^"]*"', text):
+    raise SystemExit("No aionrs git dependency refs found in Cargo.toml")
 path.write_text(re.sub(
-    r'git = "https://github\.com/iOfficeAI/aionrs\.git", tag = "[^"]*"',
-    f'git = "https://github.com/iOfficeAI/aionrs.git", tag = "{tag}"',
+    r'git = "https://github\.com/suoak/aionrs\.git", (?:tag|branch|rev) = "[^"]*"',
+    f'git = "https://github.com/suoak/aionrs.git", tag = "{tag}"',
     text,
 ))
 PY

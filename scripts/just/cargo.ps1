@@ -91,7 +91,7 @@ try {
             }
 
             $tomlPath = $crateDir.Replace("\", "/").Replace('"', '\"')
-            $cargoConfig += @("--config", "patch.'https://github.com/iOfficeAI/aionrs.git'.$crate.path = `"`"$tomlPath`"`"")
+            $cargoConfig += @("--config", "patch.'https://github.com/suoak/aionrs.git'.$crate.path = `"`"$tomlPath`"`"")
         }
 
         [Console]::Error.WriteLine("Using local aionrs SDK: $aionrsRoot")
