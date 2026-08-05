@@ -574,7 +574,11 @@ impl ClaudeAdapter {
         // omitting them under-reported the total ~10x on a cache-heavy turn (and was
         // inconsistent with codex, whose native `last.totalTokens` already includes
         // cache). `input_tokens`/`output_tokens` stay the wire's base counts; only
-        // `total_tokens` becomes the genuine total. cost from total_cost_usd.
+        // `total_tokens` becomes the genuine total. cost from total_cost_usd —
+        // the RAW wire value, which is only PROCESS-cumulative (a `--resume`
+        // respawn restarts it); the wrapping conn's CostLedger re-bases it to
+        // session-cumulative before broadcast. The adapter stays a pure frame
+        // parser with no cross-process state.
         if let Some(usage) = v.get("usage").and_then(Value::as_object) {
             let get = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
             let input_tokens = get("input_tokens");
@@ -996,6 +1000,15 @@ impl BackendAdapter for ClaudeAdapter {
             SessionSpec::Resume(id) => {
                 args.push("--resume".to_string());
                 args.push(id.clone());
+            }
+            SessionSpec::ForkFrom(id) => {
+                // Resume the PARENT session but copy it into a NEW one instead
+                // of appending (`--fork-session`, live help 2.1.221). claude
+                // mints the new id itself and echoes it in `system/init` —
+                // `--session-id` must NOT be combined here.
+                args.push("--resume".to_string());
+                args.push(id.clone());
+                args.push("--fork-session".to_string());
             }
         }
         // Manager-supplied flags (S18: --system-prompt / --mcp-config /
@@ -2047,6 +2060,42 @@ mod tests {
             .position(|a| a == "--thinking-display")
             .expect("a manager-supplied flag must reach the spawn");
         assert_eq!(gated.get(at + 1).map(String::as_str), Some("summarized"));
+    }
+
+    /// Fork spawn: `ForkFrom(parent)` resumes the PARENT session with
+    /// `--fork-session` so claude copies it into a NEW session — and never
+    /// passes `--session-id` (unsupported combination, live help 2.1.221; the
+    /// new id is backend-minted and learned from `system/init`).
+    #[tokio::test]
+    async fn fork_from_spawns_resume_with_fork_session_flag() {
+        use crate::testing::FakeSpawner;
+        let spawner = FakeSpawner::new();
+        let adapter = ClaudeAdapter::new();
+        let _ = adapter
+            .start_turn(
+                &spawner,
+                &SessionSpec::ForkFrom("22222222-2222-4222-8222-222222222222".into()),
+                None,
+                &[],
+                &[],
+                None,
+            )
+            .await;
+        let args = spawner.last_command().await.expect("a spawn was recorded").args;
+        let at = args
+            .iter()
+            .position(|a| a == "--resume")
+            .expect("fork resumes the parent");
+        assert_eq!(
+            args.get(at + 1).map(String::as_str),
+            Some("22222222-2222-4222-8222-222222222222"),
+            "--resume targets the PARENT session id"
+        );
+        assert!(args.iter().any(|a| a == "--fork-session"), "fork adds --fork-session");
+        assert!(
+            !args.iter().any(|a| a == "--session-id"),
+            "--session-id must not be combined with --fork-session, got: {args:?}"
+        );
     }
 
     /// Helper: drive one `result` NDJSON line through the adapter and return the

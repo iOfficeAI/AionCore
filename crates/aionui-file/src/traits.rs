@@ -5,6 +5,8 @@ use aionui_common::FileChangeOperation;
 
 use crate::error::FileError;
 
+use aionui_api_types::ContentEncoding;
+
 use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotInfo, WorkspaceFlatFile};
 
 /// Core file operations: directory browsing, file read/write, management,
@@ -14,6 +16,24 @@ use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotI
 /// `path_safety` module) before reaching this trait's implementations.
 #[async_trait::async_trait]
 pub trait IFileService: Send + Sync {
+    // -- Content endpoint (pre-resolved absolute paths) --
+    //
+    // The caller (preview content endpoint) has already resolved a `ChatFileRef`
+    // to an absolute path via `ProjectService::resolve_chat_file_ref` with the
+    // matching per-variant containment guard, so these operate on the trusted
+    // path directly and do NOT re-apply the `allowed_roots` sandbox.
+
+    /// Read a pre-resolved absolute path and encode it per `encoding`
+    /// (utf8 text / base64 / data URL). `NotFound` if the file is gone.
+    async fn read_resolved_content(&self, absolute_path: &Path, encoding: ContentEncoding)
+    -> Result<String, FileError>;
+
+    /// Write `data` to a pre-resolved absolute path (full overwrite).
+    async fn write_resolved_content(&self, absolute_path: &Path, data: &[u8]) -> Result<(), FileError>;
+
+    /// Metadata for a pre-resolved absolute path.
+    async fn resolved_metadata(&self, absolute_path: &Path) -> Result<FileMetadata, FileError>;
+
     // -- Directory browsing --
 
     /// List the immediate children of `dir`, returning a tree with one level

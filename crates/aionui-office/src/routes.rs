@@ -137,8 +137,22 @@ async fn start_preview(
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let validated_path = validate_office_path(&state, &req.file_path, req.workspace.as_deref())?;
-    let validated_path = validated_path.to_string_lossy().into_owned();
+    // Prefer the ChatFileRef identity (resolved server-side, already
+    // containment-checked per variant); fall back to the legacy device path +
+    // office sandbox validation for callers that have not migrated yet.
+    let validated_path = match &req.file {
+        Some(file) => {
+            let upload_root = std::env::temp_dir().join("aionui");
+            state
+                .project
+                .resolve_chat_file_ref(user_id, file, &upload_root, aionui_project::FileOp::Read)
+                .await
+                .map_err(ApiError::from)?
+        }
+        None => validate_office_path(&state, &req.file_path, req.workspace.as_deref())?
+            .to_string_lossy()
+            .into_owned(),
+    };
 
     let result = state
         .watch_manager
@@ -166,10 +180,23 @@ async fn stop_preview(
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state
-        .watch_manager
-        .stop_for_user(user_id, &req.file_path, doc_type)
-        .await;
+    // Resolve the same identity `start_preview` used so `stop_for_user` derives
+    // the same session key (watch_manager re-canonicalizes internally). Prefer
+    // the ChatFileRef; fall back to the legacy device path. Post-migration the
+    // explorer office tab has only a ChatFileRef (no device path), so without
+    // this branch stop can't match the watch and the officecli subprocess leaks.
+    let target_path = match &req.file {
+        Some(file) => {
+            let upload_root = std::env::temp_dir().join("aionui");
+            state
+                .project
+                .resolve_chat_file_ref(user_id, file, &upload_root, aionui_project::FileOp::Read)
+                .await
+                .map_err(ApiError::from)?
+        }
+        None => req.file_path.clone(),
+    };
+    state.watch_manager.stop_for_user(user_id, &target_path, doc_type).await;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -371,15 +398,15 @@ mod tests {
 
     use super::{ApiError, file_error_to_api_error, office_proxy_routes, office_routes};
 
-    #[test]
-    fn office_routes_builds_without_panic() {
-        let state = build_test_state();
+    #[tokio::test]
+    async fn office_routes_builds_without_panic() {
+        let state = build_test_state().await;
         let _router = office_routes(state);
     }
 
-    #[test]
-    fn office_proxy_routes_builds_without_panic() {
-        let state = build_test_state();
+    #[tokio::test]
+    async fn office_proxy_routes_builds_without_panic() {
+        let state = build_test_state().await;
         let _router = office_proxy_routes(state);
     }
 
@@ -468,7 +495,7 @@ mod tests {
         assert!(matches!(err, ApiError::BadGateway(_)));
     }
 
-    fn build_test_state() -> OfficeRouterState {
+    async fn build_test_state() -> OfficeRouterState {
         struct NoopSpawner;
 
         #[async_trait::async_trait]
@@ -505,12 +532,17 @@ mod tests {
         let conversion = Arc::new(ConversionService::new(None));
         let proxy = Arc::new(ProxyService::new(wm.clone()));
 
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let store: Arc<dyn aionui_db::IProjectStore> = Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
+        let project = Arc::new(aionui_project::ProjectService::new(store, std::env::temp_dir()));
+
         OfficeRouterState {
             watch_manager: wm,
             snapshot_service: snapshot,
             conversion_service: conversion,
             proxy_service: proxy,
             allowed_roots: vec![std::env::temp_dir()],
+            project,
         }
     }
 }

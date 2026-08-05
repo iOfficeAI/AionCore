@@ -870,6 +870,7 @@ pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
         conversion_service,
         proxy_service,
         allowed_roots,
+        project: Arc::new(services.project_service.clone()),
     }
 }
 

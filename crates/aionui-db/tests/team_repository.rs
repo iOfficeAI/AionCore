@@ -14,7 +14,8 @@ use std::sync::Arc;
 use aionui_common::now_ms;
 use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
 use aionui_db::{
-    DbError, ITeamRepository, SqliteTeamRepository, UpdateTaskParams, UpdateTeamParams, init_database_memory,
+    ActivityCursor, DbError, ITeamRepository, PageDirection, SqliteTeamRepository, UpdateTaskParams, UpdateTeamParams,
+    init_database_memory,
 };
 
 const DEFAULT_USER_ID: &str = "system_default_user";
@@ -427,6 +428,79 @@ async fn delete_mailbox_by_team() {
     // Team2 mailbox intact
     let h2 = repo.get_history(DEFAULT_USER_ID, "t2", "a1", None).await.unwrap();
     assert_eq!(h2.len(), 1);
+}
+
+#[tokio::test]
+async fn list_messages_by_team_orders_desc_and_clamps_limit() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+
+    // Distinct created_at so DESC ordering is deterministic.
+    for i in 1..=5 {
+        let mut msg = make_mailbox_msg(&format!("m{i}"), "t1", &format!("a{i}"), "lead", "message");
+        msg.created_at = i as i64 * 1000;
+        repo.write_message(DEFAULT_USER_ID, &msg).await.unwrap();
+    }
+
+    // limit smaller than total keeps the newest ones, newest first.
+    let latest = repo.list_messages_by_team("t1", 3).await.unwrap();
+    assert_eq!(latest.len(), 3);
+    assert_eq!(latest[0].id, "m5");
+    assert_eq!(latest[1].id, "m4");
+    assert_eq!(latest[2].id, "m3");
+
+    // limit above total returns everything (whole team, not a single mailbox).
+    let all = repo.list_messages_by_team("t1", 1000).await.unwrap();
+    assert_eq!(all.len(), 5);
+    assert_eq!(all.first().unwrap().id, "m5");
+}
+
+#[tokio::test]
+async fn list_messages_by_team_limit_one() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    for i in 1..=3 {
+        let mut msg = make_mailbox_msg(&format!("m{i}"), "t1", "a1", "lead", "message");
+        msg.created_at = i as i64 * 1000;
+        repo.write_message(DEFAULT_USER_ID, &msg).await.unwrap();
+    }
+
+    let one = repo.list_messages_by_team("t1", 1).await.unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].id, "m3");
+}
+
+#[tokio::test]
+async fn list_messages_by_team_empty() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+
+    let msgs = repo.list_messages_by_team("t1", 500).await.unwrap();
+    assert!(msgs.is_empty());
+}
+
+#[tokio::test]
+async fn list_messages_by_ids_hits_empty_and_partial() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    for i in 1..=3 {
+        let mut msg = make_mailbox_msg(&format!("m{i}"), "t1", "a1", "lead", "message");
+        msg.created_at = i as i64 * 1000;
+        repo.write_message(DEFAULT_USER_ID, &msg).await.unwrap();
+    }
+
+    // Empty ids -> empty result without touching the DB.
+    let none = repo.list_messages_by_ids(&[]).await.unwrap();
+    assert!(none.is_empty());
+
+    // Mix of existing and missing ids returns only the hits, newest first.
+    let hits = repo
+        .list_messages_by_ids(&["m1".to_string(), "m3".to_string(), "missing".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].id, "m3");
+    assert_eq!(hits[1].id, "m1");
 }
 
 #[tokio::test]
@@ -959,4 +1033,172 @@ async fn task_blocked_by_blocks_bidirectional_consistency() {
         b_blocked_by.contains(&"tkA".to_string()),
         "B.blockedBy should contain A"
     );
+}
+
+// ── Activity feed keyset pagination (messages) ───────────────────────
+
+#[tokio::test]
+async fn paged_messages_desc_walks_older_with_stable_tiebreak() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    // 5 messages, incl. a pair sharing created_at to verify the id tiebreak.
+    for (id, ts) in [("m1", 1000), ("m2", 2000), ("m3", 3000), ("m4", 3000), ("m5", 4000)] {
+        let mut msg = make_mailbox_msg(id, "t1", "a1", "lead", "message");
+        msg.created_at = ts;
+        repo.write_message(DEFAULT_USER_ID, &msg).await.unwrap();
+    }
+
+    // First page desc, limit 2 -> newest two: m5(4000), m4(3000,id"m4").
+    let page1 = repo
+        .list_messages_by_team_paged("t1", None, PageDirection::Desc, 2)
+        .await
+        .unwrap();
+    assert_eq!(page1.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["m5", "m4"]);
+
+    // Next-page cursor = m4(3000,"m4"); same created_at m3 is caught via id<"m4".
+    let cursor = ActivityCursor {
+        created_at: 3000,
+        id: "m4".into(),
+    };
+    let page2 = repo
+        .list_messages_by_team_paged("t1", Some(cursor), PageDirection::Desc, 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["m3", "m2"]);
+}
+
+#[tokio::test]
+async fn paged_messages_asc_walks_newer_from_oldest() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    for (id, ts) in [("m1", 1000), ("m2", 2000), ("m3", 3000)] {
+        let mut msg = make_mailbox_msg(id, "t1", "a1", "lead", "message");
+        msg.created_at = ts;
+        repo.write_message(DEFAULT_USER_ID, &msg).await.unwrap();
+    }
+    let page1 = repo
+        .list_messages_by_team_paged("t1", None, PageDirection::Asc, 2)
+        .await
+        .unwrap();
+    assert_eq!(page1.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["m1", "m2"]);
+
+    let cursor = ActivityCursor {
+        created_at: 2000,
+        id: "m2".into(),
+    };
+    let page2 = repo
+        .list_messages_by_team_paged("t1", Some(cursor), PageDirection::Asc, 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["m3"]);
+}
+
+// ── Activity feed keyset pagination (tasks) ──────────────────────────
+
+#[tokio::test]
+async fn paged_tasks_desc_and_cursor() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    for (id, ts) in [("k1", 1000), ("k2", 2000), ("k3", 3000)] {
+        let mut task = make_task(id, "t1", "subject");
+        task.created_at = ts;
+        repo.create_task(DEFAULT_USER_ID, &task).await.unwrap();
+    }
+    let page1 = repo
+        .list_tasks_paged(DEFAULT_USER_ID, "t1", None, PageDirection::Desc, 2)
+        .await
+        .unwrap();
+    assert_eq!(page1.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["k3", "k2"]);
+
+    let cursor = ActivityCursor {
+        created_at: 2000,
+        id: "k2".into(),
+    };
+    let page2 = repo
+        .list_tasks_paged(DEFAULT_USER_ID, "t1", Some(cursor), PageDirection::Desc, 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["k1"]);
+}
+
+#[tokio::test]
+async fn paged_tasks_rejects_cross_user() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team_for_user("t1", "user-a", "Team A"))
+        .await
+        .unwrap();
+    let mut task = make_task("k1", "t1", "subject");
+    task.created_at = 1000;
+    repo.create_task("user-a", &task).await.unwrap();
+    // Another user cannot see it.
+    let rows = repo
+        .list_tasks_paged("user-b", "t1", None, PageDirection::Desc, 10)
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+}
+
+// ── list_tasks_by_ids ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_tasks_by_ids_returns_only_requested() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    repo.create_task(DEFAULT_USER_ID, &make_task("k1", "t1", "A"))
+        .await
+        .unwrap();
+    repo.create_task(DEFAULT_USER_ID, &make_task("k2", "t1", "B"))
+        .await
+        .unwrap();
+    repo.create_task(DEFAULT_USER_ID, &make_task("k3", "t1", "C"))
+        .await
+        .unwrap();
+
+    let rows = repo
+        .list_tasks_by_ids(DEFAULT_USER_ID, "t1", &["k1".into(), "k3".into()])
+        .await
+        .unwrap();
+
+    let mut got: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    got.sort();
+    assert_eq!(got, vec!["k1".to_string(), "k3".to_string()]);
+}
+
+#[tokio::test]
+async fn list_tasks_by_ids_empty_and_unknown_return_empty() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    repo.create_task(DEFAULT_USER_ID, &make_task("k1", "t1", "A"))
+        .await
+        .unwrap();
+
+    // Empty slice must not query and yields nothing.
+    assert!(
+        repo.list_tasks_by_ids(DEFAULT_USER_ID, "t1", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Unknown ids are silently ignored, not an error.
+    let rows = repo
+        .list_tasks_by_ids(DEFAULT_USER_ID, "t1", &["nope".into()])
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+}
+
+#[tokio::test]
+async fn list_tasks_by_ids_enforces_owner_isolation() {
+    let (repo, _db) = repo().await;
+    // Team owned by user A, with a task.
+    repo.create_team(&make_team_for_user("t1", "user-a", "A team"))
+        .await
+        .unwrap();
+    repo.create_task("user-a", &make_task("k1", "t1", "secret"))
+        .await
+        .unwrap();
+
+    // User B asks for the same team/id -> nothing leaks.
+    let rows = repo.list_tasks_by_ids("user-b", "t1", &["k1".into()]).await.unwrap();
+    assert!(rows.is_empty());
 }

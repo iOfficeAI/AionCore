@@ -21,7 +21,7 @@ use crate::manager::acp::{AcpAgentManager, RequiredFullAutoApplication};
 use crate::manager::aionrs::AionrsAgentManager;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
-use crate::types::SendMessageData;
+use crate::types::{PromptMediaCaps, SendMessageData};
 
 use aionui_api_types::{
     GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SetConfigOptionResponse,
@@ -58,6 +58,12 @@ pub trait IAgentTask: Send + Sync {
 
     /// Subscribe to the agent's stream event channel.
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent>;
+
+    /// Prompt media capabilities the agent declared. Defaults to none —
+    /// callers must then deliver attachments as file paths, not blocks.
+    fn prompt_media_caps(&self) -> PromptMediaCaps {
+        PromptMediaCaps::default()
+    }
 
     /// Send a user message to the agent. Returns once the agent has
     /// accepted the turn; actual streaming proceeds on the broadcast

@@ -296,7 +296,10 @@ pub enum SessionEvent {
     /// Per-turn typed usage/cost (Addendum 5 / U15). Adapter normalizes a
     /// cumulative wire counter to a per-turn DELTA (G6). Reducer no-op (pure
     /// consumer signal). codex `thread/tokenUsage/updated.last`; claude
-    /// `result.usage`; cost_usd may be None.
+    /// `result.usage`; cost_usd may be None. When present, `cost_usd` is the
+    /// SESSION-cumulative spend: claude's wire value (`total_cost_usd`) is only
+    /// process-cumulative, so its conn re-bases it through a cost ledger before
+    /// broadcast (see `claude_conn::CostLedger`).
     UsageDelta {
         input_tokens: u64,
         output_tokens: u64,
@@ -536,6 +539,13 @@ pub enum SessionEvent {
         cost_text: Option<String>,
     },
 
+    /// Agent-generated session title (claude `generate_session_title` reply,
+    /// sniffed off the success control_response; the ACP path never reaches
+    /// this enum — it flows through the legacy bridge's `session_info_update`
+    /// translation). FSM-orthogonal: the reducer no-ops; only the conversation
+    /// layer applies it under the `name_source` guard (spec 2026-08-04).
+    SessionTitle { title: String },
+
     /// Addendum 9 (consumer-driven, conversation Tier-2): the adapter lowers its
     /// current `(session_id → backend_session_id)` binding downstream so the
     /// conversation layer can persist `conversations.backend_session_id` as the
@@ -551,6 +561,17 @@ pub enum SessionEvent {
     /// re-attach, fork, or backend-session loss. `None` = backend session lost /
     /// not yet established.
     BackendBound { backend_session_id: Option<String> },
+
+    /// Fork anchoring (BackendBound's turn-scoped sibling): the adapter lowers
+    /// the backend's OWN id for the turn that just started (codex
+    /// `turn/started` → `Turn.id`) so the conversation layer can stamp it onto
+    /// every message row it persists for that turn. That stamp is what later
+    /// resolves `thread/fork`'s `lastTurnId` when the user forks mid-history —
+    /// the runtime `turn_<shortid>` ids are aionui-minted and mean nothing to
+    /// the backend. Same contract as BackendBound: orchestration-lowered
+    /// pass-through, reducer no-op, never persisted as an event. Only codex
+    /// emits it today; backends without a turn-anchored fork never do.
+    BackendTurnBound { backend_turn_id: String },
 }
 
 // ==========================================================================
@@ -865,6 +886,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | Snapshot { .. }
         | Lagged { .. }
         | BackendBound { .. }
+        | BackendTurnBound { .. }
         | BackendSuspended => EventClass::OrchestrationLowered,
         // backend-produced (self-describing; PERSISTED — tier decided separately, §7.2)
         MessageDelta { .. }
@@ -893,6 +915,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | ItemCompleted { .. }
         | MessageFinalized(..)
         | SessionInfo { .. }
+        | SessionTitle { .. }
         | CheckpointList { .. } => EventClass::BackendProduced,
     }
 }
@@ -925,6 +948,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             CheckpointList { .. } => PersistTier::Ephemeral,                     // query response, not history
             CatalogUpdated { .. } => PersistTier::Ephemeral, // async catalog discovery, re-discovered on open (not history)
             SessionInfo { .. } => PersistTier::Ephemeral, // on-demand query snapshot, re-queryable (not history)
+            SessionTitle { .. } => PersistTier::Ephemeral, // applied to conversations.name by the conversation layer, not history
             SubagentDetail { .. } => PersistTier::Ephemeral, // transient per-agent progress (roster fill, re-derivable)
             // the phase list is re-declared on the next run's first progress frame
             WorkflowPhase { .. } => PersistTier::Ephemeral,
@@ -953,6 +977,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             | Snapshot { .. }
             | Lagged { .. }
             | BackendBound { .. }
+            | BackendTurnBound { .. }
             | BackendSuspended => PersistTier::Ephemeral,
         },
     }
@@ -1191,6 +1216,14 @@ mod additive_tests {
                 Ephemeral,
             ),
             (
+                "SessionTitle",
+                SessionEvent::SessionTitle {
+                    title: "Fix login bug".into(),
+                },
+                BackendProduced,
+                Ephemeral,
+            ),
+            (
                 "SubagentDetail",
                 SessionEvent::SubagentDetail {
                     r#ref: "a".into(),
@@ -1369,13 +1402,14 @@ mod additive_tests {
             ("Rewound", SessionEvent::Rewound { to_turn: 1 }, BackendProduced, State),
         ];
 
-        // Tripwire: every SessionEvent variant must appear. 32 variants today
-        // (7 orchestration-lowered + 25 backend-produced, incl. Notice +
-        // ToolOutputDelta + TurnDiffUpdated + SessionInfo); AdapterSpecific appears
-        // twice for its raw-timing vs structured split → 33 rows. A new variant trips.
+        // Tripwire: every SessionEvent variant must appear. 33 variants today
+        // (7 orchestration-lowered + 26 backend-produced, incl. Notice +
+        // ToolOutputDelta + TurnDiffUpdated + SessionInfo + SessionTitle);
+        // AdapterSpecific appears twice for its raw-timing vs structured split
+        // → 34 rows. A new variant trips.
         assert_eq!(
             table.len(),
-            33,
+            34,
             "every SessionEvent variant (+ the AdapterSpecific timing split) must be routed here"
         );
 

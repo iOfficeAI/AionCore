@@ -1,6 +1,24 @@
 use crate::error::DbError;
 use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
 
+/// Sort/paging direction for the activity feed cursor queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageDirection {
+    /// Newest first; `load more` walks toward older rows.
+    Desc,
+    /// Oldest first; `load more` walks toward newer rows.
+    Asc,
+}
+
+/// Keyset-pagination cursor. Rows strictly beyond `(created_at, id)` in the
+/// requested direction are returned. `id` is compared lexicographically to
+/// match the `ORDER BY ... id` tiebreak.
+#[derive(Debug, Clone)]
+pub struct ActivityCursor {
+    pub created_at: i64,
+    pub id: String,
+}
+
 /// Parameters for updating a team record.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateTeamParams {
@@ -90,6 +108,27 @@ pub trait ITeamRepository: Send + Sync {
         limit: Option<i64>,
     ) -> Result<Vec<MailboxMessageRow>, DbError>;
 
+    /// Returns the most recent messages for the whole team, ordered by
+    /// `created_at` descending and capped at `limit`. Backs the read-only
+    /// team activity view (all recipients, not a single mailbox).
+    async fn list_messages_by_team(&self, team_id: &str, limit: i64) -> Result<Vec<MailboxMessageRow>, DbError>;
+
+    /// Keyset-paginated team-wide messages for the activity feed. Returns up to
+    /// `limit` rows strictly beyond `cursor` in `direction` order (no cursor =
+    /// first page). Ordered `(created_at, id)` per direction.
+    async fn list_messages_by_team_paged(
+        &self,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        limit: i64,
+    ) -> Result<Vec<MailboxMessageRow>, DbError>;
+
+    /// Returns the message rows with the given ids, ordered by `created_at`
+    /// descending. Used to build full payloads after a batch read-mark.
+    /// An empty `ids` slice yields an empty result without querying.
+    async fn list_messages_by_ids(&self, ids: &[String]) -> Result<Vec<MailboxMessageRow>, DbError>;
+
     /// Deletes all mailbox messages belonging to a team.
     async fn delete_mailbox_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError>;
 
@@ -118,6 +157,29 @@ pub trait ITeamRepository: Send + Sync {
 
     /// Returns all tasks for a team, ordered by `created_at` ascending.
     async fn list_tasks(&self, user_id: &str, team_id: &str) -> Result<Vec<TeamTaskRow>, DbError>;
+
+    /// Keyset-paginated team tasks for the activity feed (user-scoped). Up to
+    /// `limit` rows strictly beyond `cursor` in `direction` order.
+    async fn list_tasks_paged(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        limit: i64,
+    ) -> Result<Vec<TeamTaskRow>, DbError>;
+
+    /// Returns the task rows with the given ids within a team (user-scoped),
+    /// ordered by `created_at` descending. Used to resolve dependency
+    /// (`blocked_by`) subjects for tasks that may lie outside the loaded
+    /// activity page. An empty `ids` slice yields an empty result without
+    /// querying. Unknown ids are silently ignored.
+    async fn list_tasks_by_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<TeamTaskRow>, DbError>;
 
     /// Appends `blocked_task_id` to the `blocks` JSON array of `task_id`.
     /// This is a transactional JSON array append operation.

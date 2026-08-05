@@ -6,8 +6,14 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallEventData {
     pub call_id: String,
+    /// Skipped when empty: downstream storage merges frames with RFC 7396
+    /// merge-patch, so an empty name would ERASE the stored one (the terminal
+    /// ToolResult and turn-end closes legitimately carry no name).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    #[serde(default)]
+    /// Skipped when null for the same reason: a null would DELETE the stored
+    /// arguments under merge-patch semantics.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub args: serde_json::Value,
     pub status: ToolCallStatus,
     #[serde(skip_serializing_if = "Option::is_none")]

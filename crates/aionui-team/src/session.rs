@@ -174,17 +174,17 @@ impl TeamSession {
         service: Weak<TeamSessionService>,
         prompt_dump: TeamPromptDumpConfig,
     ) -> Result<Self, TeamError> {
-        let mailbox = Arc::new(Mailbox::new_for_user(repo.clone(), user_id.clone()));
-        let task_board = Arc::new(TaskBoard::new_for_user(repo, user_id.clone()));
-        let member_runtimes = Arc::new(MemberRuntimeRegistry::new(generate_id()));
-        let team_run_manager = Arc::new(TeamRunManager::new(
+        // Single emitter shared by mailbox, task board, and the run manager so
+        // all team events reuse the same team-scoped subscription/delivery.
+        let emitter = Arc::new(TeamEventEmitter::new(
             team.id.clone(),
-            Arc::new(TeamEventEmitter::new(
-                team.id.clone(),
-                user_id.clone(),
-                broadcaster.clone(),
-            )),
+            user_id.clone(),
+            broadcaster.clone(),
         ));
+        let mailbox = Arc::new(Mailbox::new_for_user(repo.clone(), user_id.clone()).with_events(emitter.clone()));
+        let task_board = Arc::new(TaskBoard::new_for_user(repo, user_id.clone()).with_events(emitter.clone()));
+        let member_runtimes = Arc::new(MemberRuntimeRegistry::new(generate_id()));
+        let team_run_manager = Arc::new(TeamRunManager::new(team.id.clone(), emitter.clone()));
         let work_coordinator = Arc::new(SlotWorkCoordinator::new(
             team.id.clone(),
             member_runtimes.generation().to_owned(),
@@ -508,7 +508,7 @@ impl TeamSession {
             self.scheduler.set_status(&slot_id, TeammateStatus::Error).await?;
         }
 
-        let wake_target = self.scheduler.finalize_turn(&slot_id, &[]).await?;
+        let wake_target = self.scheduler.finalize_turn(&slot_id).await?;
 
         // Clear the dedup window unconditionally once finalize has run.
         self.scheduler.clear_finalized_turn(conversation_id);

@@ -112,6 +112,7 @@ async fn ensure_conversation(services: &aionui_app::AppServices, user_id: &str, 
         updated_at: now,
         project_id: None,
         folder_id: None,
+        name_source: None,
     })
     .await
     .unwrap();

@@ -36,6 +36,10 @@ pub struct ConversationRow {
     pub project_id: Option<String>,
     /// Workspace folder binding; NULL until bound/backfilled.
     pub folder_id: Option<String>,
+    /// Origin of the current `name`: NULL = default/placeholder (agent may
+    /// overwrite), "agent" = agent-generated (agent may overwrite),
+    /// "user" = explicit user rename (never overwritten by agents).
+    pub name_source: Option<String>,
 }
 
 /// Row mapping for the `conversation_assistant_snapshots` table.

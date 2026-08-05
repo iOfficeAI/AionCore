@@ -71,6 +71,7 @@ impl BackendConnection for CodexConnection {
         let logical_id = match &spec {
             SessionSpec::Fresh { session_id } => session_id.clone(),
             SessionSpec::Resume { session_id, .. } => session_id.clone(),
+            SessionSpec::Fork { session_id, .. } => session_id.clone(),
         };
         let mut args = vec!["app-server".to_string()];
         args.extend(config.extra_args.iter().cloned());
@@ -148,7 +149,10 @@ impl BackendConnection for CodexConnection {
             SessionSpec::Fresh { .. } => {
                 normalized_config_mode.or_else(|| Some(codex_perm::profile_id_to_legacy_value(":workspace")))
             }
-            SessionSpec::Resume { .. } => normalized_config_mode,
+            // Fork inherits the forked thread's own tier exactly like Resume
+            // (codex restores it and surfaces `thread/settings/updated`), so no
+            // fresh-default seed either.
+            SessionSpec::Resume { .. } | SessionSpec::Fork { .. } => normalized_config_mode,
         };
 
         // JSON-RPC handshake over the retained stdin (the reader task is already
@@ -162,12 +166,23 @@ impl BackendConnection for CodexConnection {
         // run_handshake pre-seeds the binding so the first `turn/start` has a
         // threadId without waiting on the wire. Same wire frames as a wake re-attach
         // (run_handshake is shared with wake_handle).
-        let resume_tid = match &spec {
-            SessionSpec::Fresh { .. } => None,
+        let handshake_mode = match &spec {
+            SessionSpec::Fresh { .. } => HandshakeMode::Fresh,
             // lost backend session → start fresh under the same logical id (§4.1)
-            SessionSpec::Resume { backend_session_id, .. } => backend_session_id.clone(),
+            SessionSpec::Resume { backend_session_id, .. } => match backend_session_id.as_deref() {
+                Some(tid) => HandshakeMode::Resume(tid),
+                None => HandshakeMode::Fresh,
+            },
+            SessionSpec::Fork {
+                parent_backend_session_id,
+                at_turn_id,
+                ..
+            } => HandshakeMode::Fork {
+                parent_thread_id: parent_backend_session_id,
+                last_turn_id: at_turn_id.as_deref(),
+            },
         };
-        backend.run_handshake(resume_tid.as_deref()).await?;
+        backend.run_handshake(handshake_mode).await?;
 
         // codex-model-gating: `thread/start` intentionally did NOT bind `config.model`
         // (see `thread_start_params`), nor a permission tier (`thread/start` carries no
@@ -469,6 +484,34 @@ fn thread_resume_params(config: &SessionConfig, thread_id: &str) -> HandshakePar
     HandshakeParams(params)
 }
 
+/// `thread/fork` params: the same override surface as resume (fork creates a NEW
+/// thread, which needs its MCP servers / approvalPolicy just like a resumed one),
+/// plus the PARENT threadId as the fork source and an optional `lastTurnId` —
+/// copy history only through that turn (inclusive) and drop later turns
+/// (app-server ThreadForkParams, exported from codex 0.145.0). Omitting
+/// `lastTurnId` forks at HEAD.
+fn thread_fork_params(config: &SessionConfig, parent_thread_id: &str, last_turn_id: Option<&str>) -> HandshakeParams {
+    let HandshakeParams(mut params) = thread_start_params(config);
+    params["threadId"] = json!(parent_thread_id);
+    if let Some(turn_id) = last_turn_id {
+        params["lastTurnId"] = json!(turn_id);
+    }
+    HandshakeParams(params)
+}
+
+/// How `run_handshake` opens the thread: shared by `open_session` (all three
+/// modes) and `wake_handle` (Resume against the bound threadId, or Fresh when
+/// no binding survived — a wake NEVER replays a fork: by the time a session can
+/// idle-suspend its fork has completed and its own thread is bound).
+enum HandshakeMode<'a> {
+    Fresh,
+    Resume(&'a str),
+    Fork {
+        parent_thread_id: &'a str,
+        last_turn_id: Option<&'a str>,
+    },
+}
+
 /// Serialize neutral [`McpServerSpec`]s into codex's `config.mcp_servers` MAP
 /// (keyed by name), the shape codex's config loader expects (verified live +
 /// against `codex mcp add` TOML output). DISTINCT from the ACP wire: codex stdio
@@ -655,6 +698,13 @@ pub struct CodexSessionBackend {
     /// and the conversation's recovery (anchor clear + auto-replay) takes over.
     /// Reset at the start of every handshake (a re-spawn is a fresh chance).
     resume_poison: Arc<Mutex<Option<String>>>,
+    /// The rpc id of the in-flight `thread/fork` (Fork handshakes only,
+    /// `pending_resume`'s sibling). The reader claims the response: an ERROR
+    /// (parent rollout gone, parent turn in flight, …) poisons the bound-thread
+    /// wait — a Fork handshake pre-seeds NO binding, so without the poison the
+    /// first Send would poll forever for a `thread/started` that never comes.
+    /// A success needs no action (`thread/started` for the NEW thread binds it).
+    pending_fork: Arc<Mutex<Option<u64>>>,
     /// The id of the in-flight turn (codex `turn/started.turn.id`), needed by
     /// `turn/interrupt{turnId}` and `turn/steer{expectedTurnId}` (optimistic
     /// concurrency token). Set on `turn/started`, cleared on terminal.
@@ -792,6 +842,7 @@ struct CodexReaderState {
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
+    pending_fork: Arc<Mutex<Option<u64>>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     /// F-4 turn-active flag: set on dispatch(Send), cleared by the reader at a turn
@@ -824,6 +875,7 @@ fn start_codex_reader(
             state.pending_set,
             state.pending_resume,
             state.resume_poison,
+            state.pending_fork,
             state.discovered,
             state.stdin,
             state.turn_in_flight,
@@ -952,6 +1004,7 @@ impl CodexSessionBackend {
         let pending_set = Arc::new(Mutex::new(HashMap::new()));
         let pending_resume = Arc::new(Mutex::new(None));
         let resume_poison = Arc::new(Mutex::new(None));
+        let pending_fork = Arc::new(Mutex::new(None));
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
         let turn_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (event_tx, _) = broadcast::channel(1024);
@@ -975,6 +1028,7 @@ impl CodexSessionBackend {
             pending_set: pending_set.clone(),
             pending_resume: pending_resume.clone(),
             resume_poison: resume_poison.clone(),
+            pending_fork: pending_fork.clone(),
             discovered: discovered.clone(),
             stdin: stdin.clone(),
             turn_in_flight: turn_in_flight.clone(),
@@ -1031,6 +1085,7 @@ impl CodexSessionBackend {
             pending_set,
             pending_resume,
             resume_poison,
+            pending_fork,
             discovered,
         }
     }
@@ -1106,14 +1161,14 @@ impl CodexSessionBackend {
     /// so the reader fills `discovered`). Shared by `open_session` (the initial
     /// open) and `wake_handle` (an idle-wake re-attach), so the wire shape lives in
     /// one place.
-    async fn run_handshake(&self, resume_thread_id: Option<&str>) -> Result<(), BackendError> {
+    async fn run_handshake(&self, mode: HandshakeMode<'_>) -> Result<(), BackendError> {
         // A handshake is a fresh chance: any prior resume rejection belonged to
         // the previous process/attempt.
         *self.resume_poison.lock().await = None;
         self.write_frame(initialize_params().into_frame(self.next_rpc_id(), "initialize"))
             .await?;
-        match resume_thread_id {
-            Some(tid) => {
+        match mode {
+            HandshakeMode::Resume(tid) => {
                 *self.thread_binding.lock().await = Some(tid.to_string());
                 // Resume re-sends the full thread/start override surface — a bare
                 // {threadId} resume silently drops the user's MCP servers and
@@ -1130,7 +1185,28 @@ impl CodexSessionBackend {
                 self.write_frame(thread_resume_params(&self.wake.config, tid).into_frame(resume_id, "thread/resume"))
                     .await?;
             }
-            None => {
+            HandshakeMode::Fork {
+                parent_thread_id,
+                last_turn_id,
+            } => {
+                // Deliberately NO thread_binding pre-seed: the parent threadId is
+                // only the fork SOURCE. codex answers with `thread/started` for
+                // the NEW thread, and the reader's existing handler binds it —
+                // on this session's own connection that binding is exactly the
+                // one we want (the parent conversation has its own connection
+                // and is never touched). Register the rpc id so the reader can
+                // claim an ERROR response (parent rollout gone, in-flight turn,
+                // …) and poison the bound-thread wait — otherwise the first
+                // Send would poll for a binding that will never arrive.
+                let fork_id = self.next_rpc_id();
+                *self.pending_fork.lock().await = Some(fork_id);
+                self.write_frame(
+                    thread_fork_params(&self.wake.config, parent_thread_id, last_turn_id)
+                        .into_frame(fork_id, "thread/fork"),
+                )
+                .await?;
+            }
+            HandshakeMode::Fresh => {
                 self.write_frame(thread_start_params(&self.wake.config).into_frame(self.next_rpc_id(), "thread/start"))
                     .await?;
             }
@@ -1206,8 +1282,15 @@ impl CodexSessionBackend {
         // handshake failure, abort the just-started reader so its AgentIo clone
         // releases and the freshly-spawned child is reaped (kill_on_drop) — else it
         // leaks (the controller never takes ownership of a failed wake's handle).
+        // A wake NEVER replays a fork: by the time a session can idle-suspend,
+        // its fork completed and `thread_binding` holds the NEW thread — resume
+        // against it (or Fresh if the binding was lost, the pre-fork behavior).
         let resume_tid = self.thread_binding.lock().await.clone();
-        if let Err(e) = self.run_handshake(resume_tid.as_deref()).await {
+        let mode = match resume_tid.as_deref() {
+            Some(tid) => HandshakeMode::Resume(tid),
+            None => HandshakeMode::Fresh,
+        };
+        if let Err(e) = self.run_handshake(mode).await {
             reader.abort();
             return Err(e);
         }
@@ -1236,6 +1319,7 @@ async fn reader_task(
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
+    pending_fork: Arc<Mutex<Option<u64>>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
@@ -1386,6 +1470,18 @@ async fn reader_task(
                             // turn/interrupt{turnId} + turn/steer{expectedTurnId}).
                             if let Some(tid) = params.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
                                 *active_turn_id.lock().await = Some(tid.to_string());
+                                // Fork anchoring: lower codex's OWN turn id so the
+                                // conversation layer stamps it onto this turn's
+                                // message rows (`messages.backend_turn_id`) — the
+                                // lookup key for `thread/fork`'s `lastTurnId`.
+                                emit(
+                                    &event_tx,
+                                    &session_id,
+                                    cur,
+                                    SessionEvent::BackendTurnBound {
+                                        backend_turn_id: tid.to_string(),
+                                    },
+                                );
                             }
                         }
                         // R8 dual-terminal reconcile: codex sends status→idle FIRST
@@ -1533,6 +1629,34 @@ async fn reader_task(
                                 );
                                 *thread_binding.lock().await = None;
                                 *resume_poison.lock().await = Some(format!("codex thread/resume failed: {msg}"));
+                                continue;
+                            }
+                            // Claim the thread/fork response (pending_resume's
+                            // sibling). A Fork handshake pre-seeds NO binding, so
+                            // an ERROR (parent rollout gone, …) must poison the
+                            // bound-thread wait or the first Send polls forever.
+                            // NEVER fall back to a fresh/HEAD thread here — the
+                            // user asked for the parent's context, and silently
+                            // dropping it is worse than failing (§G). A success
+                            // needs nothing: `thread/started` for the NEW thread
+                            // binds it via the notification handler above.
+                            let is_fork = {
+                                let mut pending = pending_fork.lock().await;
+                                match *pending {
+                                    Some(pfid) if pfid == rid => {
+                                        *pending = None;
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                            };
+                            if is_fork && let Some(msg) = error_message.as_deref() {
+                                tracing::warn!(
+                                    conversation_id = %session_id,
+                                    error = %msg,
+                                    "codex thread/fork rejected — poisoning bound-thread wait (no silent fallback)"
+                                );
+                                *resume_poison.lock().await = Some(format!("codex thread/fork failed: {msg}"));
                                 continue;
                             }
                             let pending_send = pending_sends.lock().await.remove(&rid);
@@ -3822,7 +3946,32 @@ impl SessionBackend for CodexSessionBackend {
 
     fn events(&self) -> BoxStream<'static, SessionEnvelope> {
         let rx = self.event_tx.subscribe();
-        futures_util::stream::unfold(rx, |mut rx| async move {
+        // Replay the current thread binding to every NEW subscriber. codex
+        // answers `thread/start` with `thread/started` in single-digit ms
+        // (local bookkeeping, no LLM call), so on a fresh open the live
+        // BackendBound routinely lands BEFORE the orchestration layer's
+        // subscription and is lost — the conversation then never persists its
+        // resume anchor (and the fork API refuses with FORK_PARENT_UNBOUND).
+        // A synthetic BackendBound is idempotent downstream (same-value
+        // set_session_id + same-value DB write), so replaying to an already-
+        // caught-up subscriber is harmless. try_lock: the binding mutex is
+        // held only for point writes/reads; on contention we just skip the
+        // preface (the caller is racing the live event, which it will get).
+        let preface: Vec<SessionEnvelope> = self
+            .thread_binding
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .map(|tid| SessionEnvelope {
+                session_id: self.session_id.clone(),
+                turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                event: SessionEvent::BackendBound {
+                    backend_session_id: Some(tid),
+                },
+            })
+            .into_iter()
+            .collect();
+        let live = futures_util::stream::unfold(rx, |mut rx| async move {
             loop {
                 match rx.recv().await {
                     Ok(env) => return Some((env, rx)),
@@ -3830,8 +3979,8 @@ impl SessionBackend for CodexSessionBackend {
                     Err(broadcast::error::RecvError::Closed) => return None,
                 }
             }
-        })
-        .boxed()
+        });
+        futures_util::stream::iter(preface).chain(live).boxed()
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -7052,7 +7201,10 @@ mod tests {
         let fake = FakeAgentIo::never_exits(Vec::new());
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-hs", Box::new(fake)).await;
-        backend.run_handshake(None).await.expect("handshake writes");
+        backend
+            .run_handshake(HandshakeMode::Fresh)
+            .await
+            .expect("handshake writes");
         let written = captured_str(&captured).await;
         assert!(
             written.contains(r#""method":"model/list""#),
@@ -8389,6 +8541,175 @@ mod tests {
         assert_eq!(
             tid, "th-late",
             "the late-arriving threadId binds (no premature timeout)"
+        );
+    }
+
+    /// Fork handshake down-leg: `run_handshake(Fork)` writes `thread/fork` with
+    /// the PARENT threadId + `lastTurnId`, and — unlike Resume — pre-seeds NO
+    /// thread binding (the NEW thread's id arrives via `thread/started`).
+    #[tokio::test]
+    async fn fork_handshake_writes_thread_fork_without_preseeding_binding() {
+        use futures_util::StreamExt as _;
+        // Gated tail: the `thread/started` for the forked (NEW) thread, released
+        // only after the down-leg assertions.
+        let tail = format!(
+            "{}\n",
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-child"}}}"#
+        )
+        .into_bytes();
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(tail);
+        let release = fake.stdout_releaser();
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-fork", Box::new(fake)).await;
+        let mut events = backend.events();
+
+        backend
+            .run_handshake(HandshakeMode::Fork {
+                parent_thread_id: "th-parent",
+                last_turn_id: Some("turn-3"),
+            })
+            .await
+            .expect("fork handshake writes");
+
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"thread/fork""#),
+            "wrote thread/fork, got: {written}"
+        );
+        assert!(
+            written.contains(r#""threadId":"th-parent""#) && written.contains(r#""lastTurnId":"turn-3""#),
+            "fork targets the parent thread at the anchor turn, got: {written}"
+        );
+        assert!(
+            backend.thread_binding.lock().await.is_none(),
+            "Fork must NOT pre-seed the binding — the parent id is only the fork source"
+        );
+
+        // Release the thread/started for the NEW thread: the reader binds it and
+        // lowers BackendBound{th-child} (the fork conversation's resume anchor).
+        release();
+        let bound = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::BackendBound { backend_session_id } = env.event {
+                    return backend_session_id;
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        assert_eq!(bound.as_deref(), Some("th-child"), "the NEW thread id is lowered");
+        assert_eq!(
+            backend.thread_binding.lock().await.as_deref(),
+            Some("th-child"),
+            "the reader bound the forked thread"
+        );
+    }
+
+    /// Fork handshake error-leg: a `thread/fork` ERROR (parent rollout gone)
+    /// poisons the bound-thread wait so the first Send fails fast with the real
+    /// cause — never a silent fresh/HEAD fallback, never an opaque timeout.
+    #[tokio::test]
+    async fn fork_handshake_error_poisons_bound_thread_wait() {
+        // rpc ids: initialize=1, thread/fork=2 → the error must carry id 2.
+        let tail = format!(
+            "{}\n",
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"no rollout found for thread id th-parent"}}"#
+        )
+        .into_bytes();
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(tail);
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-fork-err", Box::new(fake)).await;
+
+        backend
+            .run_handshake(HandshakeMode::Fork {
+                parent_thread_id: "th-parent",
+                last_turn_id: None,
+            })
+            .await
+            .expect("the down-leg write itself succeeds");
+        release();
+        // Give the reader a beat to claim the error response.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        let err = backend
+            .bound_thread_within(std::time::Duration::from_millis(200))
+            .await
+            .expect_err("poisoned wait fails fast");
+        assert!(
+            matches!(&err, BackendError::SessionNotFound(m) if m.contains("thread/fork failed") && m.contains("no rollout")),
+            "fork rejection surfaces as SessionNotFound with the codex cause, got {err:?}"
+        );
+    }
+
+    /// Fork anchoring: `turn/started` lowers codex's OWN turn id as
+    /// BackendTurnBound so the conversation layer can stamp it onto the turn's
+    /// message rows (the `thread/fork` lastTurnId lookup key).
+    #[tokio::test]
+    async fn turn_started_emits_backend_turn_bound() {
+        use futures_util::StreamExt as _;
+        let tail = format!(
+            "{}\n",
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"turn":{"id":"turn-7"}}}"#
+        )
+        .into_bytes();
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(tail);
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-turnid", Box::new(fake)).await;
+        let mut events = backend.events();
+        release();
+        let bound = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::BackendTurnBound { backend_turn_id } = env.event {
+                    return Some(backend_turn_id);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        assert_eq!(bound.as_deref(), Some("turn-7"), "turn/started lowers codex's turn id");
+    }
+
+    /// Late-subscriber self-heal: `thread/started` can land BEFORE the
+    /// orchestration layer subscribes (codex answers thread/start in
+    /// single-digit ms), which used to lose BackendBound forever — the
+    /// conversation never persisted its resume anchor and the fork API
+    /// refused with FORK_PARENT_UNBOUND. `events()` must replay the current
+    /// binding as a synthetic BackendBound to every new subscriber.
+    #[tokio::test]
+    async fn events_replays_binding_to_late_subscribers() {
+        use futures_util::StreamExt as _;
+        let prefix = format!(
+            "{}\n",
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-late-bind"}}}"#
+        )
+        .into_bytes();
+        let fake = FakeAgentIo::never_exits(prefix);
+        let backend = CodexSessionBackend::build_with_io("codex-late-sub", Box::new(fake)).await;
+        // Let the reader consume thread/started BEFORE anyone subscribes —
+        // the live BackendBound broadcast goes to zero receivers.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(
+            backend.thread_binding.lock().await.as_deref(),
+            Some("th-late-bind"),
+            "precondition: the reader already bound the thread"
+        );
+
+        let mut events = backend.events();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+            .await
+            .expect("the synthetic preface arrives immediately")
+            .expect("stream open");
+        assert!(
+            matches!(
+                first.event,
+                SessionEvent::BackendBound { backend_session_id: Some(ref tid) } if tid == "th-late-bind"
+            ),
+            "a late subscriber's first event is the replayed binding, got {:?}",
+            first.event
         );
     }
 }

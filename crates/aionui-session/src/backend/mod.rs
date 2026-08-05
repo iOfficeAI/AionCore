@@ -290,4 +290,13 @@ pub struct SessionConfig {
     /// into the F-4 wake recipe (rides the cloned `config`) so a resume re-spawn
     /// uses the same binary (R16 continuity).
     pub cli_program: Option<std::path::PathBuf>,
+    /// The conversation's cumulative cost (USD) BEFORE this backend instance
+    /// existed, read back from the persisted usage snapshot by the orchestration
+    /// layer on resume. claude only: its `result.total_cost_usd` is
+    /// PROCESS-cumulative (live-captured 2.1.221 — a `--resume` respawn restarts
+    /// the counter at zero), so the backend seeds its cost ledger with this base
+    /// and reports `base + raw`, keeping the broadcast/persisted cost
+    /// SESSION-cumulative across process recycles and app restarts. `None`
+    /// (default) = fresh conversation, base 0. Other backends ignore it.
+    pub initial_cost_usd: Option<f64>,
 }
