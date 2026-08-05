@@ -589,6 +589,54 @@ impl SessionAgentTask {
     ///     (claude keys the AskUserQuestion answer by the chosen label — see
     ///     claude_conn `build_control_response`; single-select single-question path).
     ///
+    /// Answer a structured question card (AskUserQuestion) — the DEDICATED
+    /// typed channel (2026-08-05 ruling: question answers do not ride the
+    /// permission confirm endpoint). `answers: None` = the user dismissed the
+    /// card; the claude adapter maps that to a deny (an allow with no answers
+    /// is silent data loss — claude drops unanswered questions, live 2.1.178).
+    pub fn answer_ask(
+        &self,
+        request_id: &str,
+        answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+    ) -> Result<(), AgentError> {
+        // api-types is the conversation layer's currency; convert to the
+        // session command's own type at this boundary.
+        let answers = answers.map(|list| {
+            list.into_iter()
+                .map(|a| aionui_session::QuestionAnswer {
+                    question: a.question,
+                    labels: a.labels,
+                })
+                .collect::<Vec<_>>()
+        });
+        let backend = self.backend.clone();
+        let request_id = request_id.to_string();
+        let conv_id = self.conversation_id.clone();
+        // Same fire-and-forget shape as confirm(): the REST reply has already
+        // returned by the time the dispatch runs, so a failure here MUST be
+        // surfaced in the log or a wedged ask is undiagnosable in production.
+        tokio::spawn(async move {
+            let command = aionui_session::Command::AnswerAsk {
+                request_id: request_id.clone(),
+                answers,
+            };
+            match backend.dispatch(command).await {
+                Ok(_) => tracing::info!(
+                    conv_id = %conv_id,
+                    request_id = %request_id,
+                    "ask answer delivered to backend (dedicated channel)"
+                ),
+                Err(e) => tracing::error!(
+                    conv_id = %conv_id,
+                    request_id = %request_id,
+                    error = %e,
+                    "ask answer FAILED after REST reply already returned success — claude stays blocked on can_use_tool"
+                ),
+            }
+        });
+        Ok(())
+    }
+
     /// `always_allow` (legacy flag) forces AllowAlways regardless.
     pub fn confirm(
         &self,
@@ -598,34 +646,6 @@ impl SessionAgentTask {
         always_allow: bool,
     ) -> Result<(), AgentError> {
         use aionui_session::PermissionDecision;
-        // Structured question card (`ask` frame): its confirm payload carries the
-        // FULL per-question answer set (`{answers:[{question, labels[]}]}`) or an
-        // explicit decline (`{ask_decline:true}`) — route to AnswerAsk, which the
-        // claude backend maps to allow+updatedInput.answers / deny. This is keyed
-        // on payload SHAPE, not a pending-ask registry: only the question card
-        // produces these keys, and a decline must reach claude as a deny (an
-        // allow with no answers is silent data loss, live 2.1.178).
-        if let Some(command) = ask_answer_command(call_id, &data) {
-            let backend = self.backend.clone();
-            let request_id = call_id.to_string();
-            let conv_id = self.conversation_id.clone();
-            tokio::spawn(async move {
-                match backend.dispatch(command).await {
-                    Ok(_) => tracing::info!(
-                        conv_id = %conv_id,
-                        request_id = %request_id,
-                        "ask answer delivered to backend"
-                    ),
-                    Err(e) => tracing::error!(
-                        conv_id = %conv_id,
-                        request_id = %request_id,
-                        error = %e,
-                        "ask answer FAILED after REST confirm already returned success — claude stays blocked on can_use_tool"
-                    ),
-                }
-            });
-            return Ok(());
-        }
         let picked = confirm_option_id(&data);
         let (decision, selected) = if always_allow {
             (PermissionDecision::AllowAlways, None)
@@ -3322,42 +3342,6 @@ async fn persist_context_usage(
 /// Extract the picked option id from the confirm `data` payload. The frontend sends
 /// either a bare string (the option_id) or an object `{option_id|optionId|value}`.
 /// Mirrors the ACP path's `confirm_option_id`.
-/// Parse a question-card confirm payload into `Command::AnswerAsk`, or `None`
-/// when the payload is not from the question card (generic permission confirms
-/// carry an option id, never `answers[]` / `ask_decline`). An `answers` array
-/// that fails to parse or is empty yields `None` too — falling through to the
-/// legacy single-label path is safer than sending claude an empty answer set.
-fn ask_answer_command(call_id: &str, data: &serde_json::Value) -> Option<aionui_session::Command> {
-    // The frontend confirm bridge sends `data` as a STRING (ipcBridge:
-    // `data: p.confirm_key`), so the question card's JSON payload arrives
-    // stringified. Parse it back to an object first; a non-JSON string (the
-    // legacy option-id confirms: "allow", a label, …) simply fails the parse
-    // and falls through to the legacy path via `None` below.
-    let parsed;
-    let data = match data {
-        serde_json::Value::String(s) => {
-            parsed = serde_json::from_str::<serde_json::Value>(s).ok()?;
-            &parsed
-        }
-        other => other,
-    };
-    if data.get("ask_decline").and_then(serde_json::Value::as_bool) == Some(true) {
-        return Some(aionui_session::Command::AnswerAsk {
-            request_id: call_id.to_string(),
-            answers: None,
-        });
-    }
-    let answers = data.get("answers")?.clone();
-    let parsed: Vec<aionui_session::QuestionAnswer> = serde_json::from_value(answers).ok()?;
-    if parsed.is_empty() {
-        return None;
-    }
-    Some(aionui_session::Command::AnswerAsk {
-        request_id: call_id.to_string(),
-        answers: Some(parsed),
-    })
-}
-
 fn confirm_option_id(data: &serde_json::Value) -> Option<String> {
     match data {
         serde_json::Value::String(v) => Some(v.clone()),

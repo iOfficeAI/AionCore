@@ -107,6 +107,19 @@ pub trait IMockAgent: IAgentTask {
     ) -> Result<(), AgentError> {
         Ok(())
     }
+    /// Answer a structured question card (AskUserQuestion) — the DEDICATED
+    /// channel, separate from the permission confirm path (2026-08-05 ruling).
+    /// `answers: None` = the user dismissed the card (a deny on the wire).
+    /// Default: not a question-capable agent.
+    fn answer_ask(
+        &self,
+        _request_id: &str,
+        _answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+    ) -> Result<(), AgentError> {
+        Err(AgentError::BadRequest(
+            "answer_ask is not supported by this agent".into(),
+        ))
+    }
     fn get_session_key(&self) -> Option<String> {
         None
     }
@@ -297,6 +310,24 @@ impl AgentInstance {
             Self::Session(m) => m.confirm(msg_id, call_id, data, always_allow),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.confirm(msg_id, call_id, data, always_allow),
+        }
+    }
+
+    /// Answer a structured question card via the dedicated channel.
+    pub fn answer_ask(
+        &self,
+        request_id: &str,
+        answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+    ) -> Result<(), AgentError> {
+        match self {
+            // Only the direct-CLI session path has a question channel today
+            // (claude AskUserQuestion); ACP/aionrs have none to answer on.
+            Self::Acp(_) | Self::Aionrs(_) => Err(AgentError::BadRequest(
+                "answer_ask is not supported by this agent".into(),
+            )),
+            Self::Session(m) => m.answer_ask(request_id, answers),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(m) => m.answer_ask(request_id, answers),
         }
     }
 

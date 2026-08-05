@@ -7,6 +7,7 @@ mod agent_build_extra;
 mod agent_discovery;
 mod agent_error;
 mod antigravity_hook;
+mod ask;
 mod assistant;
 mod auth;
 mod channel;
@@ -58,6 +59,7 @@ pub use antigravity_hook::{
     AntigravityHookConfig, AntigravityHookDecision, AntigravityHookInput, AntigravityHookOutput,
     AntigravityHookToolCall,
 };
+pub use ask::{AskAnswerRequest, AskQuestionAnswer};
 pub use assistant::{
     AssistantAgentResponse, AssistantCapabilitiesResponse, AssistantDefaultListRequest, AssistantDefaultListResponse,
     AssistantDefaultScalarRequest, AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse,

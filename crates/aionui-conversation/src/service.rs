@@ -3200,6 +3200,54 @@ impl ConversationService {
         Ok(())
     }
 
+    /// Answer a pending structured question (AskUserQuestion) over its
+    /// DEDICATED channel (2026-08-05 ruling: not the permission confirm path).
+    /// `answers: None` = the user dismissed the card (deny on the wire).
+    pub async fn answer_ask(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        request_id: &str,
+        answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), ConversationError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+
+        let agent = task_manager
+            .get_task(conversation_id)
+            .ok_or_else(|| ConversationError::ActiveAgentNotFound {
+                conversation_id: conversation_id.to_owned(),
+            })?;
+
+        // Same recovery-card cleanup contract as confirm(): if this request is
+        // also surfaced as a pending confirmation, broadcast its removal so
+        // every connected client drops the recovered card.
+        let conf_id = agent
+            .get_confirmations()
+            .iter()
+            .find(|c| c.call_id == request_id)
+            .map(|c| c.id.clone());
+
+        agent.answer_ask(request_id, answers)?;
+
+        if let Some(conf_id) = conf_id {
+            let payload = serde_json::json!({
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "id": conf_id,
+            });
+            let msg = WebSocketMessage::new("confirmation.remove", payload);
+            self.broadcaster.broadcast(msg);
+        }
+
+        Ok(())
+    }
+
     /// Check whether an action has been auto-approved in the current session.
     pub async fn check_approval(
         &self,
