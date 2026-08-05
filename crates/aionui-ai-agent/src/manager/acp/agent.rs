@@ -28,6 +28,7 @@ use aionui_common::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
@@ -180,6 +181,29 @@ async fn spawn_and_connect_acp(
     }
 }
 
+/// Register the freshly spawned CLI process in the runtime registry. On
+/// failure the child is force-killed before the error propagates: the caller
+/// aborts startup, and without the kill every failed send attempt would leak
+/// an un-reapable orphan agent process (ELECTRON-3WN left 4 of them behind).
+fn register_spawned_process(
+    data_dir: &Path,
+    process: &Arc<CliAgentProcess>,
+    conversation_id: String,
+    agent_type: AgentType,
+    backend: Option<String>,
+    command_preview: Option<String>,
+) -> Result<(), AgentError> {
+    register_session_process(
+        data_dir,
+        Arc::clone(process),
+        conversation_id,
+        agent_type,
+        backend,
+        command_preview,
+    )
+    .inspect_err(|_| process.force_kill_tree())
+}
+
 async fn spawn_and_connect_acp_once(
     params: &AcpSessionParams,
     runtime: &AgentRuntime,
@@ -189,9 +213,9 @@ async fn spawn_and_connect_acp_once(
             .await
             .map_err(AcpStartupConnectError::Agent)?,
     );
-    register_session_process(
+    register_spawned_process(
         &params.data_dir,
-        Arc::clone(&process),
+        &process,
         params.conversation_id.clone(),
         AgentType::Acp,
         params.metadata.backend.clone(),
@@ -204,6 +228,7 @@ async fn spawn_and_connect_acp_once(
     .map_err(AcpStartupConnectError::Agent)?;
     let (stdin, stdout) = process.take_stdio().await.ok_or_else(|| {
         error!(conversation_id = %params.conversation_id, "Failed to take stdio from CLI process");
+        process.force_kill_tree();
         let _ = unregister_agent_process(&params.data_dir, process.pid());
         AcpStartupConnectError::Agent(AgentError::internal("Failed to take stdio from CLI process"))
     })?;
@@ -239,6 +264,7 @@ async fn spawn_and_connect_acp_once(
                 error = %ErrorChain(&e),
                 "Failed to establish ACP protocol connection"
             );
+            process.force_kill_tree();
             let _ = unregister_agent_process(&params.data_dir, process.pid());
             AcpStartupConnectError::Agent(AgentError::from(e))
         })?,
@@ -1619,7 +1645,8 @@ impl AcpAgentManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_acp_final_input_dump_value, exit_status_parts, normalize_config_option_request_value, user_facing_message,
+        build_acp_final_input_dump_value, exit_status_parts, normalize_config_option_request_value,
+        register_spawned_process, user_facing_message,
     };
     use crate::agent_runtime::AgentRuntime;
     use crate::error::AgentError;
@@ -2133,4 +2160,47 @@ mod tests {
     // Close-reason compositional tests live in `agent_close.rs` so that
     // (a) `agent.rs` stays under the 1000-line budget, and (b) the test
     // suite for the close-path helpers sits next to the production logic.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn register_failure_kills_spawned_process() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        // Read-only runtime/ makes the registry temp-file creation fail with
+        // a genuine I/O error (corruption now degrades, so only real I/O
+        // errors still abort registration).
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let process = Arc::new(
+            CliAgentProcess::spawn_for_sdk(aionui_common::CommandSpec {
+                command: PathBuf::from("sh"),
+                args: vec!["-c".into(), "sleep 300".into()],
+                env: vec![],
+                cwd: None,
+            })
+            .await
+            .unwrap(),
+        );
+
+        let result = register_spawned_process(
+            dir.path(),
+            &process,
+            "conv-test".into(),
+            aionui_common::AgentType::Acp,
+            None,
+            None,
+        );
+        assert!(result.is_err(), "read-only runtime dir must fail registration");
+
+        tokio::time::timeout(Duration::from_secs(5), process.wait_for_exit())
+            .await
+            .expect("spawned process must be killed after registration failure");
+
+        // Restore permissions so tempdir cleanup can remove the directory.
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
