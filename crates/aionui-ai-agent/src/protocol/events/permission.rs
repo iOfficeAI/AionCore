@@ -82,19 +82,20 @@ impl AcpPermissionRequestData {
             call_id: self.tool_call.tool_call_id.clone(),
             title: self.tool_call.title.clone(),
             action: None,
+            // Only a real `description` string. The old fallback dumped the
+            // WHOLE raw_input via `Value::to_string()` into this field, so an
+            // agent that smuggles structured data through the permission
+            // channel (qwen/kimi AskUserQuestion) rendered a wall of one-line
+            // JSON as the card's description (user report, 2026-08-05). The
+            // card's own detail block already shows raw_input readably; an
+            // empty description simply omits the line.
             description: self
                 .tool_call
                 .raw_input
                 .as_ref()
                 .and_then(|raw| raw.get("description").and_then(Value::as_str))
                 .map(ToOwned::to_owned)
-                .unwrap_or_else(|| {
-                    self.tool_call
-                        .raw_input
-                        .as_ref()
-                        .map(Value::to_string)
-                        .unwrap_or_default()
-                }),
+                .unwrap_or_default(),
             command_type: self.tool_call.kind.map(|kind| match kind {
                 AcpToolCallKind::Read => "read".to_owned(),
                 AcpToolCallKind::Edit => "edit".to_owned(),
