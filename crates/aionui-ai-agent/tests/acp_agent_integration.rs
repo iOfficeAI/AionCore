@@ -75,6 +75,7 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
         mcp_server_ids: None,
         session_mcp_servers: vec![],
         user_id: None,
+        fork: None,
     };
 
     let tmp_skills = tempfile::TempDir::new().unwrap();
@@ -195,6 +196,7 @@ fn event_type_name(event: &AgentStreamEvent) -> &'static str {
         AgentStreamEvent::SlashCommandsUpdated(_) => "SlashCommandsUpdated",
         AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
         AgentStreamEvent::SegmentBreak => "SegmentBreak",
+        AgentStreamEvent::BackendTurnBound(_) => "BackendTurnBound",
         AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
         AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
     }

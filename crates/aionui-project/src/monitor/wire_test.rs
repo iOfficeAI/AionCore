@@ -17,12 +17,11 @@ fn fact(kind: Kind) -> EntryFact {
 
 #[test]
 fn incoming_request_parses_id_method_params() {
-    let v =
-        json!({"jsonrpc":"2.0","id":3,"method":"fs/read","params":{"file":{"pe_id":"pe1","relative_path":"a.txt"}}});
+    let v = json!({"jsonrpc":"2.0","id":3,"method":"fs/mkdir","params":{"dir":{"pe_id":"pe1","relative_path":"a"}}});
     let frame: IncomingFrame = serde_json::from_value(v).unwrap();
     assert_eq!(frame.id, Some(json!(3)));
-    assert_eq!(frame.method, "fs/read");
-    assert_eq!(frame.params["file"]["pe_id"], "pe1");
+    assert_eq!(frame.method, "fs/mkdir");
+    assert_eq!(frame.params["dir"]["pe_id"], "pe1");
 }
 
 #[test]
@@ -46,7 +45,7 @@ fn incoming_missing_method_is_error() {
     assert!(serde_json::from_value::<IncomingFrame>(v).is_err());
 }
 
-// ── params / encoding ─────────────────────────────────────────────────────
+// ── params ──────────────────────────────────────────────────────────────
 
 #[test]
 fn subscribe_params_parse_targets() {
@@ -54,19 +53,6 @@ fn subscribe_params_parse_targets() {
     let p: SubscribeParams = serde_json::from_value(v).unwrap();
     assert_eq!(p.targets.len(), 2);
     assert_eq!(p.targets[1].relative_path, "src");
-}
-
-#[test]
-fn encoding_parses_utf8_and_base64_and_defaults() {
-    assert_eq!(
-        serde_json::from_value::<Encoding>(json!("utf-8")).unwrap(),
-        Encoding::Utf8
-    );
-    assert_eq!(
-        serde_json::from_value::<Encoding>(json!("base64")).unwrap(),
-        Encoding::Base64
-    );
-    assert_eq!(Encoding::default(), Encoding::Utf8);
 }
 
 #[test]

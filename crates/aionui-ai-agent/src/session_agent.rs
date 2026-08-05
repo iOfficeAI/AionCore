@@ -30,7 +30,7 @@ use crate::protocol::events::{
 };
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::PersistedSessionState;
-use crate::types::SendMessageData;
+use crate::types::{PromptMediaCaps, SendMessageData};
 use aionui_api_types::AcpBuildExtra;
 use aionui_common::AgentType;
 use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStateParams};
@@ -1034,19 +1034,67 @@ impl IAgentTask for SessionAgentTask {
         self.runtime.tx.subscribe()
     }
 
+    fn prompt_media_caps(&self) -> PromptMediaCaps {
+        let blocks = self.backend.capabilities().prompt_blocks;
+        PromptMediaCaps {
+            image: blocks.image,
+            audio: blocks.audio,
+        }
+    }
+
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.runtime.touch();
+        // Partition attachments by the backend's declared prompt blocks:
+        // capable media becomes native Image/Audio blocks; everything else
+        // keeps the pre-multimodal form (path in the [[AION_FILES]] text +
+        // resource link). A read failure degrades that attachment back to a
+        // resource link — the path also remains in the original text because
+        // partition already ran, which the adapters tolerate (they resolve
+        // links independently of the text).
+        let partition = crate::media::partition_media(&data.content, &data.files, self.prompt_media_caps());
         let mut content: Vec<ContentBlock> = Vec::new();
-        if !data.content.is_empty() {
-            content.push(ContentBlock::Text(data.content));
+        if !partition.content.is_empty() {
+            content.push(ContentBlock::Text(partition.content));
         }
-        for path in data.files {
+        for path in partition.path_files {
             // File paths ride as resource links; the claude/codex adapters resolve
             // them (Read tool / base64) at dispatch time.
             content.push(ContentBlock::ResourceLink {
                 uri: path,
                 mime_type: None,
             });
+        }
+        for attachment in &partition.media {
+            match crate::media::read_media_bytes(attachment).await {
+                Some(bytes) => content.push(match attachment.kind {
+                    crate::media::MediaKind::Image => ContentBlock::Image {
+                        data: bytes,
+                        media_type: attachment.mime.clone(),
+                    },
+                    crate::media::MediaKind::Audio => ContentBlock::Audio {
+                        data: bytes,
+                        media_type: attachment.mime.clone(),
+                    },
+                }),
+                None => content.push(ContentBlock::ResourceLink {
+                    uri: attachment.path.clone(),
+                    mime_type: Some(attachment.mime.clone()),
+                }),
+            }
+        }
+        if !partition.media.is_empty() {
+            let (images, audios) = content.iter().fold((0usize, 0usize), |(i, a), b| match b {
+                ContentBlock::Image { .. } => (i + 1, a),
+                ContentBlock::Audio { .. } => (i, a + 1),
+                _ => (i, a),
+            });
+            tracing::info!(
+                conversation_id = %self.conversation_id,
+                msg_id = %data.msg_id,
+                images,
+                audios,
+                "session prompt carries native media content blocks"
+            );
         }
         // DEV (`--dump-prompts`): borrow the final blocks BEFORE they move into
         // Command::Send. No-op / best-effort — never affects the dispatch.
@@ -1287,6 +1335,15 @@ pub(crate) fn resolved_effort(
         .filter(|value| !value.is_empty())
 }
 
+/// The persisted session-cumulative cost (USD) that seeds the claude backend's
+/// cost ledger (`SessionConfig.initial_cost_usd`) on a rebuild. USD only:
+/// claude's own `total_cost_usd` counter is USD, and silently adding a
+/// foreign-currency figure to it would corrupt both.
+pub(crate) fn initial_cost_usd_from_snapshot(session_snapshot: Option<&PersistedSessionState>) -> Option<f64> {
+    let cost = session_snapshot?.context_usage.as_ref()?.cost.as_ref()?;
+    (cost.currency.eq_ignore_ascii_case("usd") && cost.amount > 0.0).then_some(cost.amount)
+}
+
 pub(crate) fn resolved_session_mode(
     config: &AcpBuildExtra,
     session_snapshot: Option<&PersistedSessionState>,
@@ -1319,12 +1376,26 @@ fn spec_mode_model(
 ) -> (aionui_session::SessionSpec, Option<String>, Option<String>) {
     use aionui_session::SessionSpec;
     let spec = match &backend_session_id {
+        // A bound session ALWAYS resumes — even on a forked conversation
+        // (its fork completed; the spec is now pure lineage data).
         Some(_) => SessionSpec::Resume {
             session_id: conversation_id.to_owned(),
             backend_session_id,
         },
-        None => SessionSpec::Fresh {
-            session_id: conversation_id.to_owned(),
+        // Unbound + fork spec = the fork has not materialized yet → open in
+        // Fork mode against the parent's snapshotted sid. This also makes a
+        // post-fork dead-anchor self-heal (clear_session_id) RE-FORK back to
+        // the fork point instead of silently opening Fresh — strictly better
+        // than the plain conversation's lost-anchor behavior.
+        None => match &config.fork {
+            Some(fork) => SessionSpec::Fork {
+                session_id: conversation_id.to_owned(),
+                parent_backend_session_id: fork.parent_session_id.clone(),
+                at_turn_id: fork.last_turn_id.clone(),
+            },
+            None => SessionSpec::Fresh {
+                session_id: conversation_id.to_owned(),
+            },
         },
     };
     // Normalize the resolved mode alias into the backend-native id — the SAME
@@ -1541,17 +1612,17 @@ pub async fn build_session_instance(
         model,
         mode,
         init,
-        // Packaged app: resolve the bundled claude/codex binary and forward its
-        // absolute path so the backend spawns OUR CLI, not the user's PATH one.
-        // Bundled-missing / dev falls back to a PATH lookup via
+        // A user-selected launch path wins so the process uses the same binary
+        // that the registry health check accepted. Otherwise the packaged app
+        // resolves the bundled claude/codex binary and forwards its absolute
+        // path. Bundled-missing / dev falls back to a PATH lookup via
         // `resolve_command_path` (NOT the bare name): on Windows, npm installs
         // ship `claude.cmd`/`codex.cmd` shims which `CreateProcess` does not
         // find from a bare name (#299 parity; Rust std runs `.cmd` via
         // `cmd.exe` since the BatBadBut fix). `None` (nothing on PATH either)
         // keeps the bare name so the spawn error stays diagnosable. Detection
         // (cli_probe) stays PATH-only and is unaffected.
-        cli_program: aionui_runtime::resolve_bundled_cli(backend_label)
-            .or_else(|| aionui_runtime::resolve_command_path(backend_label)),
+        cli_program: resolve_session_cli_program(backend_label, metadata),
         ..Default::default()
     };
 
@@ -1567,6 +1638,15 @@ pub async fn build_session_instance(
     // Version-gated on the binary we actually resolved above: the flag is hidden
     // (absent from `--help`) and older builds reject it at argument-parse time, so
     // an ungated flag would make every session unspawnable. See `claude_flags`.
+    // Cost-ledger seed (claude only): claude's `total_cost_usd` is
+    // process-cumulative, so a rebuilt backend (app restart / conversation
+    // reopen) must start its ledger from the conversation's persisted
+    // cumulative cost — otherwise the "session cost" falls back to the new
+    // process's own spend. codex reports no cost; other backends ignore it.
+    if backend_label == "claude" {
+        session_config.initial_cost_usd = initial_cost_usd_from_snapshot(session_snapshot);
+    }
+
     if backend_label == "claude"
         && let Some(program) = session_config.cli_program.clone()
         && crate::claude_flags::supports_thinking_display(&program).await
@@ -1735,6 +1815,24 @@ pub async fn build_session_instance(
         Some(broadcaster),
     );
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
+}
+
+fn resolve_session_cli_program(
+    backend_label: &str,
+    metadata: &aionui_api_types::AgentMetadata,
+) -> Option<std::path::PathBuf> {
+    if metadata.has_command_override {
+        return metadata.resolved_command.clone().or_else(|| {
+            metadata
+                .command
+                .as_deref()
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .map(std::path::PathBuf::from)
+        });
+    }
+
+    aionui_runtime::resolve_bundled_cli(backend_label).or_else(|| aionui_runtime::resolve_command_path(backend_label))
 }
 
 /// Assemble the direct-CLI spawn env (legacy spawn-surface parity; order
@@ -2290,6 +2388,7 @@ fn spawn_event_pump(
                         let data = crate::protocol::events::WorkflowProgressData {
                             card: card_frame,
                             agents,
+                            settle_only: false,
                         };
                         // Delivery is uniform: in-turn the per-turn relay consumes
                         // this, between turns the conversation's background stream
@@ -2894,6 +2993,23 @@ fn spawn_event_pump(
                 let _ = runtime.tx.send(ev);
             }
         }
+
+        // The event stream ended: the backend (and its process group) is being
+        // torn down. Settle every card still open and push the frames NOW —
+        // the out-of-turn watcher is still subscribed at this instant and drains
+        // buffered frames before it observes the channel close. Without this an
+        // idle-kill left cards' stored rows on `running` forever (live
+        // 2026-08-04: a load-gate bash's card spun for hours after the reaper
+        // removed the task mid-flight).
+        for data in settle_workflow_cards(
+            &mut workflow_cards,
+            crate::workflow_progress::CardStatus::Cancelled,
+            false,
+            aionui_common::now_ms(),
+            &conversation_id,
+        ) {
+            let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+        }
     });
 }
 
@@ -3373,6 +3489,7 @@ fn update_workflow_cards(
                         out.push(WorkflowProgressData {
                             card: card_frame,
                             agents,
+                            settle_only: false,
                         });
                     }
                     cards.insert(r#ref.clone(), card);
@@ -3380,6 +3497,45 @@ fn update_workflow_cards(
             }
             terminal => {
                 let Some(mut card) = cards.remove(r#ref) else {
+                    // A terminal for a card THIS pump never opened. Real case
+                    // (live 2026-08-04): the conversation was idle-killed while a
+                    // background bash kept working; the RESUMED session reported
+                    // the task terminal, but the rebuilt pump's ledger was empty —
+                    // and the stored row spun forever. Synthesize a STATUS-ONLY
+                    // settle keyed to the launching call. `settle_only` makes the
+                    // consumers update-only: the same unknown-terminal shape also
+                    // fires for workflow-INTERNAL refs that never had a row (the
+                    // 2.1.176 capture's inner bashes), and those must stay
+                    // invisible.
+                    if let Some(call_id) = parent_ref.clone() {
+                        let status = match terminal {
+                            SubagentStatus::Completed => crate::protocol::events::ToolCallStatus::Completed,
+                            SubagentStatus::Errored => crate::protocol::events::ToolCallStatus::Error,
+                            _ => crate::protocol::events::ToolCallStatus::Canceled,
+                        };
+                        tracing::info!(
+                            conv_id = %conversation_id,
+                            task_id = %r#ref,
+                            %call_id,
+                            ?status,
+                            "session-pump: terminal for unknown card — emitting status-only settle"
+                        );
+                        out.push(WorkflowProgressData {
+                            card: crate::protocol::events::ToolCallEventData {
+                                call_id,
+                                // Empty name / null args are SKIPPED at
+                                // serialization, so the stored row keeps its own.
+                                name: String::new(),
+                                args: serde_json::Value::Null,
+                                status,
+                                input: None,
+                                output: None,
+                                description: None,
+                            },
+                            agents: Vec::new(),
+                            settle_only: true,
+                        });
+                    }
                     return out;
                 };
                 let status = match terminal {
@@ -3398,7 +3554,11 @@ fn update_workflow_cards(
                     "session-pump: workflow progress card settled"
                 );
                 if let Some((card, agents)) = card.take_emission(now_ms, true) {
-                    out.push(WorkflowProgressData { card, agents });
+                    out.push(WorkflowProgressData {
+                        card,
+                        agents,
+                        settle_only: false,
+                    });
                 }
             }
         },
@@ -3437,7 +3597,11 @@ fn update_workflow_cards(
                 },
             );
             if let Some((card, agents)) = card.take_emission(now_ms, forced) {
-                out.push(WorkflowProgressData { card, agents });
+                out.push(WorkflowProgressData {
+                    card,
+                    agents,
+                    settle_only: false,
+                });
             }
         }
         SessionEvent::WorkflowPhase { task_id, index, title } => {
@@ -3446,7 +3610,11 @@ fn update_workflow_cards(
             };
             let forced = card.declare_phase(*index, title.clone());
             if let Some((card, agents)) = card.take_emission(now_ms, forced) {
-                out.push(WorkflowProgressData { card, agents });
+                out.push(WorkflowProgressData {
+                    card,
+                    agents,
+                    settle_only: false,
+                });
             }
         }
         _ => {}
@@ -3498,7 +3666,11 @@ fn settle_workflow_cards(
             let mut card = cards.remove(&k)?;
             card.settle(status);
             card.take_emission(now_ms, true)
-                .map(|(card, agents)| WorkflowProgressData { card, agents })
+                .map(|(card, agents)| WorkflowProgressData {
+                    card,
+                    agents,
+                    settle_only: false,
+                })
         })
         .collect()
 }
@@ -3591,6 +3763,12 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         // `TurnStarted` (never reaches this stream) — are therefore NOT re-projected
         // to Start here, or the frontend would see a late/duplicate turn boundary.
         SessionEvent::PromptAccepted { .. } | SessionEvent::TurnStarted { .. } => Vec::new(),
+        // Fork anchoring: forward the backend's own turn id as an internal-only
+        // relay frame so message rows persisted during this turn carry it
+        // (`messages.backend_turn_id`). Never reaches the WebSocket.
+        SessionEvent::BackendTurnBound { backend_turn_id } => {
+            vec![AgentStreamEvent::BackendTurnBound(backend_turn_id)]
+        }
         SessionEvent::MessageDelta { text, .. } => {
             vec![AgentStreamEvent::Text(TextEventData { content: text })]
         }
@@ -3891,6 +4069,13 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 params,
             })]
         }
+        // Agent-generated session title (claude generate_session_title, spec
+        // 2026-08-04). Reuse the ACP session_info_update event shape so the
+        // StreamRelay's name_source-guarded consumer handles both paths
+        // identically (translate.rs emits the same frame for real ACP agents).
+        SessionEvent::SessionTitle { title } => {
+            vec![AgentStreamEvent::AcpSessionInfo(serde_json::json!({ "title": title }))]
+        }
         // Events with no origin-side counterpart (or purely internal) are dropped.
         // Cancel folds into the Finish emitted by the resulting terminal; Heartbeat,
         // PromptAccepted, Snapshot, Lagged, item lifecycle, subagent/rewound/etc. are
@@ -3941,6 +4126,37 @@ mod build_mapping_tests {
             thought_level: level.map(str::to_owned),
             ..Default::default()
         }
+    }
+
+    /// The claude cost ledger's app-restart seed: the persisted cumulative cost
+    /// must map into `SessionConfig.initial_cost_usd` — but ONLY a USD figure
+    /// (claude's own counter is USD; a foreign-currency figure persisted by some
+    /// other path must not be silently added to it).
+    #[test]
+    fn initial_cost_seed_reads_the_persisted_usd_cost_only() {
+        use agent_client_protocol::schema::v1::{Cost, UsageUpdate};
+        let usd = PersistedSessionState {
+            context_usage: Some(UsageUpdate::new(12_600, 262_144).cost(Cost::new(6.4294, "USD"))),
+            ..Default::default()
+        };
+        assert_eq!(initial_cost_usd_from_snapshot(Some(&usd)), Some(6.4294));
+
+        let eur = PersistedSessionState {
+            context_usage: Some(UsageUpdate::new(1, 2).cost(Cost::new(1.0, "EUR"))),
+            ..Default::default()
+        };
+        assert_eq!(
+            initial_cost_usd_from_snapshot(Some(&eur)),
+            None,
+            "non-USD must not seed"
+        );
+
+        assert_eq!(initial_cost_usd_from_snapshot(None), None);
+        assert_eq!(
+            initial_cost_usd_from_snapshot(Some(&PersistedSessionState::default())),
+            None,
+            "a snapshot without a cost figure must not seed"
+        );
     }
 
     #[test]
@@ -4119,6 +4335,19 @@ mod build_mapping_tests {
     }
 
     #[test]
+    fn session_cli_program_prefers_explicit_command_override() {
+        let mut metadata = test_metadata(Some("claude"), None);
+        metadata.has_command_override = true;
+        metadata.command = Some("claude".into());
+        metadata.resolved_command = Some(std::path::PathBuf::from("/custom/claude"));
+
+        assert_eq!(
+            resolve_session_cli_program("claude", &metadata),
+            Some(std::path::PathBuf::from("/custom/claude"))
+        );
+    }
+
+    #[test]
     fn spec_fresh_when_no_anchor() {
         let cfg = AcpBuildExtra::default();
         let (spec, mode, model) = spec_mode_model("conv_1", None, &cfg, None, &test_metadata(Some("claude"), None));
@@ -4147,6 +4376,48 @@ mod build_mapping_tests {
         ));
         assert_eq!(mode.as_deref(), Some("plan"));
         assert_eq!(model.as_deref(), Some("claude-x"));
+    }
+
+    /// Fork-spec quadrant matrix (sid x fork): a bound sid ALWAYS resumes (the
+    /// fork completed; the spec is lineage data); unbound + fork spec opens in
+    /// Fork mode against the parent's snapshotted sid; unbound + no spec stays
+    /// Fresh.
+    #[test]
+    fn spec_fork_quadrants() {
+        let fork_cfg = AcpBuildExtra {
+            fork: Some(aionui_api_types::ForkSpec {
+                parent_conversation_id: "conv_parent".into(),
+                parent_message_id: "msg_9".into(),
+                parent_session_id: "parent-sid".into(),
+                last_turn_id: Some("turn-4".into()),
+            }),
+            ..Default::default()
+        };
+        let plain_cfg = AcpBuildExtra::default();
+        let md = test_metadata(Some("codex"), None);
+
+        // (None, fork) -> Fork with the parent anchor + turn id.
+        let (spec, _, _) = spec_mode_model("conv_f", None, &fork_cfg, None, &md);
+        assert!(matches!(
+            spec,
+            SessionSpec::Fork { ref parent_backend_session_id, ref at_turn_id, .. }
+                if parent_backend_session_id == "parent-sid" && at_turn_id.as_deref() == Some("turn-4")
+        ));
+
+        // (Some, fork) -> Resume (fork already materialized; never re-fork).
+        let (spec, _, _) = spec_mode_model("conv_f", Some("own-sid".into()), &fork_cfg, None, &md);
+        assert!(matches!(
+            spec,
+            SessionSpec::Resume { backend_session_id: Some(ref b), .. } if b == "own-sid"
+        ));
+
+        // (None, no fork) -> Fresh.
+        let (spec, _, _) = spec_mode_model("conv_f", None, &plain_cfg, None, &md);
+        assert!(matches!(spec, SessionSpec::Fresh { .. }));
+
+        // (Some, no fork) -> Resume (unchanged baseline).
+        let (spec, _, _) = spec_mode_model("conv_f", Some("own-sid".into()), &plain_cfg, None, &md);
+        assert!(matches!(spec, SessionSpec::Resume { .. }));
     }
 
     // The interactive-switch-persisted snapshot selection MUST win over the
@@ -5779,6 +6050,106 @@ mod pump_tests {
         }
     }
 
+    /// Backend that records every dispatched Command and advertises
+    /// image-capable prompt blocks — for asserting the media partition at
+    /// the Command::Send boundary.
+    struct RecordingBackend {
+        commands: std::sync::Mutex<Vec<Command>>,
+        blocks: aionui_session::BlockSet,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for RecordingBackend {
+        async fn dispatch(&self, c: Command) -> Result<CommandReceipt, BackendError> {
+            let admission = match c {
+                Command::Send { .. } => Admission::Started,
+                _ => Admission::NoTurn,
+            };
+            self.commands.lock().unwrap().push(c);
+            Ok(CommandReceipt {
+                accepted: true,
+                admission,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::iter(Vec::new()).boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                prompt_blocks: self.blocks,
+                ..Capabilities::default()
+            }
+        }
+    }
+
+    // Image-capable backend: an image attachment leaves the [[AION_FILES]]
+    // text and rides as a native Image block; non-media files keep the
+    // path-text + resource-link form.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_message_partitions_image_into_native_block() {
+        let dir = std::env::temp_dir().join("aionui-session-media-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("cat.png");
+        std::fs::write(&img, b"catbytes").unwrap();
+        let img = img.to_string_lossy().into_owned();
+        let pdf = dir.join("doc.pdf");
+        std::fs::write(&pdf, b"pdfbytes").unwrap();
+        let pdf = pdf.to_string_lossy().into_owned();
+
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet {
+                text: true,
+                image: true,
+                audio: false,
+                resource: true,
+                at_mention: false,
+            },
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend.clone() as Arc<dyn SessionBackend>,
+            None,
+        );
+        let marker = aionui_common::constants::AIONUI_FILES_MARKER;
+        crate::agent_task::IAgentTask::send_message(
+            task.as_ref(),
+            SendMessageData {
+                content: format!("see\n\n{marker}\n{img}\n{pdf}"),
+                msg_id: "m-media".into(),
+                turn_id: None,
+                files: vec![img.clone(), pdf.clone()],
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let commands = backend.commands.lock().unwrap();
+        let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
+            panic!("expected a Send command");
+        };
+        assert_eq!(content.len(), 3, "text + pdf link + image block: {content:?}");
+        let ContentBlock::Text(text) = &content[0] else {
+            panic!("expected text first: {content:?}");
+        };
+        assert_eq!(text, &format!("see\n\n{marker}\n{pdf}"));
+        let ContentBlock::ResourceLink { uri, .. } = &content[1] else {
+            panic!("expected resource link second: {content:?}");
+        };
+        assert_eq!(uri, &pdf);
+        let ContentBlock::Image { data, media_type } = &content[2] else {
+            panic!("expected image block third: {content:?}");
+        };
+        assert_eq!(data, b"catbytes");
+        assert_eq!(media_type, "image/png");
+    }
+
     fn env(event: SessionEvent) -> SessionEnvelope {
         env_gen(1, event)
     }
@@ -5875,6 +6246,34 @@ mod pump_tests {
             AgentStreamEvent::SegmentBreak => "SegmentBreak",
             _ => "other",
         }
+    }
+
+    // SessionTitle (claude generate_session_title, spec 2026-08-04) maps to the
+    // SAME AcpSessionInfo frame the ACP bridge emits for session_info_update, so
+    // the StreamRelay's guarded consumer handles both backends through one path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_title_maps_to_acp_session_info_frame() {
+        let script = vec![
+            env(SessionEvent::SessionTitle {
+                title: "Fix login bug".into(),
+            }),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+        ];
+        let frames = drain_script(script).await;
+        let payload = frames
+            .iter()
+            .find_map(|f| match f {
+                AgentStreamEvent::AcpSessionInfo(v) => Some(v.clone()),
+                _ => None,
+            })
+            .expect("SessionTitle must surface as an AcpSessionInfo frame");
+        assert_eq!(payload["title"], "Fix login bug");
     }
 
     // A ConfigChanged never produces a stream frame (it would fall into origin
@@ -6812,6 +7211,104 @@ mod pump_tests {
         assert_eq!(texts, 2, "launch reply AND report both stream, got {seq:?}");
     }
 
+    /// The stream ending (idle-kill teardown, crash) must settle every open
+    /// card ON THE WAY OUT: the ledger dies with the pump, so this is the last
+    /// chance to stop the stored row spinning forever (live 2026-08-04: a
+    /// load-gate bash card spun for hours after the idle reaper removed the
+    /// task mid-flight).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_teardown_settles_open_cards() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_bg".into(),
+                name: "Bash".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"command": "until ...; do sleep 30; done"}),
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-bg".into(),
+                label: None,
+                status: SubagentStatus::Running,
+                parent_ref: Some("toolu_bg".into()),
+                kind: Some(SubagentTaskKind::Other),
+            }),
+            // No terminal, no TurnResult — the stream just ends (teardown).
+        ];
+        let frames = drain_script(script).await;
+        let settled = wf_frames(&frames)
+            .into_iter()
+            .rev()
+            .find(|p| p.card.status == ToolCallStatus::Canceled)
+            .unwrap_or_else(|| {
+                panic!(
+                    "teardown must settle the open card, got {:?}",
+                    frames.iter().map(frame_name).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(settled.card.call_id, "toolu_bg");
+    }
+
+    /// A terminal for a task this pump never opened (post-resume: the old pump —
+    /// and its ledger — died with an idle-kill) synthesizes a STATUS-ONLY settle
+    /// keyed to the launching call, marked `settle_only` so consumers update an
+    /// existing row and never insert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_terminal_synthesizes_a_settle_only_frame() {
+        use aionui_session::SubagentStatus;
+        let script = vec![
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-old".into(),
+                label: None,
+                status: SubagentStatus::Interrupted,
+                parent_ref: Some("toolu_old".into()),
+                kind: None, // task_notification carries no kind
+            }),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+        ];
+        let frames = drain_script(script).await;
+        let synth = wf_frames(&frames)
+            .into_iter()
+            .find(|p| p.settle_only)
+            .unwrap_or_else(|| {
+                panic!(
+                    "unknown terminal must synthesize a settle-only frame, got {:?}",
+                    frames.iter().map(frame_name).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(synth.card.call_id, "toolu_old", "keyed to the launching call");
+        assert_eq!(synth.card.status, ToolCallStatus::Canceled);
+        // Status-only on the wire: empty name / null args are skipped at
+        // serialization so merge-patch keeps the stored row's own fields.
+        let wire = serde_json::to_value(&synth.card).unwrap();
+        assert!(wire.get("name").is_none(), "empty name must not serialize: {wire}");
+        assert!(wire.get("args").is_none(), "null args must not serialize: {wire}");
+        assert!(synth.agents.is_empty());
+    }
+
+    /// An unknown terminal WITHOUT a parent link has nowhere to settle — silence,
+    /// not a junk frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_terminal_without_parent_stays_silent() {
+        use aionui_session::SubagentStatus;
+        let script = vec![env(SessionEvent::SubagentUpdate {
+            r#ref: "task-old".into(),
+            label: None,
+            status: SubagentStatus::Completed,
+            parent_ref: None,
+            kind: None,
+        })];
+        let frames = drain_script(script).await;
+        assert!(wf_frames(&frames).is_empty());
+    }
+
     /// A killed workflow emits NO result frame — only task frames. Its container
     /// card is NOT in `open_tools` (a Workflow's tool_result lands at launch), so
     /// the turn-end drain cannot close it. Without an explicit settle the card and
@@ -6979,8 +7476,16 @@ mod pump_tests {
             finish_count, 1,
             "the Interrupted drain settles the owed Finish exactly once, got {seq:?}"
         );
+        // "Last" among TURN frames: out-of-band WorkflowProgress settles (the
+        // teardown/unknown-terminal bookkeeping added later) legitimately trail
+        // the Finish — the relay is done with the turn and the out-of-turn
+        // watcher owns them.
+        let last_turn_frame = frames
+            .iter()
+            .filter(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
+            .next_back();
         assert!(
-            matches!(frames.last(), Some(AgentStreamEvent::Finish(_))),
+            matches!(last_turn_frame, Some(AgentStreamEvent::Finish(_))),
             "the settled Finish is the turn's terminal frame, got {seq:?}"
         );
         // The Task tool call left open by the kill is closed as Canceled BEFORE the
@@ -7048,7 +7553,11 @@ mod pump_tests {
         let frames = drain_script(script).await;
         let seq: Vec<&str> = frames.iter().map(frame_name).collect();
         assert!(
-            matches!(frames.last(), Some(AgentStreamEvent::Finish(_))),
+            frames
+                .iter()
+                .filter(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
+                .next_back()
+                .is_some_and(|f| matches!(f, AgentStreamEvent::Finish(_))),
             "the clean result's Finish must flow while a background bash is alive, got {seq:?}"
         );
         assert!(

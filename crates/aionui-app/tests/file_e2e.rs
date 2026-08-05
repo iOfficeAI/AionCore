@@ -1147,3 +1147,88 @@ async fn content_write_if_match_matches_and_conflicts() {
     // File is unchanged by the rejected write.
     assert_eq!(std::fs::read_to_string(&fp).unwrap(), "v1");
 }
+
+// ===========================================================================
+// GET /api/fs/stream — raw byte range server (ChatFileRef via query)
+// ===========================================================================
+
+/// GET request with auth headers and an optional `Range`.
+fn get_with_token(uri: &str, token: &str, csrf: &str, range: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-csrf-token", csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"));
+    if let Some(r) = range {
+        builder = builder.header("range", r);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn stream_serves_full_file_with_content_type() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fp = dir.path().join("doc.pdf");
+    let bytes = b"%PDF-1.4 hello stream body";
+    std::fs::write(&fp, bytes).unwrap();
+
+    let uri = format!("/api/fs/stream?kind=local&path={}", fp.to_str().unwrap());
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(&uri, &token, &csrf, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        "application/pdf"
+    );
+    assert_eq!(
+        resp.headers().get("accept-ranges").map(|v| v.to_str().unwrap()),
+        Some("bytes")
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), bytes);
+}
+
+#[tokio::test]
+async fn stream_honors_range_returns_206_partial() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fp = dir.path().join("range.bin");
+    let bytes: &[u8] = b"0123456789";
+    std::fs::write(&fp, bytes).unwrap();
+
+    let uri = format!("/api/fs/stream?kind=local&path={}", fp.to_str().unwrap());
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(&uri, &token, &csrf, Some("bytes=0-3")))
+        .await
+        .unwrap();
+    // ServeFile answers a Range request with 206 Partial Content.
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    let content_range = resp.headers().get("content-range").unwrap().to_str().unwrap();
+    assert_eq!(content_range, "bytes 0-3/10");
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), b"0123");
+}
+
+#[tokio::test]
+async fn stream_requires_auth() {
+    let (app, _services) = build_app().await;
+    let dir = tempfile::tempdir().unwrap();
+    let fp = dir.path().join("x.pdf");
+    std::fs::write(&fp, b"x").unwrap();
+    let uri = format!("/api/fs/stream?kind=local&path={}", fp.to_str().unwrap());
+    let req = Request::builder().method("GET").uri(&uri).body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    // GET has no CSRF layer (unlike the POST endpoints, which 403 on missing
+    // CSRF); the auth middleware rejects the missing token with 401.
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

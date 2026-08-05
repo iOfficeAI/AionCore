@@ -1175,7 +1175,14 @@ impl AcpAgentManager {
         };
 
         let sid = match (session_id, opened) {
-            (None, _) => self.open_session_new().await?,
+            // Unbound + fork spec: the forked conversation's backend session
+            // has not materialized yet → session/fork against the parent sid
+            // (never session/new — that would silently drop the parent
+            // context the user forked for).
+            (None, _) => match self.params.config.fork.as_ref() {
+                Some(fork) => self.open_session_fork(fork).await?,
+                None => self.open_session_new().await?,
+            },
             (Some(sid), false) => self.open_session_resume(&sid).await?,
             (Some(sid), true) => sid,
         };
@@ -1366,6 +1373,18 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
 
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.runtime.subscribe()
+    }
+
+    fn prompt_media_caps(&self) -> crate::types::PromptMediaCaps {
+        let caps = self
+            .protocol
+            .agent_capabilities()
+            .map(|c| c.prompt_capabilities)
+            .unwrap_or_default();
+        crate::types::PromptMediaCaps {
+            image: caps.image,
+            audio: caps.audio,
+        }
     }
 
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id, msg_id = %data.msg_id))]

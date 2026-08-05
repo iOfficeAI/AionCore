@@ -2,19 +2,22 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Extension, Json, Multipart, State};
-use axum::routing::post;
+use axum::extract::{DefaultBodyLimit, Extension, Json, Multipart, Query, Request, State};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tower::ServiceExt;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::services::ServeFile;
 
 use aionui_api_types::{
     ApiResponse, ContentMetadataRequest, CopyFilesRequest, CopyFilesResponse, DirOrFileResponse,
     FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, FileWatchRequest, GetFileMetadataRequest,
     GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest, ReadContentRequest, ReadFileRequest,
     RevealItemRequest, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse,
-    SnapshotStageRequest, SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest,
-    WriteContentRequest, WriteFileRequest,
+    SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery, WorkspaceFlatFileResponse,
+    WorkspaceOfficeWatchRequest, WriteContentRequest, WriteFileRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -115,6 +118,7 @@ pub fn file_routes(state: FileRouterState) -> Router {
     Router::new()
         // A. Core file operations
         .route("/api/fs/content/metadata", post(content_metadata))
+        .route("/api/fs/stream", get(stream_file))
         .route("/api/fs/dir", post(get_files_by_dir))
         .route("/api/fs/list", post(list_workspace_files))
         .route("/api/fs/metadata", post(get_file_metadata))
@@ -397,6 +401,43 @@ async fn content_metadata(
         .map_err(ApiError::from)?;
     let meta = state.file_service.resolved_metadata(Path::new(&abs)).await?;
     Ok(Json(ApiResponse::ok(to_metadata_response(meta))))
+}
+
+/// `GET /api/fs/stream` — raw byte range server for a `ChatFileRef`-addressed
+/// file, for `<webview src>` / `<embed>` consumers (pdf) that can only GET.
+///
+/// The identity is a flattened [`StreamQuery`] in the query string (webview src
+/// has no request body). Resolves per-variant (op = Read) to a trusted absolute
+/// path, then hands the request to `tower_http`'s `ServeFile`, which supplies
+/// `Content-Type` (from the extension), `Accept-Ranges`, and full `Range` /
+/// `If-Range` handling (206 Partial Content) — including large-file byte ranges.
+async fn stream_file(
+    State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let Query(params) =
+        Query::<StreamQuery>::try_from_uri(request.uri()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let file_ref = params
+        .to_chat_file_ref()
+        .map_err(|m| ApiError::BadRequest(m.to_owned()))?;
+    let abs = state
+        .project
+        .resolve_chat_file_ref(
+            &user.id,
+            &file_ref,
+            &content_upload_root(),
+            aionui_project::FileOp::Read,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    // ServeFile owns Range/If-Range/Content-Type; the path is already
+    // containment-checked by resolve_chat_file_ref, so no re-sandbox here.
+    let response = ServeFile::new(&abs)
+        .oneshot(request)
+        .await
+        .map_err(|e| ApiError::Internal(format!("stream task failed: {e}")))?;
+    Ok(response.into_response())
 }
 
 /// Fields extracted from a `/api/fs/upload` multipart request.

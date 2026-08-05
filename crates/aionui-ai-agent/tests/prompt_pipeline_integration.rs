@@ -51,6 +51,7 @@ async fn fixture_params(
         mcp_server_ids: None,
         session_mcp_servers: vec![],
         user_id: None,
+        fork: None,
     };
 
     Arc::new(

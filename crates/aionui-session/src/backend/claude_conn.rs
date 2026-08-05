@@ -79,6 +79,22 @@ impl ClaudeConnection {
                     )
                 }
             },
+            SessionSpec::Fork {
+                session_id,
+                parent_backend_session_id,
+                ..
+            } => (
+                session_id.clone(),
+                // The wake slot's INITIAL value is the parent sid — but a wake
+                // can only fire after an idle turn, by which point `system/init`
+                // reported the fork's OWN sid and `sniff_init` updated the slot
+                // (never `--resume <parent>` twice, which would fork again).
+                // `--fork-session` makes claude mint the new id itself; pairing
+                // it with `--session-id` is unsupported (live help 2.1.221), so
+                // the new id is learned, not chosen.
+                parent_backend_session_id.clone(),
+                LegacySessionSpec::ForkFrom(parent_backend_session_id.clone()),
+            ),
         }
     }
 }
@@ -319,13 +335,14 @@ impl BackendConnection for ClaudeConnection {
         // mode AND the same provider env (#103).
         let wake = ClaudeWakeRecipe {
             spawner: self.spawner.clone(),
-            claude_session_id,
+            claude_session_id: Arc::new(std::sync::Mutex::new(claude_session_id)),
             cwd: config.cwd.clone(),
             extra_args: spawn_args,
             env: config.spawn_env.clone(),
             cli_program: config.cli_program.clone(),
         };
-        let backend = ClaudeSessionBackend::spawn(logical_id, adapter, io, config, wake).await;
+        let fresh = matches!(&spec, SessionSpec::Fresh { .. });
+        let backend = ClaudeSessionBackend::spawn(logical_id, adapter, io, config, wake, fresh).await;
         // #98/#101: ask claude for its discovery catalog (selectable models + slash
         // commands) up-front via `control_request{initialize}`. The response flows
         // back through the reader → `discovered_caps` → `capabilities()`. Best-effort:
@@ -448,6 +465,88 @@ pub struct ClaudeSessionBackend {
     /// `std::sync::Mutex` (NOT tokio) so the sync reader `process_batch` closure can
     /// lock it without awaiting — mirrors `current_mode_override`.
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// One-shot first-turn title generation (spec 2026-08-04). Shared with the
+    /// reader via `reader_state`; `dispatch(Send)` records the first prompt text.
+    title_gen: Arc<TitleGenState>,
+}
+
+/// One-shot first-turn session-title generation state (spec 2026-08-04).
+///
+/// `pending` latches true only for a `SessionSpec::Fresh` open (a brand-new
+/// conversation; a Resume — even one that rebinds a fresh claude session after
+/// a lost backend — belongs to an existing conversation and never fires). The
+/// reader swaps it false on the first successful `TurnResult` and fires a
+/// `control_request{generate_session_title, persist:true}` over the shared
+/// stdin; `sniff_session_title` turns the success control_response into
+/// `SessionEvent::SessionTitle`. Fire-and-forget: any failure is logged and
+/// dropped — title generation must never affect the turn path.
+struct TitleGenState {
+    pending: std::sync::atomic::AtomicBool,
+    /// First user prompt text of the first turn — the generation `description`.
+    /// Prompt content: never logged (see AGENTS.md logging rules).
+    description: std::sync::Mutex<Option<String>>,
+    /// The backend's shared stdin slot (same Arc as `ClaudeSessionBackend.stdin`).
+    stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
+    adapter: Arc<ClaudeAdapter>,
+    /// Shared `ctl-N` counter (same Arc as `ClaudeSessionBackend.control_seq`).
+    control_seq: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl TitleGenState {
+    /// Fire the one-shot `generate_session_title` control_request on a detached
+    /// task (the reader loop must not block on the stdin lock). The reply is
+    /// observed by `sniff_session_title`, not awaited here.
+    ///
+    /// `result_text` is the first successful turn's assistant text
+    /// (`TurnResult.result_text`), appended to the recorded first prompt.
+    /// Live-verified (claude 2.1.221, 2026-08-04): a bare short question as
+    /// the description makes the CLI's structured title generation reliably
+    /// return `{title:null}` ("什么是git ？" → null), while prompt+answer
+    /// titles reliably ("User:…/Assistant:…" → "Git 版本控制系统介绍").
+    fn fire(self: &Arc<Self>, session_id: &str, result_text: &str) {
+        use std::sync::atomic::Ordering;
+        let this = self.clone();
+        let session_id = session_id.to_string();
+        let assistant_part: String = result_text.chars().take(1000).collect();
+        tokio::spawn(async move {
+            let user_part = this
+                .description
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .unwrap_or_default();
+            let mut description = String::new();
+            if !user_part.is_empty() {
+                description.push_str("User: ");
+                description.push_str(&user_part);
+            }
+            if !assistant_part.is_empty() {
+                if !description.is_empty() {
+                    description.push_str("\n\n");
+                }
+                description.push_str("Assistant: ");
+                description.push_str(&assistant_part);
+            }
+            let request_id = format!("{TITLE_PREFIX}{}", this.control_seq.fetch_add(1, Ordering::SeqCst) + 1);
+            let frame = serde_json::json!({
+                "type": "control_request",
+                "request_id": request_id,
+                "request": {
+                    "subtype": "generate_session_title",
+                    "description": description,
+                    "persist": true,
+                },
+            });
+            let mut guard = this.stdin.lock().await;
+            let Some(stdin) = guard.as_mut() else {
+                tracing::debug!(session_id, "generate_session_title not sent: stdin unavailable");
+                return;
+            };
+            if let Err(e) = this.adapter.write_control_response(stdin, &frame).await {
+                tracing::warn!(session_id, error = %e, "generate_session_title control_request write failed");
+            }
+        });
+    }
 }
 
 /// One outstanding claude `can_use_tool` request, stored so `AnswerPermission` can
@@ -473,7 +572,13 @@ struct PendingPerm {
 /// enabled, so it is never consulted.
 struct ClaudeWakeRecipe {
     spawner: Arc<dyn Spawner>,
-    claude_session_id: String,
+    /// SHARED MUTABLE resume anchor. Open seeds it (Fresh/Resume: the id we
+    /// spawned with; Fork: the PARENT id), and `sniff_init` overwrites it with
+    /// whatever sid claude actually reports — claude can rotate the on-disk id
+    /// (`--fork-session` always does; plain runs may), and a wake that resumes
+    /// the STALE id re-forks / resurrects the parent session. The slot makes
+    /// every wake resume the session claude last said we are attached to.
+    claude_session_id: Arc<std::sync::Mutex<String>>,
     cwd: Option<String>,
     extra_args: Vec<String>,
     /// #103: the spawn env captured at open time (e.g. cc-switch provider env) so
@@ -494,6 +599,24 @@ struct ClaudeWakeRecipe {
 struct DiscoveredCaps {
     models: Vec<crate::capability::ModelInfo>,
     slash_commands: Vec<crate::capability::SlashCommandInfo>,
+}
+
+/// Session-cumulative cost ledger. claude's `result.total_cost_usd` is
+/// PROCESS-cumulative (live-captured 2.1.221: a `--resume` respawn restarts the
+/// counter at the new process's own spend), so reporting it raw makes the
+/// "session cost" fall back to one process's spend after every F-4 wake / app
+/// restart. The ledger re-baselines at each process (re)start — `base` absorbs
+/// the finished process's final counter (or, on a fresh backend, the persisted
+/// cumulative seeded via `SessionConfig.initial_cost_usd`) — and every costed
+/// `UsageDelta` is rewritten to `base + raw` before broadcast, so downstream
+/// consumers (the usage indicator, the persisted snapshot's overwrite-merge)
+/// only ever see a monotonic session-cumulative figure.
+#[derive(Debug, Default)]
+struct CostLedger {
+    /// USD the conversation had already spent BEFORE the current process run.
+    base: f64,
+    /// The current process's latest raw `total_cost_usd` report.
+    last_raw: f64,
 }
 
 /// Shared state the reader task drains into — held by the backend, cloned into
@@ -524,6 +647,16 @@ struct ClaudeReaderState {
     /// `sniff_set_config_reject` can surface a rejection as a `Notice{Warning}`
     /// (shared Arc with `ClaudeSessionBackend.pending_set_config`).
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// Session-cumulative cost ledger (see [`CostLedger`]): survives F-4 wake
+    /// respawns so a new process's restarted `total_cost_usd` counter is reported
+    /// as `base + raw`, never raw alone.
+    cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
+    /// One-shot first-turn title generation (shared Arc with the backend).
+    title_gen: Arc<TitleGenState>,
+    /// The wake recipe's SHARED resume-anchor slot (see `ClaudeWakeRecipe`): the
+    /// reader overwrites it from `system/init` so a post-fork / post-rotation
+    /// wake resumes the sid claude actually reported, never the stale spawn id.
+    wake_session_slot: Arc<std::sync::Mutex<String>>,
 }
 
 /// Spawn a claude stdout reader over `stdout`/`io` using the shared state. Used
@@ -535,6 +668,22 @@ fn start_claude_reader(
     io: Arc<dyn AgentIo>,
 ) -> tokio::task::JoinHandle<()> {
     let state = state.clone();
+    // Every reader start is a process (re)start, where claude's PROCESS-cumulative
+    // `total_cost_usd` counter restarts at zero — fold the finished process's final
+    // counter into the session base so subsequent reports stay session-cumulative.
+    // The initial spawn is a harmless no-op (last_raw is still 0).
+    {
+        let mut ledger = state.cost_ledger.lock().unwrap_or_else(|e| e.into_inner());
+        if ledger.last_raw > 0.0 {
+            ledger.base += ledger.last_raw;
+            ledger.last_raw = 0.0;
+            tracing::debug!(
+                session_id = %state.session_id,
+                cost_base_usd = ledger.base,
+                "claude cost ledger re-baselined for a process respawn"
+            );
+        }
+    }
     tokio::spawn(async move {
         reader_task(
             state.session_id,
@@ -549,6 +698,9 @@ fn start_claude_reader(
             state.turn_in_flight,
             state.current_mode_override,
             state.pending_set_config,
+            state.cost_ledger,
+            state.title_gen,
+            state.wake_session_slot,
         )
         .await;
     })
@@ -565,6 +717,7 @@ impl ClaudeSessionBackend {
         io: Box<dyn AgentIo>,
         config: SessionConfig,
         wake: ClaudeWakeRecipe,
+        fresh: bool,
     ) -> Self {
         let capabilities = {
             let mut caps = adapter.capabilities();
@@ -595,6 +748,35 @@ impl ClaudeSessionBackend {
             Some((stdin, stdout)) => (Some(stdin), Some(stdout)),
             None => (None, None),
         };
+        let stdin = Arc::new(Mutex::new(stdin));
+        let control_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Spec 2026-08-04: only a Fresh open (brand-new conversation) arms the
+        // one-shot first-turn title generation.
+        let title_gen = Arc::new(TitleGenState {
+            pending: std::sync::atomic::AtomicBool::new(fresh),
+            description: std::sync::Mutex::new(None),
+            stdin: stdin.clone(),
+            adapter: adapter.clone(),
+            control_seq: control_seq.clone(),
+        });
+
+        // Seed the cost ledger with the conversation's persisted cumulative cost
+        // (a resumed conversation on a FRESH backend instance — app restart /
+        // conversation reopen — where the in-memory ledger of the previous
+        // instance is gone). Production-diagnosable at info: one line per open,
+        // and "the indicator jumped down after a restart" hinges on this seed.
+        let initial_cost_usd = config.initial_cost_usd.unwrap_or(0.0);
+        if initial_cost_usd > 0.0 {
+            tracing::info!(
+                session_id = %session_id,
+                cost_base_usd = initial_cost_usd,
+                "claude cost ledger seeded from the persisted session cost"
+            );
+        }
+        let cost_ledger = Arc::new(std::sync::Mutex::new(CostLedger {
+            base: initial_cost_usd,
+            last_raw: 0.0,
+        }));
 
         let reader_state = ClaudeReaderState {
             session_id: session_id.clone(),
@@ -607,6 +789,9 @@ impl ClaudeSessionBackend {
             turn_in_flight: turn_in_flight.clone(),
             current_mode_override: current_mode_override.clone(),
             pending_set_config: pending_set_config.clone(),
+            cost_ledger,
+            title_gen: title_gen.clone(),
+            wake_session_slot: wake.claude_session_id.clone(),
         };
         let reader = start_claude_reader(&reader_state, stdout, io.clone());
 
@@ -645,7 +830,7 @@ impl ClaudeSessionBackend {
         Self {
             session_id,
             capabilities,
-            stdin: Arc::new(Mutex::new(stdin)),
+            stdin,
             adapter,
             turn_gen,
             event_tx,
@@ -658,10 +843,11 @@ impl ClaudeSessionBackend {
             discovered_model,
             discovered_caps,
             pending_controls: Arc::new(Mutex::new(Vec::new())),
-            control_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            control_seq,
             current_effort: Arc::new(std::sync::Mutex::new(None)),
             current_mode_override,
             pending_set_config,
+            title_gen,
         }
     }
 
@@ -672,7 +858,17 @@ impl ClaudeSessionBackend {
     /// the controller's slot. Only reached when `idle_ttl` is set AND the slot was
     /// suspended (a test backend has no spawner → never enabled).
     async fn wake_handle(&self) -> Result<ProcHandle, BackendError> {
-        let legacy_spec = LegacySessionSpec::Resume(self.wake.claude_session_id.clone());
+        // Read the SHARED slot, not an open-time snapshot: after a fork (or any
+        // claude-side id rotation) `sniff_init` updated it to the sid claude
+        // actually reported — resuming a stale id would re-fork / resurrect the
+        // parent session. A wake NEVER replays `--fork-session`.
+        let resume_sid = self
+            .wake
+            .claude_session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let legacy_spec = LegacySessionSpec::Resume(resume_sid);
         let io = self
             .adapter
             .start_turn(
@@ -1090,6 +1286,9 @@ async fn reader_task(
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
     current_mode_override: Arc<std::sync::Mutex<Option<String>>>,
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
+    title_gen: Arc<TitleGenState>,
+    wake_session_slot: Arc<std::sync::Mutex<String>>,
 ) {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
@@ -1153,7 +1352,15 @@ async fn reader_task(
                 // parse_system drops). Done on the RAW frame so parse_chunk's
                 // event stream stays zero-diff. Emits Provisioning per MCP
                 // server (parity with codex mcpServerStatus→Provisioning).
-                sniff_init(v, want_init_model, &discovered_model, &event_tx, &session_id, cur_gen);
+                sniff_init(
+                    v,
+                    want_init_model,
+                    &discovered_model,
+                    &event_tx,
+                    &session_id,
+                    cur_gen,
+                    &wake_session_slot,
+                );
                 // #98/#101: sniff the `control_request{initialize}` RESPONSE for the
                 // selectable model list + slash commands (claude's only catalog
                 // channel — the data init frame above carries neither). Fills
@@ -1208,6 +1415,9 @@ async fn reader_task(
                 // Sniff it → SessionEvent::SessionInfo (the cumulative context-budget /
                 // cost snapshot the user asked for). Done on the RAW frame.
                 sniff_session_info(v, &event_tx, &session_id, cur_gen);
+                // First-turn title generation reply (keyed ctl-title-N) →
+                // SessionEvent::SessionTitle. Done on the RAW frame.
+                sniff_session_title(v, &event_tx, &session_id, cur_gen);
                 // Subagent roster: claude emits system/task_* frames for
                 // Task/Workflow subagents (§6b b1). Translate them to
                 // SubagentUpdate so the reducer upserts Running.subagents —
@@ -1227,13 +1437,43 @@ async fn reader_task(
                 // apart at the wire. Done on the RAW frame.
                 sniff_replay_prompt_ack(v, &event_tx, &session_id, cur_gen);
             }
-            for ev in events {
+            for mut ev in events {
+                // Cost ledger: claude's `total_cost_usd` is PROCESS-cumulative, so a
+                // costed report is rewritten to the SESSION-cumulative `base + raw`
+                // (see CostLedger). `last_raw` is recorded on EVERY costed frame —
+                // even ones downstream discards (a zero-token /compact turn) — so the
+                // re-baseline at the next respawn folds in the true final counter.
+                // A frame that carried no cost stays `None`: fabricating `Some(base)`
+                // would masquerade as a fresh agent report downstream.
+                if let SessionEvent::UsageDelta {
+                    cost_usd: Some(raw), ..
+                } = &mut ev
+                {
+                    let mut ledger = cost_ledger.lock().unwrap_or_else(|e| e.into_inner());
+                    ledger.last_raw = *raw;
+                    *raw += ledger.base;
+                }
                 // F-4: a terminal clears the turn-active flag so the idle
                 // timer may suspend the now-idle process (it was held
                 // resident for the whole turn). Cleared BEFORE the broadcast
                 // so the flag is already false when subscribers react.
                 if matches!(ev, SessionEvent::TurnResult { .. }) {
                     turn_in_flight.store(false, Ordering::SeqCst);
+                    // Spec 2026-08-04: first SUCCESSFUL turn of a Fresh session
+                    // fires the one-shot generate_session_title (an error turn
+                    // keeps the latch armed for the next successful one). The
+                    // turn's assistant text is passed along — prompt+answer as
+                    // the description keeps the CLI's title generation from
+                    // returning null on short prompts (see TitleGenState::fire).
+                    if let SessionEvent::TurnResult {
+                        is_error: false,
+                        result_text,
+                        ..
+                    } = &ev
+                        && title_gen.pending.swap(false, Ordering::SeqCst)
+                    {
+                        title_gen.fire(&session_id, result_text);
+                    }
                 }
                 // Bug-A: a TurnResult is stamped with the OPEN turn's locked epoch
                 // (set at this turn's system/init), NOT the read-time turn_gen — so a
@@ -1576,6 +1816,7 @@ fn sniff_init(
     event_tx: &broadcast::Sender<SessionEnvelope>,
     session_id: &str,
     turn_gen: u64,
+    wake_session_slot: &Arc<std::sync::Mutex<String>>,
 ) {
     use serde_json::Value;
     if frame.get("type").and_then(Value::as_str) != Some("system")
@@ -1593,16 +1834,32 @@ fn sniff_init(
     // common case where claude was started with `--session-id <logical_id>`); a
     // DIFFERENT id means claude rotated/resumed under another on-disk id, which is
     // the value a later `--resume` must target.
-    if let Some(sid) = frame.get("session_id").and_then(Value::as_str)
-        && sid != session_id
-    {
-        let _ = event_tx.send(SessionEnvelope {
-            session_id: session_id.to_string(),
-            turn_gen,
-            event: SessionEvent::BackendBound {
-                backend_session_id: Some(sid.to_string()),
-            },
-        });
+    if let Some(sid) = frame.get("session_id").and_then(Value::as_str) {
+        // Keep the wake recipe's resume anchor in lock-step with claude's own
+        // report (fork rotation `--fork-session`, or any plain rotation): a wake
+        // that resumed the STALE spawn id would re-fork / resurrect the parent
+        // session. Written unconditionally-on-change, independent of the
+        // BackendBound gate below (which compares against the LOGICAL id).
+        {
+            let mut slot = wake_session_slot.lock().unwrap_or_else(|e| e.into_inner());
+            if *slot != sid {
+                tracing::debug!(
+                    session_id = %session_id,
+                    reported_sid = %sid,
+                    "claude reported a rotated session id — updating the wake resume anchor"
+                );
+                *slot = sid.to_string();
+            }
+        }
+        if sid != session_id {
+            let _ = event_tx.send(SessionEnvelope {
+                session_id: session_id.to_string(),
+                turn_gen,
+                event: SessionEvent::BackendBound {
+                    backend_session_id: Some(sid.to_string()),
+                },
+            });
+        }
     }
     if let Some(servers) = frame.get("mcp_servers").and_then(Value::as_array) {
         for s in servers {
@@ -1909,6 +2166,9 @@ fn sniff_set_config_reject(
 /// different, so we disambiguate on the id we minted).
 const QSI_USAGE_PREFIX: &str = "ctl-qsi-usage-";
 const QSI_COST_PREFIX: &str = "ctl-qsi-cost-";
+/// Request-id prefix of the one-shot `generate_session_title` control_request
+/// (spec 2026-08-04); `sniff_session_title` routes the reply by it.
+const TITLE_PREFIX: &str = "ctl-title-";
 
 /// The synthetic reasoning-effort level that mirrors the claude CLI's own interactive
 /// effort-picker entry `"ultracode (xhigh + dynamic workflow orchestration; this session
@@ -2039,6 +2299,49 @@ fn sniff_session_info(
         session_id: session_id.to_string(),
         turn_gen,
         event,
+    });
+}
+
+/// Sniff the control_response for our one-shot `generate_session_title` request
+/// (keyed by the `ctl-title-N` request_id we minted, spec 2026-08-04) →
+/// `SessionEvent::SessionTitle`. A success reply with an empty/missing title,
+/// or an error reply, is warn-logged and dropped — title generation is
+/// best-effort and never affects the turn. No-op for any other frame.
+fn sniff_session_title(
+    frame: &serde_json::Value,
+    event_tx: &broadcast::Sender<SessionEnvelope>,
+    session_id: &str,
+    turn_gen: u64,
+) {
+    use serde_json::Value;
+    if frame.get("type").and_then(Value::as_str) != Some("control_response") {
+        return;
+    }
+    let response = frame.get("response").unwrap_or(&Value::Null);
+    let request_id = response.get("request_id").and_then(Value::as_str).unwrap_or("");
+    if !request_id.starts_with(TITLE_PREFIX) {
+        return;
+    }
+    if response.get("subtype").and_then(Value::as_str) != Some("success") {
+        tracing::warn!(session_id, "generate_session_title rejected by claude");
+        return;
+    }
+    let title = response
+        .get("response")
+        .and_then(|r| r.get("title"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if title.is_empty() {
+        tracing::warn!(session_id, "generate_session_title returned no title");
+        return;
+    }
+    let _ = event_tx.send(SessionEnvelope {
+        session_id: session_id.to_string(),
+        turn_gen,
+        event: SessionEvent::SessionTitle {
+            title: title.to_string(),
+        },
     });
 }
 
@@ -2225,6 +2528,26 @@ impl SessionBackend for ClaudeSessionBackend {
                     return Err(BackendError::CommandNotSupported {
                         command: crate::capability::block_kind_name(bad),
                     });
+                }
+                // Spec 2026-08-04: while the first-turn title latch is armed,
+                // record the first prompt's text as the generation description
+                // (bounded; prompt content is never logged).
+                if self.title_gen.pending.load(Ordering::SeqCst) {
+                    let mut description = self.title_gen.description.lock().unwrap_or_else(|e| e.into_inner());
+                    if description.is_none() {
+                        let text = content
+                            .iter()
+                            .filter_map(|b| match b {
+                                super::types::ContentBlock::Text(t) => Some(t.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let bounded: String = text.chars().take(1000).collect();
+                        if !bounded.is_empty() {
+                            *description = Some(bounded);
+                        }
+                    }
                 }
                 // F-4: ensure the process is awake before any wire write. When
                 // idle_ttl=None (default) the slot is always Active → this is a
@@ -2646,13 +2969,66 @@ impl ClaudeSessionBackend {
         // recipe is never consulted — but `spawn` needs one. Use a FakeSpawner.
         let wake = ClaudeWakeRecipe {
             spawner: Arc::new(crate::testing::FakeSpawner::new()),
-            claude_session_id: session_id.clone(),
+            claude_session_id: Arc::new(std::sync::Mutex::new(session_id.clone())),
             cwd: None,
             extra_args: Vec::new(),
             env: Vec::new(),
             cli_program: None,
         };
-        Self::spawn(session_id, ClaudeAdapter::new(), io, SessionConfig::default(), wake).await
+        Self::spawn(
+            session_id,
+            ClaudeAdapter::new(),
+            io,
+            SessionConfig::default(),
+            wake,
+            false,
+        )
+        .await
+    }
+
+    /// Test-support seam: like [`build_with_io`] but with the Fresh-open one-shot
+    /// title-generation latch ARMED (`fresh: true`), for tests of the
+    /// generate_session_title fire path.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn build_with_io_fresh(session_id: impl Into<String>, io: Box<dyn AgentIo>) -> Self {
+        let session_id = session_id.into();
+        let wake = ClaudeWakeRecipe {
+            spawner: Arc::new(crate::testing::FakeSpawner::new()),
+            claude_session_id: Arc::new(std::sync::Mutex::new(session_id.clone())),
+            cwd: None,
+            extra_args: Vec::new(),
+            env: Vec::new(),
+            cli_program: None,
+        };
+        Self::spawn(
+            session_id,
+            ClaudeAdapter::new(),
+            io,
+            SessionConfig::default(),
+            wake,
+            true,
+        )
+        .await
+    }
+
+    /// Test-support seam: `build_with_io` with a caller-supplied `SessionConfig`
+    /// (e.g. `initial_cost_usd` for the cost-ledger seed tests).
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn build_with_io_config(
+        session_id: impl Into<String>,
+        io: Box<dyn AgentIo>,
+        config: SessionConfig,
+    ) -> Self {
+        let session_id = session_id.into();
+        let wake = ClaudeWakeRecipe {
+            spawner: Arc::new(crate::testing::FakeSpawner::new()),
+            claude_session_id: Arc::new(std::sync::Mutex::new(session_id.clone())),
+            cwd: None,
+            extra_args: Vec::new(),
+            env: Vec::new(),
+            cli_program: None,
+        };
+        Self::spawn(session_id, ClaudeAdapter::new(), io, config, wake, false).await
     }
 
     /// Test-support seam: build a SUSPENDABLE backend over an injected `AgentIo`,
@@ -2673,7 +3049,7 @@ impl ClaudeSessionBackend {
         // `--resume <session_id>`), so it is NOT routed through claude_session_id_for.
         let wake = ClaudeWakeRecipe {
             spawner,
-            claude_session_id: session_id.clone(),
+            claude_session_id: Arc::new(std::sync::Mutex::new(session_id.clone())),
             cwd: None,
             extra_args: Vec::new(),
             env: Vec::new(),
@@ -2683,7 +3059,7 @@ impl ClaudeSessionBackend {
             idle_ttl_ms: Some(idle_ttl_ms),
             ..Default::default()
         };
-        Self::spawn(session_id, ClaudeAdapter::new(), io, config, wake).await
+        Self::spawn(session_id, ClaudeAdapter::new(), io, config, wake, false).await
     }
 }
 
@@ -5042,6 +5418,107 @@ mod tests {
         drop(backend); // idle timer + (Dormant) controller tear down cleanly
     }
 
+    /// Await the next `UsageDelta` on the event stream and return its `cost_usd`.
+    async fn next_usage_cost(events: &mut BoxStream<'static, SessionEnvelope>) -> Option<f64> {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::UsageDelta { cost_usd, .. } = env.event {
+                    return cost_usd;
+                }
+            }
+            panic!("event stream closed before a UsageDelta arrived");
+        })
+        .await
+        .expect("timed out waiting for a UsageDelta")
+    }
+
+    /// claude's `total_cost_usd` is PROCESS-cumulative, not session-cumulative
+    /// (live-captured 2.1.221: two turns in one process report 0.250686 →
+    /// 0.278994, then a `--resume` respawn reports 0.028596 — the counter
+    /// restarts at the new process's own spend). The backend must re-baseline its
+    /// cost ledger on every process (re)start so the broadcast UsageDelta stays
+    /// SESSION-cumulative — otherwise a wake respawn makes the usage indicator
+    /// (and the persisted snapshot, which merges cost by overwrite) fall from the
+    /// real total to the last turn's own cost.
+    #[tokio::test]
+    async fn usage_cost_accumulates_across_process_respawn() {
+        let frame1 = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":2,"output_tokens":23},"total_cost_usd":0.25}"#,
+            "\n"
+        );
+        // Gate the fixture so the subscription is wired before the frame flows
+        // (broadcast does not replay to late subscribers).
+        let fake1 = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(frame1.as_bytes().to_vec());
+        let release1 = fake1.stdout_releaser();
+        let backend = ClaudeSessionBackend::build_with_io("cost-accum", Box::new(fake1)).await;
+        let mut events = backend.events();
+        release1();
+        let first = next_usage_cost(&mut events).await.expect("first turn carries a cost");
+        assert!(
+            (first - 0.25).abs() < 1e-9,
+            "process 1 reports its own cumulative cost, got {first}"
+        );
+
+        // Simulate the F-4 wake respawn: a NEW process whose counter restarts at
+        // its own spend. Drives the exact reader entry point `wake_handle` uses
+        // (start_claude_reader over the SAME shared reader_state).
+        let frame2 = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","#,
+            r#""usage":{"input_tokens":2,"output_tokens":18},"total_cost_usd":0.03}"#,
+            "\n"
+        );
+        let fake2 = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(frame2.as_bytes().to_vec());
+        let release2 = fake2.stdout_releaser();
+        let io2: Arc<dyn AgentIo> = Arc::from(Box::new(fake2) as Box<dyn AgentIo>);
+        let (_stdin2, stdout2) = io2.take_stdio().await.expect("fake stdio");
+        let _reader2 = start_claude_reader(&backend.reader_state, Some(stdout2), io2);
+        release2();
+        let second = next_usage_cost(&mut events).await.expect("second turn carries a cost");
+        assert!(
+            (second - 0.28).abs() < 1e-9,
+            "a respawned process restarts claude's counter; the ledger must report base+raw (0.25+0.03), got {second}"
+        );
+    }
+
+    /// App restart loses the in-memory ledger, so the orchestration layer seeds
+    /// `SessionConfig.initial_cost_usd` from the persisted usage snapshot. The
+    /// backend must (a) add that base to every costed report and (b) NEVER
+    /// fabricate a cost onto a frame that carried none (a fabricated
+    /// `Some(base)` would masquerade as a fresh agent report downstream).
+    #[tokio::test]
+    async fn initial_cost_seed_offsets_reports_and_is_not_fabricated() {
+        let frames = concat!(
+            // frame 1: no total_cost_usd → cost must stay None even with a base
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"a","#,
+            r#""usage":{"input_tokens":2,"output_tokens":3}}"#,
+            "\n",
+            // frame 2: the process's own cumulative cost rides on top of the seed
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"b","#,
+            r#""usage":{"input_tokens":2,"output_tokens":4},"total_cost_usd":0.1}"#,
+            "\n"
+        );
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(frames.as_bytes().to_vec());
+        let release = fake.stdout_releaser();
+        let config = SessionConfig {
+            initial_cost_usd: Some(6.0),
+            ..Default::default()
+        };
+        let backend = ClaudeSessionBackend::build_with_io_config("cost-seed", Box::new(fake), config).await;
+        let mut events = backend.events();
+        release();
+        let first = next_usage_cost(&mut events).await;
+        assert_eq!(
+            first, None,
+            "a costless frame must not have a cost fabricated from the base"
+        );
+        let second = next_usage_cost(&mut events).await.expect("costed frame");
+        assert!(
+            (second - 6.1).abs() < 1e-9,
+            "resume seed must offset the process-local counter (6.0+0.1), got {second}"
+        );
+    }
+
     /// #103: `config.spawn_env` (the cc-switch provider env the app registry fills for
     /// backend == "claude") MUST reach the spawned process's `CommandSpec.env`. Before
     /// this fix the adapter hardcoded `env: Vec::new()`, so a cc-switch third-party
@@ -5428,6 +5905,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sniff_session_title_success_maps_to_session_title_event() {
+        // Spec 2026-08-04: the generate_session_title success reply (keyed by
+        // ctl-title-N, shape from the CLI's embedded SDK contract
+        // `{response:{title}}`) → SessionEvent::SessionTitle.
+        let frame = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{TITLE_PREFIX}1","response":{{"title":"Fix login bug"}}}}}}"#
+        );
+        let bytes = format!("{frame}\n").into_bytes();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(bytes))).await;
+        let mut events = backend.events();
+
+        let mut got: Option<String> = None;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::SessionTitle { title } = env.event {
+                    got = Some(title);
+                    return;
+                }
+            }
+        })
+        .await;
+        assert_eq!(got.as_deref(), Some("Fix login bug"));
+    }
+
+    #[tokio::test]
+    async fn sniff_session_title_error_and_empty_title_emit_nothing() {
+        // An error reply or a success with an empty title must be dropped
+        // (warn-logged), never surfaced as a SessionTitle event.
+        let frames = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"error","request_id":"{TITLE_PREFIX}1","error":"nope"}}}}
+{{"type":"control_response","response":{{"subtype":"success","request_id":"{TITLE_PREFIX}2","response":{{"title":"   "}}}}}}
+"#
+        );
+        let backend =
+            ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(frames.into_bytes()))).await;
+        let mut events = backend.events();
+
+        let mut saw_title = false;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            while let Some(env) = events.next().await {
+                if matches!(env.event, SessionEvent::SessionTitle { .. }) {
+                    saw_title = true;
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(!saw_title, "error/empty title replies must not emit SessionTitle");
+    }
+
+    #[tokio::test]
+    async fn fresh_backend_fires_generate_session_title_once_after_first_success() {
+        // A Fresh-open backend fires exactly ONE generate_session_title after
+        // the first successful result; a second success must not re-fire.
+        let frames = "\
+{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"hi\"}\n\
+{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"again\"}\n";
+        let fake = FakeAgentIo::never_exits(frames.as_bytes().to_vec());
+        let captured = fake.captured_stdin();
+        let _backend = ClaudeSessionBackend::build_with_io_fresh("s-fresh", Box::new(fake)).await;
+
+        // Give the reader + detached fire task time to run.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        assert_eq!(
+            written.matches("generate_session_title").count(),
+            1,
+            "exactly one title generation request, got wire: {written:?}"
+        );
+        assert!(written.contains("\"persist\":true"), "wire: {written:?}");
+        assert!(written.contains(TITLE_PREFIX), "wire: {written:?}");
+        // The description carries the first turn's assistant text (live-verified:
+        // a bare short prompt makes the CLI's title generation return null).
+        assert!(written.contains("Assistant: hi"), "wire: {written:?}");
+    }
+
+    #[tokio::test]
+    async fn resumed_backend_never_fires_generate_session_title() {
+        // A Resume-open backend (build_with_io arms nothing) must not fire even
+        // on a successful result — the conversation already has a name.
+        let frames = "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"hi\"}\n";
+        let fake = FakeAgentIo::never_exits(frames.as_bytes().to_vec());
+        let captured = fake.captured_stdin();
+        let _backend = ClaudeSessionBackend::build_with_io("s-resume", Box::new(fake)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        assert!(
+            !written.contains("generate_session_title"),
+            "resume must not fire title generation, got wire: {written:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_result_keeps_title_latch_for_next_success() {
+        // An error first turn must NOT consume the latch; the next successful
+        // result fires the (single) title generation.
+        let frames = "\
+{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"boom\"}\n\
+{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}\n";
+        let fake = FakeAgentIo::never_exits(frames.as_bytes().to_vec());
+        let captured = fake.captured_stdin();
+        let _backend = ClaudeSessionBackend::build_with_io_fresh("s-retry", Box::new(fake)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        assert_eq!(
+            written.matches("generate_session_title").count(),
+            1,
+            "the latch survives an error turn and fires on the next success, wire: {written:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn sniff_session_info_get_context_usage_maps_to_session_info() {
         // G: claude's get_context_usage reply (keyed by ctl-qsi-usage-N) →
         // SessionInfo{context_usage:{used,max,categories}}. Shape pinned from
@@ -5767,5 +6358,91 @@ mod tests {
             .flatten();
             assert_eq!(got, Some(expected), "task_notification status={wire} → {expected:?}");
         }
+    }
+
+    /// Fork seam mapping: `SessionSpec::Fork` resumes the PARENT sid with a
+    /// ForkFrom legacy spec, and seeds the wake slot with the parent id (the
+    /// init sniffer rotates it to the fork's own sid before any wake can fire).
+    #[tokio::test]
+    async fn to_legacy_spec_fork_maps_to_fork_from_parent() {
+        let (logical, claude_id, legacy) = ClaudeConnection::to_legacy_spec(&SessionSpec::Fork {
+            session_id: "conv_fork_1".into(),
+            parent_backend_session_id: "8cd37cd6-2e88-4c8d-847a-7b237ffa9710".into(),
+            at_turn_id: None,
+        });
+        assert_eq!(logical, "conv_fork_1");
+        assert_eq!(claude_id, "8cd37cd6-2e88-4c8d-847a-7b237ffa9710");
+        assert!(
+            matches!(legacy, LegacySessionSpec::ForkFrom(ref id) if id == "8cd37cd6-2e88-4c8d-847a-7b237ffa9710"),
+            "fork resumes the parent id with --fork-session"
+        );
+    }
+
+    /// 陷阱 B regression: `system/init` reporting a DIFFERENT sid must rotate the
+    /// wake recipe's resume anchor — for a fork (claude always mints a new id)
+    /// AND for a plain resume rotation. Without the rotation, the next idle-wake
+    /// `--resume <stale>` re-forks / resurrects the parent session.
+    #[test]
+    fn sniff_init_rotates_wake_session_slot() {
+        let slot = Arc::new(std::sync::Mutex::new("parent-sid".to_string()));
+        let discovered_model = Arc::new(std::sync::Mutex::new(None));
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let frame = serde_json::json!({
+            "type": "system", "subtype": "init",
+            "session_id": "33333333-3333-4333-8333-333333333333"
+        });
+        sniff_init(&frame, false, &discovered_model, &event_tx, "conv_fork_1", 0, &slot);
+        assert_eq!(
+            slot.lock().unwrap().as_str(),
+            "33333333-3333-4333-8333-333333333333",
+            "the wake anchor follows claude's reported sid"
+        );
+        // And the rotation is still lowered as BackendBound for persistence.
+        let env = event_rx.try_recv().expect("BackendBound lowered");
+        assert!(
+            matches!(env.event, SessionEvent::BackendBound { backend_session_id: Some(ref sid) }
+                if sid == "33333333-3333-4333-8333-333333333333")
+        );
+    }
+
+    /// 陷阱 B end-to-end: after the slot rotates, a wake resumes the ROTATED sid,
+    /// not the open-time one.
+    #[tokio::test]
+    async fn wake_after_rotation_resumes_the_rotated_sid() {
+        use crate::testing::FakeSpawner;
+        let spawner = Arc::new(FakeSpawner::new());
+        let backend = ClaudeSessionBackend::build_with_io_suspending(
+            "logical-fork-wake",
+            Box::new(FakeAgentIo::never_exits(Vec::new())),
+            spawner.clone(),
+            40,
+        )
+        .await;
+        // Simulate the init sniffer's rotation (same shared Arc the reader holds).
+        *backend.wake.claude_session_id.lock().unwrap() = "44444444-4444-4444-8444-444444444444".to_string();
+
+        let suspended = backend
+            .suspend
+            .suspend_if_idle(aionui_common::now_ms() + 10_000, false)
+            .await;
+        assert!(suspended, "idle past ttl → suspended");
+        let _ = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("wake".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect_err("FakeSpawner cannot make a real process → wake Errs");
+        let spec = spawner.last_command().await.expect("a spawn was recorded");
+        let at = spec.args.iter().position(|a| a == "--resume").expect("wake resumes");
+        assert_eq!(
+            spec.args.get(at + 1).map(String::as_str),
+            Some("44444444-4444-4444-8444-444444444444"),
+            "wake resumes the ROTATED sid, never the stale open-time id"
+        );
+        assert!(
+            !spec.args.iter().any(|a| a == "--fork-session"),
+            "a wake never replays the fork"
+        );
     }
 }

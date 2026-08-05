@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-ai-agent"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "agent-client-protocol",
  "aion-agent",
@@ -366,6 +366,7 @@ dependencies = [
  "hex",
  "http 1.4.0",
  "libc",
+ "mime_guess",
  "regex",
  "rusqlite",
  "serde",
@@ -385,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-api-types"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-common",
  "serde",
@@ -394,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-app"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aion-config",
  "aionui-ai-agent",
@@ -453,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assets"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-common",
  "axum",
@@ -468,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assistant"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -494,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-auth"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -519,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-channel"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -551,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-common"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -568,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-conversation"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -599,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-cron"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -628,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-db"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-common",
  "async-trait",
@@ -644,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-extension"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -677,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-file"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -699,6 +700,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "walkdir",
@@ -707,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-mcp"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -735,12 +737,14 @@ dependencies = [
 
 [[package]]
 name = "aionui-office"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
  "aionui-common",
+ "aionui-db",
  "aionui-file",
+ "aionui-project",
  "aionui-realtime",
  "aionui-runtime",
  "async-trait",
@@ -761,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-process"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-common",
  "aionui-runtime",
@@ -781,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-project"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -806,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-realtime"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-api-types",
  "axum",
@@ -821,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-runtime"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "dirs",
  "flate2",
@@ -847,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-session"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-common",
  "aionui-process",
@@ -867,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-shell"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -899,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-system"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -929,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-team"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "agent-client-protocol",
  "aionui-ai-agent",
@@ -958,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-team-prompts"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "aionui-api-types",
  "serde",
@@ -3122,6 +3126,12 @@ dependencies = [
  "http-body 1.0.1",
  "pin-project-lite",
 ]
+
+[[package]]
+name = "http-range-header"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9171a2ea8a68358193d15dd5d70c1c10a2afc3e7e4c5bc92bc9f025cebd7359c"
 
 [[package]]
 name = "httparse"
@@ -5844,11 +5854,19 @@ checksum = "68d6fdd9f81c2819c9a8b0e0cd91660e7746a8e6ea2ba7c6b2b057985f6bcb51"
 dependencies = [
  "bitflags",
  "bytes",
+ "futures-core",
  "futures-util",
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
+ "http-range-header",
+ "httpdate",
+ "mime",
+ "mime_guess",
+ "percent-encoding",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",

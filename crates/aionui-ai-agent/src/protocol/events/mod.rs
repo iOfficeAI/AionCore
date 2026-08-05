@@ -64,6 +64,13 @@ pub enum AgentStreamEvent {
     /// under one turn). The relay consumes it internally and never forwards it
     /// to the WebSocket, so no frontend renderer is required.
     SegmentBreak,
+    /// Internal-only: the backend's OWN id for the turn that just started
+    /// (codex `turn/started` → `Turn.id`). The relay consumes it to stamp
+    /// `messages.backend_turn_id` on every row it persists for this turn — the
+    /// lookup key for `thread/fork`'s `lastTurnId` when forking mid-history.
+    /// Never forwarded to the WebSocket; never user-visible output. Only the
+    /// direct-CLI codex pump emits it.
+    BackendTurnBound(String),
     /// Internal-only: one snapshot of a running workflow's progress.
     ///
     /// NOT forwarded to the WebSocket as-is. The relay projects it into the two
@@ -168,6 +175,16 @@ pub struct WorkflowProgressData {
     /// partial list would erase the agents left out, and a reordered list would
     /// insert a second row.
     pub agents: Vec<ToolGroupEntry>,
+    /// A status-only settle for a card THIS pump never opened — the CLI reported
+    /// a task terminal after a resume/rebuild wiped the ledger (live 2026-08-04:
+    /// an idle-killed conversation's load-gate bash finished its work, and the
+    /// resumed session's `Interrupted` report found no card — the stored row
+    /// spun forever). Consumers must apply it ONLY to an EXISTING stored row
+    /// (update, never insert, never a fresh UI card): the same unknown-terminal
+    /// shape also fires for workflow-INTERNAL refs that never had a row, and
+    /// inserting for those would conjure junk cards.
+    #[serde(default)]
+    pub settle_only: bool,
 }
 
 /// Data for the internal-only [`AgentStreamEvent::AcpDialectSignal`] event.

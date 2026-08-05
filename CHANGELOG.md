@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.58](https://github.com/iOfficeAI/AionCore/compare/v0.1.57...v0.1.58) (2026-08-04)
+
+
+### Features
+
+* **conversation:** agent-driven session auto-naming (ACP session_info_update + claude generate_session_title) ([#768](https://github.com/iOfficeAI/AionCore/issues/768)) ([c551c66](https://github.com/iOfficeAI/AionCore/commit/c551c6614270ba6bf045627a1598e71bbf77d63d))
+* **conversation:** fork a conversation into a new one at a chosen message ([#772](https://github.com/iOfficeAI/AionCore/issues/772)) ([bb7c14e](https://github.com/iOfficeAI/AionCore/commit/bb7c14ef26f5af1157946841d12c5027c486cc21))
+* **fs:** add ChatFileRef content endpoints ([#757](https://github.com/iOfficeAI/AionCore/issues/757)) ([e8b6f4c](https://github.com/iOfficeAI/AionCore/commit/e8b6f4c825e04bc2c454ac75005d6f7f7642926d))
+* **fs:** pdf stream endpoint + office ChatFileRef resolve + retire fs/resolve & WS fs/read ([#762](https://github.com/iOfficeAI/AionCore/issues/762)) ([e4e991a](https://github.com/iOfficeAI/AionCore/commit/e4e991afed637346e57578a3da48b6a3c62ce960))
+
+
+### Bug Fixes
+
+* **agent:** keep the thought-level picker on a resumed conversation ([#763](https://github.com/iOfficeAI/AionCore/issues/763)) ([dcf015e](https://github.com/iOfficeAI/AionCore/commit/dcf015eda00a1a5fe3952fc7eaa1c3236a5b8e9b))
+* **runtime:** add bounded retry to managed node version probe ([#771](https://github.com/iOfficeAI/AionCore/issues/771)) ([1dee9f1](https://github.com/iOfficeAI/AionCore/commit/1dee9f1e961a529f7aae701f97ddb1deeab64655))
+* **session:** keep claude session cost cumulative across process respawns ([#767](https://github.com/iOfficeAI/AionCore/issues/767)) ([f498e9d](https://github.com/iOfficeAI/AionCore/commit/f498e9d2deb57d3491d5a107b622d24d5c8df7df))
+* **session:** settle cards through teardown and resume so no stored row spins forever ([#766](https://github.com/iOfficeAI/AionCore/issues/766)) ([3f61cc4](https://github.com/iOfficeAI/AionCore/commit/3f61cc490ec589f6602eeeb30487443cd9d1061e))
+
 ## [0.1.57](https://github.com/iOfficeAI/AionCore/compare/v0.1.56...v0.1.57) (2026-08-03)
 
 

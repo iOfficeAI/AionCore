@@ -10,9 +10,9 @@ use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery,
-    MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
-    SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationsQuery,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
+    SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -113,6 +113,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations", post(create).get(list))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/reset", post(reset))
+        .route("/api/conversations/{id}/fork", post(fork))
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
@@ -206,6 +207,17 @@ async fn reset(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     state.service.reset(&user.id, &id).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
+}
+
+async fn fork(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<ForkConversationRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let conversation = state.service.fork(&user.id, &id, req).await.map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
 }
 
 async fn associated(

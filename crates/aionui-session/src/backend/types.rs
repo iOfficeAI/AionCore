@@ -329,6 +329,20 @@ pub enum SessionSpec {
         session_id: String,
         backend_session_id: Option<String>,
     },
+    /// Open by forking an EXISTING backend session into a new one: the parent's
+    /// transport id is only the fork SOURCE, never this session's binding. The
+    /// adapter learns its own binding from the backend (codex `thread/started`,
+    /// claude `system/init`) and reports it via `BackendBound`. Used exactly
+    /// once per forked conversation — as soon as a binding is persisted, later
+    /// opens go back to `Resume`.
+    Fork {
+        session_id: String,
+        /// The parent conversation's backend session id (fork source).
+        parent_backend_session_id: String,
+        /// Backend turn to fork at (inclusive); `None` = fork at HEAD. Only
+        /// codex (`thread/fork`'s `lastTurnId`) consumes this today.
+        at_turn_id: Option<String>,
+    },
 }
 
 // ==========================================================================

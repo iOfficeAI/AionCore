@@ -839,6 +839,7 @@ mod tests {
             updated_at: 0,
             project_id: None,
             folder_id: None,
+            name_source: None,
         }
     }
 

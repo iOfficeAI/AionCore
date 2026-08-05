@@ -223,142 +223,6 @@ async fn subscribe_parent_escape_is_invalid_relative_path() {
 }
 
 #[tokio::test]
-async fn read_existing_file_returns_utf8() {
-    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
-    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
-
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(4, "fs/read", json!({"file":dir_ref(&pe, "a.txt")})),
-        )
-        .await;
-    let reply = push.last_for("1").unwrap();
-    assert_eq!(reply["result"]["content"], "hello");
-    assert_eq!(reply["result"]["encoding"], "utf-8");
-}
-
-#[tokio::test]
-async fn read_missing_file_is_resource_not_found() {
-    let (mut actor, _rx, push, pe, _dir, _db) = setup().await;
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(5, "fs/read", json!({"file":dir_ref(&pe, "missing.txt")})),
-        )
-        .await;
-    let reply = push.last_for("1").unwrap();
-    assert_eq!(reply["error"]["code"], -32002);
-    assert_eq!(reply["error"]["message"], "resource_not_found");
-    assert_eq!(reply["error"]["data"]["relative_path"], "missing.txt");
-}
-
-#[tokio::test]
-async fn read_non_utf8_falls_back_to_base64() {
-    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
-    std::fs::write(dir.path().join("bin"), [0xff, 0xfe, 0x00]).unwrap();
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(6, "fs/read", json!({"file":dir_ref(&pe, "bin")})),
-        )
-        .await;
-    let reply = push.last_for("1").unwrap();
-    assert_eq!(reply["result"]["encoding"], "base64");
-    assert!(!reply["result"]["content"].as_str().unwrap().is_empty());
-}
-
-// PATCH(ELECTRON-3SZ): tests for the temporary `fs/resolve` command. Remove
-// together with `handle_resolve` when preview no longer needs absolute paths.
-#[tokio::test]
-async fn resolve_existing_file_returns_absolute_and_workspace_root() {
-    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
-    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
-
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(40, "fs/resolve", json!({"file":dir_ref(&pe, "a.txt")})),
-        )
-        .await;
-    let reply = push.last_for("1").unwrap();
-    assert_eq!(reply["id"], 40);
-    let abs = reply["result"]["absolute_path"].as_str().unwrap();
-    let root = reply["result"]["workspace_root"].as_str().unwrap();
-    // Contract: absolute_path is the file under workspace_root. Asserted
-    // relationally (not against a hardcoded path) because the root carries the
-    // dedupe key's platform case-folding — the same folding fs/read uses.
-    assert!(!root.is_empty());
-    assert_eq!(
-        abs,
-        format!("{root}/a.txt"),
-        "absolute_path must be workspace_root + rel"
-    );
-    // The path is the same `absolute` PathBuf fs/read reads from, so it must open
-    // here too — proves resolve hands back a usable filesystem path.
-    assert_eq!(std::fs::read(abs).unwrap(), b"x");
-}
-
-#[tokio::test]
-async fn resolve_unknown_pe_is_out_of_scope() {
-    let (mut actor, _rx, push, _pe, _dir, _db) = setup().await;
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(41, "fs/resolve", json!({"file":dir_ref("pe-nope", "a.txt")})),
-        )
-        .await;
-    let reply = push.last_for("1").unwrap();
-    assert_eq!(reply["error"]["code"], -32000);
-    assert_eq!(reply["error"]["message"], "out_of_scope");
-    assert_eq!(reply["error"]["data"]["pe_id"], "pe-nope");
-}
-
-#[tokio::test]
-async fn resolve_parent_escape_is_invalid_relative_path() {
-    let (mut actor, _rx, push, pe, _dir, _db) = setup().await;
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(42, "fs/resolve", json!({"file":dir_ref(&pe, "../escape")})),
-        )
-        .await;
-    let reply = push.last_for("1").unwrap();
-    assert_eq!(reply["error"]["code"], -32004);
-    assert_eq!(reply["error"]["message"], "invalid_relative_path");
-}
-
-/// PATCH(ELECTRON-3SZ): resolve must run the same realpath containment guard as
-/// the other file commands — a symlink escaping the folder root is rejected
-/// before any path is handed back. Unix-only (symlink creation needs privilege
-/// on Windows); the `realpath_within` logic itself is platform-agnostic.
-#[cfg(unix)]
-#[tokio::test]
-async fn resolve_symlink_escape_is_resource_outside_folder() {
-    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
-    let outside = tempfile::tempdir().unwrap();
-    std::fs::write(outside.path().join("secret.txt"), b"top secret").unwrap();
-    std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
-
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(44, "fs/resolve", json!({"file":dir_ref(&pe, "link/secret.txt")})),
-        )
-        .await;
-    let reply = push.last_for("1").unwrap();
-    assert_eq!(reply["error"]["code"], -32003);
-    assert_eq!(reply["error"]["message"], "resource_outside_folder");
-}
-
-#[tokio::test]
 async fn mkdir_then_remove_roundtrip() {
     let (mut actor, _rx, push, pe, dir, _db) = setup().await;
     actor
@@ -482,6 +346,7 @@ async fn unsubscribe_is_notification_no_reply() {
 /// IO. Unix-only — creating a symlink on Windows needs elevated privilege; the
 /// `realpath_within` logic itself is platform-agnostic (walks the deepest
 /// existing ancestor), exercised on unix here and noted in the test report.
+/// Driven through `fs/mkdir` — any resolve-guarded command shares the guard.
 #[cfg(unix)]
 #[tokio::test]
 async fn command_symlink_escape_is_resource_outside_folder() {
@@ -495,7 +360,7 @@ async fn command_symlink_escape_is_resource_outside_folder() {
         .dispatch_frame(
             "1",
             "system_default_user",
-            request(20, "fs/read", json!({"file":dir_ref(&pe, "link/secret.txt")})),
+            request(20, "fs/mkdir", json!({"dir":dir_ref(&pe, "link/secret.txt")})),
         )
         .await;
     let reply = push.last_for("1").unwrap();

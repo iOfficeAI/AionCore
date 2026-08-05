@@ -408,6 +408,9 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // SessionInfo is a read-only query reply (context budget / cost) — never a
         // turn signal. The conversation projects it; FSM no-op.
         | SessionEvent::SessionInfo { .. }
+        // SessionTitle is an agent-generated conversation title — applied by the
+        // conversation layer under the name_source guard. Never a turn signal.
+        | SessionEvent::SessionTitle { .. }
         // 009 R6b: SubagentDetail is the rich BACKGROUND-plane roster fill — read
         // ONLY by the orchestrator's workflow_roster, never by the FSM. No-op here.
         | SessionEvent::SubagentDetail { .. }
@@ -418,6 +421,9 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // (persist backend_session_id). The reducer NEVER touches SessionState for
         // it — it is not a turn signal, not a requires-action, not a roster update.
         | SessionEvent::BackendBound { .. }
+        // BackendTurnBound is BackendBound's turn-scoped sibling (fork anchor
+        // pass-through for message stamping). Same contract: reducer no-op.
+        | SessionEvent::BackendTurnBound { .. }
         // 009 R6: BackendSuspended is FSM-invisible (the wake re-spawns on the
         // same event_tx). The orchestrator clears the roster on it; the reducer
         // does NOT move SessionState (suspend ≠ a turn boundary).

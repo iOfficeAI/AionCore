@@ -324,6 +324,7 @@ impl JobExecutor {
             status: Some("finish".into()),
             hidden: false,
             created_at: aionui_common::now_ms(),
+            backend_turn_id: None,
         };
 
         let user_id = self.resolve_target_conversation_user_id(conversation_id).await?;
@@ -2976,6 +2977,7 @@ mod tests {
                 updated_at: 0,
                 project_id: None,
                 folder_id: None,
+                name_source: None,
             }))
         }
 
@@ -3129,6 +3131,7 @@ mod tests {
                     updated_at: 0,
                     project_id: None,
                     folder_id: None,
+                    name_source: None,
                 },
                 updates: Mutex::new(Vec::new()),
                 inserted_messages: Mutex::new(Vec::new()),
