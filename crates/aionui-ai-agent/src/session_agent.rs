@@ -2838,6 +2838,9 @@ fn spawn_event_pump(
                     ) {
                         let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
                     }
+                    // Calls deliberately left running past this turn end (see below);
+                    // re-registered after the drain so their late frames still resolve.
+                    let mut kept_open: Vec<(String, String)> = Vec::new();
                     for (call_id, name) in open_tools.drain() {
                         // codex's unified exec starts the command in a background PTY
                         // and lets the model END ITS TURN while the process runs; the
@@ -2855,6 +2858,7 @@ fn spawn_event_pump(
                                 tool = %name,
                                 "session-pump: leaving detached exec tool call open past turn end"
                             );
+                            kept_open.push((call_id, name));
                             continue;
                         }
                         tracing::info!(
@@ -2872,6 +2876,9 @@ fn spawn_event_pump(
                             output: None,
                             description: None,
                         }));
+                    }
+                    for (call_id, name) in kept_open {
+                        open_tools.insert(call_id, name);
                     }
                     // A terminal TurnResult decided this turn; a later Detached is then
                     // an absorbed teardown, not a mid-turn crash (see `crash_outcome`).
@@ -2898,9 +2905,12 @@ fn spawn_event_pump(
                     }
                     // Live tool-output accumulators are per-turn; the authoritative
                     // full output already rode each ToolResult. Drop them so a long
-                    // session doesn't retain every turn's stdout.
-                    tool_output.clear();
-                    tool_name.clear();
+                    // session doesn't retain every turn's stdout — EXCEPT for calls
+                    // still open past this turn end (detached exec): their terminal
+                    // arrives minutes later and `stamp_tool_name` must still find the
+                    // name, or the card re-renders nameless.
+                    tool_output.retain(|call_id, _| open_tools.contains_key(call_id));
+                    tool_name.retain(|call_id, _| open_tools.contains_key(call_id));
                     // Reset the per-turn visibility flag for the next turn.
                     saw_visible_output = false;
                 }
@@ -6181,6 +6191,135 @@ mod pump_tests {
         };
         assert_eq!(data, b"catbytes");
         assert_eq!(media_type, "image/png");
+    }
+
+    /// A codex detached exec (`source: unifiedExecStartup`) is still RUNNING when
+    /// the model ends its prompt turn; the pump must not paint it Canceled — the
+    /// command's own completion settles it later. A foreground tool left open at
+    /// the same clean turn end must still be cancelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_turn_end_keeps_detached_exec_card_but_cancels_others() {
+        use aionui_session::TurnOutcome;
+        let detached = SessionEvent::ToolCall {
+            tool_use_id: "call-detached".into(),
+            name: "commandExecution".into(),
+            subagent: aionui_session::SubagentKind::Inline,
+            input: serde_json::json!({
+                "type": "commandExecution",
+                "command": "/bin/zsh -lc 'bun run build'",
+                "status": "inProgress",
+                "source": "unifiedExecStartup"
+            }),
+            parent_tool_use_id: None,
+        };
+        let foreground = SessionEvent::ToolCall {
+            tool_use_id: "call-plain".into(),
+            name: "fileChange".into(),
+            subagent: aionui_session::SubagentKind::Inline,
+            input: serde_json::json!({ "type": "fileChange" }),
+            parent_tool_use_id: None,
+        };
+        let clean_end = SessionEvent::TurnResult {
+            is_error: false,
+            api_error_status: None,
+            result_text: String::new(),
+            epoch: 0,
+            outcome: TurnOutcome::Completed {
+                stop_reason: aionui_session::StopReason::EndTurn,
+            },
+        };
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(ScriptBackend(vec![env(detached), env(foreground), env(clean_end)]));
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        let _ = task;
+
+        let mut canceled: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(AgentStreamEvent::ToolCall(data))) if data.status == ToolCallStatus::Canceled => {
+                    canceled.push(data.call_id);
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(
+            !canceled.iter().any(|id| id == "call-detached"),
+            "detached exec card must survive a clean turn end, got cancels: {canceled:?}"
+        );
+        assert!(
+            canceled.iter().any(|id| id == "call-plain"),
+            "a non-detached tool left open must still be cancelled, got: {canceled:?}"
+        );
+    }
+
+    /// The detached exec's terminal lands MINUTES after the turn ended. The
+    /// per-turn name map must keep the entry for calls left open, or the late
+    /// frame goes out nameless and the card re-renders with a blank title.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_terminal_of_a_kept_open_exec_still_carries_the_tool_name() {
+        use aionui_session::TurnOutcome;
+        let detached = SessionEvent::ToolCall {
+            tool_use_id: "call-detached".into(),
+            name: "commandExecution".into(),
+            subagent: aionui_session::SubagentKind::Inline,
+            input: serde_json::json!({ "type": "commandExecution", "source": "unifiedExecStartup" }),
+            parent_tool_use_id: None,
+        };
+        let clean_end = SessionEvent::TurnResult {
+            is_error: false,
+            api_error_status: None,
+            result_text: String::new(),
+            epoch: 0,
+            outcome: TurnOutcome::Completed {
+                stop_reason: aionui_session::StopReason::EndTurn,
+            },
+        };
+        let late_result = SessionEvent::ToolResult {
+            tool_use_id: "call-detached".into(),
+            is_error: false,
+            content: vec![],
+            parent_tool_use_id: None,
+        };
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(ScriptBackend(vec![env(detached), env(clean_end), env(late_result)]));
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        let _ = task;
+
+        let mut terminal_names: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(AgentStreamEvent::ToolCall(data)))
+                    if data.call_id == "call-detached" && data.status == ToolCallStatus::Completed =>
+                {
+                    terminal_names.push(data.name.clone());
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(
+            terminal_names.iter().any(|n| n == "commandExecution"),
+            "late terminal must keep the tool name, got: {terminal_names:?}"
+        );
     }
 
     fn env(event: SessionEvent) -> SessionEnvelope {
