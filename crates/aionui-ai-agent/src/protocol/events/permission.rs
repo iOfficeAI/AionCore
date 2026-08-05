@@ -100,6 +100,7 @@ impl AcpPermissionRequestData {
                 AcpToolCallKind::Edit => "edit".to_owned(),
                 AcpToolCallKind::Execute => "execute".to_owned(),
             }),
+            questions: None,
             options: self
                 .options
                 .iter()

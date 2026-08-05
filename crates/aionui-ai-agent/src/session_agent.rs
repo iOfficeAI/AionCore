@@ -562,6 +562,10 @@ impl SessionAgentTask {
                     action: None,
                     description: String::new(),
                     command_type: None,
+                    // The full question payload rides along so the frontend
+                    // recovery rebuilds the REAL question card; the flattened
+                    // options above stay as the fallback for older frontends.
+                    questions: if is_ask { p.questions.clone() } else { None },
                     options: options
                         .into_iter()
                         .map(|o| aionui_common::ConfirmationOption {
