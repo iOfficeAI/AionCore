@@ -6,6 +6,7 @@ mod health;
 mod item_revealer;
 mod routes;
 mod runtime_team_tools;
+mod scm_monitor;
 mod state;
 mod system_file_opener;
 mod team_conversation_adapters;

@@ -44,6 +44,7 @@ use crate::services::AppServices;
 use super::fs_monitor::spawn_fs_monitor;
 use super::health::health_check;
 use super::runtime_team_tools::{RuntimeTeamToolsState, runtime_team_tools_routes};
+use super::scm_monitor::{CompositeMessageRouter, spawn_scm_monitor};
 use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
 use super::trace::with_access_log;
 
@@ -144,7 +145,14 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     // router (fs/* frames). Built here — inside the runtime — because the actor
     // runs as a background task. The sync test-only assembly path keeps a no-op.
     let fs_router = spawn_fs_monitor(Arc::new(services.project_service.clone()), services.ws_manager.clone());
-    let ws_state = build_ws_state(services, fs_router);
+    // Source control shares the connection but owns its own envelope name, so the
+    // two inbound routers are composed behind the realtime layer's single slot.
+    let scm_router = spawn_scm_monitor(Arc::new(services.project_service.clone()), services.ws_manager.clone());
+    let inbound_router: Arc<dyn aionui_realtime::MessageRouter> = match scm_router {
+        Some(scm) => Arc::new(CompositeMessageRouter::new(vec![fs_router, scm])),
+        None => fs_router,
+    };
+    let ws_state = build_ws_state(services, inbound_router);
     let router = create_router_with_all_state(services, states, ws_state);
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
