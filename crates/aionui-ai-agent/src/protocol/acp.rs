@@ -177,10 +177,11 @@ impl AcpProtocol {
         permission_tx: mpsc::Sender<PermissionRequest>,
         notification_tx: mpsc::Sender<SessionNotification>,
         terminal_label: &str,
+        terminal_cwd: Option<std::path::PathBuf>,
     ) -> Result<Self, AcpError> {
         let alive = Arc::new(AtomicBool::new(true));
         let replay_suppression = Arc::new(AtomicBool::new(false));
-        let terminal_registry = Arc::new(crate::terminal::TerminalRegistry::new(terminal_label));
+        let terminal_registry = Arc::new(crate::terminal::TerminalRegistry::new(terminal_label, terminal_cwd));
         let started_at = std::time::Instant::now();
         log_acp_initialize_start();
 

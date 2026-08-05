@@ -203,6 +203,7 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
         permission_tx,
         notification_tx,
         "custom-agent-probe",
+        None,
     );
     let protocol = tokio::select! {
         biased;

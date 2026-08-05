@@ -38,10 +38,12 @@ pub struct TerminalOutputSnapshot {
 }
 
 struct TerminalEntry {
-    /// Held for kill; `None` after the reaper task consumed it on exit.
+    /// Held for kill; `None` once reaped (by the poller or by a kill).
     child: Arc<Mutex<Option<Child>>>,
     buffer: Arc<Mutex<OutputBuffer>>,
     exit_rx: watch::Receiver<Option<TerminalExit>>,
+    /// Kills publish the exit themselves — the reaper may be gone by then.
+    exit_tx: watch::Sender<Option<TerminalExit>>,
     command_line: String,
 }
 
@@ -66,19 +68,31 @@ impl OutputBuffer {
     }
 }
 
+/// Terminal ids are minted from a PROCESS-global counter, not a per-registry
+/// one: an agent restart builds a fresh registry, and a per-registry counter
+/// would hand out `aionui-term-1` again — colliding with the card the
+/// frontend still has on screen for the same conversation (cards are keyed by
+/// terminal id).
+static NEXT_TERMINAL_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// All live terminals of ONE agent connection. Dropped/`kill_all`-ed with it.
 #[derive(Default)]
 pub struct TerminalRegistry {
     entries: Mutex<HashMap<String, TerminalEntry>>,
-    next_id: AtomicU64,
     /// Log correlation label (the owning conversation id; empty for probes).
     label: String,
+    /// Fallback working directory when the agent sends no `cwd` — the
+    /// conversation's workspace. Without it a command would inherit the
+    /// aioncore process's cwd (the app bundle), which is never what the
+    /// agent means.
+    default_cwd: Option<std::path::PathBuf>,
 }
 
 impl TerminalRegistry {
-    pub fn new(label: impl Into<String>) -> Self {
+    pub fn new(label: impl Into<String>, default_cwd: Option<std::path::PathBuf>) -> Self {
         Self {
             label: label.into(),
+            default_cwd,
             ..Self::default()
         }
     }
@@ -129,12 +143,12 @@ impl TerminalRegistry {
         for (k, v) in &params.env {
             builder.env(k, v);
         }
-        if let Some(cwd) = &params.cwd {
+        if let Some(cwd) = params.cwd.as_ref().or(self.default_cwd.as_ref()) {
             builder.current_dir(cwd);
         }
         let mut child = builder.spawn().map_err(|e| format!("spawn failed: {e}"))?;
 
-        let id = format!("aionui-term-{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
+        let id = format!("aionui-term-{}", NEXT_TERMINAL_SEQ.fetch_add(1, Ordering::Relaxed) + 1);
         let command_line = std::iter::once(params.command.as_str())
             .chain(params.args.iter().map(String::as_str))
             .collect::<Vec<_>>()
@@ -158,11 +172,10 @@ impl TerminalRegistry {
         let stderr = child.stderr.take();
         let child = Arc::new(Mutex::new(Some(child)));
 
-        // Reader + reaper task: drain both streams into the ring buffer,
-        // then reap the child and publish the exit status.
+        // Reader task: drain both streams into the ring buffer. It may OUTLIVE
+        // the command — a backgrounded grandchild inherits the pipes and holds
+        // them open — so exit detection must not depend on it.
         let task_buffer = Arc::clone(&buffer);
-        let task_child = Arc::clone(&child);
-        let task_id = id.clone();
         tokio::spawn(async move {
             let mut out = stdout;
             let mut err = stderr;
@@ -186,38 +199,54 @@ impl TerminalRegistry {
                     }
                 }
             }
-            // Streams closed — reap. Take the child out so kill() after exit
-            // is a no-op.
-            let taken = task_child.lock().await.take();
-            let exit = match taken {
-                Some(mut c) => match c.wait().await {
-                    Ok(status) => {
-                        #[cfg(unix)]
-                        let signaled = {
-                            use std::os::unix::process::ExitStatusExt as _;
-                            status.signal().is_some()
-                        };
-                        #[cfg(not(unix))]
-                        let signaled = false;
-                        TerminalExit {
-                            exit_code: status.code().map(|c| c as u32),
-                            signaled,
-                        }
+        });
+
+        // Reaper: poll the DIRECT child. `sh -c 'sleep 30 &'` exits instantly
+        // while its backgrounded child keeps the stdout pipe open, so waiting
+        // on stream EOF would hang the terminal forever (live-reproduced).
+        // try_wait is polled rather than awaiting `wait()` under the lock so a
+        // concurrent kill can always take the mutex.
+        let reap_child = Arc::clone(&child);
+        let reap_tx = exit_tx.clone();
+        let reap_id = id.clone();
+        tokio::spawn(async move {
+            loop {
+                {
+                    let mut guard = reap_child.lock().await;
+                    match guard.as_mut() {
+                        Some(c) => match c.try_wait() {
+                            Ok(Some(status)) => {
+                                *guard = None;
+                                #[cfg(unix)]
+                                let signaled = {
+                                    use std::os::unix::process::ExitStatusExt as _;
+                                    status.signal().is_some()
+                                };
+                                #[cfg(not(unix))]
+                                let signaled = false;
+                                let _ = reap_tx.send(Some(TerminalExit {
+                                    exit_code: status.code().map(|c| c as u32),
+                                    signaled,
+                                }));
+                                return;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                warn!(terminal_id = %reap_id, error = %e, "terminal wait failed");
+                                *guard = None;
+                                let _ = reap_tx.send(Some(TerminalExit {
+                                    exit_code: None,
+                                    signaled: false,
+                                }));
+                                return;
+                            }
+                        },
+                        // A kill (or release) already reaped and published.
+                        None => return,
                     }
-                    Err(e) => {
-                        warn!(terminal_id = %task_id, error = %e, "terminal wait failed");
-                        TerminalExit {
-                            exit_code: None,
-                            signaled: false,
-                        }
-                    }
-                },
-                None => TerminalExit {
-                    exit_code: None,
-                    signaled: true,
-                },
-            };
-            let _ = exit_tx.send(Some(exit));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         });
 
         self.entries.lock().await.insert(
@@ -226,6 +255,7 @@ impl TerminalRegistry {
                 child,
                 buffer,
                 exit_rx,
+                exit_tx,
                 command_line,
             },
         );
@@ -273,17 +303,25 @@ impl TerminalRegistry {
     /// stop button). The terminal stays registered so output/exit status
     /// remain queryable until `release`.
     pub async fn kill(&self, terminal_id: &str, source: &str) -> bool {
-        let child = {
+        let Some((child, exit_tx)) = ({
             let entries = self.entries.lock().await;
-            match entries.get(terminal_id) {
-                Some(e) => Arc::clone(&e.child),
-                None => return false,
-            }
+            entries
+                .get(terminal_id)
+                .map(|e| (Arc::clone(&e.child), e.exit_tx.clone()))
+        }) else {
+            return false;
         };
         let mut guard = child.lock().await;
         if let Some(c) = guard.as_mut() {
             info!(terminal_id, source, "client terminal killed");
+            // kill_process_tree reaps the child itself, so publish the signal
+            // exit here — the reaper sees `None` and stops without a status.
             let _ = aionui_runtime::kill_process_tree(c).await;
+            *guard = None;
+            let _ = exit_tx.send(Some(TerminalExit {
+                exit_code: None,
+                signaled: true,
+            }));
         }
         true
     }
@@ -297,6 +335,11 @@ impl TerminalRegistry {
                 let mut guard = entry.child.lock().await;
                 if let Some(c) = guard.as_mut() {
                     let _ = aionui_runtime::kill_process_tree(c).await;
+                    *guard = None;
+                    let _ = entry.exit_tx.send(Some(TerminalExit {
+                        exit_code: None,
+                        signaled: true,
+                    }));
                 }
                 true
             }
@@ -337,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_runs_command_and_reports_output_and_exit() {
-        let reg = TerminalRegistry::new("conv-t");
+        let reg = TerminalRegistry::new("conv-t", None);
         let id = reg.create(params("echo", &["hello_term"])).await.unwrap();
         let exit = reg.wait_for_exit(&id).await.unwrap();
         assert_eq!(exit.exit_code, Some(0));
@@ -350,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_byte_limit_truncates_from_front() {
-        let reg = TerminalRegistry::new("conv-t");
+        let reg = TerminalRegistry::new("conv-t", None);
         let mut p = params("sh", &["-c", "printf 'AAAA'; printf 'BBBB'"]);
         p.output_byte_limit = Some(4);
         let id = reg.create(p).await.unwrap();
@@ -362,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_terminates_long_command_with_signal() {
-        let reg = TerminalRegistry::new("conv-t");
+        let reg = TerminalRegistry::new("conv-t", None);
         let id = reg.create(params("sleep", &["30"])).await.unwrap();
         assert!(reg.kill(&id, "test").await);
         let exit = reg.wait_for_exit(&id).await.unwrap();
@@ -375,7 +418,7 @@ mod tests {
 
     #[tokio::test]
     async fn release_is_idempotent_and_kill_all_clears() {
-        let reg = TerminalRegistry::new("conv-t");
+        let reg = TerminalRegistry::new("conv-t", None);
         let id1 = reg.create(params("sleep", &["30"])).await.unwrap();
         let _id2 = reg.create(params("sleep", &["30"])).await.unwrap();
         assert!(reg.release(&id1).await);
@@ -386,7 +429,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_terminal_id_is_none_or_false() {
-        let reg = TerminalRegistry::new("conv-t");
+        let reg = TerminalRegistry::new("conv-t", None);
         assert!(reg.output("nope").await.is_none());
         assert!(reg.wait_for_exit("nope").await.is_none());
         assert!(!reg.kill("nope", "test").await);
@@ -395,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn bare_compound_command_runs_through_shell() {
-        let reg = TerminalRegistry::new("conv-t");
+        let reg = TerminalRegistry::new("conv-t", None);
         let mut p = params("true && echo shell_interpreted", &[]);
         p.args = vec![];
         let id = reg.create(p).await.unwrap();
@@ -403,5 +446,54 @@ mod tests {
         assert_eq!(exit.exit_code, Some(0));
         let snap = reg.output(&id).await.unwrap();
         assert!(snap.output.contains("shell_interpreted"), "got: {}", snap.output);
+    }
+
+    #[tokio::test]
+    async fn background_child_holding_stdout_does_not_hang_exit() {
+        // B6: `sh -c 'sleep 30 &'` — the parent exits immediately but the
+        // backgrounded child inherits the stdout pipe, so the read side never
+        // sees EOF. Waiting on stream close alone would hang forever.
+        let reg = TerminalRegistry::new("conv-t", None);
+        let id = reg
+            .create(params("sh", &["-c", "sleep 30 & echo parent_done"]))
+            .await
+            .unwrap();
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), reg.wait_for_exit(&id))
+            .await
+            .expect("exit must be reported once the direct child exits, not when the pipe closes")
+            .unwrap();
+        assert_eq!(exit.exit_code, Some(0));
+        let snap = reg.output(&id).await.unwrap();
+        assert!(snap.output.contains("parent_done"), "got: {}", snap.output);
+    }
+
+    #[tokio::test]
+    async fn default_cwd_applies_when_agent_sends_none() {
+        let dir = std::env::temp_dir().join("aionui-term-cwd-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = TerminalRegistry::new("conv-t", Some(dir.clone()));
+        let id = reg.create(params("pwd", &[])).await.unwrap();
+        reg.wait_for_exit(&id).await.unwrap();
+        let snap = reg.output(&id).await.unwrap();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        assert!(
+            snap.output
+                .trim()
+                .ends_with(canonical.file_name().unwrap().to_str().unwrap()),
+            "expected cwd {} in output: {}",
+            canonical.display(),
+            snap.output
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_ids_are_unique_across_registries() {
+        // A rebuilt agent gets a fresh registry; ids must not restart at 1 or
+        // the frontend's terminal-id-keyed card collides with a stale one.
+        let a = TerminalRegistry::new("conv-a", None);
+        let b = TerminalRegistry::new("conv-b", None);
+        let id_a = a.create(params("true", &[])).await.unwrap();
+        let id_b = b.create(params("true", &[])).await.unwrap();
+        assert_ne!(id_a, id_b);
     }
 }
