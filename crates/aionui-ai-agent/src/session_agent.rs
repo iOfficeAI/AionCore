@@ -2839,6 +2839,24 @@ fn spawn_event_pump(
                         let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
                     }
                     for (call_id, name) in open_tools.drain() {
+                        // codex's unified exec starts the command in a background PTY
+                        // and lets the model END ITS TURN while the process runs; the
+                        // completion item arrives later (verified live 0.145.0: every
+                        // commandExecution item carries `source: "unifiedExecStartup"`).
+                        // Cancelling such a card on a CLEAN turn end is a lie — the
+                        // command is still running and its own terminal will settle the
+                        // card — and it is exactly what users read as "the AI stopped by
+                        // itself". Same rule as background-task cards above: keep them on
+                        // a clean end, take them down on cancel/error/crash.
+                        if keep_background && is_detached_exec_call(tool_args.get(&call_id)) {
+                            tracing::info!(
+                                conv_id = %conversation_id,
+                                %call_id,
+                                tool = %name,
+                                "session-pump: leaving detached exec tool call open past turn end"
+                            );
+                            continue;
+                        }
                         tracing::info!(
                             conv_id = %conversation_id,
                             %call_id,
@@ -3630,6 +3648,21 @@ fn update_workflow_cards(
 /// long ago. Without this a killed or crashed workflow leaves its container card
 /// and every agent row spinning forever, and `hasRunningToolMessages` keeps the
 /// conversation's running indicator lit with nothing left to clear it.
+/// Does this tool call's recorded arguments identify a codex command that runs
+/// DETACHED from the prompt turn?
+///
+/// codex's `unified_exec` starts the process in a PTY with a background exit
+/// watcher, so the model may finish its turn long before the command's own
+/// completion item arrives. The item carries that provenance verbatim in
+/// `source: "unifiedExecStartup"` (a codex wire field passed through by
+/// `codex_conn`, live-captured 0.145.0); `unifiedExecInteraction` is the
+/// follow-up interaction shape of the same family.
+fn is_detached_exec_call(args: Option<&serde_json::Value>) -> bool {
+    args.and_then(|v| v.get("source"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| s.starts_with("unifiedExec"))
+}
+
 fn settle_workflow_cards(
     cards: &mut std::collections::HashMap<String, crate::workflow_progress::WorkflowCard>,
     status: crate::workflow_progress::CardStatus,
@@ -8843,5 +8876,28 @@ mod catalog_writeback_tests {
             nested_len(msg.handshake.available_modes.as_ref(), "available_modes") > 0,
             "expected the modes-only partial to be published"
         );
+    }
+
+    #[test]
+    fn detached_exec_calls_are_recognised_by_codex_item_source() {
+        use serde_json::json;
+        // Live-captured shape (codex 0.145.0): every commandExecution item the
+        // model launches carries `source: "unifiedExecStartup"`.
+        let startup = json!({
+            "type": "commandExecution",
+            "command": "/bin/zsh -lc 'bun run build'",
+            "status": "inProgress",
+            "source": "unifiedExecStartup"
+        });
+        assert!(super::is_detached_exec_call(Some(&startup)));
+        let interaction = json!({ "type": "commandExecution", "source": "unifiedExecInteraction" });
+        assert!(super::is_detached_exec_call(Some(&interaction)));
+
+        // Foreground/other sources and non-codex tools must still be cancelled
+        // at turn end (an orphaned card would otherwise spin forever).
+        assert!(!super::is_detached_exec_call(Some(&json!({ "source": "agent" }))));
+        assert!(!super::is_detached_exec_call(Some(&json!({ "source": "userShell" }))));
+        assert!(!super::is_detached_exec_call(Some(&json!({ "command": "ls" }))));
+        assert!(!super::is_detached_exec_call(None));
     }
 }
