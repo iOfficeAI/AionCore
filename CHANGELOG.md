@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.59](https://github.com/iOfficeAI/AionCore/compare/v0.1.58...v0.1.59) (2026-08-05)
+
+
+### Features
+
+* **agent:** multimodal prompt — native image/audio content blocks gated by promptCapabilities ([#774](https://github.com/iOfficeAI/AionCore/issues/774)) ([5a78a0b](https://github.com/iOfficeAI/AionCore/commit/5a78a0b2722edcce9f979d3f06c4461577f9e574))
+* **team:** add read-only mailbox/task activity API and real-time events ([#740](https://github.com/iOfficeAI/AionCore/issues/740)) ([f86c053](https://github.com/iOfficeAI/AionCore/commit/f86c053eded3e04f5139dadeb3bdb9bae94c9c3b))
+
 ## [0.1.58](https://github.com/iOfficeAI/AionCore/compare/v0.1.57...v0.1.58) (2026-08-04)
 
 
