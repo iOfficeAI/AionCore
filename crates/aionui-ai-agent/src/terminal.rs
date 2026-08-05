@@ -97,9 +97,32 @@ pub struct CreateTerminalParams {
 impl TerminalRegistry {
     /// Spawn the command and register a terminal for it.
     pub async fn create(&self, params: CreateTerminalParams) -> Result<String, String> {
-        let mut builder = aionui_runtime::Builder::new(&params.command);
+        // Agents disagree on the `command` contract: grok wraps itself in
+        // `/bin/bash -lc '<line>'` (command + args), while codebuddy sends the
+        // whole compound line — `sleep 2 && echo hi` — as a bare `command`
+        // with no args, expecting shell interpretation (live-captured
+        // 2026-08-05: direct exec ENOENTs on the compound string). Rule:
+        // explicit args → exec verbatim; no args → run the line through the
+        // platform shell.
+        let mut builder = if params.args.is_empty() {
+            #[cfg(unix)]
+            {
+                let mut b = aionui_runtime::Builder::new("/bin/sh");
+                b.arg("-c").arg(&params.command);
+                b
+            }
+            #[cfg(windows)]
+            {
+                let mut b = aionui_runtime::Builder::new("cmd");
+                b.arg("/C").arg(&params.command);
+                b
+            }
+        } else {
+            let mut b = aionui_runtime::Builder::new(&params.command);
+            b.args(&params.args);
+            b
+        };
         builder
-            .args(&params.args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -368,5 +391,17 @@ mod tests {
         assert!(reg.wait_for_exit("nope").await.is_none());
         assert!(!reg.kill("nope", "test").await);
         assert!(!reg.release("nope").await);
+    }
+
+    #[tokio::test]
+    async fn bare_compound_command_runs_through_shell() {
+        let reg = TerminalRegistry::new("conv-t");
+        let mut p = params("true && echo shell_interpreted", &[]);
+        p.args = vec![];
+        let id = reg.create(p).await.unwrap();
+        let exit = reg.wait_for_exit(&id).await.unwrap();
+        assert_eq!(exit.exit_code, Some(0));
+        let snap = reg.output(&id).await.unwrap();
+        assert!(snap.output.contains("shell_interpreted"), "got: {}", snap.output);
     }
 }
