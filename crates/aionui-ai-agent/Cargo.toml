@@ -46,6 +46,7 @@ agent-client-protocol = { version = "2.0.0", features = ["unstable_session_fork"
 tokio-util = { version = "0.7", features = ["compat", "codec"] }
 rusqlite.workspace = true
 libc.workspace = true
+fs2.workspace = true
 
 [features]
 # Enables the `AgentInstance::Mock` variant used by downstream test harnesses

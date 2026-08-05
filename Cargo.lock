@@ -361,6 +361,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "ed25519-dalek",
+ "fs2",
  "futures-util",
  "getrandom 0.2.17",
  "hex",
