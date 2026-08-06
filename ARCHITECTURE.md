@@ -39,7 +39,7 @@ and aionui-common has zero internal dependencies.
 
 ## Crate Hierarchy
 
-The project is organized as a Cargo workspace with 20 crates across four layers:
+The project is organized as a Cargo workspace with 24 crates across four layers:
 
 ### Foundation
 
@@ -52,6 +52,7 @@ Depended on by nearly all other crates. Changes require careful impact assessmen
 | `aionui-db` | SQLite database layer, defines Repository traits and implementations |
 | `aionui-assets` | Embedded static assets (agent metadata, prompts) |
 | `aionui-runtime` | Managed Node, subprocess spawning, PATH enhancement |
+| `aionui-process` | Supervised subprocess lifecycle, containment, and startup cleanup for direct CLI sessions |
 
 ### Capability
 
@@ -69,10 +70,13 @@ Each crate owns an independent business domain. They remain loosely coupled from
 | Crate | Responsibility |
 |-------|----------------|
 | `aionui-conversation` | Conversation management, messaging, confirmations, streaming responses |
+| `aionui-session` | Unified session state, capabilities, commands, and events across direct CLI and ACP backends |
 | `aionui-channel` | Multi-channel integration (WeChat, DingTalk, Lark), plugin system, pairing sessions |
 | `aionui-team` | Team collaboration, task scheduling, mailbox system |
+| `aionui-team-prompts` | Shared team role prompts, governance rules, and tool authorization metadata |
 | `aionui-cron` | Scheduled job execution, cron expressions, event triggering |
 | `aionui-file` | File operations, watching, snapshots, git operations, compression |
+| `aionui-project` | Project/folder bindings, Project Explorer, filesystem monitoring, and resource containment |
 | `aionui-office` | Office document handling (Excel, PPT, Word), preview, conversion |
 | `aionui-system` | System settings, provider management, version checking, model fetching |
 | `aionui-mcp` | MCP protocol integration, OAuth, multi-platform adapters |
@@ -255,6 +259,20 @@ Note: JSON field names use camelCase (via `#[serde(rename_all = "camelCase")]`).
 or three-level naming (e.g., `team.agent.status`). These are historical artifacts.
 New events must follow the two-level camelCase convention above.
 Existing inconsistencies will be unified incrementally during related module iterations.
+
+### ACP Tool Output Sanitization
+
+ACP agent tool-call events enter the unified `AgentStreamEvent` stream through
+the `aionui-ai-agent` translation boundary. That boundary keeps WebSocket and
+SQLite message payloads bounded instead of forwarding large binary or inline
+base64 results unchanged.
+
+For example, Codex image generation may return both `saved_path` and PNG/JPEG/WebP
+base64 in `raw_output.result`. Before forwarding and persistence, the translation
+layer removes the inline `result` while retaining small structured fields such as
+`saved_path`, `image.path`, `result_omitted`, and `result_bytes`. When the image is
+already stored on disk, the tool status is normalized to `completed`. Clients load
+the image from its file path on demand and must not depend on inline base64.
 
 ## Data Layer
 

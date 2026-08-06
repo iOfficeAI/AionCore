@@ -1,12 +1,14 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use aionui_common::generate_short_id;
 use aionui_db::{FolderRow, IProjectStore, ProjectExplorerRow, ProjectKind, Role};
 use chrono::{Datelike, Local};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::canonical::{self, Canonical};
 use crate::containment;
+use crate::scm::ScmInbound;
 use crate::types::{
     AttachInput, FolderDto, ProjectDetail, ProjectError, ProjectExplorerEntry, ProjectExplorerView, ReferenceInput,
     ResolveOutput, ResolvedResource, RuntimeStatus,
@@ -19,11 +21,44 @@ use crate::types::{
 pub struct ProjectService {
     store: Arc<dyn IProjectStore>,
     temp_root: PathBuf,
+    /// Sink for project-root changes to the source-control actor. Shared across
+    /// clones (behind `Arc`) so the one instance the scm monitor installs the
+    /// sender on is the same one the HTTP handlers see. Set once at startup;
+    /// `None` in tests and the HTTP-only assembly path, where a root change simply
+    /// notifies nobody.
+    scm_roots_tx: Arc<OnceLock<UnboundedSender<ScmInbound>>>,
 }
 
 impl ProjectService {
     pub fn new(store: Arc<dyn IProjectStore>, temp_root: PathBuf) -> Self {
-        Self { store, temp_root }
+        Self {
+            store,
+            temp_root,
+            scm_roots_tx: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Install the sink that carries project-root changes to the source-control
+    /// actor. Called once, at startup, by the scm monitor's composition wiring;
+    /// later calls are ignored (set-once). Because the field is shared across
+    /// clones, setting it on any clone makes it visible to all of them.
+    pub fn set_scm_roots_sender(&self, tx: UnboundedSender<ScmInbound>) {
+        let _ = self.scm_roots_tx.set(tx);
+    }
+
+    /// Tell the source-control actor that a project's attached-folder set changed,
+    /// so it can recompute repositories and push a `repositoriesChanged` frame.
+    ///
+    /// Best effort: if no actor is wired, or it has stopped, source control simply
+    /// misses the live update (a manual refresh still recovers) — this never fails
+    /// the attach or detach that already succeeded.
+    fn notify_roots_changed(&self, project_id: &str, user_id: &str) {
+        if let Some(tx) = self.scm_roots_tx.get() {
+            let _ = tx.send(ScmInbound::RootsChanged {
+                project_id: project_id.to_owned(),
+                user_id: user_id.to_owned(),
+            });
+        }
     }
 
     // ── creation / backfill ────────────────────────────────────────────
@@ -159,7 +194,8 @@ impl ProjectService {
         }
 
         let order_index = entries.len() as i64;
-        self.store
+        let row = self
+            .store
             .insert_attached_entry(
                 user_id,
                 &input.project_id,
@@ -167,8 +203,12 @@ impl ProjectService {
                 input.display_name.as_deref(),
                 order_index,
             )
-            .await
-            .map_err(Into::into)
+            .await?;
+        // A newly attached folder can bring a repository into view. The
+        // focus-in-place branches above return early without notifying — they add
+        // no root, so the repository set is unchanged.
+        self.notify_roots_changed(&input.project_id, user_id);
+        Ok(row)
     }
 
     /// Remove an attached entry. The workspace entry cannot be removed here.
@@ -186,6 +226,8 @@ impl ProjectService {
             });
         }
         self.store.remove_entry(user_id, pe_id).await?;
+        // Detaching a folder can drop a repository from the project's set.
+        self.notify_roots_changed(&entry.project_id, user_id);
         Ok(())
     }
 
@@ -378,10 +420,15 @@ impl ProjectService {
     }
 
     fn build_folder_dto(&self, folder: &FolderRow) -> FolderDto {
+        // Blank (empty or whitespace-only) basenames collapse to `None`, matching
+        // the source-control seam's `pe_name`/`label` filter. A folder literally
+        // named "   " would otherwise surface a whitespace default name, and the
+        // scm label fallback (`display_name || default_display_name || pe_id`)
+        // would render it blank — breaking the "label is never blank" contract.
         let default_display_name = canonical::canonicalize(&folder.resource_canonical)
             .ok()
             .map(|c| canonical::basename(&c))
-            .filter(|name| !name.is_empty());
+            .filter(|name| !name.trim().is_empty());
         let (runtime_status, runtime_error) = runtime_status_of(folder);
         FolderDto {
             folder_id: folder.folder_id.clone(),

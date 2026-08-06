@@ -491,6 +491,7 @@ impl BackendConnection for ScriptedConnection {
         let session_id = match &spec {
             SessionSpec::Fresh { session_id } => session_id.clone(),
             SessionSpec::Resume { session_id, .. } => session_id.clone(),
+            SessionSpec::Fork { session_id, .. } => session_id.clone(),
         };
         // Gate the NDJSON bytes so the reader does NOT emit events before the
         // orchestrator subscribes to `backend.events()` (a late-subscriber drop).

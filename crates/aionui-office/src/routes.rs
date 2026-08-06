@@ -9,8 +9,8 @@ use axum::routing::{get, post};
 use std::path::{Path as FsPath, PathBuf};
 
 use aionui_api_types::{
-    ApiResponse, DocumentConversionRequest, GetSnapshotContentRequest, ListSnapshotsRequest, PreviewSnapshotInfoDto,
-    PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StartPreviewRequest, StopPreviewRequest,
+    ApiResponse, DocumentConversionRequest, PreviewUrlResponse, RefreshPreviewRequest, RefreshPreviewResponse,
+    StartPreviewRequest, StopPreviewRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -54,13 +54,13 @@ pub fn office_routes(state: OfficeRouterState) -> Router {
     Router::new()
         .route("/api/word-preview/start", post(start_word_preview))
         .route("/api/word-preview/stop", post(stop_word_preview))
+        .route("/api/word-preview/refresh", post(refresh_word_preview))
         .route("/api/excel-preview/start", post(start_excel_preview))
         .route("/api/excel-preview/stop", post(stop_excel_preview))
+        .route("/api/excel-preview/refresh", post(refresh_excel_preview))
         .route("/api/ppt-preview/start", post(start_ppt_preview))
         .route("/api/ppt-preview/stop", post(stop_ppt_preview))
-        .route("/api/preview-history/list", post(list_snapshots))
-        .route("/api/preview-history/save", post(save_snapshot))
-        .route("/api/preview-history/get-content", post(get_snapshot_content))
+        .route("/api/ppt-preview/refresh", post(refresh_ppt_preview))
         .route("/api/document/convert", post(convert_document))
         .with_state(state)
 }
@@ -80,7 +80,7 @@ struct ProxyPortPath {
     path: Option<String>,
 }
 
-// -- Preview start/stop handlers ------------------------------------------
+// -- Preview start/stop/refresh handlers ----------------------------------
 
 async fn start_word_preview(
     State(state): State<OfficeRouterState>,
@@ -96,6 +96,14 @@ async fn stop_word_preview(
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     stop_preview(state, &user.id, body, DocType::Word).await
+}
+
+async fn refresh_word_preview(
+    State(state): State<OfficeRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<RefreshPreviewRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<RefreshPreviewResponse>>, ApiError> {
+    refresh_preview(state, &user.id, body, DocType::Word).await
 }
 
 async fn start_excel_preview(
@@ -114,6 +122,14 @@ async fn stop_excel_preview(
     stop_preview(state, &user.id, body, DocType::Excel).await
 }
 
+async fn refresh_excel_preview(
+    State(state): State<OfficeRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<RefreshPreviewRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<RefreshPreviewResponse>>, ApiError> {
+    refresh_preview(state, &user.id, body, DocType::Excel).await
+}
+
 async fn start_ppt_preview(
     State(state): State<OfficeRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -130,6 +146,14 @@ async fn stop_ppt_preview(
     stop_preview(state, &user.id, body, DocType::Ppt).await
 }
 
+async fn refresh_ppt_preview(
+    State(state): State<OfficeRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<RefreshPreviewRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<RefreshPreviewResponse>>, ApiError> {
+    refresh_preview(state, &user.id, body, DocType::Ppt).await
+}
+
 async fn start_preview(
     state: OfficeRouterState,
     user_id: &str,
@@ -137,8 +161,22 @@ async fn start_preview(
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let validated_path = validate_office_path(&state, &req.file_path, req.workspace.as_deref())?;
-    let validated_path = validated_path.to_string_lossy().into_owned();
+    // Prefer the ChatFileRef identity (resolved server-side, already
+    // containment-checked per variant); fall back to the legacy device path +
+    // office sandbox validation for callers that have not migrated yet.
+    let validated_path = match &req.file {
+        Some(file) => {
+            let upload_root = std::env::temp_dir().join("aionui");
+            state
+                .project
+                .resolve_chat_file_ref(user_id, file, &upload_root, aionui_project::FileOp::Read)
+                .await
+                .map_err(ApiError::from)?
+        }
+        None => validate_office_path(&state, &req.file_path, req.workspace.as_deref())?
+            .to_string_lossy()
+            .into_owned(),
+    };
 
     let result = state
         .watch_manager
@@ -159,6 +197,108 @@ async fn start_preview(
     Ok(Json(ApiResponse::ok(resp)))
 }
 
+/// How long to wait on officecli's `/api/switch`. The switch re-renders the
+/// document in a child process before answering, so this is a render budget, not
+/// a network one; the proxy's own timeout is far shorter.
+const SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `POST /api/{word|excel|ppt}-preview/refresh` — make the running watch server
+/// re-read this document from disk.
+///
+/// officecli does not watch the filesystem (its own help says `external edits are
+/// not detected`), and nothing on our side reloads office documents either, so an
+/// externally-edited office file is the one preview type that would otherwise never
+/// update. Refresh has to be pushed.
+///
+/// Re-issuing `POST /api/switch` for the document already loaded is what does it:
+/// officecli treats a same-file switch as a supported force-refresh, re-renders in
+/// a child process, then broadcasts `doc-switched`, on which the embedded page
+/// reloads itself. Simply reloading the webview would not work — `GET /` serves the
+/// server's cached HTML, so the reload could return the same stale document and the
+/// button would appear to do nothing.
+///
+/// Reaching officecli is the backend's job, not the client's: under web deployment
+/// the frontend and officecli are on different hosts, and the existing office proxy
+/// is GET-only (its `forward` takes no method or body), so it structurally cannot
+/// carry this POST.
+async fn refresh_preview(
+    state: OfficeRouterState,
+    user_id: &str,
+    body: Result<Json<RefreshPreviewRequest>, JsonRejection>,
+    doc_type: DocType,
+) -> Result<Json<ApiResponse<RefreshPreviewResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    // Resolve exactly as start/stop do, so the session key derived below is the one
+    // the watch was registered under. Prefer the ChatFileRef; fall back to the
+    // legacy device path.
+    let target_path = match &req.file {
+        Some(file) => {
+            let upload_root = std::env::temp_dir().join("aionui");
+            state
+                .project
+                .resolve_chat_file_ref(user_id, file, &upload_root, aionui_project::FileOp::Read)
+                .await
+                .map_err(refresh_resolve_error)?
+        }
+        None => validate_office_path(&state, &req.file_path, req.workspace.as_deref())?
+            .to_string_lossy()
+            .into_owned(),
+    };
+
+    let Some(port) = state.watch_manager.active_port_for(user_id, &target_path, doc_type) else {
+        // Nothing is serving this document, so there is nothing to refresh. Not an
+        // HTTP error: the tab may simply have been closed, and the client's own
+        // recovery is to start a preview rather than to surface a failure.
+        return Ok(Json(ApiResponse::ok(RefreshPreviewResponse {
+            ok: false,
+            error: Some("OFFICECLI_NO_ACTIVE_PREVIEW".to_owned()),
+        })));
+    };
+
+    let response = state
+        .proxy_service
+        .force_reload(port, &target_path, SWITCH_TIMEOUT)
+        .await;
+    Ok(Json(ApiResponse::ok(match response {
+        Ok(()) => RefreshPreviewResponse { ok: true, error: None },
+        Err(code) => RefreshPreviewResponse {
+            ok: false,
+            error: Some(code.to_owned()),
+        },
+    })))
+}
+
+/// Collapse a `ChatFileRef` resolution failure into a path-free API error.
+///
+/// The shared `From<ProjectError>` mapping renders the error's `Display` as the
+/// public message and repeats the path under `details.path`, and several variants
+/// carry the absolute path. This caller addressed the file by identity, so that
+/// path is server-side knowledge and must not travel back out.
+///
+/// # Why the neighbours differ
+///
+/// `start_preview` and `stop_preview`, a few lines below, resolve the same way but
+/// still map through the shared conversion — so they *do* echo the path on a
+/// resolve failure. That asymmetry is deliberate, not an oversight here.
+///
+/// The leak is domain-wide, not local: `ApiError::NotFound` is constructed at 63
+/// sites across the workspace and `ApiError::Coded::public_message` clones its
+/// message too, so most of them publish whatever the caller passed. Sealing two
+/// more endpoints in passing would leave the real problem untouched while making
+/// this area *look* handled, which is worse for whoever takes on the sweep. It is
+/// registered as the "backend error-message domain-wide cleanup" follow-up; fix it
+/// there, across all call sites, rather than one endpoint at a time.
+fn refresh_resolve_error(err: aionui_project::ProjectError) -> ApiError {
+    let code = err.code();
+    tracing::warn!(target: "office_refresh", error = %err, code, "could not resolve refresh target");
+    ApiError::coded(
+        StatusCode::NOT_FOUND,
+        "FILE_NOT_FOUND",
+        "The requested file no longer exists.",
+        None::<serde_json::Value>,
+    )
+}
+
 async fn stop_preview(
     state: OfficeRouterState,
     user_id: &str,
@@ -166,49 +306,24 @@ async fn stop_preview(
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state
-        .watch_manager
-        .stop_for_user(user_id, &req.file_path, doc_type)
-        .await;
+    // Resolve the same identity `start_preview` used so `stop_for_user` derives
+    // the same session key (watch_manager re-canonicalizes internally). Prefer
+    // the ChatFileRef; fall back to the legacy device path. Post-migration the
+    // explorer office tab has only a ChatFileRef (no device path), so without
+    // this branch stop can't match the watch and the officecli subprocess leaks.
+    let target_path = match &req.file {
+        Some(file) => {
+            let upload_root = std::env::temp_dir().join("aionui");
+            state
+                .project
+                .resolve_chat_file_ref(user_id, file, &upload_root, aionui_project::FileOp::Read)
+                .await
+                .map_err(ApiError::from)?
+        }
+        None => req.file_path.clone(),
+    };
+    state.watch_manager.stop_for_user(user_id, &target_path, doc_type).await;
     Ok(Json(ApiResponse::success()))
-}
-
-// -- Snapshot handlers ----------------------------------------------------
-
-async fn list_snapshots(
-    State(state): State<OfficeRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    body: Result<Json<ListSnapshotsRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<Vec<PreviewSnapshotInfoDto>>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let snapshots = state.snapshot_service.list_for_user(&user.id, &req.target).await?;
-    Ok(Json(ApiResponse::ok(snapshots)))
-}
-
-async fn save_snapshot(
-    State(state): State<OfficeRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    body: Result<Json<SaveSnapshotRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<PreviewSnapshotInfoDto>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let info = state
-        .snapshot_service
-        .save_for_user(&user.id, &req.target, &req.content)
-        .await?;
-    Ok(Json(ApiResponse::ok(info)))
-}
-
-async fn get_snapshot_content(
-    State(state): State<OfficeRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    body: Result<Json<GetSnapshotContentRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<Option<SnapshotContentResponse>>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let result = state
-        .snapshot_service
-        .get_content_for_user(&user.id, &req.target, &req.snapshot_id)
-        .await?;
-    Ok(Json(ApiResponse::ok(result)))
 }
 
 // -- Document conversion --------------------------------------------------
@@ -252,19 +367,19 @@ fn file_error_to_api_error(error: FileError) -> ApiError {
         },
         FileError::NotFound(message) => ApiError::NotFound(message),
         FileError::Internal(message) => ApiError::Internal(message),
-        // Not reachable from office path-validation, but the mapping must be
-        // total; mirror the file crate's stable unavailable contract.
-        FileError::WatchUnavailable { errno } => ApiError::coded(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "FILE_WATCH_UNAVAILABLE",
-            "File watching is unavailable on this system.",
-            errno.map(|n| serde_json::json!({ "errno": n })),
-        ),
         // Not reachable from office path-validation; the mapping must be total.
-        FileError::RevealFailed(message) => ApiError::coded(
+        // Mirrors the file crate: the cause is logged at its origin, not forwarded.
+        FileError::RevealFailed(_) => ApiError::coded(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "REVEAL_FAILED",
-            message,
+            "Could not open the system file manager.",
+            None::<serde_json::Value>,
+        ),
+        // Not reachable from office path-validation; the mapping must be total.
+        FileError::TargetNotFound => ApiError::coded(
+            axum::http::StatusCode::NOT_FOUND,
+            "FILE_NOT_FOUND",
+            "The requested file no longer exists.",
             None::<serde_json::Value>,
         ),
     }
@@ -364,22 +479,21 @@ mod tests {
     use crate::conversion::ConversionService;
     use crate::error::OfficeError;
     use crate::proxy::{ProxyError, ProxyService};
-    use crate::snapshot::SnapshotService;
     use crate::state::OfficeRouterState;
     use crate::types::DocType;
     use crate::watch_manager::{OfficecliWatchManager, ProcessHandle, ProcessSpawner};
 
     use super::{ApiError, file_error_to_api_error, office_proxy_routes, office_routes};
 
-    #[test]
-    fn office_routes_builds_without_panic() {
-        let state = build_test_state();
+    #[tokio::test]
+    async fn office_routes_builds_without_panic() {
+        let state = build_test_state().await;
         let _router = office_routes(state);
     }
 
-    #[test]
-    fn office_proxy_routes_builds_without_panic() {
-        let state = build_test_state();
+    #[tokio::test]
+    async fn office_proxy_routes_builds_without_panic() {
+        let state = build_test_state().await;
         let _router = office_proxy_routes(state);
     }
 
@@ -468,7 +582,7 @@ mod tests {
         assert!(matches!(err, ApiError::BadGateway(_)));
     }
 
-    fn build_test_state() -> OfficeRouterState {
+    async fn build_test_state() -> OfficeRouterState {
         struct NoopSpawner;
 
         #[async_trait::async_trait]
@@ -501,16 +615,19 @@ mod tests {
         let bc: Arc<dyn aionui_realtime::EventBroadcaster> = Arc::new(NoopBroadcaster);
         let wm = Arc::new(OfficecliWatchManager::new(spawner, bc));
 
-        let snapshot = Arc::new(SnapshotService::new(std::path::Path::new("/tmp/test")));
         let conversion = Arc::new(ConversionService::new(None));
         let proxy = Arc::new(ProxyService::new(wm.clone()));
 
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let store: Arc<dyn aionui_db::IProjectStore> = Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
+        let project = Arc::new(aionui_project::ProjectService::new(store, std::env::temp_dir()));
+
         OfficeRouterState {
             watch_manager: wm,
-            snapshot_service: snapshot,
             conversion_service: conversion,
             proxy_service: proxy,
             allowed_roots: vec![std::env::temp_dir()],
+            project,
         }
     }
 }

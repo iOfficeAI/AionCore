@@ -18,7 +18,10 @@
 
 use std::sync::Arc;
 
-use aionui_api_types::{ApiResponse, AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer};
+use aionui_api_types::{
+    ApiResponse, AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest,
+    ResolveRefResponse,
+};
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use axum::extract::rejection::JsonRejection;
@@ -46,6 +49,7 @@ pub fn project_routes(state: ProjectRouterState) -> Router {
         .route("/api/projects/{project_id}", get(get_project))
         .route("/api/projects/{project_id}/folders", post(attach_folder))
         .route("/api/projects/{project_id}/folders/{pe_id}", delete(remove_folder))
+        .route("/api/projects/{project_id}/resolve-ref", post(resolve_ref))
         .with_state(state)
 }
 
@@ -58,6 +62,38 @@ async fn get_project(
 ) -> Result<Json<ApiResponse<ProjectDetailResponse>>, ApiError> {
     let detail = state.project.get_project(&user.id, &project_id).await?;
     Ok(Json(ApiResponse::ok(to_detail_response(detail))))
+}
+
+/// `POST /api/projects/{project_id}/resolve-ref` — re-express a `ChatFileRef` in
+/// its strongest form for this project.
+///
+/// The explorer and a chat link produce different refs for the same file
+/// (`Project` vs `Local`), so callers that key on the ref — tab identity, the
+/// `fs` change signal — would otherwise treat one file as two. This resolves a
+/// `Local` path that lives under one of the project's roots into the `Project`
+/// form; `Project` and `Upload` come back untouched.
+///
+/// Always succeeds with a usable ref: a path outside every root, or one that does
+/// not exist, is echoed back unchanged rather than raising. "Not upgradeable" is
+/// an ordinary answer here, and a caller mid-way through opening a missing file
+/// still needs its ref to render that state.
+///
+/// The judgement stays server-side because case folding is a compile-time
+/// platform fork (`canonical::IGNORE_PATH_CASING`); a client comparing path
+/// strings would miss matches on macOS and merge distinct files on Linux.
+async fn resolve_ref(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+    body: Result<Json<ResolveRefRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ResolveRefResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let file = state
+        .project
+        .upgrade_chat_file_ref(&user.id, &project_id, &req.file)
+        .await?;
+    let upgraded = file != req.file;
+    Ok(Json(ApiResponse::ok(ResolveRefResponse { file, upgraded })))
 }
 
 /// `POST /api/projects/{project_id}/folders` — attach a folder. Returns the

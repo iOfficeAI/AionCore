@@ -312,6 +312,14 @@ impl StreamRelay {
                             // the catch-all below does not forward it to the WebSocket, and
                             // it is never persisted.
                         }
+                        AgentStreamEvent::BackendTurnBound(backend_turn_id) => {
+                            // Internal-only fork anchor (codex Turn.id): stamp it on the
+                            // adapter so every message row persisted for this turn carries
+                            // `messages.backend_turn_id` — the `thread/fork` lastTurnId
+                            // lookup key. Never forwarded to the WS, never persisted as an
+                            // event itself.
+                            self.adapter.set_backend_turn_id(backend_turn_id.clone());
+                        }
                         AgentStreamEvent::Thinking(data) => {
                             if data.status.as_deref() == Some("done") {
                                 self.complete_active_thinking(&mut active_thinking).await;
@@ -514,6 +522,35 @@ impl StreamRelay {
                             self.forward_to_websocket(&event);
                             self.adapter.persist_tool_group(entries).await;
                         }
+                        AgentStreamEvent::WorkflowProgress(data) if data.settle_only => {
+                            // Update-only settle for a card this pump never
+                            // opened (post-resume terminal). Forward ONLY if the
+                            // stored row existed — otherwise the frontend would
+                            // append a junk nameless card for a workflow-internal
+                            // ref that never had one.
+                            if self.adapter.settle_tool_call_if_present(&data.card).await {
+                                self.forward_workflow_progress(data);
+                            }
+                        }
+                        AgentStreamEvent::WorkflowProgress(data) => {
+                            // A running workflow refreshes its progress roughly once a
+                            // second, WHILE the assistant is still streaming its "workflow
+                            // started" reply (claude runs with --include-partial-messages,
+                            // so that reply arrives as deltas). Every other tool-ish arm
+                            // above closes the active text segment first — doing that here
+                            // would shatter that one reply into a fresh bubble per refresh.
+                            //
+                            // So this arm deliberately does NOT touch `active_text` /
+                            // `active_thinking`. It projects the snapshot into the two
+                            // frames the frontend already renders and persists them, and
+                            // is otherwise invisible to the turn: no `saw_tool_or_side_effect`
+                            // either, since a progress refresh is not the turn doing work.
+                            self.forward_workflow_progress(data);
+                            self.adapter.persist_tool_call(&data.card).await;
+                            if !data.agents.is_empty() {
+                                self.adapter.persist_tool_group(&data.agents).await;
+                            }
+                        }
                         AgentStreamEvent::Tips(data) => {
                             // Only a Success tip blocks auto-replay: it can represent
                             // completed work product. Warning/Info tips are system
@@ -535,10 +572,20 @@ impl StreamRelay {
                         }
                         AgentStreamEvent::CronTrigger(_)
                         | AgentStreamEvent::Permission(_)
-                        | AgentStreamEvent::AcpPermission(_) => {
+                        | AgentStreamEvent::AcpPermission(_)
+                        // Ask rides the permission lane: a raised question is a
+                        // side-effect (blocks auto-replay) and must reach the ws
+                        // live for the card to pop mid-turn.
+                        | AgentStreamEvent::Ask(_) => {
                             attempt.saw_tool_or_side_effect = true;
                             self.forward_to_websocket(&event);
                         }
+                        // NOTE: AcpSessionInfo (agent session titles) is deliberately
+                        // NOT consumed here. Titles arrive at session-open and at the
+                        // turn's final instant (pi/omp race the relay's exit by ~1ms;
+                        // claude replies seconds after Finish), so the per-instance
+                        // BackgroundStreamWatcher is the single gate-free consumer.
+                        // The frame still reaches the frontend via the catch-all.
                         _ => {
                             self.forward_to_websocket(&event);
                         }
@@ -624,6 +671,7 @@ impl StreamRelay {
             AgentStreamEvent::Plan(_) => "Plan",
             AgentStreamEvent::Permission(_) => "Permission",
             AgentStreamEvent::AcpPermission(_) => "AcpPermission",
+            AgentStreamEvent::Ask(_) => "Ask",
             AgentStreamEvent::SkillSuggest(_) => "SkillSuggest",
             AgentStreamEvent::CronTrigger(_) => "CronTrigger",
             AgentStreamEvent::AcpModelInfo(_) => "AcpModelInfo",
@@ -631,6 +679,7 @@ impl StreamRelay {
             AgentStreamEvent::AcpConfigOption(_) => "AcpConfigOption",
             AgentStreamEvent::AcpSessionInfo(_) => "AcpSessionInfo",
             AgentStreamEvent::AcpContextUsage(_) => "AcpContextUsage",
+            AgentStreamEvent::AcpTerminalOutput(_) => "AcpTerminalOutput",
             AgentStreamEvent::AcpPromptHookWarning(_) => "AcpPromptHookWarning",
             AgentStreamEvent::SlashCommandsUpdated(_) => "SlashCommandsUpdated",
             AgentStreamEvent::AvailableCommands(_) => "AvailableCommands",
@@ -640,6 +689,8 @@ impl StreamRelay {
             AgentStreamEvent::RequestTrace(_) => "RequestTrace",
             AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
             AgentStreamEvent::SegmentBreak => "SegmentBreak",
+            AgentStreamEvent::BackendTurnBound(_) => "BackendTurnBound",
+            AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
             AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
         }
     }
@@ -811,12 +862,58 @@ impl StreamRelay {
         }
     }
 
+    /// Project a workflow snapshot onto the wire as the two frame types the
+    /// frontend already renders, so no new renderer is needed:
+    ///
+    /// - `tool_call` — the container row, keyed by the Workflow tool call's own
+    ///   `call_id`, so it updates the card the user is already looking at.
+    /// - `tool_group` — one entry per workflow agent, each with its own status
+    ///   badge.
+    ///
+    /// Hand-built rather than routed through `forward_to_websocket`, which derives
+    /// the wire `type` from the event's own serde tag — that would put
+    /// `workflow_progress` on the wire, which no frontend arm handles (it would
+    /// land in `useAcpMessage`'s `default:` and light a spurious turn timer).
+    fn forward_workflow_progress(&self, data: &aionui_ai_agent::protocol::events::WorkflowProgressData) {
+        let mut frames = vec![("tool_call", serde_json::to_value(&data.card))];
+        // A background-task card has no per-agent roster; an EMPTY tool_group
+        // would persist a junk row under a freshly minted id.
+        if !data.agents.is_empty() {
+            frames.push(("tool_group", serde_json::to_value(&data.agents)));
+        }
+        for (kind, body) in frames {
+            let mut body = match body {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %ErrorChain(&e), kind, "Failed to serialize workflow progress frame");
+                    continue;
+                }
+            };
+            normalize_keys_to_snake_case(&mut body);
+            self.broadcast_stream_payload(json!({
+                "conversation_id": self.conversation_id,
+                "msg_id": self.msg_id,
+                "turn_id": self.turn_id,
+                "type": kind,
+                "data": body,
+                "hidden": false,
+            }));
+        }
+    }
+
     fn broadcast_stream_payload(&self, mut payload: serde_json::Value) {
         if let Some(obj) = payload.as_object_mut() {
             obj.entry("user_id")
                 .or_insert_with(|| serde_json::Value::String(self.user_id.clone()));
             obj.entry("turn_id")
                 .or_insert_with(|| serde_json::Value::String(self.turn_id.clone()));
+            // Fork anchoring parity with persistence: live frames carry the
+            // backend turn anchor so the UI can show mid-history fork entries
+            // during the session, not only after a history reload.
+            if let Some(anchor) = self.adapter.current_backend_turn_id() {
+                obj.entry("backend_turn_id")
+                    .or_insert_with(|| serde_json::Value::String(anchor));
+            }
         }
         let msg = WebSocketMessage::new("message.stream", payload);
         self.broadcaster.broadcast(msg);
@@ -994,6 +1091,106 @@ mod tests {
         assert_eq!(content["content"], "Hello World");
     }
 
+    fn agent_title_test_row(name: &str, name_source: Option<&str>) -> aionui_db::models::ConversationRow {
+        let now = aionui_common::now_ms();
+        aionui_db::models::ConversationRow {
+            id: "conv-1".into(),
+            user_id: "user-1".into(),
+            name: name.into(),
+            r#type: "acp".into(),
+            extra: "{}".into(),
+            model: None,
+            status: None,
+            source: None,
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: now,
+            updated_at: now,
+            project_id: None,
+            folder_id: None,
+            name_source: name_source.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_session_info_is_forwarded_but_never_renames_at_relay_level() {
+        let repo = Arc::new(RecordingRepo::new());
+        *repo.conversation.lock().unwrap() = Some(agent_title_test_row("first message placeholder", None));
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::AcpSessionInfo(serde_json::json!({
+            "title": "Fix login bug"
+        })))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+
+        // The relay must NOT rename (the BackgroundStreamWatcher is the single
+        // title consumer — relay-side apply raced its own exit and double-applied).
+        assert!(
+            repo.conversation_updates
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, u)| u.name.is_none()),
+            "relay must not rename"
+        );
+        // The raw frame still reaches the frontend via message.stream.
+        let mut saw_forward = false;
+        while let Ok(msg) = ws_rx.try_recv() {
+            if msg.name == "message.stream" && msg.data["data"]["title"] == "Fix login bug" {
+                saw_forward = true;
+            }
+        }
+        assert!(saw_forward, "AcpSessionInfo frame must still be forwarded");
+    }
+
+    #[tokio::test]
+    async fn acp_session_info_null_title_never_renames() {
+        let repo = Arc::new(RecordingRepo::new());
+        *repo.conversation.lock().unwrap() = Some(agent_title_test_row("kept name", None));
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::AcpSessionInfo(serde_json::json!({ "title": null })))
+            .unwrap();
+        tx.send(AgentStreamEvent::AcpSessionInfo(serde_json::json!({ "title": "   " })))
+            .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+        relay.consume(rx).await;
+
+        assert!(
+            repo.conversation_updates
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, u)| u.name.is_none()),
+            "null/blank titles must not rename"
+        );
+    }
+
     #[tokio::test]
     async fn needs_auth_tip_sets_summary_flag_on_finish() {
         use aionui_ai_agent::protocol::events::{TipType, TipsEventData};
@@ -1116,6 +1313,129 @@ mod tests {
             }
         }
         assert!(saw_tip, "the token-limit tip must be forwarded to the WS");
+    }
+
+    /// A workflow refreshes its progress ~1×/s WHILE the assistant is still
+    /// streaming its "workflow started" reply (claude runs with
+    /// `--include-partial-messages`, so that reply arrives as deltas). Every other
+    /// tool-ish arm closes the active text segment first, which would shatter that
+    /// one reply into a fresh bubble per refresh — a worse regression than showing
+    /// nothing at all. This arm must leave the text segment alone.
+    ///
+    /// The `ToolCall` control below proves the test actually exercises the
+    /// splitting path, rather than passing because no split could occur anyway.
+    #[tokio::test]
+    async fn workflow_progress_does_not_split_the_streaming_reply() {
+        use aionui_ai_agent::protocol::events::tool_call::{ToolGroupEntry, ToolGroupStatus};
+        use aionui_ai_agent::protocol::events::{
+            TextEventData, ToolCallEventData, ToolCallStatus, WorkflowProgressData,
+        };
+
+        async fn run_with(interruption: AgentStreamEvent) -> (Vec<MessageRow>, Vec<serde_json::Value>) {
+            let repo = Arc::new(RecordingRepo::new());
+            let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+            let mut ws_rx = bus.subscribe();
+            let (tx, _) = broadcast::channel(64);
+            let relay = StreamRelay::new(
+                "conv-1".into(),
+                "asst-1".into(),
+                "turn-1".into(),
+                "user-1".into(),
+                repo.clone(),
+                bus.clone(),
+            );
+            let rx = tx.subscribe();
+
+            tx.send(AgentStreamEvent::Text(TextEventData {
+                content: "Workflow started, ".into(),
+            }))
+            .unwrap();
+            tx.send(interruption).unwrap();
+            tx.send(AgentStreamEvent::Text(TextEventData {
+                content: "running in the background.".into(),
+            }))
+            .unwrap();
+            tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+            relay.consume(rx).await;
+
+            let mut frames = Vec::new();
+            while let Ok(evt) = ws_rx.try_recv() {
+                if evt.name == "message.stream" {
+                    frames.push(evt.data.clone());
+                }
+            }
+            (repo.take_inserts(), frames)
+        }
+
+        fn progress_event() -> AgentStreamEvent {
+            AgentStreamEvent::WorkflowProgress(WorkflowProgressData {
+                card: ToolCallEventData {
+                    call_id: "toolu_wf".into(),
+                    name: "Workflow".into(),
+                    args: serde_json::json!({"script": "phase('Run')"}),
+                    status: ToolCallStatus::Running,
+                    input: None,
+                    output: Some("Phase 1  Run   [0/1]".into()),
+                    description: Some("Run [0/1] · run:A · 1 agents".into()),
+                },
+                agents: vec![ToolGroupEntry {
+                    call_id: "1".into(),
+                    name: "run:A".into(),
+                    status: ToolGroupStatus::Executing,
+                    description: Some("[P1 Run] · opus-4-8".into()),
+                }],
+                settle_only: false,
+            })
+        }
+
+        let (inserts, frames) = run_with(progress_event()).await;
+        let texts = inserts.iter().filter(|m| m.r#type == "text").count();
+        assert_eq!(
+            texts, 1,
+            "the streaming reply must stay ONE message; a progress refresh may not close its segment"
+        );
+
+        // Both projections must still reach the WS, under the frame types the
+        // frontend already renders — never the internal `workflow_progress` tag.
+        let kinds: Vec<&str> = frames.iter().filter_map(|f| f["type"].as_str()).collect();
+        assert!(
+            kinds.contains(&"tool_call"),
+            "container row must be forwarded: {kinds:?}"
+        );
+        assert!(kinds.contains(&"tool_group"), "agent rows must be forwarded: {kinds:?}");
+        assert!(
+            !kinds.contains(&"workflow_progress"),
+            "the internal variant must never hit the wire: {kinds:?}"
+        );
+        let card = frames.iter().find(|f| f["type"] == "tool_call").unwrap();
+        assert_eq!(card["data"]["call_id"], "toolu_wf");
+        assert_eq!(
+            card["data"]["name"], "Workflow",
+            "identity fields survive the projection"
+        );
+        let group = frames.iter().find(|f| f["type"] == "tool_group").unwrap();
+        assert_eq!(
+            group["data"][0]["status"], "Executing",
+            "tool_group's PascalCase vocabulary"
+        );
+
+        // Control: a plain ToolCall DOES split the reply. Without this, the
+        // assertion above could pass simply because nothing ever splits.
+        let (control_inserts, _) = run_with(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "toolu_other".into(),
+            name: "Bash".into(),
+            args: serde_json::Value::Null,
+            status: ToolCallStatus::Running,
+            input: None,
+            output: None,
+            description: None,
+        }))
+        .await;
+        assert_eq!(
+            control_inserts.iter().filter(|m| m.r#type == "text").count(),
+            2,
+            "control: an ordinary tool call splits the reply, so the test does exercise that path"
+        );
     }
 
     // issue 136586749 (B-3): AcpDialectSignal is an internal-only turn/near-window
@@ -2301,7 +2621,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_group_persists_message() {
-        use aionui_ai_agent::protocol::events::tool_call::{ToolCallStatus, ToolGroupEntry};
+        use aionui_ai_agent::protocol::events::tool_call::{ToolGroupEntry, ToolGroupStatus};
 
         let repo = Arc::new(RecordingRepo::new());
         let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
@@ -2322,13 +2642,13 @@ mod tests {
             ToolGroupEntry {
                 call_id: "tg-001".into(),
                 name: "search".into(),
-                status: ToolCallStatus::Completed,
+                status: ToolGroupStatus::Success,
                 description: Some("Web search".into()),
             },
             ToolGroupEntry {
                 call_id: "tg-002".into(),
                 name: "read_file".into(),
-                status: ToolCallStatus::Completed,
+                status: ToolGroupStatus::Success,
                 description: None,
             },
         ]))
@@ -2491,6 +2811,10 @@ mod tests {
     struct RecordingRepo {
         inserts: Mutex<Vec<MessageRow>>,
         updates: Mutex<Vec<(String, aionui_db::MessageRowUpdate)>>,
+        /// Optional conversation row served by `get` (agent-title tests).
+        conversation: Mutex<Option<aionui_db::models::ConversationRow>>,
+        /// Conversation-level updates recorded by `update` (agent-title tests).
+        conversation_updates: Mutex<Vec<(String, aionui_db::ConversationRowUpdate)>>,
         not_found: AtomicBool,
         foreign_key_failure: AtomicBool,
     }
@@ -2500,6 +2824,8 @@ mod tests {
             Self {
                 inserts: Mutex::new(vec![]),
                 updates: Mutex::new(vec![]),
+                conversation: Mutex::new(None),
+                conversation_updates: Mutex::new(vec![]),
                 not_found: AtomicBool::new(false),
                 foreign_key_failure: AtomicBool::new(false),
             }
@@ -2595,7 +2921,7 @@ mod tests {
     #[async_trait::async_trait]
     impl IConversationRepository for RecordingRepo {
         async fn get(&self, _user_id: &str, _id: &str) -> Result<Option<aionui_db::models::ConversationRow>, DbError> {
-            Ok(None)
+            Ok(self.conversation.lock().unwrap().clone())
         }
         async fn owner_user_id(&self, _id: &str) -> Result<Option<String>, DbError> {
             Ok(Some("user-1".into()))
@@ -2606,12 +2932,16 @@ mod tests {
         async fn update(
             &self,
             _user_id: &str,
-            _id: &str,
-            _updates: &aionui_db::ConversationRowUpdate,
+            id: &str,
+            updates: &aionui_db::ConversationRowUpdate,
         ) -> Result<(), DbError> {
             if self.not_found.load(Ordering::Acquire) {
                 return Err(DbError::NotFound("Conversation deleted-conv not found".into()));
             }
+            self.conversation_updates
+                .lock()
+                .unwrap()
+                .push((id.to_string(), updates.clone()));
             Ok(())
         }
         async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {

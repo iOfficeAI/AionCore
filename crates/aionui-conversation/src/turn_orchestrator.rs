@@ -203,6 +203,14 @@ impl ConversationTurnOrchestrator {
             "Agent task ready"
         );
 
+        // The send path builds the agent HERE, not through the service's
+        // ensure-runtime fn — without this the out-of-turn watcher only existed
+        // for conversations opened via that other path (found live: a codex e2e
+        // probe ran with no watcher at all, and its post-finish MessageDeltas
+        // were dropped exactly like the pre-watcher days).
+        self.service
+            .ensure_background_watcher(&input.user_id, &input.conv_id, &agent);
+
         let persistence = self.service.runtime_persistence();
         let runtime_state = self.service.runtime_state();
 

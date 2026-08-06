@@ -52,6 +52,15 @@ pub struct ClaudeAdapter {
     /// a compaction. Spelled exactly like the `modelUsage` keys
     /// (`"claude-opus-5"`), so it selects the right entry directly.
     current_model: Option<String>,
+    /// request_ids of outstanding `AskUserQuestion` can_use_tool requests, so a
+    /// `control_cancel_request` resolves to the RIGHT event: `AskResolved` for a
+    /// question, `PermissionResolved` for a tool approval. The reducer keeps two
+    /// separate counters and a cancel that decrements the wrong one wedges the
+    /// other at >0 (requires-action never clears). Entries are removed on cancel;
+    /// answered requests are cleared by the conn layer's own pending map — a
+    /// stale leftover here is harmless (set membership only biases WHICH resolve
+    /// event a cancel emits, and ids are unique per control request).
+    ask_requests: std::collections::HashSet<String>,
 }
 
 /// Per-message streaming state for `--include-partial-messages`. Reset on each
@@ -293,8 +302,8 @@ impl ClaudeAdapter {
             // retracts a pending one → `PermissionResolved{request_id}`. Other
             // control subtypes (keep_alive / streamlined_* / elicitation) carry no
             // FSM signal → opaque (the manager declines elicitation on the a-side).
-            "control_request" => Self::parse_control_request(v),
-            "control_cancel_request" => Self::parse_control_cancel_request(v),
+            "control_request" => self.parse_control_request(v),
+            "control_cancel_request" => self.parse_control_cancel_request(v),
             // R5 (009): `--include-partial-messages` wraps the streaming Anthropic
             // events in `stream_event`. The ONE we read is `message_delta`, whose
             // `delta.stop_reason` is the REAL-TIME per-turn boundary — it lands as
@@ -574,7 +583,11 @@ impl ClaudeAdapter {
         // omitting them under-reported the total ~10x on a cache-heavy turn (and was
         // inconsistent with codex, whose native `last.totalTokens` already includes
         // cache). `input_tokens`/`output_tokens` stay the wire's base counts; only
-        // `total_tokens` becomes the genuine total. cost from total_cost_usd.
+        // `total_tokens` becomes the genuine total. cost from total_cost_usd —
+        // the RAW wire value, which is only PROCESS-cumulative (a `--resume`
+        // respawn restarts it); the wrapping conn's CostLedger re-bases it to
+        // session-cumulative before broadcast. The adapter stays a pure frame
+        // parser with no cross-process state.
         if let Some(usage) = v.get("usage").and_then(Value::as_object) {
             let get = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
             let input_tokens = get("input_tokens");
@@ -865,7 +878,7 @@ impl ClaudeAdapter {
     /// control frame. `request_id` is the TOP-LEVEL field (distinct from the
     /// nested `request.tool_use_id`); a frame missing it cannot be answered, so
     /// it degrades to opaque rather than wedging a request we can't resolve.
-    fn parse_control_request(v: &Value) -> Vec<SessionEvent> {
+    fn parse_control_request(&mut self, v: &Value) -> Vec<SessionEvent> {
         let subtype = v
             .get("request")
             .and_then(|r| r.get("subtype"))
@@ -879,6 +892,23 @@ impl ClaudeAdapter {
                     .and_then(|r| r.get("tool_name"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                // AskUserQuestion is NOT a permission — it is the agent asking the
+                // USER a structured question. Route it to its own `Ask` event
+                // (own counter, own answer command; 2026-08-04 ruling). Remember
+                // the request_id so a later control_cancel_request resolves the
+                // matching counter, not the approval one.
+                if tool_name.as_deref() == Some("AskUserQuestion") {
+                    let questions = request
+                        .and_then(|r| r.get("input"))
+                        .and_then(|i| i.get("questions"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    self.ask_requests.insert(request_id.to_string());
+                    return vec![SessionEvent::Ask {
+                        request_id: request_id.to_string(),
+                        questions,
+                    }];
+                }
                 // Carry the raw `input` for EVERY tool. The permission card must show
                 // the user WHAT they are approving (a Bash `command`, a Write target)
                 // — with only `tool_name` the card reads "命令: Bash" and the user
@@ -915,8 +945,15 @@ impl ClaudeAdapter {
     /// requires-action sub-state can clear without a user answer. The host sends
     /// NO control_response for a cancel (the request is gone); the manager drops
     /// the pending card on the a-side.
-    fn parse_control_cancel_request(v: &Value) -> Vec<SessionEvent> {
+    fn parse_control_cancel_request(&mut self, v: &Value) -> Vec<SessionEvent> {
         match v.get("request_id").and_then(Value::as_str) {
+            // A retracted AskUserQuestion resolves the QUESTION counter — emitting
+            // PermissionResolved here would wedge waiting_on_question at >0 forever.
+            Some(id) if !id.is_empty() && self.ask_requests.remove(id) => {
+                vec![SessionEvent::AskResolved {
+                    request_id: id.to_string(),
+                }]
+            }
             Some(id) if !id.is_empty() => vec![SessionEvent::PermissionResolved {
                 request_id: id.to_string(),
                 // claude control_cancel_request retracts a TOOL approval (§9.17).
@@ -996,6 +1033,15 @@ impl BackendAdapter for ClaudeAdapter {
             SessionSpec::Resume(id) => {
                 args.push("--resume".to_string());
                 args.push(id.clone());
+            }
+            SessionSpec::ForkFrom(id) => {
+                // Resume the PARENT session but copy it into a NEW one instead
+                // of appending (`--fork-session`, live help 2.1.221). claude
+                // mints the new id itself and echoes it in `system/init` —
+                // `--session-id` must NOT be combined here.
+                args.push("--resume".to_string());
+                args.push(id.clone());
+                args.push("--fork-session".to_string());
             }
         }
         // Manager-supplied flags (S18: --system-prompt / --mcp-config /
@@ -2049,6 +2095,42 @@ mod tests {
         assert_eq!(gated.get(at + 1).map(String::as_str), Some("summarized"));
     }
 
+    /// Fork spawn: `ForkFrom(parent)` resumes the PARENT session with
+    /// `--fork-session` so claude copies it into a NEW session — and never
+    /// passes `--session-id` (unsupported combination, live help 2.1.221; the
+    /// new id is backend-minted and learned from `system/init`).
+    #[tokio::test]
+    async fn fork_from_spawns_resume_with_fork_session_flag() {
+        use crate::testing::FakeSpawner;
+        let spawner = FakeSpawner::new();
+        let adapter = ClaudeAdapter::new();
+        let _ = adapter
+            .start_turn(
+                &spawner,
+                &SessionSpec::ForkFrom("22222222-2222-4222-8222-222222222222".into()),
+                None,
+                &[],
+                &[],
+                None,
+            )
+            .await;
+        let args = spawner.last_command().await.expect("a spawn was recorded").args;
+        let at = args
+            .iter()
+            .position(|a| a == "--resume")
+            .expect("fork resumes the parent");
+        assert_eq!(
+            args.get(at + 1).map(String::as_str),
+            Some("22222222-2222-4222-8222-222222222222"),
+            "--resume targets the PARENT session id"
+        );
+        assert!(args.iter().any(|a| a == "--fork-session"), "fork adds --fork-session");
+        assert!(
+            !args.iter().any(|a| a == "--session-id"),
+            "--session-id must not be combined with --fork-session, got: {args:?}"
+        );
+    }
+
     /// Helper: drive one `result` NDJSON line through the adapter and return the
     /// `context_window` the emitted `UsageDelta` carries.
     #[cfg(test)]
@@ -2423,25 +2505,31 @@ mod tests {
                 }
             }
         });
-        let events = ClaudeAdapter::parse_control_request(&frame);
+        // 2026-08-04 spec: AskUserQuestion is its OWN Ask event now — asking is
+        // not authorizing. The adapter must route it away from Permission, carry
+        // the bare questions[] array, and remember the request_id so a later
+        // control_cancel_request resolves the QUESTION counter.
+        let mut adapter = ClaudeAdapter::new();
+        let events = adapter.parse_control_request(&frame);
         match events.as_slice() {
-            [
-                SessionEvent::Permission {
-                    request_id,
-                    tool_name,
-                    input,
-                    ..
-                },
-            ] => {
+            [SessionEvent::Ask { request_id, questions }] => {
                 assert_eq!(request_id, "req-q1");
-                assert_eq!(tool_name.as_deref(), Some("AskUserQuestion"));
-                let questions = input.as_ref().expect("AskUserQuestion carries input");
                 assert_eq!(
-                    questions["questions"][0]["question"], "Pick a color",
+                    questions[0]["question"], "Pick a color",
                     "the question text is projected, not dropped"
                 );
+                assert_eq!(
+                    questions[0]["multiSelect"], false,
+                    "multiSelect survives verbatim (the ws relay snake_cases later)"
+                );
             }
-            other => panic!("expected one Permission, got {other:?}"),
+            other => panic!("expected one Ask, got {other:?}"),
+        }
+        // The retract path must resolve the question counter, not the approval one.
+        let cancel = serde_json::json!({ "type": "control_cancel_request", "request_id": "req-q1" });
+        match adapter.parse_control_cancel_request(&cancel).as_slice() {
+            [SessionEvent::AskResolved { request_id }] => assert_eq!(request_id, "req-q1"),
+            other => panic!("expected AskResolved for a retracted ask, got {other:?}"),
         }
     }
 
@@ -2462,7 +2550,7 @@ mod tests {
                 "input": { "command": "rm -rf /" }
             }
         });
-        let events = ClaudeAdapter::parse_control_request(&frame);
+        let events = ClaudeAdapter::new().parse_control_request(&frame);
         match events.as_slice() {
             [SessionEvent::Permission { tool_name, input, .. }] => {
                 assert_eq!(tool_name.as_deref(), Some("Bash"));
@@ -2581,7 +2669,7 @@ mod tests {
     fn parse_control_cancel_request_resolves_permission_or_degrades() {
         // Valid retraction → PermissionResolved.
         let frame = serde_json::json!({ "type": "control_cancel_request", "request_id": "req-9" });
-        match ClaudeAdapter::parse_control_cancel_request(&frame).as_slice() {
+        match ClaudeAdapter::new().parse_control_cancel_request(&frame).as_slice() {
             [SessionEvent::PermissionResolved { request_id, kind }] => {
                 assert_eq!(request_id, "req-9");
                 assert_eq!(
@@ -2599,7 +2687,7 @@ mod tests {
             serde_json::json!({ "type": "control_cancel_request" }),
             serde_json::json!({ "type": "control_cancel_request", "request_id": "" }),
         ] {
-            match ClaudeAdapter::parse_control_cancel_request(&frame).as_slice() {
+            match ClaudeAdapter::new().parse_control_cancel_request(&frame).as_slice() {
                 [SessionEvent::AdapterSpecific { tag, .. }] => {
                     assert_eq!(tag, "control_cancel_request", "unidentifiable cancel stays opaque");
                 }

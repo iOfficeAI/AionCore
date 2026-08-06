@@ -43,6 +43,13 @@ use crate::capability::{
 };
 use crate::event::{PermissionKind, SessionEvent, TurnOutcome};
 
+/// The literal placeholder AionUi's team-creation flow persisted as a member's
+/// model when an assistant had no concrete model (AionUi
+/// `teamCreateModelResolver.ts`, fixed in the paired AionUi change). agy never
+/// reports a model with this id, so it must not pass through the empty-list
+/// "unknown" window below; already-persisted member sessions heal at runtime.
+const UI_PLACEHOLDER_MODEL: &str = "default";
+
 /// Broadcast backlog for a session's event stream. Matches the other backends:
 /// large enough that a slow subscriber does not lose a turn's worth of frames.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -213,6 +220,14 @@ impl BackendConnection for AntigravityConnection {
                 session_id,
                 backend_session_id,
             } => (session_id, backend_session_id),
+            // Product decision: antigravity has no headless fork surface (its
+            // only fork is the interactive TUI `/fork`). Defensive reject — the
+            // fork API already refuses agy via the capability gate.
+            SessionSpec::Fork { .. } => {
+                return Err(BackendError::Transport(
+                    "antigravity does not support session forking".into(),
+                ));
+            }
         };
         // agy reads MCP servers from files only — there is no per-run flag — so
         // the session's servers (team coordination first, then the user's) have
@@ -523,10 +538,24 @@ impl AntigravitySessionBackend {
     ///
     /// Only filters once discovery has actually produced a list; an empty list
     /// means "unknown", not "nothing is valid", so the request passes through.
+    /// The one exception is [`UI_PLACEHOLDER_MODEL`]: it is a known UI
+    /// artifact, never a real agy id, so it is dropped even while the list is
+    /// empty — this heals member sessions persisted before the AionUi fix.
     fn effective_model(&self) -> Option<String> {
         let requested = self.config.model.clone()?;
         let known = self.models.read().ok()?;
-        if known.is_empty() || known.iter().any(|m| m.id == requested) {
+        if known.is_empty() {
+            if requested == UI_PLACEHOLDER_MODEL {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    requested = %requested,
+                    "antigravity: dropping the UI placeholder model while discovery is empty; falling back to agy's default"
+                );
+                return None;
+            }
+            return Some(requested);
+        }
+        if known.iter().any(|m| m.id == requested) {
             return Some(requested);
         }
         tracing::warn!(
@@ -1529,6 +1558,17 @@ mod tests {
         // user's model here would silently ignore a perfectly good choice.
         let b = backend_with_models(&[], Some("gemini-3.1-pro-low"));
         assert_eq!(b.effective_model().as_deref(), Some("gemini-3.1-pro-low"));
+    }
+
+    #[test]
+    fn an_empty_model_list_still_drops_the_ui_placeholder() {
+        // AionUi's team-creation flow used to persist the literal placeholder
+        // "default" as a member's model. agy never reports a model with that
+        // id, so passing it through while discovery is empty fails every turn
+        // with a non-retryable model-not-found; agy's own default is strictly
+        // better. Real ids keep passing through (see the test above).
+        let b = backend_with_models(&[], Some("default"));
+        assert_eq!(b.effective_model(), None);
     }
 
     #[test]

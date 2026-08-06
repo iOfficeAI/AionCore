@@ -131,6 +131,9 @@ mod tests {
     #[test]
     fn test_env_override_log_dir() {
         let dir = resolve_log_dir();
-        assert!(dir.contains("aionui"), "log_dir should contain 'aionui': {dir}");
+        assert!(
+            dir.to_ascii_lowercase().contains("aionui"),
+            "log_dir should contain 'aionui' (case-insensitive): {dir}"
+        );
     }
 }

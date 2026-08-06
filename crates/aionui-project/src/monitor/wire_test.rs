@@ -10,6 +10,10 @@ fn fact(kind: Kind) -> EntryFact {
         kind,
         inode: 7,
         symlink_target: None,
+        // Non-`None` on purpose: the wire-projection tests below assert the
+        // serialized entry carries no mtime, which only proves anything if the
+        // fact going in had one.
+        mtime_ms: Some(1_700_000_000_000),
     }
 }
 
@@ -17,12 +21,11 @@ fn fact(kind: Kind) -> EntryFact {
 
 #[test]
 fn incoming_request_parses_id_method_params() {
-    let v =
-        json!({"jsonrpc":"2.0","id":3,"method":"fs/read","params":{"file":{"pe_id":"pe1","relative_path":"a.txt"}}});
+    let v = json!({"jsonrpc":"2.0","id":3,"method":"fs/mkdir","params":{"dir":{"pe_id":"pe1","relative_path":"a"}}});
     let frame: IncomingFrame = serde_json::from_value(v).unwrap();
     assert_eq!(frame.id, Some(json!(3)));
-    assert_eq!(frame.method, "fs/read");
-    assert_eq!(frame.params["file"]["pe_id"], "pe1");
+    assert_eq!(frame.method, "fs/mkdir");
+    assert_eq!(frame.params["dir"]["pe_id"], "pe1");
 }
 
 #[test]
@@ -46,7 +49,7 @@ fn incoming_missing_method_is_error() {
     assert!(serde_json::from_value::<IncomingFrame>(v).is_err());
 }
 
-// ── params / encoding ─────────────────────────────────────────────────────
+// ── params ──────────────────────────────────────────────────────────────
 
 #[test]
 fn subscribe_params_parse_targets() {
@@ -54,19 +57,6 @@ fn subscribe_params_parse_targets() {
     let p: SubscribeParams = serde_json::from_value(v).unwrap();
     assert_eq!(p.targets.len(), 2);
     assert_eq!(p.targets[1].relative_path, "src");
-}
-
-#[test]
-fn encoding_parses_utf8_and_base64_and_defaults() {
-    assert_eq!(
-        serde_json::from_value::<Encoding>(json!("utf-8")).unwrap(),
-        Encoding::Utf8
-    );
-    assert_eq!(
-        serde_json::from_value::<Encoding>(json!("base64")).unwrap(),
-        Encoding::Base64
-    );
-    assert_eq!(Encoding::default(), Encoding::Utf8);
 }
 
 #[test]
@@ -91,6 +81,9 @@ fn wire_entry_from_fact_maps_kind_and_drops_inode() {
     assert_eq!(v, json!({"name":"a.txt","kind":"file"}));
     // inode is internal and must never appear on the wire.
     assert!(v.get("inode").is_none());
+    // Nor may mtime: it exists only to detect modification, and a subscriber that
+    // fed it back as a write precondition would defeat conflict detection.
+    assert!(v.get("mtime_ms").is_none());
 }
 
 #[test]
@@ -99,6 +92,7 @@ fn wire_entry_symlink_includes_target() {
         kind: Kind::Symlink,
         inode: 1,
         symlink_target: Some("target".to_owned()),
+        mtime_ms: Some(1_700_000_000_000),
     };
     let v = serde_json::to_value(WireEntry::from_fact("link", &ef)).unwrap();
     assert_eq!(v["kind"], "symlink");
@@ -147,6 +141,9 @@ fn delta_params_tags_each_change_op() {
                 from: "a".to_owned(),
                 to: "b".to_owned(),
             },
+            Change::Modified {
+                name: "edited.ts".to_owned(),
+            },
         ],
     };
     let v = delta_params(&delta, &target());
@@ -154,6 +151,11 @@ fn delta_params_tags_each_change_op() {
     assert_eq!(v["changes"][0], json!({"op":"added","name":"new.ts","kind":"file"}));
     assert_eq!(v["changes"][1], json!({"op":"removed","name":"old.ts"}));
     assert_eq!(v["changes"][2], json!({"op":"renamed","from":"a","to":"b"}));
+    // Exact equality, not a field probe: it pins that `modified` carries *only* a
+    // name. A timestamp here would be the value an external write just left, and a
+    // subscriber replaying it as a write precondition would make its own save pass
+    // conflict detection against the edit this op exists to warn about.
+    assert_eq!(v["changes"][3], json!({"op":"modified","name":"edited.ts"}));
 }
 
 // ── frame builders ────────────────────────────────────────────────────────

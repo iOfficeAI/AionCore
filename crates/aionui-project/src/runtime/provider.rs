@@ -10,7 +10,9 @@ use async_trait::async_trait;
 use super::error::FsError;
 
 /// Kind of a directory entry, as the tree model cares about it (name + kind).
-/// Size/mtime are intentionally absent — the tree does not display them.
+/// Size is intentionally absent — the tree does not display it. `mtime` is kept
+/// on [`EntryFact`] for modify detection only, and is likewise never displayed
+/// nor put on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     File,
@@ -19,8 +21,9 @@ pub enum Kind {
 }
 
 /// Backend-internal fact about a single entry. Carries `inode` for same-inode
-/// rename synthesis in the tree model; the outward wire `Entry` (protocol.md)
-/// exposes only name + kind + symlink_target + excluded.
+/// rename synthesis and `mtime_ms` for content-modify detection in the tree
+/// model; the outward wire `Entry` (protocol.md) exposes only name + kind +
+/// symlink_target + excluded — neither field leaves the backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryFact {
     pub kind: Kind,
@@ -29,6 +32,16 @@ pub struct EntryFact {
     pub inode: u64,
     /// Link target when `kind == Symlink`.
     pub symlink_target: Option<String>,
+    /// Last-modified time in milliseconds since the Unix epoch, used only to
+    /// detect that an entry's *content* changed (`Change::Modified`).
+    ///
+    /// `None` when the platform/filesystem cannot supply one — modify detection
+    /// then degrades to "never reports modified" for that entry, the same
+    /// defensive posture as `inode: 0` disabling rename synthesis. Under-report
+    /// is deliberately preferred over over-report: this signal only lights up a
+    /// refresh affordance, and an indicator that changes colour for no reason is
+    /// worse than no indicator at all.
+    pub mtime_ms: Option<i64>,
 }
 
 /// Data operations for one provider scheme. Non-recursive: `read_dir` lists a

@@ -3,6 +3,7 @@ mod system;
 mod types;
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
@@ -247,7 +248,69 @@ async fn install_managed_runtime_with_reporter(
     managed::install_and_validate_with_reporter(reporter).await
 }
 
+// Bounded retry budget for the managed Node `--version` validation probe.
+// A single transient external-process failure (process fails to start, a non-zero
+// exit such as npm exit code 7, or non-semver output) must not be latched into a
+// permanent bundled_resource_invalid failure event. Kept as its own constants
+// (not reused from the copy-activation budget) so probe and copy tuning stay
+// independent; initial values intentionally match MANAGED_NODE_ACTIVATION_COPY_*
+// (managed.rs), covering a worst-case ~1.75s interference window per command.
+const VERSION_PROBE_ATTEMPTS: usize = 3;
+const VERSION_PROBE_BACKOFFS: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_millis(1000),
+];
+
 async fn command_version(command: ResolvedCommand, label: &str) -> Result<semver::Version, NodeRuntimeError> {
+    probe_command_version_with_retry(label, VERSION_PROBE_ATTEMPTS, &VERSION_PROBE_BACKOFFS, || {
+        command_version_once(command.clone(), label)
+    })
+    .await
+}
+
+/// Run the `--version` probe up to `attempts` times, sleeping the matching backoff
+/// after every failed attempt (including the last, so a persistent failure spends
+/// the full ~1.75s window before the verdict — matching `activate_copy_with_retry`
+/// in managed.rs). Every error `command_version_once` can produce is a transient
+/// external-process failure, so all are retried. A `warn` is logged only when a
+/// retry will follow; the final, budget-exhausted failure is intentionally NOT
+/// logged here — its caller (`activate_local_runtime_source`, managed.rs) already
+/// warns on the validation failure, so re-logging would duplicate it.
+async fn probe_command_version_with_retry<F, Fut>(
+    label: &str,
+    attempts: usize,
+    backoffs: &[Duration],
+    mut probe_once: F,
+) -> Result<semver::Version, NodeRuntimeError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<semver::Version, NodeRuntimeError>>,
+{
+    for attempt in 1..=attempts {
+        match probe_once().await {
+            Ok(version) => return Ok(version),
+            Err(error) => {
+                let backoff = backoffs.get(attempt - 1).copied().unwrap_or_default();
+                if attempt == attempts {
+                    tokio::time::sleep(backoff).await;
+                    return Err(error);
+                }
+                warn!(
+                    label,
+                    attempt,
+                    max_attempts = attempts,
+                    error = %error,
+                    "transient node --version probe failure; will retry after backoff"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+    unreachable!("version probe retry loop always returns on the final attempt")
+}
+
+async fn command_version_once(command: ResolvedCommand, label: &str) -> Result<semver::Version, NodeRuntimeError> {
     let mut builder = crate::Builder::from_resolved(&command);
     builder.arg("--version");
     let output = builder
@@ -454,6 +517,105 @@ mod tests {
                 .to_string()
                 .contains("npm returned ambiguous semver version output"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_probe_retries_until_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        let result = probe_command_version_with_retry(
+            "npm",
+            VERSION_PROBE_ATTEMPTS,
+            &[Duration::ZERO, Duration::ZERO, Duration::ZERO],
+            move || {
+                let probe_calls = probe_calls.clone();
+                async move {
+                    let n = probe_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n < 3 {
+                        // The exact transient failure this issue latched: npm exit 7.
+                        Err(NodeRuntimeError::managed_invalid("npm exited with exit code: 7"))
+                    } else {
+                        Ok(semver::Version::new(24, 11, 0))
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            result.expect("probe should succeed after transient failures"),
+            semver::Version::new(24, 11, 0)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "expected 2 transient failures then 1 success"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_probe_succeeds_without_retry_on_first_attempt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        let result =
+            probe_command_version_with_retry("node", VERSION_PROBE_ATTEMPTS, &VERSION_PROBE_BACKOFFS, move || {
+                let probe_calls = probe_calls.clone();
+                async move {
+                    probe_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(semver::Version::new(24, 11, 0))
+                }
+            })
+            .await;
+        assert!(result.is_ok(), "first-attempt success must return Ok");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "success on first attempt must not retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_probe_returns_last_error_after_budget_exhausted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        let result = probe_command_version_with_retry(
+            "npm",
+            VERSION_PROBE_ATTEMPTS,
+            &[Duration::ZERO, Duration::ZERO, Duration::ZERO],
+            move || {
+                let probe_calls = probe_calls.clone();
+                async move {
+                    probe_calls.fetch_add(1, Ordering::SeqCst);
+                    Err::<semver::Version, _>(NodeRuntimeError::managed_invalid("npm exited with exit code: 7"))
+                }
+            },
+        )
+        .await;
+        let error = result.expect_err("exhausted budget must return the final Err");
+        assert!(
+            error.to_string().contains("npm exited with exit code: 7"),
+            "final error must be the last probe error, got: {error}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            VERSION_PROBE_ATTEMPTS,
+            "must attempt exactly the full budget"
+        );
+    }
+
+    #[test]
+    fn version_probe_budget_matches_spec() {
+        assert_eq!(VERSION_PROBE_ATTEMPTS, 3);
+        assert_eq!(
+            VERSION_PROBE_BACKOFFS,
+            [
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_millis(1000),
+            ]
         );
     }
 

@@ -5,7 +5,7 @@
 //! id for pairing a tool's ACTIVE and DONE frames.
 
 use super::version::CODE_STEPS_FAILED;
-use super::wire::{AgyEvent, AgyState, AgyStepType, AgyStepUpdate, AgyUsage};
+use super::wire::{AgyEvent, AgyState, AgyStepType, AgyStepUpdate, AgySubagent, AgyUsage};
 use crate::event::{
     CancelReason, LocalizedText, NoticeLevel, SessionEvent, ToolResultContent, TurnOutcome, UsageBreakdown,
 };
@@ -172,8 +172,28 @@ impl Translator {
         }
     }
 
+    /// Stable id for the step's tool card.
+    ///
+    /// NAMESPACED by agy's conversation id, because `messages.id` is unique
+    /// across the whole database while `step_index` only counts within one agy
+    /// conversation. Bare `step-<n>` collided the moment a second conversation
+    /// reached the same index — observed 52 times in one log
+    /// ("Duplicate record: Message with id 'step-6' already exists outside the
+    /// requested conversation"), which silently dropped the tool card for every
+    /// conversation after the first to use that number.
+    ///
+    /// Falls back to the bare form only before `init` has bound a session id,
+    /// where there is nothing to namespace with and no second conversation to
+    /// collide against yet.
+    fn step_id(&self, step_index: u64) -> String {
+        match self.backend_session_id.as_deref() {
+            Some(session) => format!("{session}-step-{step_index}"),
+            None => format!("step-{step_index}"),
+        }
+    }
+
     fn translate_step(&mut self, su: AgyStepUpdate) -> Vec<SessionEvent> {
-        let id = format!("step-{}", su.step_index);
+        let id = self.step_id(su.step_index);
         let mut out = Vec::new();
 
         match su.step_type {
@@ -232,6 +252,35 @@ impl Translator {
             }
             // Pure bookkeeping frames: agy echoes the user turn, checkpoints and
             // system notices as steps. They carry no user-visible content.
+            // A subagent dispatch is work the user should be able to watch. agy
+            // pairs ACTIVE/DONE on one step index, so it maps onto the
+            // tool-call shape the frontend already renders — no new surface.
+            //
+            // The DONE frame carries no result: agy folds the subagent's answer
+            // into its own prose. The card therefore settles empty rather than
+            // inventing an output it was never given.
+            AgyStepType::Subagent => {
+                let agents = su.subagent_info.map(|i| i.subagents).unwrap_or_default();
+                match su.state {
+                    AgyState::Active => out.push(SessionEvent::ToolCall {
+                        tool_use_id: id,
+                        name: subagent_display_name(&agents),
+                        subagent: Default::default(),
+                        input: subagent_input(&agents),
+                        parent_tool_use_id: None,
+                    }),
+                    AgyState::Done | AgyState::Error => out.push(SessionEvent::ToolResult {
+                        tool_use_id: id,
+                        is_error: su.state == AgyState::Error,
+                        content: Vec::new(),
+                        parent_tool_use_id: None,
+                    }),
+                    // A state this build does not know is not evidence the
+                    // dispatch started or finished; settling the card on it
+                    // would report an outcome agy never sent.
+                    AgyState::Unknown => {}
+                }
+            }
             // Counted, not rendered: the frame carries no message, tool name or
             // cause (only `duration_seconds`), so there is nothing truthful to
             // put on screen per-step. The count is what makes the turn's
@@ -249,6 +298,44 @@ impl Translator {
         }
         out
     }
+}
+
+/// Card title for a subagent dispatch.
+///
+/// `role` is agy's own description of the job ("File Counter") and is what a
+/// reader wants; `type_name` ("research") is the template behind it and only
+/// stands in when there is no role. A batch is summarised by count instead of
+/// concatenated, which would overflow the card.
+fn subagent_display_name(agents: &[AgySubagent]) -> String {
+    match agents {
+        [] => "subagent".to_owned(),
+        [one] => {
+            let label = [one.role.trim(), one.type_name.trim()]
+                .into_iter()
+                .find(|v| !v.is_empty())
+                .unwrap_or("subagent");
+            format!("subagent: {label}")
+        }
+        many => format!("{} subagents", many.len()),
+    }
+}
+
+/// What the card shows when expanded. agy's internal handles
+/// (`conversation_id`, `log_uri`) are deliberately left out: they point into
+/// its private brain directory and mean nothing to the user.
+fn subagent_input(agents: &[AgySubagent]) -> serde_json::Value {
+    serde_json::Value::Array(
+        agents
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "type": a.type_name,
+                    "role": a.role,
+                    "prompt": a.initial_prompt,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn usage_delta(u: &AgyUsage) -> SessionEvent {
@@ -493,6 +580,98 @@ mod tests {
         // Only the auth case is recognised; inventing explanations for other
         // failures would mislead.
         assert_eq!(explain_turn_error("disk quota exceeded"), "disk quota exceeded");
+    }
+
+    /// Captured from agy 1.1.10 (trimmed to the fields we read).
+    const SUBAGENT_ACTIVE: &str = r#"{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"subagent","subagent_info":{"subagents":[{"type_name":"research","role":"File Counter","initial_prompt":"Count the files.","conversation_id":"108d172f","log_uri":"file:///brain/log"}]}}}"#;
+    const SUBAGENT_DONE: &str = r#"{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"subagent","duration_seconds":0.06,"subagent_info":{"subagents":[{"type_name":"research","role":"File Counter","initial_prompt":"Count the files.","conversation_id":"108d172f","log_uri":"file:///brain/log"}]}}}"#;
+
+    #[test]
+    fn tool_ids_do_not_collide_across_conversations() {
+        // `messages.id` is unique across the whole database, but `step_index`
+        // only counts within one agy conversation. A bare `step-<n>` therefore
+        // collided as soon as a second conversation reached the same index:
+        // "Duplicate record: Message with id 'step-6' already exists outside
+        // the requested conversation" — 52 of them in one log, each a tool card
+        // silently dropped. Every existing test drove a single Translator, so
+        // none of them could see it.
+        let tool_step = r#"{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{}}}}"#;
+        let id_in = |conv: &str| {
+            let init = format!(r#"{{"event":"init","conversation_id":"{conv}","init":{{"cwd":"/w"}}}}"#);
+            let (_, evs) = tr(&[&init, tool_step]);
+            evs.iter()
+                .find_map(|e| match e {
+                    SessionEvent::ToolCall { tool_use_id, .. } => Some(tool_use_id.clone()),
+                    _ => None,
+                })
+                .expect("tool call")
+        };
+        assert_ne!(
+            id_in("conv-a"),
+            id_in("conv-b"),
+            "the same step index in two conversations must not produce the same message id"
+        );
+    }
+
+    #[test]
+    fn a_subagent_dispatch_is_visible_as_a_tool_call() {
+        // Before this arm the step fell to `Unknown` and the dispatch was
+        // dropped: the user saw only whatever prose agy wrote afterwards, with
+        // no sign that work had been handed to a subagent at all.
+        let (_, evs) = tr(&[SUBAGENT_ACTIVE, SUBAGENT_DONE]);
+        let (name, input) = evs
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::ToolCall { name, input, .. } => Some((name.clone(), input.clone())),
+                _ => None,
+            })
+            .expect("a dispatch must open a card");
+        // The role is the human-written job description; the template name is
+        // not what a reader is looking for.
+        assert!(name.contains("File Counter"), "{name}");
+        assert!(
+            input.to_string().contains("Count the files."),
+            "the prompt the subagent was given must be inspectable: {input}"
+        );
+        // agy's private handles are not the user's business.
+        let rendered = format!("{name}{input}");
+        assert!(
+            !rendered.contains("108d172f") && !rendered.contains("brain/log"),
+            "{rendered}"
+        );
+
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, SessionEvent::ToolResult { is_error: false, .. })),
+            "the card must settle, or it spins forever: {evs:?}"
+        );
+    }
+
+    #[test]
+    fn a_batch_dispatch_is_summarised_not_concatenated() {
+        let two = r#"{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"subagent","subagent_info":{"subagents":[{"role":"A"},{"role":"B"}]}}}"#;
+        let (_, evs) = tr(&[two]);
+        let name = evs
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::ToolCall { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .expect("card");
+        assert_eq!(name, "2 subagents");
+    }
+
+    #[test]
+    fn a_dispatch_without_details_still_opens_a_card() {
+        // Never drop the signal because a field is missing: that is how the
+        // whole step type went unnoticed in the first place.
+        let bare = r#"{"event":"step_update","step_update":{"step_index":7,"state":"ACTIVE","step_type":"subagent"}}"#;
+        let (_, evs) = tr(&[bare]);
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, SessionEvent::ToolCall { name, .. } if name == "subagent")),
+            "{evs:?}"
+        );
     }
 
     #[test]

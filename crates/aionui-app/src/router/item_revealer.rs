@@ -23,15 +23,25 @@ impl ShellItemRevealer {
 #[async_trait::async_trait]
 impl IItemRevealer for ShellItemRevealer {
     async fn reveal(&self, absolute_path: &str) -> Result<(), FileError> {
-        self.shell
-            .show_item_in_folder(absolute_path)
-            .await
-            .map_err(|err| match err {
-                // The target path is gone → NotFound, so the client distinguishes
+        self.shell.show_item_in_folder(absolute_path).await.map_err(|err| {
+            // Classification only — never the path or the shell's message. The
+            // caller addressed this by `{pe_id, relative_path}`, so the absolute
+            // path was produced server-side and must not travel back out. Both
+            // arms deliberately discard their payload; the cause is logged here
+            // instead of being carried in the error.
+            match err {
+                // The target path is gone → not-found, so the client distinguishes
                 // "item no longer exists" from "couldn't open the file manager".
-                ShellError::FileNotFound(path) | ShellError::DirectoryNotFound(path) => FileError::NotFound(path),
-                other => FileError::RevealFailed(other.to_string()),
-            })
+                ShellError::FileNotFound(path) | ShellError::DirectoryNotFound(path) => {
+                    tracing::warn!(target: "reveal", path = %path, "reveal target does not exist");
+                    FileError::TargetNotFound
+                }
+                other => {
+                    tracing::error!(target: "reveal", error = %other, "reveal command failed");
+                    FileError::RevealFailed("shell reveal command failed".to_owned())
+                }
+            }
+        })
     }
 }
 

@@ -284,6 +284,7 @@ mod tests {
         Confirmation {
             id: call_id.to_owned(),
             call_id: call_id.to_owned(),
+            questions: None,
             title: Some("Write file".to_owned()),
             action: None,
             description: "Write /tmp/current_time.txt".to_owned(),

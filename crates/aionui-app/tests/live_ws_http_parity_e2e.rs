@@ -764,3 +764,264 @@ async fn live_claude_workflow_cancel_recovers_conversation() {
         reply_text.chars().take(60).collect::<String>()
     );
 }
+
+/// LIVE proof that a running workflow is actually VISIBLE.
+///
+/// Everything a workflow does after launch arrives only as `system/task_*`
+/// frames, which the pump used to consume silently — the conversation showed
+/// nothing for the whole flight. The unit tests drive synthetic events; only this
+/// one proves the real CLI's frames reach the WebSocket as renderable rows.
+///
+/// The assertion deliberately requires the roster to CHANGE across frames: a
+/// single static frame would also satisfy "something was sent" while still
+/// leaving the user staring at a frozen card.
+#[tokio::test]
+#[ignore = "spawns the real claude CLI; needs credentials"]
+async fn live_claude_workflow_progress_streams() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "aionui_ai_agent=debug,aionui_session=info",
+        ))
+        .try_init();
+    let app = start_live_app().await;
+
+    let ws_dir = std::env::temp_dir().join(format!("live-wf-progress-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/conversations",
+        json!({
+            "type": "acp",
+            "extra": {"workspace": ws_dir.to_string_lossy(), "backend": "claude"}
+        }),
+    )
+    .await;
+    let conv_id = created["data"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("conversation create failed: {created}"))
+        .to_owned();
+    println!("[wf-progress] conversation {conv_id} workspace {}", ws_dir.display());
+
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+
+    // Two agents so the roster has something to show, and long enough that the
+    // progress stream spans many frames.
+    let sent = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "用 Workflow 工具启动一个 workflow：一个 phase「Run」，两个 agent 并行，\
+            每个 agent 各自执行 sleep 20（睡 20 秒）。用后台方式启动（run_in_background），\
+            启动后立刻回复我「已启动」，不要等待它完成。"}),
+    )
+    .await;
+    assert!(sent["data"]["turn_id"].is_string(), "send failed: {sent}");
+
+    let mut confirmed: BTreeSet<String> = BTreeSet::new();
+    let started = Instant::now();
+    // Distinct roster snapshots seen, in arrival order.
+    let mut rosters: Vec<String> = Vec::new();
+    let mut cards: Vec<Value> = Vec::new();
+
+    while started.elapsed() < Duration::from_secs(180) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        auto_confirm_permissions(&app, &conv_id, &snapshot, &mut confirmed).await;
+        rosters.clear();
+        cards.clear();
+        for f in stream_frames_for(&snapshot, &conv_id) {
+            match f["data"]["type"].as_str().unwrap_or("") {
+                "tool_group" => {
+                    let serialized = f["data"]["data"].to_string();
+                    if rosters.last() != Some(&serialized) {
+                        rosters.push(serialized);
+                    }
+                }
+                "tool_call" if f["data"]["data"]["name"] == "Workflow" => cards.push(f["data"]["data"].clone()),
+                _ => {}
+            }
+        }
+        // Enough evidence: the roster moved at least once and the workflow ended.
+        let settled = rosters.last().is_some_and(|r| !r.contains("Executing"));
+        if rosters.len() >= 2 && settled {
+            break;
+        }
+    }
+
+    assert!(
+        rosters.len() >= 2,
+        "[wf-progress] the roster must stream and CHANGE while the workflow runs; saw {} distinct snapshot(s)",
+        rosters.len()
+    );
+    // claude's OWN `tool_use` frame for the Workflow call is also a tool_call
+    // named "Workflow" — it carries the script but no headline. The progress
+    // projections are the ones with a description, so filter to those before
+    // asserting anything about headlines.
+    let progress_cards: Vec<&Value> = cards
+        .iter()
+        .filter(|c| c["description"].as_str().is_some_and(|d| !d.is_empty()))
+        .collect();
+    assert!(
+        !progress_cards.is_empty(),
+        "[wf-progress] the container row must be re-emitted with a live headline; saw only {} raw tool_call frame(s)",
+        cards.len()
+    );
+    // Identity fields must survive every projection — losing `name`/`args` would
+    // blank the persisted row (the DB merges with JSON merge-patch).
+    for card in &progress_cards {
+        assert_eq!(card["name"], "Workflow", "[wf-progress] name must survive: {card}");
+        assert!(
+            card["args"]["script"].is_string(),
+            "[wf-progress] args must be re-sent or merge-patch deletes them: {card}"
+        );
+    }
+
+    // Show what the user would actually see, so the rendering can be judged from
+    // a real run rather than a unit fixture.
+    if let Some(head) = progress_cards.last() {
+        println!(
+            "\n[wf-progress] ── container row ──\n  ▸ {}   {}",
+            head["name"].as_str().unwrap_or(""),
+            head["description"].as_str().unwrap_or("")
+        );
+        if let Some(out) = head["output"].as_str() {
+            println!("[wf-progress] ── expanded ──");
+            for line in out.lines() {
+                println!("  {line}");
+            }
+        }
+    }
+    if let Some(final_roster) = rosters.last()
+        && let Ok(rows) = serde_json::from_str::<Vec<Value>>(final_roster)
+    {
+        println!("[wf-progress] ── agent rows ──");
+        for r in rows {
+            println!(
+                "  {:<10} {:<14} {}",
+                r["status"].as_str().unwrap_or("?"),
+                r["name"].as_str().unwrap_or("?"),
+                r["description"].as_str().unwrap_or("")
+            );
+        }
+    }
+
+    let last = rosters.last().unwrap();
+    assert!(
+        !last.contains("Executing"),
+        "[wf-progress] no agent row may still be Executing after the workflow ends: {last}"
+    );
+    // The status vocabulary must be tool_group's PascalCase — snake_case would
+    // miss every arm of normalizeToolGroupStatus and pin the rows to a spinner.
+    assert!(
+        last.contains("Success") || last.contains("Canceled") || last.contains("Error"),
+        "[wf-progress] terminal rows must use the tool_group status vocabulary: {last}"
+    );
+    println!(
+        "[wf-progress] ✅ {} roster updates, {} container updates",
+        rosters.len(),
+        cards.len()
+    );
+}
+
+/// PROBE, not a contract test: drive real codex (app-server) through our full
+/// stack and RECORD what background/collab work looks like on the wire — which
+/// SessionEvents arrive, whether anything arrives after the turn's finish, and
+/// what the out-of-turn watcher does with it. codex's background/collab frames
+/// are unsampled territory; this prints facts instead of asserting shapes.
+#[tokio::test]
+#[ignore = "spawns the real codex CLI; needs credentials"]
+async fn live_codex_background_work_probe() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "aionui_ai_agent=debug,aionui_session=debug,aionui_conversation=info",
+        ))
+        .try_init();
+    let app = start_live_app().await;
+
+    let ws_dir = std::env::temp_dir().join(format!("live-codex-bg-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/conversations",
+        json!({
+            "type": "acp",
+            "extra": {"workspace": ws_dir.to_string_lossy(), "backend": "codex"}
+        }),
+    )
+    .await;
+    let conv_id = created["data"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("conversation create failed: {created}"))
+        .to_owned();
+    println!("[codex-bg] conversation {conv_id} workspace {}", ws_dir.display());
+
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+
+    // Ask for BOTH shapes in one turn: a collab sub-agent and a long shell
+    // command, launched without waiting. Whatever codex actually does — spawn,
+    // refuse, run inline — is the data we came for.
+    let sent = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "请派一个协作 sub-agent(collab agent),让它执行 `sleep 40 && echo CODEX_AGENT_DONE` 然后汇报。\
+            派出去之后立刻回复我「已派出」,不要等它完成。如果你还能把 shell 命令放到后台执行,也用后台方式跑一个 `sleep 30 && echo CODEX_BG_DONE`。"}),
+    )
+    .await;
+    assert!(sent["data"]["turn_id"].is_string(), "send failed: {sent}");
+
+    let started = Instant::now();
+    let mut finish_at: Option<Duration> = None;
+    let mut printed = 0usize;
+    while started.elapsed() < Duration::from_secs(150) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        let stream: Vec<&Value> = stream_frames_for(&snapshot, &conv_id);
+        // Print frames incrementally with elapsed + post-finish marker.
+        for f in stream.iter().skip(printed) {
+            let ftype = f["data"]["type"].as_str().unwrap_or("?");
+            let brief = match ftype {
+                "text" | "content" => f["data"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect::<String>(),
+                "tool_call" => format!(
+                    "{} {} {}",
+                    f["data"]["data"]["name"].as_str().unwrap_or("?"),
+                    f["data"]["data"]["status"].as_str().unwrap_or("?"),
+                    f["data"]["data"]["description"].as_str().unwrap_or("")
+                ),
+                "tool_group" => f["data"]["data"].to_string().chars().take(90).collect(),
+                _ => String::new(),
+            };
+            let tag = if finish_at.is_some() { "POST-FINISH" } else { "" };
+            println!(
+                "[codex-bg] +{:5.1}s {tag:11} {ftype:14} {brief}",
+                started.elapsed().as_secs_f32()
+            );
+            if ftype == "finish" && finish_at.is_none() {
+                finish_at = Some(started.elapsed());
+            }
+        }
+        printed = stream.len();
+        // Keep listening well past the finish: the whole point is what (if
+        // anything) arrives once the turn is over.
+        if let Some(f) = finish_at
+            && started.elapsed() > f + Duration::from_secs(60)
+        {
+            break;
+        }
+    }
+    println!(
+        "[codex-bg] done: {} frames, finish at {:?}",
+        printed,
+        finish_at.map(|d| d.as_secs_f32())
+    );
+    assert!(printed > 0, "[codex-bg] no frames at all — probe produced nothing");
+}

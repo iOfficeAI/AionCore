@@ -116,8 +116,8 @@ dependencies = [
 
 [[package]]
 name = "aion-agent"
-version = "0.2.8"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.8#4bd4f3254f6d875f122b648dd55116516c380d31"
+version = "0.2.10"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.10#4cf42f2d5d0a04d44462bda3df7c1ed66c03be81"
 dependencies = [
  "aion-compact",
  "aion-config",
@@ -147,8 +147,8 @@ dependencies = [
 
 [[package]]
 name = "aion-compact"
-version = "0.2.8"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.8#4bd4f3254f6d875f122b648dd55116516c380d31"
+version = "0.2.10"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.10#4cf42f2d5d0a04d44462bda3df7c1ed66c03be81"
 dependencies = [
  "regex",
  "serde",
@@ -159,8 +159,8 @@ dependencies = [
 
 [[package]]
 name = "aion-config"
-version = "0.2.8"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.8#4bd4f3254f6d875f122b648dd55116516c380d31"
+version = "0.2.10"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.10#4cf42f2d5d0a04d44462bda3df7c1ed66c03be81"
 dependencies = [
  "aion-compact",
  "aion-process",
@@ -184,8 +184,8 @@ dependencies = [
 
 [[package]]
 name = "aion-mcp"
-version = "0.2.8"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.8#4bd4f3254f6d875f122b648dd55116516c380d31"
+version = "0.2.10"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.10#4cf42f2d5d0a04d44462bda3df7c1ed66c03be81"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -205,8 +205,8 @@ dependencies = [
 
 [[package]]
 name = "aion-memory"
-version = "0.2.8"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.8#4bd4f3254f6d875f122b648dd55116516c380d31"
+version = "0.2.10"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.10#4cf42f2d5d0a04d44462bda3df7c1ed66c03be81"
 dependencies = [
  "aion-config",
  "chrono",
@@ -219,8 +219,8 @@ dependencies = [
 
 [[package]]
 name = "aion-process"
-version = "0.2.8"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.8#4bd4f3254f6d875f122b648dd55116516c380d31"
+version = "0.2.10"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.10#4cf42f2d5d0a04d44462bda3df7c1ed66c03be81"
 dependencies = [
  "libc",
  "tokio",
@@ -230,8 +230,8 @@ dependencies = [
 
 [[package]]
 name = "aion-protocol"
-version = "0.2.8"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.8#4bd4f3254f6d875f122b648dd55116516c380d31"
+version = "0.2.10"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.10#4cf42f2d5d0a04d44462bda3df7c1ed66c03be81"
 dependencies = [
  "aion-types",
  "serde",
@@ -243,8 +243,8 @@ dependencies = [
 
 [[package]]
 name = "aion-providers"
-version = "0.2.8"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.8#4bd4f3254f6d875f122b648dd55116516c380d31"
+version = "0.2.10"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.10#4cf42f2d5d0a04d44462bda3df7c1ed66c03be81"
 dependencies = [
  "aion-config",
  "aion-types",
@@ -272,8 +272,8 @@ dependencies = [
 
 [[package]]
 name = "aion-skills"
-version = "0.2.8"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.8#4bd4f3254f6d875f122b648dd55116516c380d31"
+version = "0.2.10"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.10#4cf42f2d5d0a04d44462bda3df7c1ed66c03be81"
 dependencies = [
  "aion-config",
  "aion-mcp",
@@ -299,8 +299,8 @@ dependencies = [
 
 [[package]]
 name = "aion-tools"
-version = "0.2.8"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.8#4bd4f3254f6d875f122b648dd55116516c380d31"
+version = "0.2.10"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.10#4cf42f2d5d0a04d44462bda3df7c1ed66c03be81"
 dependencies = [
  "aion-config",
  "aion-process",
@@ -321,8 +321,8 @@ dependencies = [
 
 [[package]]
 name = "aion-types"
-version = "0.2.8"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.8#4bd4f3254f6d875f122b648dd55116516c380d31"
+version = "0.2.10"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.10#4cf42f2d5d0a04d44462bda3df7c1ed66c03be81"
 dependencies = [
  "async-trait",
  "base64",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-ai-agent"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "agent-client-protocol",
  "aion-agent",
@@ -361,11 +361,13 @@ dependencies = [
  "dashmap",
  "dirs",
  "ed25519-dalek",
+ "fs2",
  "futures-util",
  "getrandom 0.2.17",
  "hex",
  "http 1.4.0",
  "libc",
+ "mime_guess",
  "regex",
  "rusqlite",
  "serde",
@@ -385,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-api-types"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-common",
  "serde",
@@ -394,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-app"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aion-config",
  "aionui-ai-agent",
@@ -453,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assets"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-common",
  "axum",
@@ -468,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assistant"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -494,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-auth"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -519,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-channel"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -551,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-common"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -568,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-conversation"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -599,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-cron"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -628,7 +630,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-db"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-common",
  "async-trait",
@@ -644,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-extension"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -677,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-file"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -699,6 +701,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "walkdir",
@@ -707,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-mcp"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -735,12 +738,14 @@ dependencies = [
 
 [[package]]
 name = "aionui-office"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
  "aionui-common",
+ "aionui-db",
  "aionui-file",
+ "aionui-project",
  "aionui-realtime",
  "aionui-runtime",
  "async-trait",
@@ -761,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-process"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-common",
  "aionui-runtime",
@@ -781,7 +786,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-project"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -791,6 +796,7 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "git2",
  "http-body-util",
  "ignore",
  "notify",
@@ -801,12 +807,13 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "trash",
  "url",
 ]
 
 [[package]]
 name = "aionui-realtime"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-api-types",
  "axum",
@@ -821,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-runtime"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "dirs",
  "flate2",
@@ -847,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-session"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-common",
  "aionui-process",
@@ -867,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-shell"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -899,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-system"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -929,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-team"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "agent-client-protocol",
  "aionui-ai-agent",
@@ -958,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-team-prompts"
-version = "0.1.56"
+version = "0.1.61"
 dependencies = [
  "aionui-api-types",
  "serde",
@@ -3124,6 +3131,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-range-header"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9171a2ea8a68358193d15dd5d70c1c10a2afc3e7e4c5bc92bc9f025cebd7359c"
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3218,7 +3231,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -3928,6 +3941,31 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "url",
+]
+
+[[package]]
+name = "objc2"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
+dependencies = [
+ "objc2-encode",
+]
+
+[[package]]
+name = "objc2-encode"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
+
+[[package]]
+name = "objc2-foundation"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
+dependencies = [
+ "bitflags",
+ "objc2",
 ]
 
 [[package]]
@@ -5844,11 +5882,19 @@ checksum = "68d6fdd9f81c2819c9a8b0e0cd91660e7746a8e6ea2ba7c6b2b057985f6bcb51"
 dependencies = [
  "bitflags",
  "bytes",
+ "futures-core",
  "futures-util",
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
+ "http-range-header",
+ "httpdate",
+ "mime",
+ "mime_guess",
+ "percent-encoding",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",
@@ -5954,6 +6000,24 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "trash"
+version = "5.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7602e0c7d66ec2d92a8c917219fbc7894039efa2063b9064260110828a356f46"
+dependencies = [
+ "chrono",
+ "libc",
+ "log",
+ "objc2",
+ "objc2-foundation",
+ "once_cell",
+ "percent-encoding",
+ "scopeguard",
+ "urlencoding",
+ "windows",
 ]
 
 [[package]]
@@ -6413,16 +6477,49 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
+name = "windows"
+version = "0.56.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1de69df01bdf1ead2f4ac895dc77c9351aefff65b2f3db429a343f9cbf05e132"
+dependencies = [
+ "windows-core 0.56.0",
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-core"
+version = "0.56.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4698e52ed2d08f8658ab0c39512a7c00ee5fe2688c65f8c0a4f06750d729f2a6"
+dependencies = [
+ "windows-implement 0.56.0",
+ "windows-interface 0.56.0",
+ "windows-result 0.1.2",
+ "windows-targets 0.52.6",
+]
+
+[[package]]
 name = "windows-core"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
 dependencies = [
- "windows-implement",
- "windows-interface",
+ "windows-implement 0.60.2",
+ "windows-interface 0.59.3",
  "windows-link",
- "windows-result",
+ "windows-result 0.4.1",
  "windows-strings",
+]
+
+[[package]]
+name = "windows-implement"
+version = "0.56.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6fc35f58ecd95a9b71c4f2329b911016e6bec66b3f2e6a4aad86bd2e99e2f9b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6430,6 +6527,17 @@ name = "windows-implement"
 version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "windows-interface"
+version = "0.56.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08990546bf4edef8f431fa6326e032865f27138718c587dc21bc0265bbcb57cc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6452,6 +6560,15 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-result"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e383302e8ec8515204254685643de10811af0ed97ea37210dc26fb0032647f8"
+dependencies = [
+ "windows-targets 0.52.6",
+]
 
 [[package]]
 name = "windows-result"
@@ -6846,7 +6963,7 @@ dependencies = [
 [[package]]
 name = "workspace-hack"
 version = "0.1.0"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.8#4bd4f3254f6d875f122b648dd55116516c380d31"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.10#4cf42f2d5d0a04d44462bda3df7c1ed66c03be81"
 dependencies = [
  "bitflags",
  "cc",
@@ -6855,8 +6972,8 @@ dependencies = [
  "futures-sink",
  "futures-task",
  "futures-util",
- "getrandom 0.2.17",
  "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "hyper",
  "hyper-rustls",
  "hyper-util",

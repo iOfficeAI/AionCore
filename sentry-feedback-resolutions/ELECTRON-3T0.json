@@ -1,0 +1,16 @@
+{
+  "case": "ELECTRON-3T0",
+  "sentry_link": "https://iofficeai.sentry.io/issues/137477235/",
+  "status": "candidate-fixed",
+  "fixed_by": [
+    "https://github.com/iOfficeAI/AionCore/pull/722"
+  ],
+  "fix_version": "aioncore next release after 0.1.54",
+  "verification": "root cause reproduced once against a real v0.1.52 DB (timing-sensitive; not deterministic in CI); upgrade-semantics regression + scenario-2 lenient-decrypt tests green; full verification = Sentry non-recurrence after fix ships",
+  "root_cause_summary": "REVISED (initially mis-filed as environment issue): migration 030 rebuilds `users` on the same pool that serves startup; a pre-DDL connection's stale statement-cache/schema snapshot mis-decoded the first post-migration users read (sqlx panic 'len 9 index 9'), startup saw 'no system user', silently generated a NEW jwt secret, and the derived AES key could no longer decrypt any stored credential (providers, channel configs, remote agents). Credentials saved during the broken session were encrypted under the in-memory-only wrong key and became permanently undecryptable after the self-healing restart. The 502 fetch-models errors were a secondary mix (local vivo-intranet gateways + new-key rows). Fix: fresh pool after migrations + refuse silent secret generation when the user row exists + lenient provider-list decryption so affected users can re-enter keys.",
+  "diagnostics_changed": false,
+  "report_path": "unknown",
+  "ledger_sidecar": "unknown",
+  "updated_at": "2026-07-30",
+  "needs_report_reconcile": false
+}

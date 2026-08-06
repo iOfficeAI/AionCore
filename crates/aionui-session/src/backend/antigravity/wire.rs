@@ -41,6 +41,12 @@ pub(crate) enum AgyStepType {
     /// PreToolUse hook answering `deny`: four `error_message` steps, terminal
     /// `SUCCESS`, reply "DONE", and the file never written).
     ErrorMessage,
+    /// agy dispatched one or more subagents. Verified on 1.1.10: the step
+    /// carries `subagent_info.subagents[]` and pairs ACTIVE/DONE like a tool,
+    /// but is NOT a `tool` step — without this variant it fell to `Unknown`
+    /// and the whole dispatch was invisible, leaving only whatever prose agy
+    /// happened to write about it.
+    Subagent,
     #[serde(other)]
     Unknown,
 }
@@ -83,12 +89,35 @@ pub(crate) struct AgyToolInfo {
     pub error: Option<AgyToolError>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct AgySubagentInfo {
+/// One subagent agy dispatched.
+///
+/// `conversation_id` is the SUBAGENT's own agy conversation and `log_uri`
+/// points into agy's private brain directory — kept for diagnosis, never
+/// surfaced: they are agy-internal handles a user cannot act on.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct AgySubagent {
+    #[serde(default)]
+    pub type_name: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub initial_prompt: String,
     #[serde(default)]
     pub conversation_id: String,
     #[serde(default)]
     pub log_uri: Option<String>,
+}
+
+/// Payload of a `subagent` step.
+///
+/// The dispatch is a LIST: agy fans out several at once. An earlier shape here
+/// modelled a single `{conversation_id, log_uri}` and had no consumer, so it
+/// never showed the mismatch — verified against 1.1.10, the frame is
+/// `subagent_info.subagents[]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct AgySubagentInfo {
+    #[serde(default)]
+    pub subagents: Vec<AgySubagent>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

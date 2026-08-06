@@ -75,5 +75,5 @@ pub use sqlite_settings::SqliteSettingsRepository;
 pub use sqlite_skill::SqliteSkillRepository;
 pub use sqlite_team::SqliteTeamRepository;
 pub use sqlite_user::SqliteUserRepository;
-pub use team::ITeamRepository;
+pub use team::{ActivityCursor, ITeamRepository, PageDirection};
 pub use user::IUserRepository;

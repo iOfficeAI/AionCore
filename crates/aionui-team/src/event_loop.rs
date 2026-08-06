@@ -368,7 +368,7 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
 }
 
 async fn finalize_scheduler_turn(ctx: &AgentLoopContext) {
-    match ctx.scheduler.finalize_turn(&ctx.slot_id, &[]).await {
+    match ctx.scheduler.finalize_turn(&ctx.slot_id).await {
         Ok(Some(wake_target)) if wake_target != ctx.slot_id => {
             if let Err(error) = ctx
                 .session

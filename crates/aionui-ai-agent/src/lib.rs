@@ -19,6 +19,7 @@ pub mod manager;
 /// conversation's configured MCP servers into the SDK-free `SessionMcpServer`
 /// shape the `SessionBackend` stack carries in `SessionConfig.init.mcp_servers`.
 pub mod mcp_resolve;
+pub mod media;
 pub(crate) mod persistence;
 pub mod protocol;
 pub mod registry;
@@ -30,7 +31,9 @@ pub mod session_agent;
 pub mod session_context;
 pub mod shared_kernel;
 pub mod task_manager;
+pub mod terminal;
 pub mod types;
+mod workflow_progress;
 
 pub use active_lease::{ACTIVE_LEASE_TTL_MS, ActiveLeaseRegistry};
 pub use agent_runtime::AgentRuntime;

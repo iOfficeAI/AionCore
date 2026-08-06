@@ -65,6 +65,7 @@ pub fn row_to_response_with_extra(
     Ok(ConversationResponse {
         id: row.id,
         name: row.name,
+        name_source: row.name_source,
         r#type: agent_type,
         model,
         status,
@@ -75,6 +76,10 @@ pub fn row_to_response_with_extra(
         channel_chat_id: row.channel_chat_id,
         assistant: None,
         project_id: row.project_id,
+        // Detail-path post-fill only (see `attach_fork_capability`); convert
+        // stays a pure mapper with no repo access.
+        fork_capability: None,
+        prompt_capability: None,
         created_at: row.created_at,
         modified_at: row.updated_at,
         extra,
@@ -157,6 +162,7 @@ pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, Conve
         status,
         hidden: row.hidden,
         created_at: row.created_at,
+        backend_turn_id: row.backend_turn_id,
     })
 }
 
@@ -295,6 +301,7 @@ pub fn search_row_to_item(row: MessageSearchRow, data_dir: &Path) -> Result<Mess
         updated_at: row.conversation_updated_at,
         project_id: None,
         folder_id: None,
+        name_source: None,
     };
 
     let conversation = row_to_response(conversation_row, data_dir)?;
@@ -338,6 +345,7 @@ mod tests {
             updated_at: 2000,
             project_id: None,
             folder_id: None,
+            name_source: None,
         }
     }
 
@@ -410,6 +418,7 @@ mod tests {
             updated_at: 2000,
             project_id: None,
             folder_id: None,
+            name_source: None,
         };
         let err = row_to_response(row, Path::new("/tmp/data")).unwrap_err();
         assert!(matches!(err, ConversationError::Internal { .. }));
@@ -508,6 +517,7 @@ mod tests {
             updated_at: 3000,
             project_id: None,
             folder_id: None,
+            name_source: None,
         };
         let resp = row_to_response(row, Path::new("/tmp/data")).unwrap();
         assert!(resp.pinned);
