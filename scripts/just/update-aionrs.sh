@@ -7,6 +7,7 @@ footer_script="$script_dir/aionrs-changelog-footer.sh"
 
 aionrs_repo="https://github.com/iOfficeAI/aionrs.git"
 aionrs_slug="iOfficeAI/aionrs"
+aioncore_slug="iOfficeAI/AionCore"
 
 fail() { echo "error: $*" >&2; exit 1; }
 
@@ -102,10 +103,23 @@ EOF
 fi
 
 # --- create PR ---
-gh pr create \
+# Pin --repo: gh cannot resolve a default repository when multiple GitHub
+# remotes exist (e.g. origin + a contributor fork) unless one was configured
+# via 'gh repo set-default'.
+if ! gh pr create \
+    --repo "$aioncore_slug" \
     --title "chore(deps): update aionrs to $tag" \
     --body "$pr_body" \
     --base main \
-    --head "$branch"
+    --head "$branch"; then
+    cat >&2 <<EOF
+
+gh pr create failed. Branch '$branch' is already pushed.
+Create the PR manually with this body:
+
+$pr_body
+EOF
+    exit 1
+fi
 
 echo "PR created for aionrs $old_tag -> $tag"
