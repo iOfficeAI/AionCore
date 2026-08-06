@@ -101,6 +101,13 @@ impl GitScmProvider {
             .map(|entry| entry.git_dir.clone())
     }
 
+    /// Drop a repository's cached workdir / git-dir handle. Called when the runtime
+    /// releases a repository that has left every project, so a stale entry cannot
+    /// outlive the repository it describes.
+    pub(super) fn forget(&self, repo_id: &str) {
+        self.repos.write().expect("scm repo registry poisoned").remove(repo_id);
+    }
+
     fn entry(&self, repo: &RepoRef) -> Result<RepoEntry, ScmError> {
         self.repos
             .read()
@@ -752,6 +759,10 @@ impl IScmProvider for GitScmProvider {
                 relative_path: String::new(),
             },
             label: root.label.clone(),
+            // Passed through untouched: identity resolution already decided
+            // whether the entry has a name of its own, and the provider must not
+            // second-guess it.
+            pe_name: root.pe_name.clone(),
             head,
             capabilities: caps,
             state: ScmRepositoryState::Idle,

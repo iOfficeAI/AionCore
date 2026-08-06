@@ -49,6 +49,11 @@ pub enum ScmInbound {
     },
     /// The connection closed — release its subscriptions and watches.
     Disconnect { session: ScmSessionId },
+    /// A project's attached-folder set changed (a folder was attached or
+    /// detached). Recompute its repositories and tell interested sessions what was
+    /// added or removed. `user_id` authorizes the root resolution and is internal
+    /// only — it never reaches the wire.
+    RootsChanged { project_id: String, user_id: String },
 }
 
 /// Source-control protocol actor.
@@ -142,6 +147,7 @@ impl ScmActor {
                 frame,
             } => self.on_frame(&session, &user_id, frame).await,
             ScmInbound::Disconnect { session } => self.runtime.drop_session(&session).await,
+            ScmInbound::RootsChanged { project_id, user_id } => self.on_roots_changed(&project_id, &user_id).await,
         }
     }
 
@@ -157,7 +163,7 @@ impl ScmActor {
         let params = incoming.params.clone();
 
         let outcome = match incoming.method.as_str() {
-            "scm/listRepositories" => self.list_repositories(user_id, params).await,
+            "scm/listRepositories" => self.list_repositories(session, user_id, params).await,
             "scm/subscribe" => self.subscribe(session, user_id, params).await,
             "scm/unsubscribe" => {
                 self.unsubscribe(session, params).await;
@@ -187,15 +193,48 @@ impl ScmActor {
 
     // ── methods ───────────────────────────────────────────────────────────
 
-    async fn list_repositories(&self, user_id: &str, params: Value) -> Result<Value, ScmError> {
+    async fn list_repositories(&self, session: &str, user_id: &str, params: Value) -> Result<Value, ScmError> {
         let project_id = params
             .get("project_id")
             .and_then(Value::as_str)
             .ok_or(ScmError::InvalidParams { what: "project_id" })?;
 
+        // Listing a project's repositories is also how a connection registers its
+        // interest in them: from now until it disconnects it receives that
+        // project's `repositoriesChanged` frames. Registering before discovery
+        // closes the window where an attach lands between the two.
+        self.runtime.register_interest(session, project_id).await;
         let roots = self.roots_of(user_id, project_id).await?;
-        let repositories = self.runtime.discover(&roots).await;
+        let repositories = self.runtime.discover(project_id, &roots).await;
         Ok(json!({ "repositories": repositories }))
+    }
+
+    /// Recompute a project's repositories after its attached folders changed, and
+    /// push the added/removed delta to every session interested in the project.
+    ///
+    /// Wired directly (乙), not through an event bus (甲): source control is the
+    /// only subscriber to project-explorer root changes, so a dedicated inbound
+    /// message is cheaper and clearer than a general bus. Revisit if a second
+    /// subscriber ever appears.
+    async fn on_roots_changed(&self, project_id: &str, user_id: &str) {
+        let roots = match self.roots_of(user_id, project_id).await {
+            Ok(roots) => roots,
+            // The project was deleted, or the user can no longer reach it: there is
+            // nothing to recompute and nobody to tell.
+            Err(err) => {
+                tracing::debug!(project_id, error = %err, "scm: roots recompute skipped");
+                return;
+            }
+        };
+        let (added, removed) = self.runtime.recompute_project(project_id, &roots).await;
+        // An empty delta is not a change — do not wake clients for nothing.
+        if added.is_empty() && removed.is_empty() {
+            return;
+        }
+        let frame = wire::repositories_changed(project_id, &added, &removed);
+        for session in self.runtime.project_subscribers_of(project_id).await {
+            self.push.push(&session, frame.clone());
+        }
     }
 
     async fn subscribe(&self, session: &str, user_id: &str, params: Value) -> Result<Value, ScmError> {
@@ -447,18 +486,28 @@ impl ScmActor {
                     // Only local paths can host a repository; a root without one
                     // is simply not a candidate.
                     if let Some(absolute_path) = resolved.absolute_path {
-                        // Same precedence the rest of the project surface uses:
-                        // an explicit entry name wins, else the folder's derived
-                        // one, else the opaque id rather than an empty label.
-                        let label = entry
-                            .display_name
+                        // The entry's own name, if it has a non-blank one. A blank
+                        // (empty or whitespace-only) name counts as no name at all:
+                        // it must survive as neither `label` nor `pe_name`, because
+                        // the client's `pe_name || label` would otherwise render
+                        // whitespace (a blank string is truthy in JS).
+                        let named = entry.display_name.clone().filter(|name| !name.trim().is_empty());
+                        // Same precedence the rest of the project surface uses: an
+                        // explicit name wins, else the folder's derived one, else the
+                        // opaque id. Filtering blanks above makes "label is never
+                        // blank" a backend contract the client can lean on.
+                        let label = named
                             .clone()
                             .or_else(|| entry.folder.default_display_name.clone())
                             .unwrap_or_else(|| entry.pe_id.clone());
+                        // Carried raw and separate from the fallback chain; `None`
+                        // means the entry has no name of its own (never `Some("")`).
+                        let pe_name = named;
                         roots.push(ResolvedRoot {
                             pe_id: entry.pe_id,
                             absolute_path,
                             label,
+                            pe_name,
                         });
                     }
                 }

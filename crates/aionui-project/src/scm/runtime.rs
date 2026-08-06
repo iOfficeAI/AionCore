@@ -22,7 +22,7 @@
 //! belongs to the resolved root. Assembling `{ pe_id, relative_path }` is this
 //! layer's job, so a provider can never invent identity.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -62,6 +62,17 @@ pub struct ScmRuntime {
     watcher: Arc<GitWatcher>,
     repos: RwLock<HashMap<String, RepoState>>,
     locks: RwLock<HashMap<String, RepoLock>>,
+    /// The set of repositories each project last resolved to, keyed by project
+    /// id. A roots recompute diffs the fresh set against this to decide which
+    /// repositories were added or removed — by `repo_id`, never by path, since a
+    /// case-insensitive filesystem makes path comparison unsound.
+    project_repos: RwLock<HashMap<String, HashSet<String>>>,
+    /// Which connections have expressed interest in each project's repositories,
+    /// by listing them. A project's `repositoriesChanged` frame fans out to these.
+    /// Session-persistent: an entry is cleared only when the connection drops, not
+    /// when it unsubscribes from a repository, so a client that navigates away and
+    /// back keeps receiving changes without re-registering.
+    project_interest: RwLock<HashMap<String, HashSet<String>>>,
 }
 
 impl ScmRuntime {
@@ -75,16 +86,20 @@ impl ScmRuntime {
                 watcher: Arc::new(watcher),
                 repos: RwLock::new(HashMap::new()),
                 locks: RwLock::new(HashMap::new()),
+                project_repos: RwLock::new(HashMap::new()),
+                project_interest: RwLock::new(HashMap::new()),
             },
             dirty_rx,
         ))
     }
 
-    /// Discover which of a project's roots are repositories.
+    /// Discover which of a set of roots are repositories.
     ///
     /// Roots that are not repositories are simply absent from the result — never
-    /// represented as an empty repository.
-    pub(super) async fn discover(&self, roots: &[ResolvedRoot]) -> Vec<ScmRepository> {
+    /// represented as an empty repository. Registers each discovered repository in
+    /// the runtime and provider, but does not touch any project's tracked set;
+    /// that is the two project-aware callers' job.
+    async fn discover_roots(&self, roots: &[ResolvedRoot]) -> Vec<ScmRepository> {
         let mut found = Vec::new();
         for root in roots {
             match self.provider.discover(root).await {
@@ -122,6 +137,84 @@ impl ScmRuntime {
             }
         }
         found
+    }
+
+    /// Discover a project's repositories and record the result as the project's
+    /// baseline, so a later roots recompute can diff against it.
+    pub(super) async fn discover(&self, project_id: &str, roots: &[ResolvedRoot]) -> Vec<ScmRepository> {
+        let found = self.discover_roots(roots).await;
+        let ids = found.iter().map(|r| r.repo_id.clone()).collect();
+        self.project_repos.write().await.insert(project_id.to_owned(), ids);
+        found
+    }
+
+    /// Recompute a project's repositories after its attached-folder set changed,
+    /// returning what was added (full descriptors) and removed (ids) against the
+    /// last known set.
+    ///
+    /// Removed repositories are released here (watch dropped, state and provider
+    /// entry forgotten): nothing else would, and a repository no project can reach
+    /// would otherwise keep its metadata watch armed for the process's lifetime.
+    ///
+    /// Order is load-bearing. Discovery runs *first* and re-registers every
+    /// repository still present; only then is `removed` computed as "was in the
+    /// old set, is not in the fresh one". A repository removed and re-added within
+    /// one recompute is thus in the fresh set and never released — so a quick
+    /// remove-then-re-add cannot tear down the watch the re-add just implied.
+    pub(super) async fn recompute_project(
+        &self,
+        project_id: &str,
+        roots: &[ResolvedRoot],
+    ) -> (Vec<ScmRepository>, Vec<String>) {
+        let now = self.discover_roots(roots).await;
+        let now_ids: HashSet<String> = now.iter().map(|r| r.repo_id.clone()).collect();
+
+        let previous = self
+            .project_repos
+            .read()
+            .await
+            .get(project_id)
+            .cloned()
+            .unwrap_or_default();
+        let added: Vec<ScmRepository> = now.iter().filter(|r| !previous.contains(&r.repo_id)).cloned().collect();
+        let removed: Vec<String> = previous.difference(&now_ids).cloned().collect();
+
+        self.project_repos.write().await.insert(project_id.to_owned(), now_ids);
+        for repo_id in &removed {
+            self.release_repo(repo_id).await;
+        }
+        (added, removed)
+    }
+
+    /// Release a repository that has left every project: drop its watch, its cached
+    /// state (and with it its subscriber list), and the provider's handle to it.
+    async fn release_repo(&self, repo_id: &str) {
+        // Unwatch first, so no further dirty signal can arrive for a repository we
+        // are in the middle of forgetting.
+        self.watcher.unwatch(repo_id);
+        self.repos.write().await.remove(repo_id);
+        self.provider.forget(repo_id);
+    }
+
+    /// Record that `session` is interested in a project's repositories, so it
+    /// receives that project's `repositoriesChanged` frames until it disconnects.
+    pub(super) async fn register_interest(&self, session: &str, project_id: &str) {
+        self.project_interest
+            .write()
+            .await
+            .entry(project_id.to_owned())
+            .or_default()
+            .insert(session.to_owned());
+    }
+
+    /// Connections that should receive a project's `repositoriesChanged` frame.
+    pub(super) async fn project_subscribers_of(&self, project_id: &str) -> Vec<String> {
+        self.project_interest
+            .read()
+            .await
+            .get(project_id)
+            .map(|sessions| sessions.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Subscribe `session` to a repository and return its current status.
@@ -179,10 +272,15 @@ impl ScmRuntime {
         }
     }
 
-    /// Release everything a closed connection held.
+    /// Release everything a closed connection held: its repository subscriptions
+    /// (and the watches they alone kept armed) and its project interest.
     ///
-    /// Without this a reconnect churn would leak one watch per dropped
-    /// connection, since nothing else ever tells us that session is gone.
+    /// Without the subscription cleanup a reconnect churn would leak one watch per
+    /// dropped connection. Without the interest cleanup a dropped connection would
+    /// linger in every project it listed — leaking unboundedly and, worse,
+    /// receiving `repositoriesChanged` frames pushed to a session that is gone.
+    /// This is the sole release point for `project_interest` (it is
+    /// session-persistent, never dropped on repo unsubscribe).
     pub(super) async fn drop_session(&self, session: &str) {
         let orphaned: Vec<String> = {
             let mut repos = self.repos.write().await;
@@ -200,6 +298,12 @@ impl ScmRuntime {
         for repo_id in orphaned {
             self.watcher.unwatch(&repo_id);
         }
+
+        let mut interest = self.project_interest.write().await;
+        for sessions in interest.values_mut() {
+            sessions.remove(session);
+        }
+        interest.retain(|_, sessions| !sessions.is_empty());
     }
 
     /// Recompute a repository's status and publish it as the current frame.

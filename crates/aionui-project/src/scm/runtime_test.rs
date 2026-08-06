@@ -48,6 +48,7 @@ fn root_of(tmp: &TempDir, pe_id: &str) -> ResolvedRoot {
         pe_id: pe_id.to_owned(),
         absolute_path: tmp.path().to_string_lossy().into_owned(),
         label: "fixture".to_owned(),
+        pe_name: None,
     }
 }
 
@@ -68,7 +69,10 @@ async fn discovery_lists_repositories_and_skips_plain_directories() {
 
     let (runtime, _dirty) = ScmRuntime::new().expect("runtime builds");
     let found = runtime
-        .discover(&[root_of(&repo_dir, "pe-repo"), root_of(&plain_dir, "pe-plain")])
+        .discover(
+            "proj-test",
+            &[root_of(&repo_dir, "pe-repo"), root_of(&plain_dir, "pe-plain")],
+        )
         .await;
 
     assert_eq!(found.len(), 1, "only the repository is listed, got {found:?}");
@@ -84,7 +88,10 @@ async fn a_root_that_is_not_a_repository_does_not_hide_the_others() {
 
     let (runtime, _dirty) = ScmRuntime::new().expect("runtime builds");
     let found = runtime
-        .discover(&[root_of(&plain_dir, "pe-plain"), root_of(&repo_dir, "pe-repo")])
+        .discover(
+            "proj-test",
+            &[root_of(&plain_dir, "pe-plain"), root_of(&repo_dir, "pe-repo")],
+        )
         .await;
 
     assert_eq!(found.len(), 1);
@@ -97,7 +104,7 @@ async fn the_orchestration_layer_assembles_pe_identity() {
     let _repo = fixture(&tmp);
 
     let (runtime, _dirty) = ScmRuntime::new().expect("runtime builds");
-    let found = runtime.discover(&[root_of(&tmp, "pe-42")]).await;
+    let found = runtime.discover("proj-test", &[root_of(&tmp, "pe-42")]).await;
     let repo = RepoRef {
         repo_id: found[0].repo_id.clone(),
     };
@@ -121,7 +128,7 @@ async fn sequence_numbers_increase_with_every_recompute() {
     let _repo = fixture(&tmp);
 
     let (runtime, _dirty) = ScmRuntime::new().expect("runtime builds");
-    let found = runtime.discover(&[root_of(&tmp, "pe1")]).await;
+    let found = runtime.discover("proj-test", &[root_of(&tmp, "pe1")]).await;
     let repo = RepoRef {
         repo_id: found[0].repo_id.clone(),
     };
@@ -146,7 +153,7 @@ async fn concurrent_refreshes_hand_out_distinct_ordered_sequences() {
     let _repo = fixture(&tmp);
 
     let (runtime, _dirty) = ScmRuntime::new().expect("runtime builds");
-    let found = runtime.discover(&[root_of(&tmp, "pe1")]).await;
+    let found = runtime.discover("proj-test", &[root_of(&tmp, "pe1")]).await;
     let repo = RepoRef {
         repo_id: found[0].repo_id.clone(),
     };
@@ -175,7 +182,7 @@ async fn an_action_publishes_a_newer_frame_than_before_it() {
     let _repo = fixture(&tmp);
 
     let (runtime, _dirty) = ScmRuntime::new().expect("runtime builds");
-    let found = runtime.discover(&[root_of(&tmp, "pe1")]).await;
+    let found = runtime.discover("proj-test", &[root_of(&tmp, "pe1")]).await;
     let repo = RepoRef {
         repo_id: found[0].repo_id.clone(),
     };
@@ -195,7 +202,7 @@ async fn a_failing_action_does_not_publish_a_frame() {
     let _repo = fixture(&tmp);
 
     let (runtime, _dirty) = ScmRuntime::new().expect("runtime builds");
-    let found = runtime.discover(&[root_of(&tmp, "pe1")]).await;
+    let found = runtime.discover("proj-test", &[root_of(&tmp, "pe1")]).await;
     let repo = RepoRef {
         repo_id: found[0].repo_id.clone(),
     };
@@ -223,7 +230,7 @@ async fn subscribing_returns_a_first_frame_and_records_the_subscriber() {
     let _repo = fixture(&tmp);
 
     let (runtime, _dirty) = ScmRuntime::new().expect("runtime builds");
-    let found = runtime.discover(&[root_of(&tmp, "pe1")]).await;
+    let found = runtime.discover("proj-test", &[root_of(&tmp, "pe1")]).await;
     let repo = RepoRef {
         repo_id: found[0].repo_id.clone(),
     };
@@ -239,7 +246,7 @@ async fn subscribing_twice_from_one_connection_counts_once() {
     let _repo = fixture(&tmp);
 
     let (runtime, _dirty) = ScmRuntime::new().expect("runtime builds");
-    let found = runtime.discover(&[root_of(&tmp, "pe1")]).await;
+    let found = runtime.discover("proj-test", &[root_of(&tmp, "pe1")]).await;
     let repo = RepoRef {
         repo_id: found[0].repo_id.clone(),
     };
@@ -261,7 +268,7 @@ async fn the_watch_is_released_only_when_the_last_subscriber_leaves() {
     let _repo = fixture(&tmp);
 
     let (runtime, _dirty) = ScmRuntime::new().expect("runtime builds");
-    let found = runtime.discover(&[root_of(&tmp, "pe1")]).await;
+    let found = runtime.discover("proj-test", &[root_of(&tmp, "pe1")]).await;
     let repo = RepoRef {
         repo_id: found[0].repo_id.clone(),
     };
@@ -303,7 +310,7 @@ async fn a_closed_connection_releases_everything_it_held() {
 
     let (runtime, _dirty) = ScmRuntime::new().expect("runtime builds");
     let found = runtime
-        .discover(&[root_of(&repo_a, "pe-a"), root_of(&repo_b, "pe-b")])
+        .discover("proj-test", &[root_of(&repo_a, "pe-a"), root_of(&repo_b, "pe-b")])
         .await;
     assert_eq!(found.len(), 2);
     let first = RepoRef {
@@ -378,13 +385,13 @@ async fn re_discovery_keeps_subscribers_and_sequence() {
     let _repo = fixture(&tmp);
 
     let (runtime, _dirty) = ScmRuntime::new().expect("runtime builds");
-    let found = runtime.discover(&[root_of(&tmp, "pe1")]).await;
+    let found = runtime.discover("proj-test", &[root_of(&tmp, "pe1")]).await;
     let repo = RepoRef {
         repo_id: found[0].repo_id.clone(),
     };
     let seq_before = runtime.subscribe("conn-1", &repo).await.expect("subscribe ok").seq;
 
-    runtime.discover(&[root_of(&tmp, "pe1")]).await;
+    runtime.discover("proj-test", &[root_of(&tmp, "pe1")]).await;
 
     assert_eq!(
         runtime.subscribers_of(&repo.repo_id).await,

@@ -54,6 +54,7 @@ async fn discovered(dir: &Path) -> (GitScmProvider, RepoRef) {
         pe_id: "pe1".to_owned(),
         absolute_path: dir.to_string_lossy().into_owned(),
         label: "fixture".to_owned(),
+        pe_name: None,
     };
     let repo = provider
         .discover(&root)
@@ -78,6 +79,7 @@ async fn discover_reports_none_for_plain_directory() {
         pe_id: "pe1".to_owned(),
         absolute_path: tmp.path().to_string_lossy().into_owned(),
         label: "plain".to_owned(),
+        pe_name: None,
     };
 
     // Not a repository is a normal outcome, never a fabricated repo.
@@ -96,6 +98,7 @@ async fn discover_does_not_walk_up_to_parent_repository() {
         pe_id: "pe-child".to_owned(),
         absolute_path: child.to_string_lossy().into_owned(),
         label: "child".to_owned(),
+        pe_name: None,
     };
 
     // One pe root is at most one repo: a subdirectory of a repo is not itself a
@@ -115,6 +118,7 @@ async fn discover_reports_identity_capabilities_and_head() {
         pe_id: "pe1".to_owned(),
         absolute_path: tmp.path().to_string_lossy().into_owned(),
         label: "fixture".to_owned(),
+        pe_name: None,
     };
     let found = provider
         .discover(&root)
@@ -776,6 +780,7 @@ async fn discovered_with_trash(dir: &Path, trash: Arc<dyn TrashSink>) -> (GitScm
         pe_id: "pe1".to_owned(),
         absolute_path: dir.to_string_lossy().into_owned(),
         label: "fixture".to_owned(),
+        pe_name: None,
     };
     let repo = provider
         .discover(&root)
@@ -2318,4 +2323,27 @@ async fn staging_several_distinct_files_stages_every_one_of_them() {
             after.resources
         );
     }
+}
+
+/// `repo_id` is a pure `scm:{pe_id}` mapping: deterministic, and derived from the
+/// pe identity rather than a path. This is the premise the roots diff relies on —
+/// it compares repositories by `repo_id`, not by path. Because the project layer
+/// canonicalizes a folder's path (folding case on a case-insensitive filesystem)
+/// before it ever becomes a `pe_id`, one physical directory resolves to exactly
+/// one `pe_id`, hence one `repo_id`; two case-different spellings can never split
+/// it into two. (The fold itself is covered by `canonical_test::casing_folds_per_platform`
+/// and the identity-level dedup by the project service suite.)
+#[test]
+fn repo_id_is_a_deterministic_scm_prefix_over_the_pe_id() {
+    assert_eq!(GitScmProvider::repo_id_for("pe1"), "scm:pe1");
+    assert_eq!(
+        GitScmProvider::repo_id_for("pe1"),
+        GitScmProvider::repo_id_for("pe1"),
+        "the same pe id always yields the same repo id"
+    );
+    assert_ne!(
+        GitScmProvider::repo_id_for("pe1"),
+        GitScmProvider::repo_id_for("pe2"),
+        "distinct pe ids stay distinct"
+    );
 }

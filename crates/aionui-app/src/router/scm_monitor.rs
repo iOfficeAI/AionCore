@@ -72,9 +72,17 @@ pub fn spawn_scm_monitor(
     manager: Arc<WebSocketManager>,
 ) -> Option<Arc<dyn MessageRouter>> {
     let push: Arc<dyn ScmWirePush> = Arc::new(WsManagerPush { manager });
-    match ScmActor::new(project, push) {
+    let (inbound, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
+    match ScmActor::new(Arc::clone(&project), push) {
         Ok(actor) => {
-            let (inbound, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
+            // Direct wiring (乙), not an event bus (甲): source control is the only
+            // subscriber to project-explorer root changes, so feeding the service's
+            // attach/detach notifications straight into this actor's inbound is
+            // cheaper and clearer than a general bus. All `ProjectService` handles
+            // are clones of one instance, so the sender installed here is the same
+            // one the HTTP attach/detach handlers observe. Revisit if a second
+            // subscriber to root changes ever appears.
+            project.set_scm_roots_sender(inbound.clone());
             tokio::spawn(actor.run(inbound_rx));
             Some(Arc::new(ScmMessageRouter { inbound }))
         }

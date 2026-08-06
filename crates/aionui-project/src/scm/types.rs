@@ -44,8 +44,16 @@ pub struct ResolvedRoot {
     pub pe_id: String,
     /// Local absolute path of the pe root.
     pub absolute_path: String,
-    /// Display label, derived from the pe by the caller.
+    /// Display label, derived from the pe by the caller. Always present: falls
+    /// back through the folder's derived name to the opaque id, so it never
+    /// empties out.
     pub label: String,
+    /// The pe entry's own explicit display name, carried raw for the outward
+    /// model. `None` when the entry has no name of its own (the derived `label`
+    /// is then the only sensible thing to show). Never `Some("")`: the caller
+    /// filters an empty/blank name to `None`, so a consumer can treat "present"
+    /// as "meaningful".
+    pub pe_name: Option<String>,
 }
 
 /// Neutral content anchor: which version of a file to read or compare.
@@ -112,6 +120,11 @@ pub struct ScmRepository {
     /// (`relative_path: ""`), one repo per pe at most.
     pub root: FileRef,
     pub label: String,
+    /// The pe entry's own explicit name, when it has one. The client prefers it
+    /// over `label` for display and falls back to `label` otherwise; absent
+    /// (never empty) when the entry carries no name of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pe_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head: Option<ScmHead>,
     pub capabilities: ScmCapabilities,

@@ -648,3 +648,64 @@ async fn resolve_chat_file_ref_project_variant_rejects_missing_and_escaping_path
         err.code()
     );
 }
+
+/// A case-only difference in a folder path resolves to one repository identity on
+/// a case-insensitive filesystem — the premise the source-control roots diff
+/// relies on when it keys by `repo_id` (= `scm:{pe_id}`) instead of by path.
+///
+/// Load-bearing: if path canonicalization stopped folding case, the variant would
+/// mint a second folder — hence a second `pe_id`, hence a second `repo_id` — for
+/// one physical directory, and the diff would report a phantom add/remove. This
+/// test goes red in exactly that case on macOS / Windows.
+#[tokio::test]
+async fn a_case_variant_folder_resolves_to_one_repo_identity() {
+    use aionui_project::canonical::IGNORE_PATH_CASING;
+
+    let base = tempfile::tempdir().unwrap();
+    // A real mixed-case directory, and a case-only variant that denotes the same
+    // directory on macOS / Windows and a different (non-existent) one on Linux.
+    let real = base.path().join("RepoRoot");
+    std::fs::create_dir(&real).unwrap();
+    let variant = base.path().join("reporoot");
+
+    let (svc, _db) = service().await;
+    let created = svc.create_standard("system_default_user", uri_of(&real)).await.unwrap();
+    let project_id = created.project.project_id;
+    let ws_pe = created.project_explorer.pe_id;
+
+    let second = svc
+        .attach_folder(
+            "system_default_user",
+            AttachInput {
+                project_id: project_id.clone(),
+                uri: uri_of(&variant),
+                display_name: None,
+            },
+        )
+        .await;
+
+    if IGNORE_PATH_CASING {
+        // Same physical directory: the variant folds to the workspace root's
+        // canonical identity and is refused as a duplicate, never added as a
+        // second entry. One directory => one pe_id => one repo_id.
+        assert_eq!(
+            second.unwrap_err().code(),
+            "project_explorer_duplicate",
+            "a case variant of the same dir must dedup to one identity"
+        );
+        let detail = svc.get_project("system_default_user", &project_id).await.unwrap();
+        assert_eq!(detail.explorer.entries.len(), 1, "no second entry was created");
+        assert_eq!(
+            detail.explorer.entries[0].pe_id, ws_pe,
+            "the one entry is the workspace root"
+        );
+    } else {
+        // Case-sensitive filesystem: the variant path genuinely does not exist,
+        // so it is rejected before any identity question — correctly two dirs.
+        assert_eq!(
+            second.unwrap_err().code(),
+            "folder_not_found",
+            "on a case-sensitive fs the variant path does not exist"
+        );
+    }
+}

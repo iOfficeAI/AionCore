@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::error::ScmError;
-use super::types::ContentRef;
+use super::types::{ContentRef, ScmRepository};
 
 const JSONRPC_VERSION: &str = "2.0";
 
@@ -66,6 +66,35 @@ pub(super) fn error(id: Option<Value>, code: i64, message: &str, data: Value) ->
 /// A server-initiated notification.
 pub(super) fn notification(method: &str, params: Value) -> Value {
     json!({ "jsonrpc": JSONRPC_VERSION, "method": method, "params": params })
+}
+
+/// The `scm/repositoriesChanged` notification: a project's repository set gained
+/// and/or lost members.
+///
+/// `project_id` is always present so a client that holds one store across several
+/// projects (and receives every project's frame on its shared connection) can
+/// discard the ones that are not the project it is looking at — the server pushes
+/// to a session as long as it once listed *any* of the projects it is interested
+/// in, and does not itself know which project that session currently shows.
+/// `user_id` is deliberately absent: it is an internal authorization detail, not
+/// part of the outward contract.
+///
+/// `added` carries whole repository descriptors (the client splices them in);
+/// `removed` carries only ids (there is nothing left to describe). Each is omitted
+/// when empty, and the caller does not emit the frame at all when both are — an
+/// empty change is not a change.
+pub(super) fn repositories_changed(project_id: &str, added: &[ScmRepository], removed: &[String]) -> Value {
+    let mut params = json!({ "project_id": project_id });
+    if !added.is_empty() {
+        // Infallible in practice (ScmRepository is a plain data struct); an empty
+        // array on the impossible error keeps the frame well-formed rather than
+        // dropping the whole notification.
+        params["added"] = serde_json::to_value(added).unwrap_or_else(|_| json!([]));
+    }
+    if !removed.is_empty() {
+        params["removed"] = json!(removed);
+    }
+    notification("scm/repositoriesChanged", params)
 }
 
 /// Map a domain error onto its wire code, name and context.
