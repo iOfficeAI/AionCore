@@ -501,6 +501,11 @@ async fn row_to_mcp_server_config(
     let value: serde_json::Value =
         serde_json::from_str(&row.transport_config).map_err(|e| format!("invalid transport_config JSON: {e}"))?;
 
+    // Whether this server's tools are sent to the LLM as name-only stubs, to be
+    // loaded on demand via ToolSearch. Absent key preserves the previous
+    // behaviour (all schemas eager); an explicit `true` opts the server in.
+    let deferred = value.get("deferred").and_then(|v| v.as_bool()).unwrap_or(false);
+
     match row.transport_type.as_str() {
         "stdio" => {
             let command = value
@@ -531,7 +536,7 @@ async fn row_to_mcp_server_config(
                 env: Some(env),
                 url: None,
                 headers: None,
-                deferred: Some(false),
+                deferred: Some(deferred),
                 startup_timeout_ms: None,
             })
         }
@@ -557,7 +562,7 @@ async fn row_to_mcp_server_config(
                 env: None,
                 url: Some(url.to_owned()),
                 headers: Some(headers),
-                deferred: Some(false),
+                deferred: Some(deferred),
                 startup_timeout_ms: None,
             })
         }
@@ -583,7 +588,7 @@ async fn row_to_mcp_server_config(
                 env: None,
                 url: Some(url.to_owned()),
                 headers: Some(headers),
-                deferred: Some(false),
+                deferred: Some(deferred),
                 startup_timeout_ms: None,
             })
         }
@@ -1016,6 +1021,34 @@ mod tests {
             config.args.as_ref(),
             Some(&vec!["-y".to_owned(), "@upstash/context7-mcp".to_owned()])
         );
+    }
+
+    #[tokio::test]
+    async fn row_to_mcp_server_config_defaults_deferred_to_false() {
+        let row = make_row("docs", "http", r#"{"url":"https://example.test/mcp"}"#, true, false);
+
+        let config = row_to_mcp_server_config(&row, "user-row", "conv-row", test_broadcaster())
+            .await
+            .expect("convert");
+
+        assert_eq!(config.deferred, Some(false));
+    }
+
+    #[tokio::test]
+    async fn row_to_mcp_server_config_honours_explicit_deferred() {
+        let row = make_row(
+            "docs",
+            "http",
+            r#"{"url":"https://example.test/mcp","deferred":true}"#,
+            true,
+            false,
+        );
+
+        let config = row_to_mcp_server_config(&row, "user-row", "conv-row", test_broadcaster())
+            .await
+            .expect("convert");
+
+        assert_eq!(config.deferred, Some(true));
     }
 
     struct ProviderMappingCase<'a> {
