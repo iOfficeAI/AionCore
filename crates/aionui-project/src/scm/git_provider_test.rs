@@ -174,6 +174,96 @@ async fn status_is_not_degraded_when_the_index_can_be_written() {
     assert!(!status.degraded, "a writable repository takes the normal path");
 }
 
+/// Create a branch at head and check it out (updates HEAD + work tree), so the
+/// test exercises the exact head move a terminal `git checkout <branch>` makes.
+fn checkout_new_branch(repo: &Repository, name: &str) {
+    let head_commit = repo.head().expect("head").peel_to_commit().expect("commit");
+    repo.branch(name, &head_commit, false).expect("create branch");
+    let refname = format!("refs/heads/{name}");
+    let obj = repo.revparse_single(&refname).expect("revparse branch");
+    repo.checkout_tree(&obj, None).expect("checkout tree");
+    repo.set_head(&refname).expect("set head");
+}
+
+#[tokio::test]
+async fn status_carries_head_branch_name() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = init_repo(tmp.path());
+    write(tmp.path(), "a.txt", "hello\n");
+    commit_all(&repo, "base");
+
+    let (provider, repo_ref) = discovered(tmp.path()).await;
+    let status = provider.status(&repo_ref).await.expect("status ok");
+
+    // The status frame is the only frame the refresh path emits; the branch name
+    // has to be on it or a client subscribed to status alone never learns head.
+    let head = status.head.expect("status carries head");
+    let name = head.name.expect("branch name present");
+    // git2 defaults to `master` on init; either is acceptable across git versions.
+    assert!(name == "master" || name == "main", "branch name: {name}");
+    assert!(head.detached.is_none(), "an ordinary branch head is not detached");
+}
+
+#[tokio::test]
+async fn status_head_name_changes_after_checkout() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = init_repo(tmp.path());
+    write(tmp.path(), "a.txt", "hello\n");
+    commit_all(&repo, "base");
+
+    let (provider, repo_ref) = discovered(tmp.path()).await;
+    let before = provider.status(&repo_ref).await.expect("status ok");
+    let before_name = before.head.expect("head before").name.expect("name before");
+
+    // Simulate the terminal `git checkout feature/x` that motivated this frame.
+    checkout_new_branch(&repo, "feature/x");
+    let after = provider.status(&repo_ref).await.expect("status ok");
+    let after_name = after.head.expect("head after").name.expect("name after");
+
+    assert_ne!(before_name, after_name, "checkout must move the reported head");
+    assert_eq!(after_name, "feature/x");
+}
+
+#[tokio::test]
+async fn status_head_reports_detached() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = init_repo(tmp.path());
+    write(tmp.path(), "a.txt", "hello\n");
+    let oid = commit_all(&repo, "base");
+
+    // Detach: point HEAD directly at the commit, no branch.
+    repo.set_head_detached(oid).expect("detach head");
+
+    let (provider, repo_ref) = discovered(tmp.path()).await;
+    let status = provider.status(&repo_ref).await.expect("status ok");
+
+    let head = status.head.expect("status carries head");
+    // `detached` is the load-bearing signal here; `name` mirrors git2's
+    // shorthand (the short commit id when detached), same as `ScmRepository.head`.
+    assert_eq!(head.detached, Some(true), "detached head is flagged");
+    assert_ne!(
+        head.name.as_deref(),
+        Some("master"),
+        "a detached head reports the commit, not the abandoned branch"
+    );
+}
+
+#[tokio::test]
+async fn status_head_reports_unborn() {
+    let tmp = TempDir::new().expect("tempdir");
+    init_repo(tmp.path());
+    // No commit yet: HEAD is unborn. A fresh repo still has a change list.
+    write(tmp.path(), "a.txt", "hello\n");
+
+    let (provider, repo_ref) = discovered(tmp.path()).await;
+    let status = provider.status(&repo_ref).await.expect("status ok");
+
+    // Unborn is a normal state, not an error: head is present but empty.
+    let head = status.head.expect("status carries head even when unborn");
+    assert!(head.name.is_none(), "unborn head has no branch name yet");
+    assert!(head.detached.is_none(), "unborn head is not detached");
+}
+
 #[tokio::test]
 async fn status_reports_modified_and_deleted() {
     let tmp = TempDir::new().expect("tempdir");

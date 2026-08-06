@@ -4,8 +4,63 @@
 //! repository reference, a refusal to act on a conflict, and an engine
 //! malfunction must not arrive looking the same.
 
-use super::super::types::{FileRef, ScmActionFailure, ScmActionOutcome};
+use super::super::types::{FileRef, RepoRef, ScmActionFailure, ScmActionOutcome, ScmHead, ScmStatus};
 use super::*;
+
+/// Build the notification a status broadcast puts on the wire, so the assertions
+/// exercise the exact serialization a client receives (see `ScmActor` refresh).
+fn status_frame(head: Option<ScmHead>) -> serde_json::Value {
+    let status = ScmStatus {
+        repository: RepoRef {
+            repo_id: "scm:pe1".into(),
+        },
+        resources: vec![],
+        head,
+        seq: 3,
+        truncated: false,
+        degraded: false,
+    };
+    notification(
+        "scm/statusChanged",
+        serde_json::to_value(&status).expect("serialize status"),
+    )
+}
+
+#[test]
+fn status_frame_carries_head_branch_name() {
+    // The branch name reaches a status-only subscriber solely through this field;
+    // a terminal `git checkout` produces exactly this shape.
+    let frame = status_frame(Some(ScmHead {
+        name: Some("feature/x".into()),
+        detached: None,
+    }));
+    let params = &frame["params"];
+    assert_eq!(params["head"]["name"], "feature/x");
+    // `detached: None` is omitted, not serialized as null.
+    assert!(params["head"].get("detached").is_none(), "absent detached is omitted");
+}
+
+#[test]
+fn status_frame_carries_detached_head() {
+    let frame = status_frame(Some(ScmHead {
+        name: None,
+        detached: Some(true),
+    }));
+    let head = &frame["params"]["head"];
+    assert_eq!(head["detached"], true);
+    assert!(head.get("name").is_none(), "a detached head serializes no name");
+}
+
+#[test]
+fn status_frame_omits_head_when_unreadable() {
+    // `None` head is a distinct wire state from a present-but-empty head; the
+    // client must not see a null branch and mistake it for detached/unborn.
+    let frame = status_frame(None);
+    assert!(
+        frame["params"].get("head").is_none(),
+        "an unreadable head is omitted from the frame entirely"
+    );
+}
 
 #[test]
 fn frames_carry_the_jsonrpc_envelope() {

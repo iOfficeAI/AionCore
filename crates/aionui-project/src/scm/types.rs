@@ -188,6 +188,15 @@ pub struct ScmStatus {
     pub repository: RepoRef,
     /// Flat resource list; grouping is the presentation layer's derivation.
     pub resources: Vec<ScmResource>,
+    /// Head position at the moment this status was computed, same shape as
+    /// [`ScmRepository::head`]. Carried on the status frame — not only on the
+    /// repository descriptor — because a `git checkout` in the work tree moves
+    /// head and is picked up by the watch → debounce → refresh path, which only
+    /// emits a status frame; the descriptor (and its `head`) is re-sent solely on
+    /// `repositoriesChanged` (attach/detach). Without it a branch switch never
+    /// reaches a subscribed client. `None` only when head could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<ScmHead>,
     /// Monotonic per repository, allocated by the orchestration layer inside the
     /// same critical section that computes the status. Two refresh sources (an
     /// action completing, a debounced watch signal) can deliver out of order, so

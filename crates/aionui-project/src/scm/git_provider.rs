@@ -210,7 +210,12 @@ fn read_head(repo: &Repository) -> Option<ScmHead> {
 /// writeback itself is impossible, the call is retried read-only: the resource
 /// list is identical, only the timing degrades, and the degradation is logged
 /// and reported rather than hidden.
-fn collect_status(repo: &Repository) -> Result<(Vec<ScmResource>, bool, bool), ScmError> {
+fn collect_status(repo: &Repository) -> Result<(Vec<ScmResource>, bool, bool, Option<ScmHead>), ScmError> {
+    // Read head in the same blocking pass that computes the change list: a
+    // checkout moves head, and the status frame is the only frame the refresh
+    // path emits, so head must ride along with it or a branch switch never
+    // reaches the client (see `ScmStatus::head`).
+    let head = read_head(repo);
     // First pass without rename detection: it is the cheap one, and its
     // add/delete count is exactly the input size rename detection would work on.
     let (probe, degraded) = match run_statuses(repo, true, false) {
@@ -334,7 +339,7 @@ fn collect_status(repo: &Repository) -> Result<(Vec<ScmResource>, bool, bool), S
         }
     }
 
-    Ok((resources, truncated, degraded))
+    Ok((resources, truncated, degraded, head))
 }
 
 fn run_statuses(
@@ -775,7 +780,7 @@ impl IScmProvider for GitScmProvider {
         // repository-relative paths, and pe identity comes from the resolved root,
         // so the orchestration layer owns it (`formal/runtime/source-control.md`).
         // Resources therefore carry an empty `pe_id` until that layer fills it.
-        let (resources, truncated, degraded) = with_repo(entry.workdir, "status", collect_status).await?;
+        let (resources, truncated, degraded, head) = with_repo(entry.workdir, "status", collect_status).await?;
 
         if truncated {
             tracing::info!(
@@ -788,6 +793,7 @@ impl IScmProvider for GitScmProvider {
         Ok(ScmStatus {
             repository: repo.clone(),
             resources,
+            head,
             // Left at zero: allocating the sequence is the orchestration layer's
             // job, inside the critical section that serializes recomputes.
             seq: 0,
