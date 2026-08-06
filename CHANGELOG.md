@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.60](https://github.com/iOfficeAI/AionCore/compare/v0.1.59...v0.1.60) (2026-08-06)
+
+
+### Features
+
+* **acp:** client-hosted terminals — declare clientCapabilities.terminal and serve terminal/* ([#779](https://github.com/iOfficeAI/AionCore/issues/779)) ([c5fef5f](https://github.com/iOfficeAI/AionCore/commit/c5fef5f7ede02690c99bb97a7019a1b075cf939b))
+* **preview:** backend half of preview v2 — office refresh, overflow marker, content-change signal ([#780](https://github.com/iOfficeAI/AionCore/issues/780)) ([eb4bd7f](https://github.com/iOfficeAI/AionCore/commit/eb4bd7f78219fcb0bc50c52affb456a19b04bed1))
+* **session:** AskUserQuestion as a first-class capability (own event, command, counter and endpoint) ([#778](https://github.com/iOfficeAI/AionCore/issues/778)) ([f9cf506](https://github.com/iOfficeAI/AionCore/commit/f9cf506d5755d0ae8d6a4e9e28fea5cdd3880bce))
+
+
+### Bug Fixes
+
+* **ai-agent:** degrade corrupt process registry, atomic writes, and startup-failure child cleanup ([#784](https://github.com/iOfficeAI/AionCore/issues/784)) ([812af0b](https://github.com/iOfficeAI/AionCore/commit/812af0b96143f0afb80f9d638033467b05c5b2ff))
+* **antigravity:** drop the 'default' UI placeholder model while discovery is empty ([#785](https://github.com/iOfficeAI/AionCore/issues/785)) ([18617b3](https://github.com/iOfficeAI/AionCore/commit/18617b387c8797eaefa2b9438344442b8ff8e66e))
+* **engine:** update rust crate getrandom-6f8ce4dd05d13bba to 0.4 ([#212](https://github.com/iOfficeAI/AionCore/issues/212)) ([0cf059b](https://github.com/iOfficeAI/AionCore/commit/0cf059b283fcd7d795b0bd6505da7fce3d655a2f))
+* **session:** stop reporting still-running codex commands as cancelled ([#783](https://github.com/iOfficeAI/AionCore/issues/783)) ([a326fb2](https://github.com/iOfficeAI/AionCore/commit/a326fb260905c82961ca9730461f872068ccb255))
+
 ## [0.1.59](https://github.com/iOfficeAI/AionCore/compare/v0.1.58...v0.1.59) (2026-08-05)
 
 
