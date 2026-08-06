@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.62](https://github.com/iOfficeAI/AionCore/compare/v0.1.61...v0.1.62) (2026-08-06)
+
+
+### Features
+
+* **scm:** live repository-set changes + pe_name ([#790](https://github.com/iOfficeAI/AionCore/issues/790)) ([81ef258](https://github.com/iOfficeAI/AionCore/commit/81ef258913e6ac5076a86d4adcc7edcc0f8f21ef))
+
+
+### Documentation
+
+* refresh architecture crate catalog ([#791](https://github.com/iOfficeAI/AionCore/issues/791)) ([4d59a21](https://github.com/iOfficeAI/AionCore/commit/4d59a21aaa0b4ff8210e04cea41872920a2f8a65))
+
 ## [0.1.61](https://github.com/iOfficeAI/AionCore/compare/v0.1.60...v0.1.61) (2026-08-06)
 
 
