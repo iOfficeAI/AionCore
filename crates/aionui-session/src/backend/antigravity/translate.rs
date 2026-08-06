@@ -172,8 +172,28 @@ impl Translator {
         }
     }
 
+    /// Stable id for the step's tool card.
+    ///
+    /// NAMESPACED by agy's conversation id, because `messages.id` is unique
+    /// across the whole database while `step_index` only counts within one agy
+    /// conversation. Bare `step-<n>` collided the moment a second conversation
+    /// reached the same index — observed 52 times in one log
+    /// ("Duplicate record: Message with id 'step-6' already exists outside the
+    /// requested conversation"), which silently dropped the tool card for every
+    /// conversation after the first to use that number.
+    ///
+    /// Falls back to the bare form only before `init` has bound a session id,
+    /// where there is nothing to namespace with and no second conversation to
+    /// collide against yet.
+    fn step_id(&self, step_index: u64) -> String {
+        match self.backend_session_id.as_deref() {
+            Some(session) => format!("{session}-step-{step_index}"),
+            None => format!("step-{step_index}"),
+        }
+    }
+
     fn translate_step(&mut self, su: AgyStepUpdate) -> Vec<SessionEvent> {
-        let id = format!("step-{}", su.step_index);
+        let id = self.step_id(su.step_index);
         let mut out = Vec::new();
 
         match su.step_type {
@@ -565,6 +585,33 @@ mod tests {
     /// Captured from agy 1.1.10 (trimmed to the fields we read).
     const SUBAGENT_ACTIVE: &str = r#"{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"subagent","subagent_info":{"subagents":[{"type_name":"research","role":"File Counter","initial_prompt":"Count the files.","conversation_id":"108d172f","log_uri":"file:///brain/log"}]}}}"#;
     const SUBAGENT_DONE: &str = r#"{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"subagent","duration_seconds":0.06,"subagent_info":{"subagents":[{"type_name":"research","role":"File Counter","initial_prompt":"Count the files.","conversation_id":"108d172f","log_uri":"file:///brain/log"}]}}}"#;
+
+    #[test]
+    fn tool_ids_do_not_collide_across_conversations() {
+        // `messages.id` is unique across the whole database, but `step_index`
+        // only counts within one agy conversation. A bare `step-<n>` therefore
+        // collided as soon as a second conversation reached the same index:
+        // "Duplicate record: Message with id 'step-6' already exists outside
+        // the requested conversation" — 52 of them in one log, each a tool card
+        // silently dropped. Every existing test drove a single Translator, so
+        // none of them could see it.
+        let tool_step = r#"{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{}}}}"#;
+        let id_in = |conv: &str| {
+            let init = format!(r#"{{"event":"init","conversation_id":"{conv}","init":{{"cwd":"/w"}}}}"#);
+            let (_, evs) = tr(&[&init, tool_step]);
+            evs.iter()
+                .find_map(|e| match e {
+                    SessionEvent::ToolCall { tool_use_id, .. } => Some(tool_use_id.clone()),
+                    _ => None,
+                })
+                .expect("tool call")
+        };
+        assert_ne!(
+            id_in("conv-a"),
+            id_in("conv-b"),
+            "the same step index in two conversations must not produce the same message id"
+        );
+    }
 
     #[test]
     fn a_subagent_dispatch_is_visible_as_a_tool_call() {

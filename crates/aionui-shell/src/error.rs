@@ -1,9 +1,18 @@
 #[derive(Debug, thiserror::Error)]
 pub enum ShellError {
-    #[error("file not found: {0}")]
+    /// The target path does not exist. The path is kept as a field for logging
+    /// and for callers that already hold it (the `/api/shell/*` routes echo back
+    /// the path the client itself supplied), but it is deliberately **absent from
+    /// the `Display` output**: this error crosses into pe-addressed routes whose
+    /// absolute paths the client must never see, and those adapters reach for
+    /// `to_string()`. Keeping the path out of the message means an accidental
+    /// forward cannot disclose it.
+    #[error("file not found")]
     FileNotFound(String),
 
-    #[error("directory not found: {0}")]
+    /// Directory counterpart of [`Self::FileNotFound`]; same reason for keeping
+    /// the path out of `Display`.
+    #[error("directory not found")]
     DirectoryNotFound(String),
 
     #[error("invalid URL: {0}")]
@@ -72,13 +81,14 @@ mod tests {
 
     #[test]
     fn shell_error_display_messages() {
-        assert_eq!(
-            ShellError::FileNotFound("/a.txt".into()).to_string(),
-            "file not found: /a.txt"
-        );
+        // The two not-found variants must NOT render their path: these errors are
+        // adapted into pe-addressed routes where the absolute path is a secret, and
+        // adapters there stringify the error. Asserting the path is absent is the
+        // regression guard for that leak.
+        assert_eq!(ShellError::FileNotFound("/a.txt".into()).to_string(), "file not found");
         assert_eq!(
             ShellError::DirectoryNotFound("/dir".into()).to_string(),
-            "directory not found: /dir"
+            "directory not found"
         );
         assert_eq!(ShellError::InvalidUrl("bad".into()).to_string(), "invalid URL: bad");
         assert_eq!(
@@ -89,6 +99,22 @@ mod tests {
             ShellError::CommandFailed("oops".into()).to_string(),
             "command failed: oops"
         );
+    }
+
+    /// The path stays available as a field for logging and for the `/api/shell/*`
+    /// routes, which echo back the path the client itself sent — dropping it from
+    /// `Display` must not mean dropping it from the error.
+    #[test]
+    fn not_found_variants_retain_path_for_callers() {
+        let ShellError::FileNotFound(path) = ShellError::FileNotFound("/a.txt".into()) else {
+            panic!("expected FileNotFound");
+        };
+        assert_eq!(path, "/a.txt");
+
+        let ShellError::DirectoryNotFound(path) = ShellError::DirectoryNotFound("/dir".into()) else {
+            panic!("expected DirectoryNotFound");
+        };
+        assert_eq!(path, "/dir");
     }
 
     #[test]

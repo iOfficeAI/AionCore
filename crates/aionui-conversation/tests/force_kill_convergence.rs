@@ -70,6 +70,7 @@ async fn setup_repo() -> (Arc<SqliteConversationRepository>, aionui_db::Database
         updated_at: now,
         project_id: None,
         folder_id: None,
+        name_source: None,
     })
     .await
     .unwrap();

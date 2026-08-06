@@ -1,6 +1,93 @@
 use aionui_common::FileChangeOperation;
 use serde::{Deserialize, Serialize};
 
+use crate::chat_file::ChatFileRef;
+
+// ---------------------------------------------------------------------------
+// Content endpoint (ChatFileRef identity) — Request DTOs
+// ---------------------------------------------------------------------------
+
+/// How `POST /api/fs/content` encodes the returned file content.
+///
+/// Mirrors the WS `fs/read` encoding split: `utf8` for text, `base64`/`dataurl`
+/// for binary (dataurl prepends a guessed `data:<mime>;base64,` prefix).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentEncoding {
+    /// UTF-8 text (fails on non-UTF-8 input); returned as the raw string.
+    #[default]
+    Utf8,
+    /// Raw bytes, base64-encoded, no data-URL prefix.
+    Base64,
+    /// Base64 data URL with a guessed MIME type: `data:<mime>;base64,<...>`.
+    DataUrl,
+}
+
+/// Request body for `POST /api/fs/content` — read a file addressed by
+/// [`ChatFileRef`] identity (collapses the old `read` + `image-base64`).
+#[derive(Debug, Deserialize)]
+pub struct ReadContentRequest {
+    pub file: ChatFileRef,
+    #[serde(default)]
+    pub encoding: ContentEncoding,
+}
+
+/// Request body for `PUT /api/fs/content` — write a file addressed by
+/// [`ChatFileRef`] identity. Optimistic-concurrency `If-Match` (last-modified
+/// ms) travels in the request header, not this body.
+#[derive(Debug, Deserialize)]
+pub struct WriteContentRequest {
+    pub file: ChatFileRef,
+    pub data: String,
+}
+
+/// Request body for `POST /api/fs/content/metadata` — metadata for a file
+/// addressed by [`ChatFileRef`] identity.
+#[derive(Debug, Deserialize)]
+pub struct ContentMetadataRequest {
+    pub file: ChatFileRef,
+}
+
+/// Query parameters for `GET /api/fs/stream` — a flattened [`ChatFileRef`].
+///
+/// The stream endpoint is a raw byte range server for `<webview src>` / `<embed>`
+/// (pdf), which can only issue a GET with no body, so the identity travels in the
+/// query string. `kind` selects the variant; the other fields carry its payload.
+#[derive(Debug, Deserialize)]
+pub struct StreamQuery {
+    pub kind: String,
+    #[serde(default)]
+    pub pe_id: Option<String>,
+    #[serde(default)]
+    pub relative_path: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl StreamQuery {
+    /// Rebuild the [`ChatFileRef`] from the flattened query, or return a message
+    /// naming the missing/invalid field.
+    pub fn to_chat_file_ref(&self) -> Result<ChatFileRef, &'static str> {
+        match self.kind.as_str() {
+            "project" => match (self.pe_id.clone(), self.relative_path.clone()) {
+                (Some(pe_id), Some(relative_path)) => Ok(ChatFileRef::Project { pe_id, relative_path }),
+                _ => Err("project stream requires pe_id and relative_path"),
+            },
+            "upload" => self
+                .path
+                .clone()
+                .map(|path| ChatFileRef::Upload { path })
+                .ok_or("upload stream requires path"),
+            "local" => self
+                .path
+                .clone()
+                .map(|path| ChatFileRef::Local { path })
+                .ok_or("local stream requires path"),
+            _ => Err("unknown stream kind (expected project|upload|local)"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A. Core file operations — Request DTOs
 // ---------------------------------------------------------------------------
@@ -78,6 +165,23 @@ pub struct RevealItemRequest {
     pub relative_path: String,
 }
 
+/// Request body for `POST /api/fs/open-system` — open a `ChatFileRef`-addressed
+/// file with the OS default application ("open in system editor"). Preview offers
+/// this as the escape hatch for files it will not render itself (oversized or
+/// unsupported formats).
+///
+/// Uses `ChatFileRef` rather than `{pe_id, relative_path}` so all three preview
+/// sources are covered — project files, uploads, and host-picked local files —
+/// whereas [`RevealItemRequest`] serves the project-only Explorer tree.
+///
+/// The response carries no body: the backend resolves the identity to an absolute
+/// path, opens it locally, and never returns that path (see INV-OPEN on the
+/// handler).
+#[derive(Debug, Deserialize)]
+pub struct OpenSystemFileRequest {
+    pub file: ChatFileRef,
+}
+
 /// Request body for `POST /api/fs/image-base64` — get image as base64.
 #[derive(Debug, Deserialize)]
 pub struct GetImageBase64Request {
@@ -145,23 +249,7 @@ pub struct CopyFilesResponse {
 }
 
 // ---------------------------------------------------------------------------
-// D. File watch — Request DTOs
-// ---------------------------------------------------------------------------
-
-/// Request body for `POST /api/fs/watch/start` and `/stop`.
-#[derive(Debug, Deserialize)]
-pub struct FileWatchRequest {
-    pub file_path: String,
-}
-
-/// Request body for `POST /api/fs/office-watch/start` and `/stop`.
-#[derive(Debug, Deserialize)]
-pub struct WorkspaceOfficeWatchRequest {
-    pub workspace: String,
-}
-
-// ---------------------------------------------------------------------------
-// E. Workspace snapshot — Request DTOs
+// B. Workspace snapshot — Request DTOs
 // ---------------------------------------------------------------------------
 
 /// Request body for snapshot init / getInfo / compare / stageAll / unstageAll / dispose.
@@ -193,7 +281,7 @@ pub struct SnapshotDiscardRequest {
 }
 
 // ---------------------------------------------------------------------------
-// E. Workspace snapshot — Response DTOs
+// B. Workspace snapshot — Response DTOs
 // ---------------------------------------------------------------------------
 
 /// Snapshot mode.
@@ -274,13 +362,6 @@ mod tests {
         });
         let req: CopyFilesRequest = serde_json::from_value(raw).unwrap();
         assert!(req.source_root.is_none());
-    }
-
-    #[test]
-    fn file_watch_request_snake_case() {
-        let raw = r#"{"file_path":"/path/to/file.txt"}"#;
-        let req: FileWatchRequest = serde_json::from_str(raw).unwrap();
-        assert_eq!(req.file_path, "/path/to/file.txt");
     }
 
     #[test]

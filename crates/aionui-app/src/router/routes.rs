@@ -195,7 +195,6 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
             let team_service = states.team.service.clone();
             let channel_manager = states.channel.manager.clone();
             let channel_session_manager = states.channel.session_manager.clone();
-            let file_watch_service = states.file.watch_service.clone();
             let office_watch_manager = states.office.watch_manager.clone();
             Some(Arc::new(move |user_id: &str| {
                 ws_manager.disconnect_user(user_id, "session revoked");
@@ -211,7 +210,6 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 let conversation_service = conversation_service.clone();
                 let channel_manager = channel_manager.clone();
                 let channel_session_manager = channel_session_manager.clone();
-                let file_watch_service = file_watch_service.clone();
                 let office_watch_manager = office_watch_manager.clone();
                 tokio::spawn(async move {
                     channel_manager.shutdown_for_user(&user_id).await;
@@ -228,20 +226,6 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                             user_id = %user_id,
                             error = %err,
                             "failed to terminate runtimes after session revocation"
-                        );
-                    }
-                    if let Err(err) = file_watch_service.stop_all_watches_for_user(&user_id).await {
-                        tracing::warn!(
-                            user_id = %user_id,
-                            error = %err,
-                            "failed to stop file watches after session revocation"
-                        );
-                    }
-                    if let Err(err) = file_watch_service.stop_all_office_watches_for_user(&user_id).await {
-                        tracing::warn!(
-                            user_id = %user_id,
-                            error = %err,
-                            "failed to stop office file watches after session revocation"
                         );
                     }
                 });

@@ -58,16 +58,6 @@ pub struct ResourceRef {
     pub relative_path: String,
 }
 
-/// Content encoding for `fs/read`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Encoding {
-    #[serde(rename = "utf-8")]
-    #[default]
-    Utf8,
-    Base64,
-}
-
 // ── Method params ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,23 +73,6 @@ pub struct SubscribeParams {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnsubscribeParams {
     pub targets: Vec<ResourceRef>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReadParams {
-    pub file: ResourceRef,
-    #[serde(default)]
-    pub encoding: Option<Encoding>,
-}
-
-// PATCH(ELECTRON-3SZ): `fs/resolve` params. Violates the pe_id identity boundary
-// (the backend must not expose absolute paths, the frontend must not know them).
-// Added only as an emergency line fix so preview's office/pdf viewers can obtain
-// an absolute `file_path`. REMOVE together with `handle_resolve` once preview is
-// redesigned to consume content over the wire.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ResolveParams {
-    pub file: ResourceRef,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -211,16 +184,50 @@ impl WireEntry {
 
 /// Build the `fs/snapshot` params for one target from a canonical-domain
 /// [`Snapshot`]. The `target` is the subscriber's pe-relative identity.
+///
+/// Used for the `fs/subscribe` reply, where a snapshot is simply the caller's
+/// first view of a directory. The push that follows an overflow rescan carries an
+/// extra marker and goes through [`overflow_snapshot_params`].
 pub fn snapshot_params(snapshot: &Snapshot, target: &ResourceRef) -> Value {
-    let entries: Vec<WireEntry> = snapshot
+    json!({
+        "target": target,
+        "entries": wire_entries(snapshot),
+    })
+}
+
+/// Build the `fs/snapshot` params for an overflow rescan, tagged so the receiver
+/// can tell it apart from a first listing.
+///
+/// The two are indistinguishable on the wire otherwise, and they mean opposite
+/// things: a subscribe reply says "here is what this directory holds", whereas an
+/// overflow push says "the kernel dropped events, so anything here may have
+/// changed — including file contents, which a listing cannot show".
+///
+/// A receiver that treats the second as the first silently loses every change in
+/// that window. Overflow supersedes buffered per-child events during debounce
+/// (`runtime::actor`), so it does not merely lack deltas — it replaces the deltas
+/// that would otherwise have been sent. The marker is what lets a receiver
+/// respond conservatively (re-read what it is showing) instead of assuming
+/// nothing happened.
+///
+/// `reason` is an added optional field, so this needs no protocol version bump:
+/// receivers that do not know it ignore it and behave exactly as before, which is
+/// the same compatibility argument the `modified` op relies on.
+pub fn overflow_snapshot_params(snapshot: &Snapshot, target: &ResourceRef) -> Value {
+    json!({
+        "target": target,
+        "entries": wire_entries(snapshot),
+        "reason": "overflow",
+    })
+}
+
+/// Project a canonical-domain snapshot's entries to their outward form.
+fn wire_entries(snapshot: &Snapshot) -> Vec<WireEntry> {
+    snapshot
         .entries
         .iter()
         .map(|(name, fact)| WireEntry::from_fact(name, fact))
-        .collect();
-    json!({
-        "target": target,
-        "entries": entries,
-    })
+        .collect()
 }
 
 /// Build the `fs/delta` params for one target from a canonical-domain
@@ -233,7 +240,8 @@ pub fn delta_params(delta: &DeltaBatch, target: &ResourceRef) -> Value {
     })
 }
 
-/// One reconciled change → tagged wire object (`op` = added/removed/renamed).
+/// One reconciled change → tagged wire object (`op` = added/removed/renamed/
+/// modified).
 fn change_to_wire(change: &Change) -> Value {
     match change {
         Change::Added { name, kind } => json!({
@@ -249,6 +257,13 @@ fn change_to_wire(change: &Change) -> Value {
             "op": "renamed",
             "from": from,
             "to": to,
+        }),
+        // No mtime on the wire, by design — see `Change::Modified`. Adding one op
+        // is a backward-compatible extension: clients ignore ops they do not know,
+        // so this needs no protocol version bump and no lockstep release.
+        Change::Modified { name } => json!({
+            "op": "modified",
+            "name": name,
         }),
     }
 }

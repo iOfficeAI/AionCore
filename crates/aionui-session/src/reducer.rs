@@ -367,6 +367,26 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
             settle(state.clone(), to, epoch)
         }
 
+        // Ask/AskResolved: the structured-question twin of Permission/Resolved,
+        // on its OWN counter (asking is not authorizing — 2026-08-04 ruling).
+        // Mechanically identical: saturating ±1, payload never read (§R9).
+        SessionEvent::Ask { .. } => {
+            let mut to = state.clone();
+            let epoch = anchor_epoch(state);
+            if let SessionState::Running { requires_action, .. } = &mut to {
+                requires_action.waiting_on_question = requires_action.waiting_on_question.saturating_add(1);
+            }
+            settle(state.clone(), to, epoch)
+        }
+        SessionEvent::AskResolved { .. } => {
+            let mut to = state.clone();
+            let epoch = anchor_epoch(state);
+            if let SessionState::Running { requires_action, .. } = &mut to {
+                requires_action.waiting_on_question = requires_action.waiting_on_question.saturating_sub(1);
+            }
+            settle(state.clone(), to, epoch)
+        }
+
         // Opaque escape hatch (I13): count or ignore only; never inspect
         // tag/payload. P0 = ignore (no state change, no Transition).
         SessionEvent::AdapterSpecific { .. } => (state.clone(), Vec::new()),
@@ -408,6 +428,9 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // SessionInfo is a read-only query reply (context budget / cost) — never a
         // turn signal. The conversation projects it; FSM no-op.
         | SessionEvent::SessionInfo { .. }
+        // SessionTitle is an agent-generated conversation title — applied by the
+        // conversation layer under the name_source guard. Never a turn signal.
+        | SessionEvent::SessionTitle { .. }
         // 009 R6b: SubagentDetail is the rich BACKGROUND-plane roster fill — read
         // ONLY by the orchestrator's workflow_roster, never by the FSM. No-op here.
         | SessionEvent::SubagentDetail { .. }
@@ -418,6 +441,9 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // (persist backend_session_id). The reducer NEVER touches SessionState for
         // it — it is not a turn signal, not a requires-action, not a roster update.
         | SessionEvent::BackendBound { .. }
+        // BackendTurnBound is BackendBound's turn-scoped sibling (fork anchor
+        // pass-through for message stamping). Same contract: reducer no-op.
+        | SessionEvent::BackendTurnBound { .. }
         // 009 R6: BackendSuspended is FSM-invisible (the wake re-spawns on the
         // same event_tx). The orchestrator clears the roster on it; the reducer
         // does NOT move SessionState (suspend ≠ a turn boundary).
@@ -914,6 +940,7 @@ mod tests {
             requires_action: RequiresActionSet {
                 waiting_on_approval: 1, // non-default: a rebuild would reset to 0
                 waiting_on_auth: 0,
+                waiting_on_question: 0,
             },
             subagents: Vec::new(),
         }
@@ -2074,6 +2101,7 @@ mod proptest_totality {
                     requires_action: RequiresActionSet {
                         waiting_on_approval: appr,
                         waiting_on_auth: auth,
+                        waiting_on_question: 0,
                     },
                     subagents: sub
                         .map(|st| {

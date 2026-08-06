@@ -597,6 +597,127 @@ pub struct TeammateMessagePayload {
 }
 
 // ---------------------------------------------------------------------------
+// G. Team activity (mailbox & tasks) — read DTOs & event payloads
+// ---------------------------------------------------------------------------
+
+/// Read-only projection of a `mailbox` row for the team activity view.
+///
+/// Returned by `GET /api/teams/{id}/mailbox` and embedded in
+/// [`TeamMailboxChangedPayload`]. `files` is normalized to a plain list
+/// (empty when the row had none or the stored JSON was malformed).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamMailboxMessageResponse {
+    pub id: String,
+    pub team_id: String,
+    pub from_agent_id: String,
+    pub to_agent_id: String,
+    pub msg_type: String,
+    pub content: String,
+    pub summary: Option<String>,
+    pub files: Vec<String>,
+    pub read: bool,
+    pub created_at: TimestampMs,
+}
+
+/// Read-only projection of a `team_tasks` row for the team activity view.
+///
+/// Returned by `GET /api/teams/{id}/tasks` and embedded in
+/// [`TeamTaskChangedPayload`]. `metadata` is intentionally omitted (not
+/// needed by the v1 activity view).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamTaskResponse {
+    pub id: String,
+    pub team_id: String,
+    pub subject: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub owner: Option<String>,
+    pub blocked_by: Vec<String>,
+    pub blocks: Vec<String>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+/// Discriminates a unified activity item.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamActivityKind {
+    Message,
+    Task,
+}
+
+/// One entry of the unified team activity feed. `created_at`/`id` are surfaced
+/// at top level so the client can sort/cursor without unwrapping the payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamActivityItemResponse {
+    pub kind: TeamActivityKind,
+    pub created_at: TimestampMs,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<TeamMailboxMessageResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TeamTaskResponse>,
+}
+
+/// Keyset cursor echoed back for the next page.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamActivityCursor {
+    pub ts: TimestampMs,
+    pub id: String,
+}
+
+/// Response of `GET /api/teams/{id}/activity`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamActivityPageResponse {
+    pub items: Vec<TeamActivityItemResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<TeamActivityCursor>,
+    pub has_more: bool,
+}
+
+/// Kind of mailbox change carried by `team.mailboxChanged`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamMailboxChange {
+    /// A new message was written to the mailbox.
+    Created,
+    /// An existing message was marked as read.
+    Read,
+}
+
+/// Kind of task change carried by `team.taskChanged`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamTaskChange {
+    /// A new task was created.
+    Created,
+    /// An existing task was updated (deletion is an update to `status=deleted`).
+    Updated,
+}
+
+/// Payload for the `team.taskChanged` WebSocket event.
+///
+/// Pushed after a task is created or updated so the activity view can
+/// upsert it by id in real time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamTaskChangedPayload {
+    pub team_id: String,
+    pub task: TeamTaskResponse,
+    pub change: TeamTaskChange,
+}
+
+/// Payload for the `team.mailboxChanged` WebSocket event.
+///
+/// Pushed after a message is written (`created`) or marked read (`read`) so
+/// the activity view can upsert it by id and keep read badges accurate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamMailboxChangedPayload {
+    pub team_id: String,
+    pub message: TeamMailboxMessageResponse,
+    pub change: TeamMailboxChange,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -604,6 +725,47 @@ pub struct TeammateMessagePayload {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // -- Unified team activity feed -------------------------------------------
+
+    #[test]
+    fn team_activity_item_serializes_with_kind_tag() {
+        let item = TeamActivityItemResponse {
+            kind: TeamActivityKind::Message,
+            created_at: 1000,
+            id: "m1".into(),
+            message: Some(TeamMailboxMessageResponse {
+                id: "m1".into(),
+                team_id: "t1".into(),
+                from_agent_id: "a".into(),
+                to_agent_id: "b".into(),
+                msg_type: "message".into(),
+                content: "hi".into(),
+                summary: None,
+                files: vec![],
+                read: false,
+                created_at: 1000,
+            }),
+            task: None,
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["kind"], "message");
+        assert_eq!(v["id"], "m1");
+        assert!(v.get("task").is_none() || v["task"].is_null());
+    }
+
+    #[test]
+    fn team_activity_page_roundtrips() {
+        let page = TeamActivityPageResponse {
+            items: vec![],
+            next_cursor: Some(TeamActivityCursor { ts: 42, id: "x".into() }),
+            has_more: true,
+        };
+        let json = serde_json::to_string(&page).unwrap();
+        let back: TeamActivityPageResponse = serde_json::from_str(&json).unwrap();
+        assert!(back.has_more);
+        assert_eq!(back.next_cursor.unwrap().ts, 42);
+    }
 
     // -- A. Team management requests ------------------------------------------
 
@@ -1528,5 +1690,130 @@ mod tests {
         );
         let parsed: TeamAgentRuntimeStatus = serde_json::from_value(json!("dormant")).unwrap();
         assert_eq!(parsed, TeamAgentRuntimeStatus::Dormant);
+    }
+
+    // -- G. Team activity read DTOs & events ----------------------------------
+
+    #[test]
+    fn team_mailbox_message_response_field_names_and_roundtrip() {
+        let resp = TeamMailboxMessageResponse {
+            id: "m1".into(),
+            team_id: "t1".into(),
+            from_agent_id: "a2".into(),
+            to_agent_id: "a1".into(),
+            msg_type: "message".into(),
+            content: "hello".into(),
+            summary: Some("hi".into()),
+            files: vec!["/tmp/a.txt".into()],
+            read: false,
+            created_at: 1000,
+        };
+        let value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(value["id"], json!("m1"));
+        assert_eq!(value["team_id"], json!("t1"));
+        assert_eq!(value["from_agent_id"], json!("a2"));
+        assert_eq!(value["to_agent_id"], json!("a1"));
+        assert_eq!(value["msg_type"], json!("message"));
+        assert_eq!(value["summary"], json!("hi"));
+        assert_eq!(value["files"], json!(["/tmp/a.txt"]));
+        assert_eq!(value["read"], json!(false));
+        assert_eq!(value["created_at"], json!(1000));
+        let restored: TeamMailboxMessageResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, resp);
+    }
+
+    #[test]
+    fn team_task_response_field_names_and_roundtrip_no_metadata() {
+        let resp = TeamTaskResponse {
+            id: "tk1".into(),
+            team_id: "t1".into(),
+            subject: "Build".into(),
+            description: None,
+            status: "in_progress".into(),
+            owner: Some("a1".into()),
+            blocked_by: vec!["tk0".into()],
+            blocks: vec!["tk2".into()],
+            created_at: 1,
+            updated_at: 2,
+        };
+        let value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(value["status"], json!("in_progress"));
+        assert_eq!(value["blocked_by"], json!(["tk0"]));
+        assert_eq!(value["blocks"], json!(["tk2"]));
+        assert!(value.get("metadata").is_none(), "metadata must not be exposed");
+        let restored: TeamTaskResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, resp);
+    }
+
+    #[test]
+    fn team_mailbox_change_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(TeamMailboxChange::Created).unwrap(),
+            json!("created")
+        );
+        assert_eq!(serde_json::to_value(TeamMailboxChange::Read).unwrap(), json!("read"));
+        let parsed: TeamMailboxChange = serde_json::from_value(json!("read")).unwrap();
+        assert_eq!(parsed, TeamMailboxChange::Read);
+    }
+
+    #[test]
+    fn team_task_change_serializes_snake_case() {
+        assert_eq!(serde_json::to_value(TeamTaskChange::Created).unwrap(), json!("created"));
+        assert_eq!(serde_json::to_value(TeamTaskChange::Updated).unwrap(), json!("updated"));
+        let parsed: TeamTaskChange = serde_json::from_value(json!("updated")).unwrap();
+        assert_eq!(parsed, TeamTaskChange::Updated);
+    }
+
+    #[test]
+    fn team_task_changed_payload_shape() {
+        let payload = TeamTaskChangedPayload {
+            team_id: "t1".into(),
+            task: TeamTaskResponse {
+                id: "tk1".into(),
+                team_id: "t1".into(),
+                subject: "Build".into(),
+                description: None,
+                status: "pending".into(),
+                owner: None,
+                blocked_by: vec![],
+                blocks: vec![],
+                created_at: 1,
+                updated_at: 1,
+            },
+            change: TeamTaskChange::Created,
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["team_id"], json!("t1"));
+        assert_eq!(value["change"], json!("created"));
+        assert_eq!(value["task"]["id"], json!("tk1"));
+        let restored: TeamTaskChangedPayload = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, payload);
+    }
+
+    #[test]
+    fn team_mailbox_changed_payload_shape() {
+        let payload = TeamMailboxChangedPayload {
+            team_id: "t1".into(),
+            message: TeamMailboxMessageResponse {
+                id: "m1".into(),
+                team_id: "t1".into(),
+                from_agent_id: "a2".into(),
+                to_agent_id: "a1".into(),
+                msg_type: "message".into(),
+                content: "hi".into(),
+                summary: None,
+                files: vec![],
+                read: true,
+                created_at: 1,
+            },
+            change: TeamMailboxChange::Read,
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["team_id"], json!("t1"));
+        assert_eq!(value["change"], json!("read"));
+        assert_eq!(value["message"]["id"], json!("m1"));
+        assert_eq!(value["message"]["read"], json!(true));
+        let restored: TeamMailboxChangedPayload = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, payload);
     }
 }

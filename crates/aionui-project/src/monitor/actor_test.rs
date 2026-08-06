@@ -223,142 +223,6 @@ async fn subscribe_parent_escape_is_invalid_relative_path() {
 }
 
 #[tokio::test]
-async fn read_existing_file_returns_utf8() {
-    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
-    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
-
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(4, "fs/read", json!({"file":dir_ref(&pe, "a.txt")})),
-        )
-        .await;
-    let reply = push.last_for("1").unwrap();
-    assert_eq!(reply["result"]["content"], "hello");
-    assert_eq!(reply["result"]["encoding"], "utf-8");
-}
-
-#[tokio::test]
-async fn read_missing_file_is_resource_not_found() {
-    let (mut actor, _rx, push, pe, _dir, _db) = setup().await;
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(5, "fs/read", json!({"file":dir_ref(&pe, "missing.txt")})),
-        )
-        .await;
-    let reply = push.last_for("1").unwrap();
-    assert_eq!(reply["error"]["code"], -32002);
-    assert_eq!(reply["error"]["message"], "resource_not_found");
-    assert_eq!(reply["error"]["data"]["relative_path"], "missing.txt");
-}
-
-#[tokio::test]
-async fn read_non_utf8_falls_back_to_base64() {
-    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
-    std::fs::write(dir.path().join("bin"), [0xff, 0xfe, 0x00]).unwrap();
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(6, "fs/read", json!({"file":dir_ref(&pe, "bin")})),
-        )
-        .await;
-    let reply = push.last_for("1").unwrap();
-    assert_eq!(reply["result"]["encoding"], "base64");
-    assert!(!reply["result"]["content"].as_str().unwrap().is_empty());
-}
-
-// PATCH(ELECTRON-3SZ): tests for the temporary `fs/resolve` command. Remove
-// together with `handle_resolve` when preview no longer needs absolute paths.
-#[tokio::test]
-async fn resolve_existing_file_returns_absolute_and_workspace_root() {
-    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
-    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
-
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(40, "fs/resolve", json!({"file":dir_ref(&pe, "a.txt")})),
-        )
-        .await;
-    let reply = push.last_for("1").unwrap();
-    assert_eq!(reply["id"], 40);
-    let abs = reply["result"]["absolute_path"].as_str().unwrap();
-    let root = reply["result"]["workspace_root"].as_str().unwrap();
-    // Contract: absolute_path is the file under workspace_root. Asserted
-    // relationally (not against a hardcoded path) because the root carries the
-    // dedupe key's platform case-folding — the same folding fs/read uses.
-    assert!(!root.is_empty());
-    assert_eq!(
-        abs,
-        format!("{root}/a.txt"),
-        "absolute_path must be workspace_root + rel"
-    );
-    // The path is the same `absolute` PathBuf fs/read reads from, so it must open
-    // here too — proves resolve hands back a usable filesystem path.
-    assert_eq!(std::fs::read(abs).unwrap(), b"x");
-}
-
-#[tokio::test]
-async fn resolve_unknown_pe_is_out_of_scope() {
-    let (mut actor, _rx, push, _pe, _dir, _db) = setup().await;
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(41, "fs/resolve", json!({"file":dir_ref("pe-nope", "a.txt")})),
-        )
-        .await;
-    let reply = push.last_for("1").unwrap();
-    assert_eq!(reply["error"]["code"], -32000);
-    assert_eq!(reply["error"]["message"], "out_of_scope");
-    assert_eq!(reply["error"]["data"]["pe_id"], "pe-nope");
-}
-
-#[tokio::test]
-async fn resolve_parent_escape_is_invalid_relative_path() {
-    let (mut actor, _rx, push, pe, _dir, _db) = setup().await;
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(42, "fs/resolve", json!({"file":dir_ref(&pe, "../escape")})),
-        )
-        .await;
-    let reply = push.last_for("1").unwrap();
-    assert_eq!(reply["error"]["code"], -32004);
-    assert_eq!(reply["error"]["message"], "invalid_relative_path");
-}
-
-/// PATCH(ELECTRON-3SZ): resolve must run the same realpath containment guard as
-/// the other file commands — a symlink escaping the folder root is rejected
-/// before any path is handed back. Unix-only (symlink creation needs privilege
-/// on Windows); the `realpath_within` logic itself is platform-agnostic.
-#[cfg(unix)]
-#[tokio::test]
-async fn resolve_symlink_escape_is_resource_outside_folder() {
-    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
-    let outside = tempfile::tempdir().unwrap();
-    std::fs::write(outside.path().join("secret.txt"), b"top secret").unwrap();
-    std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
-
-    actor
-        .dispatch_frame(
-            "1",
-            "system_default_user",
-            request(44, "fs/resolve", json!({"file":dir_ref(&pe, "link/secret.txt")})),
-        )
-        .await;
-    let reply = push.last_for("1").unwrap();
-    assert_eq!(reply["error"]["code"], -32003);
-    assert_eq!(reply["error"]["message"], "resource_outside_folder");
-}
-
-#[tokio::test]
 async fn mkdir_then_remove_roundtrip() {
     let (mut actor, _rx, push, pe, dir, _db) = setup().await;
     actor
@@ -482,6 +346,7 @@ async fn unsubscribe_is_notification_no_reply() {
 /// IO. Unix-only — creating a symlink on Windows needs elevated privilege; the
 /// `realpath_within` logic itself is platform-agnostic (walks the deepest
 /// existing ancestor), exercised on unix here and noted in the test report.
+/// Driven through `fs/mkdir` — any resolve-guarded command shares the guard.
 #[cfg(unix)]
 #[tokio::test]
 async fn command_symlink_escape_is_resource_outside_folder() {
@@ -495,7 +360,7 @@ async fn command_symlink_escape_is_resource_outside_folder() {
         .dispatch_frame(
             "1",
             "system_default_user",
-            request(20, "fs/read", json!({"file":dir_ref(&pe, "link/secret.txt")})),
+            request(20, "fs/mkdir", json!({"dir":dir_ref(&pe, "link/secret.txt")})),
         )
         .await;
     let reply = push.last_for("1").unwrap();
@@ -518,6 +383,7 @@ async fn fan_out_snapshot_is_scoped_and_pe_keyed_per_subscriber() {
                 kind: Kind::File,
                 inode: 1,
                 symlink_target: None,
+                mtime_ms: Some(1_700_000_000_000),
             },
         )],
     };
@@ -577,6 +443,17 @@ fn has_delta_adding(frames: &[(String, Value)], session: &str, name: &str) -> bo
     })
 }
 
+fn has_delta_modifying(frames: &[(String, Value)], session: &str, name: &str) -> bool {
+    frames.iter().any(|(s, f)| {
+        s == session
+            && f["method"] == "fs/delta"
+            && f["params"]["changes"]
+                .as_array()
+                .map(|cs| cs.iter().any(|c| c["op"] == "modified" && c["name"] == name))
+                .unwrap_or(false)
+    })
+}
+
 #[tokio::test]
 async fn live_change_fans_delta_to_subscriber_only() {
     let (actor, raw_rx, push, pe, dir, _db) = setup().await;
@@ -603,6 +480,72 @@ async fn live_change_fans_delta_to_subscriber_only() {
     assert!(
         !push.frames().iter().any(|(s, _)| s == "2"),
         "non-subscriber must receive no push"
+    );
+
+    drop(tx);
+    let _ = handle.await;
+}
+
+/// An edit to a file's *contents* must reach the subscriber as `op: "modified"`.
+///
+/// The two ends of this were already covered and the middle was not: `TreeModel`
+/// tests prove the diff produces a `Modified` change, and the test above proves a
+/// delta reaches a subscriber — but nothing showed a `modified` change surviving
+/// the trip. Since the whole point of that change is to let preview light a refresh
+/// affordance, "generated correctly" and "delivered" are separate claims, and only
+/// the first had evidence.
+///
+/// The timestamp is advanced explicitly rather than by writing twice: some
+/// filesystems record whole seconds, so back-to-back writes can leave mtime
+/// untouched, and the detection deliberately under-reports when it cannot see a
+/// change. A test that relied on write timing would pass or fail by the clock —
+/// and an intermittently-red test gets triaged as a flake and muted, which costs
+/// more than having no test, because it also removes the signal that this path was
+/// ever meant to be guarded.
+#[tokio::test]
+async fn live_content_edit_fans_modified_delta_to_subscriber() {
+    let (actor, raw_rx, push, pe, dir, _db) = setup().await;
+    let (tx, rx) = unbounded_channel();
+    let handle = tokio::spawn(actor.run(rx, raw_rx));
+
+    // The file has to exist before the subscription so its baseline mtime is part
+    // of the snapshot — otherwise the edit below would surface as `added`.
+    let file = dir.path().join("watched.md");
+    std::fs::write(&file, b"before").unwrap();
+
+    tx.send(FsInbound::Frame {
+        session: "1".to_owned(),
+        user_id: "system_default_user".to_owned(),
+        frame: request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
+    })
+    .unwrap();
+    // Let subscribe mount + arm the watch.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    std::fs::write(&file, b"after").unwrap();
+    let bumped = std::time::SystemTime::now() + Duration::from_secs(5);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(bumped)
+        .unwrap();
+
+    assert!(
+        wait_until(&push, Duration::from_secs(5), |f| has_delta_modifying(
+            f,
+            "1",
+            "watched.md"
+        ))
+        .await,
+        "an edited file must reach the subscriber as op:'modified' — the signal preview keys its refresh on"
+    );
+
+    // The listing did not change, so the edit must not also be reported as a
+    // structural change; a client applying both would rebuild the node needlessly.
+    assert!(
+        !has_delta_adding(&push.frames(), "1", "watched.md"),
+        "a content edit must not surface as 'added'"
     );
 
     drop(tx);
@@ -685,6 +628,50 @@ async fn overflow_fans_full_snapshot_through_event_loop() {
     })
     .await;
     assert!(got_snapshot, "overflow must push a full fs/snapshot through the loop");
+
+    // Tagged as a rescan. Without this the push is shape-identical to a subscribe
+    // reply, and a receiver reading it as "here is the listing" loses every change
+    // in the window — overflow supersedes the buffered per-child events during
+    // debounce, so those deltas were never sent separately.
+    let tagged = push
+        .frames()
+        .iter()
+        .any(|(s, m)| s == "1" && m["method"] == "fs/snapshot" && m["params"]["reason"] == "overflow");
+    assert!(tagged, "an overflow snapshot must carry reason:'overflow'");
+
+    drop(tx);
+    let _ = handle.await;
+}
+
+/// The subscribe reply must *not* be tagged. Both paths build their params from the
+/// same snapshot, so a marker leaking onto the first listing would make every
+/// freshly-opened directory look like a rescan — the receiver would re-read content
+/// it just received, on every subscribe.
+#[tokio::test]
+async fn subscribe_reply_snapshot_is_not_marked_as_overflow() {
+    let (actor, raw_rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.ts"), b"x").unwrap();
+    let (tx, rx) = unbounded_channel();
+    let handle = tokio::spawn(actor.run(rx, raw_rx));
+
+    tx.send(FsInbound::Frame {
+        session: "1".to_owned(),
+        user_id: "system_default_user".to_owned(),
+        frame: request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
+    })
+    .unwrap();
+
+    // The reply is a response to id 1, not an fs/snapshot notification.
+    let got_reply = wait_until(&push, Duration::from_secs(5), |frames| {
+        frames
+            .iter()
+            .any(|(s, m)| s == "1" && m["id"] == 1 && m["result"]["snapshots"].is_array())
+    })
+    .await;
+    assert!(got_reply, "subscribe must answer with snapshots");
+
+    let leaked = push.frames().iter().any(|(_, m)| m.to_string().contains("overflow"));
+    assert!(!leaked, "no frame from a plain subscribe may mention overflow");
 
     drop(tx);
     let _ = handle.await;

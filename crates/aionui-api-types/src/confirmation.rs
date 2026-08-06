@@ -111,6 +111,7 @@ mod tests {
     #[test]
     fn confirmation_list_response_is_vec() {
         let list: ConfirmationListResponse = vec![Confirmation {
+            questions: None,
             id: "c1".into(),
             call_id: "call-1".into(),
             title: Some("Test".into()),
