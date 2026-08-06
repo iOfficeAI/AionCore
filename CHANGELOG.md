@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.61](https://github.com/iOfficeAI/AionCore/compare/v0.1.60...v0.1.61) (2026-08-06)
+
+
+### Bug Fixes
+
+* **adoption:** move legacy root assistant-rules to the adopter ([#788](https://github.com/iOfficeAI/AionCore/issues/788)) ([0b678e8](https://github.com/iOfficeAI/AionCore/commit/0b678e8a6812bd9c734a8c825fb2c6fca6079661))
+
 ## [0.1.60](https://github.com/iOfficeAI/AionCore/compare/v0.1.59...v0.1.60) (2026-08-06)
 
 
