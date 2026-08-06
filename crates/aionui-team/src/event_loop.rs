@@ -322,22 +322,30 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
         }
     };
 
-    let terminal_status = if ctx.session.work_coordinator().is_batch_cancelled(&batch) {
+    let (terminal_status, terminal_team_run_ids) = if ctx.session.work_coordinator().is_batch_cancelled(&batch) {
         let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
-        None
+        (None, batch.team_run_ids.clone())
     } else if outcome.status.is_success() {
-        mark_message_ids_read(ctx, &batch, &batch.mailbox_message_ids).await;
-        (ctx.session.work_coordinator().complete_batch(&batch) == CommitResult::Committed)
-            .then_some(TeamRunStatus::Completed)
+        let completion = ctx.session.work_coordinator().complete_batch_with_ack(&batch);
+        if completion.commit_result == CommitResult::Committed {
+            mark_message_ids_read(ctx, &batch, &completion.ack_message_ids).await;
+        }
+        (
+            (completion.commit_result == CommitResult::Committed).then_some(TeamRunStatus::Completed),
+            completion.team_run_ids,
+        )
     } else {
         let failure = ctx.session.work_coordinator().fail_batch(&batch, "turn_failed");
         finalize_failed_delivery(ctx, &batch, &failure).await;
         let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
-        (failure.commit_result == CommitResult::Committed).then_some(TeamRunStatus::Failed)
+        (
+            (failure.commit_result == CommitResult::Committed).then_some(TeamRunStatus::Failed),
+            batch.team_run_ids.clone(),
+        )
     };
     if let Some(status) = terminal_status {
         let emitter = ctx.session.team_event_emitter();
-        for team_run_id in &batch.team_run_ids {
+        for team_run_id in &terminal_team_run_ids {
             emitter.broadcast_child_turn(
                 TEAM_CHILD_TURN_COMPLETED_EVENT,
                 TeamChildTurnPayload {
@@ -404,14 +412,21 @@ async fn mark_message_ids_read(ctx: &AgentLoopContext, batch: &WorkBatch, messag
     if message_ids.is_empty() {
         return;
     }
-    if let Err(error) = ctx.mailbox.mark_read_batch(&ctx.team_id, message_ids).await {
-        warn!(
+    match ctx.mailbox.mark_read_batch(&ctx.team_id, message_ids).await {
+        Ok(()) => debug!(
+            team_id = %ctx.team_id,
+            slot_id = %ctx.slot_id,
+            batch_id = %batch.batch_id,
+            ack_count = message_ids.len(),
+            "team batch mailbox messages marked read"
+        ),
+        Err(error) => warn!(
             team_id = %ctx.team_id,
             slot_id = %ctx.slot_id,
             batch_id = %batch.batch_id,
             error = %error,
             "team batch mailbox terminal mark-read failed"
-        );
+        ),
     }
 }
 

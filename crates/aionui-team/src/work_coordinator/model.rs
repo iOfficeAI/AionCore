@@ -142,6 +142,11 @@ pub(crate) struct WorkBatch {
     pub(crate) slot_id: String,
     pub(crate) intent_ids: Vec<String>,
     pub(crate) mailbox_message_ids: Vec<String>,
+    /// Unread mailbox rows exposed through `team_read_messages` while this
+    /// batch owns the active turn. These rows are acknowledged only when the
+    /// turn completes successfully; failed or cancelled turns leave them
+    /// unread for the normal recovery path.
+    pub(crate) observed_message_ids: Vec<String>,
     pub(crate) highest_priority: WorkPriority,
     pub(crate) team_run_ids: Vec<String>,
     pub(crate) operation_id: u64,
@@ -241,6 +246,19 @@ pub(crate) struct ReconcileProjection {
 pub(crate) struct BatchCancelTarget {
     pub(crate) batch: WorkBatch,
     pub(crate) turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObserveMessagesResult {
+    pub(crate) batch_id: Option<String>,
+    pub(crate) observed_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchCompletionResult {
+    pub(crate) commit_result: CommitResult,
+    pub(crate) ack_message_ids: Vec<String>,
+    pub(crate) team_run_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

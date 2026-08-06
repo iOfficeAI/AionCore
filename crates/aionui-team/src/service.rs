@@ -50,7 +50,7 @@ use crate::session::{
 };
 use crate::team_run::TeamRunManager;
 use crate::types::{Team, TeamAgent, TeammateRole};
-use crate::work_coordinator::{McpRefreshDisposition, RuntimeRestartRejection};
+use crate::work_coordinator::{McpRefreshDisposition, ObserveMessagesResult, RuntimeRestartRejection};
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
 
@@ -2136,6 +2136,17 @@ impl TeamSessionService {
         slot_id: &str,
     ) -> Result<Vec<crate::types::MailboxMessage>, TeamError> {
         self.published_session(team_id)?.peek_agent_messages(slot_id).await
+    }
+
+    pub(crate) async fn observe_agent_messages(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+        message_ids: &[String],
+    ) -> Result<ObserveMessagesResult, TeamError> {
+        self.published_session(team_id)?
+            .observe_agent_messages(slot_id, message_ids)
+            .await
     }
 
     /// Resolve a send's attachments to absolute paths and re-inline them into

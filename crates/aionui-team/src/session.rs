@@ -40,8 +40,8 @@ use crate::task_board::TaskBoard;
 use crate::team_run::{TeamRunManager, target_role_for};
 use crate::types::{MailboxMessage, MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::work_coordinator::{
-    CausalBinding, CommitResult, EnqueueCommit, EnqueueDisposition, EnqueueLease, EnqueueRequest, ReconcileDecision,
-    RuntimeConstraint, SlotWorkCoordinator, WorkBatch,
+    CausalBinding, CommitResult, EnqueueCommit, EnqueueDisposition, EnqueueLease, EnqueueRequest,
+    ObserveMessagesResult, ReconcileDecision, RuntimeConstraint, SlotWorkCoordinator, WorkBatch,
 };
 use crate::work_source::WorkSource;
 
@@ -2041,6 +2041,15 @@ impl TeamSession {
             .into_iter()
             .filter(|message| message.from_agent_id != slot_id)
             .collect())
+    }
+
+    pub(crate) async fn observe_agent_messages(
+        &self,
+        slot_id: &str,
+        message_ids: &[String],
+    ) -> Result<ObserveMessagesResult, TeamError> {
+        self.scheduler.get_agent(slot_id).await?;
+        Ok(self.work_coordinator.observe_messages(slot_id, message_ids))
     }
 
     pub fn task_board(&self) -> &Arc<TaskBoard> {

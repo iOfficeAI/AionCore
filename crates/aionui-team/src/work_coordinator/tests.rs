@@ -606,6 +606,120 @@ fn active_batch_prevents_unread_projection_from_being_rebuilt() {
 }
 
 #[test]
+fn observed_messages_complete_with_the_active_batch_and_do_not_requeue() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "initial");
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("initial message must be claimable");
+    };
+    assert_eq!(coordinator.mark_started(&batch, "turn-1"), StartCommitResult::Accepted);
+    enqueue(&coordinator, WorkSource::UserMessage, "late");
+
+    let observed = coordinator.observe_messages("lead-1", &["initial".into(), "late".into()]);
+    assert_eq!(observed.batch_id.as_deref(), Some(batch.batch_id.as_str()));
+    assert_eq!(
+        observed.observed_count, 1,
+        "the original batch message is already owned"
+    );
+    assert_eq!(
+        coordinator
+            .slot_snapshot("lead-1")
+            .unwrap()
+            .active_batch
+            .unwrap()
+            .observed_message_ids,
+        vec!["late"]
+    );
+
+    let completion = coordinator.complete_batch_with_ack(&batch);
+    assert_eq!(completion.commit_result, CommitResult::Committed);
+    assert_eq!(completion.ack_message_ids, vec!["initial", "late"]);
+    assert_eq!(coordinator.next("lead-1"), ReconcileDecision::Quiescent);
+    assert!(
+        coordinator
+            .intents_for_slot("lead-1")
+            .iter()
+            .all(|intent| intent.state == WorkIntentState::Completed)
+    );
+}
+
+#[test]
+fn observed_messages_remain_queued_when_the_active_batch_fails() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "initial");
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("initial message must be claimable");
+    };
+    coordinator.mark_started(&batch, "turn-1");
+    enqueue(&coordinator, WorkSource::UserMessage, "late");
+    coordinator.observe_messages("lead-1", &["late".into()]);
+
+    let failure = coordinator.fail_batch(&batch, "turn_failed");
+    assert_eq!(failure.commit_result, CommitResult::Committed);
+    let ReconcileDecision::Claim(retry) = coordinator.next("lead-1") else {
+        panic!("observed late message must remain queued after failure");
+    };
+    assert_eq!(retry.mailbox_message_ids, vec!["late"]);
+}
+
+#[test]
+fn observed_messages_remain_queued_when_the_active_batch_is_cancelled_or_interrupted() {
+    for interruption in [false, true] {
+        let coordinator = coordinator();
+        coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+        enqueue(&coordinator, WorkSource::UserMessage, "initial");
+        let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+            panic!("initial message must be claimable");
+        };
+        coordinator.mark_started(&batch, "turn-1");
+        enqueue(&coordinator, WorkSource::UserMessage, "late");
+        coordinator.observe_messages("lead-1", &["late".into()]);
+
+        if interruption {
+            assert_eq!(
+                coordinator
+                    .interrupt_batch(&batch, Some("replace".into()), "replacement".into())
+                    .commit_result,
+                CommitResult::Committed
+            );
+        } else {
+            assert_eq!(
+                coordinator.cancel_batch(&batch, "turn_cancelled"),
+                CommitResult::Committed
+            );
+        }
+
+        let ReconcileDecision::Claim(next) = coordinator.next("lead-1") else {
+            panic!("observed late message must survive cancellation/interruption");
+        };
+        assert_eq!(next.mailbox_message_ids, vec!["late"]);
+    }
+}
+
+#[test]
+fn messages_arriving_after_observation_are_left_for_the_next_batch() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "initial");
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("initial message must be claimable");
+    };
+    coordinator.mark_started(&batch, "turn-1");
+    enqueue(&coordinator, WorkSource::UserMessage, "observed");
+    coordinator.observe_messages("lead-1", &["observed".into()]);
+    enqueue(&coordinator, WorkSource::UserMessage, "after-read");
+
+    let completion = coordinator.complete_batch_with_ack(&batch);
+    assert_eq!(completion.ack_message_ids, vec!["initial", "observed"]);
+    let ReconcileDecision::Claim(next) = coordinator.next("lead-1") else {
+        panic!("message arriving after read must start the next batch");
+    };
+    assert_eq!(next.mailbox_message_ids, vec!["after-read"]);
+}
+
+#[test]
 fn pause_cancels_running_batch_and_retains_queued_work() {
     let (coordinator, recorder) = coordinator_with_recorder();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);

@@ -331,7 +331,7 @@ fn tool_specs() -> Vec<TeamToolSpec> {
         TeamToolSpec {
             name: TeamToolName::TeamReadMessages,
             permission: TeamToolPermission::AnyTeamAgent,
-            description: "Peek at your own unread team mailbox messages without marking them read. Returns at most the most recent 50 messages in FIFO order; long content is truncated.",
+            description: "Peek at your own unread team mailbox messages. Each returned message includes message_id. Messages observed during an active turn are marked read only if that turn completes successfully; failed or cancelled turns preserve them for retry. Returns at most the most recent 50 messages in FIFO order; long content is truncated.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,

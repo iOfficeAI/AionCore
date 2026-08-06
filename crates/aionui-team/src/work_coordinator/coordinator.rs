@@ -557,6 +557,7 @@ impl SlotWorkCoordinator {
             slot_id: slot_id.to_owned(),
             intent_ids: message_intent_ids.clone(),
             mailbox_message_ids,
+            observed_message_ids: Vec::new(),
             highest_priority: priority,
             team_run_ids: team_run_ids.clone(),
             operation_id,
@@ -589,6 +590,49 @@ impl SlotWorkCoordinator {
             "team work batch claimed"
         );
         ReconcileDecision::Claim(batch)
+    }
+
+    /// Bind mailbox rows observed through `team_read_messages` to the active
+    /// turn. The binding is coordinator-local until the turn succeeds, so a
+    /// failed, cancelled, or interrupted turn leaves every observed row unread
+    /// and available to the existing retry/recovery path.
+    pub(crate) fn observe_messages(&self, slot_id: &str, message_ids: &[String]) -> ObserveMessagesResult {
+        let mut state = self.lock_state();
+        let Some(active) = state.slots.get_mut(slot_id).and_then(|slot| slot.active.as_mut()) else {
+            return ObserveMessagesResult {
+                batch_id: None,
+                observed_count: 0,
+            };
+        };
+        let original_ids = active.batch.mailbox_message_ids.iter().cloned().collect::<HashSet<_>>();
+        let mut known_ids = active
+            .batch
+            .observed_message_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut observed_count = 0;
+        for message_id in message_ids {
+            if original_ids.contains(message_id) || !known_ids.insert(message_id.clone()) {
+                continue;
+            }
+            active.batch.observed_message_ids.push(message_id.clone());
+            observed_count += 1;
+        }
+        let batch_id = active.batch.batch_id.clone();
+        drop(state);
+        debug!(
+            team_id = %self.team_id,
+            session_generation = %self.session_generation,
+            slot_id,
+            batch_id,
+            observed_count,
+            "team mailbox messages bound to active turn"
+        );
+        ObserveMessagesResult {
+            batch_id: Some(batch_id),
+            observed_count,
+        }
     }
 
     pub(crate) fn mark_started(&self, batch: &WorkBatch, turn_id: &str) -> StartCommitResult {
@@ -672,8 +716,90 @@ impl SlotWorkCoordinator {
         CommitResult::Committed
     }
 
+    #[cfg(test)]
     pub(crate) fn complete_batch(&self, batch: &WorkBatch) -> CommitResult {
-        self.terminalize_batch(batch, WorkIntentState::Completed, "completed")
+        self.complete_batch_with_ack(batch).commit_result
+    }
+
+    pub(crate) fn complete_batch_with_ack(&self, batch: &WorkBatch) -> BatchCompletionResult {
+        let mut state = self.lock_state();
+        if !self.is_current_batch(&state, batch) {
+            self.log_stale_batch(batch, "complete_batch_with_ack");
+            return BatchCompletionResult {
+                commit_result: CommitResult::StaleOwner,
+                ack_message_ids: Vec::new(),
+                team_run_ids: Vec::new(),
+            };
+        }
+
+        let active_batch = state
+            .slots
+            .get(&batch.slot_id)
+            .and_then(|slot| slot.active.as_ref())
+            .expect("current batch slot has active ownership")
+            .batch
+            .clone();
+        let mut ack_message_ids = active_batch.mailbox_message_ids.clone();
+        for message_id in &active_batch.observed_message_ids {
+            if !ack_message_ids.contains(message_id) {
+                ack_message_ids.push(message_id.clone());
+            }
+        }
+        let observed_ids = active_batch
+            .observed_message_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut completed_intent_ids = active_batch.intent_ids.iter().cloned().collect::<HashSet<_>>();
+        let mut team_run_ids = active_batch.team_run_ids.clone();
+
+        for intent in state.intents.values_mut() {
+            let belongs_to_observed_message = intent.slot_id == batch.slot_id
+                && intent
+                    .mailbox_message_id
+                    .as_ref()
+                    .is_some_and(|message_id| observed_ids.contains(message_id));
+            if completed_intent_ids.contains(&intent.intent_id)
+                || (belongs_to_observed_message && !intent.state.is_terminal())
+            {
+                completed_intent_ids.insert(intent.intent_id.clone());
+                if let Some(team_run_id) = &intent.team_run_id
+                    && !team_run_ids.contains(team_run_id)
+                {
+                    team_run_ids.push(team_run_id.clone());
+                }
+                intent.state = WorkIntentState::Completed;
+            }
+        }
+
+        let slot = state.slots.get_mut(&batch.slot_id).expect("current batch slot exists");
+        for intent_id in &completed_intent_ids {
+            slot.remove_queued(intent_id);
+        }
+        slot.active = None;
+        for message_id in &ack_message_ids {
+            slot.delivery_failure_counts.remove(message_id);
+        }
+        let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
+        let summaries = Self::run_summaries_locked(&state, team_run_ids.iter().cloned());
+        drop(state);
+        self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
+        info!(
+            team_id = %self.team_id,
+            session_generation = %self.session_generation,
+            slot_id = %batch.slot_id,
+            batch_id = %batch.batch_id,
+            operation_id = batch.operation_id,
+            ack_count = ack_message_ids.len(),
+            observed_count = active_batch.observed_message_ids.len(),
+            "team work batch terminal"
+        );
+        BatchCompletionResult {
+            commit_result: CommitResult::Committed,
+            ack_message_ids,
+            team_run_ids,
+        }
     }
 
     pub(crate) fn fail_batch(&self, batch: &WorkBatch, classification: &'static str) -> BatchFailureResult {

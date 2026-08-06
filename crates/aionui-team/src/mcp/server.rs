@@ -606,6 +606,11 @@ const MAX_INBOX_MESSAGES: usize = 50;
 const MAX_INBOX_CONTENT_CHARS: usize = 4_000;
 const INBOX_TRUNCATION_MARKER: &str = "\n[truncated]";
 
+struct InboxPage {
+    messages: Vec<MailboxMessage>,
+    total_unread_count: usize,
+}
+
 async fn exec_read_messages(
     args: &Value,
     service: &Weak<TeamSessionService>,
@@ -625,18 +630,37 @@ async fn exec_read_messages(
         .peek_agent_messages(team_id, caller_slot_id)
         .await
         .map_err(|error| ToolCallError::from_message(error.to_string()))?;
-    json_text(&read_messages_json(messages))
+    let page = inbox_page(messages);
+    let returned_message_ids = page
+        .messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    service
+        .observe_agent_messages(team_id, caller_slot_id, &returned_message_ids)
+        .await
+        .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+    json_text(&read_messages_json(page))
 }
 
-fn read_messages_json(messages: Vec<MailboxMessage>) -> Value {
+fn inbox_page(messages: Vec<MailboxMessage>) -> InboxPage {
     let total_unread_count = messages.len();
     let omitted_count = total_unread_count.saturating_sub(MAX_INBOX_MESSAGES);
-    let messages = messages
+    InboxPage {
+        messages: messages.into_iter().skip(omitted_count).collect(),
+        total_unread_count,
+    }
+}
+
+fn read_messages_json(page: InboxPage) -> Value {
+    let total_unread_count = page.total_unread_count;
+    let messages = page
+        .messages
         .into_iter()
-        .skip(omitted_count)
         .map(|message| {
             let (content, content_truncated) = truncate_inbox_content(&message.content);
             json!({
+                "message_id": message.id,
                 "from_slot": message.from_agent_id,
                 "type": message.msg_type,
                 "content": content,
@@ -651,7 +675,7 @@ fn read_messages_json(messages: Vec<MailboxMessage>) -> Value {
         "messages": messages,
         "returned_count": returned_count,
         "total_unread_count": total_unread_count,
-        "has_more": omitted_count > 0,
+        "has_more": total_unread_count > returned_count,
     })
 }
 
@@ -1376,10 +1400,11 @@ mod tests {
 
     #[test]
     fn read_messages_json_returns_fifo_messages_and_an_explicit_empty_list() {
-        let value = read_messages_json(vec![inbox_message(1, "first"), inbox_message(2, "second")]);
+        let value = read_messages_json(inbox_page(vec![inbox_message(1, "first"), inbox_message(2, "second")]));
         assert_eq!(value["returned_count"], 2);
         assert_eq!(value["total_unread_count"], 2);
         assert_eq!(value["has_more"], false);
+        assert_eq!(value["messages"][0]["message_id"], "message-01");
         assert_eq!(value["messages"][0]["from_slot"], "worker-01");
         assert_eq!(value["messages"][0]["type"], "message");
         assert_eq!(value["messages"][0]["content"], "first");
@@ -1388,7 +1413,7 @@ mod tests {
         assert_eq!(value["messages"][0]["created_at"], 1);
         assert_eq!(value["messages"][1]["content"], "second");
 
-        let empty = read_messages_json(Vec::new());
+        let empty = read_messages_json(inbox_page(Vec::new()));
         assert_eq!(empty["messages"], json!([]));
         assert_eq!(empty["returned_count"], 0);
         assert_eq!(empty["total_unread_count"], 0);
@@ -1403,11 +1428,15 @@ mod tests {
             .collect::<Vec<_>>();
         messages.push(inbox_message(MAX_INBOX_MESSAGES, long_content));
 
-        let value = read_messages_json(messages);
+        let page = inbox_page(messages);
+        assert_eq!(page.messages[0].id, "message-01");
+        assert_eq!(page.messages.len(), MAX_INBOX_MESSAGES);
+        let value = read_messages_json(page);
         assert_eq!(value["returned_count"], MAX_INBOX_MESSAGES);
         assert_eq!(value["total_unread_count"], MAX_INBOX_MESSAGES + 1);
         assert_eq!(value["has_more"], true);
         assert_eq!(value["messages"][0]["from_slot"], "worker-01");
+        assert_eq!(value["messages"][0]["message_id"], "message-01");
         let last = &value["messages"][MAX_INBOX_MESSAGES - 1];
         assert_eq!(last["from_slot"], "worker-50");
         assert_eq!(last["content_truncated"], true);
