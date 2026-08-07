@@ -103,32 +103,35 @@ impl ScmRuntime {
         let mut found = Vec::new();
         for root in roots {
             match self.provider.discover(root).await {
-                Ok(Some(repository)) => {
-                    let git_dir = self.provider.git_dir_of(&RepoRef {
-                        repo_id: repository.repo_id.clone(),
-                    });
-                    let mut repos = self.repos.write().await;
-                    let entry = repos.entry(repository.repo_id.clone());
-                    match entry {
-                        std::collections::hash_map::Entry::Occupied(mut slot) => {
-                            // Re-discovery of a known repository refreshes its
-                            // descriptor (head may have moved) but must not drop
-                            // subscribers or the sequence it has already handed out.
-                            slot.get_mut().repository = repository.clone();
+                // A root may surface many repositories now (one-level workspace
+                // discovery); an attached root still yields at most one.
+                Ok(repositories) => {
+                    for repository in repositories {
+                        let git_dir = self.provider.git_dir_of(&RepoRef {
+                            repo_id: repository.repo_id.clone(),
+                        });
+                        let mut repos = self.repos.write().await;
+                        let entry = repos.entry(repository.repo_id.clone());
+                        match entry {
+                            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                                // Re-discovery of a known repository refreshes its
+                                // descriptor (head may have moved) but must not drop
+                                // subscribers or the sequence it has already handed out.
+                                slot.get_mut().repository = repository.clone();
+                            }
+                            std::collections::hash_map::Entry::Vacant(slot) => {
+                                slot.insert(RepoState {
+                                    repository: repository.clone(),
+                                    git_dir: git_dir.unwrap_or_default(),
+                                    last: None,
+                                    seq: 0,
+                                    subscribers: Vec::new(),
+                                });
+                            }
                         }
-                        std::collections::hash_map::Entry::Vacant(slot) => {
-                            slot.insert(RepoState {
-                                repository: repository.clone(),
-                                git_dir: git_dir.unwrap_or_default(),
-                                last: None,
-                                seq: 0,
-                                subscribers: Vec::new(),
-                            });
-                        }
+                        found.push(repository);
                     }
-                    found.push(repository);
                 }
-                Ok(None) => {}
                 Err(err) => {
                     // One unreadable root must not hide the project's other
                     // repositories.

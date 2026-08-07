@@ -15,6 +15,8 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Instant, interval};
 
+use aionui_db::Role;
+
 use crate::service::ProjectService;
 use crate::types::{FileOp, ProjectError, ReferenceInput};
 
@@ -503,11 +505,17 @@ impl ScmActor {
                         // Carried raw and separate from the fallback chain; `None`
                         // means the entry has no name of its own (never `Some("")`).
                         let pe_name = named;
+                        // Only a workspace pe root relaxes discovery by one level;
+                        // an attached pe root stays one-repo-or-none. The role is a
+                        // plain string on the explorer entry; compare against the
+                        // canonical `Role` spelling rather than a literal.
+                        let discover_children = entry.role == Role::Workspace.as_str();
                         roots.push(ResolvedRoot {
                             pe_id: entry.pe_id,
                             absolute_path,
                             label,
                             pe_name,
+                            discover_children,
                         });
                     }
                 }

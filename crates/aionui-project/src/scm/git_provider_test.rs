@@ -47,20 +47,32 @@ fn commit_all(repo: &Repository, message: &str) -> git2::Oid {
         .expect("commit")
 }
 
+/// An attached-style resolved root at `dir` (discovery stays one-repo-or-none).
+fn root_at(pe_id: &str, dir: &Path, label: &str) -> ResolvedRoot {
+    ResolvedRoot {
+        pe_id: pe_id.to_owned(),
+        absolute_path: dir.to_string_lossy().into_owned(),
+        label: label.to_owned(),
+        pe_name: None,
+        discover_children: false,
+    }
+}
+
+/// A workspace-style resolved root at `dir` (one-level child discovery).
+fn workspace_root_at(pe_id: &str, dir: &Path, label: &str) -> ResolvedRoot {
+    ResolvedRoot {
+        discover_children: true,
+        ..root_at(pe_id, dir, label)
+    }
+}
+
 /// A discovered repository plus the provider that owns it.
 async fn discovered(dir: &Path) -> (GitScmProvider, RepoRef) {
     let provider = GitScmProvider::new();
-    let root = ResolvedRoot {
-        pe_id: "pe1".to_owned(),
-        absolute_path: dir.to_string_lossy().into_owned(),
-        label: "fixture".to_owned(),
-        pe_name: None,
-    };
-    let repo = provider
-        .discover(&root)
-        .await
-        .expect("discover ok")
-        .expect("is a repository");
+    let root = root_at("pe1", dir, "fixture");
+    let mut repos = provider.discover(&root).await.expect("discover ok");
+    assert_eq!(repos.len(), 1, "an attached root surfaces exactly one repo");
+    let repo = repos.remove(0);
     (provider, RepoRef { repo_id: repo.repo_id })
 }
 
@@ -75,15 +87,10 @@ fn find<'a>(status: &'a ScmStatus, rel: &str, staged: Option<bool>) -> Option<&'
 async fn discover_reports_none_for_plain_directory() {
     let tmp = TempDir::new().expect("tempdir");
     let provider = GitScmProvider::new();
-    let root = ResolvedRoot {
-        pe_id: "pe1".to_owned(),
-        absolute_path: tmp.path().to_string_lossy().into_owned(),
-        label: "plain".to_owned(),
-        pe_name: None,
-    };
+    let root = root_at("pe1", tmp.path(), "plain");
 
     // Not a repository is a normal outcome, never a fabricated repo.
-    assert!(provider.discover(&root).await.expect("discover ok").is_none());
+    assert!(provider.discover(&root).await.expect("discover ok").is_empty());
 }
 
 #[tokio::test]
@@ -94,16 +101,11 @@ async fn discover_does_not_walk_up_to_parent_repository() {
     std::fs::create_dir_all(&child).expect("mkdir child");
 
     let provider = GitScmProvider::new();
-    let root = ResolvedRoot {
-        pe_id: "pe-child".to_owned(),
-        absolute_path: child.to_string_lossy().into_owned(),
-        label: "child".to_owned(),
-        pe_name: None,
-    };
+    let root = root_at("pe-child", &child, "child");
 
     // One pe root is at most one repo: a subdirectory of a repo is not itself a
     // repo, and discovery must not surface the parent (decision "1 pe : 1 repo").
-    assert!(provider.discover(&root).await.expect("discover ok").is_none());
+    assert!(provider.discover(&root).await.expect("discover ok").is_empty());
 }
 
 #[tokio::test]
@@ -114,17 +116,10 @@ async fn discover_reports_identity_capabilities_and_head() {
     commit_all(&repo, "base");
 
     let provider = GitScmProvider::new();
-    let root = ResolvedRoot {
-        pe_id: "pe1".to_owned(),
-        absolute_path: tmp.path().to_string_lossy().into_owned(),
-        label: "fixture".to_owned(),
-        pe_name: None,
-    };
-    let found = provider
-        .discover(&root)
-        .await
-        .expect("discover ok")
-        .expect("is a repository");
+    let root = root_at("pe1", tmp.path(), "fixture");
+    let mut repos = provider.discover(&root).await.expect("discover ok");
+    assert_eq!(repos.len(), 1, "root that is itself a repo surfaces one");
+    let found = repos.remove(0);
 
     assert_eq!(found.provider_id, "git");
     assert_eq!(found.root.pe_id, "pe1");
@@ -135,6 +130,166 @@ async fn discover_reports_identity_capabilities_and_head() {
     assert!(!found.capabilities.history_graph, "stage 2, not advertised yet");
     assert!(!found.capabilities.remote_ops, "stage 2, not advertised yet");
     assert_eq!(found.state, ScmRepositoryState::Idle);
+    assert!(!found.is_worktree, "a primary clone is not a worktree");
+    assert!(
+        found.worktree_of.is_none(),
+        "a primary clone has no primary to point at"
+    );
+}
+
+// ---- one-level workspace discovery -------------------------------------------
+
+/// Init a repository at `dir` with one commit, so it is a normal (non-bare)
+/// repository with a work tree — the shape discovery surfaces.
+fn init_committed_repo(dir: &Path) -> Repository {
+    std::fs::create_dir_all(dir).expect("mkdir repo");
+    let repo = init_repo(dir);
+    write(dir, "a.txt", "hello\n");
+    commit_all(&repo, "base");
+    repo
+}
+
+/// Find the surfaced repo whose child directory name matches `name`.
+fn by_child<'a>(repos: &'a [ScmRepository], name: &str) -> &'a ScmRepository {
+    repos
+        .iter()
+        .find(|r| r.root.relative_path == name)
+        .unwrap_or_else(|| panic!("child repo {name} surfaced; got {:?}", child_names(repos)))
+}
+
+fn child_names(repos: &[ScmRepository]) -> Vec<String> {
+    repos.iter().map(|r| r.root.relative_path.clone()).collect()
+}
+
+#[tokio::test]
+async fn workspace_root_surfaces_each_child_repository() {
+    let tmp = TempDir::new().expect("tempdir");
+    init_committed_repo(&tmp.path().join("svc-a"));
+    init_committed_repo(&tmp.path().join("svc-b"));
+    // A plain (non-repo) directory among them is ignored, not surfaced.
+    std::fs::create_dir_all(tmp.path().join("docs")).expect("mkdir docs");
+    write(tmp.path(), "docs/readme.md", "not a repo\n");
+
+    let provider = GitScmProvider::new();
+    let root = workspace_root_at("ws", tmp.path(), "workspace");
+    let repos = provider.discover(&root).await.expect("discover ok");
+
+    let mut names = child_names(&repos);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["svc-a".to_owned(), "svc-b".to_owned()],
+        "only child repos surface"
+    );
+
+    for name in ["svc-a", "svc-b"] {
+        let repo = by_child(&repos, name);
+        // Contract: label = child dir name, pe_name None (name belongs to pe
+        // root), repo_id folds relative_path in, is_worktree false.
+        assert_eq!(repo.label, name);
+        assert!(repo.pe_name.is_none(), "child repo carries no pe entry name");
+        assert_eq!(repo.repo_id, format!("scm:ws/{name}"));
+        assert_eq!(repo.root.pe_id, "ws");
+        assert!(!repo.is_worktree);
+        assert!(repo.worktree_of.is_none());
+    }
+}
+
+#[tokio::test]
+async fn workspace_root_that_is_itself_a_repository_does_not_scan_children() {
+    // Root is a repo *and* has child repos: the root wins, children are not
+    // inspected (so a submodule / nested clone is never mis-captured).
+    let tmp = TempDir::new().expect("tempdir");
+    init_committed_repo(tmp.path());
+    init_committed_repo(&tmp.path().join("nested"));
+
+    let provider = GitScmProvider::new();
+    let root = workspace_root_at("ws", tmp.path(), "workspace");
+    let repos = provider.discover(&root).await.expect("discover ok");
+
+    assert_eq!(repos.len(), 1, "the root repo alone; children not scanned");
+    assert_eq!(repos[0].root.relative_path, "", "surfaced as the root itself");
+    assert_eq!(repos[0].repo_id, "scm:ws");
+}
+
+#[tokio::test]
+async fn workspace_discovery_skips_hidden_directories() {
+    let tmp = TempDir::new().expect("tempdir");
+    init_committed_repo(&tmp.path().join("visible"));
+    // A hidden dir that is itself a repo must still be skipped.
+    init_committed_repo(&tmp.path().join(".hidden-repo"));
+
+    let provider = GitScmProvider::new();
+    let root = workspace_root_at("ws", tmp.path(), "workspace");
+    let repos = provider.discover(&root).await.expect("discover ok");
+
+    assert_eq!(
+        child_names(&repos),
+        vec!["visible".to_owned()],
+        "dot-directories are skipped"
+    );
+}
+
+#[tokio::test]
+async fn attached_root_never_scans_children_even_with_child_repos() {
+    // An attached pe root keeps one-repo-or-none: a non-repo root with child
+    // repos surfaces nothing. Attach behaviour is unchanged.
+    let tmp = TempDir::new().expect("tempdir");
+    init_committed_repo(&tmp.path().join("svc-a"));
+
+    let provider = GitScmProvider::new();
+    let root = root_at("pe1", tmp.path(), "attached");
+    let repos = provider.discover(&root).await.expect("discover ok");
+
+    assert!(repos.is_empty(), "attached discovery does not relax by a level");
+}
+
+#[tokio::test]
+async fn workspace_worktree_points_at_primary_when_primary_in_view() {
+    let tmp = TempDir::new().expect("tempdir");
+    let primary = init_committed_repo(&tmp.path().join("main"));
+    // A linked worktree of `main`, sitting as a sibling child directory.
+    let wt_path = tmp.path().join("feature");
+    primary.worktree("feature", &wt_path, None).expect("add worktree");
+
+    let provider = GitScmProvider::new();
+    let root = workspace_root_at("ws", tmp.path(), "workspace");
+    let repos = provider.discover(&root).await.expect("discover ok");
+
+    let main = by_child(&repos, "main");
+    let feature = by_child(&repos, "feature");
+
+    assert!(!main.is_worktree, "the primary clone is not a worktree");
+    assert!(feature.is_worktree, "the linked worktree is flagged");
+    assert_eq!(
+        feature.worktree_of.as_deref(),
+        Some(main.repo_id.as_str()),
+        "worktree points at its primary's repo_id when the primary is in view"
+    );
+}
+
+#[tokio::test]
+async fn workspace_worktree_without_primary_has_none_owner() {
+    // The worktree lives under the workspace but its primary does not: matching
+    // is by real git dir, so with no in-view primary the owner is None (the
+    // client then renders it at the outer level).
+    let outside = TempDir::new().expect("tempdir primary");
+    let primary = init_committed_repo(outside.path());
+
+    let tmp = TempDir::new().expect("tempdir workspace");
+    let wt_path = tmp.path().join("feature");
+    primary.worktree("feature", &wt_path, None).expect("add worktree");
+
+    let provider = GitScmProvider::new();
+    let root = workspace_root_at("ws", tmp.path(), "workspace");
+    let repos = provider.discover(&root).await.expect("discover ok");
+
+    let feature = by_child(&repos, "feature");
+    assert!(feature.is_worktree, "still a worktree even with no in-view primary");
+    assert!(
+        feature.worktree_of.is_none(),
+        "no in-view primary to point at, so the owner is None"
+    );
 }
 
 #[tokio::test]
@@ -866,17 +1021,10 @@ impl TrashSink for RecordingTrash {
 /// Build a provider with an injected sink and discover the fixture repo through it.
 async fn discovered_with_trash(dir: &Path, trash: Arc<dyn TrashSink>) -> (GitScmProvider, RepoRef) {
     let provider = GitScmProvider::with_trash(trash);
-    let root = ResolvedRoot {
-        pe_id: "pe1".to_owned(),
-        absolute_path: dir.to_string_lossy().into_owned(),
-        label: "fixture".to_owned(),
-        pe_name: None,
-    };
-    let repo = provider
-        .discover(&root)
-        .await
-        .expect("discover ok")
-        .expect("is a repository");
+    let root = root_at("pe1", dir, "fixture");
+    let mut repos = provider.discover(&root).await.expect("discover ok");
+    assert_eq!(repos.len(), 1, "an attached root surfaces exactly one repo");
+    let repo = repos.remove(0);
     (provider, RepoRef { repo_id: repo.repo_id })
 }
 
@@ -2425,15 +2573,38 @@ async fn staging_several_distinct_files_stages_every_one_of_them() {
 /// and the identity-level dedup by the project service suite.)
 #[test]
 fn repo_id_is_a_deterministic_scm_prefix_over_the_pe_id() {
-    assert_eq!(GitScmProvider::repo_id_for("pe1"), "scm:pe1");
+    // The pe root itself (empty relative path) keeps the historical form.
+    assert_eq!(GitScmProvider::repo_id_for("pe1", ""), "scm:pe1");
     assert_eq!(
-        GitScmProvider::repo_id_for("pe1"),
-        GitScmProvider::repo_id_for("pe1"),
+        GitScmProvider::repo_id_for("pe1", ""),
+        GitScmProvider::repo_id_for("pe1", ""),
         "the same pe id always yields the same repo id"
     );
     assert_ne!(
-        GitScmProvider::repo_id_for("pe1"),
-        GitScmProvider::repo_id_for("pe2"),
+        GitScmProvider::repo_id_for("pe1", ""),
+        GitScmProvider::repo_id_for("pe2", ""),
         "distinct pe ids stay distinct"
+    );
+}
+
+/// A child repository under a workspace root folds its relative path into the id,
+/// so children of one pe (which share `pe_id`) stay unique and stable.
+#[test]
+fn repo_id_folds_relative_path_for_child_repositories() {
+    assert_eq!(GitScmProvider::repo_id_for("pe1", "svc-a"), "scm:pe1/svc-a");
+    assert_ne!(
+        GitScmProvider::repo_id_for("pe1", "svc-a"),
+        GitScmProvider::repo_id_for("pe1", "svc-b"),
+        "sibling children of one pe stay distinct"
+    );
+    assert_ne!(
+        GitScmProvider::repo_id_for("pe1", "svc-a"),
+        GitScmProvider::repo_id_for("pe1", ""),
+        "a child never collides with its workspace root"
+    );
+    assert_eq!(
+        GitScmProvider::repo_id_for("pe1", "svc-a"),
+        GitScmProvider::repo_id_for("pe1", "svc-a"),
+        "the same child always yields the same repo id"
     );
 }
