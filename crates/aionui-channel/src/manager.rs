@@ -1013,6 +1013,7 @@ mod tests {
                 client_secret: None,
                 account_id: None,
                 bot_token: None,
+                app_token: None,
                 extra: HashMap::new(),
             },
             config: None,

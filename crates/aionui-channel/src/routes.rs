@@ -728,6 +728,7 @@ fn build_test_config(req: &TestPluginRequest) -> PluginConfig {
         client_secret: None,
         account_id: None,
         bot_token: None,
+        app_token: None,
         extra: HashMap::new(),
     };
 
@@ -749,6 +750,13 @@ fn build_test_config(req: &TestPluginRequest) -> PluginConfig {
             credentials.bot_token = Some(req.token.clone());
             if let Some(ref extra) = req.extra_config {
                 credentials.account_id = extra.app_id.clone();
+            }
+        }
+        "slack" => {
+            // token = bot token (xoxb-…); app_secret maps to Socket Mode app token (xapp-…)
+            credentials.token = Some(req.token.clone());
+            if let Some(ref extra) = req.extra_config {
+                credentials.app_token = extra.app_secret.clone();
             }
         }
         _ => {
@@ -813,6 +821,7 @@ fn build_extension_config(
         client_secret: None,
         account_id: None,
         bot_token: None,
+        app_token: None,
         extra: HashMap::new(),
     };
     let mut config_extra = HashMap::new();
@@ -847,6 +856,7 @@ fn build_extension_config(
                 webhook_url: None,
                 rate_limit: None,
                 require_mention: None,
+                allowed_channels: None,
                 extra: config_extra,
             })
         },
@@ -1019,6 +1029,21 @@ mod tests {
         let config = build_test_config(&req);
         assert_eq!(config.credentials.client_id.as_deref(), Some("client_id_123"));
         assert_eq!(config.credentials.client_secret.as_deref(), Some("client_secret_456"));
+    }
+
+    #[test]
+    fn build_test_config_slack() {
+        let req = TestPluginRequest {
+            plugin_id: "slack".into(),
+            token: "xoxb-bot".into(),
+            extra_config: Some(TestPluginExtraConfig {
+                app_id: None,
+                app_secret: Some("xapp-app".into()),
+            }),
+        };
+        let config = build_test_config(&req);
+        assert_eq!(config.credentials.token.as_deref(), Some("xoxb-bot"));
+        assert_eq!(config.credentials.app_token.as_deref(), Some("xapp-app"));
     }
 
     #[test]

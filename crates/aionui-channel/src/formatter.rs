@@ -8,12 +8,14 @@ use crate::types::PluginType;
 ///
 /// - Telegram: escape HTML, then convert markdown → HTML tags
 /// - Lark/DingTalk: convert HTML tags → markdown
+/// - Slack: convert common markdown → Slack `mrkdwn`
 /// - WeChat/WeCom: strip all HTML
 /// - Fallback: escape HTML special chars
 pub fn format_text_for_platform(text: &str, platform: PluginType) -> String {
     match platform {
         PluginType::Telegram => markdown_to_telegram_html(text),
         PluginType::Lark | PluginType::Dingtalk => html_to_markdown(text),
+        PluginType::Slack => markdown_to_slack_mrkdwn(text),
         PluginType::Weixin => strip_html(text),
         _ => escape_html(text),
     }
@@ -63,6 +65,101 @@ fn html_to_markdown(text: &str) -> String {
     let s = RE_HTML_EM.replace_all(&s, "*$1*");
     let s = RE_HTML_SAFE_LINK.replace_all(&s, "[$2]($1)");
     strip_tags_loop(s.as_ref())
+}
+
+// ── Slack mrkdwn ─────────────────────────────────────────────────
+//
+// Slack does not render standard Markdown. With `mrkdwn: true` it expects:
+//   *bold*   _italic_   ~strike~   `code`   ```blocks```
+//   <url|label> links
+// Headers (##) are not supported — convert to bold lines.
+
+static RE_SLACK_HEADER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^(#{1,6})\s+(.+)$").unwrap());
+static RE_SLACK_STRIKE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"~~(.+?)~~").unwrap());
+static RE_SLACK_BOLD_STAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*\*(.+?)\*\*").unwrap());
+static RE_SLACK_BOLD_UNDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"__(.+?)__").unwrap());
+// Single-asterisk italic only when not already Slack bold (*text*).
+static RE_SLACK_ITALIC_STAR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?P<pre>^|[^*])\*(?P<body>[^*\n]+?)\*(?P<post>$|[^*])").unwrap());
+
+/// Convert common Markdown to Slack mrkdwn.
+fn markdown_to_slack_mrkdwn(text: &str) -> String {
+    // Protect fenced/inline code so formatting inside them is left alone.
+    let mut blocks: Vec<String> = Vec::new();
+    let s = RE_CODE_BLOCK.replace_all(text, |caps: &regex::Captures| {
+        let idx = blocks.len();
+        blocks.push(format!("```{}```", &caps[1]));
+        format!("\u{E000}BLOCK{idx}\u{E001}")
+    });
+    let mut inlines: Vec<String> = Vec::new();
+    let s = RE_INLINE_CODE.replace_all(&s, |caps: &regex::Captures| {
+        let idx = inlines.len();
+        inlines.push(format!("`{}`", &caps[1]));
+        format!("\u{E000}CODE{idx}\u{E001}")
+    });
+
+    // Links before other markup so brackets don't get mangled.
+    let s = RE_LINK.replace_all(&s, "<$2|$1>");
+
+    // Headers → bold (protect placeholders so italic pass won't rewrite them).
+    let mut bolds: Vec<String> = Vec::new();
+    let s = RE_SLACK_HEADER.replace_all(&s, |caps: &regex::Captures| {
+        let idx = bolds.len();
+        bolds.push(caps[2].to_owned());
+        format!("\u{E000}BOLD{idx}\u{E001}")
+    });
+
+    // Strikethrough ~~x~~ → ~x~
+    let s = RE_SLACK_STRIKE.replace_all(&s, "~$1~");
+
+    // Bold **x** / __x__ → placeholders (Slack bold is *x*, applied on restore)
+    let s = RE_SLACK_BOLD_STAR.replace_all(&s, |caps: &regex::Captures| {
+        let idx = bolds.len();
+        bolds.push(caps[1].to_owned());
+        format!("\u{E000}BOLD{idx}\u{E001}")
+    });
+    let s = RE_SLACK_BOLD_UNDER.replace_all(&s, |caps: &regex::Captures| {
+        let idx = bolds.len();
+        bolds.push(caps[1].to_owned());
+        format!("\u{E000}BOLD{idx}\u{E001}")
+    });
+
+    // Italic *x* (remaining singles) → _x_
+    let s = RE_SLACK_ITALIC_STAR.replace_all(&s, "${pre}_${body}_${post}");
+
+    // Materialize bold as Slack *text*
+    let mut s = s.into_owned();
+    for (i, body) in bolds.iter().enumerate() {
+        s = s.replace(&format!("\u{E000}BOLD{i}\u{E001}"), &format!("*{body}*"));
+    }
+    let s = s;
+
+    // Escape & < > that are not already part of <url|label> or placeholders.
+    // We escape ampersands first, then leave our intentional <url|label> alone by
+    // temporarily protecting them.
+    let mut links: Vec<String> = Vec::new();
+    let s = {
+        static RE_SLACK_LINK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<(https?://[^|>]+)\|([^>]+)>").unwrap());
+        RE_SLACK_LINK.replace_all(&s, |caps: &regex::Captures| {
+            let idx = links.len();
+            links.push(caps[0].to_owned());
+            format!("\u{E000}LINK{idx}\u{E001}")
+        })
+    };
+    let s = s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+
+    // Restore protected segments (reverse order of replacement).
+    let mut out = s;
+    for (i, link) in links.iter().enumerate() {
+        out = out.replace(&format!("\u{E000}LINK{i}\u{E001}"), link);
+    }
+    for (i, code) in inlines.iter().enumerate() {
+        out = out.replace(&format!("\u{E000}CODE{i}\u{E001}"), code);
+    }
+    for (i, block) in blocks.iter().enumerate() {
+        out = out.replace(&format!("\u{E000}BLOCK{i}\u{E001}"), block);
+    }
+    out
 }
 
 // ── WeChat ───────────────────────────────────────────────────────
