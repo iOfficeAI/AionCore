@@ -396,26 +396,42 @@ async fn run_backend_cancel(backend: &str) {
         .unwrap_or_else(|| panic!("[{backend}] send failed: {sent}"))
         .to_owned();
 
-    // Cancel only once the turn is demonstrably alive — cancelling before the
-    // CLI has started tests the pre-flight path, not the interrupt path.
+    // Cancel only while the turn is demonstrably STILL RUNNING — and ask the
+    // backend, rather than inferring it from the stream.
+    //
+    // Waiting for a text frame does NOT mean the turn is alive. agy batches its
+    // output and emits content essentially at the end, so `content` arrives with
+    // `finish` right behind it; a cancel sent then lands on a turn that is
+    // already over, no second terminal is owed, and the test reads that as a
+    // wedged backend. That false accusation is what this loop exists to prevent
+    // — claude and codex stream incrementally, so they hid the flaw completely.
     let started = Instant::now();
-    let mut alive = false;
+    let mut running = false;
     while started.elapsed() < Duration::from_secs(120) {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let snapshot = frames.lock().unwrap().clone();
-        if stream_frames_for(&snapshot, &conv_id).iter().any(|f| {
-            matches!(
-                f["data"]["type"].as_str(),
-                Some("text") | Some("content") | Some("thinking")
-            )
-        }) {
-            alive = true;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let state = http_get(&app, &format!("/api/conversations/{conv_id}")).await;
+        if state["data"]["runtime"]["is_processing"] == json!(true) {
+            running = true;
             break;
         }
     }
-    assert!(alive, "[{backend}] the turn never started streaming, nothing to cancel");
+    assert!(
+        running,
+        "[{backend}] the turn never began processing, nothing to cancel"
+    );
 
     let pre_cancel = frames.lock().unwrap().len();
+    // Re-confirm at the last possible moment. A turn that finished in the
+    // meantime is a flaw in this test's prompt, not in the backend, and has to
+    // say so rather than blaming the CLI.
+    let before_cancel = http_get(&app, &format!("/api/conversations/{conv_id}")).await;
+    assert_eq!(
+        before_cancel["data"]["runtime"]["is_processing"],
+        json!(true),
+        "[{backend}] the turn completed before it could be cancelled — this prompt is too short for this \
+         backend, so the test proves nothing about cancel: {}",
+        before_cancel["data"]["runtime"]
+    );
     let cancel_at = Instant::now();
     let resp = http_json(
         &app,
@@ -559,23 +575,8 @@ async fn live_codex_cancel_settles_and_recovers() {
     run_backend_cancel("codex").await;
 }
 
-/// CURRENTLY FAILS — kept because the failure is the point.
-///
-/// claude and codex both settle a cancelled turn in ~200ms. agy emits NOTHING:
-/// 0 stream frames in the 40s a characterisation run waited, so the turn never
-/// terminates on the stream at all. From the user's chair, Stop leaves the
-/// spinner running forever.
-///
-/// agy has no protocol-level interrupt — it is one process per turn, so cancel
-/// kills the process (`antigravity/conn.rs`, `Command::Cancel` → `terminate()`)
-/// and the terminal has to be synthesized from the exit. That synthesis is what
-/// is missing.
-///
-/// Left un-`#[ignore]`-gated beyond the usual live gate on purpose: an
-/// `#[ignore]`d known-failure that nobody runs is indistinguishable from
-/// coverage that does not exist, which is how agy got here.
 #[tokio::test]
-#[ignore = "spawns the real agy CLI; needs credentials — CURRENTLY FAILS, see doc comment"]
+#[ignore = "spawns the real agy CLI; needs credentials"]
 async fn live_antigravity_cancel_settles_and_recovers() {
     run_backend_cancel("antigravity").await;
 }
