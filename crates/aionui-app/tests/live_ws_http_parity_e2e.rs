@@ -359,6 +359,175 @@ async fn run_backend_parity(backend: &str, prompt: &str) {
     assert!(diffs.is_empty(), "[{backend}] WS↔HTTP divergences: {diffs:?}");
 }
 
+/// Cancel must settle the turn on the MAIN path and leave the conversation
+/// usable. claude had this covered only through its workflow tests; codex and agy
+/// had no cancel coverage at all, which meant a CLI release could start wedging
+/// cancelled turns on two of three backends and every gate would stay green.
+///
+/// The 12s deadline is deliberately inside the 15s force-kill watchdog: a
+/// watchdog rescue must not be able to masquerade as a working cancel.
+async fn run_backend_cancel(backend: &str) {
+    let app = start_live_app().await;
+    let ws_dir = std::env::temp_dir().join(format!("live-cancel-{backend}-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/conversations",
+        json!({"type": "acp", "extra": {"workspace": ws_dir.to_string_lossy(), "backend": backend}}),
+    )
+    .await;
+    let conv_id = created["data"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("[{backend}] conversation create failed: {created}"))
+        .to_owned();
+
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+    let sent = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "Count slowly from 1 to 200, one number per line, and do not stop early."}),
+    )
+    .await;
+    let turn_id = sent["data"]["turn_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("[{backend}] send failed: {sent}"))
+        .to_owned();
+
+    // Cancel only once the turn is demonstrably alive — cancelling before the
+    // CLI has started tests the pre-flight path, not the interrupt path.
+    let started = Instant::now();
+    let mut alive = false;
+    while started.elapsed() < Duration::from_secs(120) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        if stream_frames_for(&snapshot, &conv_id).iter().any(|f| {
+            matches!(
+                f["data"]["type"].as_str(),
+                Some("text") | Some("content") | Some("thinking")
+            )
+        }) {
+            alive = true;
+            break;
+        }
+    }
+    assert!(alive, "[{backend}] the turn never started streaming, nothing to cancel");
+
+    let pre_cancel = frames.lock().unwrap().len();
+    let cancel_at = Instant::now();
+    let resp = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/cancel"),
+        json!({"turn_id": turn_id}),
+    )
+    .await;
+    assert_eq!(
+        resp["success"],
+        json!(true),
+        "[{backend}] cancel must be accepted: {resp}"
+    );
+
+    let mut settled = None;
+    while cancel_at.elapsed() < Duration::from_secs(12) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        if stream_frames_for(&snapshot[pre_cancel..], &conv_id)
+            .iter()
+            .any(|f| f["data"]["type"] == "finish")
+        {
+            settled = Some(cancel_at.elapsed());
+            break;
+        }
+    }
+    let settled = settled.unwrap_or_else(|| {
+        panic!("[{backend}] no finish within 12s of cancel — the turn is wedged (watchdog fires at 15s)")
+    });
+    println!("[{backend}] cancel settled in {settled:?}");
+
+    // A cancelled conversation must still answer. This is the half that catches
+    // a CLI whose interrupt leaves the session unusable rather than wedged.
+    let pre_recovery = frames.lock().unwrap().len();
+    let recovery_at = Instant::now();
+    let sent2 = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "Reply with exactly: RECOVERED"}),
+    )
+    .await;
+    assert!(
+        sent2["data"]["turn_id"].is_string(),
+        "[{backend}] follow-up must be admitted after cancel: {sent2}"
+    );
+    let mut recovered = false;
+    while recovery_at.elapsed() < Duration::from_secs(120) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        if stream_frames_for(&snapshot[pre_recovery..], &conv_id)
+            .iter()
+            .any(|f| f["data"]["type"] == "finish")
+        {
+            recovered = true;
+            break;
+        }
+    }
+    assert!(recovered, "[{backend}] the conversation did not recover after cancel");
+    println!("[{backend}] recovered in {:?}", recovery_at.elapsed());
+}
+
+/// Context usage must reach the client with real numbers. It drives the
+/// context meter, and a CLI that stops reporting it (or reports zeros) leaves
+/// users with no warning before they hit the window — a silent regression no
+/// parity check would notice, because the reply itself is unaffected.
+async fn run_backend_usage(backend: &str) {
+    let app = start_live_app().await;
+    let ws_dir = std::env::temp_dir().join(format!("live-usage-{backend}-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/conversations",
+        json!({"type": "acp", "extra": {"workspace": ws_dir.to_string_lossy(), "backend": backend}}),
+    )
+    .await;
+    let conv_id = created["data"]["id"].as_str().expect("conversation id").to_owned();
+
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+    http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "Reply with exactly: PONG"}),
+    )
+    .await;
+
+    let started = Instant::now();
+    let mut usage: Option<Value> = None;
+    while started.elapsed() < Duration::from_secs(300) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        let stream = stream_frames_for(&snapshot, &conv_id);
+        usage = stream
+            .iter()
+            .filter(|f| f["data"]["type"] == "acp_context_usage")
+            .filter(|f| f["data"]["data"]["used"].as_u64().unwrap_or(0) > 0)
+            .next_back()
+            .map(|f| f["data"]["data"].clone());
+        if usage.is_some() && stream.iter().any(|f| f["data"]["type"] == "finish") {
+            break;
+        }
+    }
+
+    let usage = usage.unwrap_or_else(|| panic!("[{backend}] no context-usage frame with a non-zero `used`"));
+    println!("[{backend}] usage: {usage}");
+    let used = usage["used"].as_u64().unwrap_or(0);
+    assert!(used > 0, "[{backend}] context usage reported zero: {usage}");
+}
+
 const PROMPT: &str = "Read the file hello.txt in this workspace using your file-reading tool, \
     then reply with its exact content and nothing else.";
 
@@ -372,6 +541,61 @@ async fn live_claude_ws_http_parity() {
 #[ignore = "spawns the real codex CLI; needs credentials"]
 async fn live_codex_ws_http_parity() {
     run_backend_parity("codex", PROMPT).await;
+}
+
+// Cancel and context usage, for every backend. One helper each rather than
+// per-backend tests: coverage that exists only for claude is exactly what let
+// codex and agy drift with nobody noticing.
+
+#[tokio::test]
+#[ignore = "spawns the real claude CLI; needs credentials"]
+async fn live_claude_cancel_settles_and_recovers() {
+    run_backend_cancel("claude").await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real codex CLI; needs credentials"]
+async fn live_codex_cancel_settles_and_recovers() {
+    run_backend_cancel("codex").await;
+}
+
+/// CURRENTLY FAILS — kept because the failure is the point.
+///
+/// claude and codex both settle a cancelled turn in ~200ms. agy emits NOTHING:
+/// 0 stream frames in the 40s a characterisation run waited, so the turn never
+/// terminates on the stream at all. From the user's chair, Stop leaves the
+/// spinner running forever.
+///
+/// agy has no protocol-level interrupt — it is one process per turn, so cancel
+/// kills the process (`antigravity/conn.rs`, `Command::Cancel` → `terminate()`)
+/// and the terminal has to be synthesized from the exit. That synthesis is what
+/// is missing.
+///
+/// Left un-`#[ignore]`-gated beyond the usual live gate on purpose: an
+/// `#[ignore]`d known-failure that nobody runs is indistinguishable from
+/// coverage that does not exist, which is how agy got here.
+#[tokio::test]
+#[ignore = "spawns the real agy CLI; needs credentials — CURRENTLY FAILS, see doc comment"]
+async fn live_antigravity_cancel_settles_and_recovers() {
+    run_backend_cancel("antigravity").await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real claude CLI; needs credentials"]
+async fn live_claude_reports_context_usage() {
+    run_backend_usage("claude").await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real codex CLI; needs credentials"]
+async fn live_codex_reports_context_usage() {
+    run_backend_usage("codex").await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real agy CLI; needs credentials"]
+async fn live_antigravity_reports_context_usage() {
+    run_backend_usage("antigravity").await;
 }
 
 /// agy is the third direct-CLI backend and had no live coverage at all, which
