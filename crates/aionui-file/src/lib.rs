@@ -15,8 +15,8 @@ pub use routes::{FileRouterState, file_routes};
 pub use service::FileService;
 pub use snapshot_service::SnapshotService;
 pub use traits::{
-    FileServiceRef, IFileService, IItemRevealer, ISnapshotService, ISystemFileOpener, ItemRevealerRef,
-    SnapshotServiceRef, SystemFileOpenerRef,
+    ClipboardWriterRef, FileServiceRef, IClipboardWriter, IFileService, IItemRevealer, ISnapshotService,
+    ISystemFileOpener, ItemRevealerRef, SnapshotServiceRef, SystemFileOpenerRef,
 };
 pub use types::{
     CompareResult, ContentUpdateEvent, ContentUpdateOperation, CopyResult, DirOrFile, FileChangeInfo, FileMetadata,
