@@ -374,6 +374,146 @@ async fn live_codex_ws_http_parity() {
     run_backend_parity("codex", PROMPT).await;
 }
 
+/// agy is the third direct-CLI backend and had no live coverage at all, which
+/// made it the one CLI whose version could never be qualified against real
+/// behaviour. It also exercises a path the other two do not: tool approval runs
+/// through agy's PreToolUse hook bridge rather than a protocol permission frame.
+#[tokio::test]
+#[ignore = "spawns the real agy CLI; needs credentials"]
+async fn live_antigravity_ws_http_parity() {
+    run_backend_parity("antigravity", PROMPT).await;
+}
+
+/// LIVE guard for the class of upgrade that has actually bitten users: a codex
+/// release changed its supported MODES, and unattended execution stopped working.
+///
+/// Nothing about that is visible in a message shape — `approvalPolicy` and
+/// `sandbox` are launch-time values, and a version that stops honouring
+/// full-access still speaks a perfectly valid protocol. The only way to see it
+/// is to ask for full access and check that a write actually happened without
+/// anyone being asked to approve it.
+///
+/// The assertion is deliberately two-sided: the file must exist (so the sandbox
+/// really was writable) AND no permission frame may have been raised (so the
+/// approval policy really was `never`). Dropping either half lets a half-applied
+/// mode pass — writable-but-prompting is exactly what "full auto stopped
+/// working" looks like from the user's chair.
+#[tokio::test]
+#[ignore = "spawns the real codex CLI; needs credentials"]
+async fn live_codex_full_access_writes_without_approval() {
+    let app = start_live_app().await;
+
+    let ws_dir = std::env::temp_dir().join(format!("live-fullaccess-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    let target = ws_dir.join("written_by_agent.txt");
+
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/conversations",
+        json!({
+            "type": "acp",
+            "extra": {"workspace": ws_dir.to_string_lossy(), "backend": "codex"}
+        }),
+    )
+    .await;
+    let conv_id = created["data"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("conversation create failed: {created}"))
+        .to_owned();
+
+    // The config-options endpoint speaks to a live agent, so the session has to
+    // be open before the mode can be selected.
+    let ensured = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/runtime/ensure"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        ensured["success"],
+        json!(true),
+        "[full-access] runtime must come up before selecting a mode: {ensured}"
+    );
+
+    // Ask for full access BEFORE the first turn: the mode is resolved at spawn
+    // (codex binds approvalPolicy/sandbox in thread/start), so switching after
+    // the session opens would test a different path than the one that broke.
+    let mode_resp = http_json(
+        &app,
+        "PUT",
+        &format!("/api/conversations/{conv_id}/config-options/mode"),
+        json!({"value": "agent-full-access"}),
+    )
+    .await;
+    println!("[full-access] mode set: {mode_resp}");
+    // Without this the test passes for the wrong reason: codex's DEFAULT sandbox
+    // (`workspace-write`) already permits a write inside the workspace, so every
+    // assertion below stays green even when the mode was never applied. The
+    // first draft of this test did exactly that — the endpoint answered
+    // METHOD_NOT_ALLOWED and it still reported success.
+    assert_eq!(
+        mode_resp["success"],
+        json!(true),
+        "[full-access] the mode must actually be applied, or this test proves nothing: {mode_resp}"
+    );
+
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+    let sent = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({
+            "content": "Create a file named written_by_agent.txt in this workspace \
+                containing exactly AION_FULL_ACCESS_OK, then reply DONE."
+        }),
+    )
+    .await;
+    assert!(sent["data"]["turn_id"].is_string(), "send failed: {sent}");
+
+    let started = Instant::now();
+    let mut terminal: Option<String> = None;
+    let mut permission_frames: Vec<Value> = Vec::new();
+    while started.elapsed() < Duration::from_secs(300) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        permission_frames = stream_frames_for(&snapshot, &conv_id)
+            .into_iter()
+            .filter(|f| f["data"]["type"].as_str().unwrap_or("").contains("permission"))
+            .cloned()
+            .collect();
+        if let Some(f) = stream_frames_for(&snapshot, &conv_id)
+            .into_iter()
+            .find(|f| matches!(f["data"]["type"].as_str(), Some("finish") | Some("error")))
+        {
+            terminal = f["data"]["type"].as_str().map(str::to_owned);
+            break;
+        }
+    }
+
+    let terminal = terminal.expect("[full-access] turn did not terminate within 300s");
+    println!("[full-access] terminal={terminal} after {:?}", started.elapsed());
+
+    assert_eq!(terminal, "finish", "[full-access] the turn must complete cleanly");
+    assert!(
+        permission_frames.is_empty(),
+        "[full-access] full access must not ask for approval, got {} permission frame(s): {:?}",
+        permission_frames.len(),
+        permission_frames
+    );
+    assert!(
+        target.is_file(),
+        "[full-access] the agent did not write {} — the sandbox was not writable",
+        target.display()
+    );
+    let written = std::fs::read_to_string(&target).unwrap_or_default();
+    assert!(
+        written.contains("AION_FULL_ACCESS_OK"),
+        "[full-access] wrote unexpected content: {written:?}"
+    );
+}
+
 /// The prompt shape the 2.1.220 interrupt probe proved launches a non-blocking
 /// background workflow whose launch turn ends while the workflow flies (RUN A,
 /// samples/claude-cli/2.1.220/_probe_workflow_interrupt.py) — exactly the state
