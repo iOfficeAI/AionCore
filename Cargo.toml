@@ -136,7 +136,7 @@ notify = "8"
 walkdir = "2"
 ignore = "0.4"
 zip = "2"
-git2 = { version = "0.20", default-features = false }
+git2 = { version = "0.21.0", default-features = false }
 # Source-control discard sends untracked files to the platform trash instead of
 # unlinking them (mac/win/linux, x64 + arm64).
 trash = "5"
