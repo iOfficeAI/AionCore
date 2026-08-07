@@ -162,7 +162,9 @@ pub(super) fn init_snapshot_repo(workspace: &Path, temp_dir: &Path) -> Result<()
 pub(super) fn current_branch(repo: &Repository) -> Option<String> {
     // git2 0.21: Reference::shorthand() returns Result (was Option). `.ok()` keeps
     // the documented "detached / no commits → None" behavior.
-    repo.head().ok().and_then(|head| head.shorthand().ok().map(String::from))
+    repo.head()
+        .ok()
+        .and_then(|head| head.shorthand().ok().map(String::from))
 }
 
 /// Build a `SnapshotInfo` from mode and repository.
