@@ -156,9 +156,12 @@ iana-time-zone = "0.1"
 # Shell
 open = "5"
 which = "7"
-# Text-only: default features pull `image`/`zune-jpeg` (image-data) which we do
-# not use and which currently fails to build; keep Wayland text-clipboard support.
-arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+# Text-only clipboard. default-features off: `image-data` pulls `image`/`zune-jpeg`
+# which we don't use and currently fails to build. No `wayland-data-control` either:
+# it pulls wl-clipboard-rs → wayland-scanner (build-time) → the vulnerable quick-xml
+# 0.39 (RUSTSEC-2026-0194/0195). Without it, arboard uses its unconditional x11rb
+# backend on Linux (works under X11/XWayland); macOS/Windows unaffected.
+arboard = { version = "3", default-features = false }
 
 # Office
 calamine = "0.36"
