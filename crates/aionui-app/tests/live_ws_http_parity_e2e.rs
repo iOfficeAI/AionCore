@@ -370,6 +370,8 @@ async fn run_backend_parity(backend: &str, prompt: &str) {
     }
     assert_eq!(terminal, "finish", "[{backend}] turn must complete cleanly");
     assert!(diffs.is_empty(), "[{backend}] WS↔HTTP divergences: {diffs:?}");
+
+    record_frame_types(backend, &frames.lock().unwrap().clone());
 }
 
 /// Cancel must settle the turn on the MAIN path and leave the conversation
@@ -735,6 +737,8 @@ async fn run_backend_set_model(backend: &str) {
         finished,
         "[{backend}] the turn did not finish after switching model to {target}"
     );
+
+    record_frame_types(backend, &frames.lock().unwrap().clone());
 }
 
 /// The agent names the conversation. A backend that stops sending a title
@@ -789,6 +793,8 @@ async fn run_backend_session_title(backend: &str) {
         named, initial_name,
         "[{backend}] the title never changed from its placeholder"
     );
+
+    record_frame_types(backend, &frames.lock().unwrap().clone());
 }
 
 /// Resume: a user restarts the app and carries on. The CLI process from the
@@ -892,6 +898,8 @@ async fn run_backend_resume(backend: &str) {
         reply.contains(&secret),
         "[{backend}] the resumed session lost its history — expected {secret:?} in {reply:?}"
     );
+
+    record_frame_types(backend, &frames.lock().unwrap().clone());
 }
 
 /// A conversation with an MCP server that cannot start must still work.
@@ -1450,6 +1458,8 @@ async fn live_claude_ask_user_question_round_trip() {
         reply.to_lowercase().contains(&option_label.to_lowercase()),
         "the agent did not act on the answer — expected {option_label:?} in the reply, got {reply:?}"
     );
+
+    record_frame_types("claude-ask", &frames.lock().unwrap().clone());
 }
 
 // The plan card (codex only) and the tool card (all three).
