@@ -81,6 +81,7 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
         Some(Command::Capabilities) => Ok(commands::run_capabilities()),
         Some(Command::Config(args)) => Ok(commands::run_config(args).await),
         Some(Command::Diagnose(args)) => Ok(commands::run_diagnose(args).await),
+        Some(Command::Provision(args)) => Ok(commands::run_provision(args, cli.data_dir.clone()).await),
         Some(Command::Team(args)) => Ok(commands::run_team(args).await),
         Some(Command::AntigravityHook) => Ok(commands::run_antigravity_hook().await),
         Some(Command::McpBridge) => Ok(commands::run_mcp_bridge().await),

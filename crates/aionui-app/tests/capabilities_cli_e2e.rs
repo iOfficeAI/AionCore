@@ -55,4 +55,16 @@ async fn top_level_capabilities_prints_domain_index_without_runtime_env() {
     assert_eq!(diagnose["mode"], "read-only");
     assert_eq!(diagnose["contract_command"], "diagnose capabilities");
     assert_eq!(diagnose["invocation"], "aioncore diagnose capabilities");
+
+    let provision = domains
+        .iter()
+        .find(|domain| domain["name"] == "provision")
+        .expect("provision domain should be advertised");
+    assert_eq!(provision["mode"], "trusted-local-provisioning");
+    assert_eq!(provision["contract"], "trusted-local-provisioning");
+    assert_eq!(provision["contract_command"], "provision capabilities");
+    assert_eq!(provision["invocation"], "aioncore provision capabilities");
+    assert_eq!(provision["discovery"]["caller_port_required"], false);
+    assert_eq!(provision["safety"]["does_not_use_runtime_token"], true);
+    assert_eq!(provision["safety"]["does_not_use_local_default_identity"], true);
 }

@@ -246,6 +246,30 @@ pub(crate) async fn run_server(
     let addr = bound.addr;
     info!(elapsed_ms = boot.elapsed().as_millis(), "Server listening on {addr}");
 
+    // Advertise a port-free local discovery endpoint for trusted provisioning
+    // (A0/A1). Callers resolve this file via --data-dir; they never supply a
+    // port. Best-effort: discovery degrades to closed-app if write fails.
+    match aionui_app::write_endpoint_for_config(&env.config, std::process::id(), {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }) {
+        Ok(path) => info!(
+            path = %path.display(),
+            port = env.config.port,
+            "startup: local provision endpoint advertised"
+        ),
+        Err(error) => warn!(
+            code = "BOOTSTRAP_DEGRADED_PROVISION_ENDPOINT",
+            stage = "provision.endpoint",
+            error = %error,
+            "startup: failed to write local provision endpoint advertisement"
+        ),
+    }
+    let provision_data_dir = env.config.data_dir.clone();
+
     let runtime_prepare_service = RuntimePrepareService::new(services.event_bus.clone());
     tokio::spawn(async move {
         let scope = RuntimeStatusScope {
@@ -371,6 +395,16 @@ pub(crate) async fn run_server(
     }
 
     services.database.close().await;
+    if let Err(error) = aionui_app::remove_endpoint(&provision_data_dir) {
+        warn!(
+            code = "BOOTSTRAP_DEGRADED_PROVISION_ENDPOINT",
+            stage = "provision.endpoint.remove",
+            error = %error,
+            "shutdown: failed to remove local provision endpoint advertisement"
+        );
+    } else {
+        info!("shutdown: local provision endpoint advertisement removed");
+    }
     info!("Server shut down gracefully");
 
     // Prevent the log guard from being dropped before final log flush.

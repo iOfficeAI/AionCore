@@ -6,10 +6,15 @@
 //! submodules. All logic lives in the modules below.
 
 mod config;
+pub mod provisioning;
 mod router;
 mod services;
 
 pub use config::{AppConfig, IdentityMode, derive_encryption_key};
+pub use provisioning::{
+    endpoint_file_path, installation_id_for_data_dir, read_endpoint, remove_endpoint, write_endpoint,
+    write_endpoint_for_config,
+};
 pub use router::{
     ChannelOrchestratorComponents, ModuleStates, RouterBuildError, RouterRuntime, build_assistant_state,
     build_conversation_state, build_extension_states, build_module_states, build_ws_state, create_router,

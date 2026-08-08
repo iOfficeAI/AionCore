@@ -24,6 +24,7 @@ mod mcp;
 mod office;
 mod project;
 mod provider;
+mod provisioning;
 mod remote_agent;
 mod response;
 mod runtime;
@@ -141,6 +142,18 @@ pub use provider::{
     ModelHealthStatus, ModelImageInputCapability, ModelInfo, ModelOpenAiApiMode, ModelSettings, ModelType,
     MultiKeyResult, ProtocolDetectionResponse, ProviderHealthCheckErrorKind, ProviderHealthCheckRequest,
     ProviderHealthCheckResponse, ProviderResponse, SuggestionType, UpdateProviderRequest,
+};
+pub use provisioning::{
+    AssistantDeleteRequest, AssistantDesiredState, AssistantGetRequest, AssistantPlacement, AssistantReadback,
+    AssistantReconcileRequest, DispositionOutcome, LocalProvisionEndpoint, ManagedProvenance, McpDeleteRequest,
+    McpDesiredState, McpGetRequest, McpReadback, McpReconcileRequest, PROVISION_CONTRACT, PROVISION_PROTOCOL_VERSION,
+    PROVISION_SCHEMA_VERSION, ProvisionAttestation, ProvisionAuthContext, ProvisionAuthorizeRequest,
+    ProvisionBackendAvailability, ProvisionBackendState, ProvisionDiscoveryMethod, ProvisionErrorBody,
+    ProvisionErrorCode, ProvisionGrant, ProvisionScope, ProvisionSubject, ProvisionSubjectStatus, ResourceDisposition,
+    SkillDeleteRequest, SkillDesiredState, SkillGetRequest, SkillReadback, SkillReconcileRequest, TeamAdjacency,
+    TeamDefinitionDeleteRequest, TeamDefinitionDesiredState, TeamDefinitionGetRequest, TeamDefinitionReadback,
+    TeamDefinitionUpsertRequest, TeamDeleteDisposition, TeamMemberDesired, TeamMemberReadback, TeamMemberRole,
+    TeamRuntimeObservation, TeamRuntimeState, TeamWorkspacePolicy,
 };
 pub use remote_agent::{
     CreateRemoteAgentRequest, HandshakeResponse, RemoteAgentListItem, RemoteAgentResponse,

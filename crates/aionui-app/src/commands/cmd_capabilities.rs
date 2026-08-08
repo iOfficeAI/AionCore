@@ -105,6 +105,33 @@ fn data() -> Value {
                     "runtime_token_required_for_context_and_call": true,
                     "does_not_accept_identity_authority_from_stdin": true
                 }
+            },
+            {
+                "name": "provision",
+                "mode": "trusted-local-provisioning",
+                "description": "Conversation-independent trusted local provisioning for adopted principals (A0 assistants/MCP/skills, A1 team_definition).",
+                "contract": "trusted-local-provisioning",
+                "contract_command": "provision capabilities",
+                "invocation": "aioncore provision capabilities",
+                "runtime_required": [],
+                "runtime_free_commands": ["provision capabilities", "provision discover", "provision attest"],
+                "discovery": {
+                    "caller_port_required": false,
+                    "method": "data_dir_endpoint_file",
+                    "resolved_via": ["--data-dir"]
+                },
+                "safety": {
+                    "can_write": true,
+                    "conversation_independent": true,
+                    "does_not_use_runtime_token": true,
+                    "does_not_use_local_default_identity": true,
+                    "scopes": [
+                        "assistant_management",
+                        "mcp_configuration",
+                        "skill_registration",
+                        "team_definition"
+                    ]
+                }
             }
         ],
         "non_agent_subcommands": [

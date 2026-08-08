@@ -113,6 +113,8 @@ pub(crate) enum Command {
     Config(ConfigArgs),
     /// Agent-facing read-only troubleshooting CLI for AionUi diagnosis.
     Diagnose(DiagnoseArgs),
+    /// Trusted local provisioning protocol (conversation-independent; A0/A1).
+    Provision(ProvisionArgs),
     /// Agent-facing Team collaboration CLI fallback.
     Team(TeamArgs),
     /// PreToolUse permission gate for the Antigravity CLI (spawned by agy).
@@ -139,6 +141,7 @@ impl Command {
             Self::Capabilities => "capabilities",
             Self::Config(_) => "config",
             Self::Diagnose(_) => "diagnose",
+            Self::Provision(_) => "provision",
             Self::Team(_) => "team",
             Self::AntigravityHook => "antigravity-hook",
             Self::McpBridge => "mcp-bridge",
@@ -151,6 +154,87 @@ impl Command {
     pub(crate) fn need_runtime(&self) -> bool {
         matches!(self, Self::Doctor | Self::PrepareManagedResources(_))
     }
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ProvisionArgs {
+    #[command(subcommand)]
+    pub command: ProvisionCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ProvisionCommand {
+    /// Print the trusted local provisioning capability contract.
+    Capabilities,
+    /// Resolve installation/profile endpoint without a caller-provided port.
+    Discover,
+    /// Read attested installation/profile/subject before any write.
+    Attest,
+    /// Mint a short-lived least-privilege grant for requested scopes.
+    Authorize,
+    /// Revoke a grant (account-switch / explicit revoke).
+    Revoke,
+    /// Managed assistant reconcile/get/delete (A0).
+    Assistants(ProvisionAssistantsArgs),
+    /// Managed MCP reconcile/get/delete (A0).
+    Mcp(ProvisionMcpArgs),
+    /// Managed skill reconcile/get/delete (A0).
+    Skills(ProvisionSkillsArgs),
+    /// Team definition create/read/update/delete (A1).
+    Teams(ProvisionTeamsArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ProvisionAssistantsArgs {
+    #[command(subcommand)]
+    pub command: ProvisionAssistantsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ProvisionAssistantsCommand {
+    Reconcile,
+    Get,
+    Delete,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ProvisionMcpArgs {
+    #[command(subcommand)]
+    pub command: ProvisionMcpCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ProvisionMcpCommand {
+    Reconcile,
+    Get,
+    Delete,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ProvisionSkillsArgs {
+    #[command(subcommand)]
+    pub command: ProvisionSkillsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ProvisionSkillsCommand {
+    Reconcile,
+    Get,
+    Delete,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ProvisionTeamsArgs {
+    #[command(subcommand)]
+    pub command: ProvisionTeamsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ProvisionTeamsCommand {
+    Create,
+    Update,
+    Get,
+    Delete,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -846,6 +930,35 @@ mod tests {
             &["aioncore", "team", "spawn-agent"],
             &["aioncore", "team", "rename-agent"],
             &["aioncore", "team", "shutdown-agent"],
+        ];
+
+        for command in commands {
+            let result = Cli::try_parse_from(*command);
+            assert!(result.is_ok(), "command should parse: {command:?}");
+        }
+    }
+
+    #[test]
+    fn provision_cli_accepts_trusted_local_command_paths() {
+        let commands: &[&[&str]] = &[
+            &["aioncore", "provision", "capabilities"],
+            &["aioncore", "provision", "discover"],
+            &["aioncore", "provision", "attest"],
+            &["aioncore", "provision", "authorize"],
+            &["aioncore", "provision", "revoke"],
+            &["aioncore", "provision", "assistants", "reconcile"],
+            &["aioncore", "provision", "assistants", "get"],
+            &["aioncore", "provision", "assistants", "delete"],
+            &["aioncore", "provision", "mcp", "reconcile"],
+            &["aioncore", "provision", "mcp", "get"],
+            &["aioncore", "provision", "mcp", "delete"],
+            &["aioncore", "provision", "skills", "reconcile"],
+            &["aioncore", "provision", "skills", "get"],
+            &["aioncore", "provision", "skills", "delete"],
+            &["aioncore", "provision", "teams", "create"],
+            &["aioncore", "provision", "teams", "update"],
+            &["aioncore", "provision", "teams", "get"],
+            &["aioncore", "provision", "teams", "delete"],
         ];
 
         for command in commands {
