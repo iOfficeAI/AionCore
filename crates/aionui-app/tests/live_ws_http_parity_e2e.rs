@@ -983,6 +983,128 @@ async fn run_backend_mcp_provisioning(backend: &str) {
     println!("[{backend}] with a broken MCP server, frame types: {types:?}");
 }
 
+/// The approval card, actually raised and actually answered.
+///
+/// The full-access test asserts a permission frame does NOT appear; nothing
+/// asserted the opposite, so a CLI that stopped asking would have sailed
+/// through every gate while silently running unapproved writes. This is the
+/// half that matters for safety.
+///
+/// Also the only test that produces a `permission` frame at all — the frontend
+/// consumes 28 message types and the live suite was producing 10 of them.
+async fn run_backend_permission_prompt(backend: &str) {
+    let app = start_live_app().await;
+    let ws_dir = std::env::temp_dir().join(format!("live-perm-{backend}-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/conversations",
+        json!({"type": "acp", "extra": {"workspace": ws_dir.to_string_lossy(), "backend": backend}}),
+    )
+    .await;
+    let conv_id = created["data"]["id"].as_str().expect("conversation id").to_owned();
+
+    // Default mode on purpose: an approval must be required. Anything that
+    // pre-approves would make the absence of a prompt look like success.
+    //
+    // The target is OUTSIDE the workspace. A write inside it needs no approval
+    // under codex's default `workspace-write` sandbox, so an in-workspace path
+    // makes the test's own premise false for that backend — the first draft did
+    // exactly that and read codex's correct silence as "the CLI stopped asking".
+    let outside = std::env::temp_dir().join(format!("aion-approval-{}.txt", aionui_common::now_ms()));
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+    http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({
+            "content": format!(
+                "Run the shell command `echo AION_APPROVED > {}` using your command-execution tool. \
+                 Then reply with exactly: DONE.",
+                outside.display()
+            )
+        }),
+    )
+    .await;
+
+    // ---- a prompt must be raised ----
+    let started = Instant::now();
+    let mut prompt: Option<Value> = None;
+    while started.elapsed() < Duration::from_secs(180) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        prompt = stream_frames_for(&snapshot, &conv_id)
+            .into_iter()
+            .find(|f| f["data"]["type"].as_str().is_some_and(|t| t.contains("permission")))
+            .map(|f| f["data"].clone());
+        if prompt.is_some() {
+            break;
+        }
+    }
+    let prompt = prompt.unwrap_or_else(|| {
+        panic!("[{backend}] no approval was requested for a shell write — the CLI ran it unapproved, or stopped asking")
+    });
+    println!(
+        "[{backend}] approval requested: {}",
+        prompt.to_string().chars().take(300).collect::<String>()
+    );
+
+    // The card cannot be rendered without these: an approval the user cannot
+    // read is an approval they will click through blind.
+    let call_id = prompt["data"]["tool_call"]["tool_call_id"]
+        .as_str()
+        .or_else(|| prompt["data"]["call_id"].as_str())
+        .or_else(|| prompt["data"]["request_id"].as_str())
+        .unwrap_or_else(|| panic!("[{backend}] the approval carries no call id: {prompt}"))
+        .to_owned();
+    let options = prompt["data"]["options"]
+        .as_array()
+        .unwrap_or_else(|| panic!("[{backend}] the approval carries no options to choose from: {prompt}"));
+    assert!(
+        !options.is_empty(),
+        "[{backend}] the approval offered an empty option list: {prompt}"
+    );
+
+    // ---- answering it must let the turn finish, and the write must happen ----
+    let allow = options[0].clone();
+    let confirmed = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/confirmations/{call_id}/confirm"),
+        json!({
+            "msg_id": prompt["msg_id"],
+            "data": allow.get("optionId").cloned().unwrap_or(allow.clone()),
+        }),
+    )
+    .await;
+    println!("[{backend}] confirm: {confirmed}");
+
+    let after = Instant::now();
+    let mut finished = false;
+    while after.elapsed() < Duration::from_secs(180) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        if stream_frames_for(&snapshot, &conv_id)
+            .iter()
+            .any(|f| matches!(f["data"]["type"].as_str(), Some("finish") | Some("error")))
+        {
+            finished = true;
+            break;
+        }
+    }
+    assert!(
+        finished,
+        "[{backend}] the turn never terminated after the approval was granted"
+    );
+    assert!(
+        outside.is_file(),
+        "[{backend}] approval was granted but the command never ran — the answer did not reach the CLI"
+    );
+    let _ = std::fs::remove_file(&outside);
+}
+
 const PROMPT: &str = "Read the file hello.txt in this workspace using your file-reading tool, \
     then reply with its exact content and nothing else.";
 
@@ -1112,6 +1234,31 @@ async fn live_claude_ask_user_question_round_trip() {
         "the agent did not act on the answer — expected {option_label:?} in the reply, got {reply:?}"
     );
 }
+
+// The approval prompt is raised, rendered-able, answered, and acted on.
+
+#[tokio::test]
+#[ignore = "spawns the real claude CLI; needs credentials"]
+async fn live_claude_asks_before_running_a_command() {
+    run_backend_permission_prompt("claude").await;
+}
+
+// codex and agy are NOT instantiated, and this is an open question rather than
+// a decision.
+//
+// Observed: claude raises `acp_permission` for a shell write and the confirm
+// round-trips. Neither codex nor agy raised anything in 180s, for a write
+// inside the workspace OR outside it (codex default sandbox is
+// `workspace-write` with `approvalPolicy: on-request`, so the in-workspace case
+// legitimately needs no approval — the out-of-workspace case should have, and
+// did not).
+//
+// UNEXPLAINED. It could be the prompt not provoking the tool, the policy
+// applying to categories this command does not fall in, or a real gap in the
+// approval path. Not asserted either way: a red test whose premise nobody has
+// established teaches people to ignore this file, and a deleted one hides the
+// question. Written down here so the next person starts from the observation
+// instead of re-deriving it.
 
 // MCP provisioning with a server that cannot start, for every backend.
 
