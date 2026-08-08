@@ -544,6 +544,216 @@ async fn run_backend_usage(backend: &str) {
     assert!(used > 0, "[{backend}] context usage reported zero: {usage}");
 }
 
+/// Switching the model mid-conversation must reach the CLI and be confirmed by
+/// it, and the next turn must still work. The picker reporting success while
+/// nothing changed is a failure mode this repo has shipped before (the same
+/// class as the mode switch that "succeeded" and changed nothing).
+async fn run_backend_set_model(backend: &str) {
+    let app = start_live_app().await;
+    let ws_dir = std::env::temp_dir().join(format!("live-model-{backend}-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/conversations",
+        json!({"type": "acp", "extra": {"workspace": ws_dir.to_string_lossy(), "backend": backend}}),
+    )
+    .await;
+    let conv_id = created["data"]["id"].as_str().expect("conversation id").to_owned();
+
+    let ensured = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/runtime/ensure"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        ensured["success"],
+        json!(true),
+        "[{backend}] runtime must come up: {ensured}"
+    );
+
+    // Take the catalog from the agent rather than hardcoding a model name: the
+    // list differs per backend and changes with every CLI release, which is
+    // precisely the kind of drift this suite is meant to survive.
+    //
+    // It only exists once the agent has opened its session and reported it —
+    // the FIRST `runtime/ensure` answers `config_options: []` on all three
+    // backends — so a turn has to run before the catalog can be read.
+    let warmup = connect_ws_recorder(app.addr, &app.token).await;
+    http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "Reply with exactly: READY"}),
+    )
+    .await;
+    let warm_at = Instant::now();
+    while warm_at.elapsed() < Duration::from_secs(300) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = warmup.lock().unwrap().clone();
+        if stream_frames_for(&snapshot, &conv_id)
+            .iter()
+            .any(|f| f["data"]["type"] == "finish")
+        {
+            break;
+        }
+    }
+
+    // Poll rather than read once. agy discovers its models OFF the session-open
+    // path — `agy models` costs a process launch, so the backend fires it and
+    // lets the catalog write-back pick it up later
+    // (`antigravity/conn.rs`, `spawn_model_probe`). Reading immediately after
+    // the first turn finds an empty list and looks like a backend with no
+    // models, which it is not.
+    let catalog_at = Instant::now();
+    let mut options = Value::Null;
+    let mut models: Vec<Value> = Vec::new();
+    while catalog_at.elapsed() < Duration::from_secs(60) {
+        options = http_json(
+            &app,
+            "POST",
+            &format!("/api/conversations/{conv_id}/runtime/ensure"),
+            json!({}),
+        )
+        .await;
+        models = options["data"]["config_options"]
+            .as_array()
+            .and_then(|opts| opts.iter().find(|o| o["id"] == "model"))
+            .and_then(|o| o["options"].as_array().cloned())
+            .unwrap_or_default();
+        if models.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    assert!(
+        models.len() >= 2,
+        "[{backend}] no model catalog after 60s — needs at least two models to prove a switch, got {models:?}"
+    );
+
+    let current = options["data"]["config_options"]
+        .as_array()
+        .and_then(|opts| opts.iter().find(|o| o["id"] == "model"))
+        .and_then(|o| o["current_value"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let target = models
+        .iter()
+        .filter_map(|m| m["value"].as_str())
+        .find(|v| *v != current)
+        .unwrap_or_else(|| panic!("[{backend}] no model to switch to besides {current:?}"))
+        .to_owned();
+    println!("[{backend}] switching model {current:?} -> {target:?}");
+
+    let resp = http_json(
+        &app,
+        "PUT",
+        &format!("/api/conversations/{conv_id}/config-options/model"),
+        json!({"value": target}),
+    )
+    .await;
+    assert_eq!(
+        resp["success"],
+        json!(true),
+        "[{backend}] model switch rejected: {resp}"
+    );
+
+    let confirmed = resp["data"]["config_options"]
+        .as_array()
+        .and_then(|opts| opts.iter().find(|o| o["id"] == "model"))
+        .and_then(|o| o["current_value"].as_str())
+        .unwrap_or_default();
+    assert_eq!(
+        confirmed, target,
+        "[{backend}] the CLI did not confirm the switch — the picker would report a change that did not happen: {resp}"
+    );
+
+    // A switched session must still be able to run a turn. Confirming the value
+    // and then failing to answer would be a worse outcome than refusing it.
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+    http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "Reply with exactly: PONG"}),
+    )
+    .await;
+    let started = Instant::now();
+    let mut finished = false;
+    while started.elapsed() < Duration::from_secs(300) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        if stream_frames_for(&snapshot, &conv_id)
+            .iter()
+            .any(|f| f["data"]["type"] == "finish")
+        {
+            finished = true;
+            break;
+        }
+    }
+    assert!(
+        finished,
+        "[{backend}] the turn did not finish after switching model to {target}"
+    );
+}
+
+/// The agent names the conversation. A backend that stops sending a title
+/// leaves every conversation on its placeholder name — cosmetic-looking, but it
+/// is how users find anything in the list.
+async fn run_backend_session_title(backend: &str) {
+    let app = start_live_app().await;
+    let ws_dir = std::env::temp_dir().join(format!("live-title-{backend}-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/conversations",
+        json!({"type": "acp", "extra": {"workspace": ws_dir.to_string_lossy(), "backend": backend}}),
+    )
+    .await;
+    let conv_id = created["data"]["id"].as_str().expect("conversation id").to_owned();
+    let initial_name = created["data"]["name"].as_str().unwrap_or_default().to_owned();
+
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+    http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "Explain in one sentence what a hash map is."}),
+    )
+    .await;
+
+    let started = Instant::now();
+    let mut named: Option<String> = None;
+    while started.elapsed() < Duration::from_secs(300) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        named = snapshot
+            .iter()
+            .filter(|f| f["name"] == "conversation.nameUpdated" && f["data"]["conversation_id"] == conv_id.as_str())
+            .filter_map(|f| f["data"]["name"].as_str().map(str::to_owned))
+            .next_back();
+        let done = stream_frames_for(&snapshot, &conv_id)
+            .iter()
+            .any(|f| f["data"]["type"] == "finish");
+        if named.is_some() && done {
+            break;
+        }
+    }
+
+    let named = named.unwrap_or_else(|| panic!("[{backend}] no conversation.nameUpdated event within 300s"));
+    println!("[{backend}] title: {initial_name:?} -> {named:?}");
+    assert!(!named.trim().is_empty(), "[{backend}] the agent set an empty title");
+    assert_ne!(
+        named, initial_name,
+        "[{backend}] the title never changed from its placeholder"
+    );
+}
+
 const PROMPT: &str = "Read the file hello.txt in this workspace using your file-reading tool, \
     then reply with its exact content and nothing else.";
 
@@ -558,6 +768,166 @@ async fn live_claude_ws_http_parity() {
 async fn live_codex_ws_http_parity() {
     run_backend_parity("codex", PROMPT).await;
 }
+
+/// AskUserQuestion end to end: the agent raises a structured question, the user
+/// answers it through the REST endpoint, and the turn carries on to a clean
+/// finish. claude is the only backend that supports `AnswerAsk` — codex rejects
+/// it (`answer_ask`), agy has no arm at all — so this is deliberately
+/// claude-only rather than a generic helper.
+///
+/// The feature had no live coverage at all, which meant the whole path
+/// (`ask` frame → `POST /asks/{id}/answer` → the CLI's control response → the
+/// turn resuming) was only ever exercised by hand.
+#[tokio::test]
+#[ignore = "spawns the real claude CLI; needs credentials"]
+async fn live_claude_ask_user_question_round_trip() {
+    let app = start_live_app().await;
+    let ws_dir = std::env::temp_dir().join(format!("live-ask-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/conversations",
+        json!({"type": "acp", "extra": {"workspace": ws_dir.to_string_lossy(), "backend": "claude"}}),
+    )
+    .await;
+    let conv_id = created["data"]["id"].as_str().expect("conversation id").to_owned();
+
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+    let sent = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({
+            "content": "Use your AskUserQuestion tool RIGHT NOW to ask me exactly one question: \
+                \"Which colour?\" with the options Red and Blue. Do not guess an answer, do not \
+                explain — call the tool and wait for my reply. After I answer, reply with exactly \
+                the word I chose and nothing else."
+        }),
+    )
+    .await;
+    assert!(sent["data"]["turn_id"].is_string(), "send failed: {sent}");
+
+    // ---- the agent must raise a structured question ----
+    let started = Instant::now();
+    let mut ask: Option<Value> = None;
+    while started.elapsed() < Duration::from_secs(180) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        ask = stream_frames_for(&snapshot, &conv_id)
+            .into_iter()
+            .find(|f| f["data"]["type"] == "ask")
+            .map(|f| f["data"].clone());
+        if ask.is_some() {
+            break;
+        }
+    }
+    let ask = ask.expect("claude never raised an ask frame within 180s");
+    println!("[ask] frame: {}", ask.to_string().chars().take(400).collect::<String>());
+
+    let request_id = ask["data"]["request_id"]
+        .as_str()
+        .or_else(|| ask["msg_id"].as_str())
+        .unwrap_or_else(|| panic!("ask frame carries no request id: {ask}"))
+        .to_owned();
+    let questions = ask["data"]["questions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("ask frame carries no questions: {ask}"));
+    assert!(!questions.is_empty(), "ask frame carried an empty question list: {ask}");
+
+    // The answer is keyed by the question TEXT — claude's answers map is keyed
+    // that way, so sending an index or a paraphrase silently answers nothing.
+    let question_text = questions[0]["question"]
+        .as_str()
+        .unwrap_or_else(|| panic!("question has no text: {ask}"))
+        .to_owned();
+    let option_label = questions[0]["options"][0]["label"]
+        .as_str()
+        .unwrap_or_else(|| panic!("question has no options: {ask}"))
+        .to_owned();
+    println!("[ask] answering {question_text:?} with {option_label:?}");
+
+    let answered = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/asks/{request_id}/answer"),
+        json!({"answers": [{"question": question_text, "labels": [option_label.clone()]}], "decline": false}),
+    )
+    .await;
+    assert_eq!(answered["success"], json!(true), "answering the ask failed: {answered}");
+
+    // ---- the turn must resume and finish, having seen the answer ----
+    let resumed_at = Instant::now();
+    let mut finished = false;
+    let mut reply = String::new();
+    while resumed_at.elapsed() < Duration::from_secs(180) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        reply.clear();
+        for f in stream_frames_for(&snapshot, &conv_id) {
+            match f["data"]["type"].as_str().unwrap_or("") {
+                "text" | "content" => reply.push_str(f["data"]["data"]["content"].as_str().unwrap_or("")),
+                "finish" => finished = true,
+                _ => {}
+            }
+        }
+        if finished {
+            break;
+        }
+    }
+    assert!(finished, "the turn never finished after the ask was answered");
+    println!("[ask] reply after answering: {reply:?}");
+    assert!(
+        reply.to_lowercase().contains(&option_label.to_lowercase()),
+        "the agent did not act on the answer — expected {option_label:?} in the reply, got {reply:?}"
+    );
+}
+
+// Model switching and agent-set titles, for every backend.
+
+#[tokio::test]
+#[ignore = "spawns the real claude CLI; needs credentials"]
+async fn live_claude_set_model_takes_effect() {
+    run_backend_set_model("claude").await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real codex CLI; needs credentials"]
+async fn live_codex_set_model_takes_effect() {
+    run_backend_set_model("codex").await;
+}
+
+// agy is deliberately NOT instantiated here.
+//
+// Observed, not concluded: in this harness its `config_options` carry only
+// `mode` — no `model` entry appears, even after a completed turn and 60s of
+// polling, while `agy models` from a shell lists them immediately. agy probes
+// its catalog off the session-open path (`antigravity/conn.rs`,
+// `spawn_model_probe`) and caches it per process, so a fresh test process has
+// to run the probe and something about it yields nothing here.
+//
+// Whether that also affects a real desktop session is UNVERIFIED. It would
+// matter if it does — the same file notes the picker "stays stuck on its
+// loading state for the whole session" when the first answer is empty — so this
+// is written down as a lead to chase, not asserted as a defect and not hidden
+// behind a test that fails for reasons nobody has established.
+
+#[tokio::test]
+#[ignore = "spawns the real claude CLI; needs credentials"]
+async fn live_claude_names_the_conversation() {
+    run_backend_session_title("claude").await;
+}
+
+// codex and agy are NOT instantiated: agent-generated titles are a claude-only
+// capability. `SessionEvent::SessionTitle` appears nine times in claude_conn.rs
+// and zero times in codex_conn.rs and antigravity/conn.rs, so asserting it for
+// them would fail forever while proving nothing about either backend.
+//
+// Check the backend implements a capability BEFORE instantiating a generic
+// helper for it. This suite has already made the opposite assumption twice —
+// once for the model catalog, once here — and each time the resulting red test
+// looked like a backend defect rather than a wrong expectation.
 
 // Cancel and context usage, for every backend. One helper each rather than
 // per-backend tests: coverage that exists only for claude is exactly what let
