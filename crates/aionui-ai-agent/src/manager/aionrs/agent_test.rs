@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aion_config::config::{McpServerConfig, TransportType};
+use aion_types::message::TokenUsage;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::timeout;
 
@@ -330,9 +331,7 @@ async fn runtime_can_emit_error_and_finish() {
     agent.runtime.emit_error("test error");
     // emit_error sets status to Finished, so emit_finish is a no-op here.
     // We emit directly for the Finish broadcast path test:
-    agent
-        .runtime
-        .emit(AgentStreamEvent::Finish(FinishEventData { session_id: None }));
+    agent.runtime.emit(AgentStreamEvent::Finish(FinishEventData::default()));
 
     match rx.try_recv().unwrap() {
         AgentStreamEvent::Error(data) => assert_eq!(data.message, "test error"),
@@ -341,5 +340,113 @@ async fn runtime_can_emit_error_and_finish() {
     match rx.try_recv().unwrap() {
         AgentStreamEvent::Finish(_) => {}
         other => panic!("Expected Finish, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn successful_finish_emits_only_usage_added_since_the_previous_run() {
+    let agent = AionrsAgentManager::new("conv-usage".into(), "/project".into(), make_test_config(), None)
+        .await
+        .unwrap();
+    *agent.usage_watermark.lock().await = Some(TokenUsage {
+        input_tokens: 1_000,
+        output_tokens: 400,
+        ..Default::default()
+    });
+    agent.runtime.reset_for_new_turn(ConversationStatus::Running);
+    let mut rx = agent.subscribe();
+
+    agent
+        .emit_successful_finish(TokenUsage {
+            input_tokens: 1_250,
+            output_tokens: 475,
+            ..Default::default()
+        })
+        .await;
+
+    match rx.recv().await.expect("finish event") {
+        AgentStreamEvent::Finish(data) => {
+            assert_eq!(data.input_tokens, Some(250));
+            assert_eq!(data.output_tokens, Some(75));
+        }
+        other => panic!("expected Finish, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn successful_finish_omits_usage_when_the_provider_total_did_not_advance() {
+    let agent = AionrsAgentManager::new("conv-no-usage".into(), "/project".into(), make_test_config(), None)
+        .await
+        .unwrap();
+    *agent.usage_watermark.lock().await = Some(TokenUsage {
+        input_tokens: 1_000,
+        output_tokens: 400,
+        ..Default::default()
+    });
+    agent.runtime.reset_for_new_turn(ConversationStatus::Running);
+    let mut rx = agent.subscribe();
+
+    agent
+        .emit_successful_finish(TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 400,
+            ..Default::default()
+        })
+        .await;
+
+    match rx.recv().await.expect("finish event") {
+        AgentStreamEvent::Finish(data) => {
+            assert_eq!(data.input_tokens, None);
+            assert_eq!(data.output_tokens, None);
+        }
+        other => panic!("expected Finish, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn failed_or_cancelled_turn_rebaselines_usage_before_reporting_again() {
+    let agent = AionrsAgentManager::new("conv-rebaseline".into(), "/project".into(), make_test_config(), None)
+        .await
+        .unwrap();
+    *agent.usage_watermark.lock().await = Some(TokenUsage {
+        input_tokens: 1_000,
+        output_tokens: 400,
+        ..Default::default()
+    });
+    agent.invalidate_usage_watermark().await;
+    agent.runtime.reset_for_new_turn(ConversationStatus::Running);
+    let mut rx = agent.subscribe();
+
+    agent
+        .emit_successful_finish(TokenUsage {
+            input_tokens: 1_250,
+            output_tokens: 475,
+            ..Default::default()
+        })
+        .await;
+
+    match rx.recv().await.expect("rebaseline finish event") {
+        AgentStreamEvent::Finish(data) => {
+            assert_eq!(data.input_tokens, None);
+            assert_eq!(data.output_tokens, None);
+        }
+        other => panic!("expected Finish, got {other:?}"),
+    }
+
+    agent.runtime.reset_for_new_turn(ConversationStatus::Running);
+    agent
+        .emit_successful_finish(TokenUsage {
+            input_tokens: 1_400,
+            output_tokens: 525,
+            ..Default::default()
+        })
+        .await;
+
+    match rx.recv().await.expect("post-rebaseline finish event") {
+        AgentStreamEvent::Finish(data) => {
+            assert_eq!(data.input_tokens, Some(150));
+            assert_eq!(data.output_tokens, Some(50));
+        }
+        other => panic!("expected Finish, got {other:?}"),
     }
 }

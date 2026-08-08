@@ -390,9 +390,10 @@ impl RecordingAgent {
     /// Fire a Finish event on the agent's stream (simulates agent completing a turn).
     #[allow(dead_code)]
     fn fire_finish(&self) {
-        let _ = self
-            .event_tx
-            .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }));
+        let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData {
+            session_id: None,
+            ..Default::default()
+        }));
     }
 }
 

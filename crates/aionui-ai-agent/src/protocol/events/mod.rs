@@ -159,6 +159,10 @@ pub enum TipType {
 pub struct FinishEventData {
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
 }
 
 /// Kind of CodeBuddy ACP dialect signal absorbed by the tolerant transport
@@ -328,6 +332,7 @@ mod tests {
     fn finish_event_roundtrip() {
         let event = AgentStreamEvent::Finish(FinishEventData {
             session_id: Some("sess-abc".into()),
+            ..Default::default()
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "finish");

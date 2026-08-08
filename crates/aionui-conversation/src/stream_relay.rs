@@ -2336,7 +2336,12 @@ mod tests {
         let mut ws_rx = bus.subscribe();
         let rx = tx.subscribe();
 
-        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData {
+            input_tokens: Some(1_200),
+            output_tokens: Some(345),
+            ..Default::default()
+        }))
+        .unwrap();
 
         let outcome = relay.consume(rx).await;
         assert!(outcome.system_responses.is_empty());
@@ -2362,6 +2367,8 @@ mod tests {
             .find(|e| e.name == "message.stream")
             .expect("finish should be forwarded as message.stream");
         assert_eq!(stream_event.data["turn_id"], "turn-1");
+        assert_eq!(stream_event.data["data"]["input_tokens"], 1_200);
+        assert_eq!(stream_event.data["data"]["output_tokens"], 345);
     }
 
     // ── Tool persistence tests ────────────────────────────────────

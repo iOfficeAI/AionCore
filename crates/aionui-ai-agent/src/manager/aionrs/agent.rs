@@ -14,6 +14,7 @@ use aion_config::config::{CliArgs, Config, McpServerConfig, ProviderType};
 use aion_mcp::manager::McpManager;
 use aion_protocol::commands::{ApprovalScope, SessionMode};
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
+use aion_types::message::TokenUsage;
 use aionui_api_types::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentModeResponse, ConfigOptionConfirmation,
     GetConfigOptionsResponse, SetConfigOptionResponse, SlashCommandItem,
@@ -104,6 +105,8 @@ fn build_aionrs_final_input_dump_value(
 pub struct AionrsAgentManager {
     runtime: AgentRuntime,
     engine: Mutex<AgentEngine>,
+    /// Last cumulative engine usage already projected onto per-turn finish events.
+    usage_watermark: Mutex<Option<TokenUsage>>,
     /// Static slash command metadata captured at bootstrap so UI lookups do
     /// not wait behind an active `engine.run()` turn.
     slash_commands: Vec<SlashCommandItem>,
@@ -143,6 +146,10 @@ impl AionrsAgentManager {
     ) -> Result<Self, AgentError> {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
+        let usage_watermark = resume_session
+            .as_ref()
+            .map(|session| session.total_usage.clone())
+            .unwrap_or_default();
         let runtime_env = config_extra.runtime_env.clone();
         let image_input_override = config_extra.compat_overrides.image_input;
         let image_input_capability = image_input_override.unwrap_or_else(|| {
@@ -275,6 +282,7 @@ impl AionrsAgentManager {
         Ok(Self {
             runtime,
             engine: Mutex::new(engine),
+            usage_watermark: Mutex::new(Some(usage_watermark)),
             slash_commands,
             mcp_managers: result.mcp_managers,
             approval_manager,
@@ -283,6 +291,31 @@ impl AionrsAgentManager {
             cancel_notify: Arc::new(Notify::new()),
             turn_finished_notify: Arc::new(Notify::new()),
         })
+    }
+
+    async fn emit_successful_finish(&self, cumulative_usage: TokenUsage) {
+        let mut usage_watermark = self.usage_watermark.lock().await;
+        let usage_delta = usage_watermark
+            .as_ref()
+            .and_then(|watermark| {
+                cumulative_usage
+                    .input_tokens
+                    .checked_sub(watermark.input_tokens)
+                    .zip(cumulative_usage.output_tokens.checked_sub(watermark.output_tokens))
+            })
+            .filter(|(input_tokens, output_tokens)| *input_tokens > 0 || *output_tokens > 0);
+        *usage_watermark = Some(cumulative_usage);
+        drop(usage_watermark);
+
+        if let Some((input_tokens, output_tokens)) = usage_delta {
+            self.runtime.emit_finish_with_usage(None, input_tokens, output_tokens);
+        } else {
+            self.runtime.emit_finish(None);
+        }
+    }
+
+    async fn invalidate_usage_watermark(&self) {
+        *self.usage_watermark.lock().await = None;
     }
 
     fn request_stop(&self, reason: Option<AgentKillReason>, operation: &'static str) -> bool {
@@ -422,16 +455,17 @@ impl IAgentTask for AionrsAgentManager {
         self.runtime.bump_activity();
 
         let send_result = match result {
-            Some(Ok(_)) => {
+            Some(Ok(run_result)) => {
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
                     elapsed_ms,
                     "Aionrs engine.run() completed, emitting Finish"
                 );
-                self.runtime.emit_finish(None);
+                self.emit_successful_finish(run_result.usage).await;
                 Ok(())
             }
             Some(Err(e)) => {
+                self.invalidate_usage_watermark().await;
                 let summary = aionrs_runtime_error_summary(&e);
                 error!(
                     conversation_id = %self.runtime.conversation_id(),
@@ -458,6 +492,7 @@ impl IAgentTask for AionrsAgentManager {
                 Err(send_error)
             }
             None => {
+                self.invalidate_usage_watermark().await;
                 self.runtime.emit_finish(None);
                 Ok(())
             }

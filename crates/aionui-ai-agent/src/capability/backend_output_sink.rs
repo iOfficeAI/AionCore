@@ -128,14 +128,16 @@ impl OutputSink for BackendOutputSink {
         &self,
         _msg_id: &str,
         _turns: usize,
-        _input_tokens: u64,
-        _output_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
         _cache_creation_tokens: u64,
         _cache_read_tokens: u64,
     ) {
-        let _ = self
-            .event_tx
-            .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }));
+        let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData {
+            session_id: None,
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+        }));
     }
 
     fn emit_error(&self, msg: &str) {
@@ -284,10 +286,11 @@ mod tests {
         let (sink, mut rx) = make_sink();
         sink.emit_stream_end("msg-1", 3, 1000, 500, 100, 200);
         let event = rx.try_recv().unwrap();
-        match event {
-            AgentStreamEvent::Finish(_) => {}
-            other => panic!("Expected Finish, got {:?}", other),
-        }
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["type"], "finish");
+        assert_eq!(value["data"]["input_tokens"], 1000);
+        assert_eq!(value["data"]["output_tokens"], 500);
     }
 
     #[test]
