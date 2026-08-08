@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Mutex, OnceLock};
 
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -31,10 +30,17 @@ use crate::cli::{
     ProvisionMcpCommand, ProvisionSkillsArgs, ProvisionSkillsCommand, ProvisionTeamsArgs, ProvisionTeamsCommand,
 };
 
-/// Process-local engine for the CLI process (skeleton store).
-fn engine() -> &'static Mutex<ProvisionEngine> {
-    static ENGINE: OnceLock<Mutex<ProvisionEngine>> = OnceLock::new();
-    ENGINE.get_or_init(|| Mutex::new(ProvisionEngine::new()))
+/// Load the durable protocol engine for this data-dir.
+fn load_engine(data_dir: &Path) -> ProvisionEngine {
+    ProvisionEngine::load_from_data_dir(data_dir)
+}
+
+/// Persist after successful mutation. Failures are logged but do not undo the
+/// in-memory result already returned to the caller for this process.
+fn save_engine(data_dir: &Path, engine: &ProvisionEngine) {
+    if let Err(err) = engine.save_to_data_dir(data_dir) {
+        tracing::warn!(error = %err, "failed to persist provision engine state");
+    }
 }
 
 pub async fn run_provision(args: ProvisionArgs, data_dir: PathBuf) -> ExitCode {
@@ -54,11 +60,11 @@ async fn run(args: ProvisionArgs, data_dir: PathBuf) -> Result<(), ProvisionCliE
         ProvisionCommand::Discover => run_discover(&data_dir),
         ProvisionCommand::Attest => run_attest(&data_dir),
         ProvisionCommand::Authorize => run_authorize(&data_dir),
-        ProvisionCommand::Revoke => run_revoke(),
-        ProvisionCommand::Assistants(args) => run_assistants(args),
-        ProvisionCommand::Mcp(args) => run_mcp(args),
-        ProvisionCommand::Skills(args) => run_skills(args),
-        ProvisionCommand::Teams(args) => run_teams(args),
+        ProvisionCommand::Revoke => run_revoke(&data_dir),
+        ProvisionCommand::Assistants(args) => run_assistants(&data_dir, args),
+        ProvisionCommand::Mcp(args) => run_mcp(&data_dir, args),
+        ProvisionCommand::Skills(args) => run_skills(&data_dir, args),
+        ProvisionCommand::Teams(args) => run_teams(&data_dir, args),
     }
 }
 
@@ -98,14 +104,15 @@ fn run_authorize(data_dir: &Path) -> Result<(), ProvisionCliError> {
     let command = "provision authorize";
     let request: ProvisionAuthorizeRequest = read_stdin_json(command)?;
     let attestation = build_attestation(data_dir)?;
-    let mut engine = engine().lock().expect("provision engine lock");
+    let mut engine = load_engine(data_dir);
     let grant = engine
         .authorize(request, &attestation)
         .map_err(|err| engine_error(command, err))?;
+    save_engine(data_dir, &engine);
     print_success(serde_json::to_value(grant).unwrap(), meta())
 }
 
-fn run_revoke() -> Result<(), ProvisionCliError> {
+fn run_revoke(data_dir: &Path) -> Result<(), ProvisionCliError> {
     let command = "provision revoke";
     let payload: Value = read_stdin_json(command)?;
     let grant_id = payload
@@ -117,26 +124,28 @@ fn run_revoke() -> Result<(), ProvisionCliError> {
             ProvisionCliError::new(ProvisionErrorCode::InvalidPayload, command, "grant_id is required")
                 .field("field", "grant_id")
         })?;
-    let mut engine = engine().lock().expect("provision engine lock");
+    let mut engine = load_engine(data_dir);
     engine.revoke(grant_id).map_err(|err| engine_error(command, err))?;
+    save_engine(data_dir, &engine);
     print_success(json!({ "revoked": true, "grant_id": grant_id }), meta())
 }
 
-fn run_assistants(args: ProvisionAssistantsArgs) -> Result<(), ProvisionCliError> {
+fn run_assistants(data_dir: &Path, args: ProvisionAssistantsArgs) -> Result<(), ProvisionCliError> {
     match args.command {
         ProvisionAssistantsCommand::Reconcile => {
             let command = "provision assistants reconcile";
             let request: AssistantReconcileRequest = read_stdin_json(command)?;
-            let mut engine = engine().lock().expect("provision engine lock");
+            let mut engine = load_engine(data_dir);
             let readback = engine
                 .reconcile_assistant(request)
                 .map_err(|err| engine_error(command, err))?;
+            save_engine(data_dir, &engine);
             print_success(serde_json::to_value(readback).unwrap(), meta())
         }
         ProvisionAssistantsCommand::Get => {
             let command = "provision assistants get";
             let request: AssistantGetRequest = read_stdin_json(command)?;
-            let engine = engine().lock().expect("provision engine lock");
+            let engine = load_engine(data_dir);
             let readback = engine
                 .get_assistant(request)
                 .map_err(|err| engine_error(command, err))?;
@@ -145,103 +154,111 @@ fn run_assistants(args: ProvisionAssistantsArgs) -> Result<(), ProvisionCliError
         ProvisionAssistantsCommand::Delete => {
             let command = "provision assistants delete";
             let request: AssistantDeleteRequest = read_stdin_json(command)?;
-            let mut engine = engine().lock().expect("provision engine lock");
+            let mut engine = load_engine(data_dir);
             engine
                 .delete_assistant(request)
                 .map_err(|err| engine_error(command, err))?;
+            save_engine(data_dir, &engine);
             print_success(json!({ "deleted": true }), meta())
         }
     }
 }
 
-fn run_mcp(args: ProvisionMcpArgs) -> Result<(), ProvisionCliError> {
+fn run_mcp(data_dir: &Path, args: ProvisionMcpArgs) -> Result<(), ProvisionCliError> {
     match args.command {
         ProvisionMcpCommand::Reconcile => {
             let command = "provision mcp reconcile";
             let request: McpReconcileRequest = read_stdin_json(command)?;
-            let mut engine = engine().lock().expect("provision engine lock");
+            let mut engine = load_engine(data_dir);
             let readback = engine
                 .reconcile_mcp(request)
                 .map_err(|err| engine_error(command, err))?;
+            save_engine(data_dir, &engine);
             print_success(serde_json::to_value(readback).unwrap(), meta())
         }
         ProvisionMcpCommand::Get => {
             let command = "provision mcp get";
             let request: McpGetRequest = read_stdin_json(command)?;
-            let engine = engine().lock().expect("provision engine lock");
+            let engine = load_engine(data_dir);
             let readback = engine.get_mcp(request).map_err(|err| engine_error(command, err))?;
             print_success(serde_json::to_value(readback).unwrap(), meta())
         }
         ProvisionMcpCommand::Delete => {
             let command = "provision mcp delete";
             let request: McpDeleteRequest = read_stdin_json(command)?;
-            let mut engine = engine().lock().expect("provision engine lock");
+            let mut engine = load_engine(data_dir);
             engine.delete_mcp(request).map_err(|err| engine_error(command, err))?;
+            save_engine(data_dir, &engine);
             print_success(json!({ "deleted": true }), meta())
         }
     }
 }
 
-fn run_skills(args: ProvisionSkillsArgs) -> Result<(), ProvisionCliError> {
+fn run_skills(data_dir: &Path, args: ProvisionSkillsArgs) -> Result<(), ProvisionCliError> {
     match args.command {
         ProvisionSkillsCommand::Reconcile => {
             let command = "provision skills reconcile";
             let request: SkillReconcileRequest = read_stdin_json(command)?;
-            let mut engine = engine().lock().expect("provision engine lock");
+            let mut engine = load_engine(data_dir);
             let readback = engine
                 .reconcile_skill(request)
                 .map_err(|err| engine_error(command, err))?;
+            save_engine(data_dir, &engine);
             print_success(serde_json::to_value(readback).unwrap(), meta())
         }
         ProvisionSkillsCommand::Get => {
             let command = "provision skills get";
             let request: SkillGetRequest = read_stdin_json(command)?;
-            let engine = engine().lock().expect("provision engine lock");
+            let engine = load_engine(data_dir);
             let readback = engine.get_skill(request).map_err(|err| engine_error(command, err))?;
             print_success(serde_json::to_value(readback).unwrap(), meta())
         }
         ProvisionSkillsCommand::Delete => {
             let command = "provision skills delete";
             let request: SkillDeleteRequest = read_stdin_json(command)?;
-            let mut engine = engine().lock().expect("provision engine lock");
+            let mut engine = load_engine(data_dir);
             engine.delete_skill(request).map_err(|err| engine_error(command, err))?;
+            save_engine(data_dir, &engine);
             print_success(json!({ "deleted": true }), meta())
         }
     }
 }
 
-fn run_teams(args: ProvisionTeamsArgs) -> Result<(), ProvisionCliError> {
+fn run_teams(data_dir: &Path, args: ProvisionTeamsArgs) -> Result<(), ProvisionCliError> {
     match args.command {
         ProvisionTeamsCommand::Create => {
             let command = "provision teams create";
             let request: TeamDefinitionUpsertRequest = read_stdin_json(command)?;
-            let mut engine = engine().lock().expect("provision engine lock");
+            let mut engine = load_engine(data_dir);
             let readback = engine
                 .upsert_team(request, true)
                 .map_err(|err| engine_error(command, err))?;
+            save_engine(data_dir, &engine);
             print_success(serde_json::to_value(readback).unwrap(), meta())
         }
         ProvisionTeamsCommand::Update => {
             let command = "provision teams update";
             let request: TeamDefinitionUpsertRequest = read_stdin_json(command)?;
-            let mut engine = engine().lock().expect("provision engine lock");
+            let mut engine = load_engine(data_dir);
             let readback = engine
                 .upsert_team(request, false)
                 .map_err(|err| engine_error(command, err))?;
+            save_engine(data_dir, &engine);
             print_success(serde_json::to_value(readback).unwrap(), meta())
         }
         ProvisionTeamsCommand::Get => {
             let command = "provision teams get";
             let request: TeamDefinitionGetRequest = read_stdin_json(command)?;
-            let engine = engine().lock().expect("provision engine lock");
+            let engine = load_engine(data_dir);
             let readback = engine.get_team(request).map_err(|err| engine_error(command, err))?;
             print_success(serde_json::to_value(readback).unwrap(), meta())
         }
         ProvisionTeamsCommand::Delete => {
             let command = "provision teams delete";
             let request: TeamDefinitionDeleteRequest = read_stdin_json(command)?;
-            let mut engine = engine().lock().expect("provision engine lock");
+            let mut engine = load_engine(data_dir);
             let disposition = engine.delete_team(request).map_err(|err| engine_error(command, err))?;
+            save_engine(data_dir, &engine);
             print_success(serde_json::to_value(disposition).unwrap(), meta())
         }
     }
@@ -315,11 +332,11 @@ fn build_attestation(data_dir: &Path) -> Result<ProvisionAttestation, ProvisionC
         None => ("unknown".to_owned(), env!("CARGO_PKG_VERSION").to_owned(), None),
     };
 
-    // Subject: skeleton does not extract browser/session credentials. When the
-    // backend is running under aionpro, subject remains Unknown until a future
-    // principal-attestation channel is wired. Unknown never becomes
-    // system_default_user authority.
-    let subject = ProvisionSubject {
+    // Subject attestation prefers the Electron userData `auth.enc` file
+    // (plaintext identity store next to the aionui data-dir). That is NOT a
+    // browser cookie, CSRF secret, conversation runtime token, or port scrape.
+    // Unknown never becomes system_default_user authority.
+    let mut subject = subject_from_auth_enc(data_dir).unwrap_or(ProvisionSubject {
         subject_id: None,
         user_type: None,
         session_generation: None,
@@ -328,15 +345,14 @@ fn build_attestation(data_dir: &Path) -> Result<ProvisionAttestation, ProvisionC
         } else {
             ProvisionSubjectStatus::Absent
         },
-    };
+    });
 
-    // For offline protocol testing, accept AIONCORE_PROVISION_TEST_SUBJECT
-    // only when explicitly provided — never invent local-default identity.
-    let subject = if let Ok(raw) = std::env::var("AIONCORE_PROVISION_TEST_SUBJECT") {
-        parse_test_subject(&raw).unwrap_or(subject)
-    } else {
-        subject
-    };
+    // Offline protocol testing may inject a subject; never invent local-default.
+    if let Ok(raw) = std::env::var("AIONCORE_PROVISION_TEST_SUBJECT") {
+        if let Some(test_subject) = parse_test_subject(&raw) {
+            subject = test_subject;
+        }
+    }
 
     Ok(attestation_from_parts(
         discovery.installation_id,
@@ -359,6 +375,38 @@ fn parse_test_subject(raw: &str) -> Option<ProvisionSubject> {
         subject_id: Some(subject_id),
         user_type: value.get("user_type").and_then(Value::as_str).map(str::to_owned),
         session_generation: value.get("session_generation").and_then(Value::as_i64),
+        status: ProvisionSubjectStatus::Attested,
+    })
+}
+
+/// Read adopted/cloud principal from Electron `auth.enc` beside the data-dir.
+///
+/// Layout: `<userData>/auth.enc` and `<userData>/aionui` (data-dir). Refuse
+/// `system_default_user` and empty ids. Failures are non-fatal (Unknown/Absent).
+fn subject_from_auth_enc(data_dir: &Path) -> Option<ProvisionSubject> {
+    let user_data = data_dir.parent()?;
+    let path = user_data.join("auth.enc");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let user = value.get("user")?;
+    let subject_id = user.get("id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())?;
+    if subject_id == "system_default_user" {
+        return None;
+    }
+    // Do not copy email/token material into attestation — id + optional type only.
+    let user_type = user
+        .get("user_type")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            // Production auth.enc often lacks user_type; cloud user objects still
+            // prove a non-local principal.
+            Some("aionpro".to_owned())
+        });
+    Some(ProvisionSubject {
+        subject_id: Some(subject_id.to_owned()),
+        user_type,
+        session_generation: None,
         status: ProvisionSubjectStatus::Attested,
     })
 }

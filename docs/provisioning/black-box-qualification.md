@@ -98,6 +98,28 @@ forwarding, `system_default_user` authority.
 | `aionui-app` CLI parse tests | `aioncore provision …` clap surface |
 | `aionui-app` capabilities e2e | Top-level index advertises provision domain |
 
+
+## macOS evidence captured 2026-08-08 (ordinary user, adopted AionPro)
+
+Against `/Applications/AionUi.app` user data at
+`~/Library/Application Support/AionUi/aionui` with cloud subject attested from
+`auth.enc` (not cookie/runtime-token):
+
+| AC | Result |
+|----|--------|
+| A0-AC1 | **pass (macOS)** — `provision discover` without caller port |
+| A0-AC2 | **pass (macOS)** — `provision attest` returns attested aionpro subject |
+| A0-AC3 | **partial (macOS protocol engine)** — create disabled assistant + five axes + readback + delete via durable engine; **not** live UI vendor-table write |
+| A0-AC4 | **pass (macOS)** — concurrent conflict returns `PROVISION_CONCURRENT_CONFLICT` |
+| A0-AC5 | **partial** — durable `runtime/provision-engine-state.json` survives CLI process restart; not app upgrade path |
+| A0-AC9 | **partial** — closed-app discover; never `system_default_user` |
+| A0-AC11 | **pass (macOS)** — Team-referenced assistant delete refused |
+| A1-AC2 | **pass (macOS protocol)** — team create with duplicate assistant refs, one leader, no runtime start |
+| A1-AC3/6/8/9 | **partial/pass (macOS protocol)** — invalid/runtime/delete disposition/no runtime start |
+| A0-AC8 / A1-AC12 | **still open** — Windows + second-release upgrade matrix |
+
+Evidence logs (implementer session): `1082-native/macos-a0-discover-attest.txt`, `macos-a0-lifecycle.txt`.
+
 ## What remains blocked for native qualification
 
 1. Durable store for managed provenance under adopted AionPro principals.

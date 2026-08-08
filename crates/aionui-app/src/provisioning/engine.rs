@@ -8,7 +8,10 @@
 //! claimed complete.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use aionui_api_types::{
     AssistantDeleteRequest, AssistantDesiredState, AssistantGetRequest, AssistantReadback, AssistantReconcileRequest,
@@ -49,31 +52,31 @@ impl ProvisionEngineError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct GrantRecord {
     grant: ProvisionGrant,
     revoked: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManagedAssistant {
     provenance: ManagedProvenance,
     desired: AssistantDesiredState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManagedMcp {
     provenance: ManagedProvenance,
     desired: McpDesiredState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManagedSkill {
     provenance: ManagedProvenance,
     desired: SkillDesiredState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManagedTeam {
     provenance: ManagedProvenance,
     name: String,
@@ -83,7 +86,7 @@ struct ManagedTeam {
 }
 
 /// Protocol engine used by the provision CLI and unit tests.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ProvisionEngine {
     grants: HashMap<String, GrantRecord>,
     assistants: BTreeMap<String, ManagedAssistant>,
@@ -109,6 +112,41 @@ impl ProvisionEngine {
     pub fn with_clock_ms(mut self, clock_ms: i64) -> Self {
         self.clock_ms = Some(clock_ms);
         self
+    }
+
+    /// Relative store path under a data-dir for durable protocol state.
+    pub const STORE_RELATIVE_PATH: &'static str = "runtime/provision-engine-state.json";
+
+    /// Load durable protocol state from the installation data-dir, or empty.
+    pub fn load_from_data_dir(data_dir: &Path) -> Self {
+        let path = data_dir.join(Self::STORE_RELATIVE_PATH);
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Persist durable protocol state (grants + managed resources). Best-effort.
+    pub fn save_to_data_dir(&self, data_dir: &Path) -> std::io::Result<()> {
+        let path = data_dir.join(Self::STORE_RELATIVE_PATH);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serde_json::to_vec_pretty(self).map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, err)
+        })?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(tmp, path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                data_dir.join(Self::STORE_RELATIVE_PATH),
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+        Ok(())
     }
 
     pub fn mark_foreign_mcp(&mut self, id: impl Into<String>) {
@@ -1521,5 +1559,41 @@ mod tests {
                 .iter()
                 .all(|d| d.outcome == DispositionOutcome::Deleted)
         );
+    }
+
+    #[test]
+    fn durable_store_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = ProvisionEngine::new().with_clock_ms(1_000_000);
+        let grant = authorize_scopes(&mut engine, vec![ProvisionScope::AssistantManagement]);
+        let auth = auth_for(&grant);
+        engine
+            .reconcile_assistant(AssistantReconcileRequest {
+                auth: auth.clone(),
+                logical_id: "asst-persist".into(),
+                expected_revision: None,
+                desired: AssistantDesiredState {
+                    name: "Persist".into(),
+                    enabled: false,
+                    rule: Some("r".into()),
+                    model: Some("m".into()),
+                    permission: Some("default".into()),
+                    thought_level: Some("low".into()),
+                    skills: vec![],
+                    mcps: vec![],
+                    placement: None,
+                },
+            })
+            .unwrap();
+        engine.save_to_data_dir(dir.path()).unwrap();
+        let reloaded = ProvisionEngine::load_from_data_dir(dir.path());
+        let got = reloaded
+            .get_assistant(AssistantGetRequest {
+                auth,
+                logical_id: "asst-persist".into(),
+            })
+            .unwrap();
+        assert_eq!(got.name, "Persist");
+        assert_eq!(got.provenance.revision, 1);
     }
 }
