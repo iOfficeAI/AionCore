@@ -469,19 +469,22 @@ mod tests {
 
     #[tokio::test]
     async fn default_cwd_applies_when_agent_sends_none() {
-        let dir = std::env::temp_dir().join("aionui-term-cwd-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let reg = TerminalRegistry::new("conv-t", Some(dir.clone()));
+        // A private temp dir per run: the old fixed, shared path
+        // (`temp_dir()/aionui-term-cwd-test`) was raced by every parallel test
+        // process on the machine, which made this test flaky.
+        let dir = tempfile::TempDir::new().unwrap();
+        let reg = TerminalRegistry::new("conv-t", Some(dir.path().to_path_buf()));
         let id = reg.create(params("pwd", &[])).await.unwrap();
         reg.wait_for_exit(&id).await.unwrap();
         let snap = reg.output(&id).await.unwrap();
-        let canonical = std::fs::canonicalize(&dir).unwrap();
-        assert!(
-            snap.output
-                .trim()
-                .ends_with(canonical.file_name().unwrap().to_str().unwrap()),
-            "expected cwd {} in output: {}",
-            canonical.display(),
+        // `pwd` prints the resolved path (on macOS temp_dir lives under
+        // /var -> /private/var), so compare against the canonicalized full path
+        // rather than only the trailing directory name.
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(
+            snap.output.trim(),
+            canonical.to_str().unwrap(),
+            "pwd should report the default cwd; output: {}",
             snap.output
         );
     }
