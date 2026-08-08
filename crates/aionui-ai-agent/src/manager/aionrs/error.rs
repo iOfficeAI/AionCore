@@ -4,6 +4,7 @@ use aionui_api_types::{
     AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind, AgentErrorResolutionTarget,
 };
 
+use crate::error::AgentError;
 use crate::protocol::send_error::AgentSendError;
 
 pub(super) fn aionrs_engine_error_to_send_error(error: &AionrsAgentError) -> AgentSendError {
@@ -27,7 +28,11 @@ pub(super) fn aionrs_engine_error_to_send_error(error: &AionrsAgentError) -> Age
             AgentErrorResolutionKind::ReduceContext,
             None,
         ),
-        AionrsAgentError::ApiError(_) => unknown_upstream_send_error(detail),
+        // Provider stream failures cross the aionrs LlmEvent boundary as a
+        // string-backed ApiError. Reuse the host's upstream classifier so
+        // connection, rate-limit, billing, and status signatures do not
+        // collapse into UNKNOWN_UPSTREAM_ERROR after retries are exhausted.
+        AionrsAgentError::ApiError(_) => AgentSendError::from_agent_error(AgentError::bad_gateway(detail)),
         AionrsAgentError::UserAborted => unknown_upstream_send_error(detail),
     }
 }

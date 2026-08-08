@@ -112,10 +112,20 @@ fn tool_call_failure_summary_classifies_loop() {
 
 #[test]
 fn aionrs_api_connection_error_is_user_llm_provider_network_error() {
-    let error = AionrsAgentError::Provider(ProviderError::Connection("error decoding response body".to_owned()));
+    let error = AionrsAgentError::ApiError("Connection error: OpenAI stream ended without a terminal event".to_owned());
     let send_error = aionrs_engine_error_to_send_error(&error);
 
     assert_eq!(send_error.code(), Some(AgentErrorCode::UserLlmProviderNetworkError));
+    assert_eq!(send_error.ownership(), Some(AgentErrorOwnership::UserLlmProvider));
+    assert_eq!(send_error.stream_error().retryable, Some(true));
+}
+
+#[test]
+fn aionrs_api_rate_limit_error_remains_a_provider_rate_limit() {
+    let error = AionrsAgentError::ApiError("Rate limited, retry after 17000ms".to_owned());
+    let send_error = aionrs_engine_error_to_send_error(&error);
+
+    assert_eq!(send_error.code(), Some(AgentErrorCode::UserLlmProviderRateLimited));
     assert_eq!(send_error.ownership(), Some(AgentErrorOwnership::UserLlmProvider));
     assert_eq!(send_error.stream_error().retryable, Some(true));
 }
