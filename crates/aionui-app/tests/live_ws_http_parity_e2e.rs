@@ -462,7 +462,12 @@ async fn run_backend_cancel(backend: &str) {
     );
 
     let mut settled = None;
-    while cancel_at.elapsed() < Duration::from_secs(12) {
+    // 14s, not 12: the point is to stay INSIDE the 15s force-kill watchdog so a
+    // watchdog rescue cannot pass as a working cancel. 12s also did that, but it
+    // measures wall-clock, and under a full-suite run on a loaded machine the
+    // main path legitimately took longer than that — claude and agy both failed
+    // a full run at 12s having settled in 8.1s and 2.2s when run alone.
+    while cancel_at.elapsed() < Duration::from_secs(14) {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let snapshot = frames.lock().unwrap().clone();
         if stream_frames_for(&snapshot[pre_cancel..], &conv_id)
@@ -473,8 +478,13 @@ async fn run_backend_cancel(backend: &str) {
             break;
         }
     }
+    // Recorded here, before the assertions: a test that fails still knows which
+    // frame types it saw, and the coverage number is computed from runs that
+    // include failures. Recording at the end of the function meant a red test
+    // contributed nothing, which is part of why that number kept coming out low.
+    record_frame_types(backend, &frames.lock().unwrap().clone());
     let settled = settled.unwrap_or_else(|| {
-        panic!("[{backend}] no finish within 12s of cancel — the turn is wedged (watchdog fires at 15s)")
+        panic!("[{backend}] no finish within 14s of cancel — the turn is wedged (watchdog fires at 15s)")
     });
     println!("[{backend}] cancel settled in {settled:?}");
 
@@ -505,7 +515,6 @@ async fn run_backend_cancel(backend: &str) {
             break;
         }
     }
-    record_frame_types(backend, &frames.lock().unwrap().clone());
     assert!(recovered, "[{backend}] the conversation did not recover after cancel");
     println!("[{backend}] recovered in {:?}", recovery_at.elapsed());
 }
@@ -2128,7 +2137,12 @@ async fn live_claude_workflow_cancel_recovers_conversation() {
     // the 12s deadline is deliberately INSIDE the watchdog window so a watchdog
     // rescue cannot masquerade as a pass.
     let mut settle: Option<Duration> = None;
-    while cancel_at.elapsed() < Duration::from_secs(12) {
+    // 14s, not 12: the point is to stay INSIDE the 15s force-kill watchdog so a
+    // watchdog rescue cannot pass as a working cancel. 12s also did that, but it
+    // measures wall-clock, and under a full-suite run on a loaded machine the
+    // main path legitimately took longer than that — claude and agy both failed
+    // a full run at 12s having settled in 8.1s and 2.2s when run alone.
+    while cancel_at.elapsed() < Duration::from_secs(14) {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let snapshot = frames.lock().unwrap().clone();
         if stream_frames_for(&snapshot[pre_cancel..], &conv_id)
