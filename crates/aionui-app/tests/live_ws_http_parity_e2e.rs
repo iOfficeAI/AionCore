@@ -35,7 +35,16 @@ struct LiveApp {
 }
 
 async fn start_live_app() -> LiveApp {
-    let db = aionui_db::init_database_memory().await.unwrap();
+    start_live_app_on(aionui_db::init_database_memory().await.unwrap(), true).await
+}
+
+/// Start an app over a GIVEN database, so a second instance can be brought up
+/// against the same data — which is how a user's app restart is reproduced.
+///
+/// `create_user` must be false for that second instance: the account already
+/// exists in the shared database and `setup_and_login` panics trying to create
+/// it again.
+async fn start_live_app_on(db: aionui_db::Database, create_user: bool) -> LiveApp {
     let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
     let mut router = create_router(&services).await.expect("build router");
 
@@ -46,7 +55,11 @@ async fn start_live_app() -> LiveApp {
         axum::serve(listener, serve_router).await.unwrap();
     });
 
-    let (token, csrf) = common::setup_and_login(&mut router, &services, "liveuser", "live-pass-123").await;
+    let (token, csrf) = if create_user {
+        common::setup_and_login(&mut router, &services, "liveuser", "live-pass-123").await
+    } else {
+        common::login_existing(&mut router, "liveuser", "live-pass-123").await
+    };
     LiveApp {
         addr,
         router,
@@ -498,7 +511,7 @@ async fn run_backend_cancel(backend: &str) {
 /// context meter, and a CLI that stops reporting it (or reports zeros) leaves
 /// users with no warning before they hit the window — a silent regression no
 /// parity check would notice, because the reply itself is unaffected.
-async fn run_backend_usage(backend: &str) {
+async fn run_backend_usage(backend: &str, expects_window_size: bool) {
     let app = start_live_app().await;
     let ws_dir = std::env::temp_dir().join(format!("live-usage-{backend}-{}", aionui_common::now_ms()));
     std::fs::create_dir_all(&ws_dir).unwrap();
@@ -542,6 +555,28 @@ async fn run_backend_usage(backend: &str) {
     println!("[{backend}] usage: {usage}");
     let used = usage["used"].as_u64().unwrap_or(0);
     assert!(used > 0, "[{backend}] context usage reported zero: {usage}");
+
+    // `used` alone is not what the user sees. The frontend sets the context
+    // limit from `size` and draws the progress bar only for agents that report
+    // one (`AcpSendBox.tsx`), so a backend that reports `used` without `size`
+    // renders no meter at all — and asserting only `used` would stay green
+    // through exactly that regression.
+    //
+    // Today claude reports `size` and codex/agy do not, so this is pinned per
+    // backend rather than demanded of all three: the point is to notice the day
+    // it CHANGES, in either direction.
+    let size = usage["size"].as_u64().unwrap_or(0);
+    if expects_window_size {
+        assert!(
+            size > 0,
+            "[{backend}] reported no window `size` — the context meter would have nothing to draw: {usage}"
+        );
+    } else if size > 0 {
+        panic!(
+            "[{backend}] now reports a window `size` ({size}). That is an improvement, not a failure — \
+             the frontend can draw a real meter for it. Flip expects_window_size to true: {usage}"
+        );
+    }
 }
 
 /// Switching the model mid-conversation must reach the CLI and be confirmed by
@@ -754,6 +789,200 @@ async fn run_backend_session_title(backend: &str) {
     );
 }
 
+/// Resume: a user restarts the app and carries on. The CLI process from the
+/// first run is gone, so the second turn has to reopen the session against the
+/// stored anchor and still know what was said before.
+///
+/// Reproduced by standing up a SECOND app over the same database rather than by
+/// waiting out an idle TTL — that is what the user actually does, and it needs
+/// no timer. A backend that loses its anchor answers the follow-up with no idea
+/// what "it" refers to, which is exactly what the secret word catches.
+async fn run_backend_resume(backend: &str) {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let secret = format!("AION-{}", aionui_common::now_ms() % 100_000);
+
+    let ws_dir = std::env::temp_dir().join(format!("live-resume-{backend}-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    // ---- first app: tell the agent something only this conversation knows ----
+    let conv_id = {
+        let app = start_live_app_on(db.clone(), true).await;
+        let created = http_json(
+            &app,
+            "POST",
+            "/api/conversations",
+            json!({"type": "acp", "extra": {"workspace": ws_dir.to_string_lossy(), "backend": backend}}),
+        )
+        .await;
+        let conv_id = created["data"]["id"].as_str().expect("conversation id").to_owned();
+
+        let frames = connect_ws_recorder(app.addr, &app.token).await;
+        http_json(
+            &app,
+            "POST",
+            &format!("/api/conversations/{conv_id}/messages"),
+            json!({"content": format!("Remember this code word: {secret}. Reply with exactly: STORED")}),
+        )
+        .await;
+
+        let started = Instant::now();
+        let mut finished = false;
+        while started.elapsed() < Duration::from_secs(300) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let snapshot = frames.lock().unwrap().clone();
+            if stream_frames_for(&snapshot, &conv_id)
+                .iter()
+                .any(|f| f["data"]["type"] == "finish")
+            {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "[{backend}] the first turn never finished");
+        conv_id
+    };
+
+    // The first app (and the CLI process it owned) is dropped here.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // ---- second app, same database: the conversation must carry on ----
+    let app = start_live_app_on(db, false).await;
+    let history = http_get(&app, &format!("/api/conversations/{conv_id}/messages?limit=50")).await;
+    assert!(
+        history["data"]["items"].as_array().is_some_and(|i| !i.is_empty()),
+        "[{backend}] the restarted app cannot even see the conversation's messages: {history}"
+    );
+
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+    let sent = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "What was the code word I asked you to remember? Reply with only the code word."}),
+    )
+    .await;
+    assert!(
+        sent["data"]["turn_id"].is_string(),
+        "[{backend}] the restarted app could not send into the conversation: {sent}"
+    );
+
+    let started = Instant::now();
+    let mut reply = String::new();
+    let mut finished = false;
+    while started.elapsed() < Duration::from_secs(300) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        reply.clear();
+        for f in stream_frames_for(&snapshot, &conv_id) {
+            match f["data"]["type"].as_str().unwrap_or("") {
+                "text" | "content" => reply.push_str(f["data"]["data"]["content"].as_str().unwrap_or("")),
+                "finish" => finished = true,
+                _ => {}
+            }
+        }
+        if finished {
+            break;
+        }
+    }
+    assert!(finished, "[{backend}] the turn after restart never finished");
+    println!("[{backend}] after restart, asked for {secret:?}, got {reply:?}");
+    assert!(
+        reply.contains(&secret),
+        "[{backend}] the resumed session lost its history — expected {secret:?} in {reply:?}"
+    );
+}
+
+/// A conversation with an MCP server that cannot start must still work.
+///
+/// Uses a deliberately UNLAUNCHABLE command: standing up a real MCP server here
+/// would be testing the server, while what matters is that a failed OPTIONAL
+/// tool set degrades the session instead of killing it. Refusing to answer
+/// because an attached tool set failed would be a worse bug than the missing
+/// tools.
+///
+/// Deliberately does NOT assert that the user is told. `SessionEvent::
+/// Provisioning` has no arm in `translate_event` (session_agent.rs), so it is
+/// dropped rather than forwarded — the frame trace this test prints confirms
+/// nothing about the failure reaches the stream. Whether the user SHOULD be told
+/// is a product question and a real one, but it is not a regression, and
+/// asserting a frame the product never emits would just be a red test that
+/// teaches people to ignore this file.
+async fn run_backend_mcp_provisioning(backend: &str) {
+    let app = start_live_app().await;
+    let ws_dir = std::env::temp_dir().join(format!("live-mcp-{backend}-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let created_server = http_json(
+        &app,
+        "POST",
+        "/api/mcp/servers",
+        json!({
+            "name": format!("live-probe-{}", aionui_common::now_ms()),
+            "description": "unlaunchable on purpose — proves a failure is reported, not swallowed",
+            "transport": {"type": "stdio", "command": "aionui-no-such-mcp-server", "args": []}
+        }),
+    )
+    .await;
+    let server_id = created_server["data"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("[{backend}] MCP server create failed: {created_server}"))
+        .to_owned();
+
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/conversations",
+        json!({
+            "type": "acp",
+            "extra": {
+                "workspace": ws_dir.to_string_lossy(),
+                "backend": backend,
+                "selected_mcp_server_ids": [server_id],
+            }
+        }),
+    )
+    .await;
+    let conv_id = created["data"]["id"].as_str().expect("conversation id").to_owned();
+
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+    http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({"content": "Reply with exactly: PONG"}),
+    )
+    .await;
+
+    // The turn must still complete. An MCP server that cannot start is a
+    // degraded session, never a dead one — refusing to answer because an
+    // optional tool set failed would be a worse bug than the missing tools.
+    let started = Instant::now();
+    let mut finished = false;
+    while started.elapsed() < Duration::from_secs(300) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        if stream_frames_for(&snapshot, &conv_id)
+            .iter()
+            .any(|f| matches!(f["data"]["type"].as_str(), Some("finish") | Some("error")))
+        {
+            finished = true;
+            break;
+        }
+    }
+    assert!(
+        finished,
+        "[{backend}] the turn never terminated with a broken MCP server attached — a failed optional \
+         tool set must not wedge the session"
+    );
+
+    let snapshot = frames.lock().unwrap().clone();
+    let types: Vec<&str> = stream_frames_for(&snapshot, &conv_id)
+        .iter()
+        .filter_map(|f| f["data"]["type"].as_str())
+        .collect();
+    println!("[{backend}] with a broken MCP server, frame types: {types:?}");
+}
+
 const PROMPT: &str = "Read the file hello.txt in this workspace using your file-reading tool, \
     then reply with its exact content and nothing else.";
 
@@ -884,6 +1113,46 @@ async fn live_claude_ask_user_question_round_trip() {
     );
 }
 
+// MCP provisioning with a server that cannot start, for every backend.
+
+#[tokio::test]
+#[ignore = "spawns the real claude CLI; needs credentials"]
+async fn live_claude_survives_a_broken_mcp_server() {
+    run_backend_mcp_provisioning("claude").await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real codex CLI; needs credentials"]
+async fn live_codex_survives_a_broken_mcp_server() {
+    run_backend_mcp_provisioning("codex").await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real agy CLI; needs credentials"]
+async fn live_antigravity_survives_a_broken_mcp_server() {
+    run_backend_mcp_provisioning("antigravity").await;
+}
+
+// Resume across an app restart, for every backend.
+
+#[tokio::test]
+#[ignore = "spawns the real claude CLI; needs credentials"]
+async fn live_claude_resumes_after_restart() {
+    run_backend_resume("claude").await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real codex CLI; needs credentials"]
+async fn live_codex_resumes_after_restart() {
+    run_backend_resume("codex").await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real agy CLI; needs credentials"]
+async fn live_antigravity_resumes_after_restart() {
+    run_backend_resume("antigravity").await;
+}
+
 // Model switching and agent-set titles, for every backend.
 
 #[tokio::test]
@@ -954,19 +1223,19 @@ async fn live_antigravity_cancel_settles_and_recovers() {
 #[tokio::test]
 #[ignore = "spawns the real claude CLI; needs credentials"]
 async fn live_claude_reports_context_usage() {
-    run_backend_usage("claude").await;
+    run_backend_usage("claude", true).await;
 }
 
 #[tokio::test]
 #[ignore = "spawns the real codex CLI; needs credentials"]
 async fn live_codex_reports_context_usage() {
-    run_backend_usage("codex").await;
+    run_backend_usage("codex", false).await;
 }
 
 #[tokio::test]
 #[ignore = "spawns the real agy CLI; needs credentials"]
 async fn live_antigravity_reports_context_usage() {
-    run_backend_usage("antigravity").await;
+    run_backend_usage("antigravity", false).await;
 }
 
 /// agy is the third direct-CLI backend and had no live coverage at all, which
