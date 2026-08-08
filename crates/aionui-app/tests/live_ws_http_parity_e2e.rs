@@ -1105,6 +1105,210 @@ async fn run_backend_permission_prompt(backend: &str) {
     let _ = std::fs::remove_file(&outside);
 }
 
+/// Wait for a turn to finish while collecting every stream frame type it
+/// produced. Several checks below care about "did this frame ever appear",
+/// which is otherwise the same twenty lines each time.
+async fn drive_and_collect(app: &LiveApp, conv_id: &str, prompt: &str, timeout_s: u64) -> Vec<Value> {
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+    http_json(
+        app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({ "content": prompt }),
+    )
+    .await;
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(timeout_s) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let snapshot = frames.lock().unwrap().clone();
+        if stream_frames_for(&snapshot, conv_id)
+            .iter()
+            .any(|f| matches!(f["data"]["type"].as_str(), Some("finish") | Some("error")))
+        {
+            break;
+        }
+    }
+    // A short grace period: trailing frames (usage, late tool settles) land
+    // just after the terminal and are part of what the UI renders.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let snapshot = frames.lock().unwrap().clone();
+    stream_frames_for(&snapshot, conv_id).into_iter().cloned().collect()
+}
+
+async fn conversation_for(app: &LiveApp, backend: &str, label: &str) -> String {
+    let ws_dir = std::env::temp_dir().join(format!("live-{label}-{backend}-{}", aionui_common::now_ms()));
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    let created = http_json(
+        app,
+        "POST",
+        "/api/conversations",
+        json!({"type": "acp", "extra": {"workspace": ws_dir.to_string_lossy(), "backend": backend}}),
+    )
+    .await;
+    created["data"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("[{backend}] conversation create failed: {created}"))
+        .to_owned()
+}
+
+/// Thinking must reach the stream with content in it.
+///
+/// The thinking card is a whole surface of the product, and it is fragile in a
+/// way plain text is not: claude only emits it when `--thinking-display` is
+/// accepted (version-gated, see `claude_flags`), and codex's reasoning has
+/// already gone missing once behind a gateway that dropped summaries. Both
+/// failures look identical to the user — no card — and neither breaks a reply.
+async fn run_backend_thinking(backend: &str) {
+    let app = start_live_app().await;
+    let conv_id = conversation_for(&app, backend, "think").await;
+
+    // Raise the effort first. Neither CLI reasons visibly at its default level:
+    // a first draft of this test asked a deliberately reasoning-shaped question
+    // and got pure `content` from both, which reads as "thinking is broken" when
+    // it only means nobody asked for any.
+    let ensured = http_json(
+        &app,
+        "POST",
+        &format!("/api/conversations/{conv_id}/runtime/ensure"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        ensured["success"],
+        json!(true),
+        "[{backend}] runtime must come up: {ensured}"
+    );
+    let effort = http_json(
+        &app,
+        "PUT",
+        &format!("/api/conversations/{conv_id}/config-options/reasoning_effort"),
+        json!({"value": "high"}),
+    )
+    .await;
+    assert_eq!(
+        effort["success"],
+        json!(true),
+        "[{backend}] could not raise the reasoning effort, so this proves nothing about thinking: {effort}"
+    );
+
+    let frames = drive_and_collect(
+        &app,
+        &conv_id,
+        "Think carefully, step by step, about why 91 is not a prime number. \
+         Reason it through before answering, then give the two factors.",
+        300,
+    )
+    .await;
+
+    let thinking: Vec<&Value> = frames
+        .iter()
+        .filter(|f| matches!(f["data"]["type"].as_str(), Some("thinking") | Some("thought")))
+        .collect();
+    let types: Vec<&str> = frames.iter().filter_map(|f| f["data"]["type"].as_str()).collect();
+    assert!(
+        !thinking.is_empty(),
+        "[{backend}] no thinking frame — the thinking card would be empty. Frames seen: {types:?}"
+    );
+
+    let text: String = thinking
+        .iter()
+        .filter_map(|f| f["data"]["data"]["content"].as_str())
+        .collect();
+    println!("[{backend}] thinking frames: {}, {} chars", thinking.len(), text.len());
+    assert!(
+        !text.trim().is_empty(),
+        "[{backend}] thinking frames arrived but carried no text — the card renders blank"
+    );
+}
+
+/// The plan card. codex is the only backend that emits `SessionEvent::Plan`
+/// (five sites in codex_conn.rs; claude and agy have none), and the card is
+/// pure side-channel — a turn that stops emitting plans still answers
+/// perfectly, so nothing else in this suite would notice.
+async fn run_codex_plan() {
+    let app = start_live_app().await;
+    let conv_id = conversation_for(&app, "codex", "plan").await;
+
+    let frames = drive_and_collect(
+        &app,
+        &conv_id,
+        "Use your planning tool to lay out a 3-step plan for adding a health-check endpoint \
+         to a web service, then say DONE. Do not write any files.",
+        300,
+    )
+    .await;
+
+    let types: Vec<&str> = frames.iter().filter_map(|f| f["data"]["type"].as_str()).collect();
+    let plan = frames
+        .iter()
+        .find(|f| f["data"]["type"] == "plan")
+        .unwrap_or_else(|| panic!("[codex] no plan frame — the plan card stays empty. Frames seen: {types:?}"));
+
+    let entries = plan["data"]["data"]["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("[codex] the plan frame carries no entries: {plan}"));
+    println!("[codex] plan with {} entries", entries.len());
+    assert!(
+        !entries.is_empty(),
+        "[codex] the plan card would render an empty list: {plan}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["content"].as_str().is_some_and(|c| !c.trim().is_empty())),
+        "[codex] plan entries carry no text — the card renders blank rows: {plan}"
+    );
+}
+
+/// A tool card must reach the stream with the fields the card renders from.
+///
+/// The parity tests already prove ONE tool call survives the WS↔HTTP round
+/// trip, but they never look at what is in it. A CLI that renamed the field the
+/// title comes from would keep parity green and leave the user a row of
+/// untitled cards.
+async fn run_backend_tool_card(backend: &str) {
+    let app = start_live_app().await;
+    let conv_id = conversation_for(&app, backend, "toolcard").await;
+    let ws_dir = std::env::temp_dir();
+
+    let frames = drive_and_collect(
+        &app,
+        &conv_id,
+        "List the files in the current directory using your file-listing tool, then say DONE.",
+        300,
+    )
+    .await;
+    let _ = &ws_dir;
+
+    let types: Vec<&str> = frames.iter().filter_map(|f| f["data"]["type"].as_str()).collect();
+    let tool = frames
+        .iter()
+        .find(|f| matches!(f["data"]["type"].as_str(), Some("tool_call") | Some("acp_tool_call")))
+        .unwrap_or_else(|| panic!("[{backend}] no tool frame at all. Frames seen: {types:?}"));
+
+    // The two fields the card cannot render without: something to key updates
+    // on, and something to title the row with.
+    let data = &tool["data"]["data"];
+    let call_id = data["call_id"]
+        .as_str()
+        .or_else(|| data["update"]["tool_call_id"].as_str())
+        .unwrap_or_default();
+    let name = data["name"]
+        .as_str()
+        .or_else(|| data["update"]["title"].as_str())
+        .unwrap_or_default();
+    println!("[{backend}] tool card: call_id={call_id:?} name={name:?}");
+    assert!(
+        !call_id.is_empty(),
+        "[{backend}] the tool frame has no call id — updates cannot be matched to a card: {tool}"
+    );
+    assert!(
+        !name.is_empty(),
+        "[{backend}] the tool frame has no name/title — the card renders an untitled row: {tool}"
+    );
+}
+
 const PROMPT: &str = "Read the file hello.txt in this workspace using your file-reading tool, \
     then reply with its exact content and nothing else.";
 
@@ -1234,6 +1438,52 @@ async fn live_claude_ask_user_question_round_trip() {
         "the agent did not act on the answer — expected {option_label:?} in the reply, got {reply:?}"
     );
 }
+
+// The plan card (codex only) and the tool card (all three).
+
+#[tokio::test]
+#[ignore = "spawns the real codex CLI; needs credentials"]
+async fn live_codex_produces_a_plan() {
+    run_codex_plan().await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real claude CLI; needs credentials"]
+async fn live_claude_tool_card_is_renderable() {
+    run_backend_tool_card("claude").await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real codex CLI; needs credentials"]
+async fn live_codex_tool_card_is_renderable() {
+    run_backend_tool_card("codex").await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real agy CLI; needs credentials"]
+async fn live_antigravity_tool_card_is_renderable() {
+    run_backend_tool_card("antigravity").await;
+}
+
+// Thinking, for the two backends that emit it. agy has no ThoughtDelta arm in
+// either its conn or an adapter, so it is not instantiated.
+
+// NOT instantiated, and the reason is the environment rather than the code.
+//
+// `run_backend_thinking` is kept because it works and the surface is worth
+// guarding — the thinking card is a whole product surface, claude only emits it
+// when `--thinking-display` is accepted (version-gated, `claude_flags`), and
+// codex's reasoning has already gone missing once behind a gateway that dropped
+// summaries.
+//
+// But on the machine this was written, neither backend produces a single
+// thinking frame: not at default effort, and not with `reasoning_effort: high`
+// applied and confirmed first. The provider in front of both is not returning
+// reasoning summaries. A test that red-lights for that reason teaches people to
+// ignore this file, which costs more than the coverage buys.
+//
+// Wire it up on a host whose provider returns reasoning, and it should pass as
+// written.
 
 // The approval prompt is raised, rendered-able, answered, and acted on.
 
