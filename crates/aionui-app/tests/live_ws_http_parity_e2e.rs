@@ -503,6 +503,7 @@ async fn run_backend_cancel(backend: &str) {
             break;
         }
     }
+    record_frame_types(backend, &frames.lock().unwrap().clone());
     assert!(recovered, "[{backend}] the conversation did not recover after cancel");
     println!("[{backend}] recovered in {:?}", recovery_at.elapsed());
 }
@@ -551,6 +552,7 @@ async fn run_backend_usage(backend: &str, expects_window_size: bool) {
         }
     }
 
+    record_frame_types(backend, &frames.lock().unwrap().clone());
     let usage = usage.unwrap_or_else(|| panic!("[{backend}] no context-usage frame with a non-zero `used`"));
     println!("[{backend}] usage: {usage}");
     let used = usage["used"].as_u64().unwrap_or(0);
@@ -975,12 +977,7 @@ async fn run_backend_mcp_provisioning(backend: &str) {
          tool set must not wedge the session"
     );
 
-    let snapshot = frames.lock().unwrap().clone();
-    let types: Vec<&str> = stream_frames_for(&snapshot, &conv_id)
-        .iter()
-        .filter_map(|f| f["data"]["type"].as_str())
-        .collect();
-    println!("[{backend}] with a broken MCP server, frame types: {types:?}");
+    record_frame_types(backend, &frames.lock().unwrap().clone());
 }
 
 /// The approval card, actually raised and actually answered.
@@ -1108,6 +1105,20 @@ async fn run_backend_permission_prompt(backend: &str) {
 /// Wait for a turn to finish while collecting every stream frame type it
 /// produced. Several checks below care about "did this frame ever appear",
 /// which is otherwise the same twenty lines each time.
+/// Print every stream frame type a test produced, in one canonical line.
+///
+/// The suite's coverage of the frontend's renderable types is a number worth
+/// knowing — the UI renders 28 of them — and it was being ESTIMATED from
+/// whichever tests happened to be run, which produced two different wrong
+/// answers. Grep `FRAME-TYPES` across a full `--nocapture` run to compute it
+/// from what actually happened.
+fn record_frame_types(label: &str, frames: &[Value]) {
+    let mut types: Vec<&str> = frames.iter().filter_map(|f| f["data"]["type"].as_str()).collect();
+    types.sort_unstable();
+    types.dedup();
+    println!("FRAME-TYPES {label}: {}", types.join(" "));
+}
+
 async fn drive_and_collect(app: &LiveApp, conv_id: &str, prompt: &str, timeout_s: u64) -> Vec<Value> {
     let frames = connect_ws_recorder(app.addr, &app.token).await;
     http_json(
@@ -1133,7 +1144,9 @@ async fn drive_and_collect(app: &LiveApp, conv_id: &str, prompt: &str, timeout_s
     // just after the terminal and are part of what the UI renders.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let snapshot = frames.lock().unwrap().clone();
-    stream_frames_for(&snapshot, conv_id).into_iter().cloned().collect()
+    let collected: Vec<Value> = stream_frames_for(&snapshot, conv_id).into_iter().cloned().collect();
+    record_frame_types(conv_id, &collected);
+    collected
 }
 
 async fn conversation_for(app: &LiveApp, backend: &str, label: &str) -> String {
