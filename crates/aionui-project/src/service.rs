@@ -321,6 +321,28 @@ impl ProjectService {
         let root = canonical::canonicalize(&folder.resource_canonical)?;
         let resolved = containment::resolve_relative(&root, &input.relative_path, input.op)?;
 
+        // The agent-facing absolute path must preserve the real on-disk casing.
+        // Derive it from the folder's stored real-case URI (`resource_uri`), NOT
+        // the case-folded canonical: `canonical::canonicalize` ASCII-lowercases the
+        // path on macOS/Windows (`IGNORE_PATH_CASING`) for dedupe/containment
+        // identity, so `resolved.absolute_path` carries a lowercased root. That
+        // folded form stays the containment + dedupe key (unchanged); only the
+        // outward path handed to agents / clipboard / reveal switches to real
+        // casing. The relative segment is already validated (no `..`, contained)
+        // by `resolve_relative`, so joining it onto the real root cannot escape.
+        let absolute_path = match resolved.absolute_path {
+            Some(_) => {
+                let real_root = canonical::uri_to_path(&folder.resource_uri)?;
+                let abs = if resolved.relative_path.is_empty() {
+                    real_root
+                } else {
+                    real_root.join(&resolved.relative_path)
+                };
+                Some(abs.to_string_lossy().into_owned())
+            }
+            None => None,
+        };
+
         Ok(ResolvedResource {
             project_id: entry.project_id,
             pe_id: entry.pe_id,
@@ -329,7 +351,7 @@ impl ProjectService {
             root_resource_canonical: folder.resource_canonical,
             relative_path: resolved.relative_path,
             resource_uri: resolved.resource_uri,
-            absolute_path: resolved.absolute_path.map(|p| p.to_string_lossy().into_owned()),
+            absolute_path,
         })
     }
 
