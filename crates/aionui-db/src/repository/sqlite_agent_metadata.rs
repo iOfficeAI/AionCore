@@ -977,6 +977,10 @@ mod tests {
             .find(|row| row.agent_type == "aionrs" && row.agent_source == "internal")
             .expect("seeded aion cli row");
         assert_eq!(aionrs.icon.as_deref(), Some("/api/assets/logos/brand/aion.svg"));
+        assert_eq!(
+            aionrs.native_skills_dirs.as_deref(),
+            Some(r#"[".csbu-workmate/skills"]"#)
+        );
         let aionrs_modes: serde_json::Value =
             serde_json::from_str(aionrs.available_modes.as_deref().expect("aionrs modes catalog")).unwrap();
         assert_eq!(aionrs_modes["current_mode_id"].as_str(), Some("default"));

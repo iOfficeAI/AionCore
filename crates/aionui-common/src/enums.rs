@@ -89,7 +89,7 @@ impl AgentType {
     /// Codex conversations use ACP metadata with `backend = "codex"`.
     pub fn native_skills_dirs(&self) -> Option<&'static [&'static str]> {
         match self {
-            AgentType::Aionrs => Some(&[".aionrs/skills"]),
+            AgentType::Aionrs => Some(&[".csbu-workmate/skills"]),
             // Verified 2026-07-31 against agy 1.1.8: a skill at
             // `.agents/skills/<name>/SKILL.md` is discovered and executed in
             // headless (`-p`) runs. agy also accepts `.agent/` / `_agents/` /
@@ -545,6 +545,14 @@ mod tests {
         assert_eq!(
             AgentType::Antigravity.native_skills_dirs(),
             Some([".agents/skills"].as_slice())
+        );
+    }
+
+    #[test]
+    fn workmate_uses_the_branded_workspace_skills_directory() {
+        assert_eq!(
+            AgentType::Aionrs.native_skills_dirs(),
+            Some([".csbu-workmate/skills"].as_slice())
         );
     }
 }
