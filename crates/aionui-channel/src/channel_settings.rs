@@ -544,9 +544,7 @@ fn parse_channel_workspace_setting(value: &str) -> Option<ChannelWorkspaceSettin
     if path.is_empty() {
         return None;
     }
-    Some(ChannelWorkspaceSetting {
-        path: path.to_owned(),
-    })
+    Some(ChannelWorkspaceSetting { path: path.to_owned() })
 }
 
 fn default_agent_config() -> ResolvedAgentConfig {
@@ -1386,11 +1384,12 @@ mod tests {
         let repo = Arc::new(MockPrefRepo::new());
         let svc = ChannelSettingsService::new(repo);
 
-        assert!(svc
-            .get_workspace_path(TEST_USER_ID, PluginType::Telegram)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            svc.get_workspace_path(TEST_USER_ID, PluginType::Telegram)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         svc.set_workspace_setting(
             TEST_USER_ID,
@@ -1427,11 +1426,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(svc
-            .get_workspace_path(TEST_USER_ID, PluginType::Telegram)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            svc.get_workspace_path(TEST_USER_ID, PluginType::Telegram)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let cleared = svc
             .get_platform_settings(TEST_USER_ID, PluginType::Telegram)
             .await
