@@ -403,6 +403,7 @@ mod tests {
         let exit = reg.wait_for_exit(&id).await.unwrap();
         assert_eq!(exit.exit_code, Some(0));
         assert!(!exit.signaled);
+        output_contains(&reg, &id, "hello_term").await;
         let snap = reg.output(&id).await.unwrap();
         assert!(snap.output.contains("hello_term"));
         assert!(!snap.truncated);
@@ -416,6 +417,7 @@ mod tests {
         p.output_byte_limit = Some(4);
         let id = reg.create(p).await.unwrap();
         reg.wait_for_exit(&id).await.unwrap();
+        output_contains(&reg, &id, "BBBB").await;
         let snap = reg.output(&id).await.unwrap();
         assert_eq!(snap.output, "BBBB");
         assert!(snap.truncated);
