@@ -31,6 +31,9 @@ pub struct SlackPlugin {
     last_error: Option<String>,
     /// Bot user id (`Uxxxx`) used to filter self-echoes and strip mentions.
     bot_user_id: String,
+    /// Whether an app-level token (`xapp-`) was supplied. Required only to open
+    /// the Socket Mode connection in `start()`, not for the credential test.
+    app_token_present: bool,
 
     // Dependencies (set during `initialize`)
     api: Option<Arc<SlackApi>>,
@@ -52,6 +55,7 @@ impl Default for SlackPlugin {
             bot_info: None,
             last_error: None,
             bot_user_id: String::new(),
+            app_token_present: false,
             api: None,
             callbacks: None,
             ws_handle: None,
@@ -73,28 +77,25 @@ impl ChannelPlugin for SlackPlugin {
     async fn initialize(&mut self, config: PluginConfig, callbacks: PluginCallbacks) -> Result<(), ChannelError> {
         self.status = PluginStatus::Initializing;
 
-        let bot_token = config
-            .credentials
-            .token
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
+        let bot_token = match require_bot_token(&config) {
+            Ok(token) => token,
+            Err(e) => {
                 self.status = PluginStatus::Error;
                 self.last_error = Some("Missing Slack bot token".into());
-                ChannelError::InvalidConfig("Missing Slack bot token (xoxb-)".into())
-            })?;
+                return Err(e);
+            }
+        };
 
-        // App-level token (xapp-) authorizes the Socket Mode connection.
+        // App-level token (xapp-) is optional here: it is only needed to open
+        // the Socket Mode connection in `start()`. The credential-test path
+        // sends the bot token alone, so requiring it here would break "Test".
         let app_token = config
             .credentials
             .app_token
             .as_deref()
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                self.status = PluginStatus::Error;
-                self.last_error = Some("Missing Slack app-level token".into());
-                ChannelError::InvalidConfig("Missing Slack app-level token (xapp-)".into())
-            })?;
+            .unwrap_or("");
+        self.app_token_present = !app_token.is_empty();
 
         let http_client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -105,7 +106,7 @@ impl ChannelPlugin for SlackPlugin {
                 ChannelError::ConnectionFailed(format!("HTTP client init failed: {e}"))
             })?;
 
-        let api = Arc::new(SlackApi::new(http_client, bot_token, app_token));
+        let api = Arc::new(SlackApi::new(http_client, &bot_token, app_token));
 
         // Validate the bot token and capture the bot identity.
         let identity = api.auth_test().await.map_err(|e| {
@@ -131,6 +132,17 @@ impl ChannelPlugin for SlackPlugin {
 
     async fn start(&mut self) -> Result<(), ChannelError> {
         self.status = PluginStatus::Starting;
+
+        // The app-level token is mandatory to open the Socket Mode connection.
+        // Validated here (not in `initialize`) so the credential-test path can
+        // succeed with the bot token alone.
+        if !self.app_token_present {
+            self.status = PluginStatus::Error;
+            self.last_error = Some("Missing Slack app-level token".into());
+            return Err(ChannelError::InvalidConfig(
+                "Missing Slack app-level token (xapp-), required for Socket Mode".into(),
+            ));
+        }
 
         let callbacks = self.callbacks.take().ok_or_else(|| {
             self.status = PluginStatus::Error;
@@ -241,6 +253,22 @@ impl ChannelPlugin for SlackPlugin {
     fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
+}
+
+/// Validate that the Slack bot token (`xoxb-`) is present.
+///
+/// The app-level token (`xapp-`) is intentionally NOT required here: it is only
+/// needed to open the Socket Mode connection in `start()`. Requiring it during
+/// `initialize` would break the credential-test path, which sends the bot token
+/// alone.
+fn require_bot_token(config: &PluginConfig) -> Result<String, ChannelError> {
+    config
+        .credentials
+        .token
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| ChannelError::InvalidConfig("Missing Slack bot token (xoxb-)".into()))
 }
 
 /// Truncate a message to the platform limit, appending "..." if truncated.

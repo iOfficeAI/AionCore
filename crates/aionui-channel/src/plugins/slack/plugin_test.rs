@@ -38,23 +38,49 @@ async fn initialize_missing_bot_token_fails() {
 }
 
 #[tokio::test]
-async fn initialize_missing_app_token_fails() {
-    let mut plugin = SlackPlugin::new();
-    let result = plugin
-        .initialize(make_config(Some("xoxb-1"), None), make_callbacks())
-        .await;
-    assert!(matches!(result, Err(ChannelError::InvalidConfig(_))));
-    assert_eq!(plugin.status(), PluginStatus::Error);
-    assert!(plugin.last_error().unwrap().contains("app-level token"));
-}
-
-#[tokio::test]
 async fn initialize_empty_bot_token_fails() {
     let mut plugin = SlackPlugin::new();
     let result = plugin
         .initialize(make_config(Some(""), Some("xapp-1")), make_callbacks())
         .await;
     assert!(matches!(result, Err(ChannelError::InvalidConfig(_))));
+}
+
+// -- require_bot_token: bot token required, app token optional ---------------
+// (app token is NOT required at config validation; it is only needed to open
+// Socket Mode in start(). This is the credential-test regression guard.)
+
+#[test]
+fn require_bot_token_accepts_bot_token_only() {
+    // No app_token supplied — the credential-test path — must still validate.
+    let cfg = make_config(Some("xoxb-1"), None);
+    assert_eq!(require_bot_token(&cfg).unwrap(), "xoxb-1");
+}
+
+#[test]
+fn require_bot_token_missing_is_err() {
+    let cfg = make_config(None, Some("xapp-1"));
+    assert!(matches!(require_bot_token(&cfg), Err(ChannelError::InvalidConfig(_))));
+}
+
+#[test]
+fn require_bot_token_empty_is_err() {
+    let cfg = make_config(Some(""), Some("xapp-1"));
+    assert!(matches!(require_bot_token(&cfg), Err(ChannelError::InvalidConfig(_))));
+}
+
+// -- start() requires the app-level token ------------------------------------
+
+#[tokio::test]
+async fn start_without_app_token_fails() {
+    // A fresh plugin has app_token_present == false (as it would after an
+    // initialize that received only the bot token). start() must reject it
+    // before opening any connection.
+    let mut plugin = SlackPlugin::new();
+    let result = plugin.start().await;
+    assert!(matches!(result, Err(ChannelError::InvalidConfig(_))));
+    assert_eq!(plugin.status(), PluginStatus::Error);
+    assert!(plugin.last_error().unwrap().contains("app-level token"));
 }
 
 // -- accessors / defaults ----------------------------------------------------
