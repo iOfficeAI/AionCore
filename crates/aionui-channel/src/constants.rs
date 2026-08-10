@@ -37,6 +37,9 @@ pub const LARK_MESSAGE_LIMIT: usize = 4000;
 /// Maximum characters per DingTalk message.
 pub const DINGTALK_MESSAGE_LIMIT: usize = 4000;
 
+/// Maximum characters per Slack message.
+pub const SLACK_MESSAGE_LIMIT: usize = 4000;
+
 // ---------------------------------------------------------------------------
 // Reconnection (Telegram long-polling)
 // ---------------------------------------------------------------------------
@@ -53,6 +56,13 @@ pub const TELEGRAM_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 
 /// TTL for Lark event deduplication cache.
 pub const LARK_EVENT_DEDUP_TTL: Duration = Duration::from_secs(5 * 60);
+
+// ---------------------------------------------------------------------------
+// Slack
+// ---------------------------------------------------------------------------
+
+/// TTL for Slack event deduplication cache.
+pub const SLACK_EVENT_DEDUP_TTL: Duration = Duration::from_secs(5 * 60);
 
 // ---------------------------------------------------------------------------
 // DingTalk
@@ -130,6 +140,16 @@ mod tests {
     #[test]
     fn dingtalk_message_limit() {
         assert_eq!(DINGTALK_MESSAGE_LIMIT, 4000);
+    }
+
+    #[test]
+    fn slack_message_limit() {
+        assert_eq!(SLACK_MESSAGE_LIMIT, 4000);
+    }
+
+    #[test]
+    fn slack_event_dedup_ttl_is_five_minutes() {
+        assert_eq!(SLACK_EVENT_DEDUP_TTL, Duration::from_secs(300));
     }
 
     #[test]

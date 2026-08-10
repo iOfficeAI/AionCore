@@ -6,7 +6,7 @@ use tracing::{error, info, warn};
 use crate::action::{ActionExecutor, MessageResult};
 use crate::message_service::ChannelMessageService;
 use crate::session::SessionManager;
-use crate::stream_relay::{ChannelSender, ChannelStreamRelay, RelayConfig};
+use crate::stream_relay::{ChannelSender, ChannelStreamRelay, RelayConfig, throttle_ms_for_platform};
 use crate::types::{ActionBehavior, OutgoingMessageType, UnifiedIncomingMessage, UnifiedOutgoingMessage};
 
 /// Orchestrates the full channel message lifecycle.
@@ -216,7 +216,7 @@ async fn handle_dispatched(
             platform,
             plugin_id: plugin_id.to_owned(),
             chat_id: chat_id.to_owned(),
-            throttle_ms: 500,
+            throttle_ms: throttle_ms_for_platform(platform),
         };
         let relay = ChannelStreamRelay::new(relay_config, Arc::clone(sender));
         tokio::spawn(relay.run(rx));

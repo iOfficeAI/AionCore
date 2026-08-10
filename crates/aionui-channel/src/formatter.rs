@@ -8,15 +8,40 @@ use crate::types::PluginType;
 ///
 /// - Telegram: escape HTML, then convert markdown → HTML tags
 /// - Lark/DingTalk: convert HTML tags → markdown
+/// - Slack: escape `&<>`, then convert markdown → Slack mrkdwn
 /// - WeChat/WeCom: strip all HTML
 /// - Fallback: escape HTML special chars
 pub fn format_text_for_platform(text: &str, platform: PluginType) -> String {
     match platform {
         PluginType::Telegram => markdown_to_telegram_html(text),
         PluginType::Lark | PluginType::Dingtalk => html_to_markdown(text),
+        PluginType::Slack => markdown_to_slack_mrkdwn(text),
         PluginType::Weixin => strip_html(text),
         _ => escape_html(text),
     }
+}
+
+// ── Slack (mrkdwn) ───────────────────────────────────────────────
+
+static RE_MD_LINK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
+static RE_MD_BOLD_STAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*\*(.+?)\*\*").unwrap());
+static RE_MD_BOLD_UNDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"__(.+?)__").unwrap());
+static RE_MD_STRIKE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"~~(.+?)~~").unwrap());
+
+/// Convert standard markdown to Slack mrkdwn.
+///
+/// Slack requires `&`, `<`, `>` escaped in message text, uses single `*` for
+/// bold, single `~` for strikethrough, and `<url|text>` for links. Single-`*`
+/// italic is intentionally left untouched — converting it would clobber the
+/// bold delimiter, and rendering markdown italic as Slack bold is a harmless
+/// cosmetic difference.
+fn markdown_to_slack_mrkdwn(text: &str) -> String {
+    let s = escape_html(text);
+    let s = RE_MD_LINK.replace_all(&s, "<$2|$1>");
+    let s = RE_MD_BOLD_STAR.replace_all(&s, "*$1*");
+    let s = RE_MD_BOLD_UNDER.replace_all(&s, "*$1*");
+    let s = RE_MD_STRIKE.replace_all(&s, "~$1~");
+    s.into_owned()
 }
 
 // ── Telegram ─────────────────────────────────────────────────────
@@ -126,3 +151,7 @@ fn decode_all_entities(text: &str) -> String {
         .replace("&gt;", ">")
         .replace("&nbsp;", " ")
 }
+
+#[cfg(test)]
+#[path = "formatter_test.rs"]
+mod formatter_test;
