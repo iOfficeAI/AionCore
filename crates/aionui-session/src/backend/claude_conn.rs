@@ -346,6 +346,10 @@ impl BackendConnection for ClaudeConnection {
         // first `capabilities()` read; a late response is merged on the next read
         // (same late-discovery contract as codex `model/list`).
         backend.request_initialize().await;
+        // Report a claude whose version differs from the release AionUi
+        // verified. claude runs from the user's own install (nothing is
+        // bundled), so this is the same situation agy has always been in.
+        backend.spawn_version_check();
         Ok(Arc::new(backend))
     }
 
@@ -1020,6 +1024,43 @@ impl ClaudeSessionBackend {
             admission: Admission::NoTurn,
             turn_gen: cur_gen,
         })
+    }
+
+    /// Tell the user once per conversation when the installed claude is not the
+    /// release AionUi verified.
+    ///
+    /// Fire-and-forget: the probe spawns `claude --version` and a failure only
+    /// costs the drift claim, never the session.
+    fn spawn_version_check(&self) {
+        use std::sync::atomic::Ordering;
+        // Both live on the wake recipe — it is what re-spawns the CLI, so it
+        // holds the spawner and the resolved program path.
+        let spawner = Arc::clone(&self.wake.spawner);
+        let session_id = self.session_id.clone();
+        let program = self
+            .wake
+            .cli_program
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("claude"));
+        let event_tx = self.event_tx.clone();
+        let turn_gen = Arc::clone(&self.turn_gen);
+        tokio::spawn(async move {
+            let Some((level, message, localized)) =
+                crate::backend::cli_version::session_drift_notice(&spawner, "claude", &program, &session_id).await
+            else {
+                return;
+            };
+            let _ = event_tx.send(SessionEnvelope {
+                session_id: session_id.clone(),
+                turn_gen: turn_gen.load(Ordering::SeqCst),
+                event: SessionEvent::Notice {
+                    level,
+                    message,
+                    localized: Some(localized),
+                    supersedes_key: None,
+                },
+            });
+        });
     }
 
     /// G2: send a host→CLI `control_request` (set_model / set_permission_mode) over
@@ -2221,6 +2262,7 @@ fn sniff_set_config_reject(
             level: crate::event::NoticeLevel::Warning,
             message: format!("{label} failed: {err}"),
             localized: None,
+            supersedes_key: None,
         },
     });
 }

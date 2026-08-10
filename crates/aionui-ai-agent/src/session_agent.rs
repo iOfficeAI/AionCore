@@ -1904,7 +1904,13 @@ fn resolve_session_cli_program(
         });
     }
 
-    aionui_runtime::resolve_bundled_cli(backend_label).or_else(|| aionui_runtime::resolve_command_path(backend_label))
+    // PATH only. claude/codex used to prefer a bundled, version-pinned copy,
+    // which silently diverged from whatever the user had installed: the same
+    // prompt behaved differently in AionUi and in the user's terminal, with
+    // nothing on screen explaining why. They are now treated exactly like agy —
+    // the user's own install is the one that runs, and a drift from the version
+    // this integration was verified against is reported rather than hidden.
+    aionui_runtime::resolve_command_path(backend_label)
 }
 
 /// Assemble the direct-CLI spawn env (legacy spawn-surface parity; order
@@ -3869,6 +3875,7 @@ fn empty_turn_tip(outcome: &aionui_session::TurnOutcome) -> Option<TipsEventData
         tip_type,
         code: Some(code.to_owned()),
         params: None,
+        supersedes_key: None,
     })
 }
 
@@ -4187,6 +4194,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             level,
             message,
             localized,
+            supersedes_key,
         } => {
             let tip_type = match level {
                 aionui_session::NoticeLevel::Info => TipType::Info,
@@ -4205,6 +4213,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 tip_type,
                 code,
                 params,
+                supersedes_key,
             })]
         }
         // Agent-generated session title (claude generate_session_title, spec
@@ -5074,6 +5083,7 @@ mod translate_tests {
                     level,
                     message: "set effort: rejected by agent".into(),
                     localized: None,
+                    supersedes_key: None,
                 },
                 "conv-1",
                 false,

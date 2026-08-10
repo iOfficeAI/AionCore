@@ -101,6 +101,11 @@ impl BackendConnection for CodexConnection {
             config: config.clone(),
         };
         let mut backend = CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms).await;
+        // Report a codex whose version differs from the release AionUi verified.
+        // codex runs from the user's own install (nothing is bundled), the same
+        // situation agy has always been in. Placed here rather than at the two
+        // return sites so the reconcile path cannot skip it.
+        backend.spawn_version_check();
         // Seed the current model (M1): the backend tracks it from the start so the
         // model selector's current value and a subsequent SetModel are consistent.
         // OPTIMISTIC seed: the model is not actually bound at thread/start
@@ -894,6 +899,44 @@ fn idle_check_interval_ms(idle_ttl_ms: Option<i64>) -> u64 {
 }
 
 impl CodexSessionBackend {
+    /// Tell the user once per conversation when the installed codex is not the
+    /// release AionUi verified.
+    ///
+    /// Fire-and-forget: the probe spawns `codex --version` and a failure only
+    /// costs the drift claim, never the session.
+    fn spawn_version_check(&self) {
+        let Some(spawner) = self.wake.spawner.clone() else {
+            tracing::debug!(session_id = %self.session_id, "codex version check skipped: no spawner on the wake recipe");
+            return;
+        };
+        let session_id = self.session_id.clone();
+        let program = self
+            .wake
+            .config
+            .cli_program
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("codex"));
+        let event_tx = self.event_tx.clone();
+        let turn_gen = Arc::clone(&self.turn_gen);
+        tokio::spawn(async move {
+            let Some((level, message, localized)) =
+                crate::backend::cli_version::session_drift_notice(&spawner, "codex", &program, &session_id).await
+            else {
+                return;
+            };
+            let _ = event_tx.send(SessionEnvelope {
+                session_id: session_id.clone(),
+                turn_gen: turn_gen.load(std::sync::atomic::Ordering::SeqCst),
+                event: SessionEvent::Notice {
+                    level,
+                    message,
+                    localized: Some(localized),
+                    supersedes_key: None,
+                },
+            });
+        });
+    }
+
     /// Test-support seam: build over an injected `AgentIo` replaying a codex
     /// JSON-RPC fixture WITHOUT spawning a real app-server — proves the
     /// parse/reverse-RPC/dispatch contract end-to-end.
@@ -1588,7 +1631,7 @@ async fn reader_task(
                             continue;
                         }
                         for ev in map_notification(m, params) {
-                            emit(&event_tx, &session_id, cur, ev);
+                            emit(&event_tx, &session_id, cur, scope_notice_to_turn(ev, cur));
                         }
                     }
                     _ => {
@@ -1709,6 +1752,7 @@ async fn reader_task(
                                                 level: crate::event::NoticeLevel::Warning,
                                                 message: format!("Codex logout failed: {msg}"),
                                                 localized: None,
+                                                supersedes_key: None,
                                             },
                                         );
                                     }
@@ -1825,6 +1869,7 @@ async fn reader_task(
                                         level: crate::event::NoticeLevel::Warning,
                                         message: format!("{label} failed: {message}"),
                                         localized: None,
+                                        supersedes_key: None,
                                     },
                                 );
                             }
@@ -2603,7 +2648,38 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
         // The `vec![]` is a defensive fallthrough only.
         "error" => {
             if params.get("willRetry").and_then(Value::as_bool) == Some(true) {
-                vec![SessionEvent::Heartbeat]
+                // A retry keeps the turn alive (Heartbeat), but staying silent
+                // made an upstream stall indistinguishable from a hung app:
+                // codex says "Reconnecting... 1/5" with a reason, and the user
+                // saw only a spinner that never resolved (live 0.147.0, whose
+                // response stream disconnected repeatedly). Surface what codex
+                // said so a stall is explained while it is happening.
+                let mut out = vec![SessionEvent::Heartbeat];
+                if let Some(message) = retry_notice_message(params) {
+                    // One card for the whole stall: attempt 2/5 replaces 1/5 in
+                    // place, so the user watches it count up instead of
+                    // collecting five near-identical cards (codex emits each
+                    // attempt more than once, so appending produced ten).
+                    // Deliberately NOT keyed on codex's own `turnId`: a single
+                    // prompt can make codex retry in several rounds, each with a
+                    // fresh turnId, and that showed up as two cards both reading
+                    // "5/5". The reader scopes this key to OUR turn instead.
+                    // The card is localizable: the CLI's own line rides as a
+                    // parameter, and the wrapper adds the running totals the
+                    // relay fills in (how many attempts this prompt has cost,
+                    // how long it has been waiting) — codex restarts its own
+                    // "1/5" counter every round, so its text alone understates
+                    // a long stall.
+                    let mut localized = crate::event::LocalizedText::new(CODE_CODEX_RETRYING);
+                    localized.params.insert("detail".into(), Value::String(message.clone()));
+                    out.push(SessionEvent::Notice {
+                        level: crate::event::NoticeLevel::Warning,
+                        message,
+                        localized: Some(localized),
+                        supersedes_key: Some(RETRY_NOTICE_KEY.to_string()),
+                    });
+                }
+                out
             } else {
                 vec![]
             }
@@ -2618,6 +2694,7 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
                 level: crate::event::NoticeLevel::Warning,
                 message,
                 localized: None,
+                supersedes_key: None,
             }]
         }
         "configWarning" => {
@@ -2626,6 +2703,7 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
                 level: crate::event::NoticeLevel::Warning,
                 message,
                 localized: None,
+                supersedes_key: None,
             }]
         }
         "deprecationNotice" => {
@@ -2634,6 +2712,7 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
                 level: crate::event::NoticeLevel::Info,
                 message,
                 localized: None,
+                supersedes_key: None,
             }]
         }
         // `hook/*` provisioning is a separate concern (not MCP startup) — kept as a
@@ -2655,6 +2734,61 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
 /// `configWarning` params object: `{summary, details?, ...}`. Joins summary +
 /// details (when present) so the user sees the actionable guidance, not just the
 /// headline. Falls back to `message` then empty string.
+/// The user-facing text for a RETRYING codex error, or `None` when the frame
+/// carries nothing worth showing.
+///
+/// `error.message` is the headline ("Reconnecting... 1/5"); `additionalDetails`
+/// carries the cause ("We're currently experiencing high demand"), which is the
+/// part that tells the user this is not their fault and not a hung app.
+/// Merge key for the retry card, scoped to our turn by [`scope_notice_to_turn`]
+/// before it leaves the reader.
+const RETRY_NOTICE_KEY: &str = "codex-retry";
+
+/// i18n code for the retry card. Its body wraps the CLI's own line with the
+/// running totals the stream relay fills in.
+const CODE_CODEX_RETRYING: &str = "CODEX_RETRYING";
+
+/// Qualify a superseding notice with the turn generation that produced it.
+///
+/// The key decides which card a notice replaces, so its scope decides what the
+/// user sees. Session-wide would let a stall in turn 7 rewrite a card sitting
+/// next to turn 1; codex's own `turnId` is too narrow — one prompt can make
+/// codex retry in several rounds, and keying on its id showed two cards both
+/// reading "5/5", which looks like a duplicate. Our turn generation is the
+/// scope that matches what the user did: one prompt, one card.
+fn scope_notice_to_turn(event: SessionEvent, turn_gen: u64) -> SessionEvent {
+    match event {
+        SessionEvent::Notice {
+            level,
+            message,
+            localized,
+            supersedes_key: Some(key),
+        } => SessionEvent::Notice {
+            level,
+            message,
+            localized,
+            supersedes_key: Some(format!("{key}:turn-{turn_gen}")),
+        },
+        other => other,
+    }
+}
+
+fn retry_notice_message(params: &Value) -> Option<String> {
+    let error = params.get("error")?;
+    let headline = error.get("message").and_then(Value::as_str).unwrap_or("").trim();
+    let details = error
+        .get("additionalDetails")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    match (headline.is_empty(), details.is_empty()) {
+        (true, true) => None,
+        (false, false) => Some(format!("{headline} — {details}")),
+        (false, true) => Some(headline.to_owned()),
+        (true, false) => Some(details.to_owned()),
+    }
+}
+
 fn notice_message(params: &Value) -> String {
     let summary = params
         .get("summary")
@@ -3476,6 +3610,7 @@ impl SessionBackend for CodexSessionBackend {
                             level: crate::event::NoticeLevel::Warning,
                             message: "Logged out of Codex. New turns will require re-authentication.".into(),
                             localized: None,
+                            supersedes_key: None,
                         },
                     );
                     return Ok(CommandReceipt {
@@ -4184,6 +4319,163 @@ mod tests {
     use crate::event::PermissionKind;
     use crate::testing::FakeAgentIo;
     use futures_util::StreamExt;
+
+    /// A retrying error must reach the user, not just tick the heartbeat.
+    ///
+    /// Frame captured live from codex 0.147.0, whose response stream kept
+    /// disconnecting: the turn stayed "in progress" forever with no assistant
+    /// output, and the only clue — codex's own "Reconnecting… / high demand"
+    /// message — was swallowed, so a stalled upstream was indistinguishable
+    /// from a hung app.
+    #[tokio::test]
+    async fn a_retrying_error_surfaces_the_reason_alongside_the_heartbeat() {
+        let events = drive_codex(&[
+            r#"{"method":"error","params":{"error":{"message":"Reconnecting... 1/5","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}},"additionalDetails":"We're currently experiencing high demand, which may cause temporary errors."},"willRetry":true,"threadId":"t1","turnId":"u1"},"emittedAtMs":1}"#,
+        ])
+        .await;
+
+        assert!(
+            events.iter().any(|e| matches!(e, SessionEvent::Heartbeat)),
+            "a retry is still a liveness signal, got {events:?}"
+        );
+        let notice = events
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Notice { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("the retry reason must reach the user");
+        assert!(notice.contains("Reconnecting"), "keeps codex's headline: {notice}");
+        assert!(notice.contains("high demand"), "keeps the cause: {notice}");
+    }
+
+    /// Successive attempts must REPLACE the previous card, not stack up: codex
+    /// emits each of its five attempts more than once, so appending produced
+    /// ten near-identical warnings for a single stall.
+    #[tokio::test]
+    async fn successive_retry_attempts_share_one_superseding_key() {
+        let events = drive_codex(&[
+            r#"{"method":"error","params":{"error":{"message":"Reconnecting... 1/5","additionalDetails":"high demand"},"willRetry":true,"threadId":"th1","turnId":"u1"},"emittedAtMs":1}"#,
+            r#"{"method":"error","params":{"error":{"message":"Reconnecting... 2/5","additionalDetails":"high demand"},"willRetry":true,"threadId":"th1","turnId":"u1"},"emittedAtMs":2}"#,
+        ])
+        .await;
+
+        let keys: Vec<Option<String>> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Notice { supersedes_key, .. } => Some(supersedes_key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 2, "both attempts are reported, got {events:?}");
+        assert_eq!(
+            keys[0], keys[1],
+            "the same turn's attempts must share a key so the card updates"
+        );
+        assert!(
+            keys[0].as_deref().is_some_and(|k| k.starts_with("codex-retry:turn-")),
+            "the key is scoped to our turn, got {keys:?}"
+        );
+    }
+
+    /// One prompt can make codex retry in more than one round, each round
+    /// carrying a fresh `turnId`. Live 0.147.0 did exactly that and produced two
+    /// cards both ending at "5/5", which reads as a bug. Rounds within one of
+    /// OUR turns are one stall, so they share one card.
+    #[tokio::test]
+    async fn retry_rounds_within_one_prompt_share_one_card() {
+        let events = drive_codex(&[
+            r#"{"method":"error","params":{"error":{"message":"Reconnecting... 5/5"},"willRetry":true,"threadId":"th1","turnId":"u1"},"emittedAtMs":1}"#,
+            r#"{"method":"error","params":{"error":{"message":"Reconnecting... 1/5"},"willRetry":true,"threadId":"th1","turnId":"u2"},"emittedAtMs":2}"#,
+        ])
+        .await;
+        let keys: Vec<Option<String>> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Notice { supersedes_key, .. } => Some(supersedes_key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            keys[0], keys[1],
+            "a second retry round is the same stall, not a new card"
+        );
+    }
+
+    /// The turn generation is what separates cards: a stall in a later turn must
+    /// not rewrite a card sitting next to an earlier one.
+    #[test]
+    fn notices_from_different_turns_get_different_keys() {
+        let notice = || SessionEvent::Notice {
+            level: crate::event::NoticeLevel::Warning,
+            message: "Reconnecting... 1/5".into(),
+            localized: None,
+            supersedes_key: Some(RETRY_NOTICE_KEY.to_string()),
+        };
+        let key_of = |event: SessionEvent| match event {
+            SessionEvent::Notice { supersedes_key, .. } => supersedes_key,
+            _ => None,
+        };
+
+        assert_ne!(
+            key_of(scope_notice_to_turn(notice(), 1)),
+            key_of(scope_notice_to_turn(notice(), 2))
+        );
+    }
+
+    /// The retry card is localizable, with the CLI's own line as a parameter:
+    /// the stream relay adds the running totals around it, because a stalled
+    /// prompt can be replayed against a fresh codex process and a per-process
+    /// counter would restart mid-card.
+    #[tokio::test]
+    async fn a_retry_card_carries_the_cli_line_as_an_i18n_parameter() {
+        let events = drive_codex(&[
+            r#"{"method":"error","params":{"error":{"message":"Reconnecting... 1/5","additionalDetails":"high demand"},"willRetry":true,"threadId":"th1","turnId":"u1"},"emittedAtMs":1}"#,
+        ])
+        .await;
+
+        let localized = events
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Notice { localized, .. } => localized.clone(),
+                _ => None,
+            })
+            .expect("the retry notice is localizable, got {events:?}");
+        assert_eq!(localized.code, CODE_CODEX_RETRYING);
+        assert_eq!(localized.params["detail"], "Reconnecting... 1/5 — high demand");
+    }
+
+    /// A notice with no key is untouched — scoping must not turn a plain notice
+    /// into one that silently replaces something.
+    #[test]
+    fn a_notice_without_a_key_stays_without_one() {
+        let plain = SessionEvent::Notice {
+            level: crate::event::NoticeLevel::Info,
+            message: "advisory".into(),
+            localized: None,
+            supersedes_key: None,
+        };
+        assert!(matches!(
+            scope_notice_to_turn(plain, 3),
+            SessionEvent::Notice {
+                supersedes_key: None,
+                ..
+            }
+        ));
+    }
+
+    /// A retry frame with nothing to say must not produce an empty card.
+    #[tokio::test]
+    async fn a_retry_without_text_only_heartbeats() {
+        let events =
+            drive_codex(&[r#"{"method":"error","params":{"error":{},"willRetry":true},"emittedAtMs":1}"#]).await;
+        assert!(events.iter().any(|e| matches!(e, SessionEvent::Heartbeat)));
+        assert!(
+            !events.iter().any(|e| matches!(e, SessionEvent::Notice { .. })),
+            "an empty error must not render a blank notice, got {events:?}"
+        );
+    }
 
     /// Build a FakeAgentIo replaying codex JSON-RPC lines, then collect the
     /// SessionEvents the backend surfaces (excluding the EOF Detached).

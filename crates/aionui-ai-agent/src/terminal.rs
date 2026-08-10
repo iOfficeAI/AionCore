@@ -378,6 +378,24 @@ mod tests {
         }
     }
 
+    /// `wait_for_exit` returns as soon as the direct child is reaped, but the
+    /// reader task that drains its stdout is a separate task — so a snapshot
+    /// taken the instant after exit can legitimately still be empty. Poll for
+    /// the expected text instead of racing it; the bounded wait keeps a real
+    /// regression (output never delivered) failing.
+    async fn output_contains(reg: &TerminalRegistry, id: &str, needle: &str) -> String {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last = String::new();
+        while tokio::time::Instant::now() < deadline {
+            last = reg.output(id).await.map(|s| s.output).unwrap_or_default();
+            if last.contains(needle) {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        last
+    }
+
     #[tokio::test]
     async fn create_runs_command_and_reports_output_and_exit() {
         let reg = TerminalRegistry::new("conv-t", None);
@@ -444,8 +462,8 @@ mod tests {
         let id = reg.create(p).await.unwrap();
         let exit = reg.wait_for_exit(&id).await.unwrap();
         assert_eq!(exit.exit_code, Some(0));
-        let snap = reg.output(&id).await.unwrap();
-        assert!(snap.output.contains("shell_interpreted"), "got: {}", snap.output);
+        let output = output_contains(&reg, &id, "shell_interpreted").await;
+        assert!(output.contains("shell_interpreted"), "got: {output}");
     }
 
     #[tokio::test]
@@ -463,8 +481,8 @@ mod tests {
             .expect("exit must be reported once the direct child exits, not when the pipe closes")
             .unwrap();
         assert_eq!(exit.exit_code, Some(0));
-        let snap = reg.output(&id).await.unwrap();
-        assert!(snap.output.contains("parent_done"), "got: {}", snap.output);
+        let output = output_contains(&reg, &id, "parent_done").await;
+        assert!(output.contains("parent_done"), "got: {output}");
     }
 
     #[tokio::test]

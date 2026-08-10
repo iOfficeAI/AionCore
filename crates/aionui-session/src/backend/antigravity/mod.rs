@@ -10,13 +10,16 @@
 //! `~/aion/protocols/samples/antigravity-cli/1.1.8/`.
 
 mod argv;
+/// i18n key for the "some steps in this turn did not take effect" notice,
+/// interpolating `{{count}}`. agy-specific: no other backend reports steps that
+/// silently failed while the turn still ends in success.
+pub(crate) const CODE_STEPS_FAILED: &str = "ANTIGRAVITY_STEPS_FAILED";
+
 mod conn;
 mod mcp_config;
 mod models;
 mod skills;
 mod translate;
-mod version;
 mod wire;
 
 pub use conn::{AntigravityConnection, AntigravitySessionBackend, antigravity_capabilities};
-pub use version::{VersionDrift, version_drift};
