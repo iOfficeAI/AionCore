@@ -66,6 +66,50 @@ pub struct CreateConversationRequest {
     pub extra: serde_json::Value,
 }
 
+/// Body for `POST /api/conversations/{id}/fork`.
+///
+/// Forks the conversation at `message_id` (inclusive) into a NEW conversation
+/// that inherits the parent's workspace/agent/history. The backend session
+/// materializes lazily on the fork's first open (see `AcpBuildExtra.fork`).
+#[derive(Debug, Deserialize)]
+pub struct ForkConversationRequest {
+    /// The fork point: a message in the parent conversation (inclusive).
+    pub message_id: String,
+    /// Optional name for the forked conversation; defaults to the parent's.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Prompt media capability projection for one conversation, sourced from
+/// `agent_metadata.agent_capabilities.prompt_capabilities` (ACP agents:
+/// handshake-persisted; claude/codex: migration-constructed, 037). `None` =
+/// unknown/unsupported — the UI then hints that media attachments are sent
+/// as file paths. Filled only on the single-conversation detail path (list
+/// responses omit it — no N+1).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptCapabilityView {
+    /// Agent takes native image content blocks.
+    #[serde(default)]
+    pub image: bool,
+    /// Agent takes native audio content blocks.
+    #[serde(default)]
+    pub audio: bool,
+}
+
+/// Session-fork capability projection for one conversation, sourced from
+/// `agent_metadata.agent_capabilities.session_capabilities.fork` (ACP agents:
+/// handshake-persisted; claude/codex: migration-constructed). `Some` = the fork
+/// entry point may be shown; `None` = hidden. Filled only on the single-
+/// conversation detail path (list responses omit it — no N+1).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkCapabilityView {
+    /// Whether the backend can fork at an ARBITRARY turn (codex
+    /// `thread/fork.lastTurnId`). `false` = HEAD fork only → the UI shows the
+    /// entry point only on the last turn's messages.
+    #[serde(default)]
+    pub at_turn: bool,
+}
+
 /// Body for `PATCH /api/conversations/:id`.
 ///
 /// All fields optional — only supplied fields are applied.
@@ -242,6 +286,14 @@ pub struct ConversationResponse {
     pub assistant: Option<ConversationAssistantIdentityResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// Service-layer post-fill on the DETAIL path only (like `runtime`);
+    /// `None` on list responses. See [`ForkCapabilityView`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_capability: Option<ForkCapabilityView>,
+    /// Service-layer post-fill on the DETAIL path only (like `runtime`);
+    /// `None` on list responses. See [`PromptCapabilityView`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_capability: Option<PromptCapabilityView>,
     pub created_at: TimestampMs,
     pub modified_at: TimestampMs,
     pub extra: serde_json::Value,
@@ -262,6 +314,12 @@ pub struct MessageResponse {
     pub status: Option<MessageStatus>,
     pub hidden: bool,
     pub created_at: TimestampMs,
+    /// Backend turn anchor (codex `Turn.id`) stamped on rows persisted while
+    /// that turn streamed. Presence tells the UI a mid-history fork can anchor
+    /// at (or after) this message; absent on legacy/copied rows and on
+    /// backends without turn-anchored forks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_turn_id: Option<String>,
 }
 
 /// Cursor-paginated list of messages.
@@ -635,6 +693,8 @@ mod tests {
             created_at: 1712345678000,
             modified_at: 1712345678000,
             extra: json!({ "workspace": "/project" }),
+            fork_capability: None,
+            prompt_capability: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], "conv_1");
@@ -675,6 +735,8 @@ mod tests {
             created_at: 1,
             modified_at: 1,
             extra: json!({}),
+            fork_capability: None,
+            prompt_capability: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("model").is_none(), "model None should be omitted");
@@ -709,6 +771,8 @@ mod tests {
             created_at: 1000,
             modified_at: 2000,
             extra: json!({}),
+            fork_capability: None,
+            prompt_capability: None,
         };
         let serialized = serde_json::to_string(&resp).unwrap();
         let deserialized: ConversationResponse = serde_json::from_str(&serialized).unwrap();
@@ -732,6 +796,7 @@ mod tests {
             status: Some(MessageStatus::Finish),
             hidden: false,
             created_at: 1712345678000,
+            backend_turn_id: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], "msg_1");
@@ -760,6 +825,7 @@ mod tests {
             status: None,
             hidden: true,
             created_at: 5000,
+            backend_turn_id: None,
         };
         let serialized = serde_json::to_string(&resp).unwrap();
         let deserialized: MessageResponse = serde_json::from_str(&serialized).unwrap();
@@ -795,6 +861,8 @@ mod tests {
                 created_at: 1712345678000,
                 modified_at: 1712345678000,
                 extra: json!({}),
+                fork_capability: None,
+                prompt_capability: None,
             },
         };
         let json = serde_json::to_value(&item).unwrap();
@@ -834,6 +902,8 @@ mod tests {
                 created_at: 9000,
                 modified_at: 9000,
                 extra: json!({}),
+                fork_capability: None,
+                prompt_capability: None,
             },
         };
         let serialized = serde_json::to_string(&item).unwrap();
@@ -925,6 +995,8 @@ mod tests {
                 created_at: 1000,
                 modified_at: 1000,
                 extra: json!({}),
+                fork_capability: None,
+                prompt_capability: None,
             }],
             total: 1,
             has_more: false,
@@ -979,6 +1051,8 @@ mod tests {
                     created_at: 5000,
                     modified_at: 5000,
                     extra: json!({}),
+                    fork_capability: None,
+                    prompt_capability: None,
                 },
             }],
             total: 1,

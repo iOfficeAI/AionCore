@@ -196,7 +196,15 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
     // almost immediately with a non-zero status; without this race the
     // `AcpProtocol::connect` call would block on its internal 30 s
     // timeout waiting for an `initialize` reply that will never arrive.
-    let connect = AcpProtocol::connect(stdin, stdout, event_tx, permission_tx, notification_tx);
+    let connect = AcpProtocol::connect(
+        stdin,
+        stdout,
+        event_tx,
+        permission_tx,
+        notification_tx,
+        "custom-agent-probe",
+        None,
+    );
     let protocol = tokio::select! {
         biased;
         res = connect => match res {

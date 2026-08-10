@@ -56,6 +56,69 @@ impl ProxyService {
         Self { watch_manager, client }
     }
 
+    /// Tell the watch server on `port` to re-render `absolute_path`, by re-issuing
+    /// the switch it already holds.
+    ///
+    /// officecli has no same-file short-circuit here on purpose — it documents a
+    /// repeat switch as a force-refresh — so this re-renders from disk and then
+    /// broadcasts `doc-switched`, which the embedded page reacts to by reloading.
+    /// Nothing is streamed back to our caller; the reload happens between officecli
+    /// and the webview.
+    ///
+    /// Deliberately not routed through [`forward`](Self::forward): that path is a
+    /// read-only GET proxy for page assets. This is a control call with a body, and
+    /// its failures map to codes the frontend already has copy for rather than being
+    /// relayed as an HTTP response.
+    ///
+    /// `Err` carries a stable code. Every failure is safe to show as "refresh did
+    /// not happen": officecli keeps serving the current document when a switch
+    /// fails, so the tab the user is looking at survives.
+    pub(crate) async fn force_reload(
+        &self,
+        port: u16,
+        absolute_path: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), &'static str> {
+        let url = build_target_url(port, "/api/switch");
+        let result = self
+            .client
+            .post(&url)
+            .timeout(timeout)
+            .json(&serde_json::json!({ "file": absolute_path }))
+            .send()
+            .await;
+
+        let response = match result {
+            Ok(response) => response,
+            Err(err) => {
+                // The path is ours, not the client's, so it stays in the log.
+                tracing::warn!(target: "office_refresh", port, error = %err, "switch request failed");
+                return Err(if err.is_timeout() {
+                    "OFFICECLI_PORT_TIMEOUT"
+                } else {
+                    "OFFICECLI_START_FAILED"
+                });
+            }
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        // officecli's documented rejections. 409 means another process holds the
+        // per-file update pipe — distinct from a render failure, because the
+        // document is fine and the conflict is about who serves it.
+        let code = match status.as_u16() {
+            404 => "OFFICECLI_FILE_NOT_FOUND",
+            409 => "OFFICECLI_ALREADY_WATCHED",
+            400 => "OFFICECLI_UNSUPPORTED_FILE",
+            _ => "OFFICECLI_START_FAILED",
+        };
+        tracing::warn!(target: "office_refresh", port, status = status.as_u16(), code, "switch rejected");
+        Err(code)
+    }
+
     pub async fn forward(
         &self,
         port: u16,

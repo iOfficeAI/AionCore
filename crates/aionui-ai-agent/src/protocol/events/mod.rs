@@ -38,6 +38,15 @@ pub enum AgentStreamEvent {
     Plan(PlanEventData),
     Permission(serde_json::Value),
     AcpPermission(AcpPermissionEventData),
+    /// Structured question card (claude AskUserQuestion — `SessionEvent::Ask`).
+    /// Its own frame, NOT an `AcpPermission`: asking is not authorizing
+    /// (2026-08-04 spec). Payload: `{ session_id, request_id, questions }` where
+    /// `questions` is the raw claude `questions[]` array — the cross-vendor shape
+    /// (claude/qwen/grok all converged on it, 2026-08-04 captures):
+    /// `[{question, header?, options:[{label, description?}], multiSelect?}]`.
+    /// Answered via the confirm channel with the FULL per-question answer set;
+    /// wire tag `ask`.
+    Ask(serde_json::Value),
     SkillSuggest(SkillSuggestEventData),
     CronTrigger(CronTriggerEventData),
     AcpModelInfo(serde_json::Value),
@@ -45,6 +54,11 @@ pub enum AgentStreamEvent {
     AcpConfigOption(serde_json::Value),
     AcpSessionInfo(serde_json::Value),
     AcpContextUsage(serde_json::Value),
+    /// Live snapshot of a client-hosted terminal (ACP `terminal/*`):
+    /// `{terminal_id, command, output(cumulative), truncated, exit_status?}`.
+    /// Emitted throttled while the delegated command runs, plus one final
+    /// frame when it exits.
+    AcpTerminalOutput(serde_json::Value),
     AcpPromptHookWarning(serde_json::Value),
     SlashCommandsUpdated(serde_json::Value),
     AvailableCommands(AvailableCommandsEventData),
@@ -64,6 +78,13 @@ pub enum AgentStreamEvent {
     /// under one turn). The relay consumes it internally and never forwards it
     /// to the WebSocket, so no frontend renderer is required.
     SegmentBreak,
+    /// Internal-only: the backend's OWN id for the turn that just started
+    /// (codex `turn/started` → `Turn.id`). The relay consumes it to stamp
+    /// `messages.backend_turn_id` on every row it persists for this turn — the
+    /// lookup key for `thread/fork`'s `lastTurnId` when forking mid-history.
+    /// Never forwarded to the WebSocket; never user-visible output. Only the
+    /// direct-CLI codex pump emits it.
+    BackendTurnBound(String),
     /// Internal-only: one snapshot of a running workflow's progress.
     ///
     /// NOT forwarded to the WebSocket as-is. The relay projects it into the two
@@ -121,6 +142,12 @@ pub struct TipsEventData {
     pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
+    /// Stable identity for a tip that SUPERSEDES its predecessor: a later tip
+    /// with the same key replaces the earlier one in place instead of being
+    /// appended. Used by progress-style notices (codex retry attempts count up
+    /// 1/5 → 2/5 → …) so the conversation shows one card, not five.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_key: Option<String>,
 }
 
 /// Severity level for a tip event.
@@ -220,6 +247,7 @@ mod tests {
             tip_type: TipType::Error,
             code: None,
             params: None,
+            supersedes_key: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "tips");
@@ -233,6 +261,7 @@ mod tests {
             tip_type: TipType::Info,
             code: Some("acp.empty_turn.choose_command".into()),
             params: Some(json!({ "command_count": 3 })),
+            supersedes_key: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "tips");

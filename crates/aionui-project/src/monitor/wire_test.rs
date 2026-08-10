@@ -10,6 +10,10 @@ fn fact(kind: Kind) -> EntryFact {
         kind,
         inode: 7,
         symlink_target: None,
+        // Non-`None` on purpose: the wire-projection tests below assert the
+        // serialized entry carries no mtime, which only proves anything if the
+        // fact going in had one.
+        mtime_ms: Some(1_700_000_000_000),
     }
 }
 
@@ -77,6 +81,9 @@ fn wire_entry_from_fact_maps_kind_and_drops_inode() {
     assert_eq!(v, json!({"name":"a.txt","kind":"file"}));
     // inode is internal and must never appear on the wire.
     assert!(v.get("inode").is_none());
+    // Nor may mtime: it exists only to detect modification, and a subscriber that
+    // fed it back as a write precondition would defeat conflict detection.
+    assert!(v.get("mtime_ms").is_none());
 }
 
 #[test]
@@ -85,6 +92,7 @@ fn wire_entry_symlink_includes_target() {
         kind: Kind::Symlink,
         inode: 1,
         symlink_target: Some("target".to_owned()),
+        mtime_ms: Some(1_700_000_000_000),
     };
     let v = serde_json::to_value(WireEntry::from_fact("link", &ef)).unwrap();
     assert_eq!(v["kind"], "symlink");
@@ -133,6 +141,9 @@ fn delta_params_tags_each_change_op() {
                 from: "a".to_owned(),
                 to: "b".to_owned(),
             },
+            Change::Modified {
+                name: "edited.ts".to_owned(),
+            },
         ],
     };
     let v = delta_params(&delta, &target());
@@ -140,6 +151,11 @@ fn delta_params_tags_each_change_op() {
     assert_eq!(v["changes"][0], json!({"op":"added","name":"new.ts","kind":"file"}));
     assert_eq!(v["changes"][1], json!({"op":"removed","name":"old.ts"}));
     assert_eq!(v["changes"][2], json!({"op":"renamed","from":"a","to":"b"}));
+    // Exact equality, not a field probe: it pins that `modified` carries *only* a
+    // name. A timestamp here would be the value an external write just left, and a
+    // subscriber replaying it as a write precondition would make its own save pass
+    // conflict detection against the edit this op exists to warn about.
+    assert_eq!(v["changes"][3], json!({"op":"modified","name":"edited.ts"}));
 }
 
 // ── frame builders ────────────────────────────────────────────────────────

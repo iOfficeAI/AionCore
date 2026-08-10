@@ -32,6 +32,12 @@ pub enum SessionSpec {
     /// 0-frame-exits (`No conversation found`); the manager detects that and
     /// falls back to `Fresh` (R16/S17).
     Resume(String),
+    /// Fork off an existing session: resume the PARENT id but have the backend
+    /// copy it into a NEW session instead of appending (claude: `--resume <id>
+    /// --fork-session`; the new id is backend-minted and learned from
+    /// `system/init`). Unlike `Resume`, a missing parent must FAIL, never fall
+    /// back to `Fresh` — the user asked for the parent's context.
+    ForkFrom(String),
 }
 
 /// Narrow process-I/O seam (D2). Exposes only the two methods P0 uses: the

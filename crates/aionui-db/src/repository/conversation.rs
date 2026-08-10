@@ -138,6 +138,54 @@ pub trait IConversationRepository: Send + Sync {
     /// Deletes all messages belonging to a conversation.
     async fn delete_messages_by_conversation(&self, user_id: &str, conv_id: &str) -> Result<(), DbError>;
 
+    /// Copies every source message at or before the fork point — `(created_at,
+    /// id)` cursor, endpoint inclusive — into the target conversation inside a
+    /// single transaction, reminting primary keys with time-ordered ids so the
+    /// copies keep their relative `(created_at, id)` display order. `msg_id`
+    /// and `created_at` are preserved verbatim; `backend_turn_id` is dropped
+    /// (it anchors the SOURCE conversation's backend thread and would poison
+    /// fork-point resolution in the copy). Returns the number of copied rows.
+    ///
+    /// Both conversations must belong to `user_id`. Default is unsupported so
+    /// test doubles that never fork don't have to implement it.
+    async fn copy_messages_up_to(
+        &self,
+        _user_id: &str,
+        _source_conversation_id: &str,
+        _target_conversation_id: &str,
+        _cursor: (TimestampMs, &str),
+    ) -> Result<u64, DbError> {
+        Err(DbError::Init(
+            "copy_messages_up_to is not supported by this repository".into(),
+        ))
+    }
+
+    /// Resolves the backend turn anchor for a fork point: the `backend_turn_id`
+    /// of the nearest row at or before the `(created_at, id)` cursor that has
+    /// one. `Ok(None)` when no row up to the fork point carries an anchor
+    /// (HEAD forks never need one; mid-history forks must then be refused).
+    async fn resolve_backend_turn_anchor(
+        &self,
+        _user_id: &str,
+        _conv_id: &str,
+        _cursor: (TimestampMs, &str),
+    ) -> Result<Option<String>, DbError> {
+        Ok(None)
+    }
+
+    /// Finds a message by (conversation_id, msg_id) regardless of type — the
+    /// fork API's fallback: live-streamed frontend messages only know their
+    /// stream `msg_id` (their local `id` is never persisted). Returns the
+    /// EARLIEST match so a fork lands at the segment that opened the bubble.
+    async fn get_message_by_msg_id_any(
+        &self,
+        _user_id: &str,
+        _conv_id: &str,
+        _msg_id: &str,
+    ) -> Result<Option<MessageRow>, DbError> {
+        Ok(None)
+    }
+
     /// Finds a message by (conversation_id, msg_id, type) triple.
     async fn get_message_by_msg_id(
         &self,

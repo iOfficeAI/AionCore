@@ -5,7 +5,6 @@ use std::path::{Component, Path, PathBuf};
 
 pub const MANAGED_RESOURCES_CONTRACT_FILE: &str = "manifest.json";
 pub const MANAGED_RESOURCES_CONTRACT_SCHEMA_VERSION: u8 = 2;
-const REQUIRED_CLI_NAMES: [&str; 2] = ["claude", "codex"];
 const SUPPORTED_RUNTIME_KEYS: [&str; 6] = [
     "win32-x64",
     "win32-arm64",
@@ -14,6 +13,21 @@ const SUPPORTED_RUNTIME_KEYS: [&str; 6] = [
     "linux-x64",
     "linux-arm64",
 ];
+
+/// The runtime key (`<os>-<arch>`) identifying the current platform's managed
+/// resources subtree. Lives beside `SUPPORTED_RUNTIME_KEYS` — the values must
+/// stay in sync, and the bundled-CLI module that used to own this is gone.
+pub fn current_runtime_key() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("darwin-arm64"),
+        ("macos", "x86_64") => Some("darwin-x64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        ("linux", "x86_64") => Some("linux-x64"),
+        ("windows", "x86_64") => Some("win32-x64"),
+        ("windows", "aarch64") => Some("win32-arm64"),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -171,14 +185,12 @@ fn validate_clis_schema(contract: &ManagedResourcesContract) -> Result<(), Manag
         }
     }
 
-    for required_name in REQUIRED_CLI_NAMES {
-        if !names.contains(required_name) {
-            return Err(ManagedResourcesContractError::invalid(format!(
-                "missing required clis name {required_name}"
-            )));
-        }
-    }
-
+    // No CLI is REQUIRED to be present. claude and codex used to be demanded
+    // here because the app shipped a pinned copy of each; it no longer ships
+    // any, so an empty `clis` list is the normal shape and demanding entries
+    // would fail every build. Entries that ARE present (an older bundle) are
+    // still validated above — dropping the requirement must not mean dropping
+    // the validation.
     Ok(())
 }
 
@@ -331,15 +343,36 @@ mod tests {
         assert!(error.to_string().contains("duplicate clis name claude"));
     }
 
+    /// The app bundles no agent CLI, so a contract that declares none is the
+    /// normal shape — not a defect. This is the assertion that would have caught
+    /// the packaging failure: the bundling was removed while this validator
+    /// still demanded claude and codex, so every macOS build died on
+    /// `missing required clis name claude`.
     #[test]
-    fn validate_contract_rejects_missing_required_cli_name() {
+    fn validate_contract_accepts_an_empty_cli_list() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut contract = example_contract("win32-x64");
-        contract.clis.retain(|cli| cli.name != "codex");
+        contract.clis.clear();
+        // The node runtime is still bundled and still validated, so the tree has
+        // to exist for this to reach the CLI question at all.
+        let node_root = temp.path().join("node").join("node-v24.11.0-win-x64");
+        std::fs::create_dir_all(&node_root).expect("create node root");
+        std::fs::write(node_root.join("node.exe"), b"").expect("create node executable");
 
-        let error = validate_contract(temp.path(), &contract).expect_err("missing required name should fail");
+        validate_contract(temp.path(), &contract).expect("a bundle with no agent CLI is valid");
+    }
 
-        assert!(error.to_string().contains("missing required clis name codex"));
+    /// Dropping the requirement must not drop the validation: an entry that IS
+    /// present (an older bundle, or a future one) is still checked.
+    #[test]
+    fn validate_contract_still_rejects_a_malformed_cli_entry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut contract = example_contract("win32-x64");
+        contract.clis[0].name = String::new();
+
+        let error = validate_contract(temp.path(), &contract).expect_err("a nameless CLI entry must fail");
+
+        assert!(error.to_string().contains("clis[].name"), "got: {error}");
     }
 
     #[test]

@@ -165,6 +165,7 @@ mod tests {
             status: Some("work".into()),
             hidden: false,
             created_at: 1,
+            backend_turn_id: None,
         };
 
         assert_eq!(
@@ -186,6 +187,7 @@ mod tests {
                 status: Some("work".into()),
                 hidden: false,
                 created_at: 1,
+                backend_turn_id: None,
             };
             assert_eq!(classify_recovery_action(&row), StartupRecoveryAction::SettleToolRow);
         }
@@ -236,6 +238,7 @@ mod tests {
             status: Some("work".into()),
             hidden: false,
             created_at: 1,
+            backend_turn_id: None,
         };
 
         assert_eq!(

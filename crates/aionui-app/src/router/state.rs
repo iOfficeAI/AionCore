@@ -28,14 +28,12 @@ use aionui_extension::{
     HubIndexManager, HubInstaller, HubRouterState, SkillHubClient, SkillRegistryService, SkillRouterState,
     resolve_install_target_dir_for_data_dir, resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
-use aionui_file::{FileRouterState, FileService, FileWatchService, SnapshotService};
+use aionui_file::{FileRouterState, FileService, SnapshotService};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
 };
-use aionui_office::{
-    ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
-};
+use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
 use aionui_project::ProjectRouterState;
 use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
 use aionui_shell::ShellRouterState;
@@ -472,22 +470,28 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
     let broadcaster = services.event_bus.clone();
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
     let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
-    // Non-fatal: watcher creation failure (e.g. inotify limit) yields a disabled
-    // watch service, never a bootstrap abort. See ELECTRON-2PM.
-    let watch_service = Arc::new(FileWatchService::new(broadcaster));
     let snapshot_service = Arc::new(SnapshotService::new());
-    // Reveal-in-file-manager for `/api/fs/reveal`: an adapter over the shell
-    // service, injected as the file crate's revealer port (keeps aionui-file
-    // free of a shell dependency).
-    let revealer: aionui_file::ItemRevealerRef = Arc::new(super::item_revealer::ShellItemRevealer::new(Arc::new(
-        aionui_shell::ShellService::new(Arc::new(aionui_shell::DefaultSystemOpener)),
+    // Shell-backed capabilities for `/api/fs/reveal` (open enclosing folder) and
+    // `/api/fs/open-system` (open with the default application): adapters over one
+    // shared shell service, injected as the file crate's ports so aionui-file stays
+    // free of a shell dependency.
+    let shell = Arc::new(aionui_shell::ShellService::new(Arc::new(
+        aionui_shell::DefaultSystemOpener,
     )));
+    let revealer: aionui_file::ItemRevealerRef = Arc::new(super::item_revealer::ShellItemRevealer::new(shell.clone()));
+    let system_opener: aionui_file::SystemFileOpenerRef =
+        Arc::new(super::system_file_opener::ShellSystemFileOpener::new(shell.clone()));
+    // Clipboard capability for `/api/fs/copy-absolute-path`: the backend resolves
+    // the path and writes it to the clipboard itself, so the abs never returns.
+    let clipboard: aionui_file::ClipboardWriterRef =
+        Arc::new(super::clipboard_writer::ShellClipboardWriter::new(shell));
     Ok(FileRouterState {
         file_service,
-        watch_service,
         snapshot_service,
         project: Arc::new(services.project_service.clone()),
         revealer,
+        system_opener,
+        clipboard,
         allowed_roots,
     })
 }
@@ -860,13 +864,11 @@ pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
         Arc::new(aionui_office::DefaultProcessSpawner::new(data_dir.to_path_buf()));
     let watch_manager = Arc::new(OfficecliWatchManager::new(spawner, services.event_bus.clone()));
 
-    let snapshot_service = Arc::new(OfficeSnapshotService::new(data_dir));
     let conversion_service = Arc::new(ConversionService::with_data_dir(None, data_dir.to_path_buf()));
     let proxy_service = Arc::new(ProxyService::new(watch_manager.clone()));
 
     OfficeRouterState {
         watch_manager,
-        snapshot_service,
         conversion_service,
         proxy_service,
         allowed_roots,
@@ -1372,11 +1374,4 @@ mod tests {
 
         services.database.close().await;
     }
-
-    // NOTE (ELECTRON-2PM): the former `file_watch_init_error_maps_to_bootstrap_server_failed`
-    // test was removed intentionally. File-watch init is no longer a fatal
-    // bootstrap stage — `FileWatchService::new` is infallible and degrades to a
-    // disabled state, so there is no error-to-BOOTSTRAP_SERVER_FAILED mapping to
-    // assert here. Disabled-state behavior is covered in `aionui-file`
-    // (watch_service disabled-path tests + the `FILE_WATCH_UNAVAILABLE` mapping).
 }

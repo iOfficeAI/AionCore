@@ -57,6 +57,14 @@ pub struct Confirmation {
     pub description: String,
     pub command_type: Option<String>,
     pub options: Vec<ConfirmationOption>,
+    /// Structured-question recovery (AskUserQuestion): the bare `questions[]`
+    /// array when this pending confirmation is a question, so the REST
+    /// `/confirmations` recovery path can rebuild the REAL question card
+    /// (title/multi-question/multiSelect) instead of degrading to a
+    /// title-less permission card whose options can only carry flat labels.
+    /// `None` for ordinary tool approvals; skipped on the wire when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<serde_json::Value>,
 }
 
 /// A single option within a confirmation dialog.
@@ -142,6 +150,7 @@ mod tests {
             action: None,
             description: "Execute shell command".into(),
             command_type: Some("bash".into()),
+            questions: None,
             options: vec![ConfirmationOption {
                 label: "Allow".into(),
                 value: serde_json::json!(true),
@@ -151,6 +160,10 @@ mod tests {
         let json = serde_json::to_value(&c).unwrap();
         assert_eq!(json["call_id"], "call1");
         assert_eq!(json["command_type"], "bash");
+        assert!(
+            json.get("questions").is_none(),
+            "an ordinary approval must not put a null questions key on the wire"
+        );
     }
 
     #[test]

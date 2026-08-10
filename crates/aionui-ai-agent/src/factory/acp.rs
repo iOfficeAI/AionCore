@@ -68,6 +68,14 @@ pub(super) async fn build(
     }
 
     if matches!(route_for_backend(config.backend.as_deref()), BackendRoute::Antigravity) {
+        // Product decision: antigravity has no fork surface. The fork API's
+        // capability gate already refuses agy; this is defense in depth so a
+        // hand-crafted fork spec can never open a context-free session.
+        if config.fork.is_some() {
+            return Err(AgentError::Conflict(
+                "antigravity conversations cannot be forked".into(),
+            ));
+        }
         return super::antigravity::build(
             deps,
             crate::session_context::AntigravitySessionBuildContext {

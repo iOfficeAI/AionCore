@@ -46,6 +46,7 @@ async fn insert_message(
         status: Some("finish".into()),
         hidden: false,
         created_at,
+        backend_turn_id: None,
     };
     aionui_db::IConversationRepository::insert_message(&repo, &user_id, &msg)
         .await
@@ -102,6 +103,7 @@ async fn insert_acp_tool_message(
         status: Some("finish".into()),
         hidden: false,
         created_at,
+        backend_turn_id: None,
     };
     aionui_db::IConversationRepository::insert_message(&repo, &user_id, &msg)
         .await
@@ -428,6 +430,7 @@ async fn t8_7_messages_exclude_legacy_cron_rows() {
             status: Some("finish".into()),
             hidden: false,
             created_at: 2000,
+            backend_turn_id: None,
         };
         let user_id = repo.owner_user_id(&conv_id).await.unwrap().unwrap();
         aionui_db::IConversationRepository::insert_message(&repo, &user_id, &msg)

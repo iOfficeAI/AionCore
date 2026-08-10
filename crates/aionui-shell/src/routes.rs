@@ -25,6 +25,11 @@ use crate::stt_stream_provider::ProviderUpstreamFactory;
 impl From<ShellError> for ApiError {
     fn from(err: ShellError) -> Self {
         match err {
+            // These routes take `file_path` from the client, so echoing it back
+            // discloses nothing it did not already send. The path is interpolated
+            // here rather than coming from `Display`, which omits it precisely
+            // because identity-addressed callers must not leak a server-resolved
+            // path (see `ShellError::FileNotFound`).
             ShellError::FileNotFound(path) => ApiError::BadRequest(format!("file not found: {path}")),
             ShellError::DirectoryNotFound(path) => ApiError::BadRequest(format!("directory not found: {path}")),
             ShellError::InvalidUrl(msg) => ApiError::BadRequest(format!("invalid URL: {msg}")),

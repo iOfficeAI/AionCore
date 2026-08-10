@@ -150,6 +150,7 @@ impl OutputSink for BackendOutputSink {
             tip_type: TipType::Success,
             code: None,
             params: None,
+            supersedes_key: None,
         }));
     }
 }

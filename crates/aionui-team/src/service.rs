@@ -9,22 +9,27 @@ use std::sync::{Arc, RwLock, Weak};
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
-    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus,
-    TeamSessionStatusPayload, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
+    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamActivityCursor, TeamActivityPageResponse,
+    TeamAgentResponse, TeamAgentRuntimeStatus, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse,
+    TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
+    TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
     TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
 use aionui_db::{
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
-    ITeamRepository, UpdateTeamParams,
+    ActivityCursor, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    IProviderRepository, ITeamRepository, PageDirection, UpdateTeamParams,
 };
 use aionui_project::{ProjectService, canonical};
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
+use crate::activity_mapping::{
+    mailbox_row_to_response, message_row_to_activity_item, sort_activity_items, task_row_to_activity_item,
+    task_to_response,
+};
 use crate::error::TeamError;
 use crate::event_loop::{AgentLoopContext, EventLoopRegistrationError};
 use crate::events::{
@@ -45,9 +50,28 @@ use crate::runtime_tools::{
 };
 use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
 use crate::team_run::TeamRunManager;
-use crate::types::{Team, TeamAgent, TeammateRole};
+use crate::types::{Team, TeamAgent, TeamTask, TeammateRole};
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
+
+/// Default number of activity items returned when the client omits `limit`.
+pub const DEFAULT_ACTIVITY_LIMIT: i64 = 500;
+/// Hard upper bound for the activity `limit` query parameter.
+pub const MAX_ACTIVITY_LIMIT: i64 = 1000;
+/// Upper bound on how many task ids one dependency-resolution request may
+/// look up, to bound query size regardless of client input.
+pub const MAX_TASK_ID_LOOKUP: usize = 200;
+
+/// Which item kinds the unified activity feed returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityKind {
+    /// Merged messages and tasks.
+    All,
+    /// Messages only.
+    Message,
+    /// Tasks only.
+    Task,
+}
 
 pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &str) {
     if !workspace.trim().is_empty() {
@@ -289,6 +313,168 @@ impl TeamSessionService {
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
         Ok(row.user_id)
+    }
+
+    /// Returns the most recent team-wide mailbox messages (all recipients),
+    /// newest first, for the read-only activity view. `limit` is clamped to
+    /// `[1, MAX_ACTIVITY_LIMIT]`. Ownership is enforced first via a scoped
+    /// lookup: a missing team and another user's team both surface as
+    /// `TeamNotFound`, so team existence is never leaked across users.
+    pub async fn list_team_mailbox(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TeamMailboxMessageResponse>, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let clamped = limit.clamp(1, MAX_ACTIVITY_LIMIT);
+        let rows = self.repo.list_messages_by_team(team_id, clamped).await?;
+        let responses: Vec<TeamMailboxMessageResponse> = rows.iter().map(mailbox_row_to_response).collect();
+        info!(kind = "team", team_id, count = responses.len(), "team mailbox listed");
+        Ok(responses)
+    }
+
+    /// Returns the team's tasks, newest first (`created_at` DESC, `id` as a
+    /// stable secondary key), truncated to a clamped `limit`, for the
+    /// read-only activity view. Reuses the existing ASC `list_tasks` and sorts
+    /// in the service. Ownership is enforced first.
+    pub async fn list_team_tasks(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TeamTaskResponse>, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let clamped = limit.clamp(1, MAX_ACTIVITY_LIMIT);
+        let rows = self.repo.list_tasks(user_id, team_id).await?;
+        let mut tasks: Vec<TeamTask> = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
+        tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        tasks.truncate(clamped as usize);
+        let responses: Vec<TeamTaskResponse> = tasks.iter().map(task_to_response).collect();
+        info!(kind = "team", team_id, count = responses.len(), "team tasks listed");
+        Ok(responses)
+    }
+
+    /// Returns the team's tasks matching `ids` (newest first), for resolving
+    /// dependency (`blocked_by`) subjects that may lie outside the loaded
+    /// activity page. Ownership is enforced first; `ids` is clamped to
+    /// `MAX_TASK_ID_LOOKUP`. An empty `ids` yields an empty result.
+    pub async fn list_team_tasks_by_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<TeamTaskResponse>, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let capped = &ids[..ids.len().min(MAX_TASK_ID_LOOKUP)];
+        let rows = self.repo.list_tasks_by_ids(user_id, team_id, capped).await?;
+        let tasks: Vec<TeamTask> = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
+        let responses: Vec<TeamTaskResponse> = tasks.iter().map(task_to_response).collect();
+        info!(
+            kind = "team",
+            team_id,
+            count = responses.len(),
+            "team tasks resolved by ids"
+        );
+        Ok(responses)
+    }
+
+    /// Returns one keyset-paginated page of the unified activity feed (messages
+    /// and/or tasks per `kind`), ordered by `(created_at, id)` in `direction`.
+    /// Ownership is enforced first, so another user's team is indistinguishable
+    /// from a missing one (`TeamNotFound`). For `kind = All`, each stream is
+    /// fetched up to `limit` rows and merged; the global top-`limit` is
+    /// mathematically complete (any item newer/older than the cursor is within
+    /// its own stream's top-`limit`). `has_more` is conservative: a full sub-
+    /// query or a post-merge truncation both flag "possibly more".
+    pub async fn list_team_activity(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        kind: ActivityKind,
+        limit: i64,
+    ) -> Result<TeamActivityPageResponse, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let limit = limit.clamp(1, MAX_ACTIVITY_LIMIT);
+
+        let (mut items, mailbox_full, tasks_full) = match kind {
+            ActivityKind::Message => {
+                let rows = self
+                    .repo
+                    .list_messages_by_team_paged(team_id, cursor.clone(), direction, limit)
+                    .await?;
+                let full = rows.len() as i64 == limit;
+                (
+                    rows.iter().map(message_row_to_activity_item).collect::<Vec<_>>(),
+                    full,
+                    false,
+                )
+            }
+            ActivityKind::Task => {
+                let rows = self
+                    .repo
+                    .list_tasks_paged(user_id, team_id, cursor.clone(), direction, limit)
+                    .await?;
+                let full = rows.len() as i64 == limit;
+                (
+                    rows.iter().filter_map(task_row_to_activity_item).collect::<Vec<_>>(),
+                    false,
+                    full,
+                )
+            }
+            ActivityKind::All => {
+                let msgs = self
+                    .repo
+                    .list_messages_by_team_paged(team_id, cursor.clone(), direction, limit)
+                    .await?;
+                let tasks = self
+                    .repo
+                    .list_tasks_paged(user_id, team_id, cursor.clone(), direction, limit)
+                    .await?;
+                let mailbox_full = msgs.len() as i64 == limit;
+                let tasks_full = tasks.len() as i64 == limit;
+                let mut merged: Vec<_> = msgs
+                    .iter()
+                    .map(message_row_to_activity_item)
+                    .chain(tasks.iter().filter_map(task_row_to_activity_item))
+                    .collect();
+                sort_activity_items(&mut merged, direction);
+                (merged, mailbox_full, tasks_full)
+            }
+        };
+
+        // Truncate to the top `limit`; whether we cut anything feeds `has_more`.
+        let truncated = items.len() as i64 > limit;
+        items.truncate(limit as usize);
+
+        let has_more = mailbox_full || tasks_full || truncated;
+        let next_cursor = if has_more {
+            items.last().map(|i| TeamActivityCursor {
+                ts: i.created_at,
+                id: i.id.clone(),
+            })
+        } else {
+            None
+        };
+
+        info!(
+            kind = "team",
+            team_id,
+            count = items.len(),
+            first_page = cursor.is_none(),
+            "team activity listed"
+        );
+
+        Ok(TeamActivityPageResponse {
+            items,
+            next_cursor,
+            has_more,
+        })
     }
 
     pub async fn renew_active_lease(

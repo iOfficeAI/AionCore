@@ -363,7 +363,10 @@ fn lp3_lead_prompt_contains_task_management_guidance() {
         prompt.contains("Break the work into tasks"),
         "missing decompose guidance"
     );
-    assert!(prompt.contains("Assign tasks"), "missing assign guidance");
+    assert!(
+        prompt.contains("assigning a task to a teammate") && prompt.contains("automatically notifies and wakes"),
+        "missing task-assignment auto-notify/wake guidance"
+    );
     assert!(prompt.contains("dependency"), "missing dependency guidance");
     assert!(
         prompt.contains("When teammates report back"),

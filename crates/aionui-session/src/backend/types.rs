@@ -57,6 +57,20 @@ pub enum Command {
         selected: Option<String>,
         answers: Vec<QuestionAnswer>,
     },
+    /// Answer an `Ask{request_id}` (structured question card — its own command,
+    /// NOT AnswerPermission: asking is not authorizing, 2026-08-04 ruling).
+    ///
+    /// `answers: Some(...)` = the user's per-question picks (claude wire shape,
+    /// see [`QuestionAnswer`]); `None` = the user dismissed the card without
+    /// answering. `None` MUST reach the claude adapter as a deny — claude
+    /// silently DROPS unanswered questions on an allow (not a re-ask, live
+    /// 2.1.178), so an allow-with-empty-answers is silent data loss. The
+    /// `Option` makes "declined" and "answered" unconfusable at the type level.
+    /// Backends without a question channel reject with `CommandNotSupported`.
+    AnswerAsk {
+        request_id: String,
+        answers: Option<Vec<QuestionAnswer>>,
+    },
     /// Answer a mid-session re-auth challenge (waiting_on_auth). Gated by
     /// `supported_commands.answer_auth`.
     AnswerAuth {
@@ -162,7 +176,9 @@ pub struct PendingPermissionView {
     /// The tool the permission gates (used as the recovered card's title). May be
     /// empty if the backend did not name it.
     pub tool_name: String,
-    /// AskUserQuestion recovery: the question payload (`{questions:[…]}`) when
+    /// AskUserQuestion recovery: the BARE `questions[]` array (NOT the
+    /// `{questions:[…]}` wrapper — claude_conn stores `input.get("questions")`;
+    /// consumers re-wrap if they need the tool-input shape) when
     /// `tool_name == "AskUserQuestion"`, else `None`. Lets the REST `/confirmations`
     /// recovery path rebuild a question card symmetric to the live `ConfirmationAdded`
     /// frame (rather than degrading to an Allow/Deny permission card). Only
@@ -329,6 +345,20 @@ pub enum SessionSpec {
         session_id: String,
         backend_session_id: Option<String>,
     },
+    /// Open by forking an EXISTING backend session into a new one: the parent's
+    /// transport id is only the fork SOURCE, never this session's binding. The
+    /// adapter learns its own binding from the backend (codex `thread/started`,
+    /// claude `system/init`) and reports it via `BackendBound`. Used exactly
+    /// once per forked conversation — as soon as a binding is persisted, later
+    /// opens go back to `Resume`.
+    Fork {
+        session_id: String,
+        /// The parent conversation's backend session id (fork source).
+        parent_backend_session_id: String,
+        /// Backend turn to fork at (inclusive); `None` = fork at HEAD. Only
+        /// codex (`thread/fork`'s `lastTurnId`) consumes this today.
+        at_turn_id: Option<String>,
+    },
 }
 
 // ==========================================================================
@@ -373,6 +403,7 @@ pub fn command_name(cmd: &Command) -> &'static str {
         Command::Cancel { .. } => "cancel",
         Command::Steer { .. } => "steer",
         Command::AnswerPermission { .. } => "answer_permission",
+        Command::AnswerAsk { .. } => "answer_ask",
         Command::AnswerAuth { .. } => "answer_auth",
         Command::Acknowledge { .. } => "acknowledge",
         Command::SetMode { .. } => "set_mode",

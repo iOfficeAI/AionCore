@@ -56,6 +56,7 @@ fn make_message(conv_id: &str, content: &str) -> MessageRow {
         status: Some("finish".to_string()),
         hidden: false,
         created_at: now,
+        backend_turn_id: None,
     }
 }
 
@@ -696,6 +697,7 @@ async fn anchor_rejects_legacy_artifact_rows() {
             status: Some("finish".into()),
             hidden: false,
             created_at: 1000,
+            backend_turn_id: None,
         },
     )
     .await
@@ -1071,6 +1073,7 @@ async fn get_messages_excludes_legacy_cron_and_skill_suggest_rows() {
                 status: Some("finish".into()),
                 hidden: false,
                 created_at: 2000,
+                backend_turn_id: None,
             },
         )
         .await
@@ -1110,6 +1113,7 @@ async fn list_legacy_cron_trigger_messages_returns_only_trigger_rows() {
             status: Some("finish".into()),
             hidden: false,
             created_at: 1000,
+            backend_turn_id: None,
         },
     )
     .await
@@ -1284,4 +1288,178 @@ async fn upsert_artifact_rejects_cross_user_id_takeover() {
 
     let user_1_artifacts = repo.list_artifacts(USER_ID, &c1.id).await.unwrap();
     assert!(user_1_artifacts.is_empty());
+}
+
+// ── Fork support: copy_messages_up_to / resolve_backend_turn_anchor ─────
+
+fn make_message_at(conv_id: &str, content: &str, created_at: i64, backend_turn_id: Option<&str>) -> MessageRow {
+    MessageRow {
+        id: aionui_common::generate_prefixed_id("msg"),
+        conversation_id: conv_id.to_string(),
+        msg_id: Some(aionui_common::generate_prefixed_id("cmsg")),
+        r#type: "text".to_string(),
+        content: format!(r#"{{"content":"{content}"}}"#),
+        position: Some("left".to_string()),
+        status: Some("finish".to_string()),
+        hidden: false,
+        created_at,
+        backend_turn_id: backend_turn_id.map(str::to_string),
+    }
+}
+
+#[tokio::test]
+async fn copy_messages_up_to_is_inclusive_reminted_and_order_preserving() {
+    let (repo, _db) = setup().await;
+    let source = make_conversation("fork-src");
+    let target = make_conversation("fork-dst");
+    repo.create(&source).await.unwrap();
+    repo.create(&target).await.unwrap();
+
+    // Two rows share created_at=2000 to exercise same-timestamp ordering.
+    let m1 = make_message_at(&source.id, "one", 1000, Some("turn_a"));
+    let mut m2 = make_message_at(&source.id, "two", 2000, None);
+    let mut m3 = make_message_at(&source.id, "three", 2000, Some("turn_b"));
+    // Force a known (created_at, id) order for the shared timestamp.
+    m2.id = "2000-a".to_string();
+    m3.id = "2000-b".to_string();
+    let m4 = make_message_at(&source.id, "four", 3000, None);
+    for m in [&m1, &m2, &m3, &m4] {
+        repo.insert_message(USER_ID, m).await.unwrap();
+    }
+
+    // Fork at m3 (inclusive): m4 must not be copied.
+    let copied = repo
+        .copy_messages_up_to(USER_ID, &source.id, &target.id, (2000, &m3.id))
+        .await
+        .unwrap();
+    assert_eq!(copied, 3);
+
+    let page = repo
+        .list_messages_page(
+            USER_ID,
+            &target.id,
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 3);
+
+    let contents: Vec<&str> = page
+        .items
+        .iter()
+        .map(|m| {
+            if m.content.contains("one") {
+                "one"
+            } else if m.content.contains("two") {
+                "two"
+            } else {
+                "three"
+            }
+        })
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["one", "two", "three"],
+        "display order must match the source order"
+    );
+
+    for (copy, original) in page.items.iter().zip([&m1, &m2, &m3]) {
+        assert_ne!(copy.id, original.id, "primary keys must be reminted");
+        assert_eq!(copy.msg_id, original.msg_id, "msg_id is preserved");
+        assert_eq!(copy.created_at, original.created_at, "created_at is preserved");
+        assert_eq!(
+            copy.backend_turn_id, None,
+            "source turn anchors must not leak into the fork"
+        );
+    }
+}
+
+#[tokio::test]
+async fn copy_messages_up_to_rejects_foreign_target_without_partial_copy() {
+    let (repo, db) = setup().await;
+    create_user_2(&db).await;
+    let source = make_conversation("fork-src-own");
+    repo.create(&source).await.unwrap();
+    repo.insert_message(USER_ID, &make_message_at(&source.id, "one", 1000, None))
+        .await
+        .unwrap();
+
+    let mut foreign = make_conversation("fork-dst-foreign");
+    foreign.user_id = "user_2".to_string();
+    repo.create(&foreign).await.unwrap();
+
+    let err = repo
+        .copy_messages_up_to(USER_ID, &source.id, &foreign.id, (9999, "zzz"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DbError::NotFound(_)));
+
+    let page = repo
+        .list_messages_page(
+            "user_2",
+            &foreign.id,
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(page.items.is_empty(), "failed copy must not leave partial rows");
+}
+
+#[tokio::test]
+async fn resolve_backend_turn_anchor_picks_nearest_at_or_before_cursor() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("anchor");
+    repo.create(&conv).await.unwrap();
+
+    let m1 = make_message_at(&conv.id, "one", 1000, Some("turn_a"));
+    let m2 = make_message_at(&conv.id, "two", 2000, None);
+    let m3 = make_message_at(&conv.id, "three", 3000, Some("turn_b"));
+    for m in [&m1, &m2, &m3] {
+        repo.insert_message(USER_ID, m).await.unwrap();
+    }
+
+    // Cursor on a row without an anchor → nearest earlier anchor wins.
+    let anchor = repo
+        .resolve_backend_turn_anchor(USER_ID, &conv.id, (2000, &m2.id))
+        .await
+        .unwrap();
+    assert_eq!(anchor.as_deref(), Some("turn_a"));
+
+    // Cursor at HEAD → the latest anchor.
+    let anchor = repo
+        .resolve_backend_turn_anchor(USER_ID, &conv.id, (3000, &m3.id))
+        .await
+        .unwrap();
+    assert_eq!(anchor.as_deref(), Some("turn_b"));
+
+    // Cursor before every anchored row → None.
+    let anchor = repo
+        .resolve_backend_turn_anchor(USER_ID, &conv.id, (500, "aaa"))
+        .await
+        .unwrap();
+    assert_eq!(anchor, None);
+}
+
+#[tokio::test]
+async fn resolve_backend_turn_anchor_is_user_scoped() {
+    let (repo, db) = setup().await;
+    create_user_2(&db).await;
+    let mut conv = make_conversation("anchor-foreign");
+    conv.user_id = "user_2".to_string();
+    repo.create(&conv).await.unwrap();
+    let mut msg = make_message_at(&conv.id, "one", 1000, Some("turn_a"));
+    msg.conversation_id = conv.id.clone();
+    repo.insert_message("user_2", &msg).await.unwrap();
+
+    let anchor = repo
+        .resolve_backend_turn_anchor(USER_ID, &conv.id, (2000, "zzz"))
+        .await
+        .unwrap();
+    assert_eq!(anchor, None, "foreign conversations must resolve to nothing");
 }

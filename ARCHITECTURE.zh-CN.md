@@ -39,7 +39,7 @@ aionui-common 没有任何内部依赖。
 
 ## Crate 层级
 
-项目采用 Cargo workspace 组织，共 20 个 crate，分为四层：
+项目采用 Cargo workspace 组织，共 24 个 crate，分为四层：
 
 ### 基础层（Foundation）
 
@@ -52,6 +52,7 @@ aionui-common 没有任何内部依赖。
 | `aionui-db` | SQLite 数据库层，定义 Repository trait 和实现 |
 | `aionui-assets` | 嵌入式静态资源（Agent 元数据、提示词） |
 | `aionui-runtime` | 托管 Node、子进程管理、PATH 增强 |
+| `aionui-process` | 直连 CLI 会话的子进程监管、隔离和启动清理 |
 
 ### 能力层（Capability）
 
@@ -69,10 +70,13 @@ aionui-common 没有任何内部依赖。
 | Crate | 职责 |
 |-------|------|
 | `aionui-conversation` | 对话管理、消息收发、确认机制、流式响应 |
+| `aionui-session` | 统一直连 CLI 与 ACP 后端的会话状态、能力、命令和事件 |
 | `aionui-channel` | 多渠道集成（微信、钉钉、飞书）、插件系统、配对会话 |
 | `aionui-team` | 团队协作、任务调度、邮箱系统 |
+| `aionui-team-prompts` | 团队角色提示词、治理规则和工具授权元数据 |
 | `aionui-cron` | 定时任务执行、Cron 表达式、事件触发 |
 | `aionui-file` | 文件操作、监听、快照、Git 操作、压缩 |
+| `aionui-project` | 项目/文件夹绑定、项目浏览器、文件系统监听和资源边界校验 |
 | `aionui-office` | Office 文档处理（Excel、PPT、Word）、预览、转换 |
 | `aionui-system` | 系统设置、提供商管理、版本检查、模型获取 |
 | `aionui-mcp` | MCP 协议集成、OAuth、多平台适配器 |
