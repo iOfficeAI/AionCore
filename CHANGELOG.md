@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.63](https://github.com/iOfficeAI/AionCore/compare/v0.1.62...v0.1.63) (2026-08-10)
+
+
+### Features
+
+* **channel:** add Slack Socket Mode plugin ([#806](https://github.com/iOfficeAI/AionCore/issues/806)) ([ff887f1](https://github.com/iOfficeAI/AionCore/commit/ff887f1fd6ff787d59448a8353e4ac1d98f73081))
+* **fs:** add copy-absolute-path endpoint that writes the clipboard server-side ([#803](https://github.com/iOfficeAI/AionCore/issues/803)) ([a621ed8](https://github.com/iOfficeAI/AionCore/commit/a621ed888c662bce2deaf16b30a9ccf8ab588804))
+* **scm:** one-level repository discovery for workspace roots ([#800](https://github.com/iOfficeAI/AionCore/issues/800)) ([3d0e276](https://github.com/iOfficeAI/AionCore/commit/3d0e276078fe95180c9267bdbde548096459becb))
+
+
+### Bug Fixes
+
+* **agent:** stop the idle scanner from killing agents with live background tasks ([#811](https://github.com/iOfficeAI/AionCore/issues/811)) ([50b6570](https://github.com/iOfficeAI/AionCore/commit/50b6570b95b69564037ee89901c8709f889f60b7))
+* **project:** emit real-case absolute path to agents, not folded canonical ([#809](https://github.com/iOfficeAI/AionCore/issues/809)) ([f0f4fbd](https://github.com/iOfficeAI/AionCore/commit/f0f4fbd1234a039861f2b3e857cd821337c37672))
+
+
+### Code Refactoring
+
+* **session:** run the user's own claude/codex, with one shared version-drift path ([#799](https://github.com/iOfficeAI/AionCore/issues/799)) ([ae817e3](https://github.com/iOfficeAI/AionCore/commit/ae817e32d7f7f24246fcb0001e334a344d59f351))
+
 ## [0.1.62](https://github.com/iOfficeAI/AionCore/compare/v0.1.61...v0.1.62) (2026-08-06)
 
 
