@@ -15,6 +15,7 @@ fn slack_uses_larger_throttle_than_others() {
     // Slack's chat.update is rate-limited harder, so it gets a wider interval;
     // the other editable platforms must stay at the original 500 ms.
     assert_eq!(throttle_ms_for_platform(PluginType::Slack), 1200);
+    assert_eq!(throttle_ms_for_platform(PluginType::Discord), 1000);
     assert_eq!(throttle_ms_for_platform(PluginType::Telegram), 500);
     assert_eq!(throttle_ms_for_platform(PluginType::Lark), 500);
     assert_eq!(throttle_ms_for_platform(PluginType::Dingtalk), 500);

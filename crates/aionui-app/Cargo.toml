@@ -9,12 +9,13 @@ name = "aioncore"
 path = "src/main.rs"
 
 [features]
-default = ["telegram", "lark", "dingtalk", "weixin", "slack"]
+default = ["telegram", "lark", "dingtalk", "weixin", "slack", "discord"]
 telegram = ["aionui-channel/telegram"]
 lark = ["aionui-channel/lark"]
 dingtalk = ["aionui-channel/dingtalk"]
 weixin = ["aionui-channel/weixin"]
 slack = ["aionui-channel/slack"]
+discord = ["aionui-channel/discord"]
 
 [dependencies]
 aionui-common.workspace = true
