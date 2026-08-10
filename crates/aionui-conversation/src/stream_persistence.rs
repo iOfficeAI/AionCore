@@ -377,11 +377,16 @@ impl StreamPersistenceAdapter {
             TipType::Error => "error",
             TipType::Success | TipType::Warning | TipType::Info => "finish",
         };
+        // `supersedes_key` has to survive persistence too: on reload the history
+        // is folded with the same merge the live stream uses, so without the key
+        // a stalled turn's retry attempts come back as N stacked cards even
+        // though the user only ever saw one counting up.
         let content = json!({
             "content": &data.content,
             "type": &data.tip_type,
             "code": &data.code,
             "params": &data.params,
+            "supersedes_key": &data.supersedes_key,
         })
         .to_string();
         let row = MessageRow {

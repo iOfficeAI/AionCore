@@ -11,6 +11,7 @@
 mod acp_conn;
 mod antigravity;
 mod claude_conn;
+mod cli_version;
 mod codex_conn;
 mod conversation_session;
 mod orchestrator;
@@ -19,10 +20,12 @@ mod suspend;
 mod types;
 
 pub use acp_conn::{AcpConnection, AcpSessionBackend, acp_capabilities};
-pub use antigravity::{
-    AntigravityConnection, AntigravitySessionBackend, VersionDrift, antigravity_capabilities, version_drift,
-};
+pub use antigravity::{AntigravityConnection, AntigravitySessionBackend, antigravity_capabilities};
 pub use claude_conn::{ClaudeConnection, ClaudeSessionBackend};
+pub use cli_version::{
+    VERIFIED_CLAUDE_VERSION, VERIFIED_CODEX_VERSION, VersionDrift, VersionVerdict, classify as classify_cli_version,
+    parse_version as parse_cli_version, version_drift,
+};
 pub use codex_conn::{CodexConnection, CodexSessionBackend, codex_capabilities, slash_command_name};
 pub use conversation_session::{ConversationSession, MsgStatus, PendingMessage};
 pub use orchestrator::Orchestrator;

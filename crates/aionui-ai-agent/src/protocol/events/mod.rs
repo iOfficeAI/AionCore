@@ -142,6 +142,12 @@ pub struct TipsEventData {
     pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
+    /// Stable identity for a tip that SUPERSEDES its predecessor: a later tip
+    /// with the same key replaces the earlier one in place instead of being
+    /// appended. Used by progress-style notices (codex retry attempts count up
+    /// 1/5 → 2/5 → …) so the conversation shows one card, not five.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_key: Option<String>,
 }
 
 /// Severity level for a tip event.
@@ -241,6 +247,7 @@ mod tests {
             tip_type: TipType::Error,
             code: None,
             params: None,
+            supersedes_key: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "tips");
@@ -254,6 +261,7 @@ mod tests {
             tip_type: TipType::Info,
             code: Some("acp.empty_turn.choose_command".into()),
             params: Some(json!({ "command_count": 3 })),
+            supersedes_key: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "tips");

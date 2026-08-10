@@ -476,6 +476,16 @@ pub enum SessionEvent {
         message: String,
         /// Optional translation handle. `None` renders `message` verbatim.
         localized: Option<LocalizedText>,
+        /// Stable identity for a notice that SUPERSEDES its predecessor.
+        ///
+        /// A progress-style notice restates the same fact with a new number
+        /// (codex retries: "Reconnecting... 1/5", then 2/5, 3/5 …). Appending
+        /// each one buries the conversation under near-identical cards, while
+        /// showing only the first hides the progress. Notices sharing a key
+        /// replace the previous one in place, so the user sees a single card
+        /// counting up. `None` = an ordinary notice, always appended.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supersedes_key: Option<String>,
     },
 
     /// Live tool-OUTPUT delta (codex `item/commandExecution/outputDelta`). The
@@ -1188,6 +1198,7 @@ mod additive_tests {
                     level: NoticeLevel::Warning,
                     message: "config key X is deprecated".into(),
                     localized: None,
+                    supersedes_key: None,
                 },
                 BackendProduced,
                 Display,
@@ -1609,6 +1620,7 @@ mod additive_tests {
                 level: NoticeLevel::Info,
                 message: "deprecated: use --foo".into(),
                 localized: None,
+                supersedes_key: None,
             },
             SessionEvent::ToolOutputDelta {
                 item_id: "call_0".into(),

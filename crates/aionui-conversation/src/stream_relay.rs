@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::protocol::events::{ErrorEventData, TipType};
+use aionui_ai_agent::protocol::events::{ErrorEventData, TipType, TipsEventData};
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
 use crate::response_middleware::{ISkillLoadService, MessageMiddleware, MiddlewareResult};
@@ -23,6 +23,65 @@ use tracing::{debug, info, warn};
 
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
+
+/// Running totals for tips that supersede themselves, kept for the whole turn.
+///
+/// A superseding tip is one card the user watches update — codex's retry card
+/// is the first — and what it measures is the turn, not the agent process. A
+/// stalled prompt can be replayed against a freshly spawned CLI, and a counter
+/// living in that process restarts at 1 halfway through the card. The relay
+/// outlives those attempts, so the totals belong here.
+///
+/// The two params are added to whatever the producer already sent, so a locale
+/// body can use them (`CODEX_RETRYING`) or ignore them.
+///
+/// Shared by handle: the turn orchestrator builds a FRESH relay per attempt, so
+/// state living in one relay resets on exactly the boundary this is meant to
+/// span. The orchestrator makes one of these per turn and hands every attempt
+/// the same handle.
+#[derive(Debug, Clone, Default)]
+pub struct SupersedingTipTotals {
+    seen: Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, i64)>>>,
+}
+
+impl SupersedingTipTotals {
+    /// Returns the tip with `attempts`/`elapsed` filled in, or `None` when it
+    /// carries no merge key and therefore has no history to report.
+    fn annotate(&self, data: &TipsEventData, now_ms: i64) -> Option<TipsEventData> {
+        let key = data.supersedes_key.as_deref()?;
+        let (attempts, first_ms) = {
+            let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = seen.entry(key.to_owned()).or_insert((0, now_ms));
+            entry.0 += 1;
+            *entry
+        };
+
+        let mut params = match data.params.clone() {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        params.insert("attempts".into(), serde_json::Value::from(attempts));
+        params.insert(
+            "elapsed".into(),
+            serde_json::Value::String(humanize_ms(now_ms.saturating_sub(first_ms))),
+        );
+
+        Some(TipsEventData {
+            params: Some(serde_json::Value::Object(params)),
+            ..data.clone()
+        })
+    }
+}
+
+/// Compact, locale-neutral duration: `45s`, `7m41s`, `1h02m`.
+fn humanize_ms(ms: i64) -> String {
+    let total = (ms.max(0) / 1000) as u64;
+    match (total / 3600, (total % 3600) / 60, total % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m{s:02}s"),
+        (h, m, _) => format!("{h}h{m:02}m"),
+    }
+}
 
 /// Conservative summary of what happened during one agent send attempt.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -112,6 +171,7 @@ pub struct StreamRelay {
     adapter: StreamPersistenceAdapter,
     complete_turn: bool,
     defer_clean_terminal_errors: bool,
+    superseding_tips: SupersedingTipTotals,
 }
 
 impl StreamRelay {
@@ -138,6 +198,7 @@ impl StreamRelay {
             adapter,
             complete_turn: true,
             defer_clean_terminal_errors: false,
+            superseding_tips: SupersedingTipTotals::default(),
         }
     }
 
@@ -164,6 +225,14 @@ impl StreamRelay {
 
     pub fn with_turn_completion(mut self, enabled: bool) -> Self {
         self.complete_turn = enabled;
+        self
+    }
+
+    /// Share this turn's superseding-tip totals across its replay attempts.
+    /// Without it each attempt counts from one, and the card the user is
+    /// watching restarts mid-stall.
+    pub fn with_superseding_tip_totals(mut self, totals: SupersedingTipTotals) -> Self {
+        self.superseding_tips = totals;
         self
     }
 
@@ -565,9 +634,17 @@ impl StreamRelay {
                             if data.code.as_deref() == Some("ACP_EMPTY_TURN_NEEDS_AUTH") {
                                 attempt.needs_auth = true;
                             }
-                            self.forward_to_websocket(&event);
+                            // A card that supersedes itself gets this turn's
+                            // running totals before it goes anywhere, so the
+                            // live frame and the persisted row agree.
+                            let annotated = self.superseding_tips.annotate(data, now_ms());
+                            let forwarded = match &annotated {
+                                Some(data) => std::borrow::Cow::Owned(AgentStreamEvent::Tips(data.clone())),
+                                None => std::borrow::Cow::Borrowed(&event),
+                            };
+                            self.forward_to_websocket(&forwarded);
                             if matches!(data.tip_type, TipType::Success | TipType::Warning | TipType::Info) {
-                                self.adapter.persist_tip(data).await;
+                                self.adapter.persist_tip(annotated.as_ref().unwrap_or(data)).await;
                             }
                         }
                         AgentStreamEvent::CronTrigger(_)
@@ -1216,6 +1293,7 @@ mod tests {
             tip_type: TipType::Info,
             code: Some("ACP_EMPTY_TURN_NEEDS_AUTH".into()),
             params: Some(serde_json::json!({ "hint": "Run `kilo auth login` in the terminal" })),
+            supersedes_key: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -1251,6 +1329,7 @@ mod tests {
             tip_type: TipType::Info,
             code: Some("ACP_EMPTY_TURN".into()),
             params: None,
+            supersedes_key: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -1289,6 +1368,7 @@ mod tests {
             tip_type: TipType::Info,
             code: Some("ACP_EMPTY_TURN_TOKEN_LIMIT".into()),
             params: None,
+            supersedes_key: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -1812,6 +1892,7 @@ mod tests {
             tip_type: TipType::Warning,
             code: None,
             params: None,
+            supersedes_key: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Error(ErrorEventData {
@@ -1910,6 +1991,7 @@ mod tests {
                 tip_type: aionui_ai_agent::protocol::events::TipType::Warning,
                 code: Some("ACP_EMPTY_TURN".into()),
                 params: None,
+                supersedes_key: None,
             },
         ))
         .unwrap();

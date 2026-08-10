@@ -85,10 +85,20 @@ impl GitScmProvider {
         }
     }
 
-    /// Opaque `repo_id` for a pe root. Generation rule only — consumers must
-    /// not parse it back into a `pe_id`.
-    fn repo_id_for(pe_id: &str) -> String {
-        format!("scm:{pe_id}")
+    /// Opaque `repo_id` for a discovered repository. Generation rule only —
+    /// consumers must not parse it back.
+    ///
+    /// A pe root that is itself the repository has `relative_path == ""` and keeps
+    /// the historical `scm:{pe_id}` form, so ids for the common one-repo-per-pe
+    /// case are unchanged. A child repository discovered one level under a
+    /// workspace root folds its `relative_path` in, keeping ids stable and unique
+    /// across the children of one pe (which all share `pe_id`).
+    fn repo_id_for(pe_id: &str, relative_path: &str) -> String {
+        if relative_path.is_empty() {
+            format!("scm:{pe_id}")
+        } else {
+            format!("scm:{pe_id}/{relative_path}")
+        }
     }
 
     /// The real git directory of a discovered repository, for arming a metadata
@@ -192,7 +202,10 @@ fn read_head(repo: &Repository) -> Option<ScmHead> {
         Ok(head) => {
             let detached = repo.head_detached().unwrap_or(false);
             Some(ScmHead {
-                name: head.shorthand().map(str::to_owned),
+                // git2 0.21: Reference::shorthand() returns Result (was Option in
+                // 0.20). `.ok()` keeps the prior "unreadable/unborn head → None"
+                // semantics — an unborn head is a normal state, not an error to log.
+                name: head.shorthand().ok().map(str::to_owned),
                 detached: detached.then_some(true),
             })
         }
@@ -200,6 +213,104 @@ fn read_head(repo: &Repository) -> Option<ScmHead> {
         // error: the repository exists and has a change list.
         Err(_) => Some(ScmHead::default()),
     }
+}
+
+/// The plain, `Send` data one opened repository contributes to discovery. Kept
+/// free of git2 handles so it can cross the blocking-task boundary.
+struct OpenedRepo {
+    /// Directory name relative to the workspace root; empty for the root itself.
+    relative_path: String,
+    workdir: PathBuf,
+    /// The repository's own git dir (`Repository::path`), what a watch arms on.
+    git_dir: PathBuf,
+    /// The shared common dir (`Repository::commondir`): for a linked worktree
+    /// this is its primary repository's git dir, otherwise it equals `git_dir`.
+    common_dir: PathBuf,
+    is_worktree: bool,
+    head: Option<ScmHead>,
+}
+
+/// Open a single path as a repository, returning its discovery data.
+///
+/// `Ok(None)` covers both "not a repository" and "bare repository": a bare repo
+/// has no work tree and thus no change list to show, so surfacing it would only
+/// yield a repo whose every operation fails. Any other git error propagates.
+fn open_repo(path: &Path, relative_path: String) -> Result<Option<OpenedRepo>, git2::Error> {
+    match Repository::open(path) {
+        Ok(repo) => {
+            let Some(workdir) = repo.workdir().map(Path::to_path_buf) else {
+                tracing::debug!(?path, "scm discover: bare repository has no work tree, not surfaced");
+                return Ok(None);
+            };
+            Ok(Some(OpenedRepo {
+                relative_path,
+                workdir,
+                git_dir: repo.path().to_path_buf(),
+                common_dir: repo.commondir().to_path_buf(),
+                is_worktree: repo.is_worktree(),
+                head: read_head(&repo),
+            }))
+        }
+        Err(err) if matches!(err.code(), ErrorCode::NotFound) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Read one level of `root`'s child directories and surface each that opens as a
+/// repository. Never recurses. Skips dotfiles/hidden entries, non-directories,
+/// and symlinks (a symlink is not descended into — it is not a child directory
+/// of this workspace in any meaningful sense and could point anywhere).
+///
+/// A directory that fails to open as a repository is simply skipped; only a
+/// hard read error on an individual child is logged. A `read_dir` failure on the
+/// root yields an empty set rather than an error: an unreadable workspace root
+/// is "no repositories here", consistent with the not-a-repository outcome.
+fn discover_child_repos(root: &Path) -> Vec<OpenedRepo> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::debug!(?root, error = %err, "scm discover: workspace root not readable");
+            return vec![];
+        }
+    };
+
+    let mut repos = vec![];
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // Skip hidden entries (`.git`, `.DS_Store`, editor dirs, …).
+        if name.starts_with('.') {
+            continue;
+        }
+        // `file_type` does not follow symlinks, so a symlinked directory reports
+        // as a symlink and is excluded here.
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => {}
+            Ok(_) => continue,
+            Err(err) => {
+                tracing::debug!(?name, error = %err, "scm discover: child file_type failed, skipping");
+                continue;
+            }
+        }
+        match open_repo(&entry.path(), name.to_owned()) {
+            Ok(Some(opened)) => repos.push(opened),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(?name, error = %err, "scm discover: child open failed, skipping");
+            }
+        }
+    }
+    repos
+}
+
+/// A path key for worktree/primary matching that tolerates macOS realpath and
+/// case differences. Falls back to the raw path when canonicalization fails
+/// (e.g. a transient race), which at worst misses a link and renders the
+/// worktree at the outer level — never a wrong match.
+fn canonical_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Run one `statuses()` pass, with the stale-index fallback.
@@ -267,7 +378,10 @@ fn collect_status(repo: &Repository) -> Result<(Vec<ScmResource>, bool, bool, Op
     let mut truncated = false;
 
     for entry in statuses_owned.iter() {
-        let Some(path) = entry.path() else {
+        // git2 0.21: StatusEntry::path() returns Result (was Option in 0.20).
+        // `.ok()` keeps the prior "non-UTF-8 path → skip" behavior; the Err case
+        // is exactly the non-UTF-8 path we already warn-and-skip.
+        let Some(path) = entry.path().ok() else {
             // Non-UTF-8 path: skipped rather than lossily rendered, since a
             // mangled path would not round-trip back to a real file.
             tracing::warn!("scm status: skipping entry with non-UTF-8 path");
@@ -715,23 +829,28 @@ impl IScmProvider for GitScmProvider {
         }
     }
 
-    async fn discover(&self, root: &ResolvedRoot) -> Result<Option<ScmRepository>, ScmError> {
-        let path = PathBuf::from(&root.absolute_path);
-        let caps = self.capabilities();
+    async fn discover(&self, root: &ResolvedRoot) -> Result<Vec<ScmRepository>, ScmError> {
+        let root_path = PathBuf::from(&root.absolute_path);
+        let discover_children = root.discover_children;
 
-        // `open` (not `discover`): one pe root is at most one repo — never walk
-        // up to a parent repository, never enumerate nested ones.
-        let opened = tokio::task::spawn_blocking(move || match Repository::open(&path) {
-            Ok(repo) => {
-                let workdir = repo.workdir().map(Path::to_path_buf);
-                // `path()` is the real git dir, which is what a watch must be
-                // armed on: for a linked worktree or a submodule the `.git`
-                // entry beside the work tree is a file pointing elsewhere.
-                let git_dir = repo.path().to_path_buf();
-                Ok(Some((workdir, git_dir, read_head(&repo))))
+        // All git access happens in one blocking pass: opening the root, and —
+        // only when the root is not itself a repository and the policy allows —
+        // reading one level of child directories and opening each. The closure
+        // returns just the plain data each surfaced repository needs; identity
+        // and registry insertion stay on the async side.
+        let opened = tokio::task::spawn_blocking(move || -> Result<Vec<OpenedRepo>, git2::Error> {
+            // `open` (not `discover`): a root is at most one repo — never walk up
+            // to a parent repository, never enumerate nested ones. A submodule is
+            // therefore never mis-captured, since we never descend into a repo.
+            if let Some(opened) = open_repo(&root_path, String::new())? {
+                return Ok(vec![opened]);
             }
-            Err(err) if matches!(err.code(), ErrorCode::NotFound) => Ok(None),
-            Err(err) => Err(err),
+            if !discover_children {
+                return Ok(vec![]);
+            }
+            // The root itself is not a repository: relax by exactly one level and
+            // surface each immediate child directory that is a repository.
+            Ok(discover_child_repos(&root_path))
         })
         .await
         .map_err(|err| ScmError::OperationFailed {
@@ -740,38 +859,72 @@ impl IScmProvider for GitScmProvider {
         })?
         .map_err(|e| engine_error("discover", &e))?;
 
-        let Some((workdir, git_dir, head)) = opened else {
-            return Ok(None);
-        };
-        // A bare repository has no work tree, so it has no change list to show;
-        // treating it as "not a repository" here beats surfacing a repo whose
-        // every operation would fail.
-        let Some(workdir) = workdir else {
-            tracing::debug!(pe_id = %root.pe_id, "scm discover: bare repository has no work tree, not surfaced");
-            return Ok(None);
-        };
-        let repo_id = Self::repo_id_for(&root.pe_id);
-        self.repos
-            .write()
-            .expect("scm repo registry poisoned")
-            .insert(repo_id.clone(), RepoEntry { workdir, git_dir });
+        // Index surfaced repositories by their common directory so a linked
+        // worktree can point at its primary repository when the primary is also
+        // in view. Keyed by canonicalized common dir: macOS reports symlinked and
+        // case-variant paths that only agree after realpath resolution (see
+        // `watch.rs`). A non-worktree's `path()` equals its `commondir()`, so this
+        // maps "primary common dir" → its repo_id.
+        let common_to_repo_id: HashMap<PathBuf, String> = opened
+            .iter()
+            .filter(|o| !o.is_worktree)
+            .map(|o| {
+                (
+                    canonical_key(&o.git_dir),
+                    Self::repo_id_for(&root.pe_id, &o.relative_path),
+                )
+            })
+            .collect();
 
-        Ok(Some(ScmRepository {
-            repo_id,
-            provider_id: self.provider_id().to_owned(),
-            root: FileRef {
-                pe_id: root.pe_id.clone(),
-                relative_path: String::new(),
-            },
-            label: root.label.clone(),
-            // Passed through untouched: identity resolution already decided
-            // whether the entry has a name of its own, and the provider must not
-            // second-guess it.
-            pe_name: root.pe_name.clone(),
-            head,
-            capabilities: caps,
-            state: ScmRepositoryState::Idle,
-        }))
+        let caps = self.capabilities();
+        let mut repos = Vec::with_capacity(opened.len());
+        for o in opened {
+            let repo_id = Self::repo_id_for(&root.pe_id, &o.relative_path);
+            let worktree_of = if o.is_worktree {
+                // Match by real git directory, never by path text: the primary's
+                // gitdir is this worktree's common dir.
+                common_to_repo_id.get(&canonical_key(&o.common_dir)).cloned()
+            } else {
+                None
+            };
+
+            self.repos.write().expect("scm repo registry poisoned").insert(
+                repo_id.clone(),
+                RepoEntry {
+                    workdir: o.workdir,
+                    git_dir: o.git_dir,
+                },
+            );
+
+            // A child repository is a repository found *inside* the pe root, not
+            // the pe root itself, so the entry's own name (`pe_name`) does not
+            // apply to it; only the pe root (relative_path == "") carries it.
+            let is_child = !o.relative_path.is_empty();
+            repos.push(ScmRepository {
+                repo_id,
+                provider_id: self.provider_id().to_owned(),
+                root: FileRef {
+                    pe_id: root.pe_id.clone(),
+                    relative_path: o.relative_path.clone(),
+                },
+                label: if is_child {
+                    o.relative_path.clone()
+                } else {
+                    root.label.clone()
+                },
+                // Passed through untouched for the pe root: identity resolution
+                // already decided whether the entry has a name of its own, and the
+                // provider must not second-guess it.
+                pe_name: if is_child { None } else { root.pe_name.clone() },
+                head: o.head,
+                is_worktree: o.is_worktree,
+                worktree_of,
+                capabilities: caps,
+                state: ScmRepositoryState::Idle,
+            });
+        }
+
+        Ok(repos)
     }
 
     async fn status(&self, repo: &RepoRef) -> Result<ScmStatus, ScmError> {

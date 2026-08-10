@@ -49,6 +49,7 @@ fn root_of(tmp: &TempDir, pe_id: &str) -> ResolvedRoot {
         absolute_path: tmp.path().to_string_lossy().into_owned(),
         label: "fixture".to_owned(),
         pe_name: None,
+        discover_children: false,
     }
 }
 

@@ -378,6 +378,24 @@ mod tests {
         }
     }
 
+    /// `wait_for_exit` returns as soon as the direct child is reaped, but the
+    /// reader task that drains its stdout is a separate task — so a snapshot
+    /// taken the instant after exit can legitimately still be empty. Poll for
+    /// the expected text instead of racing it; the bounded wait keeps a real
+    /// regression (output never delivered) failing.
+    async fn output_contains(reg: &TerminalRegistry, id: &str, needle: &str) -> String {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last = String::new();
+        while tokio::time::Instant::now() < deadline {
+            last = reg.output(id).await.map(|s| s.output).unwrap_or_default();
+            if last.contains(needle) {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        last
+    }
+
     #[tokio::test]
     async fn create_runs_command_and_reports_output_and_exit() {
         let reg = TerminalRegistry::new("conv-t", None);
@@ -444,8 +462,8 @@ mod tests {
         let id = reg.create(p).await.unwrap();
         let exit = reg.wait_for_exit(&id).await.unwrap();
         assert_eq!(exit.exit_code, Some(0));
-        let snap = reg.output(&id).await.unwrap();
-        assert!(snap.output.contains("shell_interpreted"), "got: {}", snap.output);
+        let output = output_contains(&reg, &id, "shell_interpreted").await;
+        assert!(output.contains("shell_interpreted"), "got: {output}");
     }
 
     #[tokio::test]
@@ -463,25 +481,28 @@ mod tests {
             .expect("exit must be reported once the direct child exits, not when the pipe closes")
             .unwrap();
         assert_eq!(exit.exit_code, Some(0));
-        let snap = reg.output(&id).await.unwrap();
-        assert!(snap.output.contains("parent_done"), "got: {}", snap.output);
+        let output = output_contains(&reg, &id, "parent_done").await;
+        assert!(output.contains("parent_done"), "got: {output}");
     }
 
     #[tokio::test]
     async fn default_cwd_applies_when_agent_sends_none() {
-        let dir = std::env::temp_dir().join("aionui-term-cwd-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let reg = TerminalRegistry::new("conv-t", Some(dir.clone()));
+        // A private temp dir per run: the old fixed, shared path
+        // (`temp_dir()/aionui-term-cwd-test`) was raced by every parallel test
+        // process on the machine, which made this test flaky.
+        let dir = tempfile::TempDir::new().unwrap();
+        let reg = TerminalRegistry::new("conv-t", Some(dir.path().to_path_buf()));
         let id = reg.create(params("pwd", &[])).await.unwrap();
         reg.wait_for_exit(&id).await.unwrap();
         let snap = reg.output(&id).await.unwrap();
-        let canonical = std::fs::canonicalize(&dir).unwrap();
-        assert!(
-            snap.output
-                .trim()
-                .ends_with(canonical.file_name().unwrap().to_str().unwrap()),
-            "expected cwd {} in output: {}",
-            canonical.display(),
+        // `pwd` prints the resolved path (on macOS temp_dir lives under
+        // /var -> /private/var), so compare against the canonicalized full path
+        // rather than only the trailing directory name.
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(
+            snap.output.trim(),
+            canonical.to_str().unwrap(),
+            "pwd should report the default cwd; output: {}",
             snap.output
         );
     }

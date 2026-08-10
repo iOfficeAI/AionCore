@@ -480,13 +480,18 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
     )));
     let revealer: aionui_file::ItemRevealerRef = Arc::new(super::item_revealer::ShellItemRevealer::new(shell.clone()));
     let system_opener: aionui_file::SystemFileOpenerRef =
-        Arc::new(super::system_file_opener::ShellSystemFileOpener::new(shell));
+        Arc::new(super::system_file_opener::ShellSystemFileOpener::new(shell.clone()));
+    // Clipboard capability for `/api/fs/copy-absolute-path`: the backend resolves
+    // the path and writes it to the clipboard itself, so the abs never returns.
+    let clipboard: aionui_file::ClipboardWriterRef =
+        Arc::new(super::clipboard_writer::ShellClipboardWriter::new(shell));
     Ok(FileRouterState {
         file_service,
         snapshot_service,
         project: Arc::new(services.project_service.clone()),
         revealer,
         system_opener,
+        clipboard,
         allowed_roots,
     })
 }
