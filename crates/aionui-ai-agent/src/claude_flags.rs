@@ -126,7 +126,7 @@ mod tests {
         assert!(!supported("2.1.0"), "2.1.0 hard-errors on --thinking-display");
         assert!(!supported("2.1.190"), "below the verified floor stays off");
         assert!(supported("2.1.191"), "lowest live-probed OK version");
-        assert!(supported("2.1.215"), "the release this integration is verified against");
+        assert!(supported("2.1.226"), "the release this integration is verified against");
         assert!(supported("2.1.220"));
         assert!(supported("3.0.0"), "a future major must not regress the gate");
     }

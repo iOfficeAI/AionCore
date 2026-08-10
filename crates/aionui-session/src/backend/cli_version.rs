@@ -26,11 +26,18 @@ use crate::event::{LocalizedText, NoticeLevel};
 
 /// The release a backend's wire contracts were verified against.
 ///
-/// Bumping one of these means re-verifying against captured traffic, not just
-/// editing the constant.
-pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.215";
-pub const VERIFIED_CODEX_VERSION: &str = "0.144.6";
-pub const VERIFIED_AGY_VERSION: &str = "1.1.10";
+/// Bumping one of these means the live e2e suite passed against that exact
+/// binary — not that the version number looked safe. `live_ws_http_parity_e2e`
+/// is the evidence; a schema diff or a clean changelog is not, because neither
+/// can see a behavioural regression.
+///
+/// codex is deliberately NOT on the latest release: 0.147.0 never completes a
+/// turn (its response stream disconnects with `httpStatusCode: null`, observed
+/// three times including a back-to-back control after three clean versions), so
+/// the verified release stops at 0.146.0 until upstream fixes it.
+pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.226";
+pub const VERIFIED_CODEX_VERSION: &str = "0.146.0";
+pub const VERIFIED_AGY_VERSION: &str = "1.1.11";
 
 /// The verified release for a direct-CLI backend, keyed by the program name the
 /// backend spawns. `None` for anything not version-gated here.
@@ -270,8 +277,10 @@ mod tests {
 
     #[test]
     fn the_verified_release_says_nothing() {
-        assert_eq!(classify("2.1.215", VERIFIED_CLAUDE_VERSION), VersionVerdict::Verified);
-        assert!(drift_notice("claude", "2.1.215", VERIFIED_CLAUDE_VERSION).is_none());
+        // Literal on purpose: this is the exact string a user on the verified
+        // release reports, so the test breaks if a bump forgets to re-verify.
+        assert_eq!(classify("2.1.226", VERIFIED_CLAUDE_VERSION), VersionVerdict::Verified);
+        assert!(drift_notice("claude", "2.1.226", VERIFIED_CLAUDE_VERSION).is_none());
     }
 
     #[test]
@@ -279,7 +288,7 @@ mod tests {
         // The bug a string compare would introduce: "0.144.6" < "0.99.0"
         // lexically, but 144 > 99.
         assert_eq!(classify("0.99.0", VERIFIED_CODEX_VERSION), VersionVerdict::Older);
-        assert_eq!(classify("0.144.7", VERIFIED_CODEX_VERSION), VersionVerdict::Newer);
+        assert_eq!(classify("0.146.1", VERIFIED_CODEX_VERSION), VersionVerdict::Newer);
     }
 
     #[test]
