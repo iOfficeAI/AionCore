@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.68](https://github.com/suoak/AionCore/compare/v0.1.67...v0.1.68) (2026-08-10)
+
+### Bug Fixes
+
+* **grok:** update the managed package version to 1.0.0
+
 ## [0.1.67](https://github.com/suoak/AionCore/compare/v0.1.66...v0.1.67) (2026-08-10)
 
 ### Features
