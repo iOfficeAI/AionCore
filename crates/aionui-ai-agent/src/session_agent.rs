@@ -78,6 +78,11 @@ fn resolve_current_model_efforts(models: &[aionui_session::ModelInfo], current_m
 struct SessionRuntime {
     tx: broadcast::Sender<AgentStreamEvent>,
     last_activity_ms: AtomicI64,
+    /// Live (declared, not yet terminal) background containers — the pump's
+    /// `workflow_cards` ledger size, mirrored here so the idle scanner can see
+    /// that background work outlives the turn (status=Finished + no frames
+    /// otherwise reads as idle and gets the agent killed mid-flight).
+    live_background_tasks: std::sync::atomic::AtomicUsize,
     /// Coarse status derived from the FSM edge the translator observes.
     status: std::sync::Mutex<Option<ConversationStatus>>,
     /// The CLI-assigned backend session id, learned from `BackendBound`. The ACP
@@ -108,6 +113,9 @@ struct SessionRuntime {
 impl SessionRuntime {
     fn touch(&self) {
         self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+    }
+    fn set_live_background_tasks(&self, count: usize) {
+        self.live_background_tasks.store(count, Ordering::Relaxed);
     }
     fn set_status(&self, s: ConversationStatus) {
         if let Ok(mut g) = self.status.lock() {
@@ -431,6 +439,7 @@ impl SessionAgentTask {
         let runtime = Arc::new(SessionRuntime {
             tx,
             last_activity_ms: AtomicI64::new(now_ms()),
+            live_background_tasks: std::sync::atomic::AtomicUsize::new(0),
             status: std::sync::Mutex::new(None),
             session_id: std::sync::Mutex::new(None),
             mode_override: std::sync::Mutex::new(None),
@@ -1087,6 +1096,10 @@ impl IAgentTask for SessionAgentTask {
 
     fn last_activity_at(&self) -> TimestampMs {
         self.runtime.last_activity_ms.load(Ordering::Relaxed)
+    }
+
+    fn live_background_tasks(&self) -> usize {
+        self.runtime.live_background_tasks.load(Ordering::Relaxed)
     }
 
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
@@ -2699,6 +2712,7 @@ fn spawn_event_pump(
                 // turns (forward + persist), so no pump-side broadcast bypass.
                 let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
             }
+            runtime.set_live_background_tasks(workflow_cards.len());
 
             // Track in-flight workflow/subagent refs so a non-blocking Workflow's
             // intermediate `result` frame does not prematurely terminate the turn.
@@ -2800,6 +2814,7 @@ fn spawn_event_pump(
                             ) {
                                 let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
                             }
+                            runtime.set_live_background_tasks(workflow_cards.len());
                             // Same per-turn closure the real terminal arm performs:
                             // close every tool call left open as Canceled BEFORE the
                             // Finish (the relay stops forwarding the turn at Finish).
@@ -2906,6 +2921,7 @@ fn spawn_event_pump(
                     ) {
                         let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
                     }
+                    runtime.set_live_background_tasks(workflow_cards.len());
                     // Calls deliberately left running past this turn end (see below);
                     // re-registered after the drain so their late frames still resolve.
                     let mut kept_open: Vec<(String, String)> = Vec::new();
@@ -3106,6 +3122,7 @@ fn spawn_event_pump(
         ) {
             let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
         }
+        runtime.set_live_background_tasks(workflow_cards.len());
     });
 }
 
@@ -6464,6 +6481,41 @@ mod pump_tests {
         }
     }
 
+    /// Like `GatedScriptBackend`, but the stream stays OPEN after the script —
+    /// for asserting mid-flight pump state (a closed stream tears the pump down,
+    /// which settles every card and zeroes `live_background_tasks`).
+    struct HeldOpenScriptBackend {
+        script: Vec<SessionEnvelope>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for HeldOpenScriptBackend {
+        async fn dispatch(&self, c: Command) -> Result<CommandReceipt, BackendError> {
+            let admission = match c {
+                Command::Send { .. } => Admission::Started,
+                _ => Admission::NoTurn,
+            };
+            Ok(CommandReceipt {
+                accepted: true,
+                admission,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            let gate = self.gate.clone();
+            let script = self.script.clone();
+            futures_util::stream::once(async move { gate.notified().await })
+                .flat_map(move |_| futures_util::stream::iter(script.clone()))
+                .chain(futures_util::stream::pending())
+                .boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
     // Build a task over a gated script, subscribe, THEN release the gate, and collect
     // every frame the task forwards until its (finite) event stream drains. Subscribing
     // before releasing is what makes the collection deterministic — see
@@ -7627,6 +7679,134 @@ mod pump_tests {
         assert!(
             last_progress < finish,
             "the settled card must be forwarded before the turn's Finish, got {seq:?}"
+        );
+    }
+
+    /// The idle scanner reads `live_background_tasks()` to keep from killing an
+    /// agent whose background work outlives its turn (five real IdleTimeout
+    /// misfires over 2026-08-08..10, each cutting down a 10-45 min gate run).
+    /// A declared background card that survives its launch turn must be counted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_background_card_counts_as_live_background_task() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_bash".into(),
+                name: "Bash".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"command": "sleep 900", "run_in_background": true}),
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-bash".into(),
+                label: Some("local_bash".into()),
+                status: SubagentStatus::Running,
+                parent_ref: Some("toolu_bash".into()),
+                kind: Some(SubagentTaskKind::Other),
+            }),
+            // Clean turn end: the background card survives it (that is the
+            // whole point of #732) — and must keep the agent counted busy.
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+        ];
+        let gate = Arc::new(tokio::sync::Notify::new());
+        // Held-open stream: the background task is still "running", so the
+        // backend must not close (teardown settles cards and zeroes the count).
+        let backend: Arc<dyn SessionBackend> = Arc::new(HeldOpenScriptBackend {
+            script,
+            gate: gate.clone(),
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let _rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        gate.notify_one();
+
+        // The pump processes the script asynchronously; poll instead of racing it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::agent_task::IAgentTask::live_background_tasks(task.as_ref()) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "open background card never reflected in live_background_tasks"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Counterpart: the task's own terminal settles the card and the counter
+    /// must drop back to 0 — otherwise the idle scanner would protect the
+    /// agent forever and idle cleanup would never fire again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_card_terminal_clears_live_background_task() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let bash_env = |status: SubagentStatus, kind: Option<SubagentTaskKind>| {
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-bash".into(),
+                label: Some("local_bash".into()),
+                status,
+                parent_ref: Some("toolu_bash".into()),
+                kind,
+            })
+        };
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_bash".into(),
+                name: "Bash".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"command": "sleep 1", "run_in_background": true}),
+                parent_tool_use_id: None,
+            }),
+            bash_env(SubagentStatus::Running, Some(SubagentTaskKind::Other)),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+            // The out-of-turn terminal (task_notification on the wire).
+            bash_env(SubagentStatus::Completed, None),
+        ];
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
+            script,
+            gate: gate.clone(),
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        gate.notify_one();
+
+        // Drain to exhaustion: after the terminal the card is gone, the ticker
+        // disarms, and the stream quiesces. Require the card to have existed so
+        // the final 0 is a transition, not a vacuous default.
+        let mut saw_card = false;
+        while let Ok(Ok(ev)) = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+            if matches!(ev, AgentStreamEvent::WorkflowProgress(_)) {
+                saw_card = true;
+            }
+        }
+        assert!(saw_card, "the background card must have opened during the script");
+        assert_eq!(
+            crate::agent_task::IAgentTask::live_background_tasks(task.as_ref()),
+            0,
+            "a settled card must release the idle-scanner protection"
         );
     }
 

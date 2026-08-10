@@ -189,6 +189,11 @@ pub struct PluginCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_token: Option<String>,
 
+    // Slack
+    /// Slack app-level token (`xapp-`), used to open the Socket Mode connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_token: Option<String>,
+
     // Extensibility
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -210,6 +215,7 @@ impl PluginCredentials {
             && self.client_secret.is_none()
             && self.account_id.is_none()
             && self.bot_token.is_none()
+            && self.app_token.is_none()
             && self.extra.is_empty()
     }
 }
@@ -605,6 +611,7 @@ mod tests {
             client_secret: None,
             account_id: None,
             bot_token: None,
+            app_token: None,
             extra: HashMap::new(),
         };
         let json = serde_json::to_value(&creds).unwrap();
@@ -625,6 +632,7 @@ mod tests {
             client_secret: None,
             account_id: None,
             bot_token: None,
+            app_token: None,
             extra: HashMap::new(),
         };
         let json = serde_json::to_value(&creds).unwrap();
@@ -1030,6 +1038,7 @@ mod tests {
                 client_secret: None,
                 account_id: None,
                 bot_token: None,
+                app_token: None,
                 extra: HashMap::new(),
             },
             config: Some(PluginConfigOptions {

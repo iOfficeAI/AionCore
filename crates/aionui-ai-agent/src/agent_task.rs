@@ -56,6 +56,15 @@ pub trait IAgentTask: Send + Sync {
     /// Timestamp (ms) of the last activity (message send, event received).
     fn last_activity_at(&self) -> TimestampMs;
 
+    /// Number of live (declared, not yet terminal) background containers —
+    /// workflows, background bashes, background subagents. These outlive their
+    /// launching turn by design and emit no mid-flight frames, so `status` and
+    /// `last_activity_at` alone misread a busy agent as idle. Backends without
+    /// a background-task subsystem report 0.
+    fn live_background_tasks(&self) -> usize {
+        0
+    }
+
     /// Subscribe to the agent's stream event channel.
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent>;
 
@@ -228,6 +237,12 @@ impl AgentInstance {
     /// Timestamp (ms) of the last activity.
     pub fn last_activity_at(&self) -> TimestampMs {
         self.as_task().last_activity_at()
+    }
+
+    /// Number of live background containers (workflows / background bashes /
+    /// background subagents) still in flight.
+    pub fn live_background_tasks(&self) -> usize {
+        self.as_task().live_background_tasks()
     }
 
     /// Subscribe to the stream event channel.
