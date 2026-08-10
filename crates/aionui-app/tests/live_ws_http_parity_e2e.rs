@@ -554,9 +554,7 @@ async fn run_backend_usage(backend: &str, expects_window_size: bool) {
         let stream = stream_frames_for(&snapshot, &conv_id);
         usage = stream
             .iter()
-            .filter(|f| f["data"]["type"] == "acp_context_usage")
-            .filter(|f| f["data"]["data"]["used"].as_u64().unwrap_or(0) > 0)
-            .next_back()
+            .rfind(|f| f["data"]["type"] == "acp_context_usage" && f["data"]["data"]["used"].as_u64().unwrap_or(0) > 0)
             .map(|f| f["data"]["data"].clone());
         if usage.is_some() && stream.iter().any(|f| f["data"]["type"] == "finish") {
             break;
@@ -1189,6 +1187,10 @@ async fn conversation_for(app: &LiveApp, backend: &str, label: &str) -> String {
 /// accepted (version-gated, see `claude_flags`), and codex's reasoning has
 /// already gone missing once behind a gateway that dropped summaries. Both
 /// failures look identical to the user — no card — and neither breaks a reply.
+#[expect(
+    dead_code,
+    reason = "kept for a host whose provider returns reasoning; see the note at its call site"
+)]
 async fn run_backend_thinking(backend: &str) {
     let app = start_live_app().await;
     let conv_id = conversation_for(&app, backend, "think").await;
