@@ -21,7 +21,7 @@ use aionui_db::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
     SqliteConversationRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    SqliteRemoteAgentRepository, SqliteSettingsRepository, UserStatus, UserType,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -187,6 +187,7 @@ pub struct ChannelOrchestratorComponents {
     pub manager: Arc<aionui_channel::manager::ChannelManager>,
     pub plugin_factory: Arc<aionui_channel::manager::PluginFactory>,
     pub owner_user_id: Option<String>,
+    pub restore_owner_user_ids: Vec<String>,
 }
 
 /// Build all default `ModuleStates` from application services.
@@ -305,6 +306,7 @@ pub async fn build_module_states(
         agent: build_module_state_phase(&boot, "agent", || AgentRouterState {
             agent_registry: services.agent_registry.clone(),
             service: agent_service,
+            require_host_admin: !services.identity_mode.is_local(),
         }),
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
@@ -396,7 +398,10 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
         },
         services.data_dir.clone(),
     ));
-    AssistantRouterState { service }
+    AssistantRouterState {
+        service,
+        require_host_admin: !services.identity_mode.is_local(),
+    }
 }
 
 /// Build the default `SystemRouterState` from application services.
@@ -417,7 +422,8 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
     SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),
         client_pref_service,
-        provider_service: ProviderService::new(provider_repo.clone(), encryption_key),
+        provider_service: ProviderService::new(provider_repo.clone(), encryption_key)
+            .with_share_repo(services.share_repo.clone()),
         model_fetch_service: ModelFetchService::new(provider_repo, encryption_key, http_client.clone()),
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
         version_check_service: VersionCheckService::new(http_client, env!("CARGO_PKG_VERSION").to_owned()),
@@ -455,6 +461,7 @@ pub fn build_remote_agent_state(services: &AppServices) -> RemoteAgentRouterStat
     let repo = Arc::new(SqliteRemoteAgentRepository::new(pool));
     RemoteAgentRouterState {
         service: Arc::new(RemoteAgentService::new(repo, encryption_key)),
+        require_host_admin: !services.identity_mode.is_local(),
     }
 }
 
@@ -469,7 +476,14 @@ pub fn build_connection_test_state() -> ConnectionTestRouterState {
 pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, RouterBuildError> {
     let broadcaster = services.event_bus.clone();
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
-    let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
+    let file_service = if services.identity_mode.is_local() {
+        Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()))
+    } else {
+        Arc::new(FileService::new_user_session(
+            broadcaster.clone(),
+            allowed_roots.clone(),
+        ))
+    };
     let snapshot_service = Arc::new(SnapshotService::new());
     // Shell-backed capabilities for `/api/fs/reveal` (open enclosing folder) and
     // `/api/fs/open-system` (open with the default application): adapters over one
@@ -601,6 +615,34 @@ async fn startup_channel_owner_user_id(services: &AppServices) -> Option<String>
     Some(owner_user_id)
 }
 
+async fn startup_channel_restore_owner_user_ids(services: &AppServices) -> Vec<String> {
+    if services.identity_mode == IdentityMode::AionPro {
+        return Vec::new();
+    }
+
+    match services.user_repo.list_users().await {
+        Ok(users) => {
+            let mut owner_user_ids = users
+                .into_iter()
+                .filter(|user| user.user_type == UserType::Local && user.status == UserStatus::Active)
+                .map(|user| user.id)
+                .collect::<Vec<_>>();
+            owner_user_ids.sort();
+            owner_user_ids.dedup();
+            owner_user_ids
+        }
+        Err(error) => {
+            tracing::warn!(
+                code = "BOOTSTRAP_DEGRADED_CHANNEL_OWNER_DISCOVERY",
+                stage = "channel.restore.owners",
+                error = %error,
+                "failed to discover channel plugin owners"
+            );
+            startup_channel_owner_user_id(services).await.into_iter().collect()
+        }
+    }
+}
+
 /// Build the default `ChannelRouterState` and orchestrator components.
 pub async fn build_channel_state(
     services: &AppServices,
@@ -637,6 +679,7 @@ pub async fn build_channel_state(
     // Build channel settings service for per-plugin agent/model configuration.
     let channel_settings = build_channel_settings_service(services, generated_assistant_materializer);
     let startup_owner_user_id = startup_channel_owner_user_id(services).await;
+    let restore_owner_user_ids = startup_channel_restore_owner_user_ids(services).await;
 
     // Build orchestrator dependencies
     let action_executor = Arc::new(aionui_channel::action::ActionExecutor::new(
@@ -663,6 +706,8 @@ pub async fn build_channel_state(
         plugin_factory: Arc::clone(&plugin_factory),
         settings_service: channel_settings,
         extension_registry,
+        #[cfg(feature = "weixin")]
+        weixin_login_coordinator: Arc::new(aionui_channel::plugins::weixin::WeixinLoginCoordinator::new()),
     };
 
     let components = ChannelOrchestratorComponents {
@@ -672,6 +717,7 @@ pub async fn build_channel_state(
         manager,
         plugin_factory,
         owner_user_id: startup_owner_user_id,
+        restore_owner_user_ids,
     };
 
     (state, components)
@@ -782,8 +828,9 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         services.skill_paths.clone(),
         services.skill_repo.clone(),
     ));
+    let conversation_workspace_root = services.conversation_workspace_root();
     let conv_service = ConversationService::new(
-        services.work_dir.clone(),
+        conversation_workspace_root.clone(),
         services.event_bus.clone(),
         skill_resolver,
         services.worker_task_manager.clone(),
@@ -811,7 +858,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         services.worker_task_manager.clone(),
         conv_repo,
         Arc::new(conv_service.clone()),
-        services.work_dir.clone(),
+        conversation_workspace_root,
         services.data_dir.clone(),
         services.event_bus.clone(),
         services.agent_registry.clone(),
@@ -852,6 +899,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     CronRouterState {
         cron_service,
         conversation_service: conv_service,
+        allow_system_resume_http: services.identity_mode.is_local(),
     }
 }
 
@@ -888,6 +936,7 @@ pub fn build_shell_state(services: &AppServices) -> ShellRouterState {
         ))),
         stt_service: Arc::new(aionui_shell::SttService::new(reqwest::Client::new())),
         client_pref_service,
+        require_host_admin: !services.identity_mode.is_local(),
     }
 }
 
@@ -959,7 +1008,15 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
             if identity_mode == IdentityMode::AionPro && user.user_type != aionui_db::UserType::Aionpro {
                 return None;
             }
-            (payload.session_generation == user.session_generation).then_some(user.id)
+            if payload.session_generation != user.session_generation || user.must_change_password {
+                return None;
+            }
+            if let Some(session_id) = payload.session_id.as_deref()
+                && !user_repo.is_auth_session_active(session_id, &user.id).await.ok()?
+            {
+                return None;
+            }
+            Some(user.id)
         })
     });
 
@@ -1185,6 +1242,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_restore_discovers_every_active_local_owner() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+        let active = services
+            .user_repo
+            .create_user("active-channel-owner", "hash")
+            .await
+            .unwrap();
+        let disabled = services
+            .user_repo
+            .create_user("disabled-channel-owner", "hash")
+            .await
+            .unwrap();
+        services
+            .user_repo
+            .set_status(&disabled.id, UserStatus::Disabled)
+            .await
+            .unwrap();
+
+        let owner_user_ids = startup_channel_restore_owner_user_ids(&services).await;
+
+        assert!(owner_user_ids.contains(&"system_default_user".to_string()));
+        assert!(owner_user_ids.contains(&active.id));
+        assert!(!owner_user_ids.contains(&disabled.id));
+        assert!(owner_user_ids.windows(2).all(|pair| pair[0] < pair[1]));
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn channel_restore_is_disabled_for_aionpro_identity() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let config = AppConfig {
+            identity_mode: IdentityMode::AionPro,
+            bootstrap_secret: Some("bootstrap-secret".to_owned()),
+            ..AppConfig::default()
+        };
+        let services = AppServices::from_config(db, &config).await.unwrap();
+
+        assert!(startup_channel_restore_owner_user_ids(&services).await.is_empty());
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
     async fn build_channel_message_service_uses_app_conversation_service_for_assistant_bindings() {
         let db = aionui_db::init_database_memory().await.unwrap();
         let services = AppServices::from_config(db, &AppConfig::default())
@@ -1272,6 +1374,9 @@ mod tests {
         let config = AppConfig {
             data_dir: tmp.path().join("data"),
             work_dir: tmp.path().join("work"),
+            local: true,
+            identity_mode: IdentityMode::Local,
+            local_client_secret: Some("abcdefghijklmnopqrstuvwxyzABCDEFGH012345678".to_string()),
             ..Default::default()
         };
         let db = aionui_db::init_database_memory().await.unwrap();

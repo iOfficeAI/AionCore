@@ -9,7 +9,7 @@ mod context;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_db::{IMcpServerRepository, IProviderRepository};
+use aionui_db::{IMcpServerRepository, IProviderRepository, IUserRepository, SiteRole};
 use aionui_realtime::EventBroadcaster;
 use futures_util::FutureExt;
 
@@ -27,6 +27,8 @@ use crate::types::BuildTaskOptions;
 pub struct AgentFactoryDeps {
     pub skill_manager: Arc<AcpSkillManager>,
     pub provider_repo: Arc<dyn IProviderRepository>,
+    /// Live user records used to enforce the hosted-runtime trust boundary.
+    pub user_repo: Arc<dyn IUserRepository>,
     pub encryption_key: [u8; 32],
     pub agent_registry: Arc<AgentRegistry>,
     pub acp_agent_service: Arc<AcpSessionSyncService>,
@@ -41,6 +43,10 @@ pub struct AgentFactoryDeps {
     /// inject enabled servers into `session/new` (ELECTRON-1JG fix).
     /// `None` for tests/composition paths that do not need MCP injection.
     pub mcp_server_repo: Option<Arc<dyn IMcpServerRepository>>,
+    /// In hosted WebUI mode, only live local administrators may start agents
+    /// with host-process or unrestricted filesystem tools. Members retain the
+    /// built-in conversational agent with its tool surface disabled.
+    pub restrict_member_host_tools: bool,
     /// Subprocess spawner for the clean-slate session model. claude/codex always
     /// run through `SessionAgentTask` (direct-CLI) instead of the ACP manager, so
     /// the spawner is unconditionally wired — there is no fallback to the ACP path.
@@ -73,14 +79,36 @@ pub fn build_agent_factory(deps: AgentFactoryDeps) -> AgentFactory {
     })
 }
 
+fn can_run_host_tools(restrict_member_host_tools: bool, site_role: SiteRole) -> bool {
+    !restrict_member_host_tools || site_role == SiteRole::Admin
+}
+
 async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, AgentError> {
     let context = options.context;
     let ctx = FactoryContext::resolve(&context).await?;
     let model = context.model.clone();
+    let host_tools_allowed = if deps.restrict_member_host_tools {
+        let user = deps
+            .user_repo
+            .find_active_by_id(&ctx.user_id)
+            .await
+            .map_err(|error| AgentError::internal(format!("Failed to authorize agent runtime: {error}")))?
+            .ok_or_else(|| AgentError::unauthorized("Active user required for agent runtime"))?;
+        can_run_host_tools(true, user.site_role)
+    } else {
+        true
+    };
     match context.kind {
-        AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx).await,
-        AgentSessionKind::Aionrs(aionrs_context) => aionrs::build(deps, *aionrs_context, model, ctx).await,
-        AgentSessionKind::Antigravity(agy_context) => antigravity::build(deps, *agy_context, ctx).await,
+        AgentSessionKind::Aionrs(aionrs_context) => {
+            aionrs::build(deps, *aionrs_context, model, ctx, host_tools_allowed).await
+        }
+        AgentSessionKind::Acp(acp_context) if host_tools_allowed => acp::build(deps, *acp_context, ctx).await,
+        AgentSessionKind::Antigravity(agy_context) if host_tools_allowed => {
+            antigravity::build(deps, *agy_context, ctx).await
+        }
+        AgentSessionKind::Acp(_) | AgentSessionKind::Antigravity(_) => Err(AgentError::forbidden(
+            "External agent runtimes are restricted to administrators in hosted multi-user mode",
+        )),
     }
 }
 
@@ -94,5 +122,12 @@ mod tests {
         let _: fn() -> AgentFactoryDeps = || {
             panic!("compile-time check only");
         };
+    }
+
+    #[test]
+    fn hosted_runtime_trusts_only_live_site_admins() {
+        assert!(can_run_host_tools(true, SiteRole::Admin));
+        assert!(!can_run_host_tools(true, SiteRole::Member));
+        assert!(can_run_host_tools(false, SiteRole::Member));
     }
 }

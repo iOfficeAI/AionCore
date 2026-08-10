@@ -107,11 +107,17 @@ impl Fixture {
 
     /// Send one request as `session` and wait for the actor's reply to it.
     async fn call_as(&self, session: &str, id: u64, method: &str, params: Value) -> Value {
+        self.call_as_user(session, "system_default_user", id, method, params)
+            .await
+    }
+
+    /// Send one request as a specific authenticated user and wait for its reply.
+    async fn call_as_user(&self, session: &str, user_id: &str, id: u64, method: &str, params: Value) -> Value {
         let before = self.push.sent.lock().expect("sink").len();
         self.inbound
             .send(ScmInbound::Frame {
                 session: session.to_owned(),
-                user_id: "system_default_user".to_owned(),
+                user_id: user_id.to_owned(),
                 frame: json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
             })
             .expect("actor alive");
@@ -563,6 +569,60 @@ async fn repositories_changed_reaches_only_interested_sessions() {
     assert!(
         !fx.pushed_to("conn-2", "scm/repositoriesChanged"),
         "an uninterested connection receives no repositoriesChanged frame"
+    );
+}
+
+/// A failed cross-account list must not register project interest as a side
+/// effect. Otherwise a guessed project id receives later repository metadata.
+#[tokio::test]
+async fn rejected_cross_account_list_does_not_receive_repository_changes() {
+    let fx = fixture().await;
+
+    let rejected = fx
+        .call_as_user(
+            "attacker-conn",
+            "other-user",
+            1,
+            "scm/listRepositories",
+            json!({ "project_id": fx.project_id }),
+        )
+        .await;
+    assert!(
+        rejected.get("error").is_some(),
+        "cross-account list is rejected: {rejected}"
+    );
+
+    let listed = fx
+        .call_as(
+            "owner-conn",
+            2,
+            "scm/listRepositories",
+            json!({ "project_id": fx.project_id }),
+        )
+        .await;
+    assert!(listed.get("result").is_some(), "owner can list repositories: {listed}");
+
+    let second_dir = tempfile::tempdir().expect("tempdir");
+    init_committed_repo(second_dir.path());
+    let before = fx.frame_count();
+    fx.service
+        .attach_folder(
+            "system_default_user",
+            AttachInput {
+                project_id: fx.project_id.clone(),
+                uri: to_file_uri(second_dir.path()).expect("uri"),
+                display_name: Some("Private repository".to_owned()),
+            },
+        )
+        .await
+        .expect("owner attach");
+
+    let _ = fx
+        .wait_for_notification("owner-conn", "scm/repositoriesChanged", before)
+        .await;
+    assert!(
+        !fx.pushed_to("attacker-conn", "scm/repositoriesChanged"),
+        "rejected cross-account interest must not receive repository metadata"
     );
 }
 

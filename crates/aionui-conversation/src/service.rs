@@ -40,7 +40,7 @@ use aionui_db::{
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
-use aionui_project::{ProjectService, ResolvedChatMessage, canonical};
+use aionui_project::{FileOp, ProjectError, ProjectService, ResolvedChatMessage, canonical};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
 use chrono::Datelike;
@@ -453,6 +453,64 @@ impl ConversationService {
         if let Ok(mut guard) = self.project_service.write() {
             *guard = Some(project_service);
         }
+    }
+
+    /// Validate a user-selected workspace against both runtime availability
+    /// and the active identity mode's filesystem boundary. Local desktop mode
+    /// intentionally retains host-path support; hosted sessions are confined
+    /// to the caller's managed root (plus the bootstrap operator workspace).
+    pub(crate) fn authorize_workspace_path(&self, user_id: &str, workspace: &str) -> Result<String, ConversationError> {
+        let normalized = normalize_workspace_path(workspace)?;
+        let project = self
+            .project_service
+            .read()
+            .map_err(|_| ConversationError::internal("Project filesystem policy is unavailable"))?
+            .clone();
+        let Some(project) = project else {
+            // Unit-level consumers predating project injection retain their
+            // existing local semantics. App composition always injects it.
+            return Ok(normalized);
+        };
+        project
+            .authorize_user_path(user_id, Path::new(&normalized), FileOp::Browse, false)
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(|error| match error {
+                ProjectError::UserFilesystemDenied => ConversationError::Forbidden {
+                    reason: "Workspace is outside the current user's managed filesystem".into(),
+                },
+                _ => ConversationError::WorkspacePathUnavailable { path: normalized },
+            })
+    }
+
+    /// Whether legacy desktop workspace browsing may follow directory
+    /// symlinks outside the selected root. Hosted sessions always fail closed.
+    pub(crate) fn allows_workspace_symlink_escape(&self) -> bool {
+        self.project_service
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .is_none_or(|project| project.allows_host_paths())
+    }
+
+    fn authorize_workspace_extra(&self, user_id: &str, extra: &mut serde_json::Value) -> Result<(), ConversationError> {
+        let Some(obj) = extra.as_object_mut() else {
+            return Ok(());
+        };
+        let Some(workspace) = obj
+            .get("workspace")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned)
+        else {
+            return Ok(());
+        };
+        if workspace.is_empty() {
+            return Ok(());
+        }
+        let authorized = self.authorize_workspace_path(user_id, &workspace)?;
+        if authorized != workspace {
+            obj.insert("workspace".to_owned(), serde_json::Value::String(authorized));
+        }
+        Ok(())
     }
 
     /// Project-bind side branch: resolve the owner's workspace into a
@@ -991,7 +1049,7 @@ impl ConversationService {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
         {
-            Some(workspace) => Some(normalize_workspace_path(workspace)?),
+            Some(workspace) => Some(self.authorize_workspace_path(user_id, workspace)?),
             None => None,
         };
         if let Some(workspace) = user_supplied_workspace.as_ref() {
@@ -2195,7 +2253,7 @@ impl ConversationService {
                 warn!("aionrs update: stripped legacy `extra.model` from merged extra");
             }
             if new_extra.get("workspace").is_some() {
-                normalize_workspace_extra(&mut existing_extra)?;
+                self.authorize_workspace_extra(user_id, &mut existing_extra)?;
             }
             Some(
                 serde_json::to_string(&existing_extra)
@@ -2319,7 +2377,7 @@ impl ConversationService {
             serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
         merge_json(&mut merged, &patch);
         if patch.get("workspace").is_some() {
-            normalize_workspace_extra(&mut merged)?;
+            self.authorize_workspace_extra(user_id, &mut merged)?;
         }
 
         let updates = ConversationRowUpdate {
@@ -4032,9 +4090,12 @@ impl ConversationService {
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let seed = self.load_aionrs_permission_seed(row).await?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options(row, seed)
-            .await
+        let options =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+                .build_options(row, seed)
+                .await?;
+        self.authorize_workspace_path(&row.user_id, &options.context.workspace.path)?;
+        Ok(options)
     }
 
     pub async fn build_task_options_for_runtime(
@@ -4044,9 +4105,12 @@ impl ConversationService {
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let seed = self.load_aionrs_permission_seed(row).await?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options_with_workspace_override(row, workspace_override, seed)
-            .await
+        let options =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+                .build_options_with_workspace_override(row, workspace_override, seed)
+                .await?;
+        self.authorize_workspace_path(&row.user_id, &options.context.workspace.path)?;
+        Ok(options)
     }
 
     /// Re-read the persisted resume anchor into a turn's `BuildTaskOptions`
@@ -4298,28 +4362,6 @@ fn backfill_cron_job_id_alias(extra: &mut serde_json::Value) -> bool {
     mutated
 }
 
-fn normalize_workspace_extra(extra: &mut serde_json::Value) -> Result<(), ConversationError> {
-    let Some(obj) = extra.as_object_mut() else {
-        return Ok(());
-    };
-    let Some(workspace) = obj
-        .get("workspace")
-        .and_then(|value| value.as_str())
-        .map(ToOwned::to_owned)
-    else {
-        return Ok(());
-    };
-    if workspace.is_empty() {
-        return Ok(());
-    }
-
-    let normalized = normalize_workspace_path(&workspace)?;
-    if normalized != workspace.as_str() {
-        obj.insert("workspace".to_owned(), serde_json::Value::String(normalized));
-    }
-    Ok(())
-}
-
 fn strip_request_owner_user_id(extra: &mut serde_json::Value) {
     if let Some(obj) = extra.as_object_mut() {
         obj.remove("user_id");
@@ -4389,7 +4431,7 @@ fn expected_auto_workspace_path(
 }
 
 fn auto_workspace_parent(workspace_root: &Path, user_id: &str) -> PathBuf {
-    let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
+    let dir = aionui_common::user_dir_name_or_fingerprint(user_id);
     let now = chrono::Local::now();
     workspace_root
         .join("conversations")

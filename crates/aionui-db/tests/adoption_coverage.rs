@@ -54,7 +54,13 @@ const NON_CORE_USER_ID_TABLES: &[(&str, &str)] = &[
 ];
 
 /// Identity / infrastructure tables outside the ownership model.
-const INFRA_TABLES: &[&str] = &["users", "_sqlx_migrations"];
+const INFRA_TABLES: &[&str] = &[
+    // Site-level identity administration history must remain append-only and
+    // is not adopted into any individual AionPro identity.
+    "admin_audit_log",
+    "users",
+    "_sqlx_migrations",
+];
 
 async fn table_names(pool: &sqlx::SqlitePool) -> Vec<String> {
     sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")

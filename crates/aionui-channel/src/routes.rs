@@ -44,6 +44,8 @@ pub struct ChannelRouterState {
     pub plugin_factory: Arc<PluginFactory>,
     pub settings_service: Arc<ChannelSettingsService>,
     pub extension_registry: ExtensionRegistry,
+    #[cfg(feature = "weixin")]
+    pub weixin_login_coordinator: Arc<crate::plugins::weixin::WeixinLoginCoordinator>,
 }
 
 fn db_error_to_api_error(err: DbError) -> ApiError {
@@ -684,7 +686,10 @@ async fn sync_channel_settings(
 
 /// `GET /api/channel/weixin/login` — start WeChat QR code login SSE stream.
 #[cfg(feature = "weixin")]
-async fn weixin_login_sse(State(_state): State<ChannelRouterState>) -> impl axum::response::IntoResponse {
+async fn weixin_login_sse(
+    State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
     use std::convert::Infallible;
 
     use axum::response::sse::{Event, KeepAlive, Sse};
@@ -692,9 +697,11 @@ async fn weixin_login_sse(State(_state): State<ChannelRouterState>) -> impl axum
     use tokio::sync::mpsc;
 
     use crate::plugins::weixin::WeixinLoginEvent;
-    use crate::plugins::weixin::weixin_login_stream;
 
-    let rx = weixin_login_stream();
+    let rx = state
+        .weixin_login_coordinator
+        .start(&user.id)
+        .map_err(weixin_login_start_error)?;
 
     let sse_stream = futures_util::stream::unfold(rx, |mut rx: mpsc::Receiver<WeixinLoginEvent>| async move {
         match rx.recv().await {
@@ -706,7 +713,35 @@ async fn weixin_login_sse(State(_state): State<ChannelRouterState>) -> impl axum
         }
     });
 
-    Sse::new(sse_stream).keep_alive(KeepAlive::default())
+    Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+}
+
+#[cfg(feature = "weixin")]
+fn weixin_login_start_error(error: crate::plugins::weixin::WeixinLoginStartError) -> ApiError {
+    use crate::plugins::weixin::WeixinLoginStartError;
+
+    match error {
+        WeixinLoginStartError::InProgress => ApiError::coded(
+            StatusCode::CONFLICT,
+            "WEIXIN_LOGIN_IN_PROGRESS",
+            "A WeChat QR login is already in progress for this user.",
+            None,
+        ),
+        WeixinLoginStartError::RateLimited { retry_after } => {
+            let retry_after_seconds = retry_after
+                .as_secs()
+                .saturating_add(u64::from(retry_after.subsec_nanos() > 0))
+                .max(1);
+            ApiError::coded(
+                StatusCode::TOO_MANY_REQUESTS,
+                "WEIXIN_LOGIN_RATE_LIMITED",
+                "Please wait before starting another WeChat QR login.",
+                Some(serde_json::json!({
+                    "retryAfterSeconds": retry_after_seconds,
+                })),
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -900,6 +935,27 @@ mod tests {
 
         assert_eq!(err.status_code(), StatusCode::CONFLICT);
         assert_eq!(err.error_code(), "CROSS_ACCOUNT_REFERENCE");
+    }
+
+    #[cfg(feature = "weixin")]
+    #[test]
+    fn active_weixin_login_maps_to_stable_conflict() {
+        let err = weixin_login_start_error(crate::plugins::weixin::WeixinLoginStartError::InProgress);
+
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "WEIXIN_LOGIN_IN_PROGRESS");
+    }
+
+    #[cfg(feature = "weixin")]
+    #[test]
+    fn repeated_weixin_login_maps_to_rate_limit_with_rounded_retry() {
+        let err = weixin_login_start_error(crate::plugins::weixin::WeixinLoginStartError::RateLimited {
+            retry_after: std::time::Duration::from_millis(1_001),
+        });
+
+        assert_eq!(err.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(err.error_code(), "WEIXIN_LOGIN_RATE_LIMITED");
+        assert_eq!(err.error_details().unwrap()["retryAfterSeconds"], 2);
     }
 
     #[test]

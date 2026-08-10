@@ -46,6 +46,7 @@ impl ProviderHealthCheckService {
         &self,
         user_id: &str,
         req: ProviderHealthCheckRequest,
+        host_access_allowed: bool,
     ) -> Result<ProviderHealthCheckResponse, AgentError> {
         if req.provider_id.trim().is_empty() {
             return Err(AgentError::bad_request("provider_id is required"));
@@ -64,6 +65,8 @@ impl ProviderHealthCheckService {
             .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;
 
         let config = self.resolve_probe_config(&row, model)?;
+        let effective_base_url = config.base_url.as_deref().unwrap_or(&row.base_url);
+        enforce_provider_runtime_access(host_access_allowed, &row.platform, effective_base_url).await?;
         run_probe(row.id, row.platform, config).await
     }
 
@@ -105,8 +108,22 @@ impl ProviderHealthCheckService {
             bedrock_config,
             runtime_env: Vec::new(),
             prompt_dump_dir: None,
+            tool_policy: aion_agent::tool_policy::ToolPolicy::allow_only(std::iter::empty::<String>()),
         })
     }
+}
+
+async fn enforce_provider_runtime_access(
+    host_access_allowed: bool,
+    platform: &str,
+    base_url: &str,
+) -> Result<(), AgentError> {
+    if host_access_allowed {
+        return Ok(());
+    }
+    aionui_system::validate_member_provider_runtime(platform, base_url)
+        .await
+        .map_err(|error| AgentError::bad_request(error.to_string()))
 }
 
 async fn run_probe(
@@ -341,16 +358,18 @@ mod tests {
     const TEST_KEY: [u8; 32] = [0xAB; 32];
     const TEST_USER_ID: &str = "user-1";
 
-    struct UnusedProviderRepository;
+    struct TestProviderRepository {
+        provider: Option<Provider>,
+    }
 
     #[async_trait::async_trait]
-    impl IProviderRepository for UnusedProviderRepository {
+    impl IProviderRepository for TestProviderRepository {
         async fn list(&self, _user_id: &str) -> Result<Vec<Provider>, DbError> {
             unreachable!("provider repo is not used by resolve_probe_config")
         }
 
         async fn find_by_id(&self, _user_id: &str, _id: &str) -> Result<Option<Provider>, DbError> {
-            unreachable!("provider repo is not used by resolve_probe_config")
+            Ok(self.provider.clone())
         }
 
         async fn create(&self, _params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
@@ -373,7 +392,7 @@ mod tests {
 
     fn test_service() -> ProviderHealthCheckService {
         ProviderHealthCheckService {
-            provider_repo: Arc::new(UnusedProviderRepository),
+            provider_repo: Arc::new(TestProviderRepository { provider: None }),
             encryption_key: TEST_KEY,
             data_dir: PathBuf::from("/tmp/aioncore-provider-health-test"),
         }
@@ -469,5 +488,61 @@ mod tests {
             classify_error("Health check timeout (30s)", true),
             ProviderHealthCheckErrorKind::Timeout
         );
+    }
+
+    #[tokio::test]
+    async fn hosted_member_health_probe_rejects_private_and_unapproved_endpoints() {
+        for (base_url, expected) in [
+            ("http://127.0.0.1:11434/v1", "private or local"),
+            ("https://attacker.example/v1", "approved WebUI member endpoint"),
+        ] {
+            let error = enforce_provider_runtime_access(false, "custom", base_url)
+                .await
+                .unwrap_err();
+            match error {
+                AgentError::BadRequest(message) => assert!(
+                    message.contains(expected),
+                    "{base_url} returned an unexpected rejection: {message}"
+                ),
+                other => panic!("{base_url} returned unexpected error: {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_member_health_check_blocks_private_provider_before_bootstrap() {
+        let mut provider = test_provider();
+        provider.platform = "custom".to_owned();
+        provider.base_url = "http://127.0.0.1:11434/v1".to_owned();
+        let service = ProviderHealthCheckService {
+            provider_repo: Arc::new(TestProviderRepository {
+                provider: Some(provider),
+            }),
+            encryption_key: TEST_KEY,
+            data_dir: PathBuf::from("/tmp/aioncore-provider-health-test"),
+        };
+
+        let error = service
+            .health_check(
+                TEST_USER_ID,
+                ProviderHealthCheckRequest {
+                    provider_id: "provider-1".to_owned(),
+                    model: "gpt-4o".to_owned(),
+                },
+                false,
+            )
+            .await
+            .unwrap_err();
+        match error {
+            AgentError::BadRequest(message) => assert!(message.contains("private or local")),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_local_health_probe_retains_private_provider_support() {
+        enforce_provider_runtime_access(true, "custom", "http://127.0.0.1:11434/v1")
+            .await
+            .unwrap();
     }
 }

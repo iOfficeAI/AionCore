@@ -1,13 +1,13 @@
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{ExternalUserProjection, User, UserStatus, UserType};
+use crate::models::{ExternalUserProjection, SiteRole, User, UserStatus, UserType};
 use crate::repository::IUserRepository;
 
 /// SQLite-backed implementation of [`IUserRepository`].
 #[derive(Clone, Debug)]
 pub struct SqliteUserRepository {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 impl SqliteUserRepository {
@@ -27,6 +27,17 @@ impl IUserRepository for SqliteUserRepository {
         .await?;
 
         Ok(row.0 > 0)
+    }
+
+    async fn has_usable_admin(&self) -> Result<bool, DbError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users \
+             WHERE user_type = 'local' AND site_role = 'admin' AND status = 'active' \
+               AND password_hash IS NOT NULL AND password_hash != ''",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count > 0)
     }
 
     async fn get_system_user(&self) -> Result<Option<User>, DbError> {
@@ -54,7 +65,8 @@ impl IUserRepository for SqliteUserRepository {
     async fn set_system_user_credentials(&self, username: &str, password_hash: &str) -> Result<(), DbError> {
         let now = aionui_common::now_ms();
         let result = sqlx::query(
-            "UPDATE users SET username = ?, password_hash = ?, updated_at = ? \
+            "UPDATE users SET username = ?, password_hash = ?, site_role = 'admin', \
+                 status = 'active', must_change_password = 0, updated_at = ? \
              WHERE id = 'system_default_user' AND user_type = 'local'",
         )
         .bind(username)
@@ -108,6 +120,8 @@ impl IUserRepository for SqliteUserRepository {
             avatar_path: None,
             jwt_secret: None,
             status: UserStatus::Active,
+            site_role: SiteRole::Member,
+            must_change_password: false,
             session_generation: 0,
             created_at: now,
             updated_at: now,
@@ -118,7 +132,7 @@ impl IUserRepository for SqliteUserRepository {
     async fn find_by_username(&self, username: &str) -> Result<Option<User>, DbError> {
         let user = sqlx::query_as::<_, User>(
             "SELECT * FROM users \
-             WHERE user_type = 'local' AND password_hash IS NOT NULL AND username = ?",
+             WHERE user_type = 'local' AND status = 'active' AND password_hash IS NOT NULL AND username = ?",
         )
         .bind(username)
         .fetch_optional(&self.pool)
@@ -446,6 +460,77 @@ impl IUserRepository for SqliteUserRepository {
             .await?;
 
         Ok(generation)
+    }
+
+    async fn create_auth_session(&self, user_id: &str, expires_at: i64) -> Result<String, DbError> {
+        let id = aionui_common::generate_prefixed_id("session");
+        let now = aionui_common::now_ms();
+        sqlx::query(
+            "INSERT INTO auth_sessions (id, user_id, created_at, last_seen_at, expires_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(now)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    async fn is_auth_session_active(&self, session_id: &str, user_id: &str) -> Result<bool, DbError> {
+        let now = aionui_common::now_ms();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM auth_sessions \
+             WHERE id = ? AND user_id = ? AND revoked_at IS NULL AND expires_at > ?",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count == 1)
+    }
+
+    async fn touch_auth_session(&self, session_id: &str, user_id: &str) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE auth_sessions SET last_seen_at = ? \
+             WHERE id = ? AND user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(aionui_common::now_ms())
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn revoke_auth_session(&self, session_id: &str, user_id: &str, reason: &str) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE auth_sessions SET revoked_at = COALESCE(revoked_at, ?), \
+                 revoke_reason = COALESCE(revoke_reason, ?) WHERE id = ? AND user_id = ?",
+        )
+        .bind(aionui_common::now_ms())
+        .bind(reason)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn revoke_all_auth_sessions(&self, user_id: &str, reason: &str) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE auth_sessions SET revoked_at = ?, revoke_reason = ? \
+             WHERE user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(aionui_common::now_ms())
+        .bind(reason)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 }
 

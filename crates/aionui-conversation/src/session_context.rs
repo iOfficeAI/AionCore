@@ -610,7 +610,7 @@ fn expected_auto_workspace_path(
 }
 
 fn auto_workspace_parent(workspace_root: &Path, user_id: &str) -> PathBuf {
-    let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
+    let dir = aionui_common::user_dir_name_or_fingerprint(user_id);
     let now = chrono::Local::now();
     workspace_root
         .join("conversations")

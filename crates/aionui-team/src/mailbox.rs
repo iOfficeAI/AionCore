@@ -135,7 +135,7 @@ impl Mailbox {
         if let Some(events) = &self.events
             && !ids.is_empty()
         {
-            let rows = self.repo.list_messages_by_ids(ids).await?;
+            let rows = self.repo.list_messages_by_ids(&self.user_id, team_id, ids).await?;
             for row in &rows {
                 let mut resp = mailbox_row_to_response(row);
                 resp.read = true;

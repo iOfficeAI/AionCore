@@ -56,6 +56,7 @@ struct MockPlugin {
     last_error: Option<String>,
     should_fail_init: bool,
     start_calls: Arc<AtomicUsize>,
+    stop_calls: Arc<AtomicUsize>,
 }
 
 impl MockPlugin {
@@ -67,6 +68,7 @@ impl MockPlugin {
             last_error: None,
             should_fail_init: false,
             start_calls: Arc::new(AtomicUsize::new(0)),
+            stop_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -104,6 +106,7 @@ impl ChannelPlugin for MockPlugin {
     }
 
     async fn stop(&mut self) -> Result<(), ChannelError> {
+        self.stop_calls.fetch_add(1, Ordering::SeqCst);
         self.status = PluginStatus::Stopping;
         self.status = PluginStatus::Stopped;
         Ok(())
@@ -199,15 +202,18 @@ fn make_no_impl_factory() -> PluginFactory {
     Box::new(|_pt| None)
 }
 
-fn make_counting_factory() -> (PluginFactory, Arc<AtomicUsize>) {
+fn make_lifecycle_counting_factory() -> (PluginFactory, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let start_calls = Arc::new(AtomicUsize::new(0));
-    let captured = Arc::clone(&start_calls);
+    let stop_calls = Arc::new(AtomicUsize::new(0));
+    let captured_start_calls = Arc::clone(&start_calls);
+    let captured_stop_calls = Arc::clone(&stop_calls);
     let factory = Box::new(move |pt| {
         let mut plugin = MockPlugin::new(pt);
-        plugin.start_calls = Arc::clone(&captured);
+        plugin.start_calls = Arc::clone(&captured_start_calls);
+        plugin.stop_calls = Arc::clone(&captured_stop_calls);
         Some(Box::new(plugin) as Box<dyn ChannelPlugin>)
     });
-    (factory, start_calls)
+    (factory, start_calls, stop_calls)
 }
 
 fn make_telegram_config() -> serde_json::Value {
@@ -455,7 +461,7 @@ async fn tp1_test_valid_credentials() {
 #[tokio::test]
 async fn test_plugin_initializes_without_starting_runtime() {
     let (mgr, _repo, _bc) = setup().await;
-    let (factory, start_calls) = make_counting_factory();
+    let (factory, start_calls, stop_calls) = make_lifecycle_counting_factory();
 
     let username = mgr
         .test_plugin("telegram", make_plugin_config(), &factory)
@@ -467,6 +473,11 @@ async fn test_plugin_initializes_without_starting_runtime() {
         start_calls.load(Ordering::SeqCst),
         0,
         "credential tests must not start long-running plugin runtime"
+    );
+    assert_eq!(
+        stop_calls.load(Ordering::SeqCst),
+        1,
+        "credential tests must always clean up the temporary plugin"
     );
 }
 

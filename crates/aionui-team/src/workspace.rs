@@ -3,6 +3,7 @@ use std::sync::Arc;
 use aionui_common::{WorkspacePathValidationError, validate_workspace_path_availability};
 use aionui_db::models::TeamRow;
 use aionui_db::{ITeamRepository, UpdateTeamParams};
+use aionui_project::{FileOp, ProjectError, ProjectService};
 use tracing::warn;
 
 use crate::error::TeamError;
@@ -34,25 +35,47 @@ fn usable_runtime_workspace(workspace: &str) -> Option<String> {
 pub(crate) struct TeamWorkspaceResolver {
     repo: Arc<dyn ITeamRepository>,
     conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+    project_service: Option<Arc<ProjectService>>,
 }
 
 impl TeamWorkspaceResolver {
     pub(crate) fn new(
         repo: Arc<dyn ITeamRepository>,
         conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+        project_service: Option<Arc<ProjectService>>,
     ) -> Self {
         Self {
             repo,
             conversation_port,
+            project_service,
         }
     }
 
-    pub(crate) async fn resolve_for_new_agent(&self, row: &TeamRow, team: &Team) -> Result<String, TeamError> {
-        if let Some(workspace) = usable_runtime_workspace(row.workspace.trim()) {
+    fn authorize_runtime_workspace(&self, user_id: &str, workspace: &str) -> Result<String, TeamError> {
+        let workspace = validate_runtime_workspace_path(workspace)?;
+        let Some(project_service) = &self.project_service else {
             return Ok(workspace);
+        };
+        project_service
+            .authorize_user_path(user_id, std::path::Path::new(&workspace), FileOp::Browse, false)
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(|error| match error {
+                ProjectError::UserFilesystemDenied => {
+                    TeamError::Forbidden("Workspace is outside the current user's managed filesystem".into())
+                }
+                _ => TeamError::WorkspacePathRuntimeUnavailable(workspace),
+            })
+    }
+
+    pub(crate) async fn resolve_for_new_agent(&self, row: &TeamRow, team: &Team) -> Result<String, TeamError> {
+        match self.authorize_runtime_workspace(&row.user_id, row.workspace.trim()) {
+            Ok(workspace) => return Ok(workspace),
+            Err(error @ TeamError::Forbidden(_)) => return Err(error),
+            Err(_) => {}
         }
 
         if let Some(leader_workspace) = self.resolve_from_leader(team).await? {
+            let leader_workspace = self.authorize_runtime_workspace(&row.user_id, &leader_workspace)?;
             self.write_team_workspace(&row.id, &leader_workspace).await?;
             warn!(
                 team_id = %row.id,
@@ -66,7 +89,7 @@ impl TeamWorkspaceResolver {
             .conversation_port
             .create_team_temp_workspace(&row.user_id, &row.id)
             .await?;
-        let workspace = validate_runtime_workspace_path(&workspace)?;
+        let workspace = self.authorize_runtime_workspace(&row.user_id, &workspace)?;
         self.write_team_workspace(&row.id, &workspace).await?;
         self.patch_leader_workspace_best_effort(&row.id, team, &workspace).await;
         warn!(

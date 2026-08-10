@@ -14,6 +14,7 @@ async fn conversation_workspace_uses_work_dir() {
         data_dir: data_dir.path().to_path_buf(),
         work_dir: work_dir.path().to_path_buf(),
         local: true,
+        local_client_secret: Some("abcdefghijklmnopqrstuvwxyzABCDEFGH012345678".to_string()),
         ..Default::default()
     };
     let services = AppServices::from_config(db, &config).await.unwrap();
@@ -52,6 +53,7 @@ async fn user_specified_workspace_is_not_overridden() {
         data_dir: data_dir.path().to_path_buf(),
         work_dir: work_dir.path().to_path_buf(),
         local: true,
+        local_client_secret: Some("abcdefghijklmnopqrstuvwxyzABCDEFGH012345678".to_string()),
         ..Default::default()
     };
     let services = AppServices::from_config(db, &config).await.unwrap();
@@ -86,6 +88,7 @@ async fn workspace_defaults_to_data_dir_when_work_dir_equals_data_dir() {
         data_dir: data_dir.path().to_path_buf(),
         work_dir: data_dir.path().to_path_buf(),
         local: true,
+        local_client_secret: Some("abcdefghijklmnopqrstuvwxyzABCDEFGH012345678".to_string()),
         ..Default::default()
     };
     let services = AppServices::from_config(db, &config).await.unwrap();

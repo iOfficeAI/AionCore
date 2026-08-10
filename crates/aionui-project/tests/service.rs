@@ -78,6 +78,24 @@ async fn create_temp_auto_uuid_yields_distinct_projects() {
 }
 
 #[tokio::test]
+async fn create_temp_rejects_a_basename_that_escapes_the_managed_root() {
+    let temp_root = tempfile::tempdir().unwrap();
+    let (svc, _store, _db) = harness(temp_root.path().to_path_buf()).await;
+    let escaped_name = format!("escape-{}", aionui_common::generate_short_id());
+
+    let error = svc
+        .create_temp("system_default_user", Some(format!("../{escaped_name}")))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        aionui_project::ProjectError::InvalidRelativePath { .. }
+    ));
+    assert!(!temp_root.path().parent().unwrap().join(escaped_name).exists());
+}
+
+#[tokio::test]
 async fn resolve_existing_classifies_temp_vs_standard_by_temp_root() {
     let temp_root = tempfile::tempdir().unwrap();
     let (svc, _store, _db) = harness(temp_root.path().to_path_buf()).await;

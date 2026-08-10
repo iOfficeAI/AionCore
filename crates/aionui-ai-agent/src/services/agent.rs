@@ -110,8 +110,11 @@ impl AgentService {
         &self,
         user_id: &str,
         req: ProviderHealthCheckRequest,
+        host_access_allowed: bool,
     ) -> Result<ProviderHealthCheckResponse, AgentError> {
-        self.provider_health.health_check(user_id, req).await
+        self.provider_health
+            .health_check(user_id, req, host_access_allowed)
+            .await
     }
 
     pub async fn set_agent_overrides(

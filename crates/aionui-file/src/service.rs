@@ -62,6 +62,7 @@ pub struct FileService {
     broadcaster: Arc<dyn EventBroadcaster>,
     /// Allowed root directories for path safety validation.
     allowed_roots: Vec<std::path::PathBuf>,
+    follow_directory_symlinks: bool,
     /// In-memory cache for `list_workspace_files`, keyed by canonical root.
     workspace_files_cache: DashMap<String, Vec<WorkspaceFlatFile>>,
 }
@@ -71,6 +72,19 @@ impl FileService {
         Self {
             broadcaster,
             allowed_roots,
+            follow_directory_symlinks: true,
+            workspace_files_cache: DashMap::new(),
+        }
+    }
+
+    /// Browser-session variant. Directory listings expose symlink entries but
+    /// never traverse a linked directory, which could otherwise enumerate a
+    /// target outside the caller's managed root after the parent was checked.
+    pub fn new_user_session(broadcaster: Arc<dyn EventBroadcaster>, allowed_roots: Vec<std::path::PathBuf>) -> Self {
+        Self {
+            broadcaster,
+            allowed_roots,
+            follow_directory_symlinks: false,
             workspace_files_cache: DashMap::new(),
         }
     }
@@ -117,15 +131,27 @@ impl FileService {
     async fn build_dir_tree(&self, dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileError> {
         let dir_owned = dir.to_path_buf();
         let root_owned = root.to_path_buf();
+        let follow_directory_symlinks = self.follow_directory_symlinks;
 
-        tokio::task::spawn_blocking(move || build_dir_tree_sync(&dir_owned, &root_owned))
-            .await
-            .map_err(|e| FileError::Internal(format!("directory listing task failed: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            build_dir_tree_sync_with_policy(&dir_owned, &root_owned, follow_directory_symlinks)
+        })
+        .await
+        .map_err(|e| FileError::Internal(format!("directory listing task failed: {e}")))?
     }
 }
 
 /// Synchronous directory tree builder (runs in blocking thread pool).
+#[cfg(test)]
 fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileError> {
+    build_dir_tree_sync_with_policy(dir, root, true)
+}
+
+fn build_dir_tree_sync_with_policy(
+    dir: &Path,
+    root: &Path,
+    follow_directory_symlinks: bool,
+) -> Result<Vec<DirOrFile>, FileError> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| FileError::BadRequest(format!("cannot read directory '{}': {e}", dir.display())))?;
 
@@ -135,6 +161,9 @@ fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileEr
         let entry = entry.map_err(|e| FileError::Internal(format!("error reading directory entry: {e}")))?;
 
         let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| FileError::Internal(format!("cannot read file type for '{}': {e}", path.display())))?;
         let metadata = entry
             .metadata()
             .map_err(|e| FileError::Internal(format!("cannot read metadata for '{}': {e}", path.display())))?;
@@ -144,11 +173,11 @@ fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileEr
         let full_path = strip_verbatim_prefix(&path.to_string_lossy());
         let relative_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
 
-        let is_dir = metadata.is_dir();
+        let is_dir = metadata.is_dir() && (follow_directory_symlinks || !file_type.is_symlink());
 
         // For directories, also read their immediate children
         let children = if is_dir {
-            read_children_sync(&path, root)?
+            read_children_sync(&path, root, follow_directory_symlinks)?
         } else {
             Vec::new()
         };
@@ -169,7 +198,7 @@ fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileEr
 }
 
 /// Read immediate children of a directory (one level, no grandchildren).
-fn read_children_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileError> {
+fn read_children_sync(dir: &Path, root: &Path, follow_directory_symlinks: bool) -> Result<Vec<DirOrFile>, FileError> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Ok(Vec::new()),
@@ -184,7 +213,9 @@ fn read_children_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileErr
         };
 
         let path = entry.path();
-        let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
+        let file_type = entry.file_type().ok();
+        let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false)
+            && (follow_directory_symlinks || !file_type.is_some_and(|kind| kind.is_symlink()));
 
         let name = entry.file_name().to_string_lossy().into_owned();
 
@@ -776,6 +807,17 @@ impl crate::traits::IFileService for FileService {
         data: &[u8],
         conversation_id: Option<&str>,
     ) -> Result<String, FileError> {
+        self.create_upload_file_in_root(&std::env::temp_dir().join("aionui"), file_name, data, conversation_id)
+            .await
+    }
+
+    async fn create_upload_file_in_root(
+        &self,
+        root: &Path,
+        file_name: &str,
+        data: &[u8],
+        conversation_id: Option<&str>,
+    ) -> Result<String, FileError> {
         if file_name.is_empty() {
             return Err(FileError::BadRequest("file name must not be empty".to_owned()));
         }
@@ -808,9 +850,10 @@ impl crate::traits::IFileService for FileService {
 
         let name = file_name.to_owned();
         let bytes = data.to_vec();
+        let root = root.to_path_buf();
 
         tokio::task::spawn_blocking(move || {
-            let mut dir = std::env::temp_dir().join("aionui");
+            let mut dir = root;
             if let Some(conv_id) = conv_id.as_deref() {
                 dir = dir.join(conv_id);
             } else {

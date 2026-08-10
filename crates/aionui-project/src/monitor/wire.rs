@@ -311,6 +311,7 @@ pub fn project_error_to_rpc(err: &ProjectError) -> (i64, &'static str) {
         ProjectError::ProjectExplorerNotFound { .. } | ProjectError::ProjectNotFound { .. } => {
             (CODE_OUT_OF_SCOPE, "out_of_scope")
         }
+        ProjectError::UserFilesystemDenied => (CODE_OUT_OF_SCOPE, "out_of_scope"),
         ProjectError::InvalidRelativePath { .. } => (CODE_INVALID_RELATIVE_PATH, "invalid_relative_path"),
         ProjectError::ResourceOutsideFolder { .. } => (CODE_RESOURCE_OUTSIDE_FOLDER, "resource_outside_folder"),
         ProjectError::UnsupportedResourceScheme { .. } => {

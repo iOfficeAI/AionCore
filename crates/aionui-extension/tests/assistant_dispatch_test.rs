@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use aionui_api_types::{ApiResponse, AssistantSource, SkillImportLimitsResponse};
 use aionui_auth::CurrentUser;
-use aionui_db::{UserStatus, UserType};
+use aionui_db::{SiteRole, UserStatus, UserType};
 use aionui_extension::classifier::{AssistantClassifier, AssistantRuleDispatcher};
 use aionui_extension::error::ExtensionError;
 use aionui_extension::external_paths::ExternalPathsManager;
@@ -179,6 +179,8 @@ async fn router_with_dispatcher(dispatcher: Arc<FakeDispatcher>) -> axum::Router
         username: "user-current".into(),
         user_type: UserType::Local,
         status: UserStatus::Active,
+        site_role: SiteRole::Member,
+        must_change_password: false,
     }))
 }
 

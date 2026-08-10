@@ -1,8 +1,8 @@
 //! Black-box tests for auth DTO serialization/deserialization.
 
 use aionui_api_types::{
-    AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser, QrLoginRequest,
-    RefreshTokenRequest,
+    AccountStatus, AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser, QrLoginRequest,
+    RefreshTokenRequest, UserRole,
 };
 
 // --- LoginRequest ---
@@ -48,6 +48,9 @@ fn login_response_serialization_matches_spec() {
         PublicUser {
             id: "auth_1712345678_abc".into(),
             username: "admin".into(),
+            role: UserRole::Admin,
+            status: AccountStatus::Active,
+            must_change_password: false,
         },
         "eyJhbGciOiJIUzI1NiJ9".into(),
     );

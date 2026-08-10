@@ -15,8 +15,8 @@ use tower::ServiceExt;
 
 use aionui_auth::CurrentUser;
 use aionui_db::{
-    SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
+    IProviderRepository, SiteRole, SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository,
+    SqliteProviderRepository, SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
 };
 use aionui_system::{
     ClientPrefService, FeedbackDiagnosticsService, ModelFetchService, ProtocolDetectionService, ProviderService,
@@ -81,6 +81,8 @@ fn get_request_for_user(user_id: &str, uri: &str) -> Request<Body> {
         username: user_id.to_owned(),
         user_type: UserType::Local,
         status: UserStatus::Active,
+        site_role: SiteRole::Admin,
+        must_change_password: false,
     });
     req
 }
@@ -90,6 +92,16 @@ fn json_request(method: &str, uri: &str, body: serde_json::Value) -> Request<Bod
 }
 
 fn json_request_for_user(user_id: &str, method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
+    json_request_for_user_with_role(user_id, method, uri, body, SiteRole::Admin)
+}
+
+fn json_request_for_user_with_role(
+    user_id: &str,
+    method: &str,
+    uri: &str,
+    body: serde_json::Value,
+    site_role: SiteRole,
+) -> Request<Body> {
     let mut req = Request::builder()
         .method(method)
         .uri(uri)
@@ -101,6 +113,8 @@ fn json_request_for_user(user_id: &str, method: &str, uri: &str, body: serde_jso
         username: user_id.to_owned(),
         user_type: UserType::Local,
         status: UserStatus::Active,
+        site_role,
+        must_change_password: false,
     });
     req
 }
@@ -120,6 +134,8 @@ fn delete_request_for_user(user_id: &str, uri: &str) -> Request<Body> {
         username: user_id.to_owned(),
         user_type: UserType::Local,
         status: UserStatus::Active,
+        site_role: SiteRole::Admin,
+        must_change_password: false,
     });
     req
 }
@@ -331,6 +347,35 @@ async fn create_provider_with_optional_fields() {
 }
 
 #[tokio::test]
+async fn member_cannot_create_bedrock_provider_with_host_profile() {
+    let (app, _db) = setup().await;
+    let body = json!({
+        "platform": "bedrock",
+        "name": "Host AWS profile",
+        "base_url": "",
+        "api_key": "",
+        "bedrock_config": {
+            "auth_method": "profile",
+            "region": "us-east-1",
+            "profile": "default"
+        }
+    });
+    let resp = app
+        .oneshot(json_request_for_user_with_role(
+            TEST_USER_ID,
+            "POST",
+            "/api/providers",
+            body,
+            SiteRole::Member,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "BAD_REQUEST");
+}
+
+#[tokio::test]
 async fn create_provider_persists_model_settings() {
     let (_app, db) = setup().await;
     let mut body = sample_create_body();
@@ -434,6 +479,70 @@ async fn create_provider_invalid_url() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn member_cannot_create_provider_targeting_private_network() {
+    let (app, _db) = setup().await;
+    for base_url in ["http://127.0.0.1:11434", "http://169.254.169.254/latest/meta-data"] {
+        let body = json!({
+            "platform": "openai",
+            "name": "Blocked provider",
+            "base_url": base_url,
+            "api_key": "sk-test"
+        });
+        let resp = app
+            .clone()
+            .oneshot(json_request_for_user_with_role(
+                TEST_USER_ID,
+                "POST",
+                "/api/providers",
+                body,
+                SiteRole::Member,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{base_url} must be blocked");
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "BAD_REQUEST");
+    }
+}
+
+#[tokio::test]
+async fn member_cannot_create_provider_on_unapproved_public_host() {
+    let (app, _db) = setup().await;
+    let body = json!({
+        "platform": "custom",
+        "name": "Unapproved relay",
+        "base_url": "https://api.example.com/v1",
+        "api_key": "sk-test"
+    });
+    let resp = app
+        .oneshot(json_request_for_user_with_role(
+            TEST_USER_ID,
+            "POST",
+            "/api/providers",
+            body,
+            SiteRole::Member,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "BAD_REQUEST");
+}
+
+#[tokio::test]
+async fn admin_can_create_provider_targeting_loopback() {
+    let (app, _db) = setup().await;
+    let body = json!({
+        "platform": "openai",
+        "name": "Local model server",
+        "base_url": "http://127.0.0.1:11434",
+        "api_key": "local-key"
+    });
+    let resp = app.oneshot(json_request("POST", "/api/providers", body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
 // ===========================================================================
 // PUT /api/providers/{id} — update
 // ===========================================================================
@@ -457,6 +566,67 @@ async fn update_provider_name() {
     let json = body_json(resp).await;
     assert_eq!(json["data"]["name"], "New Name");
     assert_eq!(json["data"]["platform"], "anthropic");
+}
+
+#[tokio::test]
+async fn member_cannot_update_provider_to_private_network() {
+    let (_app, db) = setup().await;
+    let (_, id) = create_one(&db).await;
+
+    let app = system_routes(build_state(&db));
+    let resp = app
+        .oneshot(json_request_for_user_with_role(
+            TEST_USER_ID,
+            "PUT",
+            &format!("/api/providers/{id}"),
+            json!({"base_url": "http://10.0.0.1:8080"}),
+            SiteRole::Member,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "BAD_REQUEST");
+
+    let stored = SqliteProviderRepository::new(db.pool().clone())
+        .find_by_id(TEST_USER_ID, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.base_url, "https://api.anthropic.com");
+}
+
+#[tokio::test]
+async fn member_cannot_retain_admin_created_private_provider_on_partial_update() {
+    let (app, _db) = setup().await;
+    let create = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/providers",
+            json!({
+                "platform": "custom",
+                "name": "Admin local model",
+                "base_url": "http://127.0.0.1:11434",
+                "api_key": "local-key"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let id = body_json(create).await["data"]["id"].as_str().unwrap().to_owned();
+
+    let update = app
+        .oneshot(json_request_for_user_with_role(
+            TEST_USER_ID,
+            "PUT",
+            &format!("/api/providers/{id}"),
+            json!({"name": "Still unsafe"}),
+            SiteRole::Member,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

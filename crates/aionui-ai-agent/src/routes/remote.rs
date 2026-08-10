@@ -16,13 +16,14 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, State};
 use axum::http::StatusCode;
+use axum::middleware::from_fn;
 use axum::routing::{get, post};
 
 use aionui_api_types::{
     ApiResponse, CreateRemoteAgentRequest, HandshakeResponse, RemoteAgentListItem, RemoteAgentResponse,
     TestRemoteAgentConnectionRequest, UpdateRemoteAgentRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, admin_required_middleware};
 use aionui_common::ApiError;
 
 use super::error_mapping::agent_error_to_api_error;
@@ -32,12 +33,23 @@ use super::state::RemoteAgentRouterState;
 ///
 /// All routes require authentication (applied by the caller).
 pub fn remote_agent_routes(state: RemoteAgentRouterState) -> Router {
-    Router::new()
-        .route("/api/remote-agents", get(list).post(create))
+    let personal_catalog = Router::new()
+        .route("/api/remote-agents", get(list))
+        .route("/api/remote-agents/{id}", get(get_one));
+
+    let connection_management = Router::new()
+        .route("/api/remote-agents", post(create))
         .route("/api/remote-agents/test-connection", post(test_connection))
-        .route("/api/remote-agents/{id}", get(get_one).put(update).delete(delete_one))
-        .route("/api/remote-agents/{id}/handshake", post(handshake))
-        .with_state(state)
+        .route("/api/remote-agents/{id}", axum::routing::put(update).delete(delete_one))
+        .route("/api/remote-agents/{id}/handshake", post(handshake));
+
+    let connection_management = if state.require_host_admin {
+        connection_management.route_layer(from_fn(admin_required_middleware))
+    } else {
+        connection_management
+    };
+
+    personal_catalog.merge(connection_management).with_state(state)
 }
 
 async fn list(

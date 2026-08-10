@@ -28,6 +28,7 @@ struct Fixture {
     token: String,
     csrf: String,
     data_dir: std::path::PathBuf,
+    managed_upload_root: std::path::PathBuf,
     _tmp: TempDir,
 }
 
@@ -86,12 +87,27 @@ async fn fixture_embedded() -> Fixture {
 
     let mut app = create_router_with_states(&services, states);
     let (token, csrf) = setup_and_login(&mut app, &services, "builtin-e2e", "StrongP@ss1").await;
+    sqlx::query("UPDATE users SET site_role = 'admin' WHERE username = ?")
+        .bind("builtin-e2e")
+        .execute(services.database.pool())
+        .await
+        .unwrap();
+    let user = services
+        .user_repo
+        .find_by_username("builtin-e2e")
+        .await
+        .unwrap()
+        .expect("test user should exist");
+    let managed_upload_root = data_dir
+        .join("uploads/users")
+        .join(aionui_common::user_dir_name(&user.id).unwrap());
 
     Fixture {
         app,
         token,
         csrf,
         data_dir,
+        managed_upload_root,
         _tmp: tmp,
     }
 }
@@ -253,7 +269,7 @@ async fn list_skills_builtin_entries_carry_relative_location() {
     let fx = fixture_embedded().await;
 
     // Seed one user skill so the merge is non-trivial.
-    let source_dir = fx.data_dir.join("import-source").join("my-custom");
+    let source_dir = fx.managed_upload_root.join("import-source").join("my-custom");
     std::fs::create_dir_all(&source_dir).unwrap();
     std::fs::write(
         source_dir.join("SKILL.md"),

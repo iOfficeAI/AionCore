@@ -7,6 +7,7 @@ edition.workspace = true
 aionui-common.workspace = true
 aionui-api-types.workspace = true
 aionui-auth.workspace = true
+aionui-db.workspace = true
 aionui-system.workspace = true
 aionui-runtime.workspace = true
 async-trait.workspace = true
@@ -27,7 +28,6 @@ tokio-tungstenite.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-aionui-db.workspace = true
 http-body-util.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true

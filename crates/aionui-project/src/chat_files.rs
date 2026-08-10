@@ -68,9 +68,9 @@ impl ProjectService {
     /// - `Project` → [`resolve_reference`](Self::resolve_reference) with the caller's `op` (lexical +
     ///   realpath containment; read paths pass `Read`, the write endpoint passes `Write`); must exist
     ///   (file or folder).
-    /// - `Upload` → an existing regular file under the managed `upload_root` (D2 invariant).
-    /// - `Local` → a canonicalized existing regular file; **no sandbox** (the host picker that
-    ///   produced it already exposes the whole filesystem).
+    /// - `Upload` → an existing regular file under the current user's managed upload root.
+    /// - `Local` → unrestricted only in embedded local mode; browser sessions are constrained
+    ///   to the current user's managed workspace and upload roots.
     ///
     /// `op` only affects the `Project` arm's containment mode; `Upload`/`Local` are path-based and
     /// identical regardless of op.
@@ -108,10 +108,23 @@ impl ProjectService {
                 if !candidate.is_file() {
                     return Err(ProjectError::ChatFileMissing { path: path.clone() });
                 }
-                if !path_within(upload_root, candidate) {
+                let effective_upload_root = if self.allows_host_paths() {
+                    upload_root.to_path_buf()
+                } else {
+                    self.user_upload_root(user_id)?
+                };
+                if !path_within(&effective_upload_root, candidate) {
                     return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
                 }
-                Ok(path.clone())
+                let canonical = std::fs::canonicalize(candidate)
+                    .map_err(|_| ProjectError::ChatFileMissing { path: path.clone() })?
+                    .to_string_lossy()
+                    .into_owned();
+                if self.allows_host_paths() {
+                    Ok(path.clone())
+                } else {
+                    Ok(canonical)
+                }
             }
             ChatFileRef::Local { path } => {
                 // A path the user explicitly picked in the host-file browser,
@@ -124,7 +137,8 @@ impl ProjectService {
                 if !canonical.is_file() {
                     return Err(ProjectError::LocalPathNotReadable { path: path.clone() });
                 }
-                Ok(canonical.to_string_lossy().into_owned())
+                let authorized = self.authorize_user_path(user_id, &canonical, op, true)?;
+                Ok(authorized.to_string_lossy().into_owned())
             }
         }
     }

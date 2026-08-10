@@ -16,7 +16,9 @@ use aionui_auth::{
     AuthIdentityMode, AuthRouterState, CookieConfig, JwtService, QrTokenStore, SessionRevokedHook, auth_routes,
     hash_password,
 };
-use aionui_db::{IUserRepository, SqliteUserRepository, UserStatus, init_database_memory};
+use aionui_db::{
+    IUserRepository, SqliteResourceShareRepository, SqliteUserRepository, UserStatus, init_database_memory,
+};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -42,7 +44,8 @@ async fn test_app_with_options_and_hook(
     session_revoked_hook: Option<Arc<SessionRevokedHook>>,
 ) -> (Router, TestContext) {
     let db = init_database_memory().await.unwrap();
-    let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let sqlite_user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone()));
+    let user_repo = sqlite_user_repo.clone() as Arc<dyn IUserRepository>;
     let jwt_service = Arc::new(JwtService::new("test_secret_for_routes".into()));
     let cookie_config = Arc::new(CookieConfig {
         secure: false,
@@ -50,9 +53,13 @@ async fn test_app_with_options_and_hook(
     });
     let qr_token_store = Arc::new(QrTokenStore::new());
 
+    let share_repo = Arc::new(SqliteResourceShareRepository::new(db.pool().clone()));
     let state = AuthRouterState {
         jwt_service: jwt_service.clone(),
         user_repo: user_repo.clone(),
+        admin_user_repo: sqlite_user_repo,
+        share_repo,
+        initial_admin_credentials_file: None,
         fs_adopter: None,
         cookie_config,
         qr_token_store: qr_token_store.clone(),
@@ -155,6 +162,16 @@ fn json_post_with_token(uri: &str, body: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn json_patch_with_token(uri: &str, body: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("PATCH")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(body.to_owned()))
+        .unwrap()
+}
+
 /// Helper: perform a GET request with auth token.
 fn get_with_token(uri: &str, token: &str) -> Request<Body> {
     Request::builder()
@@ -245,7 +262,7 @@ async fn t4_2_login_nonexistent_user() {
     let (app, _ctx) = test_app().await;
 
     let req = json_post("/login", r#"{"username":"ghost","password":"whatever"}"#);
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let json = body_json(resp).await;
@@ -349,6 +366,8 @@ async fn t5_1_logout_success() {
     let (mut app, ctx) = test_app().await;
     create_test_user(&ctx, "admin", "StrongP@ss1").await;
     let (token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+    let payload = ctx.jwt_service.verify(&token).unwrap();
+    let session_id = payload.session_id.clone().expect("persistent session id");
 
     let req = json_post_with_token("/logout", "", &token);
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -362,6 +381,12 @@ async fn t5_1_logout_success() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     assert_eq!(json["message"], "Logged out successfully");
+    assert!(
+        !ctx.user_repo
+            .is_auth_session_active(&session_id, &payload.user_id)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -516,9 +541,12 @@ async fn t8_1_change_password_success() {
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
+    let replacement = extract_session_token(&resp).expect("replacement session cookie");
+    assert_ne!(replacement, token);
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
-    assert_eq!(json["message"], "Password changed successfully");
+    assert_eq!(json["data"]["username"], "admin");
+    assert_eq!(json["data"]["must_change_password"], false);
 }
 
 #[tokio::test]
@@ -535,13 +563,18 @@ async fn t8_2_change_password_old_token_invalidated() {
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let replacement = extract_session_token(&resp).expect("replacement session cookie");
 
     // Old token should be invalid (JWT secret rotated)
     let req = get_with_token("/api/auth/user", &token);
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let json = body_json(resp).await;
     assert_eq!(json["code"], "UNAUTHORIZED");
+
+    let req = get_with_token("/api/auth/user", &replacement);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -557,9 +590,9 @@ async fn t8_3_change_password_wrong_current() {
     );
     let resp = app.oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json = body_json(resp).await;
-    assert_eq!(json["code"], "UNAUTHORIZED");
+    assert_eq!(json["code"], "INVALID_CURRENT_PASSWORD");
 }
 
 #[tokio::test]
@@ -640,7 +673,9 @@ async fn t9_1_refresh_token_success() {
 
     // New token should be valid
     let new_token = json["token"].as_str().unwrap();
-    assert!(ctx.jwt_service.verify(new_token).is_ok());
+    let old_payload = ctx.jwt_service.verify(&token).unwrap();
+    let new_payload = ctx.jwt_service.verify(new_token).unwrap();
+    assert_eq!(new_payload.session_id, old_payload.session_id);
 }
 
 #[tokio::test]
@@ -826,6 +861,92 @@ async fn qr_login_page_returns_html() {
     assert_eq!(resp.status(), StatusCode::OK);
     let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap();
     assert!(content_type.contains("text/html"));
+}
+
+#[tokio::test]
+async fn admin_created_member_must_change_password_then_cannot_access_admin_api() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "AdminP@ssword1").await;
+    let (admin_token, _) = login(&mut app, "admin", "AdminP@ssword1").await;
+
+    let response = app
+        .clone()
+        .oneshot(json_post_with_token(
+            "/api/admin/users",
+            r#"{"username":"member-one","role":"member"}"#,
+            &admin_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let json = body_json(response).await;
+    let temporary_password = json["data"]["temporary_password"].as_str().unwrap();
+    let (member_token, _) = login(&mut app, "member-one", temporary_password).await;
+
+    let response = app
+        .clone()
+        .oneshot(get_with_token("/api/admin/users", &member_token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "PASSWORD_CHANGE_REQUIRED");
+
+    let response = app
+        .clone()
+        .oneshot(json_post_with_token(
+            "/api/auth/change-password",
+            &format!(r#"{{"current_password":"{temporary_password}","new_password":"MemberP@ssword2"}}"#),
+            &member_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let replacement = extract_session_token(&response).unwrap();
+
+    let response = app
+        .oneshot(get_with_token("/api/admin/users", &replacement))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "ADMIN_REQUIRED");
+}
+
+#[tokio::test]
+async fn last_active_admin_role_change_is_rejected_and_audited_mutations_are_listed() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "AdminP@ssword1").await;
+    let (token, _) = login(&mut app, "admin", "AdminP@ssword1").await;
+
+    let response = app
+        .clone()
+        .oneshot(json_patch_with_token(
+            "/api/admin/users/system_default_user/role",
+            r#"{"role":"member"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(response).await["code"], "LAST_ACTIVE_ADMIN");
+
+    let response = app
+        .oneshot(get_with_token("/api/admin/audit?limit=50", &token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert!(json["data"]["items"].is_array());
+}
+
+#[tokio::test]
+async fn admin_routes_are_not_registered_in_local_mode() {
+    let (app, _ctx) = test_app_with_local(true).await;
+    let response = app
+        .oneshot(Request::builder().uri("/api/admin/users").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 // ===========================================================================

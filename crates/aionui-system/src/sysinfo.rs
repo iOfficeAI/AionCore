@@ -1,5 +1,7 @@
 use aionui_api_types::SystemInfoResponse;
 
+const REDACTED_PATH: &str = "[redacted]";
+
 /// Map Rust `std::env::consts::OS` to the Node.js-compatible platform name
 /// used by the API contract.
 fn map_platform() -> &'static str {
@@ -86,6 +88,15 @@ pub fn get_system_info() -> SystemInfoResponse {
     }
 }
 
+/// Build system information without exposing server filesystem paths.
+pub fn get_redacted_system_info() -> SystemInfoResponse {
+    let mut info = get_system_info();
+    info.cache_dir = REDACTED_PATH.to_owned();
+    info.work_dir = REDACTED_PATH.to_owned();
+    info.log_dir = REDACTED_PATH.to_owned();
+    info
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +120,16 @@ mod tests {
         assert!(!info.cache_dir.is_empty(), "cache_dir should not be empty");
         assert!(!info.work_dir.is_empty(), "work_dir should not be empty");
         assert!(!info.log_dir.is_empty(), "log_dir should not be empty");
+        assert!(!info.platform.is_empty());
+        assert!(!info.arch.is_empty());
+    }
+
+    #[test]
+    fn test_redacted_system_info_hides_host_paths() {
+        let info = get_redacted_system_info();
+        assert_eq!(info.cache_dir, REDACTED_PATH);
+        assert_eq!(info.work_dir, REDACTED_PATH);
+        assert_eq!(info.log_dir, REDACTED_PATH);
         assert!(!info.platform.is_empty());
         assert!(!info.arch.is_empty());
     }

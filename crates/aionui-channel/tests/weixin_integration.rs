@@ -213,6 +213,20 @@ mod weixin_tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn test_plugin_rejects_custom_api_origin_before_polling() {
+        let (manager, _repo, _bc) = setup().await;
+        let factory = weixin_factory();
+        let mut config = make_plugin_config(Some("tok_1"), Some("acc_1"));
+        config.credentials.extra.insert(
+            "baseUrl".into(),
+            serde_json::Value::String("http://169.254.169.254/latest/meta-data".into()),
+        );
+
+        let error = manager.test_plugin("weixin", config, &factory).await.unwrap_err();
+        assert!(error.to_string().contains("Custom WeChat API endpoints"));
+    }
+
     // -- EP-5: Invalid plugin type ------------------------------------------
 
     #[tokio::test]

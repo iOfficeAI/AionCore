@@ -1,10 +1,11 @@
 //! Bootstrap layers shared by non-MCP subcommands.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use tracing::info;
 
-use aionui_app::{AppConfig, IdentityMode};
+use aionui_app::{AppConfig, IdentityMode, parse_allowed_origins, validate_local_client_secret};
 use aionui_db::Database;
 
 use crate::cli::Cli;
@@ -49,7 +50,25 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
     let bootstrap_secret = std::env::var("AIONCORE_BOOTSTRAP_SECRET")
         .ok()
         .filter(|secret| !secret.is_empty());
-    validate_identity_environment(identity_mode, bootstrap_secret.as_deref())?;
+    let bootstrap_workspace = std::env::var_os("AIONUI_BOOTSTRAP_WORKSPACE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let allowed_origins_raw = std::env::var("AIONCORE_ALLOWED_ORIGINS").ok();
+    let allowed_origins = parse_allowed_origins(allowed_origins_raw.as_deref()).map_err(|error| {
+        BootstrapError::new(
+            BootstrapErrorCode::ConfigInvalid,
+            "config.allowed_origins",
+            "AIONCORE_ALLOWED_ORIGINS contains an invalid origin",
+        )
+        .with_field("reason", error)
+    })?;
+    let local_client_secret =
+        resolve_local_client_secret(identity_mode, std::env::var("AIONCORE_LOCAL_CLIENT_SECRET").ok())?;
+    validate_identity_environment(
+        identity_mode,
+        bootstrap_secret.as_deref(),
+        bootstrap_workspace.as_deref(),
+    )?;
 
     let config = AppConfig {
         host: cli.host.clone(),
@@ -60,6 +79,10 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         local: cli.local || identity_mode.is_local(),
         identity_mode,
         bootstrap_secret,
+        bootstrap_workspace,
+        bootstrap_initial_admin: identity_mode == IdentityMode::WebUi,
+        local_client_secret,
+        allowed_origins,
         dump_prompts: cli.dump_prompts,
         recover_corrupted_database: cli.recover_corrupted_database,
     };
@@ -71,6 +94,9 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
             "enabled"
         },
         bootstrap_secret_configured = config.bootstrap_secret.is_some(),
+        bootstrap_workspace_configured = config.bootstrap_workspace.is_some(),
+        allowed_origin_count = config.allowed_origins.len(),
+        local_client_secret_configured = config.local_client_secret.is_some(),
         "startup: identity mode resolved"
     );
 
@@ -80,15 +106,50 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
     })
 }
 
+fn resolve_local_client_secret(
+    identity_mode: IdentityMode,
+    secret: Option<String>,
+) -> Result<Option<String>, BootstrapError> {
+    if identity_mode == IdentityMode::Local {
+        let secret = secret.ok_or_else(|| {
+            BootstrapError::new(
+                BootstrapErrorCode::ConfigInvalid,
+                "config.local_client_secret",
+                "Local identity mode requires AIONCORE_LOCAL_CLIENT_SECRET",
+            )
+        })?;
+        validate_local_client_secret(&secret).map_err(|error| {
+            BootstrapError::new(
+                BootstrapErrorCode::ConfigInvalid,
+                "config.local_client_secret",
+                "AIONCORE_LOCAL_CLIENT_SECRET is invalid",
+            )
+            .with_field("reason", error)
+        })?;
+        Ok(Some(secret))
+    } else {
+        Ok(None)
+    }
+}
+
 fn validate_identity_environment(
     identity_mode: IdentityMode,
     bootstrap_secret: Option<&str>,
+    bootstrap_workspace: Option<&std::path::Path>,
 ) -> Result<(), BootstrapError> {
     if identity_mode == IdentityMode::AionPro && bootstrap_secret.is_none() {
         return Err(BootstrapError::new(
             BootstrapErrorCode::ConfigInvalid,
             "config.identity_mode",
             "AionPro identity mode requires AIONCORE_BOOTSTRAP_SECRET",
+        ));
+    }
+
+    if bootstrap_workspace.is_some_and(|path| !path.is_absolute()) {
+        return Err(BootstrapError::new(
+            BootstrapErrorCode::ConfigInvalid,
+            "config.bootstrap_workspace",
+            "AIONUI_BOOTSTRAP_WORKSPACE must be an absolute path",
         ));
     }
 
@@ -188,7 +249,7 @@ mod tests {
 
     #[test]
     fn aionpro_identity_requires_bootstrap_secret() {
-        let err = validate_identity_environment(IdentityMode::AionPro, None)
+        let err = validate_identity_environment(IdentityMode::AionPro, None, None)
             .expect_err("AionPro startup must require bootstrap secret");
 
         assert_eq!(err.code(), BootstrapErrorCode::ConfigInvalid);
@@ -197,15 +258,61 @@ mod tests {
 
     #[test]
     fn aionpro_identity_accepts_bootstrap_secret() {
-        validate_identity_environment(IdentityMode::AionPro, Some("secret"))
+        validate_identity_environment(IdentityMode::AionPro, Some("secret"), None)
             .expect("AionPro startup should accept configured bootstrap secret");
     }
 
     #[test]
     fn non_aionpro_identity_does_not_require_bootstrap_secret() {
-        validate_identity_environment(IdentityMode::WebUi, None)
+        validate_identity_environment(IdentityMode::WebUi, None, None)
             .expect("WebUI startup should not require bootstrap secret");
-        validate_identity_environment(IdentityMode::Local, None)
+        validate_identity_environment(IdentityMode::Local, None, None)
             .expect("local startup should not require bootstrap secret");
+    }
+
+    #[test]
+    fn bootstrap_workspace_must_be_absolute() {
+        let err = validate_identity_environment(
+            IdentityMode::WebUi,
+            None,
+            Some(std::path::Path::new("relative/workspace")),
+        )
+        .expect_err("relative bootstrap workspace must fail closed");
+
+        assert_eq!(err.code(), BootstrapErrorCode::ConfigInvalid);
+        assert_eq!(err.stage(), "config.bootstrap_workspace");
+    }
+
+    #[test]
+    fn local_identity_requires_a_valid_per_launch_client_secret() {
+        let missing = resolve_local_client_secret(IdentityMode::Local, None).unwrap_err();
+        assert_eq!(missing.code(), BootstrapErrorCode::ConfigInvalid);
+        assert_eq!(missing.stage(), "config.local_client_secret");
+
+        let invalid = resolve_local_client_secret(IdentityMode::Local, Some("too-short".to_string())).unwrap_err();
+        assert_eq!(invalid.code(), BootstrapErrorCode::ConfigInvalid);
+        assert_eq!(invalid.stage(), "config.local_client_secret");
+
+        assert_eq!(
+            resolve_local_client_secret(
+                IdentityMode::Local,
+                Some("abcdefghijklmnopqrstuvwxyzABCDEFGH012345678".to_string()),
+            )
+            .unwrap()
+            .as_deref(),
+            Some("abcdefghijklmnopqrstuvwxyzABCDEFGH012345678")
+        );
+    }
+
+    #[test]
+    fn non_local_identity_does_not_retain_the_local_client_secret() {
+        assert!(
+            resolve_local_client_secret(
+                IdentityMode::WebUi,
+                Some("abcdefghijklmnopqrstuvwxyzABCDEFGH012345678".to_string()),
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 }

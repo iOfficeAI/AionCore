@@ -7,7 +7,11 @@ use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{body_json, build_app, build_app_with_file_roots, json_with_token, setup_and_login};
+use common::{
+    body_json, build_app as build_secure_app, build_app_at, build_app_at_with_bootstrap_workspace,
+    build_app_with_file_roots, build_app_with_legacy_file_access as build_app, json_with_token, login_existing,
+    setup_and_login,
+};
 
 // ===========================================================================
 // Auth guard
@@ -15,7 +19,7 @@ use common::{body_json, build_app, build_app_with_file_roots, json_with_token, s
 
 #[tokio::test]
 async fn fs_endpoints_require_auth() {
-    let (app, _services) = build_app().await;
+    let (app, _services) = build_secure_app().await;
     let endpoints = [
         "/api/fs/content",
         "/api/fs/content/metadata",
@@ -56,6 +60,347 @@ async fn fs_endpoints_require_auth() {
             "expected 403 for unauthenticated {uri}"
         );
     }
+}
+
+#[tokio::test]
+async fn bootstrap_workspace_is_available_only_to_the_seeded_system_user() {
+    let root = tempfile::tempdir().unwrap();
+    let bootstrap = tempfile::tempdir().unwrap();
+    let secret = bootstrap.path().join("project").join("secret.txt");
+    std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+    std::fs::write(&secret, "bootstrap workspace").unwrap();
+
+    let (mut app, services) = build_app_at_with_bootstrap_workspace(root.path(), bootstrap.path()).await;
+    let (admin_token, admin_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let _ = setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
+    let member = services.user_repo.find_by_username("bob").await.unwrap().unwrap();
+    aionui_db::IAdminUserRepository::update_managed_role(
+        &aionui_db::SqliteUserRepository::new(services.database.pool().clone()),
+        &member.id,
+        aionui_db::SiteRole::Admin,
+        &aionui_db::AuditActor::system(),
+    )
+    .await
+    .unwrap();
+    let (member_token, member_csrf) = login_existing(&mut app, "bob", "StrongP@ss2").await;
+
+    let admin_request = json_with_token(
+        "POST",
+        "/api/fs/read",
+        json!({ "path": secret, "workspace": bootstrap.path() }),
+        &admin_token,
+        &admin_csrf,
+    );
+    let response = app.clone().oneshot(admin_request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["data"], "bootstrap workspace");
+
+    let member_request = json_with_token(
+        "POST",
+        "/api/fs/read",
+        json!({ "path": secret, "workspace": bootstrap.path() }),
+        &member_token,
+        &member_csrf,
+    );
+    let response = app.clone().oneshot(member_request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "user_filesystem_denied");
+
+    let admin = services.user_repo.find_by_username("admin").await.unwrap().unwrap();
+    services
+        .project_service
+        .resolve_existing(
+            &admin.id,
+            aionui_project::canonical::to_file_uri(bootstrap.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let member_result = services
+        .project_service
+        .resolve_existing(
+            &member.id,
+            aionui_project::canonical::to_file_uri(bootstrap.path()).unwrap(),
+        )
+        .await;
+    assert!(matches!(
+        member_result,
+        Err(aionui_project::ProjectError::UserFilesystemDenied)
+    ));
+
+    let member_workspace = services
+        .project_service
+        .user_workspace_root(&member.id)
+        .unwrap()
+        .join("private");
+    std::fs::create_dir_all(&member_workspace).unwrap();
+    let member_secret = member_workspace.join("member.txt");
+    std::fs::write(&member_secret, "other admin private data").unwrap();
+    assert!(!member_workspace.starts_with(bootstrap.path()));
+
+    let request = json_with_token(
+        "POST",
+        "/api/fs/read",
+        json!({ "path": member_secret, "workspace": member_workspace }),
+        &admin_token,
+        &admin_csrf,
+    );
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "user_filesystem_denied");
+}
+
+#[tokio::test]
+async fn bootstrap_workspace_rejects_nested_managed_user_roots() {
+    let bootstrap = tempfile::tempdir().unwrap();
+    let data_dir = bootstrap.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let database = aionui_db::init_database_memory().await.unwrap();
+    let config = aionui_app::AppConfig {
+        data_dir,
+        work_dir: bootstrap.path().to_path_buf(),
+        bootstrap_workspace: Some(bootstrap.path().to_path_buf()),
+        ..Default::default()
+    };
+
+    let error = match aionui_app::AppServices::from_config(database, &config).await {
+        Ok(_) => panic!("managed user roots below the bootstrap workspace must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("managed user filesystem roots"));
+}
+
+// ===========================================================================
+// WebUi multi-user filesystem boundary
+// ===========================================================================
+
+#[tokio::test]
+async fn webui_raw_paths_local_refs_and_snapshots_are_user_isolated() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_at(root.path()).await;
+    let (token_a, csrf_a) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token_b, _csrf_b) = setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
+    let user_a = services.user_repo.find_by_username("admin").await.unwrap().unwrap();
+    let user_b = services.user_repo.find_by_username("bob").await.unwrap().unwrap();
+
+    let workspace_a = services
+        .project_service
+        .user_workspace_root(&user_a.id)
+        .unwrap()
+        .join("workspace");
+    let workspace_b = services
+        .project_service
+        .user_workspace_root(&user_b.id)
+        .unwrap()
+        .join("workspace");
+    std::fs::create_dir_all(&workspace_a).unwrap();
+    std::fs::create_dir_all(&workspace_b).unwrap();
+    let file_a = workspace_a.join("a.txt");
+    let file_b = workspace_b.join("secret.txt");
+    std::fs::write(&file_a, "owned by a").unwrap();
+    std::fs::write(&file_b, "owned by b").unwrap();
+
+    let unmanaged = tempfile::tempdir().unwrap();
+    let unmanaged_result = services
+        .project_service
+        .resolve_existing(
+            &user_a.id,
+            aionui_project::canonical::to_file_uri(unmanaged.path()).unwrap(),
+        )
+        .await;
+    assert!(matches!(
+        unmanaged_result,
+        Err(aionui_project::ProjectError::UserFilesystemDenied)
+    ));
+
+    let own = json_with_token(
+        "POST",
+        "/api/fs/read",
+        json!({ "path": file_a.to_str().unwrap(), "workspace": workspace_a.to_str().unwrap() }),
+        &token_a,
+        &csrf_a,
+    );
+    let response = app.clone().oneshot(own).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["data"], "owned by a");
+
+    let foreign = json_with_token(
+        "POST",
+        "/api/fs/read",
+        json!({ "path": file_b.to_str().unwrap(), "workspace": workspace_b.to_str().unwrap() }),
+        &token_a,
+        &csrf_a,
+    );
+    let response = app.clone().oneshot(foreign).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "user_filesystem_denied");
+
+    let users_root = workspace_a.parent().unwrap().parent().unwrap();
+    let traversal = workspace_a
+        .join("..")
+        .join("..")
+        .join(workspace_b.strip_prefix(users_root).unwrap());
+    let traversal = traversal.join("secret.txt");
+    let request = json_with_token(
+        "POST",
+        "/api/fs/read",
+        json!({ "path": traversal.to_str().unwrap(), "workspace": workspace_a.to_str().unwrap() }),
+        &token_a,
+        &csrf_a,
+    );
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    #[cfg(unix)]
+    {
+        let link = workspace_a.join("escape-dir");
+        std::os::unix::fs::symlink(&workspace_b, &link).unwrap();
+        let request = json_with_token(
+            "POST",
+            "/api/fs/read",
+            json!({ "path": link.to_str().unwrap(), "workspace": workspace_a.to_str().unwrap() }),
+            &token_a,
+            &csrf_a,
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let request = json_with_token(
+            "POST",
+            "/api/fs/dir",
+            json!({ "dir": workspace_a.to_str().unwrap(), "root": workspace_a.to_str().unwrap() }),
+            &token_a,
+            &csrf_a,
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listing = body_json(response).await;
+        let link_entry = listing["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "escape-dir")
+            .unwrap();
+        assert_eq!(link_entry["is_dir"], false);
+        assert!(link_entry.get("children").is_none_or(serde_json::Value::is_null));
+        assert!(!listing.to_string().contains("owned by b"));
+
+        let foreign_target = workspace_b.join("created-through-link.txt");
+        let dangling_link = workspace_a.join("dangling-write.txt");
+        std::os::unix::fs::symlink(&foreign_target, &dangling_link).unwrap();
+        let request = json_with_token(
+            "POST",
+            "/api/fs/write",
+            json!({
+                "path": dangling_link.to_str().unwrap(),
+                "workspace": workspace_a.to_str().unwrap(),
+                "data": "must not escape"
+            }),
+            &token_a,
+            &csrf_a,
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!foreign_target.exists());
+    }
+
+    let local = json_with_token(
+        "POST",
+        "/api/fs/content",
+        json!({ "file": local_ref(&file_b), "encoding": "utf8" }),
+        &token_a,
+        &csrf_a,
+    );
+    let response = app.clone().oneshot(local).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let snapshot = json_with_token(
+        "POST",
+        "/api/fs/snapshot/init",
+        json!({ "workspace": workspace_b.to_str().unwrap() }),
+        &token_a,
+        &csrf_a,
+    );
+    let response = app.clone().oneshot(snapshot).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let project_b = services
+        .project_service
+        .resolve_existing(
+            &user_b.id,
+            aionui_project::canonical::to_file_uri(&workspace_b).unwrap(),
+        )
+        .await
+        .unwrap();
+    let project_ref = json!({
+        "kind": "project",
+        "pe_id": project_b.project_explorer.pe_id,
+        "relative_path": "secret.txt"
+    });
+    let request = json_with_token(
+        "POST",
+        "/api/fs/content",
+        json!({ "file": project_ref, "encoding": "utf8" }),
+        &token_a,
+        &csrf_a,
+    );
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // A second user's token is valid, proving the denials above are ownership
+    // failures rather than an authentication setup error.
+    let request = json_with_token(
+        "POST",
+        "/api/fs/read",
+        json!({ "path": file_b.to_str().unwrap(), "workspace": workspace_b.to_str().unwrap() }),
+        &token_b,
+        &_csrf_b,
+    );
+    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn webui_uploads_are_written_to_and_resolved_from_the_callers_root() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_at(root.path()).await;
+    let (token_a, csrf_a) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token_b, csrf_b) = setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
+    let user_a = services.user_repo.find_by_username("admin").await.unwrap().unwrap();
+
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "private.txt", "text/plain", b"private upload")
+        .add_text("conversation_id", "conversation-a")
+        .build();
+    let response = app
+        .clone()
+        .oneshot(upload_request(&content_type, body, &token_a, &csrf_a))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let upload_path = body_json(response).await["data"].as_str().unwrap().to_owned();
+    let expected_root = services.project_service.user_upload_root(&user_a.id).unwrap();
+    assert!(std::path::Path::new(&upload_path).starts_with(expected_root));
+
+    let upload_ref = json!({ "kind": "upload", "path": upload_path });
+    let own = json_with_token(
+        "POST",
+        "/api/fs/content",
+        json!({ "file": upload_ref.clone(), "encoding": "utf8" }),
+        &token_a,
+        &csrf_a,
+    );
+    let response = app.clone().oneshot(own).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["data"], "private upload");
+
+    let foreign = json_with_token(
+        "POST",
+        "/api/fs/content",
+        json!({ "file": upload_ref, "encoding": "utf8" }),
+        &token_b,
+        &csrf_b,
+    );
+    let response = app.oneshot(foreign).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 // ===========================================================================

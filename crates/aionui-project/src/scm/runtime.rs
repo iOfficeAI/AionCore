@@ -210,6 +210,20 @@ impl ScmRuntime {
             .insert(session.to_owned());
     }
 
+    /// Remove one session's interest in one project.
+    ///
+    /// Used when the actor's post-registration refresh discovers that the
+    /// project is no longer authorized. Normal interest remains session-lived.
+    pub(super) async fn unregister_interest(&self, session: &str, project_id: &str) {
+        let mut interest = self.project_interest.write().await;
+        if let Some(sessions) = interest.get_mut(project_id) {
+            sessions.remove(session);
+            if sessions.is_empty() {
+                interest.remove(project_id);
+            }
+        }
+    }
+
     /// Connections that should receive a project's `repositoriesChanged` frame.
     pub(super) async fn project_subscribers_of(&self, project_id: &str) -> Vec<String> {
         self.project_interest

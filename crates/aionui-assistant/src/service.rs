@@ -37,6 +37,15 @@ const BOOTSTRAP_RETRY_MAX_ATTEMPTS: u32 = 5;
 const BOOTSTRAP_RETRY_BACKOFF_MS: [u64; 4] = [50, 100, 200, 400];
 const DEFAULT_USER_ID: &str = "system_default_user";
 
+/// Controls whether a caller may import an assistant avatar from an arbitrary
+/// host filesystem path. Hosted members use [`Self::ManagedOnly`];
+/// local mode and trusted operators retain the legacy file-picker workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantAvatarPolicy {
+    AllowHostPaths,
+    ManagedOnly,
+}
+
 /// Whether an assistant error is transient SQLite busy/locked contention. Repos
 /// convert `DbError` into `AssistantError::Internal(other.to_string())`, so the
 /// service can only classify by text — reusing the same markers as
@@ -1062,6 +1071,16 @@ impl AssistantService {
         user_id: &str,
         req: CreateAssistantRequest,
     ) -> Result<AssistantResponse, AssistantError> {
+        self.create_for_user_with_avatar_policy(user_id, req, AssistantAvatarPolicy::AllowHostPaths)
+            .await
+    }
+
+    pub async fn create_for_user_with_avatar_policy(
+        &self,
+        user_id: &str,
+        req: CreateAssistantRequest,
+        avatar_policy: AssistantAvatarPolicy,
+    ) -> Result<AssistantResponse, AssistantError> {
         let name = req.name.trim().to_string();
         if name.is_empty() {
             return Err(AssistantError::BadRequest("name is required".into()));
@@ -1091,7 +1110,7 @@ impl AssistantService {
         };
         self.resolve_runtime_backend_for_agent_id(user_id, &resolved_agent_id)
             .await?;
-        let avatar = self.normalize_user_avatar_input(user_id, &id, req.avatar.as_deref())?;
+        let avatar = self.normalize_user_avatar_input(user_id, &id, req.avatar.as_deref(), avatar_policy)?;
         let params = CreateAssistantParams {
             id: &id,
             name: &name,
@@ -1132,6 +1151,17 @@ impl AssistantService {
         user_id: &str,
         id: &str,
         req: UpdateAssistantRequest,
+    ) -> Result<AssistantResponse, AssistantError> {
+        self.update_for_user_with_avatar_policy(user_id, id, req, AssistantAvatarPolicy::AllowHostPaths)
+            .await
+    }
+
+    pub async fn update_for_user_with_avatar_policy(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: UpdateAssistantRequest,
+        avatar_policy: AssistantAvatarPolicy,
     ) -> Result<AssistantResponse, AssistantError> {
         match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => {
@@ -1305,7 +1335,7 @@ impl AssistantService {
             .as_deref()
             .is_some_and(|agent_id| agent_id != current_definition.agent_id);
         let normalized_avatar = if req.avatar.is_some() {
-            Some(self.normalize_user_avatar_input(user_id, id, req.avatar.as_deref())?)
+            Some(self.normalize_user_avatar_input(user_id, id, req.avatar.as_deref(), avatar_policy)?)
         } else {
             None
         };
@@ -1643,6 +1673,16 @@ impl AssistantService {
         user_id: &str,
         req: ImportAssistantsRequest,
     ) -> Result<ImportAssistantsResult, AssistantError> {
+        self.import_for_user_with_avatar_policy(user_id, req, AssistantAvatarPolicy::AllowHostPaths)
+            .await
+    }
+
+    pub async fn import_for_user_with_avatar_policy(
+        &self,
+        user_id: &str,
+        req: ImportAssistantsRequest,
+        avatar_policy: AssistantAvatarPolicy,
+    ) -> Result<ImportAssistantsResult, AssistantError> {
         let mut result = ImportAssistantsResult::default();
 
         // Resolved-once cache for the inferred default agent id. We only
@@ -1741,7 +1781,7 @@ impl AssistantService {
                 continue;
             }
 
-            let avatar = match self.normalize_user_avatar_input(user_id, &id, entry.avatar.as_deref()) {
+            let avatar = match self.normalize_user_avatar_input(user_id, &id, entry.avatar.as_deref(), avatar_policy) {
                 Ok(value) => value,
                 Err(e) => {
                     result.failed += 1;
@@ -2025,7 +2065,7 @@ impl AssistantService {
                         .as_deref()
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
-                        && let Some(asset) = self.read_user_avatar_asset_by_filename(user_id, value)
+                        && let Some(asset) = self.read_user_avatar_asset_by_filename(user_id, id, value)
                     {
                         return Some(asset);
                     }
@@ -2044,8 +2084,9 @@ impl AssistantService {
     }
 
     fn user_rules_dir_for_user(&self, user_id: &str) -> PathBuf {
-        let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
-        self.user_rules_root_dir().join("users").join(dir)
+        self.user_rules_root_dir()
+            .join("users")
+            .join(aionui_common::user_dir_name_or_fingerprint(user_id))
     }
 
     fn user_skills_root_dir(&self) -> PathBuf {
@@ -2053,8 +2094,9 @@ impl AssistantService {
     }
 
     fn user_skills_dir_for_user(&self, user_id: &str) -> PathBuf {
-        let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
-        self.user_skills_root_dir().join("users").join(dir)
+        self.user_skills_root_dir()
+            .join("users")
+            .join(aionui_common::user_dir_name_or_fingerprint(user_id))
     }
 
     fn user_avatars_dir(&self) -> PathBuf {
@@ -2062,8 +2104,9 @@ impl AssistantService {
     }
 
     fn user_avatars_dir_for_user(&self, user_id: &str) -> PathBuf {
-        let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
-        self.user_avatars_dir().join("users").join(dir)
+        self.user_avatars_dir()
+            .join("users")
+            .join(aionui_common::user_dir_name_or_fingerprint(user_id))
     }
 
     fn normalize_legacy_user_avatar_input(
@@ -2166,18 +2209,23 @@ impl AssistantService {
         user_id: &str,
         id: &str,
         avatar: Option<&str>,
+        policy: AssistantAvatarPolicy,
     ) -> Result<Option<String>, AssistantError> {
         let Some(value) = avatar.map(str::trim).filter(|value| !value.is_empty()) else {
             remove_assistant_avatar_files(&self.user_avatars_dir_for_user(user_id), id);
             return Ok(None);
         };
 
-        if !looks_like_avatar_asset(value) {
+        if !looks_like_avatar_asset(value) && !is_unsupported_direct_avatar_reference(value) {
             remove_assistant_avatar_files(&self.user_avatars_dir_for_user(user_id), id);
             return Ok(Some(value.to_string()));
         }
 
-        if let Some(source_assistant_id) = parse_assistant_avatar_route(value) {
+        let source_assistant_id = match policy {
+            AssistantAvatarPolicy::AllowHostPaths => parse_assistant_avatar_route(value),
+            AssistantAvatarPolicy::ManagedOnly => parse_exact_managed_assistant_avatar_route(value),
+        };
+        if let Some(source_assistant_id) = source_assistant_id {
             if let Some(existing_avatar_path) = self.find_existing_user_avatar_file(user_id, &source_assistant_id) {
                 if source_assistant_id == id {
                     return managed_user_avatar_value_from_path(&existing_avatar_path).map(Some);
@@ -2191,7 +2239,24 @@ impl AssistantService {
                     .persist_user_avatar_bytes(user_id, id, &builtin_avatar.bytes, builtin_avatar.extension.as_deref())
                     .map(Some);
             }
+            if policy == AssistantAvatarPolicy::ManagedOnly {
+                return Err(AssistantError::BadRequest(
+                    "assistant avatar route must reference an owned or built-in avatar".into(),
+                ));
+            }
             return Ok(Some(value.to_string()));
+        }
+
+        if policy == AssistantAvatarPolicy::ManagedOnly && is_unsupported_direct_avatar_reference(value) {
+            return Err(AssistantError::BadRequest(
+                "assistant avatar must be inline text or an owned or built-in avatar route".into(),
+            ));
+        }
+
+        if policy == AssistantAvatarPolicy::ManagedOnly && looks_like_host_avatar_reference(value) {
+            return Err(AssistantError::BadRequest(
+                "host filesystem avatar paths are available only to site administrators".into(),
+            ));
         }
 
         if is_unsupported_direct_avatar_reference(value) {
@@ -2225,7 +2290,7 @@ impl AssistantService {
         let destination_dir = self.user_avatars_dir_for_user(user_id);
         std::fs::create_dir_all(&destination_dir)
             .map_err(|e| AssistantError::Internal(format!("create assistant avatar directory: {e}")))?;
-        let destination = destination_dir.join(format!("{id}.{extension}"));
+        let destination = destination_dir.join(assistant_avatar_filename(id, &extension));
         if paths_refer_to_same_file(source_path, &destination) {
             return managed_user_avatar_value_from_path(&destination);
         }
@@ -2264,7 +2329,7 @@ impl AssistantService {
             .map_err(|e| AssistantError::Internal(format!("create assistant avatar directory: {e}")))?;
         remove_assistant_avatar_files(&destination_dir, id);
 
-        let destination = destination_dir.join(format!("{id}.{extension}"));
+        let destination = destination_dir.join(assistant_avatar_filename(id, &extension));
         std::fs::write(&destination, bytes).map_err(|e| {
             AssistantError::Internal(format!("write assistant avatar to '{}': {e}", destination.display()))
         })?;
@@ -2274,22 +2339,33 @@ impl AssistantService {
 
     fn find_existing_user_avatar_file(&self, user_id: &str, id: &str) -> Option<PathBuf> {
         let entries = std::fs::read_dir(self.user_avatars_dir_for_user(user_id)).ok()?;
+        let encoded_id = encode_filename_component(id);
+        let mut legacy_match = None;
         for entry in entries.flatten() {
             let path = entry.path();
+            if !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
+                continue;
+            }
+            let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+                continue;
+            };
+            if !is_supported_avatar_extension(&extension.to_ascii_lowercase()) {
+                continue;
+            }
             let file_stem = path.file_stem().and_then(|stem| stem.to_str());
-            if file_stem == Some(id) {
+            if file_stem == Some(encoded_id.as_str()) {
                 return Some(path);
             }
+            if legacy_filename_component_is_safe(id) && file_stem == Some(id) {
+                legacy_match = Some(path);
+            }
         }
-        None
+        legacy_match
     }
 
-    fn read_user_avatar_asset_by_filename(&self, user_id: &str, value: &str) -> Option<AvatarAsset> {
-        let value = value.trim();
-        if value.is_empty() || value.contains('/') || value.contains('\\') {
-            return None;
-        }
-        read_user_avatar_asset_from_path(&self.user_avatars_dir_for_user(user_id).join(value))
+    fn read_user_avatar_asset_by_filename(&self, user_id: &str, id: &str, value: &str) -> Option<AvatarAsset> {
+        let filename = validated_assistant_avatar_filename(id, value)?;
+        read_user_avatar_asset_from_path(&self.user_avatars_dir_for_user(user_id).join(filename))
     }
 
     fn user_asset_avatar_value_is_renderable(&self, user_id: &str, definition: &AssistantDefinitionRow) -> bool {
@@ -2304,11 +2380,8 @@ impl AssistantService {
         if is_local_avatar_value(value) || value.contains('/') || value.contains('\\') {
             return false;
         }
-        let path = Path::new(value);
-        if path.file_stem().and_then(|stem| stem.to_str()) != Some(definition.assistant_id.as_str()) {
-            return false;
-        }
-        self.read_user_avatar_asset_by_filename(user_id, value).is_some()
+        self.read_user_avatar_asset_by_filename(user_id, &definition.assistant_id, value)
+            .is_some()
     }
 
     fn user_rule_path_for_user(&self, user_id: &str, id: &str, locale: Option<&str>) -> PathBuf {
@@ -2674,7 +2747,19 @@ fn serialize_avatar(source: &str, avatar: Option<&str>) -> (String, Option<Strin
 }
 
 fn looks_like_avatar_asset(value: &str) -> bool {
-    value.contains('/') || (std::path::Path::new(value).extension().is_some() && !value.starts_with('.'))
+    value.contains('/')
+        || value.contains('\\')
+        || has_windows_drive_prefix(value)
+        || (std::path::Path::new(value).extension().is_some() && !value.starts_with('.'))
+}
+
+fn looks_like_host_avatar_reference(value: &str) -> bool {
+    looks_like_avatar_asset(value) || value.to_ascii_lowercase().starts_with("file:")
+}
+
+fn has_windows_drive_prefix(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn managed_user_avatar_value_from_path(path: &Path) -> Result<String, AssistantError> {
@@ -2686,6 +2771,9 @@ fn managed_user_avatar_value_from_path(path: &Path) -> Result<String, AssistantE
 }
 
 fn read_user_avatar_asset_from_path(path: &Path) -> Option<AvatarAsset> {
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
     let bytes = std::fs::read(path).ok()?;
     let extension = path
         .extension()
@@ -2727,6 +2815,26 @@ fn parse_assistant_avatar_route(value: &str) -> Option<String> {
     let route = &route_and_after[..suffix_end];
     let id = route.strip_prefix(prefix)?.strip_suffix(suffix)?.trim();
     (!id.is_empty()).then(|| id.to_string())
+}
+
+fn parse_exact_managed_assistant_avatar_route(value: &str) -> Option<String> {
+    let (path, query) = match value.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (value, None),
+    };
+    if query.is_some_and(|query| {
+        !query
+            .strip_prefix("v=")
+            .is_some_and(|version| !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit()))
+    }) {
+        return None;
+    }
+
+    let id = path.strip_prefix("/api/assistants/")?.strip_suffix("/avatar")?;
+    if id.is_empty() || id.contains('/') || id.contains('\\') {
+        return None;
+    }
+    Some(id.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -3219,6 +3327,33 @@ fn encode_filename_component(value: &str) -> String {
     encoded
 }
 
+fn assistant_avatar_filename(id: &str, extension: &str) -> String {
+    format!("{}.{extension}", encode_filename_component(id))
+}
+
+fn validated_assistant_avatar_filename(id: &str, value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.contains('/') || value.contains('\\') {
+        return None;
+    }
+    let extension = Path::new(value).extension()?.to_str()?;
+    if !is_supported_avatar_extension(&extension.to_ascii_lowercase()) {
+        return None;
+    }
+
+    let encoded = assistant_avatar_filename(id, extension);
+    if value == encoded {
+        return Some(encoded);
+    }
+    if legacy_filename_component_is_safe(id) {
+        let legacy = format!("{id}.{extension}");
+        if value == legacy {
+            return Some(legacy);
+        }
+    }
+    None
+}
+
 fn read_file_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
@@ -3356,17 +3491,25 @@ fn remove_assistant_avatar_files(dir: &Path, id: &str) -> bool {
         return false;
     };
     let mut deleted = false;
-    let prefix = format!("{id}.");
+    let encoded_id = encode_filename_component(id);
+    let allow_legacy = legacy_filename_component_is_safe(id);
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(&prefix) {
-            if let Err(e) = std::fs::remove_file(entry.path()) {
-                warn!("failed to remove {}: {e}", entry.path().display());
-                continue;
-            }
-            deleted = true;
+        let path = entry.path();
+        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+            continue;
+        };
+        if !is_supported_avatar_extension(&extension.to_ascii_lowercase()) {
+            continue;
         }
+        let stem = path.file_stem().and_then(|stem| stem.to_str());
+        if stem != Some(encoded_id.as_str()) && !(allow_legacy && stem == Some(id)) {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            warn!("failed to remove {}: {e}", path.display());
+            continue;
+        }
+        deleted = true;
     }
     deleted
 }
@@ -3452,6 +3595,23 @@ mod tests {
             svc.user_avatars_dir_for_user("system_default_user"),
             std::path::Path::new("/data/assistant-avatars/users/system_default_user")
         );
+    }
+
+    #[tokio::test]
+    async fn unsafe_user_ids_cannot_escape_managed_roots() {
+        let svc = test_service_with_data_dir(std::path::Path::new("/data")).await;
+        for path in [
+            svc.user_rules_dir_for_user("../other"),
+            svc.user_skills_dir_for_user("../other"),
+            svc.user_avatars_dir_for_user("../other"),
+        ] {
+            assert!(path.starts_with("/data"));
+            assert!(!path.to_string_lossy().contains("../other"));
+            assert!(
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("invalid-"))
+            );
+        }
     }
 
     #[tokio::test]
@@ -5289,6 +5449,329 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, AssistantError::BadRequest(_)));
         }
+    }
+
+    #[tokio::test]
+    async fn managed_only_create_rejects_host_path_forms_but_allows_inline_text() {
+        let fx = fixture().await;
+        let source_avatar = fx._tmp.path().join("member-source.png");
+        std::fs::write(&source_avatar, b"host-secret").unwrap();
+        let file_uri = format!("file://{}", source_avatar.display());
+        let absolute = source_avatar.to_string_lossy().into_owned();
+
+        for (index, avatar) in [
+            absolute.as_str(),
+            file_uri.as_str(),
+            "relative/avatar.png",
+            "..\\relative\\avatar.png",
+            "C:\\Users\\member\\avatar.png",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("managed-path-{index}");
+            let error = fx
+                .service
+                .create_for_user_with_avatar_policy(
+                    DEFAULT_USER_ID,
+                    CreateAssistantRequest {
+                        id: Some(id.clone()),
+                        name: "Managed member".into(),
+                        avatar: Some(avatar.into()),
+                        ..req_default()
+                    },
+                    AssistantAvatarPolicy::ManagedOnly,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, AssistantError::BadRequest(_)),
+                "{avatar} must be rejected"
+            );
+            assert!(fx.repo.get_for_user(DEFAULT_USER_ID, &id).await.unwrap().is_none());
+        }
+
+        let created = fx
+            .service
+            .create_for_user_with_avatar_policy(
+                DEFAULT_USER_ID,
+                CreateAssistantRequest {
+                    id: Some("managed-inline".into()),
+                    name: "Managed inline".into(),
+                    avatar: Some("🤖".into()),
+                    ..req_default()
+                },
+                AssistantAvatarPolicy::ManagedOnly,
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.avatar.as_deref(), Some("🤖"));
+        assert_eq!(std::fs::read(&source_avatar).unwrap(), b"host-secret");
+    }
+
+    #[tokio::test]
+    async fn managed_only_accepts_owned_and_builtin_routes_but_rejects_foreign_routes() {
+        let fx = fixture_with_builtins(vec![mk_builtin_with_avatar(
+            "builtin-avatar-source",
+            "Builtin Avatar Source",
+            "avatars/builtin-source.png",
+        )])
+        .await;
+        let source_avatar = fx._tmp.path().join("owned-source.png");
+        std::fs::write(&source_avatar, b"owned-avatar").unwrap();
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("owned-source".into()),
+                name: "Owned source".into(),
+                avatar: Some(source_avatar.to_string_lossy().into_owned()),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+
+        for (id, route) in [
+            ("owned-copy", "/api/assistants/owned-source/avatar"),
+            ("owned-versioned-copy", "/api/assistants/owned-source/avatar?v=123"),
+            ("builtin-copy", "/api/assistants/builtin-avatar-source/avatar"),
+        ] {
+            fx.service
+                .create_for_user_with_avatar_policy(
+                    DEFAULT_USER_ID,
+                    CreateAssistantRequest {
+                        id: Some(id.into()),
+                        name: id.into(),
+                        avatar: Some(route.into()),
+                        ..req_default()
+                    },
+                    AssistantAvatarPolicy::ManagedOnly,
+                )
+                .await
+                .unwrap();
+        }
+
+        for (id, route) in [
+            (
+                "absolute-route-copy",
+                "https://example.com/api/assistants/builtin-avatar-source/avatar",
+            ),
+            ("file-route-copy", "file:///api/assistants/builtin-avatar-source/avatar"),
+        ] {
+            let error = fx
+                .service
+                .create_for_user_with_avatar_policy(
+                    DEFAULT_USER_ID,
+                    CreateAssistantRequest {
+                        id: Some(id.into()),
+                        name: id.into(),
+                        avatar: Some(route.into()),
+                        ..req_default()
+                    },
+                    AssistantAvatarPolicy::ManagedOnly,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, AssistantError::BadRequest(_)));
+        }
+
+        let error = fx
+            .service
+            .create_for_user_with_avatar_policy(
+                DEFAULT_USER_ID,
+                CreateAssistantRequest {
+                    id: Some("foreign-copy".into()),
+                    name: "Foreign copy".into(),
+                    avatar: Some("/api/assistants/other-users-avatar/avatar".into()),
+                    ..req_default()
+                },
+                AssistantAvatarPolicy::ManagedOnly,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AssistantError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn managed_only_update_and_import_reject_paths_without_removing_existing_avatar() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("managed-update".into()),
+                name: "Managed update".into(),
+                avatar: Some("🙂".into()),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let source_avatar = fx._tmp.path().join("update-source.jpg");
+        std::fs::write(&source_avatar, b"update-secret").unwrap();
+
+        let update_error = fx
+            .service
+            .update_for_user_with_avatar_policy(
+                DEFAULT_USER_ID,
+                "managed-update",
+                UpdateAssistantRequest {
+                    avatar: Some(source_avatar.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                AssistantAvatarPolicy::ManagedOnly,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(update_error, AssistantError::BadRequest(_)));
+        assert_eq!(
+            fx.service.get("managed-update").await.unwrap().avatar.as_deref(),
+            Some("🙂"),
+        );
+
+        let result = fx
+            .service
+            .import_for_user_with_avatar_policy(
+                DEFAULT_USER_ID,
+                ImportAssistantsRequest {
+                    assistants: vec![
+                        CreateAssistantRequest {
+                            id: Some("managed-import-path".into()),
+                            name: "Path import".into(),
+                            avatar: Some(source_avatar.to_string_lossy().into_owned()),
+                            ..req_default()
+                        },
+                        CreateAssistantRequest {
+                            id: Some("managed-import-inline".into()),
+                            name: "Inline import".into(),
+                            avatar: Some("✨".into()),
+                            ..req_default()
+                        },
+                    ],
+                },
+                AssistantAvatarPolicy::ManagedOnly,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.failed, 1);
+        assert!(
+            fx.repo
+                .get_for_user(DEFAULT_USER_ID, "managed-import-path")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn encoded_avatar_destinations_cannot_escape_for_file_or_byte_copies() {
+        let fx = fixture_with_builtins(vec![mk_builtin_with_avatar(
+            "builtin-avatar-source",
+            "Builtin Avatar Source",
+            "avatars/builtin-source.png",
+        )])
+        .await;
+        let source_avatar = fx._tmp.path().join("traversal-source.png");
+        std::fs::write(&source_avatar, b"copied-from-path").unwrap();
+        let avatar_root = fx._tmp.path().join("assistant-avatars");
+        std::fs::create_dir_all(&avatar_root).unwrap();
+        let path_escape = avatar_root.join("outside-path.png");
+        let byte_escape = avatar_root.join("outside-bytes.png");
+        let import_escape = avatar_root.join("outside-import.png");
+        std::fs::write(&path_escape, b"path-sentinel").unwrap();
+        std::fs::write(&byte_escape, b"bytes-sentinel").unwrap();
+        std::fs::write(&import_escape, b"import-sentinel").unwrap();
+
+        let path_value = fx
+            .service
+            .persist_user_avatar_file(DEFAULT_USER_ID, "../../outside-path", &source_avatar)
+            .unwrap();
+        let byte_value = fx
+            .service
+            .persist_user_avatar_bytes(
+                DEFAULT_USER_ID,
+                "../../outside-bytes",
+                b"copied-from-bytes",
+                Some("png"),
+            )
+            .unwrap();
+
+        assert_eq!(path_value, "%2E%2E%2F%2E%2E%2Foutside-path.png");
+        assert_eq!(byte_value, "%2E%2E%2F%2E%2E%2Foutside-bytes.png");
+        assert_eq!(std::fs::read(&path_escape).unwrap(), b"path-sentinel");
+        assert_eq!(std::fs::read(&byte_escape).unwrap(), b"bytes-sentinel");
+        let managed_dir = fx._tmp.path().join("assistant-avatars/users/system_default_user");
+        assert_eq!(
+            std::fs::read(managed_dir.join(path_value)).unwrap(),
+            b"copied-from-path"
+        );
+        assert_eq!(
+            std::fs::read(managed_dir.join(byte_value)).unwrap(),
+            b"copied-from-bytes"
+        );
+
+        let import = fx
+            .service
+            .import_for_user_with_avatar_policy(
+                DEFAULT_USER_ID,
+                ImportAssistantsRequest {
+                    assistants: vec![CreateAssistantRequest {
+                        id: Some("../../outside-import".into()),
+                        name: "Traversal import".into(),
+                        avatar: Some("/api/assistants/builtin-avatar-source/avatar".into()),
+                        ..req_default()
+                    }],
+                },
+                AssistantAvatarPolicy::ManagedOnly,
+            )
+            .await
+            .unwrap();
+        assert_eq!(import.imported, 1);
+        assert_eq!(std::fs::read(&import_escape).unwrap(), b"import-sentinel");
+        assert_eq!(
+            std::fs::read(managed_dir.join("%2E%2E%2F%2E%2E%2Foutside-import.png")).unwrap(),
+            b"builtin-avatar-bytes",
+        );
+
+        assert_eq!(
+            fx.service
+                .find_existing_user_avatar_file(DEFAULT_USER_ID, "../../outside-path"),
+            Some(managed_dir.join("%2E%2E%2F%2E%2E%2Foutside-path.png")),
+        );
+        assert!(remove_assistant_avatar_files(&managed_dir, "../../outside-path"));
+        assert_eq!(std::fs::read(&path_escape).unwrap(), b"path-sentinel");
+    }
+
+    #[test]
+    fn avatar_cleanup_does_not_delete_a_longer_legacy_assistant_id() {
+        let tmp = TempDir::new().unwrap();
+        let avatar_dir = tmp.path();
+        std::fs::write(avatar_dir.join("foo.png"), b"foo").unwrap();
+        std::fs::write(avatar_dir.join("foo.bar.png"), b"foo-bar").unwrap();
+
+        assert!(remove_assistant_avatar_files(avatar_dir, "foo"));
+        assert!(!avatar_dir.join("foo.png").exists());
+        assert_eq!(std::fs::read(avatar_dir.join("foo.bar.png")).unwrap(), b"foo-bar");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_avatar_lookup_and_read_ignore_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let fx = fixture().await;
+        let outside = fx._tmp.path().join("outside.png");
+        std::fs::write(&outside, b"outside-secret").unwrap();
+        let avatar_dir = fx._tmp.path().join("assistant-avatars/users/system_default_user");
+        std::fs::create_dir_all(&avatar_dir).unwrap();
+        symlink(&outside, avatar_dir.join("symlink-avatar.png")).unwrap();
+
+        assert!(
+            fx.service
+                .find_existing_user_avatar_file(DEFAULT_USER_ID, "symlink-avatar")
+                .is_none()
+        );
+        assert!(
+            fx.service
+                .read_user_avatar_asset_by_filename(DEFAULT_USER_ID, "symlink-avatar", "symlink-avatar.png")
+                .is_none()
+        );
     }
 
     #[tokio::test]

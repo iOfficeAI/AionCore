@@ -12,6 +12,7 @@ use crate::error::AuthError;
 
 /// JWT token lifetime: 24 hours.
 const TOKEN_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+pub const TOKEN_EXPIRY_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// JWT issuer claim value.
 const JWT_ISSUER: &str = "aionui";
@@ -37,6 +38,9 @@ pub struct TokenPayload {
     /// User session generation at token issuance time.
     #[serde(default)]
     pub session_generation: i64,
+    /// Persistent server-side session ID. Legacy upgrade tokens omit it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// JWT service for signing, verification, and token blacklisting.
@@ -72,6 +76,26 @@ impl JwtService {
         username: &str,
         session_generation: i64,
     ) -> Result<String, AuthError> {
+        self.sign_with_persistent_session(user_id, username, session_generation, None)
+    }
+
+    pub fn sign_with_session_id(
+        &self,
+        user_id: &str,
+        username: &str,
+        session_generation: i64,
+        session_id: &str,
+    ) -> Result<String, AuthError> {
+        self.sign_with_persistent_session(user_id, username, session_generation, Some(session_id))
+    }
+
+    fn sign_with_persistent_session(
+        &self,
+        user_id: &str,
+        username: &str,
+        session_generation: i64,
+        session_id: Option<&str>,
+    ) -> Result<String, AuthError> {
         let now = now_secs()?;
         let exp = now + TOKEN_EXPIRY.as_secs();
 
@@ -83,6 +107,7 @@ impl JwtService {
             iss: JWT_ISSUER.to_owned(),
             aud: JWT_AUDIENCE.to_owned(),
             session_generation,
+            session_id: session_id.map(str::to_owned),
         };
 
         let secret = self
@@ -286,6 +311,7 @@ mod tests {
             iss: JWT_ISSUER.into(),
             aud: JWT_AUDIENCE.into(),
             session_generation: 0,
+            session_id: None,
         };
         let token = encode(
             &Header::default(),
@@ -368,6 +394,7 @@ mod tests {
             iss: JWT_ISSUER.into(),
             aud: JWT_AUDIENCE.into(),
             session_generation: 0,
+            session_id: None,
         };
         let token = encode(
             &Header::default(),

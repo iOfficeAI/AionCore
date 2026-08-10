@@ -577,3 +577,5 @@ graphify-out/
 
 .tmp/
 .playwright-mcp/
+target-linux/
+.cargo-docker/

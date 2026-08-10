@@ -17,9 +17,10 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use aionui_auth::CurrentUser;
 use aionui_db::{
-    SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteSettingsRepository, init_database_memory,
+    SiteRole, SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
+    SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
 };
 use aionui_system::{
     ClientPrefService, FeedbackDiagnosticsService, ModelFetchService, ProtocolDetectionService, ProviderService,
@@ -71,7 +72,20 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 }
 
 fn get_request(uri: &str) -> Request<Body> {
-    Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
+    get_request_with_role(uri, SiteRole::Admin)
+}
+
+fn get_request_with_role(uri: &str, site_role: SiteRole) -> Request<Body> {
+    let mut request = Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
+    request.extensions_mut().insert(CurrentUser {
+        id: "system-info-test-user".to_owned(),
+        username: "system-info-test-user".to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
+        site_role,
+        must_change_password: false,
+    });
+    request
 }
 
 fn json_request(method_str: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
@@ -124,6 +138,24 @@ async fn test_system_info_returns_all_fields() {
     assert!(data["log_dir"].as_str().is_some_and(|s| !s.is_empty()));
     assert!(data["platform"].as_str().is_some_and(|s| !s.is_empty()));
     assert!(data["arch"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+#[tokio::test]
+async fn test_system_info_redacts_host_paths_for_members() {
+    let app = setup().await;
+    let resp = app
+        .oneshot(get_request_with_role("/api/system/info", SiteRole::Member))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let data = &json["data"];
+    assert_eq!(data["cache_dir"], "[redacted]");
+    assert_eq!(data["work_dir"], "[redacted]");
+    assert_eq!(data["log_dir"], "[redacted]");
+    assert!(data["platform"].as_str().is_some_and(|value| !value.is_empty()));
+    assert!(data["arch"].as_str().is_some_and(|value| !value.is_empty()));
 }
 
 #[tokio::test]

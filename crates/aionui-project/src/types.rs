@@ -182,6 +182,9 @@ pub enum ProjectError {
     #[error("local file path is not a readable file: {path}")]
     LocalPathNotReadable { path: String },
 
+    #[error("path is outside the current user's managed filesystem")]
+    UserFilesystemDenied,
+
     #[error(transparent)]
     Database(#[from] DbError),
 }
@@ -209,6 +212,7 @@ impl ProjectError {
             ProjectError::UploadPathOutsideRoot { .. } => "upload_path_outside_root",
             ProjectError::ChatFileMissing { .. } => "chat_file_missing",
             ProjectError::LocalPathNotReadable { .. } => "local_path_not_readable",
+            ProjectError::UserFilesystemDenied => "user_filesystem_denied",
             ProjectError::Database(_) => "internal_db_error",
         }
     }

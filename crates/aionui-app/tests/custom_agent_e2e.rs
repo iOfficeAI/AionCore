@@ -363,3 +363,60 @@ async fn test_on_save_cli_not_found_blocks_upsert() {
         "rejected create must not leave rows behind"
     );
 }
+
+#[tokio::test]
+async fn hosted_member_cannot_manage_or_probe_host_agents() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "member", "StrongP@ss2").await;
+
+    let requests = [
+        get_with_token("/api/agents/management", &token),
+        get_with_token("/api/agents/2d23ff1c/overrides", &token),
+        json_with_token("POST", "/api/agents/2d23ff1c/health-check", json!({}), &token, &csrf),
+        json_with_token(
+            "PATCH",
+            "/api/agents/2d23ff1c/enabled",
+            json!({ "enabled": true }),
+            &token,
+            &csrf,
+        ),
+        json_with_token(
+            "PUT",
+            "/api/agents/2d23ff1c/overrides",
+            json!({ "command_override": "/bin/sh" }),
+            &token,
+            &csrf,
+        ),
+        json_with_token(
+            "POST",
+            "/api/agents/custom/try-connect",
+            json!({ "command": "/bin/sh", "acp_args": [], "env": [] }),
+            &token,
+            &csrf,
+        ),
+        json_with_token(
+            "POST",
+            "/api/agents/custom",
+            json!({ "name": "blocked", "command": "/bin/sh" }),
+            &token,
+            &csrf,
+        ),
+        json_with_token(
+            "PUT",
+            "/api/agents/custom/missing",
+            json!({ "name": "blocked", "command": "/bin/sh" }),
+            &token,
+            &csrf,
+        ),
+        json_with_token("DELETE", "/api/agents/custom/missing", json!(null), &token, &csrf),
+    ];
+
+    for request in requests {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "ADMIN_REQUIRED");
+    }
+
+    let response = app.oneshot(get_with_token("/api/agents/logos", &token)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}

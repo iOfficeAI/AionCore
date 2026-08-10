@@ -41,6 +41,7 @@ fn make_test_config() -> AionrsResolvedConfig {
         bedrock_config: None,
         runtime_env: Vec::new(),
         prompt_dump_dir: None,
+        tool_policy: aion_agent::tool_policy::ToolPolicy::Unrestricted,
     }
 }
 

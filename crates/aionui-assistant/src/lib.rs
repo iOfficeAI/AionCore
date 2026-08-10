@@ -17,4 +17,4 @@ pub use agent_catalog::AssistantAgentCatalogPort;
 pub use builtin::{AvatarAsset, BuiltinAssistant, BuiltinAssistantRegistry};
 pub use error::AssistantError;
 pub use routes::{AssistantRouterState, assistant_routes};
-pub use service::AssistantService;
+pub use service::{AssistantAvatarPolicy, AssistantService};
