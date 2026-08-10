@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.67](https://github.com/suoak/AionCore/compare/v0.1.66...v0.1.67) (2026-08-10)
+
+### Features
+
+* **skills:** preserve the CSBU WorkMate workspace skill path
+
+### Bug Fixes
+
+* **project:** emit real-case absolute workspace paths to agents
+* **session:** use the user's installed Claude and Codex with shared version-drift handling
+* **aionrs:** update the branded runtime dependency to v0.2.13
+
 ## [0.1.62](https://github.com/iOfficeAI/AionCore/compare/v0.1.61...v0.1.62) (2026-08-06)
 
 
