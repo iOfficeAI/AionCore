@@ -79,6 +79,22 @@ impl ClaudeConnection {
                     )
                 }
             },
+            SessionSpec::Fork {
+                session_id,
+                parent_backend_session_id,
+                ..
+            } => (
+                session_id.clone(),
+                // The wake slot's INITIAL value is the parent sid — but a wake
+                // can only fire after an idle turn, by which point `system/init`
+                // reported the fork's OWN sid and `sniff_init` updated the slot
+                // (never `--resume <parent>` twice, which would fork again).
+                // `--fork-session` makes claude mint the new id itself; pairing
+                // it with `--session-id` is unsupported (live help 2.1.221), so
+                // the new id is learned, not chosen.
+                parent_backend_session_id.clone(),
+                LegacySessionSpec::ForkFrom(parent_backend_session_id.clone()),
+            ),
         }
     }
 }
@@ -215,18 +231,12 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
     // syscall-free fn.
     args.push("--allow-dangerously-skip-permissions".to_string());
 
-    // TEMPORARY: disable AskUserQuestion until the multi-question interactive card is
-    // ported to the current frontend. claude's AskUserQuestion can ask several
-    // questions at once (`{questions:[…]}`), but the active frontend only renders a
-    // single-question permission card, so a multi-question ask would silently drop all
-    // but the first. Rather than ship that half-answer behaviour, deny the tool at
-    // spawn time — claude then falls back to plain-text questions, which render fully.
-    // Mirrors the official @agentclientprotocol/claude-agent-acp adapter, which
-    // likewise lists `AskUserQuestion` in `disallowedTools` for the same reason
-    // ("not a great way to expose this over ACP at the moment"). Remove once the
-    // frontend gains a multi-question renderer.
-    args.push("--disallowed-tools".to_string());
-    args.push("AskUserQuestion".to_string());
+    // AskUserQuestion is ENABLED: the frontend now renders a real multi-question
+    // card fed by `SessionEvent::Ask` and answers through `Command::AnswerAsk`
+    // (2026-08-04 spec 2026-08-04-askuserquestion-统一问询设计.md). This used to be
+    // `--disallowed-tools AskUserQuestion` while the active frontend could only
+    // show a single-question permission card — removing the flag is the claude
+    // half of P0; the adapter routes the tool to `Ask`, never to `Permission`.
 
     if let Some(model) = config.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         args.push("--model".to_string());
@@ -319,7 +329,7 @@ impl BackendConnection for ClaudeConnection {
         // mode AND the same provider env (#103).
         let wake = ClaudeWakeRecipe {
             spawner: self.spawner.clone(),
-            claude_session_id,
+            claude_session_id: Arc::new(std::sync::Mutex::new(claude_session_id)),
             cwd: config.cwd.clone(),
             extra_args: spawn_args,
             env: config.spawn_env.clone(),
@@ -336,6 +346,10 @@ impl BackendConnection for ClaudeConnection {
         // first `capabilities()` read; a late response is merged on the next read
         // (same late-discovery contract as codex `model/list`).
         backend.request_initialize().await;
+        // Report a claude whose version differs from the release AionUi
+        // verified. claude runs from the user's own install (nothing is
+        // bundled), so this is the same situation agy has always been in.
+        backend.spawn_version_check();
         Ok(Arc::new(backend))
     }
 
@@ -556,7 +570,13 @@ struct PendingPerm {
 /// enabled, so it is never consulted.
 struct ClaudeWakeRecipe {
     spawner: Arc<dyn Spawner>,
-    claude_session_id: String,
+    /// SHARED MUTABLE resume anchor. Open seeds it (Fresh/Resume: the id we
+    /// spawned with; Fork: the PARENT id), and `sniff_init` overwrites it with
+    /// whatever sid claude actually reports — claude can rotate the on-disk id
+    /// (`--fork-session` always does; plain runs may), and a wake that resumes
+    /// the STALE id re-forks / resurrects the parent session. The slot makes
+    /// every wake resume the session claude last said we are attached to.
+    claude_session_id: Arc<std::sync::Mutex<String>>,
     cwd: Option<String>,
     extra_args: Vec<String>,
     /// #103: the spawn env captured at open time (e.g. cc-switch provider env) so
@@ -631,6 +651,10 @@ struct ClaudeReaderState {
     cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
     /// One-shot first-turn title generation (shared Arc with the backend).
     title_gen: Arc<TitleGenState>,
+    /// The wake recipe's SHARED resume-anchor slot (see `ClaudeWakeRecipe`): the
+    /// reader overwrites it from `system/init` so a post-fork / post-rotation
+    /// wake resumes the sid claude actually reported, never the stale spawn id.
+    wake_session_slot: Arc<std::sync::Mutex<String>>,
 }
 
 /// Spawn a claude stdout reader over `stdout`/`io` using the shared state. Used
@@ -674,6 +698,7 @@ fn start_claude_reader(
             state.pending_set_config,
             state.cost_ledger,
             state.title_gen,
+            state.wake_session_slot,
         )
         .await;
     })
@@ -764,6 +789,7 @@ impl ClaudeSessionBackend {
             pending_set_config: pending_set_config.clone(),
             cost_ledger,
             title_gen: title_gen.clone(),
+            wake_session_slot: wake.claude_session_id.clone(),
         };
         let reader = start_claude_reader(&reader_state, stdout, io.clone());
 
@@ -830,7 +856,17 @@ impl ClaudeSessionBackend {
     /// the controller's slot. Only reached when `idle_ttl` is set AND the slot was
     /// suspended (a test backend has no spawner → never enabled).
     async fn wake_handle(&self) -> Result<ProcHandle, BackendError> {
-        let legacy_spec = LegacySessionSpec::Resume(self.wake.claude_session_id.clone());
+        // Read the SHARED slot, not an open-time snapshot: after a fork (or any
+        // claude-side id rotation) `sniff_init` updated it to the sid claude
+        // actually reported — resuming a stale id would re-fork / resurrect the
+        // parent session. A wake NEVER replays `--fork-session`.
+        let resume_sid = self
+            .wake
+            .claude_session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let legacy_spec = LegacySessionSpec::Resume(resume_sid);
         let io = self
             .adapter
             .start_turn(
@@ -897,14 +933,90 @@ impl ClaudeSessionBackend {
             request_id = %request_id,
             "claude control_response (permission answer) written to stdin"
         );
-        // RA -1: the reducer leaves requires-action only on PermissionResolved.
+        // RA -1: resolve the SAME counter the originating event incremented. An
+        // AskUserQuestion raised `Ask` (waiting_on_question), and the REST
+        // recovery card answers it through THIS legacy AnswerPermission path
+        // (Confirmation options carry the answer labels) — emitting
+        // PermissionResolved here would decrement waiting_on_approval instead,
+        // leaving waiting_on_question pinned at >0 and the session locked out of
+        // can_send forever after a recovered ask is answered.
+        let cur_gen = self.turn_gen.load(Ordering::SeqCst);
+        let resolve_event = if pending.tool_name == "AskUserQuestion" {
+            SessionEvent::AskResolved {
+                request_id: request_id.to_string(),
+            }
+        } else {
+            SessionEvent::PermissionResolved {
+                request_id: request_id.to_string(),
+                kind: crate::event::PermissionKind::Tool,
+            }
+        };
+        let _ = self.event_tx.send(SessionEnvelope {
+            session_id: self.session_id.clone(),
+            turn_gen: cur_gen,
+            event: resolve_event,
+        });
+        Ok(CommandReceipt {
+            accepted: true,
+            admission: Admission::NoTurn,
+            turn_gen: cur_gen,
+        })
+    }
+
+    /// Wire an AskUserQuestion answer (`Command::AnswerAsk`) to claude's blocking
+    /// `can_use_tool` request. Same pending map + keyed `control_response` as
+    /// `answer_permission` — on the WIRE this is still can_use_tool — but the
+    /// b-side event is `AskResolved` (the question counter), and the decision is
+    /// derived from `answers`: `Some` → allow with `updatedInput.answers`
+    /// (build_control_response's existing AskUserQuestion path), `None` (user
+    /// dismissed the card) → deny. `None` MUST NOT become an allow: claude
+    /// silently drops unanswered questions on allow (live 2.1.178) — that would
+    /// be silent data loss, not a re-ask.
+    async fn answer_ask(
+        &self,
+        request_id: &str,
+        answers: Option<Vec<super::types::QuestionAnswer>>,
+    ) -> Result<CommandReceipt, BackendError> {
+        use std::sync::atomic::Ordering;
+        let pending = self
+            .pending_perms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request_id);
+        let Some(pending) = pending else {
+            return Err(BackendError::Transport(format!(
+                "no pending ask for request_id {request_id}"
+            )));
+        };
+        let (decision, answer_slice) = match &answers {
+            Some(list) => (super::types::PermissionDecision::Approved, list.as_slice()),
+            None => (super::types::PermissionDecision::Denied, &[][..]),
+        };
+        let response = build_control_response(request_id, &pending, decision, None, answer_slice);
+        {
+            let mut guard = self.stdin.lock().await;
+            let stdin = guard
+                .as_mut()
+                .ok_or_else(|| BackendError::Transport("claude stdin unavailable".into()))?;
+            self.adapter
+                .write_control_response(stdin, &response)
+                .await
+                .map_err(|e| BackendError::Transport(format!("write control_response: {e}")))?;
+        }
+        // Lifecycle marker, same wedge class as permission answers: "user answered
+        // but claude never resumed" hinges on whether this write happened.
+        tracing::info!(
+            conversation_id = %self.session_id,
+            request_id = %request_id,
+            answered = answers.is_some(),
+            "claude control_response (ask answer) written to stdin"
+        );
         let cur_gen = self.turn_gen.load(Ordering::SeqCst);
         let _ = self.event_tx.send(SessionEnvelope {
             session_id: self.session_id.clone(),
             turn_gen: cur_gen,
-            event: SessionEvent::PermissionResolved {
+            event: SessionEvent::AskResolved {
                 request_id: request_id.to_string(),
-                kind: crate::event::PermissionKind::Tool,
             },
         });
         Ok(CommandReceipt {
@@ -912,6 +1024,43 @@ impl ClaudeSessionBackend {
             admission: Admission::NoTurn,
             turn_gen: cur_gen,
         })
+    }
+
+    /// Tell the user once per conversation when the installed claude is not the
+    /// release AionUi verified.
+    ///
+    /// Fire-and-forget: the probe spawns `claude --version` and a failure only
+    /// costs the drift claim, never the session.
+    fn spawn_version_check(&self) {
+        use std::sync::atomic::Ordering;
+        // Both live on the wake recipe — it is what re-spawns the CLI, so it
+        // holds the spawner and the resolved program path.
+        let spawner = Arc::clone(&self.wake.spawner);
+        let session_id = self.session_id.clone();
+        let program = self
+            .wake
+            .cli_program
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("claude"));
+        let event_tx = self.event_tx.clone();
+        let turn_gen = Arc::clone(&self.turn_gen);
+        tokio::spawn(async move {
+            let Some((level, message, localized)) =
+                crate::backend::cli_version::session_drift_notice(&spawner, "claude", &program, &session_id).await
+            else {
+                return;
+            };
+            let _ = event_tx.send(SessionEnvelope {
+                session_id: session_id.clone(),
+                turn_gen: turn_gen.load(Ordering::SeqCst),
+                event: SessionEvent::Notice {
+                    level,
+                    message,
+                    localized: Some(localized),
+                    supersedes_key: None,
+                },
+            });
+        });
     }
 
     /// G2: send a host→CLI `control_request` (set_model / set_permission_mode) over
@@ -1250,6 +1399,7 @@ async fn reader_task(
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
     title_gen: Arc<TitleGenState>,
+    wake_session_slot: Arc<std::sync::Mutex<String>>,
 ) {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
@@ -1313,7 +1463,15 @@ async fn reader_task(
                 // parse_system drops). Done on the RAW frame so parse_chunk's
                 // event stream stays zero-diff. Emits Provisioning per MCP
                 // server (parity with codex mcpServerStatus→Provisioning).
-                sniff_init(v, want_init_model, &discovered_model, &event_tx, &session_id, cur_gen);
+                sniff_init(
+                    v,
+                    want_init_model,
+                    &discovered_model,
+                    &event_tx,
+                    &session_id,
+                    cur_gen,
+                    &wake_session_slot,
+                );
                 // #98/#101: sniff the `control_request{initialize}` RESPONSE for the
                 // selectable model list + slash commands (claude's only catalog
                 // channel — the data init frame above carries neither). Fills
@@ -1769,6 +1927,7 @@ fn sniff_init(
     event_tx: &broadcast::Sender<SessionEnvelope>,
     session_id: &str,
     turn_gen: u64,
+    wake_session_slot: &Arc<std::sync::Mutex<String>>,
 ) {
     use serde_json::Value;
     if frame.get("type").and_then(Value::as_str) != Some("system")
@@ -1786,16 +1945,32 @@ fn sniff_init(
     // common case where claude was started with `--session-id <logical_id>`); a
     // DIFFERENT id means claude rotated/resumed under another on-disk id, which is
     // the value a later `--resume` must target.
-    if let Some(sid) = frame.get("session_id").and_then(Value::as_str)
-        && sid != session_id
-    {
-        let _ = event_tx.send(SessionEnvelope {
-            session_id: session_id.to_string(),
-            turn_gen,
-            event: SessionEvent::BackendBound {
-                backend_session_id: Some(sid.to_string()),
-            },
-        });
+    if let Some(sid) = frame.get("session_id").and_then(Value::as_str) {
+        // Keep the wake recipe's resume anchor in lock-step with claude's own
+        // report (fork rotation `--fork-session`, or any plain rotation): a wake
+        // that resumed the STALE spawn id would re-fork / resurrect the parent
+        // session. Written unconditionally-on-change, independent of the
+        // BackendBound gate below (which compares against the LOGICAL id).
+        {
+            let mut slot = wake_session_slot.lock().unwrap_or_else(|e| e.into_inner());
+            if *slot != sid {
+                tracing::debug!(
+                    session_id = %session_id,
+                    reported_sid = %sid,
+                    "claude reported a rotated session id — updating the wake resume anchor"
+                );
+                *slot = sid.to_string();
+            }
+        }
+        if sid != session_id {
+            let _ = event_tx.send(SessionEnvelope {
+                session_id: session_id.to_string(),
+                turn_gen,
+                event: SessionEvent::BackendBound {
+                    backend_session_id: Some(sid.to_string()),
+                },
+            });
+        }
     }
     if let Some(servers) = frame.get("mcp_servers").and_then(Value::as_array) {
         for s in servers {
@@ -2087,6 +2262,7 @@ fn sniff_set_config_reject(
             level: crate::event::NoticeLevel::Warning,
             message: format!("{label} failed: {err}"),
             localized: None,
+            supersedes_key: None,
         },
     });
 }
@@ -2776,6 +2952,9 @@ impl SessionBackend for ClaudeSessionBackend {
                 self.answer_permission(&request_id, decision, selected.as_deref(), &answers)
                     .await
             }
+            // AnswerAsk: the structured-question twin (wire = same can_use_tool
+            // control_response; b-side event = AskResolved on its own counter).
+            Command::AnswerAsk { request_id, answers } => self.answer_ask(&request_id, answers).await,
             // Acknowledge: a conversation-side fold (done-unseen → seen). NO claude
             // wire; accept as a local no-op (§C1).
             Command::Acknowledge { .. } => {
@@ -2905,7 +3084,7 @@ impl ClaudeSessionBackend {
         // recipe is never consulted — but `spawn` needs one. Use a FakeSpawner.
         let wake = ClaudeWakeRecipe {
             spawner: Arc::new(crate::testing::FakeSpawner::new()),
-            claude_session_id: session_id.clone(),
+            claude_session_id: Arc::new(std::sync::Mutex::new(session_id.clone())),
             cwd: None,
             extra_args: Vec::new(),
             env: Vec::new(),
@@ -2930,7 +3109,7 @@ impl ClaudeSessionBackend {
         let session_id = session_id.into();
         let wake = ClaudeWakeRecipe {
             spawner: Arc::new(crate::testing::FakeSpawner::new()),
-            claude_session_id: session_id.clone(),
+            claude_session_id: Arc::new(std::sync::Mutex::new(session_id.clone())),
             cwd: None,
             extra_args: Vec::new(),
             env: Vec::new(),
@@ -2958,7 +3137,7 @@ impl ClaudeSessionBackend {
         let session_id = session_id.into();
         let wake = ClaudeWakeRecipe {
             spawner: Arc::new(crate::testing::FakeSpawner::new()),
-            claude_session_id: session_id.clone(),
+            claude_session_id: Arc::new(std::sync::Mutex::new(session_id.clone())),
             cwd: None,
             extra_args: Vec::new(),
             env: Vec::new(),
@@ -2985,7 +3164,7 @@ impl ClaudeSessionBackend {
         // `--resume <session_id>`), so it is NOT routed through claude_session_id_for.
         let wake = ClaudeWakeRecipe {
             spawner,
-            claude_session_id: session_id.clone(),
+            claude_session_id: Arc::new(std::sync::Mutex::new(session_id.clone())),
             cwd: None,
             extra_args: Vec::new(),
             env: Vec::new(),
@@ -3052,12 +3231,10 @@ mod tests {
                 "--permission-mode".to_string(),
                 "default".to_string(),
                 "--allow-dangerously-skip-permissions".to_string(),
-                "--disallowed-tools".to_string(),
-                "AskUserQuestion".to_string(),
             ],
             "an unconfigured claude session is gated as `default` (never silently bypassed), \
-             with runtime-bypass UNLOCKED but not activated, and AskUserQuestion denied \
-             (temporary — no multi-question frontend renderer yet)"
+             with runtime-bypass UNLOCKED but not activated, and AskUserQuestion ENABLED \
+             (the Ask card renders multi-question payloads)"
         );
         assert_eq!(build_claude_mcp_config(&[]), None, "no servers → no --mcp-config");
     }
@@ -3161,12 +3338,10 @@ mod tests {
                 "--permission-mode".to_string(),
                 "default".to_string(),
                 "--allow-dangerously-skip-permissions".to_string(),
-                "--disallowed-tools".to_string(),
-                "AskUserQuestion".to_string(),
             ],
             "a blank mode is gated as `default` (never silently bypassed); the unlock flag \
              is always present so a later in-band switch to bypass is accepted; \
-             AskUserQuestion is denied (temporary)"
+             AskUserQuestion is enabled (the Ask card renders multi-question payloads)"
         );
     }
 
@@ -6294,5 +6469,91 @@ mod tests {
             .flatten();
             assert_eq!(got, Some(expected), "task_notification status={wire} → {expected:?}");
         }
+    }
+
+    /// Fork seam mapping: `SessionSpec::Fork` resumes the PARENT sid with a
+    /// ForkFrom legacy spec, and seeds the wake slot with the parent id (the
+    /// init sniffer rotates it to the fork's own sid before any wake can fire).
+    #[tokio::test]
+    async fn to_legacy_spec_fork_maps_to_fork_from_parent() {
+        let (logical, claude_id, legacy) = ClaudeConnection::to_legacy_spec(&SessionSpec::Fork {
+            session_id: "conv_fork_1".into(),
+            parent_backend_session_id: "8cd37cd6-2e88-4c8d-847a-7b237ffa9710".into(),
+            at_turn_id: None,
+        });
+        assert_eq!(logical, "conv_fork_1");
+        assert_eq!(claude_id, "8cd37cd6-2e88-4c8d-847a-7b237ffa9710");
+        assert!(
+            matches!(legacy, LegacySessionSpec::ForkFrom(ref id) if id == "8cd37cd6-2e88-4c8d-847a-7b237ffa9710"),
+            "fork resumes the parent id with --fork-session"
+        );
+    }
+
+    /// 陷阱 B regression: `system/init` reporting a DIFFERENT sid must rotate the
+    /// wake recipe's resume anchor — for a fork (claude always mints a new id)
+    /// AND for a plain resume rotation. Without the rotation, the next idle-wake
+    /// `--resume <stale>` re-forks / resurrects the parent session.
+    #[test]
+    fn sniff_init_rotates_wake_session_slot() {
+        let slot = Arc::new(std::sync::Mutex::new("parent-sid".to_string()));
+        let discovered_model = Arc::new(std::sync::Mutex::new(None));
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let frame = serde_json::json!({
+            "type": "system", "subtype": "init",
+            "session_id": "33333333-3333-4333-8333-333333333333"
+        });
+        sniff_init(&frame, false, &discovered_model, &event_tx, "conv_fork_1", 0, &slot);
+        assert_eq!(
+            slot.lock().unwrap().as_str(),
+            "33333333-3333-4333-8333-333333333333",
+            "the wake anchor follows claude's reported sid"
+        );
+        // And the rotation is still lowered as BackendBound for persistence.
+        let env = event_rx.try_recv().expect("BackendBound lowered");
+        assert!(
+            matches!(env.event, SessionEvent::BackendBound { backend_session_id: Some(ref sid) }
+                if sid == "33333333-3333-4333-8333-333333333333")
+        );
+    }
+
+    /// 陷阱 B end-to-end: after the slot rotates, a wake resumes the ROTATED sid,
+    /// not the open-time one.
+    #[tokio::test]
+    async fn wake_after_rotation_resumes_the_rotated_sid() {
+        use crate::testing::FakeSpawner;
+        let spawner = Arc::new(FakeSpawner::new());
+        let backend = ClaudeSessionBackend::build_with_io_suspending(
+            "logical-fork-wake",
+            Box::new(FakeAgentIo::never_exits(Vec::new())),
+            spawner.clone(),
+            40,
+        )
+        .await;
+        // Simulate the init sniffer's rotation (same shared Arc the reader holds).
+        *backend.wake.claude_session_id.lock().unwrap() = "44444444-4444-4444-8444-444444444444".to_string();
+
+        let suspended = backend
+            .suspend
+            .suspend_if_idle(aionui_common::now_ms() + 10_000, false)
+            .await;
+        assert!(suspended, "idle past ttl → suspended");
+        let _ = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("wake".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect_err("FakeSpawner cannot make a real process → wake Errs");
+        let spec = spawner.last_command().await.expect("a spawn was recorded");
+        let at = spec.args.iter().position(|a| a == "--resume").expect("wake resumes");
+        assert_eq!(
+            spec.args.get(at + 1).map(String::as_str),
+            Some("44444444-4444-4444-8444-444444444444"),
+            "wake resumes the ROTATED sid, never the stale open-time id"
+        );
+        assert!(
+            !spec.args.iter().any(|a| a == "--fork-session"),
+            "a wake never replays the fork"
+        );
     }
 }

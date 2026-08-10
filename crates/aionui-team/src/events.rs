@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use aionui_api_types::{
     TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentRuntimeStatus, TeamAgentRuntimeStatusPayload,
-    TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload, TeamRunPayload, TeamSlotWorkChangedPayload,
-    WebSocketMessage,
+    TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload, TeamMailboxChange,
+    TeamMailboxChangedPayload, TeamMailboxMessageResponse, TeamRunPayload, TeamSlotWorkChangedPayload, TeamTaskChange,
+    TeamTaskChangedPayload, TeamTaskResponse, WebSocketMessage,
 };
 use aionui_realtime::EventBroadcaster;
 use serde::Serialize;
@@ -24,6 +25,7 @@ pub const TEAM_REMOVED_EVENT: &str = "team.removed";
 pub const TEAM_RENAMED_EVENT: &str = "team.renamed";
 pub const TEAM_SESSION_STATUS_CHANGED_EVENT: &str = "team.sessionStatusChanged";
 pub const TEAM_TASK_CHANGED_EVENT: &str = "team.taskChanged";
+pub const TEAM_MAILBOX_CHANGED_EVENT: &str = "team.mailboxChanged";
 pub const TEAM_SESSION_CHANGED_EVENT: &str = "team.sessionChanged";
 pub const TEAM_RUN_ACCEPTED_EVENT: &str = "team.runAccepted";
 pub const TEAM_RUN_STARTED_EVENT: &str = "team.runStarted";
@@ -158,10 +160,7 @@ impl TeamEventEmitter {
             active_turn_id = ?payload.slot_work.active_turn_id,
             "team websocket event emitted"
         );
-        let event = WebSocketMessage::new(
-            TEAM_SLOT_WORK_CHANGED_EVENT,
-            serde_json::to_value(payload).expect("serialize team slot work payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_SLOT_WORK_CHANGED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -178,6 +177,48 @@ impl TeamEventEmitter {
             "team websocket event emitted"
         );
         let event = WebSocketMessage::new(event_name, self.scoped_payload(payload));
+        self.broadcaster.broadcast(event);
+    }
+
+    /// Broadcasts `team.taskChanged` after a task is created or updated.
+    ///
+    /// Only non-sensitive correlation fields (id / change / team_id) are
+    /// logged; subject and description never appear in logs.
+    pub fn broadcast_task_changed(&self, task: TeamTaskResponse, change: TeamTaskChange) {
+        debug!(
+            event_name = TEAM_TASK_CHANGED_EVENT,
+            team_id = %self.team_id,
+            task_id = %task.id,
+            change = ?change,
+            "team websocket event emitted"
+        );
+        let payload = TeamTaskChangedPayload {
+            team_id: self.team_id.clone(),
+            task,
+            change,
+        };
+        let event = WebSocketMessage::new(TEAM_TASK_CHANGED_EVENT, self.scoped_payload(payload));
+        self.broadcaster.broadcast(event);
+    }
+
+    /// Broadcasts `team.mailboxChanged` after a message is written or read.
+    ///
+    /// Only non-sensitive correlation fields (id / change / team_id) are
+    /// logged; content and summary never appear in logs.
+    pub fn broadcast_mailbox_changed(&self, message: TeamMailboxMessageResponse, change: TeamMailboxChange) {
+        debug!(
+            event_name = TEAM_MAILBOX_CHANGED_EVENT,
+            team_id = %self.team_id,
+            message_id = %message.id,
+            change = ?change,
+            "team websocket event emitted"
+        );
+        let payload = TeamMailboxChangedPayload {
+            team_id: self.team_id.clone(),
+            message,
+            change,
+        };
+        let event = WebSocketMessage::new(TEAM_MAILBOX_CHANGED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 }
@@ -426,6 +467,9 @@ mod tests {
         let events = bc.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "team.slotWorkChanged");
+        // Must carry user_id so the event-bus → WebSocket bridge delivers it to
+        // the owning user instead of dropping it (multi-account isolation #669).
+        assert_eq!(events[0].data["user_id"], "user-1");
 
         let payload: aionui_api_types::TeamSlotWorkChangedPayload =
             serde_json::from_value(events[0].data.clone()).unwrap();
@@ -433,6 +477,70 @@ mod tests {
         assert_eq!(payload.slot_work.slot_id, "lead-1");
         assert_eq!(payload.slot_work.state, aionui_api_types::TeamSlotWorkState::Idle);
         assert_eq!(payload.slot_work.active_turn_id, None);
+    }
+
+    #[test]
+    fn task_changed_event_has_correct_shape() {
+        let (emitter, bc) = make_emitter();
+        emitter.broadcast_task_changed(
+            TeamTaskResponse {
+                id: "tk1".into(),
+                team_id: "team-1".into(),
+                subject: "Build".into(),
+                description: None,
+                status: "pending".into(),
+                owner: None,
+                blocked_by: vec![],
+                blocks: vec![],
+                created_at: 1,
+                updated_at: 1,
+            },
+            TeamTaskChange::Created,
+        );
+
+        let events = bc.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "team.taskChanged");
+        // Must carry user_id so the event-bus → WebSocket bridge delivers it to
+        // the owning user instead of dropping it (multi-account isolation #669).
+        assert_eq!(events[0].data["user_id"], "user-1");
+
+        let payload: TeamTaskChangedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
+        assert_eq!(payload.team_id, "team-1");
+        assert_eq!(payload.task.id, "tk1");
+        assert_eq!(payload.change, TeamTaskChange::Created);
+    }
+
+    #[test]
+    fn mailbox_changed_event_has_correct_shape() {
+        let (emitter, bc) = make_emitter();
+        emitter.broadcast_mailbox_changed(
+            TeamMailboxMessageResponse {
+                id: "m1".into(),
+                team_id: "team-1".into(),
+                from_agent_id: "a2".into(),
+                to_agent_id: "a1".into(),
+                msg_type: "message".into(),
+                content: "hi".into(),
+                summary: None,
+                files: vec![],
+                read: true,
+                created_at: 1,
+            },
+            TeamMailboxChange::Read,
+        );
+
+        let events = bc.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "team.mailboxChanged");
+        // Must carry user_id so the event-bus → WebSocket bridge delivers it to
+        // the owning user instead of dropping it (multi-account isolation #669).
+        assert_eq!(events[0].data["user_id"], "user-1");
+
+        let payload: TeamMailboxChangedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
+        assert_eq!(payload.team_id, "team-1");
+        assert_eq!(payload.message.id, "m1");
+        assert_eq!(payload.change, TeamMailboxChange::Read);
     }
 
     #[test]

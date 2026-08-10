@@ -54,6 +54,17 @@ pub async fn adopt_user_filesystem(
         moved += move_dir_contents(&src, &dst);
     }
 
+    // Pre-user-scope installs kept assistant rule files directly under
+    // `assistant-rules/` (no `users/` segment) and no upgrade migration ever
+    // moved them: the local default user still reads them through a
+    // default-user-only legacy fallback in AssistantService, but an adopter
+    // cannot reach that fallback — without this move the adopted account
+    // silently loses every rule authored before the user-scope upgrade.
+    moved += move_root_files(
+        &paths.assistant_rules_dir,
+        &paths.assistant_rules_dir.join("users").join(&adopter_dir),
+    );
+
     rewrite_adopted_skill_paths(paths, skill_repo, adopter_user_id, &adopter_dir).await;
 
     if moved > 0 {
@@ -79,6 +90,42 @@ fn move_dir_contents(src: &Path, dst: &Path) -> u64 {
         let to = dst.join(name);
         if to.exists() {
             continue; // idempotent: destination already has it
+        }
+        match std::fs::rename(&from, &to) {
+            Ok(()) => moved += 1,
+            Err(err) if is_cross_device(&err) => {
+                if copy_then_remove(&from, &to) {
+                    moved += 1;
+                }
+            }
+            Err(err) => {
+                warn!(from = %from.display(), to = %to.display(), error = %err, "fs adoption: move failed");
+            }
+        }
+    }
+    moved
+}
+
+/// Move only the regular files at the top level of `root` into `dst`,
+/// leaving subdirectories (`users/`, ...) untouched. Missing `root` -> 0.
+fn move_root_files(root: &Path, dst: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut moved = 0u64;
+    for entry in entries.flatten() {
+        let from = entry.path();
+        if from.is_dir() {
+            continue; // the per-user tree (and any future subdir) stays put
+        }
+        let Some(name) = from.file_name() else { continue };
+        let to = dst.join(name);
+        if to.exists() {
+            continue; // idempotent: destination already has it
+        }
+        if let Err(err) = std::fs::create_dir_all(dst) {
+            warn!(dst = %dst.display(), error = %err, "fs adoption: create destination failed");
+            return moved;
         }
         match std::fs::rename(&from, &to) {
             Ok(()) => moved += 1,

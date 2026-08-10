@@ -77,6 +77,14 @@ impl BackendConnection for AcpConnection {
         let logical_id = match &spec {
             SessionSpec::Fresh { session_id } => session_id.clone(),
             SessionSpec::Resume { session_id, .. } => session_id.clone(),
+            // Clean-slate ACP backend is not factory-wired yet; the live ACP
+            // fork path is AcpAgentManager's `session/fork`. Explicit reject —
+            // never silently open fresh under a fork spec.
+            SessionSpec::Fork { .. } => {
+                return Err(BackendError::Transport(
+                    "acp_conn does not support SessionSpec::Fork (use the ACP manager fork path)".into(),
+                ));
+            }
         };
 
         // Live spawn via the injected Spawner (records into the unified registry
@@ -118,6 +126,8 @@ impl BackendConnection for AcpConnection {
             SessionSpec::Fresh { .. } => None,
             // lost backend session → fresh under the same logical id (§4.1).
             SessionSpec::Resume { backend_session_id, .. } => backend_session_id.clone(),
+            // Unreachable: the logical-id match above already rejected Fork.
+            SessionSpec::Fork { .. } => unreachable!("acp_conn rejects SessionSpec::Fork at open"),
         };
         backend.run_handshake(resume_sid.as_deref()).await?;
 
@@ -1171,6 +1181,7 @@ async fn reader_task(ctx: ReaderCtx) {
                                         level: crate::event::NoticeLevel::Warning,
                                         message: format!("{label} failed: {message}"),
                                         localized: None,
+                                        supersedes_key: None,
                                     },
                                 );
                             } else if let Some((kind, value)) = label.split_once('\u{2192}') {
@@ -2469,6 +2480,10 @@ impl SessionBackend for AcpSessionBackend {
                     turn_gen: self.turn_gen.load(Ordering::SeqCst),
                 })
             }
+            // ACP has no structured-question channel (elicitation unimplemented,
+            // 0/24 live agents emit it — 2026-08-04 sweep); Ask is never raised
+            // here, so an answer has nothing to land on.
+            Command::AnswerAsk { .. } => Err(BackendError::CommandNotSupported { command: "answer_ask" }),
             Command::AnswerAuth { method_id, .. } => {
                 // D2: only when the agent advertised authMethods at initialize
                 // (answer_auth cap dynamically true) do we honor this. ACP auth is a

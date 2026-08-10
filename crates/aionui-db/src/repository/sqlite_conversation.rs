@@ -1,6 +1,6 @@
 use sqlx::{Row, SqlitePool};
 
-use aionui_common::PaginatedResult;
+use aionui_common::{PaginatedResult, TimestampMs};
 
 use crate::error::DbError;
 use crate::models::{
@@ -75,8 +75,8 @@ impl SqliteConversationRepository {
             sqlx::query(
                 "INSERT INTO messages \
                     (id, conversation_id, msg_id, type, content, position, \
-                     status, hidden, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     status, hidden, created_at, backend_turn_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&message.id)
             .bind(&message.conversation_id)
@@ -87,6 +87,7 @@ impl SqliteConversationRepository {
             .bind(&message.status)
             .bind(message.hidden)
             .bind(message.created_at)
+            .bind(&message.backend_turn_id)
             .execute(&mut *connection)
             .await?;
 
@@ -123,8 +124,8 @@ impl SqliteConversationRepository {
             let result = sqlx::query(
                 "INSERT INTO messages \
                 (id, conversation_id, msg_id, type, content, position, \
-                 status, hidden, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 status, hidden, created_at, backend_turn_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET \
                 content = CASE \
                     WHEN messages.status IN ('finish', 'error') AND excluded.status = 'work' THEN \
@@ -148,7 +149,8 @@ impl SqliteConversationRepository {
                 END, \
                 position = COALESCE(messages.position, excluded.position), \
                 hidden = excluded.hidden, \
-                created_at = MIN(messages.created_at, excluded.created_at) \
+                created_at = MIN(messages.created_at, excluded.created_at), \
+                backend_turn_id = COALESCE(messages.backend_turn_id, excluded.backend_turn_id) \
              WHERE messages.conversation_id = excluded.conversation_id \
                AND EXISTS ( \
                     SELECT 1 FROM conversations c \
@@ -164,6 +166,7 @@ impl SqliteConversationRepository {
             .bind(&message.status)
             .bind(message.hidden)
             .bind(message.created_at)
+            .bind(&message.backend_turn_id)
             .bind(user_id)
             .execute(&mut *connection)
             .await?;
@@ -928,6 +931,148 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
+    async fn copy_messages_up_to(
+        &self,
+        user_id: &str,
+        source_conversation_id: &str,
+        target_conversation_id: &str,
+        cursor: (TimestampMs, &str),
+    ) -> Result<u64, DbError> {
+        let (cursor_created_at, cursor_id) = cursor;
+
+        // Writer-lock-first transaction; see `insert_message_once` for why.
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+
+        let result: Result<u64, DbError> = async {
+            // Both endpoints must belong to the caller; checked inside the
+            // transaction so authorization and the copy are atomic.
+            for conv_id in [source_conversation_id, target_conversation_id] {
+                let exists: i64 =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
+                        .bind(user_id)
+                        .bind(conv_id)
+                        .fetch_one(&mut *connection)
+                        .await?;
+                if exists == 0 {
+                    return Err(DbError::NotFound(format!("Conversation '{conv_id}' not found")));
+                }
+            }
+
+            let rows = sqlx::query_as::<_, MessageRow>(
+                "SELECT m.* FROM messages m \
+                 WHERE m.conversation_id = ? \
+                   AND (m.created_at < ? OR (m.created_at = ? AND m.id <= ?)) \
+                 ORDER BY m.created_at ASC, m.id ASC",
+            )
+            .bind(source_conversation_id)
+            .bind(cursor_created_at)
+            .bind(cursor_created_at)
+            .bind(cursor_id)
+            .fetch_all(&mut *connection)
+            .await?;
+
+            let mut copied: u64 = 0;
+            let mut latest_created_at: Option<TimestampMs> = None;
+            for row in &rows {
+                // `generate_id()` is a monotonic UUIDv7, so reminting in
+                // display order keeps the `(created_at, id)` sort stable for
+                // rows sharing a timestamp.
+                sqlx::query(
+                    "INSERT INTO messages \
+                        (id, conversation_id, msg_id, type, content, position, \
+                         status, hidden, created_at, backend_turn_id) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                )
+                .bind(aionui_common::generate_id())
+                .bind(target_conversation_id)
+                .bind(&row.msg_id)
+                .bind(&row.r#type)
+                .bind(&row.content)
+                .bind(&row.position)
+                .bind(&row.status)
+                .bind(row.hidden)
+                .bind(row.created_at)
+                .execute(&mut *connection)
+                .await?;
+                copied += 1;
+                latest_created_at = Some(row.created_at);
+            }
+
+            // One recency bump for the whole batch (mirrors the per-insert
+            // bump contract of `insert_message_once`).
+            if let Some(bump) = latest_created_at {
+                sqlx::query("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?")
+                    .bind(bump)
+                    .bind(target_conversation_id)
+                    .execute(&mut *connection)
+                    .await?;
+            }
+
+            Ok(copied)
+        }
+        .await;
+
+        match result {
+            Ok(copied) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(copied)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn resolve_backend_turn_anchor(
+        &self,
+        user_id: &str,
+        conv_id: &str,
+        cursor: (TimestampMs, &str),
+    ) -> Result<Option<String>, DbError> {
+        let (cursor_created_at, cursor_id) = cursor;
+        let anchor: Option<String> = sqlx::query_scalar(
+            "SELECT m.backend_turn_id FROM messages m \
+             INNER JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? \
+               AND m.backend_turn_id IS NOT NULL \
+               AND (m.created_at < ? OR (m.created_at = ? AND m.id <= ?)) \
+             ORDER BY m.created_at DESC, m.id DESC \
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(conv_id)
+        .bind(cursor_created_at)
+        .bind(cursor_created_at)
+        .bind(cursor_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(anchor)
+    }
+
+    async fn get_message_by_msg_id_any(
+        &self,
+        user_id: &str,
+        conv_id: &str,
+        msg_id: &str,
+    ) -> Result<Option<MessageRow>, DbError> {
+        let row = sqlx::query_as::<_, MessageRow>(
+            "SELECT m.* FROM messages m \
+             INNER JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? AND m.msg_id = ? \
+             ORDER BY m.created_at ASC, m.id ASC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(conv_id)
+        .bind(msg_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
     async fn get_message_by_msg_id(
         &self,
         user_id: &str,
@@ -977,6 +1122,7 @@ impl IConversationRepository for SqliteConversationRepository {
                         status: row.try_get("status")?,
                         hidden: row.try_get("hidden")?,
                         created_at: row.try_get("created_at")?,
+                        backend_turn_id: row.try_get("backend_turn_id")?,
                     },
                 })
             })
@@ -1371,6 +1517,7 @@ mod tests {
             status: Some("finish".to_string()),
             hidden: false,
             created_at: now,
+            backend_turn_id: None,
         }
     }
 

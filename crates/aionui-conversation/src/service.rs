@@ -20,11 +20,11 @@ use aionui_api_types::{
     ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
     ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
     ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery,
-    MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
-    SendMessageResponse, SessionMcpServer, SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
-    assistant_avatar_response_value_with_version,
+    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
+    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
+    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
+    SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    WebSocketMessage, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -915,6 +915,10 @@ impl ConversationService {
 
         let mut extra = req.extra;
         strip_request_owner_user_id(&mut extra);
+        // `extra.fork` is server-minted by the fork API only. A client-supplied
+        // value would let anyone fork an arbitrary `parent_session_id` they do
+        // not own — strip it unconditionally on the create path.
+        strip_request_fork_spec(&mut extra);
 
         let assistant_id = req
             .assistant
@@ -2036,6 +2040,17 @@ impl ConversationService {
         let mut response = row_to_response_with_extra(row, extra, &self.workspace_root)?;
         self.attach_assistant_identity(user_id, &mut response).await?;
         response.runtime = Some(self.runtime_summary_for(id).await);
+        // Fork + prompt capabilities: detail-path-only post-fill (list stays
+        // N+1-free). Best-effort — a lookup failure just hides the fork entry
+        // point / media hint.
+        if let Ok(Some(acp_row)) = self.acp_session_repo.get_for_user(user_id, id).await
+            && let Ok(capabilities) = self
+                .agent_capabilities_for_agent(user_id, &acp_row.agent_id, &response.extra.to_string())
+                .await
+        {
+            response.fork_capability = capabilities.as_ref().and_then(fork_capability_view);
+            response.prompt_capability = capabilities.as_ref().and_then(prompt_capability_view);
+        }
         if project_backfilled {
             self.broadcast_list_changed(user_id, id, "updated", response.source.as_ref());
         }
@@ -2375,7 +2390,33 @@ impl ConversationService {
             .source
             .as_deref()
             .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
-        let auto_workspace_to_delete = auto_provisioned_workspace_to_delete(&self.workspace_root, &existing, id);
+        let mut auto_workspace_to_delete = auto_provisioned_workspace_to_delete(&self.workspace_root, &existing, id);
+        // Shared-workspace guard: a forked conversation inherits the parent's
+        // auto workspace verbatim (claude keys on-disk sessions by cwd), so
+        // deleting the parent must not rip the directory out from under the
+        // fork. Checked BEFORE the row delete (`list_associated` reads the
+        // source row). Fails closed: an error keeps the workspace.
+        if auto_workspace_to_delete.is_some() {
+            match self.conversation_repo.list_associated(user_id, id).await {
+                Ok(rows) if !rows.is_empty() => {
+                    info!(
+                        conversation_id = %id,
+                        remaining_references = rows.len(),
+                        "Skipping auto-workspace removal: other conversations still share it"
+                    );
+                    auto_workspace_to_delete = None;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(
+                        conversation_id = %id,
+                        error = %ErrorChain(&err),
+                        "Shared-workspace check failed; keeping the workspace to be safe"
+                    );
+                    auto_workspace_to_delete = None;
+                }
+            }
+        }
 
         let had_active_turn = self.runtime_state.mark_deleting(id);
 
@@ -2450,6 +2491,304 @@ impl ConversationService {
         req: CloneConversationRequest,
     ) -> Result<ConversationResponse, ConversationError> {
         self.create(user_id, req.conversation).await
+    }
+
+    /// Fork a conversation at a message (inclusive) into a NEW conversation.
+    ///
+    /// The fork API is pure bookkeeping: it validates, snapshots the parent's
+    /// backend session id into `extra.fork`, creates the new row (same
+    /// workspace — claude keys on-disk sessions by cwd), copies the visible
+    /// history, and returns. The BACKEND session materializes lazily on the
+    /// fork's first open (`SessionSpec::Fork` / ACP `session/fork`); the
+    /// frontend calls `POST {new_id}/runtime/ensure` right after to surface
+    /// fork failures eagerly.
+    ///
+    /// Error contract (stable `reason` prefixes the frontend maps to i18n):
+    /// 403 team / 404 conversation or message / 409 `FORK_TURN_IN_FLIGHT`,
+    /// `FORK_PARENT_UNBOUND` / 422 `FORK_UNSUPPORTED`, `FORK_POINT_UNSUPPORTED`.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
+    pub async fn fork(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: ForkConversationRequest,
+    ) -> Result<ConversationResponse, ConversationError> {
+        let parent = self
+            .conversation_repo
+            .get(user_id, id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+
+        if team_id_from_extra(&parent.extra).is_some() {
+            return Err(ConversationError::Forbidden {
+                reason: "team conversations cannot be forked".into(),
+            });
+        }
+        // A turn in flight means the parent's backend session is advancing
+        // right now — the snapshotted sid would race the stream (and claude's
+        // HEAD-fork point would be mid-sentence).
+        if self.runtime_state.active_turn_id_for(id).is_some() {
+            return Err(ConversationError::Busy {
+                reason: "FORK_TURN_IN_FLIGHT: wait for the current reply to finish before forking".into(),
+            });
+        }
+
+        // Capability gate + parent session anchor, both from the acp_session
+        // row (claude/codex/ACP all share it; other agent types have none).
+        let acp_row = self
+            .acp_session_repo
+            .get_for_user(user_id, id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("acp_session lookup: {e}")))?
+            .ok_or_else(|| ConversationError::Unprocessable {
+                reason: "FORK_UNSUPPORTED: this conversation type cannot be forked".into(),
+            })?;
+        let fork_capability = self
+            .fork_capability_for_agent(user_id, &acp_row.agent_id, &parent.extra)
+            .await?
+            .ok_or_else(|| ConversationError::Unprocessable {
+                reason: "FORK_UNSUPPORTED: this agent does not support session forking".into(),
+            })?;
+        let parent_session_id = acp_row.session_id.clone().ok_or_else(|| ConversationError::Busy {
+            reason: "FORK_PARENT_UNBOUND: the conversation has no backend session to fork yet".into(),
+        })?;
+
+        // Fork point: must be a message of the PARENT conversation. Cursor is
+        // the display sort key (created_at, id), endpoint inclusive.
+        // Row-id first (history-loaded messages), then stream msg_id (live
+        // messages carry a frontend-local `id` that is never persisted).
+        let fork_point = match self.conversation_repo.get_message(user_id, id, &req.message_id).await? {
+            Some(row) => row,
+            None => self
+                .conversation_repo
+                .get_message_by_msg_id_any(user_id, id, &req.message_id)
+                .await?
+                .ok_or_else(|| ConversationError::MessageNotFound {
+                    id: req.message_id.clone(),
+                })?,
+        };
+        let cursor = (fork_point.created_at, fork_point.id.as_str());
+
+        // HEAD detection against the visible timeline (the same filtered view
+        // the UI renders and the copy uses).
+        let latest = self
+            .conversation_repo
+            .list_messages_page(
+                user_id,
+                id,
+                &aionui_db::MessagePageParams {
+                    limit: 1,
+                    direction: aionui_db::MessagePageDirection::InitialLatest,
+                },
+            )
+            .await?;
+        let is_head = latest.items.last().is_none_or(|m| m.id == fork_point.id);
+
+        let last_turn_id = if is_head {
+            // HEAD fork: every backend supports it and no anchor is needed
+            // (codex `lastTurnId` omitted = fork at HEAD).
+            None
+        } else if fork_capability.at_turn {
+            // Mid-history fork (codex): resolve the backend turn anchor from
+            // the stamped rows. Refuse explicitly when unresolvable (rows
+            // predating the anchor column) — never silently fork at HEAD.
+            match self
+                .conversation_repo
+                .resolve_backend_turn_anchor(user_id, id, cursor)
+                .await?
+            {
+                Some(anchor) => Some(anchor),
+                None => {
+                    return Err(ConversationError::Unprocessable {
+                        reason: "FORK_POINT_UNSUPPORTED: this message predates turn tracking; \
+                                 fork from the latest message instead"
+                            .into(),
+                    });
+                }
+            }
+        } else {
+            return Err(ConversationError::Unprocessable {
+                reason: "FORK_POINT_UNSUPPORTED: this agent only supports forking from the latest message".into(),
+            });
+        };
+
+        // ── All checks passed: build the fork row ──────────────────────
+        let new_id = generate_short_id();
+        let now = now_ms();
+        let mut extra: serde_json::Value = serde_json::from_str(&parent.extra)
+            .map_err(|e| ConversationError::internal(format!("Invalid parent extra JSON: {e}")))?;
+        if let Some(obj) = extra.as_object_mut() {
+            obj.insert(
+                "fork".to_owned(),
+                serde_json::to_value(aionui_api_types::ForkSpec {
+                    parent_conversation_id: id.to_owned(),
+                    parent_message_id: fork_point.id.clone(),
+                    parent_session_id,
+                    last_turn_id,
+                })
+                .map_err(|e| ConversationError::internal(format!("Failed to serialize fork spec: {e}")))?,
+            );
+        }
+
+        let explicit_name = req.name.filter(|n| !n.is_empty());
+        // Caller-chosen name = user intent (auto-titling must not overwrite it);
+        // an inherited parent name keeps the parent's provenance marker.
+        let name_source = if explicit_name.is_some() {
+            Some("user".to_owned())
+        } else {
+            parent.name_source.clone()
+        };
+        let row = aionui_db::models::ConversationRow {
+            id: new_id.clone(),
+            user_id: user_id.to_owned(),
+            name: explicit_name.unwrap_or_else(|| parent.name.clone()),
+            name_source,
+            r#type: parent.r#type.clone(),
+            extra: serde_json::to_string(&extra)
+                .map_err(|e| ConversationError::internal(format!("Failed to serialize extra: {e}")))?,
+            model: parent.model.clone(),
+            status: Some(enum_to_db(&ConversationStatus::Pending)?),
+            source: parent.source.clone(),
+            // Channel bindings are 1:1 with the parent chat — never duplicated.
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: now,
+            updated_at: now,
+            // Direct inheritance (the create() heuristics re-derive from the
+            // workspace, which is shared anyway — copying is exact and cheap).
+            project_id: parent.project_id.clone(),
+            folder_id: parent.folder_id.clone(),
+        };
+        self.conversation_repo.create(&row).await?;
+
+        // Assistant snapshot: copy the parent's so rules/skills resolution is
+        // identical in the fork.
+        if let Some(snapshot) = self.conversation_repo.get_assistant_snapshot(user_id, id).await? {
+            self.conversation_repo
+                .upsert_assistant_snapshot(
+                    user_id,
+                    &UpsertConversationAssistantSnapshotParams {
+                        conversation_id: &new_id,
+                        assistant_definition_id: &snapshot.assistant_definition_id,
+                        assistant_id: &snapshot.assistant_id,
+                        assistant_source: &snapshot.assistant_source,
+                        agent_id: &snapshot.agent_id,
+                        rules_content: &snapshot.rules_content,
+                        default_model_mode: &snapshot.default_model_mode,
+                        resolved_model_id: snapshot.resolved_model_id.as_deref(),
+                        default_permission_mode: &snapshot.default_permission_mode,
+                        resolved_permission_value: snapshot.resolved_permission_value.as_deref(),
+                        default_thought_level_mode: &snapshot.default_thought_level_mode,
+                        resolved_thought_level_value: snapshot.resolved_thought_level_value.as_deref(),
+                        default_skills_mode: &snapshot.default_skills_mode,
+                        resolved_skill_ids: &snapshot.resolved_skill_ids,
+                        resolved_disabled_builtin_skill_ids: &snapshot.resolved_disabled_builtin_skill_ids,
+                        default_mcps_mode: &snapshot.default_mcps_mode,
+                        resolved_mcp_ids: &snapshot.resolved_mcp_ids,
+                    },
+                )
+                .await?;
+        }
+
+        // acp_session row: same agent identity, session_id NULL ("fork
+        // pending" — the first open materializes it); mode/model seeded from
+        // the parent's live runtime state so the fork opens with the same
+        // selections.
+        let params = CreateAcpSessionParams {
+            user_id,
+            conversation_id: &new_id,
+            agent_source: &acp_row.agent_source,
+            agent_id: &acp_row.agent_id,
+        };
+        self.acp_session_repo
+            .create(&params)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to create acp_session row: {e}")))?;
+        if let Ok(Some(state)) = self.acp_session_repo.load_runtime_state_for_user(user_id, id).await {
+            let seed = SaveRuntimeStateParams {
+                current_mode_id: state.current_mode_id.as_deref().map(Some),
+                current_model_id: state.current_model_id.as_deref().map(Some),
+                config_selections_json: None,
+                context_usage_json: None,
+            };
+            if (seed.current_mode_id.is_some() || seed.current_model_id.is_some())
+                && let Err(err) = self
+                    .acp_session_repo
+                    .save_runtime_state_for_user(user_id, &new_id, &seed)
+                    .await
+            {
+                warn!(error = %ErrorChain(&err), "fork: failed to seed runtime state (non-fatal)");
+            }
+        }
+
+        // Copy the visible history up to (and including) the fork point.
+        let copied = self
+            .conversation_repo
+            .copy_messages_up_to(user_id, id, &new_id, cursor)
+            .await?;
+        info!(
+            parent_conversation_id = %id,
+            fork_conversation_id = %new_id,
+            copied_messages = copied,
+            "Conversation forked"
+        );
+
+        let mut response = row_to_response(row, &self.workspace_root)?;
+        self.attach_assistant_identity(user_id, &mut response).await?;
+        response.fork_capability = Some(fork_capability);
+        self.broadcast_list_changed(user_id, &new_id, "created", response.source.as_ref());
+        Ok(response)
+    }
+
+    /// Resolve the fork capability for an agent from
+    /// `agent_metadata.agent_capabilities.session_capabilities.fork`
+    /// (snake_case, the shape `apply_handshake` persists and migrations
+    /// 003/033/036 seed). `Ok(None)` = no fork support declared.
+    async fn fork_capability_for_agent(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        parent_extra: &str,
+    ) -> Result<Option<ForkCapabilityView>, ConversationError> {
+        Ok(self
+            .agent_capabilities_for_agent(user_id, agent_id, parent_extra)
+            .await?
+            .as_ref()
+            .and_then(fork_capability_view))
+    }
+
+    /// Load and parse `agent_metadata.agent_capabilities` for the
+    /// conversation's agent (by id, or by `extra.backend` for legacy rows).
+    async fn agent_capabilities_for_agent(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        parent_extra: &str,
+    ) -> Result<Option<serde_json::Value>, ConversationError> {
+        let metadata_row = if !agent_id.is_empty() {
+            self.agent_metadata_repo
+                .get_for_user(user_id, agent_id)
+                .await
+                .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?
+        } else {
+            // Defensive fallback for legacy rows that only carry `backend`.
+            let backend = serde_json::from_str::<serde_json::Value>(parent_extra)
+                .ok()
+                .and_then(|v| v.get("backend").and_then(|b| b.as_str()).map(str::to_owned));
+            match backend {
+                Some(backend) if !backend.is_empty() => self
+                    .agent_metadata_repo
+                    .find_builtin_by_backend_for_user(user_id, &backend)
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?,
+                _ => None,
+            }
+        };
+        let Some(capabilities_json) = metadata_row.and_then(|row| row.agent_capabilities) else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_str(&capabilities_json).ok())
     }
 
     /// Reset a conversation: clear messages and set status back to pending.
@@ -2861,6 +3200,54 @@ impl ConversationService {
         Ok(())
     }
 
+    /// Answer a pending structured question (AskUserQuestion) over its
+    /// DEDICATED channel (2026-08-05 ruling: not the permission confirm path).
+    /// `answers: None` = the user dismissed the card (deny on the wire).
+    pub async fn answer_ask(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        request_id: &str,
+        answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), ConversationError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+
+        let agent = task_manager
+            .get_task(conversation_id)
+            .ok_or_else(|| ConversationError::ActiveAgentNotFound {
+                conversation_id: conversation_id.to_owned(),
+            })?;
+
+        // Same recovery-card cleanup contract as confirm(): if this request is
+        // also surfaced as a pending confirmation, broadcast its removal so
+        // every connected client drops the recovered card.
+        let conf_id = agent
+            .get_confirmations()
+            .iter()
+            .find(|c| c.call_id == request_id)
+            .map(|c| c.id.clone());
+
+        agent.answer_ask(request_id, answers)?;
+
+        if let Some(conf_id) = conf_id {
+            let payload = serde_json::json!({
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "id": conf_id,
+            });
+            let msg = WebSocketMessage::new("confirmation.remove", payload);
+            self.broadcaster.broadcast(msg);
+        }
+
+        Ok(())
+    }
+
     /// Check whether an action has been auto-approved in the current session.
     pub async fn check_approval(
         &self,
@@ -2959,6 +3346,7 @@ impl ConversationService {
             status: Some("finish".into()),
             hidden: req.hidden,
             created_at: now_ms(),
+            backend_turn_id: None,
         };
         if !self
             .runtime_persistence()
@@ -3085,6 +3473,7 @@ impl ConversationService {
                 status: Some("finish".into()),
                 hidden: request.user_message_hidden,
                 created_at: now_ms(),
+                backend_turn_id: None,
             };
             if self
                 .runtime_persistence()
@@ -3255,6 +3644,40 @@ impl ConversationService {
 
     /// Stop the current streaming response for a conversation.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
+    /// Stop ONE client-hosted terminal command (ACP `terminal/*`) without
+    /// touching the turn: the agent observes the signal exit and continues.
+    pub async fn kill_terminal(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        terminal_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), ConversationError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        let Some(agent) = task_manager.get_task(conversation_id) else {
+            return Err(ConversationError::BadRequest {
+                reason: "no running agent for conversation".to_owned(),
+            });
+        };
+        let killed = match &agent {
+            AgentInstance::Acp(mgr) => mgr.kill_client_terminal(terminal_id).await,
+            // Client-hosted terminals only exist on the ACP path.
+            _ => false,
+        };
+        if !killed {
+            return Err(ConversationError::NotFound {
+                id: format!("terminal {terminal_id}"),
+            });
+        }
+        info!(conversation_id, terminal_id, "client terminal killed by user");
+        Ok(())
+    }
+
     pub async fn cancel(
         &self,
         user_id: &str,
@@ -3903,6 +4326,16 @@ fn strip_request_owner_user_id(extra: &mut serde_json::Value) {
     }
 }
 
+/// See the call site in `create`: `extra.fork` may only be minted by the
+/// server-side fork API, never accepted from a client payload.
+fn strip_request_fork_spec(extra: &mut serde_json::Value) {
+    if let Some(obj) = extra.as_object_mut()
+        && obj.remove("fork").is_some()
+    {
+        warn!("create: stripped client-supplied `extra.fork` (server-minted only)");
+    }
+}
+
 fn team_id_from_extra(extra: &str) -> Option<String> {
     TeamSessionBinding::team_id_marker_from_extra_str(extra)
 }
@@ -4438,6 +4871,32 @@ fn legacy_cron_trigger_to_artifact(row: MessageRow) -> Result<ConversationArtifa
 }
 
 /// Merge `patch` into `base` (top-level key overwrite).
+/// Project `session_capabilities.fork` out of a parsed
+/// `agent_metadata.agent_capabilities` value. `None` = fork hidden.
+fn fork_capability_view(capabilities: &serde_json::Value) -> Option<ForkCapabilityView> {
+    let fork = capabilities.get("session_capabilities")?.get("fork")?;
+    if fork.is_null() {
+        return None;
+    }
+    Some(ForkCapabilityView {
+        at_turn: fork.get("at_turn").and_then(|v| v.as_bool()).unwrap_or(false),
+    })
+}
+
+/// Project `prompt_capabilities` out of a parsed
+/// `agent_metadata.agent_capabilities` value. `None` = unknown (UI treats
+/// media attachments as path-delivered).
+fn prompt_capability_view(capabilities: &serde_json::Value) -> Option<PromptCapabilityView> {
+    let prompt = capabilities.get("prompt_capabilities")?;
+    if !prompt.is_object() {
+        return None;
+    }
+    Some(PromptCapabilityView {
+        image: prompt.get("image").and_then(|v| v.as_bool()).unwrap_or(false),
+        audio: prompt.get("audio").and_then(|v| v.as_bool()).unwrap_or(false),
+    })
+}
+
 fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
     if let (Some(base_obj), Some(patch_obj)) = (base.as_object_mut(), patch.as_object()) {
         for (key, value) in patch_obj {
@@ -4671,6 +5130,8 @@ mod tests {
             channel_chat_id: None,
             assistant: None,
             project_id: None,
+            fork_capability: None,
+            prompt_capability: None,
             created_at: 0,
             modified_at: 0,
             extra: json!({}),

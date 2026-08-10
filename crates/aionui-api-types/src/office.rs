@@ -1,4 +1,3 @@
-use aionui_common::PreviewContentType;
 use serde::{Deserialize, Serialize};
 
 use crate::chat_file::ChatFileRef;
@@ -17,6 +16,25 @@ pub struct StartPreviewRequest {
     /// Preferred identity: a [`ChatFileRef`] the backend resolves to an absolute
     /// path (keeps pe→path resolution server-side). When present it takes
     /// precedence over `file_path`.
+    #[serde(default)]
+    pub file: Option<ChatFileRef>,
+}
+
+/// `POST /api/{word|excel|ppt}-preview/refresh` body — force the running watch
+/// server to re-read this document from disk.
+///
+/// Same shape as [`StartPreviewRequest`]: the caller already holds that payload
+/// for the tab it is refreshing, and the backend has to resolve the identity to
+/// the same absolute path `start` keyed its session on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RefreshPreviewRequest {
+    /// Legacy device-path identity. Retained for the frontend migration window;
+    /// used when `file` is absent.
+    pub file_path: String,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// Preferred identity: a [`ChatFileRef`] the backend resolves to an absolute
+    /// path. When present it takes precedence over `file_path`.
     #[serde(default)]
     pub file: Option<ChatFileRef>,
 }
@@ -45,6 +63,20 @@ pub struct PreviewUrlResponse {
     pub error: Option<String>,
 }
 
+/// `POST /api/{word|excel|ppt}-preview/refresh` response.
+///
+/// A failed refresh is reported as `ok: false` with a code rather than an HTTP
+/// error: the watch server keeps serving the current document when a reload
+/// fails, so the tab the user is looking at is still intact and the frontend only
+/// needs to say the refresh did not take.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RefreshPreviewResponse {
+    pub ok: bool,
+    /// Stable code for the frontend's existing office-error copy; absent on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PreviewState {
@@ -62,68 +94,7 @@ pub struct PreviewStatusEvent {
 }
 
 // ---------------------------------------------------------------------------
-// C. Preview history target & snapshot info
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PreviewHistoryTargetDto {
-    pub content_type: PreviewContentType,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub language: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PreviewSnapshotInfoDto {
-    pub id: String,
-    pub label: String,
-    pub created_at: i64,
-    pub size: u64,
-    pub content_type: PreviewContentType,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_path: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// D. Snapshot requests & responses
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SaveSnapshotRequest {
-    pub target: PreviewHistoryTargetDto,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ListSnapshotsRequest {
-    pub target: PreviewHistoryTargetDto,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct GetSnapshotContentRequest {
-    pub target: PreviewHistoryTargetDto,
-    pub snapshot_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SnapshotContentResponse {
-    pub snapshot: PreviewSnapshotInfoDto,
-    pub content: String,
-}
-
-// ---------------------------------------------------------------------------
-// E. Document conversion
+// C. Document conversion
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,7 +131,7 @@ pub struct ConversionResultDto {
 }
 
 // ---------------------------------------------------------------------------
-// G. Excel conversion data model
+// D. Excel conversion data model
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -204,7 +175,7 @@ pub struct ExcelSheetImage {
 }
 
 // ---------------------------------------------------------------------------
-// H. PPT conversion data model
+// E. PPT conversion data model
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -362,249 +333,7 @@ mod tests {
         assert_eq!(parsed, event);
     }
 
-    // -- C. PreviewHistoryTargetDto -------------------------------------------
-
-    #[test]
-    fn target_dto_full_fields() {
-        let raw = json!({
-            "content_type": "markdown",
-            "file_path": "/a.md",
-            "workspace": "/ws",
-            "file_name": "a.md",
-            "title": "My Doc",
-            "language": "rust",
-            "conversation_id": "conv_123"
-        });
-        let t: PreviewHistoryTargetDto = serde_json::from_value(raw).unwrap();
-        assert_eq!(t.content_type, PreviewContentType::Markdown);
-        assert_eq!(t.file_path.as_deref(), Some("/a.md"));
-        assert_eq!(t.workspace.as_deref(), Some("/ws"));
-        assert_eq!(t.file_name.as_deref(), Some("a.md"));
-        assert_eq!(t.title.as_deref(), Some("My Doc"));
-        assert_eq!(t.language.as_deref(), Some("rust"));
-        assert_eq!(t.conversation_id.as_deref(), Some("conv_123"));
-    }
-
-    #[test]
-    fn target_dto_minimal() {
-        let raw = json!({"content_type": "code"});
-        let t: PreviewHistoryTargetDto = serde_json::from_value(raw).unwrap();
-        assert_eq!(t.content_type, PreviewContentType::Code);
-        assert!(t.file_path.is_none());
-        assert!(t.workspace.is_none());
-        assert!(t.file_name.is_none());
-        assert!(t.title.is_none());
-        assert!(t.language.is_none());
-        assert!(t.conversation_id.is_none());
-    }
-
-    #[test]
-    fn target_dto_missing_content_type() {
-        let raw = json!({"file_path": "/a.md"});
-        assert!(serde_json::from_value::<PreviewHistoryTargetDto>(raw).is_err());
-    }
-
-    #[test]
-    fn target_dto_serialize_omits_none() {
-        let t = PreviewHistoryTargetDto {
-            content_type: PreviewContentType::Html,
-            file_path: Some("/b.html".into()),
-            workspace: None,
-            file_name: None,
-            title: None,
-            language: None,
-            conversation_id: None,
-        };
-        let json = serde_json::to_value(&t).unwrap();
-        assert_eq!(json["content_type"], "html");
-        assert_eq!(json["file_path"], "/b.html");
-        assert!(json.get("workspace").is_none());
-        assert!(json.get("file_name").is_none());
-        assert!(json.get("title").is_none());
-        assert!(json.get("language").is_none());
-        assert!(json.get("conversation_id").is_none());
-    }
-
-    #[test]
-    fn target_dto_roundtrip() {
-        let t = PreviewHistoryTargetDto {
-            content_type: PreviewContentType::Excel,
-            file_path: Some("/sheet.xlsx".into()),
-            workspace: Some("/ws".into()),
-            file_name: Some("sheet.xlsx".into()),
-            title: Some("Budget".into()),
-            language: None,
-            conversation_id: Some("conv_1".into()),
-        };
-        let json = serde_json::to_string(&t).unwrap();
-        let parsed: PreviewHistoryTargetDto = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, t);
-    }
-
-    #[test]
-    fn target_dto_all_content_types() {
-        let types = [
-            ("markdown", PreviewContentType::Markdown),
-            ("diff", PreviewContentType::Diff),
-            ("code", PreviewContentType::Code),
-            ("html", PreviewContentType::Html),
-            ("pdf", PreviewContentType::Pdf),
-            ("ppt", PreviewContentType::Ppt),
-            ("word", PreviewContentType::Word),
-            ("excel", PreviewContentType::Excel),
-            ("image", PreviewContentType::Image),
-            ("url", PreviewContentType::Url),
-        ];
-        for (name, expected) in types {
-            let raw = json!({"content_type": name});
-            let t: PreviewHistoryTargetDto = serde_json::from_value(raw).unwrap();
-            assert_eq!(t.content_type, expected);
-        }
-    }
-
-    // -- C2. PreviewSnapshotInfoDto -------------------------------------------
-
-    #[test]
-    fn snapshot_info_serialize() {
-        let info = PreviewSnapshotInfoDto {
-            id: "1700000000000-abc".into(),
-            label: "2023-11-14 12:00".into(),
-            created_at: 1700000000000,
-            size: 1024,
-            content_type: PreviewContentType::Markdown,
-            file_name: Some("doc.md".into()),
-            file_path: Some("/a/doc.md".into()),
-        };
-        let json = serde_json::to_value(&info).unwrap();
-        assert_eq!(json["id"], "1700000000000-abc");
-        assert_eq!(json["label"], "2023-11-14 12:00");
-        assert_eq!(json["created_at"], 1700000000000_i64);
-        assert_eq!(json["size"], 1024);
-        assert_eq!(json["content_type"], "markdown");
-        assert_eq!(json["file_name"], "doc.md");
-        assert_eq!(json["file_path"], "/a/doc.md");
-    }
-
-    #[test]
-    fn snapshot_info_without_file_info() {
-        let info = PreviewSnapshotInfoDto {
-            id: "snap1".into(),
-            label: "Snapshot 1".into(),
-            created_at: 1000,
-            size: 256,
-            content_type: PreviewContentType::Code,
-            file_name: None,
-            file_path: None,
-        };
-        let json = serde_json::to_value(&info).unwrap();
-        assert!(json.get("file_name").is_none());
-        assert!(json.get("file_path").is_none());
-    }
-
-    #[test]
-    fn snapshot_info_roundtrip() {
-        let info = PreviewSnapshotInfoDto {
-            id: "snap2".into(),
-            label: "Label".into(),
-            created_at: 2000,
-            size: 512,
-            content_type: PreviewContentType::Ppt,
-            file_name: Some("slides.pptx".into()),
-            file_path: None,
-        };
-        let json = serde_json::to_string(&info).unwrap();
-        let parsed: PreviewSnapshotInfoDto = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, info);
-    }
-
-    // -- D. Snapshot requests & responses -------------------------------------
-
-    #[test]
-    fn save_snapshot_request_deserialize() {
-        let raw = json!({
-            "target": {"content_type": "markdown", "file_path": "/a.md"},
-            "content": "# Hello World"
-        });
-        let req: SaveSnapshotRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.target.content_type, PreviewContentType::Markdown);
-        assert_eq!(req.content, "# Hello World");
-    }
-
-    #[test]
-    fn save_snapshot_request_missing_content() {
-        let raw = json!({"target": {"content_type": "markdown"}});
-        assert!(serde_json::from_value::<SaveSnapshotRequest>(raw).is_err());
-    }
-
-    #[test]
-    fn save_snapshot_request_missing_target() {
-        let raw = json!({"content": "hello"});
-        assert!(serde_json::from_value::<SaveSnapshotRequest>(raw).is_err());
-    }
-
-    #[test]
-    fn list_snapshots_request_deserialize() {
-        let raw = json!({"target": {"content_type": "html"}});
-        let req: ListSnapshotsRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.target.content_type, PreviewContentType::Html);
-    }
-
-    #[test]
-    fn get_snapshot_content_request_deserialize() {
-        let raw = json!({
-            "target": {"content_type": "code", "language": "rust"},
-            "snapshot_id": "snap_abc"
-        });
-        let req: GetSnapshotContentRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.target.language.as_deref(), Some("rust"));
-        assert_eq!(req.snapshot_id, "snap_abc");
-    }
-
-    #[test]
-    fn get_snapshot_content_request_missing_snapshot_id() {
-        let raw = json!({"target": {"content_type": "markdown"}});
-        assert!(serde_json::from_value::<GetSnapshotContentRequest>(raw).is_err());
-    }
-
-    #[test]
-    fn snapshot_content_response_serialize() {
-        let resp = SnapshotContentResponse {
-            snapshot: PreviewSnapshotInfoDto {
-                id: "s1".into(),
-                label: "L".into(),
-                created_at: 1000,
-                size: 5,
-                content_type: PreviewContentType::Markdown,
-                file_name: None,
-                file_path: None,
-            },
-            content: "hello".into(),
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["snapshot"]["id"], "s1");
-        assert_eq!(json["content"], "hello");
-    }
-
-    #[test]
-    fn snapshot_content_response_roundtrip() {
-        let resp = SnapshotContentResponse {
-            snapshot: PreviewSnapshotInfoDto {
-                id: "s2".into(),
-                label: "Lab".into(),
-                created_at: 2000,
-                size: 10,
-                content_type: PreviewContentType::Word,
-                file_name: Some("doc.docx".into()),
-                file_path: Some("/path/doc.docx".into()),
-            },
-            content: "content here".into(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: SnapshotContentResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, resp);
-    }
-
-    // -- E. Document conversion -----------------------------------------------
+    // -- C. Document conversion -----------------------------------------------
 
     #[test]
     fn conversion_target_serialize() {
@@ -716,7 +445,7 @@ mod tests {
         assert_eq!(parsed, resp);
     }
 
-    // -- G. Excel data model --------------------------------------------------
+    // -- D. Excel data model --------------------------------------------------
 
     #[test]
     fn excel_workbook_data_serialize() {
@@ -841,7 +570,7 @@ mod tests {
         assert_eq!(parsed, wb);
     }
 
-    // -- H. PPT data model ----------------------------------------------------
+    // -- E. PPT data model ----------------------------------------------------
 
     #[test]
     fn ppt_json_data_serialize() {

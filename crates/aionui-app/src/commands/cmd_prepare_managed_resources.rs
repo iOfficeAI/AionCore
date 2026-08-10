@@ -2,15 +2,13 @@ use std::process::ExitCode;
 
 use crate::cli::PrepareManagedResourcesArgs;
 use crate::commands::error::{CliBoundaryCode, CliBoundaryError};
+use aionui_runtime::current_runtime_key;
 use aionui_runtime::ensure_node_runtime;
-use aionui_runtime::managed_cli::{managed_cli_contract_for_export, prepare_managed_cli_to_root};
 use aionui_runtime::managed_resources::export_node_runtime_to_root;
 use aionui_runtime::managed_resources_contract::{
     MANAGED_RESOURCES_CONTRACT_SCHEMA_VERSION, ManagedResourcesContract, validate_contract, write_contract,
 };
 use aionui_runtime::node_runtime::managed_node_contract_for_export;
-
-const MANAGED_CLI_NAMES: [&str; 2] = ["claude", "codex"];
 
 const SUBCOMMAND: &str = "prepare-managed-resources";
 
@@ -32,33 +30,20 @@ pub async fn run_prepare_managed_resources(args: PrepareManagedResourcesArgs) ->
     println!("Prepared managed resources under {}", output_root.display());
     println!("  node   -> {}", exported_node.display());
 
-    let mut prepared_clis = Vec::new();
-    for name in MANAGED_CLI_NAMES {
-        let prepared = prepare_managed_cli_to_root(name, &output_root)
-            .await
-            .map_err(|error| prepare_managed_resources_error_with_detail("cli.prepare", error))?;
-        println!("  {:<6} -> {}", name, prepared.root.display());
-        prepared_clis.push(prepared);
-    }
-
     let node = managed_node_contract_for_export(&output_root, &exported_node)
         .map_err(|error| prepare_managed_resources_error_with_detail("contract.write", error))?;
-    let mut clis = Vec::new();
-    for prepared in &prepared_clis {
-        clis.push(
-            managed_cli_contract_for_export(&output_root, prepared)
-                .map_err(|error| prepare_managed_resources_error_with_detail("contract.write", error))?,
-        );
-    }
-    let runtime_key = clis
-        .first()
-        .map(|cli| cli.platform_directory.clone())
-        .ok_or_else(|| prepare_managed_resources_error("contract.write"))?;
+    // No agent CLIs are bundled: claude/codex run from the user's own install,
+    // like agy always has. `clis` stays in the schema (older bundles still
+    // carry entries and must keep parsing) but is emitted empty, so the
+    // runtime key now comes from the host rather than from a CLI's directory.
+    let runtime_key = current_runtime_key()
+        .ok_or_else(|| prepare_managed_resources_error("contract.runtime_key"))?
+        .to_owned();
     let contract = ManagedResourcesContract {
         schema_version: MANAGED_RESOURCES_CONTRACT_SCHEMA_VERSION,
         runtime_key,
         node,
-        clis,
+        clis: Vec::new(),
     };
     let manifest_path = write_contract(&output_root, &contract)
         .map_err(|error| prepare_managed_resources_error_with_detail("contract.write", error))?;

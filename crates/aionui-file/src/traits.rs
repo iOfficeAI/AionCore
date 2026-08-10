@@ -118,65 +118,6 @@ pub trait IFileService: Send + Sync {
     async fn fetch_remote_image(&self, url: &str) -> String;
 }
 
-/// File system watching: single-file changes and workspace Office file
-/// additions.
-#[async_trait::async_trait]
-pub trait IFileWatchService: Send + Sync {
-    /// Start watching a single file for changes.
-    /// Emits `fileWatch.fileChanged` events on the broadcast channel.
-    async fn start_watch(&self, file_path: &str) -> Result<(), FileError>;
-
-    /// Start watching a single file for one WebUI user.
-    async fn start_watch_for_user(&self, user_id: &str, file_path: &str) -> Result<(), FileError> {
-        let _ = user_id;
-        self.start_watch(file_path).await
-    }
-
-    /// Stop watching a previously registered file.
-    async fn stop_watch(&self, file_path: &str) -> Result<(), FileError>;
-
-    /// Stop watching a file for one WebUI user.
-    async fn stop_watch_for_user(&self, user_id: &str, file_path: &str) -> Result<(), FileError> {
-        let _ = user_id;
-        self.stop_watch(file_path).await
-    }
-
-    /// Stop all active file watches.
-    async fn stop_all_watches(&self) -> Result<(), FileError>;
-
-    /// Stop all active file watches for one WebUI user.
-    async fn stop_all_watches_for_user(&self, user_id: &str) -> Result<(), FileError> {
-        let _ = user_id;
-        self.stop_all_watches().await
-    }
-
-    /// Start watching a workspace directory for new Office files
-    /// (.pptx, .docx, .xlsx).
-    /// Emits `workspaceOfficeWatch.fileAdded` events.
-    async fn start_office_watch(&self, workspace: &str) -> Result<(), FileError>;
-
-    /// Start watching a workspace for one WebUI user.
-    async fn start_office_watch_for_user(&self, user_id: &str, workspace: &str) -> Result<(), FileError> {
-        let _ = user_id;
-        self.start_office_watch(workspace).await
-    }
-
-    /// Stop watching a workspace directory for Office files.
-    async fn stop_office_watch(&self, workspace: &str) -> Result<(), FileError>;
-
-    /// Stop watching a workspace for one WebUI user.
-    async fn stop_office_watch_for_user(&self, user_id: &str, workspace: &str) -> Result<(), FileError> {
-        let _ = user_id;
-        self.stop_office_watch(workspace).await
-    }
-
-    /// Stop all active Office workspace watches for one WebUI user.
-    async fn stop_all_office_watches_for_user(&self, user_id: &str) -> Result<(), FileError> {
-        let _ = user_id;
-        Ok(())
-    }
-}
-
 /// Git-based workspace snapshot system for tracking file changes.
 ///
 /// Supports two modes:
@@ -239,9 +180,6 @@ pub trait ISnapshotService: Send + Sync {
 /// Convenience alias for an Arc-wrapped file service.
 pub type FileServiceRef = Arc<dyn IFileService>;
 
-/// Convenience alias for an Arc-wrapped file watch service.
-pub type FileWatchServiceRef = Arc<dyn IFileWatchService>;
-
 /// Convenience alias for an Arc-wrapped snapshot service.
 pub type SnapshotServiceRef = Arc<dyn ISnapshotService>;
 
@@ -258,3 +196,41 @@ pub trait IItemRevealer: Send + Sync {
 
 /// Convenience alias for an Arc-wrapped item revealer.
 pub type ItemRevealerRef = Arc<dyn IItemRevealer>;
+
+/// Open an absolute filesystem path with the OS default application (the
+/// "open in system editor" escape hatch preview offers for files it cannot
+/// render itself — oversized or unsupported formats). Sibling port to
+/// [`IItemRevealer`], which reveals the enclosing folder instead of opening the
+/// file; the composition layer supplies an adapter over the shell service so
+/// this crate needs no shell dependency.
+#[async_trait::async_trait]
+pub trait ISystemFileOpener: Send + Sync {
+    /// Open `absolute_path` with the OS default application. The path is the
+    /// resolved, contained absolute path from `resolve_chat_file_ref` — never
+    /// client input.
+    ///
+    /// **INV-OPEN**: implementations must not put the path (nor any string
+    /// derived from it) into the returned error. See the `/api/fs/open-system`
+    /// handler for the full invariant.
+    async fn open(&self, absolute_path: &str) -> Result<(), FileError>;
+}
+
+/// Convenience alias for an Arc-wrapped system file opener.
+pub type SystemFileOpenerRef = Arc<dyn ISystemFileOpener>;
+
+/// Write text to the OS clipboard. The `/api/fs/copy-absolute-path` route
+/// resolves the path server-side and writes it here, so — exactly like
+/// [`IItemRevealer`] / [`ISystemFileOpener`] — the backend performs the OS action
+/// itself and the resolved absolute path is never returned to the client. The
+/// composition layer supplies an adapter over the shell service, so this crate
+/// needs no shell dependency.
+#[async_trait::async_trait]
+pub trait IClipboardWriter: Send + Sync {
+    /// Write `text` (the resolved absolute path) to the OS clipboard. Errors on a
+    /// headless/no-clipboard environment rather than panicking; the error carries
+    /// no path.
+    async fn write_text(&self, text: &str) -> Result<(), FileError>;
+}
+
+/// Convenience alias for an Arc-wrapped clipboard writer.
+pub type ClipboardWriterRef = Arc<dyn IClipboardWriter>;

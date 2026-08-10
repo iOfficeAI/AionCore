@@ -31,13 +31,33 @@ pub struct Snapshot {
     pub entries: Vec<(String, EntryFact)>,
 }
 
-/// One reconciled change to a directory level. The tree tracks only name+kind
-/// (no size/mtime → no `modified`); a kind change surfaces as removed + added.
+/// One reconciled change to a directory level. The tree tracks name+kind for
+/// listing purposes (a kind change surfaces as removed + added) plus an mtime
+/// used solely to detect that a file's content changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
-    Added { name: String, kind: Kind },
-    Removed { name: String },
-    Renamed { from: String, to: String },
+    Added {
+        name: String,
+        kind: Kind,
+    },
+    Removed {
+        name: String,
+    },
+    Renamed {
+        from: String,
+        to: String,
+    },
+    /// Same name, same kind, different mtime — the file's *content* changed.
+    ///
+    /// Deliberately carries no mtime value. The timestamp here is the one left by
+    /// the external write, so a subscriber that fed it back as an optimistic
+    /// concurrency precondition would make its own save look conflict-free
+    /// against the very edit this signal exists to warn about. Withholding the
+    /// value removes that misuse structurally rather than by convention.
+    /// Subscribers re-read content on demand.
+    Modified {
+        name: String,
+    },
 }
 
 /// A batch of reconciled changes for one canonical (canonical domain).
@@ -96,14 +116,29 @@ fn child_uri(canonical: &str, name: &str) -> Result<String, FsError> {
     })
 }
 
-/// Reconcile `old` → `fresh` into added/removed/renamed changes. A same-inode
-/// removed+added pair is synthesized into a rename (falls back to removed+added
-/// when the provider cannot supply an inode).
+/// Whether two facts for the same surviving entry show a moved mtime.
+///
+/// Requires both sides to be known: an unknown mtime on either side means "no
+/// evidence of a change", never "changed". That keeps a provider or filesystem
+/// that cannot supply timestamps silent instead of reporting every entry as
+/// modified on the first reconcile (see [`EntryFact::mtime_ms`]).
+fn is_mtime_change(old: &EntryFact, fresh: &EntryFact) -> bool {
+    match (old.mtime_ms, fresh.mtime_ms) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
+/// Reconcile `old` → `fresh` into added/removed/renamed/modified changes. A
+/// same-inode removed+added pair is synthesized into a rename (falls back to
+/// removed+added when the provider cannot supply an inode). A surviving file
+/// whose mtime moved yields `Modified`.
 fn diff(old: &BTreeMap<String, EntryFact>, fresh: &BTreeMap<String, EntryFact>) -> Vec<Change> {
     // Candidate removals/additions by name; a same-name kind change counts as
     // both (removed old kind + added new kind).
     let mut removed: Vec<(String, EntryFact)> = Vec::new();
     let mut added: Vec<(String, EntryFact)> = Vec::new();
+    let mut modified: Vec<String> = Vec::new();
     for (name, of) in old {
         match fresh.get(name) {
             None => removed.push((name.clone(), of.clone())),
@@ -111,6 +146,13 @@ fn diff(old: &BTreeMap<String, EntryFact>, fresh: &BTreeMap<String, EntryFact>) 
                 removed.push((name.clone(), of.clone()));
                 added.push((name.clone(), nf.clone()));
             }
+            // Survived with its kind intact: the listing is unchanged, but the
+            // content may not be. Only files qualify — a directory's mtime also
+            // moves when its children are added or removed, which the child
+            // entries' own added/removed changes already express, and a symlink's
+            // mtime describes the link rather than anything a subscriber reads.
+            // Both would be noise for a content-changed signal.
+            Some(nf) if of.kind == Kind::File && is_mtime_change(of, nf) => modified.push(name.clone()),
             Some(_) => {}
         }
     }
@@ -154,6 +196,11 @@ fn diff(old: &BTreeMap<String, EntryFact>, fresh: &BTreeMap<String, EntryFact>) 
     }
     for (name, _) in removed {
         changes.push(Change::Removed { name });
+    }
+    // Modified last: it never participates in rename synthesis (those entries
+    // survived under the same name), so ordering is purely for stable output.
+    for name in modified {
+        changes.push(Change::Modified { name });
     }
     changes
 }

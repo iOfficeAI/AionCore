@@ -278,22 +278,6 @@ pub enum AgentKillReason {
     SessionRevoked,
 }
 
-/// Preview content type for document preview history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PreviewContentType {
-    Markdown,
-    Diff,
-    Code,
-    Html,
-    Pdf,
-    Ppt,
-    Word,
-    Excel,
-    Image,
-    Url,
-}
-
 /// File change operation type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

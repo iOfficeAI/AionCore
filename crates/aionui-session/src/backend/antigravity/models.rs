@@ -96,30 +96,6 @@ async fn read_to_end(stdout: aionui_process::BoxedStdout) -> String {
     out
 }
 
-/// Read `agy --version`, or `None` when it cannot be determined.
-///
-/// Best-effort like `probe_models`: a version we cannot read must not stop a
-/// session, it only means no drift claim can be made.
-pub(crate) async fn probe_version(
-    spawner: &Arc<dyn Spawner>,
-    program: &std::path::Path,
-    owner_tag: &str,
-) -> Option<String> {
-    let spec = CommandSpec {
-        command: program.to_path_buf(),
-        args: vec!["--version".to_owned()],
-        env: Vec::new(),
-        cwd: None,
-    };
-    let proc = spawner.spawn(spec, &[], owner_tag).await.ok()?;
-    let (stdin, stdout) = proc.take_stdio().await?;
-    // Same reason as `probe_models`: agy waits on stdin.
-    drop(stdin);
-    let text = tokio::time::timeout(PROBE_TIMEOUT, read_to_end(stdout)).await.ok()?;
-    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
-    Some(line.to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -25,6 +25,14 @@ pub struct SendMessageData {
     pub inject_skills: Vec<String>,
 }
 
+/// Prompt media capabilities an agent declared (ACP `promptCapabilities`
+/// or the session backend's `prompt_blocks` support).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptMediaCaps {
+    pub image: bool,
+    pub audio: bool,
+}
+
 /// Options for building (creating or resuming) an Agent task.
 #[derive(Debug, Clone)]
 pub struct BuildTaskOptions {

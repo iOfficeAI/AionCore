@@ -220,6 +220,9 @@ impl ChannelMessageService {
             | AgentStreamEvent::Plan(_)
             | AgentStreamEvent::Permission(_)
             | AgentStreamEvent::AcpPermission(_)
+            // IM channels have no interactive question card; the ask stays
+            // pending in the app UI (same treatment as Permission).
+            | AgentStreamEvent::Ask(_)
             | AgentStreamEvent::AcpToolCall(_)
             | AgentStreamEvent::AvailableCommands(_)
             | AgentStreamEvent::SkillSuggest(_)
@@ -229,12 +232,16 @@ impl ChannelMessageService {
             | AgentStreamEvent::AcpConfigOption(_)
             | AgentStreamEvent::AcpSessionInfo(_)
             | AgentStreamEvent::AcpContextUsage(_)
+            // Live terminal snapshots are a web-UI card refresh; the final
+            // command outcome reaches the IM transcript via the tool result.
+            | AgentStreamEvent::AcpTerminalOutput(_)
             | AgentStreamEvent::AcpPromptHookWarning(_)
             | AgentStreamEvent::System(_)
             | AgentStreamEvent::RequestTrace(_)
             | AgentStreamEvent::SlashCommandsUpdated(_)
             | AgentStreamEvent::SessionAssigned(_)
             | AgentStreamEvent::SegmentBreak
+            | AgentStreamEvent::BackendTurnBound(_)
             // A workflow progress refresh is a live re-render of a card in the
             // web UI; an IM transcript has no card to update, and streaming one
             // message per refresh would spam the channel.

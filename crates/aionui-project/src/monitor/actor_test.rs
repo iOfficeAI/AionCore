@@ -383,6 +383,7 @@ async fn fan_out_snapshot_is_scoped_and_pe_keyed_per_subscriber() {
                 kind: Kind::File,
                 inode: 1,
                 symlink_target: None,
+                mtime_ms: Some(1_700_000_000_000),
             },
         )],
     };
@@ -442,6 +443,17 @@ fn has_delta_adding(frames: &[(String, Value)], session: &str, name: &str) -> bo
     })
 }
 
+fn has_delta_modifying(frames: &[(String, Value)], session: &str, name: &str) -> bool {
+    frames.iter().any(|(s, f)| {
+        s == session
+            && f["method"] == "fs/delta"
+            && f["params"]["changes"]
+                .as_array()
+                .map(|cs| cs.iter().any(|c| c["op"] == "modified" && c["name"] == name))
+                .unwrap_or(false)
+    })
+}
+
 #[tokio::test]
 async fn live_change_fans_delta_to_subscriber_only() {
     let (actor, raw_rx, push, pe, dir, _db) = setup().await;
@@ -468,6 +480,72 @@ async fn live_change_fans_delta_to_subscriber_only() {
     assert!(
         !push.frames().iter().any(|(s, _)| s == "2"),
         "non-subscriber must receive no push"
+    );
+
+    drop(tx);
+    let _ = handle.await;
+}
+
+/// An edit to a file's *contents* must reach the subscriber as `op: "modified"`.
+///
+/// The two ends of this were already covered and the middle was not: `TreeModel`
+/// tests prove the diff produces a `Modified` change, and the test above proves a
+/// delta reaches a subscriber — but nothing showed a `modified` change surviving
+/// the trip. Since the whole point of that change is to let preview light a refresh
+/// affordance, "generated correctly" and "delivered" are separate claims, and only
+/// the first had evidence.
+///
+/// The timestamp is advanced explicitly rather than by writing twice: some
+/// filesystems record whole seconds, so back-to-back writes can leave mtime
+/// untouched, and the detection deliberately under-reports when it cannot see a
+/// change. A test that relied on write timing would pass or fail by the clock —
+/// and an intermittently-red test gets triaged as a flake and muted, which costs
+/// more than having no test, because it also removes the signal that this path was
+/// ever meant to be guarded.
+#[tokio::test]
+async fn live_content_edit_fans_modified_delta_to_subscriber() {
+    let (actor, raw_rx, push, pe, dir, _db) = setup().await;
+    let (tx, rx) = unbounded_channel();
+    let handle = tokio::spawn(actor.run(rx, raw_rx));
+
+    // The file has to exist before the subscription so its baseline mtime is part
+    // of the snapshot — otherwise the edit below would surface as `added`.
+    let file = dir.path().join("watched.md");
+    std::fs::write(&file, b"before").unwrap();
+
+    tx.send(FsInbound::Frame {
+        session: "1".to_owned(),
+        user_id: "system_default_user".to_owned(),
+        frame: request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
+    })
+    .unwrap();
+    // Let subscribe mount + arm the watch.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    std::fs::write(&file, b"after").unwrap();
+    let bumped = std::time::SystemTime::now() + Duration::from_secs(5);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(bumped)
+        .unwrap();
+
+    assert!(
+        wait_until(&push, Duration::from_secs(5), |f| has_delta_modifying(
+            f,
+            "1",
+            "watched.md"
+        ))
+        .await,
+        "an edited file must reach the subscriber as op:'modified' — the signal preview keys its refresh on"
+    );
+
+    // The listing did not change, so the edit must not also be reported as a
+    // structural change; a client applying both would rebuild the node needlessly.
+    assert!(
+        !has_delta_adding(&push.frames(), "1", "watched.md"),
+        "a content edit must not surface as 'added'"
     );
 
     drop(tx);
@@ -550,6 +628,50 @@ async fn overflow_fans_full_snapshot_through_event_loop() {
     })
     .await;
     assert!(got_snapshot, "overflow must push a full fs/snapshot through the loop");
+
+    // Tagged as a rescan. Without this the push is shape-identical to a subscribe
+    // reply, and a receiver reading it as "here is the listing" loses every change
+    // in the window — overflow supersedes the buffered per-child events during
+    // debounce, so those deltas were never sent separately.
+    let tagged = push
+        .frames()
+        .iter()
+        .any(|(s, m)| s == "1" && m["method"] == "fs/snapshot" && m["params"]["reason"] == "overflow");
+    assert!(tagged, "an overflow snapshot must carry reason:'overflow'");
+
+    drop(tx);
+    let _ = handle.await;
+}
+
+/// The subscribe reply must *not* be tagged. Both paths build their params from the
+/// same snapshot, so a marker leaking onto the first listing would make every
+/// freshly-opened directory look like a rescan — the receiver would re-read content
+/// it just received, on every subscribe.
+#[tokio::test]
+async fn subscribe_reply_snapshot_is_not_marked_as_overflow() {
+    let (actor, raw_rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.ts"), b"x").unwrap();
+    let (tx, rx) = unbounded_channel();
+    let handle = tokio::spawn(actor.run(rx, raw_rx));
+
+    tx.send(FsInbound::Frame {
+        session: "1".to_owned(),
+        user_id: "system_default_user".to_owned(),
+        frame: request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
+    })
+    .unwrap();
+
+    // The reply is a response to id 1, not an fs/snapshot notification.
+    let got_reply = wait_until(&push, Duration::from_secs(5), |frames| {
+        frames
+            .iter()
+            .any(|(s, m)| s == "1" && m["id"] == 1 && m["result"]["snapshots"].is_array())
+    })
+    .await;
+    assert!(got_reply, "subscribe must answer with snapshots");
+
+    let leaked = push.frames().iter().any(|(_, m)| m.to_string().contains("overflow"));
+    assert!(!leaked, "no frame from a plain subscribe may mention overflow");
 
     drop(tx);
     let _ = handle.await;

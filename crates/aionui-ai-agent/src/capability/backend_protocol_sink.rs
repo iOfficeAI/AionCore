@@ -38,6 +38,7 @@ impl BackendProtocolSink {
             title: Some(title),
             action: Some(tool_name.to_string()),
             description: description.to_string(),
+            questions: None,
             command_type,
             options: vec![
                 ConfirmationOption {

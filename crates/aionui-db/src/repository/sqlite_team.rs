@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
-use crate::repository::team::{ITeamRepository, UpdateTaskParams, UpdateTeamParams};
+use crate::repository::team::{ActivityCursor, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 
 /// SQLite-backed implementation of [`ITeamRepository`].
 #[derive(Clone, Debug)]
@@ -315,6 +315,80 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(rows)
     }
 
+    async fn list_messages_by_team(&self, team_id: &str, limit: i64) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let rows = sqlx::query_as::<_, MailboxMessageRow>(
+            "SELECT id, team_id, to_agent_id, from_agent_id, \
+                    type, content, summary, files, read, created_at \
+             FROM mailbox \
+             WHERE team_id = ? \
+             ORDER BY created_at DESC \
+             LIMIT ?",
+        )
+        .bind(team_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn list_messages_by_team_paged(
+        &self,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        limit: i64,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let (cmp, order) = match direction {
+            PageDirection::Desc => ("<", "DESC"),
+            PageDirection::Asc => (">", "ASC"),
+        };
+        let cursor_clause = if cursor.is_some() {
+            format!("AND (created_at {cmp} ? OR (created_at = ? AND id {cmp} ?)) ")
+        } else {
+            String::new()
+        };
+        let sql = format!(
+            "SELECT id, team_id, to_agent_id, from_agent_id, \
+                    type, content, summary, files, read, created_at \
+             FROM mailbox \
+             WHERE team_id = ? {cursor_clause}\
+             ORDER BY created_at {order}, id {order} \
+             LIMIT ?"
+        );
+        let mut q = sqlx::query_as::<_, MailboxMessageRow>(&sql).bind(team_id);
+        if let Some(c) = &cursor {
+            q = q.bind(c.created_at).bind(c.created_at).bind(&c.id);
+        }
+        let rows = q.bind(limit).fetch_all(&self.pool).await?;
+        Ok(rows)
+    }
+
+    async fn list_messages_by_ids(&self, ids: &[String]) -> Result<Vec<MailboxMessageRow>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // SQLite placeholder limit is 999; batch in the same way as
+        // `mark_read_batch` and merge the chunks.
+        let mut out = Vec::new();
+        for chunk in ids.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT id, team_id, to_agent_id, from_agent_id, \
+                        type, content, summary, files, read, created_at \
+                 FROM mailbox \
+                 WHERE id IN ({placeholders}) \
+                 ORDER BY created_at DESC"
+            );
+            let mut query = sqlx::query_as::<_, MailboxMessageRow>(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            out.extend(rows);
+        }
+        Ok(out)
+    }
+
     async fn delete_mailbox_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
         sqlx::query(
             "DELETE FROM mailbox \
@@ -453,6 +527,69 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
+        Ok(rows)
+    }
+
+    async fn list_tasks_by_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<TeamTaskRow>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // SQLite placeholder limit is 999; chunk defensively like
+        // `list_messages_by_ids` and merge the results.
+        let mut out = Vec::new();
+        for chunk in ids.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT * FROM team_tasks \
+                 WHERE team_id = ? \
+                   AND EXISTS (SELECT 1 FROM teams t WHERE t.id = team_tasks.team_id AND t.user_id = ?) \
+                   AND id IN ({placeholders}) \
+                 ORDER BY created_at DESC"
+            );
+            let mut q = sqlx::query_as::<_, TeamTaskRow>(&sql).bind(team_id).bind(user_id);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            out.extend(q.fetch_all(&self.pool).await?);
+        }
+        Ok(out)
+    }
+
+    async fn list_tasks_paged(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        limit: i64,
+    ) -> Result<Vec<TeamTaskRow>, DbError> {
+        let (cmp, order) = match direction {
+            PageDirection::Desc => ("<", "DESC"),
+            PageDirection::Asc => (">", "ASC"),
+        };
+        let cursor_clause = if cursor.is_some() {
+            format!("AND (created_at {cmp} ? OR (created_at = ? AND id {cmp} ?)) ")
+        } else {
+            String::new()
+        };
+        let sql = format!(
+            "SELECT * FROM team_tasks \
+             WHERE team_id = ? \
+               AND EXISTS (SELECT 1 FROM teams t WHERE t.id = team_tasks.team_id AND t.user_id = ?) \
+               {cursor_clause}\
+             ORDER BY created_at {order}, id {order} \
+             LIMIT ?"
+        );
+        let mut q = sqlx::query_as::<_, TeamTaskRow>(&sql).bind(team_id).bind(user_id);
+        if let Some(c) = &cursor {
+            q = q.bind(c.created_at).bind(c.created_at).bind(&c.id);
+        }
+        let rows = q.bind(limit).fetch_all(&self.pool).await?;
         Ok(rows)
     }
 

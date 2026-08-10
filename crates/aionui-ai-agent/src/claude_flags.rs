@@ -7,10 +7,10 @@
 //! spawn", so anything not universally supported has to be gated on the binary we
 //! are actually about to run.
 //!
-//! The packaged app runs the bundled CLI pinned by `CLAUDE_CLI_VERSION`, but dev
-//! builds, `Download` mode, and a missing bundle all fall back to whatever
-//! `claude` is on PATH (`resolve_bundled_cli` → `None`), whose version we do not
-//! control. Hence a real probe rather than a compile-time assumption.
+//! claude always runs from the user's own install (nothing is bundled), so its
+//! version is never something this app controls. Hence a real probe rather than
+//! a compile-time assumption — the same reason `cli_version` reports drift from
+//! `VERIFIED_CLAUDE_VERSION` instead of assuming it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -126,20 +126,22 @@ mod tests {
         assert!(!supported("2.1.0"), "2.1.0 hard-errors on --thinking-display");
         assert!(!supported("2.1.190"), "below the verified floor stays off");
         assert!(supported("2.1.191"), "lowest live-probed OK version");
-        assert!(supported("2.1.215"), "our bundled CLAUDE_CLI_VERSION pin");
+        assert!(supported("2.1.215"), "the release this integration is verified against");
         assert!(supported("2.1.220"));
         assert!(supported("3.0.0"), "a future major must not regress the gate");
     }
 
-    /// The bundled pin must never drift below the floor — that would silently turn
-    /// the packaged app's thinking display off.
+    /// The verified release must never drift below the floor: a user running
+    /// exactly the version this integration was validated against has to get
+    /// the thinking display, otherwise the drift notice says "you match" while
+    /// a feature is silently off.
     #[test]
-    fn bundled_pin_is_at_or_above_the_floor() {
-        let pin = parse_version(aionui_runtime::CLAUDE_CLI_VERSION).expect("pin must parse");
+    fn the_verified_release_is_at_or_above_the_floor() {
+        let verified = parse_version(aionui_session::VERIFIED_CLAUDE_VERSION).expect("verified version must parse");
         assert!(
-            pin >= THINKING_DISPLAY_MIN_VERSION,
-            "CLAUDE_CLI_VERSION {} is below the --thinking-display floor {:?}",
-            aionui_runtime::CLAUDE_CLI_VERSION,
+            verified >= THINKING_DISPLAY_MIN_VERSION,
+            "VERIFIED_CLAUDE_VERSION {} is below the --thinking-display floor {:?}",
+            aionui_session::VERIFIED_CLAUDE_VERSION,
             THINKING_DISPLAY_MIN_VERSION
         );
     }

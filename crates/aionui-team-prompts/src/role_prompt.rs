@@ -44,8 +44,8 @@ current task state.
    - Exception: If the message contains a [SYSTEM NOTE] indicating the user has already confirmed the lineup, skip the proposal step and proceed directly to spawning all listed teammates
 11. Wait for explicit confirmation before using team_spawn_agent, unless the user explicitly told you to create specific teammates immediately or a [SYSTEM NOTE] in the message indicates prior confirmation
 12. After the lineup is confirmed, create teammates with team_spawn_agent using `assistant_id` from team_list_assistants; do not pass a model
-13. Break the work into tasks with team_task_create
-14. Assign tasks and notify teammates via team_send_message
+13. Break the work into tasks with team_task_create — assigning a task to a teammate (via `owner`) automatically notifies and wakes them with the task details, so you do NOT need a separate team_send_message just to hand off work or wake them
+14. Use team_send_message only for follow-up conversation, clarifications, or context beyond the task's subject/description
 15. When teammates report back, review results and decide next steps
 16. Synthesize results and respond to the user
 
@@ -62,7 +62,7 @@ Do NOT prioritize type errors or code style issues unless they affect runtime be
 Teammates go idle after every turn — this is completely normal and expected.
 A teammate going idle immediately after sending you a message does NOT mean they are done or unavailable. Idle simply means they are waiting for input.
 
-- **Idle teammates can receive messages.** Sending a message to an idle teammate wakes them up.
+- **Idle teammates can receive both task assignments and messages.** Assigning a task to a teammate (team_task_create/team_task_update with `owner`) OR sending them a message both wake them up.
 - **Idle notifications are automatic.** The system sends an idle notification when a teammate's turn ends. You do NOT need to react to every idle notification — only when you want to assign new work or follow up.
 - **Do not treat idle as an error.** A teammate sending a message and then going idle is the normal flow.
 
@@ -72,7 +72,7 @@ When teammate B's work depends on teammate A's output (e.g. reviewer waits for i
 Doing so makes B sit in an open LLM stream waiting, which hits the provider's request timeout (~300s) and marks B as failed.
 
 **The correct sequencing:**
-1. Dispatch A's task first (via team_task_create + team_send_message). Do NOT message B yet.
+1. Dispatch A's task first (via team_task_create with owner=A — this notifies and wakes A). Do NOT assign or message B yet.
 2. Wait for A's idle_notification (signaling A finished).
 3. Then dispatch B's task — by which time A's output is ready and B can start immediately without waiting.
 

@@ -12,6 +12,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::chat_file::ChatFileRef;
+
 /// Aggregated project detail — everything the explorer needs in one call,
 /// so the frontend never fans out one request per root.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,4 +65,31 @@ pub struct AttachFolderRequest {
     pub uri: String,
     #[serde(default)]
     pub display_name: Option<String>,
+}
+
+/// `POST /api/projects/{project_id}/resolve-ref` body — a [`ChatFileRef`] to
+/// re-express in its strongest form for this project.
+///
+/// Exists because the same file reached from different entry points produces
+/// different refs (the explorer yields `Project`, a chat link yields `Local`),
+/// and callers that key on the ref need one answer per file.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveRefRequest {
+    pub file: ChatFileRef,
+}
+
+/// `POST /api/projects/{project_id}/resolve-ref` response.
+///
+/// `file` is the upgraded ref when the path turned out to live under one of the
+/// project's roots, and the request's ref unchanged otherwise — the caller
+/// always gets something addressable, so there is no failure case to branch on.
+/// Absolute paths stay on the backend: an upgraded ref carries only
+/// `{pe_id, relative_path}`, and a ref that could not be upgraded is echoed back
+/// exactly as the caller sent it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolveRefResponse {
+    pub file: ChatFileRef,
+    /// Whether `file` differs from what was sent. Lets a caller skip a state
+    /// write when nothing changed, without comparing the refs itself.
+    pub upgraded: bool,
 }

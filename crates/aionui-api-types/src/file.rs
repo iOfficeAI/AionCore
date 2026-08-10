@@ -165,6 +165,23 @@ pub struct RevealItemRequest {
     pub relative_path: String,
 }
 
+/// Request body for `POST /api/fs/open-system` — open a `ChatFileRef`-addressed
+/// file with the OS default application ("open in system editor"). Preview offers
+/// this as the escape hatch for files it will not render itself (oversized or
+/// unsupported formats).
+///
+/// Uses `ChatFileRef` rather than `{pe_id, relative_path}` so all three preview
+/// sources are covered — project files, uploads, and host-picked local files —
+/// whereas [`RevealItemRequest`] serves the project-only Explorer tree.
+///
+/// The response carries no body: the backend resolves the identity to an absolute
+/// path, opens it locally, and never returns that path (see INV-OPEN on the
+/// handler).
+#[derive(Debug, Deserialize)]
+pub struct OpenSystemFileRequest {
+    pub file: ChatFileRef,
+}
+
 /// Request body for `POST /api/fs/image-base64` — get image as base64.
 #[derive(Debug, Deserialize)]
 pub struct GetImageBase64Request {
@@ -232,23 +249,7 @@ pub struct CopyFilesResponse {
 }
 
 // ---------------------------------------------------------------------------
-// D. File watch — Request DTOs
-// ---------------------------------------------------------------------------
-
-/// Request body for `POST /api/fs/watch/start` and `/stop`.
-#[derive(Debug, Deserialize)]
-pub struct FileWatchRequest {
-    pub file_path: String,
-}
-
-/// Request body for `POST /api/fs/office-watch/start` and `/stop`.
-#[derive(Debug, Deserialize)]
-pub struct WorkspaceOfficeWatchRequest {
-    pub workspace: String,
-}
-
-// ---------------------------------------------------------------------------
-// E. Workspace snapshot — Request DTOs
+// B. Workspace snapshot — Request DTOs
 // ---------------------------------------------------------------------------
 
 /// Request body for snapshot init / getInfo / compare / stageAll / unstageAll / dispose.
@@ -280,7 +281,7 @@ pub struct SnapshotDiscardRequest {
 }
 
 // ---------------------------------------------------------------------------
-// E. Workspace snapshot — Response DTOs
+// B. Workspace snapshot — Response DTOs
 // ---------------------------------------------------------------------------
 
 /// Snapshot mode.
@@ -361,13 +362,6 @@ mod tests {
         });
         let req: CopyFilesRequest = serde_json::from_value(raw).unwrap();
         assert!(req.source_root.is_none());
-    }
-
-    #[test]
-    fn file_watch_request_snake_case() {
-        let raw = r#"{"file_path":"/path/to/file.txt"}"#;
-        let req: FileWatchRequest = serde_json::from_str(raw).unwrap();
-        assert_eq!(req.file_path, "/path/to/file.txt");
     }
 
     #[test]

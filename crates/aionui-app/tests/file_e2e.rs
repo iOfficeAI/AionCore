@@ -28,11 +28,6 @@ async fn fs_endpoints_require_auth() {
         "/api/fs/upload",
         "/api/fs/image-base64",
         "/api/fs/fetch-remote-image",
-        "/api/fs/watch/start",
-        "/api/fs/watch/stop",
-        "/api/fs/watch/stop-all",
-        "/api/fs/office-watch/start",
-        "/api/fs/office-watch/stop",
         "/api/fs/snapshot/init",
         "/api/fs/snapshot/info",
         "/api/fs/snapshot/compare",
@@ -587,23 +582,6 @@ async fn fetch_remote_image_non_whitelisted_returns_placeholder_svg() {
         data_url.starts_with("data:image/svg+xml"),
         "expected placeholder SVG for non-whitelisted host"
     );
-}
-
-// ===========================================================================
-// File watch
-// ===========================================================================
-
-#[tokio::test]
-async fn watch_stop_all_succeeds() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-
-    let req = json_with_token("POST", "/api/fs/watch/stop-all", json!({}), &token, &csrf);
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
 }
 
 // ===========================================================================
