@@ -30,8 +30,9 @@ use aionui_extension::{
 };
 use aionui_file::{FileRouterState, FileService, SnapshotService};
 use aionui_mcp::{
-    AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
-    McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
+    AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, KimiAdapter,
+    McpAgentAdapter, McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter,
+    QwenAdapter,
 };
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
 use aionui_project::{ProjectRouterState, ProjectService};
@@ -581,6 +582,7 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
         Arc::new(CodexAdapter),
         Arc::new(CodeBuddyAdapter),
         Arc::new(OpencodeAdapter),
+        Arc::new(KimiAdapter),
         Arc::new(AionrsAdapter),
         Arc::new(AionuiAdapter::new(repo.clone())),
     ];
