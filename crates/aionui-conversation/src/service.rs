@@ -4458,6 +4458,24 @@ fn is_auto_workspace_relative_path(relative: &Path) -> bool {
     }
 }
 
+/// True when `workspace` is a backend auto-generated temp session directory
+/// under `{work_dir}/conversations` — the sidebar read model's "temp path" test.
+///
+/// Pure lexical prefix strip + [`is_auto_workspace_relative_path`]; performs no
+/// filesystem access, so it is safe on the side-effect-free sidebar read path
+/// (dead/removed workspaces classify correctly rather than failing an fs probe).
+/// This is the same judgment the conversation service applies per row; it is
+/// exposed only so the sidebar can classify a conversation's `extra.workspace`
+/// (or a team's `workspace` column) without duplicating the rule. `work_dir` is
+/// the application data directory (`ConversationService`'s `workspace_root`),
+/// injected from the same source on both sides.
+pub fn is_temp_session_workspace(work_dir: &Path, workspace: &Path) -> bool {
+    match workspace.strip_prefix(work_dir.join("conversations")) {
+        Ok(relative) => is_auto_workspace_relative_path(relative),
+        Err(_) => false,
+    }
+}
+
 async fn cleanup_empty_date_workspace_parents(workspace_root: &Path, workspace_path: &Path) {
     let Some(date_dirs) = date_workspace_parent_dirs(workspace_root, workspace_path) else {
         return;

@@ -37,6 +37,7 @@ use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager,
 use aionui_project::ProjectRouterState;
 use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
 use aionui_shell::ShellRouterState;
+use aionui_sidebar::{SidebarRouterState, SidebarService};
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
     ProtocolDetectionService, ProviderService, RuntimePrepareService, SettingsService, SystemRouterState,
@@ -129,6 +130,7 @@ pub struct ModuleStates {
     pub connection_test: ConnectionTestRouterState,
     pub file: FileRouterState,
     pub project: ProjectRouterState,
+    pub sidebar: SidebarRouterState,
     pub mcp: McpRouterState,
     pub extension: ExtensionRouterState,
     pub hub: HubRouterState,
@@ -309,6 +311,7 @@ pub async fn build_module_states(
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
         project: build_module_state_phase(&boot, "project", || build_project_state(services)),
+        sidebar: build_module_state_phase(&boot, "sidebar", || build_sidebar_state(services)),
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
         hub: hub_state,
@@ -500,6 +503,23 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
 pub fn build_project_state(services: &AppServices) -> ProjectRouterState {
     ProjectRouterState {
         project: Arc::new(services.project_service.clone()),
+    }
+}
+
+/// Build the sidebar read/ordering router state from application services.
+/// The sidebar store and ordering store share the app-wide pool; `work_dir` is
+/// the conversation temp-workspace root used for path classification (must match
+/// `ProjectService`'s temp root).
+pub fn build_sidebar_state(services: &AppServices) -> SidebarRouterState {
+    let sidebar_store: Arc<dyn aionui_db::ISidebarStore> =
+        Arc::new(aionui_db::SqliteSidebarStore::new(services.database.pool().clone()));
+    let service = SidebarService::new(
+        sidebar_store,
+        services.user_order_store.clone(),
+        services.work_dir.join("conversations"),
+    );
+    SidebarRouterState {
+        service: Arc::new(service),
     }
 }
 
@@ -762,6 +782,8 @@ pub fn build_team_state(
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
     service.with_project_service(Arc::new(services.project_service.clone()));
+    // Path-2 cascade: removing a team drops its `user_order` row (sidebar §4.3).
+    service.with_user_order_store(services.user_order_store.clone());
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),

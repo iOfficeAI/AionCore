@@ -3793,6 +3793,61 @@ async fn td6_delete_nonexistent_returns_error() {
     assert!(result.is_err());
 }
 
+// Path 2 cascade (design §4.3): removing a team drops its `user_order` row.
+// The store is injected independently; the assertion is on the table row count,
+// not any API output.
+#[tokio::test]
+async fn td_remove_team_cascades_its_pinned_order_row() {
+    let svc = setup();
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let store: Arc<dyn aionui_db::IUserOrderStore> = Arc::new(aionui_db::SqliteUserOrderStore::new(db.pool().clone()));
+    svc.with_user_order_store(store.clone());
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // Pin the team, then pin an unrelated team for a second user (BR-24 scope).
+    let team_item = aionui_db::OrderItemRef::new(aionui_db::OrderItemType::Team, &created.id);
+    store
+        .pin("user1", aionui_db::OrderScene::Pinned, &team_item)
+        .await
+        .unwrap();
+    let other = aionui_db::OrderItemRef::new(aionui_db::OrderItemType::Team, &created.id);
+    store.pin("user2", aionui_db::OrderScene::Pinned, &other).await.unwrap();
+
+    let count = |user: &'static str, id: String| {
+        let pool = db.pool().clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_order WHERE user_id = ? AND item_id = ?")
+                .bind(user)
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(count("user1", created.id.clone()).await, 1);
+
+    svc.remove_team("user1", &created.id).await.unwrap();
+
+    // Owner's team row is gone; the other user's identically-keyed row stands.
+    assert_eq!(
+        count("user1", created.id.clone()).await,
+        0,
+        "path-2 cascade removed the team's pinned row"
+    );
+    assert_eq!(count("user2", created.id.clone()).await, 1, "cascade is user-scoped");
+}
+
 // -- Rename team --------------------------------------------------------------
 
 #[tokio::test]
