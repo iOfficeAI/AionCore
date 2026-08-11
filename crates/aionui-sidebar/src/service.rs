@@ -630,7 +630,7 @@ impl SidebarService {
             _ => return GroupKey::Chats,
         };
         let ws_path = Path::new(ws);
-        if is_temp_session_workspace(&self.work_dir, ws_path) {
+        if is_temp_session_workspace(ws_path) {
             return GroupKey::Chats;
         }
         let uri = match canonical::to_file_uri(ws_path) {

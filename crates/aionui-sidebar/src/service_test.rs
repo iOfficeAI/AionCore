@@ -36,10 +36,18 @@ impl Fixture {
         self.db.pool()
     }
 
-    /// A temp-session workspace path under `work_dir/conversations/<leaf>` — the
-    /// same shape the write side auto-assigns, which classifies to chats (case 5).
+    /// A temp-session workspace path under
+    /// `work_dir/conversations/<label>-temp-<leaf>` — the same shape the write
+    /// side auto-assigns (`{label}-temp-{id}`), which classifies to chats
+    /// (case 5). The `-temp-` marker is required: it is what
+    /// `is_temp_session_workspace` keys on to stay root-agnostic.
     fn temp_workspace(&self, leaf: &str) -> String {
-        self._tmp.path().join("conversations").join(leaf).display().to_string()
+        self._tmp
+            .path()
+            .join("conversations")
+            .join(format!("acp-temp-{leaf}"))
+            .display()
+            .to_string()
     }
 }
 
@@ -264,6 +272,32 @@ async fn classifies_five_cases_for_conversations() {
             .groups
             .iter()
             .any(|g| matches!(&g.scope, SidebarScope::Project { project_id, .. } if project_id == "proj-temp"))
+    );
+}
+
+// Historical-debt regression: a conversation whose temp workspace was baked
+// under a PREVIOUS data-dir root (user migrated their conversation directory
+// across releases) must still land in chats — not spawn a pseudo-dir project
+// group. Before the root-agnostic fix, the old root failed the temp check
+// (it != the current work_dir) so the path fell through to `GroupKey::Dir`,
+// rendering the temp session as a project. The stable `-temp-` leaf marker is
+// what lets us recognize it regardless of the root prefix.
+#[tokio::test]
+async fn migrated_root_temp_workspace_still_classifies_to_chats() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+
+    // Absolute temp path under a DIFFERENT (older) root than the fixture
+    // work_dir, carrying the `-temp-` leaf marker.
+    let migrated = "/old-data/aionui/conversations/users/u1/2025/01/02/acp-temp-migrated";
+    insert_conv_ws(pool, USER, "c-mig", migrated, 60).await;
+
+    let resp = fx.service.first_screen(USER, Some(50), &[]).await.unwrap();
+
+    assert_eq!(conv_ids(&find_chats(&resp).items), vec!["c-mig"]);
+    assert!(
+        !resp.groups.iter().any(|g| matches!(g.scope, SidebarScope::Dir { .. })),
+        "migrated temp workspace must not spawn a pseudo-dir group"
     );
 }
 

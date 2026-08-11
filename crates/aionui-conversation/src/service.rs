@@ -4448,32 +4448,52 @@ fn is_auto_workspace_relative_path(relative: &Path) -> bool {
             && day.chars().all(|ch| ch.is_ascii_digit())
     };
 
+    // Auto/temp workspace leaves are always `{label}-temp-{id}` (conversations)
+    // or `team-temp-{team_id}` (teams); the `-temp-` marker has been stable
+    // across every historical layout. Requiring it keeps the root-agnostic
+    // match (see [`is_temp_session_workspace`]) from misclassifying a user
+    // directory that merely sits under some `conversations/` ancestor.
+    let is_temp_leaf = |leaf: &str| leaf.contains("-temp-");
+
     match parts.as_slice() {
         // legacy: bare leaf, or {Y}/{M}/{D}/leaf
-        [_file_name] => true,
-        [year, month, day, _file_name] => dated(year, month, day),
+        [leaf] => is_temp_leaf(leaf),
+        [year, month, day, leaf] => dated(year, month, day) && is_temp_leaf(leaf),
         // per-user, type-first: users/{user_dir}/{Y}/{M}/{D}/leaf
-        ["users", _user_dir, year, month, day, _file_name] => dated(year, month, day),
+        ["users", _user_dir, year, month, day, leaf] => dated(year, month, day) && is_temp_leaf(leaf),
         _ => false,
     }
 }
 
-/// True when `workspace` is a backend auto-generated temp session directory
-/// under `{work_dir}/conversations` — the sidebar read model's "temp path" test.
+/// True when `workspace` is a backend auto-generated temp session directory —
+/// the sidebar read model's "temp path" test.
 ///
-/// Pure lexical prefix strip + [`is_auto_workspace_relative_path`]; performs no
-/// filesystem access, so it is safe on the side-effect-free sidebar read path
-/// (dead/removed workspaces classify correctly rather than failing an fs probe).
-/// This is the same judgment the conversation service applies per row; it is
-/// exposed only so the sidebar can classify a conversation's `extra.workspace`
-/// (or a team's `workspace` column) without duplicating the rule. `work_dir` is
-/// the application data directory (`ConversationService`'s `workspace_root`),
-/// injected from the same source on both sides.
-pub fn is_temp_session_workspace(work_dir: &Path, workspace: &Path) -> bool {
-    match workspace.strip_prefix(work_dir.join("conversations")) {
-        Ok(relative) => is_auto_workspace_relative_path(relative),
-        Err(_) => false,
-    }
+/// Root-agnostic: matches the auto-workspace layout after the LAST
+/// `conversations` path segment, regardless of which data-dir root precedes
+/// it. This is deliberate. Users who migrated their conversation directory
+/// across releases carry `extra.workspace` values baked under a *previous*
+/// root; anchoring on the current `work_dir` would strip-fail on those and
+/// misclassify historical temp sessions as projects. The layout after
+/// `conversations/` has always ended in a `-temp-` leaf, so
+/// [`is_auto_workspace_relative_path`] keys on that marker rather than the
+/// (mutable) root prefix.
+///
+/// Pure lexical (no filesystem access), so it is safe on the side-effect-free
+/// sidebar read path — dead/removed workspaces classify correctly rather than
+/// failing an fs probe. Exposed so the sidebar can classify a conversation's
+/// `extra.workspace` (or a team's `workspace` column) without duplicating the
+/// rule.
+pub fn is_temp_session_workspace(workspace: &Path) -> bool {
+    let parts = workspace.iter().map(|part| part.to_str()).collect::<Option<Vec<_>>>();
+    let Some(parts) = parts else {
+        return false;
+    };
+    // Classify the tail after the LAST `conversations` segment (root-agnostic).
+    let Some(idx) = parts.iter().rposition(|part| *part == "conversations") else {
+        return false;
+    };
+    let relative: PathBuf = parts[idx + 1..].iter().collect();
+    is_auto_workspace_relative_path(&relative)
 }
 
 async fn cleanup_empty_date_workspace_parents(workspace_root: &Path, workspace_path: &Path) {
