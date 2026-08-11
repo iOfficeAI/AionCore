@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use aionui_api_types::{
-    ConversationResponse, RemoveProjectResult, SidebarGroup, SidebarItem, SidebarItemsResponse, SidebarResponse,
-    SidebarScope, SidebarTeamItem,
+    ConversationResponse, RemoveProjectItem, RemoveProjectItemKind, RemoveProjectResult, SidebarGroup, SidebarItem,
+    SidebarItemsResponse, SidebarResponse, SidebarScope, SidebarTeamItem,
 };
 use aionui_conversation::{is_temp_session_workspace, row_to_response_with_extra};
 use aionui_db::models::ConversationRow;
@@ -180,9 +180,39 @@ impl SidebarService {
         }
 
         if dry_run {
+            // Name the delete set so the confirm dialog can list *which* items go.
+            // Pinned members were hoisted into the top pinned group (B1 anti-join),
+            // so the frontend can't reconstruct project membership — the names and
+            // pinned flags must come from here.
+            let pinned_refs = self.user_order.pinned_refs(user_id, OrderScene::Pinned).await?;
+            let pinned_set: HashSet<(String, String)> = pinned_refs
+                .iter()
+                .map(|r| (r.item_type.as_str().to_owned(), r.item_id.clone()))
+                .collect();
+
+            let team_name: HashMap<&str, &str> = teams.iter().map(|t| (t.id.as_str(), t.name.as_str())).collect();
+            let conv_resp = self.hydrate(user_id, &conv_ids).await?;
+
+            let mut items: Vec<RemoveProjectItem> = Vec::with_capacity(team_ids.len() + conv_ids.len());
+            for team_id in &team_ids {
+                items.push(RemoveProjectItem {
+                    name: team_name.get(team_id.as_str()).copied().unwrap_or_default().to_owned(),
+                    pinned: pinned_set.contains(&(OrderItemType::Team.as_str().to_owned(), team_id.clone())),
+                    kind: RemoveProjectItemKind::Team,
+                });
+            }
+            for conv_id in &conv_ids {
+                items.push(RemoveProjectItem {
+                    name: conv_resp.get(conv_id).map(|c| c.name.clone()).unwrap_or_default(),
+                    pinned: pinned_set.contains(&(OrderItemType::Conversation.as_str().to_owned(), conv_id.clone())),
+                    kind: RemoveProjectItemKind::Conversation,
+                });
+            }
+
             return Ok(RemoveProjectResult {
                 teams_deleted: team_ids.len() as i64,
                 conversations_deleted: conv_ids.len() as i64,
+                items,
             });
         }
 
@@ -227,6 +257,7 @@ impl SidebarService {
         Ok(RemoveProjectResult {
             teams_deleted,
             conversations_deleted,
+            items: Vec::new(),
         })
     }
 

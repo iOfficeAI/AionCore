@@ -105,6 +105,31 @@ pub struct RemoveProjectResult {
     pub teams_deleted: i64,
     /// Independent conversations classified into the project's group.
     pub conversations_deleted: i64,
+    /// The named units in the delete set, so a `dry_run` preview can list *which*
+    /// items go — not just how many. Pinned members live in the top pinned group
+    /// (B1 double-render: a project's pinned rows are anti-joined out of its own
+    /// group), so the frontend cannot reconstruct project membership itself; the
+    /// names must come from here. Empty on a live delete (the preview already
+    /// showed them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<RemoveProjectItem>,
+}
+
+/// One named unit in a [`RemoveProjectResult`] preview.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveProjectItem {
+    pub name: String,
+    /// Whether the unit is currently pinned (hoisted into the top pinned group).
+    pub pinned: bool,
+    pub kind: RemoveProjectItemKind,
+}
+
+/// Which sidebar unit a [`RemoveProjectItem`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoveProjectItemKind {
+    Conversation,
+    Team,
 }
 
 /// Aggregated team row for the sidebar.

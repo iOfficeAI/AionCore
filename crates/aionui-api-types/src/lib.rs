@@ -158,8 +158,8 @@ pub use shell::{
     SpeechToTextProvider, SpeechToTextResult, SttStreamClientMessage, SttStreamServerMessage, ToolType,
 };
 pub use sidebar::{
-    RemoveProjectResult, SidebarGroup, SidebarItem, SidebarItemsResponse, SidebarResponse, SidebarScope,
-    SidebarTeamItem,
+    RemoveProjectItem, RemoveProjectItemKind, RemoveProjectResult, SidebarGroup, SidebarItem, SidebarItemsResponse,
+    SidebarResponse, SidebarScope, SidebarTeamItem,
 };
 pub use skill::{
     AddExternalPathRequest, DeleteSkillRequest, ExportSkillRequest, ExternalSkillSourceResponse,

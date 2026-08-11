@@ -727,10 +727,42 @@ async fn remove_project_deletes_the_visible_construct_and_orphan_rows() {
     assert!(conv_exists(pool, "c1").await, "dry run must not delete");
     assert_eq!(ports.deleted_convs.lock().unwrap().len(), 0);
 
+    // The preview names the delete set with pinned flags so the confirm dialog can
+    // list *which* items go. Pinned members (c1, T1) were hoisted into the top
+    // pinned group (B1 anti-join) — the frontend cannot reconstruct them, so the
+    // names must ride the preview.
+    let team_items: Vec<_> = preview
+        .items
+        .iter()
+        .filter(|i| i.kind == aionui_api_types::RemoveProjectItemKind::Team)
+        .collect();
+    assert_eq!(team_items.len(), 1);
+    assert_eq!(team_items[0].name, "T1");
+    assert!(team_items[0].pinned, "T1 was pinned");
+
+    let mut conv_items: Vec<_> = preview
+        .items
+        .iter()
+        .filter(|i| i.kind == aionui_api_types::RemoveProjectItemKind::Conversation)
+        .collect();
+    conv_items.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(
+        conv_items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+        ["c1", "c3"]
+    );
+    let c1 = conv_items.iter().find(|i| i.name == "c1").unwrap();
+    let c3 = conv_items.iter().find(|i| i.name == "c3").unwrap();
+    assert!(c1.pinned, "c1 was pinned");
+    assert!(!c3.pinned, "c3 was not pinned");
+
     // Live delete matches the preview exactly.
     let result = fx.service.remove_project(USER, "proj-std", false).await.unwrap();
     assert_eq!(result.teams_deleted, preview.teams_deleted);
     assert_eq!(result.conversations_deleted, preview.conversations_deleted);
+    assert!(
+        result.items.is_empty(),
+        "live delete omits the name list (preview already showed it)"
+    );
 
     // The whole visible construct is gone: bound conv, merged conv, team, members.
     assert!(!conv_exists(pool, "c1").await);
