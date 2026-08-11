@@ -107,6 +107,59 @@ async fn resolves_project_root_ref_empty_relative_path() {
     );
 }
 
+/// bug2 regression: the path emitted to the agent (inlined into `[[AION_FILES]]`)
+/// must keep the folder's REAL on-disk casing, not the case-folded canonical.
+/// `canonical::canonicalize` ASCII-lowercases the path on macOS/Windows
+/// (`IGNORE_PATH_CASING`) for dedupe identity; before the fix that folded root
+/// leaked to the agent (`…/mixedcaseroot/Brief.md`), which a case-sensitive gate
+/// or display can reject. The relative segment was never folded, so the ROOT
+/// casing is the discriminating check. On Linux nothing folds, so real == given.
+#[tokio::test]
+async fn emitted_absolute_path_keeps_real_root_casing() {
+    let db = init_database_memory().await.unwrap();
+    let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
+    let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
+
+    // A mixed-case root directory; only OUR segment's casing is asserted, so the
+    // tempdir parent's own casing is irrelevant.
+    let base = tempfile::tempdir().unwrap();
+    let mixed_root = base.path().join("MixedCaseRoot");
+    std::fs::create_dir(&mixed_root).unwrap();
+    std::fs::write(mixed_root.join("Brief.md"), b"content").unwrap();
+
+    let created = service
+        .create_standard("system_default_user", to_file_uri(&mixed_root).unwrap())
+        .await
+        .unwrap();
+    let upload_root = tempfile::tempdir().unwrap();
+
+    let out = service
+        .resolve_chat_message(
+            "system_default_user",
+            "read this",
+            &[ChatFileRef::Project {
+                pe_id: created.project_explorer.pe_id,
+                relative_path: "Brief.md".into(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap();
+
+    let abs = &out.files[0];
+    // Real root casing preserved — folded would be `mixedcaseroot` on macOS/Windows.
+    assert!(
+        abs.contains("MixedCaseRoot"),
+        "root casing must be preserved, got {abs}"
+    );
+    assert!(abs.ends_with("Brief.md"), "file casing must be preserved, got {abs}");
+    // The emitted path physically resolves to the real file.
+    assert!(
+        std::path::Path::new(abs).is_file(),
+        "emitted path must exist, got {abs}"
+    );
+}
+
 #[tokio::test]
 async fn empty_files_leaves_content_unchanged() {
     let (service, _pe, _dir, upload_root) = setup().await;

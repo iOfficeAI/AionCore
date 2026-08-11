@@ -35,10 +35,21 @@ pub trait IScmProvider: Send + Sync {
     /// Which optional capabilities this provider supports.
     fn capabilities(&self) -> ScmCapabilities;
 
-    /// Decide whether an already-resolved root is a repository of this
-    /// provider. `Ok(None)` means "not a repository" — a normal outcome, not an
+    /// Discover the repositories an already-resolved root surfaces.
+    ///
+    /// The result is a set, not a single value, but its size is bounded by the
+    /// root's discovery policy:
+    /// - Always at most one when [`ResolvedRoot::discover_children`] is `false`
+    ///   (an attached pe root): the root path itself is a repository or it is not.
+    /// - Zero or more when `discover_children` is `true` (a workspace pe root)
+    ///   *and* the root path is not itself a repository: each immediate child
+    ///   directory that is a non-bare repository is surfaced. When the workspace
+    ///   root path is itself a repository, that single repository is returned and
+    ///   children are not inspected.
+    ///
+    /// An empty result means "no repository here" — a normal outcome, not an
     /// error, and never a fabricated repository.
-    async fn discover(&self, root: &ResolvedRoot) -> Result<Option<ScmRepository>, ScmError>;
+    async fn discover(&self, root: &ResolvedRoot) -> Result<Vec<ScmRepository>, ScmError>;
 
     /// Full flat change list for a repository (no pre-grouping).
     async fn status(&self, repo: &RepoRef) -> Result<ScmStatus, ScmError>;

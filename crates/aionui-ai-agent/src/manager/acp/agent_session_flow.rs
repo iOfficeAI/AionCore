@@ -759,6 +759,7 @@ fn empty_turn_info_tip(code: &str, params: Option<Value>) -> TipsEventData {
         tip_type: TipType::Info,
         code: Some(code.to_owned()),
         params,
+        supersedes_key: None,
     }
 }
 
@@ -768,6 +769,7 @@ fn empty_finish_diagnostic_tip(stop_reason: StopReason) -> TipsEventData {
         tip_type: TipType::Warning,
         code: Some(empty_finish_tip_code(stop_reason).to_owned()),
         params: None,
+        supersedes_key: None,
     }
 }
 

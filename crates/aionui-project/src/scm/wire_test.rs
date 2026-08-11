@@ -4,8 +4,54 @@
 //! repository reference, a refusal to act on a conflict, and an engine
 //! malfunction must not arrive looking the same.
 
-use super::super::types::{FileRef, RepoRef, ScmActionFailure, ScmActionOutcome, ScmHead, ScmStatus};
+use super::super::types::{
+    FileRef, RepoRef, ScmActionFailure, ScmActionOutcome, ScmCapabilities, ScmHead, ScmRepository, ScmRepositoryState,
+    ScmStatus,
+};
 use super::*;
+
+/// Build a repository descriptor with the worktree fields set, to lock how the
+/// new optional fields ride the wire (they are what a client branches on).
+fn repository(is_worktree: bool, worktree_of: Option<&str>) -> ScmRepository {
+    ScmRepository {
+        repo_id: "scm:ws/feature".into(),
+        provider_id: "git".into(),
+        root: FileRef {
+            pe_id: "ws".into(),
+            relative_path: "feature".into(),
+        },
+        label: "feature".into(),
+        pe_name: None,
+        head: None,
+        is_worktree,
+        worktree_of: worktree_of.map(str::to_owned),
+        capabilities: ScmCapabilities {
+            staging: true,
+            local_branches: true,
+            history_graph: false,
+            remote_ops: false,
+        },
+        state: ScmRepositoryState::Idle,
+    }
+}
+
+#[test]
+fn repository_frame_carries_worktree_ownership() {
+    let value = serde_json::to_value(repository(true, Some("scm:ws/main"))).expect("serialize");
+    assert_eq!(value["is_worktree"], true);
+    assert_eq!(value["worktree_of"], "scm:ws/main");
+    // A child repo carries no pe entry name; it is omitted, not null.
+    assert!(value.get("pe_name").is_none(), "absent pe_name is omitted");
+}
+
+#[test]
+fn repository_frame_omits_worktree_fields_by_default() {
+    // A primary clone: `is_worktree` false and `worktree_of` None must both drop
+    // off the wire so the common one-repo case stays byte-for-byte as before.
+    let value = serde_json::to_value(repository(false, None)).expect("serialize");
+    assert!(value.get("is_worktree").is_none(), "false is_worktree is omitted");
+    assert!(value.get("worktree_of").is_none(), "None worktree_of is omitted");
+}
 
 /// Build the notification a status broadcast puts on the wire, so the assertions
 /// exercise the exact serialization a client receives (see `ScmActor` refresh).

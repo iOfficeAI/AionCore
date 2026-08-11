@@ -54,6 +54,13 @@ pub struct ResolvedRoot {
     /// filters an empty/blank name to `None`, so a consumer can treat "present"
     /// as "meaningful".
     pub pe_name: Option<String>,
+    /// Whether repository discovery may relax by one level for this root. Set for
+    /// a workspace pe root: if the root's own path is not a repository, the
+    /// provider reads its immediate child directories and surfaces each one that
+    /// is a (non-bare) repository. Left `false` for an attached pe root, whose
+    /// discovery stays exactly one-repo-or-none at the root path — attach
+    /// behaviour is unchanged. Never recurses past one level.
+    pub discover_children: bool,
 }
 
 /// Neutral content anchor: which version of a file to read or compare.
@@ -116,17 +123,33 @@ pub struct ScmRepository {
     pub repo_id: String,
     /// Which provider serves it (`"git"`, ...).
     pub provider_id: String,
-    /// Repository root; stage 0 discovery makes this the pe root itself
-    /// (`relative_path: ""`), one repo per pe at most.
+    /// Repository root. For a pe root that is itself a repository this is the pe
+    /// root (`relative_path: ""`). For a workspace root whose own path is not a
+    /// repository, one-level discovery surfaces each child repository with
+    /// `relative_path` set to the child directory name.
     pub root: FileRef,
     pub label: String,
     /// The pe entry's own explicit name, when it has one. The client prefers it
     /// over `label` for display and falls back to `label` otherwise; absent
-    /// (never empty) when the entry carries no name of its own.
+    /// (never empty) when the entry carries no name of its own. Always `None` for
+    /// a child repository discovered under a workspace root — the entry name
+    /// belongs to the pe root, not to a repository found inside it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pe_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head: Option<ScmHead>,
+    /// Whether this repository is a linked worktree (as opposed to a primary
+    /// clone). Only surfaced under one-level workspace discovery; omitted from the
+    /// wire when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_worktree: bool,
+    /// When this is a linked worktree *and* its primary repository is also in the
+    /// same project's surfaced set, the primary repository's `repo_id`. `None`
+    /// when the primary is outside the current view (the client then renders the
+    /// worktree at the outer level). Matched by real git directory, never by path
+    /// text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_of: Option<String>,
     pub capabilities: ScmCapabilities,
     pub state: ScmRepositoryState,
 }

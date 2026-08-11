@@ -341,3 +341,28 @@ pub async fn setup_and_login(
 
     (token, csrf)
 }
+
+/// Log in an account that already exists — for a second app instance brought up
+/// over the same database, where creating the user again would panic.
+pub async fn login_existing(app: &mut axum::Router, username: &str, password: &str) -> (String, String) {
+    let resp = app.clone().oneshot(get_request("/api/auth/status")).await.unwrap();
+    let csrf = extract_csrf_token(&resp).expect("CSRF cookie should be set");
+
+    let body = format!(r#"{{"username":"{username}","password":"{password}"}}"#);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/login")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "login should succeed for an existing user"
+    );
+
+    let json = body_json(resp).await;
+    let token = json["token"].as_str().unwrap().to_owned();
+    (token, csrf)
+}

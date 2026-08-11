@@ -22,6 +22,13 @@ impl ShellService {
         self.opener.open_detached(&path.to_string_lossy())
     }
 
+    /// Write `text` to the OS clipboard (used by the copy-absolute-path endpoint,
+    /// which resolves the path server-side and copies it here so the client never
+    /// receives it).
+    pub async fn copy_text_to_clipboard(&self, text: &str) -> Result<(), ShellError> {
+        self.opener.copy_to_clipboard(text)
+    }
+
     pub async fn show_item_in_folder(&self, file_path: &str) -> Result<(), ShellError> {
         let path = validate_path_exists(file_path)?;
         if cfg!(target_os = "macos") {

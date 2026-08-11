@@ -58,8 +58,9 @@ pub use backend::{
     CommandMeta, CommandReceipt, ContentBlock, ConversationSession, McpServerSpec, McpTransport, MsgStatus,
     Orchestrator, PendingMessage, PendingPermissionView, PermissionDecision, QuestionAnswer, SessionBackend,
     SessionConfig, SessionEnvelope, SessionInfoKind, SessionInit, SessionSpec, StateSnapshot, Tier2Checkpoint,
-    TransitionReason, VersionDrift, acp_capabilities, antigravity_capabilities, codex_capabilities, command_name,
-    rehydrate, slash_command_name, version_drift,
+    TransitionReason, VERIFIED_CLAUDE_VERSION, VERIFIED_CODEX_VERSION, VersionDrift, VersionVerdict, acp_capabilities,
+    antigravity_capabilities, classify_cli_version, codex_capabilities, command_name, parse_cli_version, rehydrate,
+    slash_command_name, version_drift,
 };
 pub use capability::{
     BlockSet, Capabilities, CapabilityTier, CommandSet, ModeInfo, ModelInfo, PromptAcceptedSource, SignalSet,

@@ -15,7 +15,7 @@ use crate::runtime_state::TurnClaim;
 use crate::service::{
     ConversationService, MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
 };
-use crate::stream_relay::{RelayOutcome, StreamRelay, TurnAttemptSummary};
+use crate::stream_relay::{RelayOutcome, StreamRelay, SupersedingTipTotals, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use crate::turn_recovery_policy::{TurnRecoveryDecision, TurnRecoveryPolicy};
 use aionui_api_types::AgentErrorCode;
@@ -73,6 +73,8 @@ struct TurnAttemptInput {
     required_runtime_mode: Option<String>,
     continuation_count: usize,
     defer_clean_terminal_errors: bool,
+    /// Shared by every attempt of this turn — see the field's use in run_attempt.
+    superseding_tips: SupersedingTipTotals,
 }
 
 struct TurnAttemptResult {
@@ -259,7 +261,11 @@ impl ConversationTurnOrchestrator {
             .with_runtime_state(Arc::clone(&runtime_state))
             .with_persistence(persistence.clone())
             .with_turn_completion(false)
-            .with_defer_clean_terminal_errors(defer_clean_terminal_errors);
+            .with_defer_clean_terminal_errors(defer_clean_terminal_errors)
+            // A replay spawns a fresh CLI whose own retry counter starts at one,
+            // but from the user's side it is still the same stalled prompt and
+            // the same card counting up — so these totals span the attempts.
+            .with_superseding_tip_totals(input.superseding_tips.clone());
 
             let rx = agent.subscribe();
             if let Some(mode) = input
@@ -435,6 +441,7 @@ impl ConversationTurnOrchestrator {
             inject_skills: input.inject_skills,
         };
         let mut replayed = false;
+        let superseding_tips = SupersedingTipTotals::default();
         let mut replay_started_at = None;
         let mut final_error_message;
         let mut auth_failure = false;
@@ -456,6 +463,7 @@ impl ConversationTurnOrchestrator {
                     required_runtime_mode: input.required_runtime_mode.clone(),
                     continuation_count: 0,
                     defer_clean_terminal_errors: !replayed,
+                    superseding_tips: superseding_tips.clone(),
                 })
                 .await
             {

@@ -15,6 +15,7 @@ base64.workspace = true
 futures-util.workspace = true
 open.workspace = true
 which.workspace = true
+arboard.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true

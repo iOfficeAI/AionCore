@@ -217,3 +217,20 @@ pub trait ISystemFileOpener: Send + Sync {
 
 /// Convenience alias for an Arc-wrapped system file opener.
 pub type SystemFileOpenerRef = Arc<dyn ISystemFileOpener>;
+
+/// Write text to the OS clipboard. The `/api/fs/copy-absolute-path` route
+/// resolves the path server-side and writes it here, so — exactly like
+/// [`IItemRevealer`] / [`ISystemFileOpener`] — the backend performs the OS action
+/// itself and the resolved absolute path is never returned to the client. The
+/// composition layer supplies an adapter over the shell service, so this crate
+/// needs no shell dependency.
+#[async_trait::async_trait]
+pub trait IClipboardWriter: Send + Sync {
+    /// Write `text` (the resolved absolute path) to the OS clipboard. Errors on a
+    /// headless/no-clipboard environment rather than panicking; the error carries
+    /// no path.
+    async fn write_text(&self, text: &str) -> Result<(), FileError>;
+}
+
+/// Convenience alias for an Arc-wrapped clipboard writer.
+pub type ClipboardWriterRef = Arc<dyn IClipboardWriter>;

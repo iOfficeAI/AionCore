@@ -1181,6 +1181,7 @@ async fn reader_task(ctx: ReaderCtx) {
                                         level: crate::event::NoticeLevel::Warning,
                                         message: format!("{label} failed: {message}"),
                                         localized: None,
+                                        supersedes_key: None,
                                     },
                                 );
                             } else if let Some((kind, value)) = label.split_once('\u{2192}') {

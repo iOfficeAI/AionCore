@@ -21,6 +21,18 @@ pub struct RelayConfig {
     pub throttle_ms: u64,
 }
 
+/// Per-platform minimum interval between streaming `edit_message` calls.
+///
+/// Slack's `chat.update` is rate-limited more aggressively than the other
+/// editable platforms, so it uses a larger interval; Telegram/Lark/DingTalk
+/// keep the original 500 ms cadence.
+pub fn throttle_ms_for_platform(platform: PluginType) -> u64 {
+    match platform {
+        PluginType::Slack => 1200,
+        _ => 500,
+    }
+}
+
 /// Abstraction for sending/editing messages through a channel plugin.
 ///
 /// Decouples ChannelStreamRelay from ChannelManager for testability.

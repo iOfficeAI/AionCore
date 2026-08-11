@@ -27,11 +27,11 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 
 use super::argv::{ArgvInput, build_argv};
 use super::mcp_config::write_mcp_config;
-use super::models::{probe_models, probe_version};
+use super::models::probe_models;
 use super::skills::scan_skill_commands;
 use super::translate::Translator;
-use super::version::drift_notice;
 use super::wire::parse_line;
+use crate::backend::cli_version::session_drift_notice;
 use crate::backend::types::{
     Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
     PermissionDecision, SessionEnvelope, SessionSpec,
@@ -82,16 +82,6 @@ fn store_models(models: &[ModelInfo]) {
     if let Ok(mut guard) = model_cache().write() {
         *guard = models.to_vec();
     }
-}
-
-/// Whether the agy version has already been reported in this process.
-///
-/// The installed binary cannot change under a running app, so repeating the
-/// notice on every session would just be noise.
-static VERSION_REPORTED: AtomicBool = AtomicBool::new(false);
-
-fn version_already_reported() -> bool {
-    VERSION_REPORTED.swap(true, Ordering::SeqCst)
 }
 
 /// How long a permission card may stay unanswered before we answer `deny` for
@@ -409,9 +399,6 @@ impl AntigravitySessionBackend {
     /// Reported once per process: the answer cannot change while agy's binary
     /// stays put, and repeating it on every session would be noise.
     fn spawn_version_check(self: &Arc<Self>) {
-        if version_already_reported() {
-            return;
-        }
         let spawner = Arc::clone(&self.spawner);
         let session_id = self.session_id.clone();
         let program = self
@@ -421,14 +408,10 @@ impl AntigravitySessionBackend {
             .unwrap_or_else(|| std::path::PathBuf::from("agy"));
         let weak = self.weak_self.get().cloned();
         tokio::spawn(async move {
-            let Some(reported) = probe_version(&spawner, &program, &session_id).await else {
+            let Some((level, message, localized)) = session_drift_notice(&spawner, "agy", &program, &session_id).await
+            else {
                 return;
             };
-            tracing::info!(session_id = %session_id, version = %reported, "antigravity: agy version detected");
-            let Some((level, message, localized)) = drift_notice(&reported) else {
-                return;
-            };
-            tracing::warn!(session_id = %session_id, version = %reported, "antigravity: agy version drift");
             if let Some(backend) = weak.and_then(|w| w.upgrade()) {
                 backend.emit(
                     backend.turn_gen.load(Ordering::SeqCst),
@@ -436,6 +419,7 @@ impl AntigravitySessionBackend {
                         level,
                         message,
                         localized: Some(localized),
+                        supersedes_key: None,
                     },
                 );
             }

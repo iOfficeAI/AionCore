@@ -1088,6 +1088,7 @@ mod tests {
                 level: crate::event::NoticeLevel::Warning,
                 message: "advisory".into(),
                 localized: None,
+                supersedes_key: None,
             },
             SessionEvent::ItemStarted {
                 item_id: "i".into(),
@@ -1256,6 +1257,7 @@ mod tests {
                 level: crate::event::NoticeLevel::Warning,
                 message: "advisory".into(),
                 localized: None,
+                supersedes_key: None,
             },
             SessionEvent::ItemStarted {
                 item_id: "i".into(),
@@ -2300,6 +2302,7 @@ mod proptest_totality {
                 level: crate::event::NoticeLevel::Warning,
                 message: "advisory".into(),
                 localized: None,
+                supersedes_key: None,
             }),
             Just(SessionEvent::SessionInfo {
                 context_usage: None,
