@@ -1050,16 +1050,23 @@ impl ClaudeSessionBackend {
             else {
                 return;
             };
-            let _ = event_tx.send(SessionEnvelope {
-                session_id: session_id.clone(),
-                turn_gen: turn_gen.load(Ordering::SeqCst),
-                event: SessionEvent::Notice {
-                    level,
-                    message,
-                    localized: Some(localized),
-                    supersedes_key: None,
+            // Retry until subscribed: a broadcast send with no receiver is
+            // discarded, and this notice has no second chance.
+            crate::backend::cli_version::broadcast_notice(
+                &event_tx,
+                SessionEnvelope {
+                    session_id: session_id.clone(),
+                    turn_gen: turn_gen.load(Ordering::SeqCst),
+                    event: SessionEvent::Notice {
+                        level,
+                        message,
+                        localized: Some(localized),
+                        supersedes_key: None,
+                    },
                 },
-            });
+                "claude",
+            )
+            .await;
         });
     }
 

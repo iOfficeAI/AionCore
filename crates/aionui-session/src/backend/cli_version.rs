@@ -264,9 +264,163 @@ pub async fn session_drift_notice(
     Some(notice)
 }
 
+/// How long to keep trying to hand the notice to a subscriber.
+///
+/// Sized against the gap that produced the bug — codex broadcast at
+/// `02:18:02.863` and the session pump attached at `02:18:05.036`, 2.2s later —
+/// with room for a slower machine. A conversation that has attracted no
+/// subscriber in 30s has no one left to tell.
+const NOTICE_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const NOTICE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Broadcast a session notice, retrying until someone is subscribed.
+///
+/// `event_tx` is a `broadcast` channel, so a send with zero receivers is
+/// DISCARDED, not queued — and the version notice is one-shot: unlike a turn
+/// frame there is no later event carrying the same information, and
+/// `already_reported` guarantees the check will not run again for this session.
+///
+/// The three backends all spawn their version probe as a detached task, so
+/// whether the notice wins the race against the orchestration layer's
+/// `events()` subscription is pure timing. claude happens to win (its check is
+/// the last statement in `open_session`); codex reliably loses, because its
+/// check is deliberately placed early — before model discovery, so the
+/// reconcile path cannot skip it — and that discovery keeps `open_session`
+/// busy for seconds while `codex --version` returns in ~60ms.
+///
+/// Measured on 2026-08-11 dev logs: 13 codex drifts detected, 13 notices
+/// broadcast, 0 delivered — every one dropped by an empty channel, and every
+/// one logged as if it had been sent, because the send result was discarded
+/// with `let _ =`.
+///
+/// Retrying is free here: the caller is already a detached task whose only job
+/// is this notice.
+pub async fn broadcast_notice(
+    event_tx: &tokio::sync::broadcast::Sender<crate::backend::types::SessionEnvelope>,
+    envelope: crate::backend::types::SessionEnvelope,
+    cli: &str,
+) {
+    broadcast_notice_within(event_tx, envelope, cli, NOTICE_DELIVERY_TIMEOUT).await
+}
+
+/// [`broadcast_notice`] with an injectable deadline, so a test does not wait 30s
+/// to observe the give-up path.
+async fn broadcast_notice_within(
+    event_tx: &tokio::sync::broadcast::Sender<crate::backend::types::SessionEnvelope>,
+    envelope: crate::backend::types::SessionEnvelope,
+    cli: &str,
+    timeout: std::time::Duration,
+) {
+    let session_id = envelope.session_id.clone();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut waited = false;
+    loop {
+        // `send` fails ONLY when there is no receiver, which is precisely the
+        // condition worth retrying — a subscriber that is merely slow still
+        // takes the value into the ring buffer.
+        if event_tx.send(envelope.clone()).is_ok() {
+            if waited {
+                tracing::info!(session_id = %session_id, cli = %cli, "session notice delivered to a late subscriber");
+            }
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                session_id = %session_id,
+                cli = %cli,
+                timeout_ms = timeout.as_millis(),
+                "session notice dropped: nothing ever subscribed to this session's events"
+            );
+            return;
+        }
+        waited = true;
+        tokio::time::sleep(NOTICE_RETRY_INTERVAL).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn notice_envelope(session_id: &str) -> crate::backend::types::SessionEnvelope {
+        crate::backend::types::SessionEnvelope {
+            session_id: session_id.to_string(),
+            turn_gen: 0,
+            event: crate::event::SessionEvent::Notice {
+                level: NoticeLevel::Warning,
+                message: "drift".into(),
+                localized: None,
+                supersedes_key: None,
+            },
+        }
+    }
+
+    /// The bug this function exists for: the notice is produced BEFORE the
+    /// orchestration layer subscribes, which is what codex does every time — its
+    /// version check is placed early (so the reconcile path cannot skip it) and
+    /// `open_session` then spends seconds on model discovery. A plain
+    /// `send` drops the value on an empty channel, and 13 of 13 codex drift
+    /// notices were lost that way.
+    #[tokio::test]
+    async fn a_notice_broadcast_before_anyone_subscribes_still_arrives() {
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        // Proof the send would have been LOST as written before: no receiver
+        // exists, so the one-shot send fails outright.
+        assert!(
+            tx.send(notice_envelope("s1")).is_err(),
+            "precondition: an empty channel drops the value"
+        );
+
+        let sender = tx.clone();
+        let task = tokio::spawn(async move {
+            broadcast_notice(&sender, notice_envelope("s1"), "codex").await;
+        });
+
+        // Subscribe late, the way the session pump does (measured: 2.2s after
+        // the codex notice was broadcast).
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let mut rx = tx.subscribe();
+
+        task.await.expect("delivery task");
+        let env = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the notice must still be waiting for a late subscriber")
+            .expect("channel open");
+        assert_eq!(env.session_id, "s1");
+        assert!(matches!(env.event, crate::event::SessionEvent::Notice { .. }));
+    }
+
+    /// The claude timing — a subscriber is already attached — must not regress
+    /// into waiting for anything.
+    #[tokio::test]
+    async fn an_already_subscribed_session_gets_the_notice_immediately() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let started = tokio::time::Instant::now();
+        broadcast_notice(&tx, notice_envelope("s2"), "claude").await;
+        assert!(
+            started.elapsed() < NOTICE_RETRY_INTERVAL,
+            "a live subscriber must be served without a retry sleep"
+        );
+        assert_eq!(rx.recv().await.expect("delivered").session_id, "s2");
+    }
+
+    /// A session nobody ever listens to must not keep a task alive forever.
+    #[tokio::test]
+    async fn delivery_gives_up_once_the_deadline_passes() {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        drop(rx);
+        let started = tokio::time::Instant::now();
+        broadcast_notice_within(&tx, notice_envelope("s3"), "agy", std::time::Duration::from_millis(120)).await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(120),
+            "must honour the deadline: {waited:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "must not hang past it: {waited:?}"
+        );
+    }
 
     #[test]
     fn the_verified_release_says_nothing() {
