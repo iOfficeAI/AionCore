@@ -101,6 +101,22 @@ pub const CODE_CLI_VERSION_NEWER: &str = "CLI_VERSION_NEWER";
 /// would strand users on an old release. It is reported once so that, if the
 /// session then misbehaves, the cause is already on screen.
 ///
+/// Both directions are `Info`, which is a statement about PRESENTATION, not
+/// about how much the two verdicts matter. `Warning` renders as a filled card
+/// with the same alarm glyph an error uses, and a drifting install is not an
+/// error: nothing has failed, the turn is running, and the user is being told
+/// something about their environment. Reported live 2026-08-11 — an `Older`
+/// codex read as a failure report. `Info` is the tier the frontend draws as a
+/// quiet centred line, and `MessageTips` documents it as the tier a backend
+/// picks when it deliberately wants a notice to be unobtrusive.
+///
+/// The severity difference survives where it is acted on rather than merely
+/// read: the two verdicts keep distinct i18n codes, distinct prose ("some
+/// features may be missing. Consider upgrading" vs "should still work"), and
+/// distinct diagnostic codes on the availability probe — which is the surface
+/// that reaches the user BEFORE a conversation exists, when they are still
+/// deciding whether to rely on this agent, and which keeps its own weight.
+///
 /// Returns the English text AND its translation handle: the text is the
 /// fallback shown when the locale has no entry for the code, so both travel
 /// together rather than the caller having to rebuild one from the other.
@@ -114,7 +130,7 @@ pub fn drift_notice(cli: &str, reported: &str, verified: &str) -> Option<(Notice
     match classify(reported, verified) {
         VersionVerdict::Verified | VersionVerdict::Unknown => None,
         VersionVerdict::Older => Some((
-            NoticeLevel::Warning,
+            NoticeLevel::Info,
             format!(
                 "The installed {cli} is older than the version AionUi verified; \
                  some features may be missing. Consider upgrading {cli}. \
@@ -444,11 +460,19 @@ mod tests {
         assert_eq!(parse_version("1.1.10"), Some(vec![1, 1, 10]));
     }
 
+    /// Both drift directions are `Info` — the tier the frontend draws as a quiet
+    /// centred line. `Warning` renders with the same alarm glyph as an error,
+    /// and a drifting install is not a failure. What must stay distinguishable
+    /// is what the user acts on: the code and the prose.
     #[test]
-    fn an_older_install_warns_and_a_newer_one_only_informs() {
+    fn an_older_install_is_told_apart_by_its_words_not_by_an_alarm() {
         let (level, text, localized) =
             drift_notice("claude", "2.1.100", VERIFIED_CLAUDE_VERSION).expect("older drifts");
-        assert_eq!(level, NoticeLevel::Warning);
+        assert_eq!(level, NoticeLevel::Info, "a drifting install must not read as an error");
+        assert!(
+            text.contains("older") && text.contains("Consider upgrading"),
+            "the older case must still say what to do: {text}"
+        );
         assert!(text.contains("2.1.100") && text.contains(VERIFIED_CLAUDE_VERSION));
         assert_eq!(localized.code, CODE_CLI_VERSION_OLDER);
         assert_eq!(localized.params.get("cli").and_then(|v| v.as_str()), Some("claude"));
