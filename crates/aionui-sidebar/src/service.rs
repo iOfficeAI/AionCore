@@ -15,11 +15,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use aionui_api_types::{
-    ConversationResponse, SidebarGroup, SidebarItem, SidebarItemsResponse, SidebarResponse, SidebarScope,
-    SidebarTeamItem,
+    ConversationResponse, RemoveProjectResult, SidebarGroup, SidebarItem, SidebarItemsResponse, SidebarResponse,
+    SidebarScope, SidebarTeamItem,
 };
 use aionui_conversation::{is_temp_session_workspace, row_to_response_with_extra};
 use aionui_db::models::ConversationRow;
@@ -29,6 +29,7 @@ use aionui_db::{
 };
 use aionui_project::canonical;
 
+use crate::ports::RemoveProjectPorts;
 use crate::types::{
     Cursor, DEFAULT_ITEMS_LIMIT, DEFAULT_LIMIT, ScopeToken, SidebarError, canonical_to_dir_key, validate_limit,
 };
@@ -47,6 +48,10 @@ pub struct SidebarService {
     /// Backend-managed data dir (conversation workspace root). Used both to
     /// detect temp workspaces (classification) and as the hydration `data_dir`.
     work_dir: PathBuf,
+    /// Deletion ports for `remove_project`, injected once after startup (the
+    /// team service they wrap is built after this service — see
+    /// `build_module_states`). Empty in the read/pin paths, which never touch it.
+    remove_project_ports: Arc<OnceLock<Arc<dyn RemoveProjectPorts>>>,
 }
 
 impl SidebarService {
@@ -55,7 +60,16 @@ impl SidebarService {
             sidebar,
             user_order,
             work_dir,
+            remove_project_ports: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Install the deletion ports `remove_project` drives. Called once, after the
+    /// conversation / team / project services exist; later calls are ignored
+    /// (set-once). Because the field is shared behind `Arc`, setting it on any
+    /// clone makes it visible everywhere.
+    pub fn set_remove_project_ports(&self, ports: Arc<dyn RemoveProjectPorts>) {
+        let _ = self.remove_project_ports.set(ports);
     }
 
     // -- Write side (pin / unpin) --------------------------------------------
@@ -75,6 +89,145 @@ impl SidebarService {
         let item = OrderItemRef::new(parse_item_type(item_type)?, item_id.to_owned());
         self.user_order.unpin(user_id, scene, &item).await?;
         Ok(())
+    }
+
+    // -- Remove project (BR-19 / D13 "所见即所删") ---------------------------
+
+    /// Remove a standard project: delete every unit that renders into its group,
+    /// then the project record itself. When `dry_run` is set, nothing is deleted
+    /// and the returned counts are the preview (what *would* be removed).
+    ///
+    /// # Delete set
+    /// The set is computed with the **same** classifier the renderer uses
+    /// ([`classify_unit`](Self::classify_unit)) over the active universe: a unit
+    /// is deleted iff it classifies into `Project(project_id)`. This is why
+    /// "所见即所删" holds — the delete set *is* the render construct, so it also
+    /// catches path-merged unbound items (a conversation whose workspace
+    /// canonicalizes onto this project's root, case 3) that carry no `project_id`.
+    /// Pinned units are included: pinning only hoists a row into the pinned group
+    /// for display, it does not change which project the row belongs to.
+    ///
+    /// Team-member conversations are not enumerated here — they are folded into
+    /// their team and removed by the team cascade, "无论成员自身 project_id 为何";
+    /// a member whose *team* lands in another project is therefore not touched.
+    ///
+    /// # Atomicity
+    /// Deletion is **best-effort per entity**, mirroring the standalone team
+    /// delete: killing agent processes, dropping filesystem dirs, and running
+    /// cross-service delete hooks cannot share one DB transaction, so D13's
+    /// "单事务原子 + 中途失败全回滚" is not literally achievable. A failed unit is
+    /// logged and skipped; the project record is dropped last, so a mid-way
+    /// failure leaves a smaller (self-consistent) project rather than orphaning
+    /// its contents. Only the archived-inclusion refinement is deferred to PR-B;
+    /// PR-A has no archiving, so the active universe is the whole universe.
+    pub async fn remove_project(
+        &self,
+        user_id: &str,
+        project_id: &str,
+        dry_run: bool,
+    ) -> Result<RemoveProjectResult, SidebarError> {
+        let convs = self.sidebar.list_active_conversations_thin(user_id).await?;
+        let teams = self.sidebar.list_active_teams_thin(user_id).await?;
+        let projects = self.sidebar.list_user_projects(user_id).await?;
+
+        // Same project maps `classify` builds: id→meta and standard-canonical→id.
+        let by_id: HashMap<&str, &SidebarProjectMeta> = projects.iter().map(|p| (p.project_id.as_str(), p)).collect();
+        let std_canon: HashMap<&str, &str> = projects
+            .iter()
+            .filter(|p| p.kind == KIND_STANDARD)
+            .filter_map(|p| p.workspace_canonical.as_deref().map(|c| (c, p.project_id.as_str())))
+            .collect();
+
+        // The target must be an owned standard project. Temp projects and
+        // pseudo-dir groups are not removable through this path → 404.
+        match by_id.get(project_id) {
+            Some(meta) if meta.kind == KIND_STANDARD => {}
+            _ => return Err(SidebarError::ScopeGone),
+        }
+
+        let (team_by_id, independents) = aggregate_teams(convs, teams.clone());
+        let target = GroupKey::Project(project_id.to_owned());
+
+        let mut team_ids: Vec<String> = Vec::new();
+        for team in &teams {
+            // Skip teams that dropped out of the aggregate (none currently, but
+            // keeps parity with `classify`'s guard).
+            if !team_by_id.contains_key(&team.id) {
+                continue;
+            }
+            let key = self.classify_unit(
+                team.project_id.as_deref(),
+                team.workspace.as_deref(),
+                &by_id,
+                &std_canon,
+            );
+            if key == target {
+                team_ids.push(team.id.clone());
+            }
+        }
+
+        let mut conv_ids: Vec<String> = Vec::new();
+        for conv in &independents {
+            let key = self.classify_unit(
+                conv.project_id.as_deref(),
+                conv.workspace.as_deref(),
+                &by_id,
+                &std_canon,
+            );
+            if key == target {
+                conv_ids.push(conv.id.clone());
+            }
+        }
+
+        if dry_run {
+            return Ok(RemoveProjectResult {
+                teams_deleted: team_ids.len() as i64,
+                conversations_deleted: conv_ids.len() as i64,
+            });
+        }
+
+        let ports = self
+            .remove_project_ports
+            .get()
+            .ok_or_else(|| SidebarError::Internal("remove_project ports not wired".into()))?;
+
+        let mut teams_deleted = 0i64;
+        for team_id in &team_ids {
+            match ports.remove_team(user_id, team_id).await {
+                Ok(()) => teams_deleted += 1,
+                Err(err) => {
+                    tracing::warn!(team_id = %team_id, error = %err, "remove_project: team delete failed")
+                }
+            }
+        }
+
+        let mut conversations_deleted = 0i64;
+        for conv_id in &conv_ids {
+            match ports.delete_conversation(user_id, conv_id).await {
+                Ok(()) => conversations_deleted += 1,
+                Err(err) => {
+                    tracing::warn!(conversation_id = %conv_id, error = %err, "remove_project: conversation delete failed")
+                }
+            }
+        }
+
+        // Project record last: its contents are already gone, so a failure here
+        // leaves only an empty shell (which a retry finishes off).
+        if let Err(err) = ports.delete_project_record(user_id, project_id).await {
+            tracing::warn!(project_id = %project_id, error = %err, "remove_project: project record delete failed");
+        }
+
+        tracing::info!(
+            project_id = %project_id,
+            teams_deleted,
+            conversations_deleted,
+            "Project removed (best-effort)"
+        );
+
+        Ok(RemoveProjectResult {
+            teams_deleted,
+            conversations_deleted,
+        })
     }
 
     // -- Read side (first screen / paging) -----------------------------------

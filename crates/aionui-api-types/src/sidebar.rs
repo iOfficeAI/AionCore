@@ -91,6 +91,22 @@ pub enum SidebarItem {
     Team(SidebarTeamItem),
 }
 
+/// Result of `DELETE /api/sidebar/project/{id}` (and its `dry_run` preview).
+///
+/// Counts are of the units classified into the project's group (BR-19). A live
+/// delete reports how many were actually removed; a `dry_run` reports how many
+/// *would* be — the two agree when no concurrent deletion races in. Team-member
+/// conversations are not counted separately: they are folded into their team and
+/// removed by the team cascade, so only the visible rows (`teams_deleted` +
+/// `conversations_deleted`) are reported.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveProjectResult {
+    /// Teams classified into the project's group.
+    pub teams_deleted: i64,
+    /// Independent conversations classified into the project's group.
+    pub conversations_deleted: i64,
+}
+
 /// Aggregated team row for the sidebar.
 ///
 /// Membership grouping is already expressed by the group the row sits in, so

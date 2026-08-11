@@ -18,12 +18,12 @@
 
 use std::sync::Arc;
 
-use aionui_api_types::{ApiResponse, SidebarItemsResponse, SidebarResponse};
+use aionui_api_types::{ApiResponse, RemoveProjectResult, SidebarItemsResponse, SidebarResponse};
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
-use axum::routing::{get, put};
+use axum::routing::{delete, get, put};
 use axum::{Extension, Json, Router};
 
 use crate::service::SidebarService;
@@ -45,6 +45,7 @@ pub fn sidebar_routes(state: SidebarRouterState) -> Router {
             "/api/order/{scene}/{item_type}/{item_id}",
             put(put_order).delete(delete_order),
         )
+        .route("/api/sidebar/project/{project_id}", delete(delete_project))
         .with_state(state)
 }
 
@@ -118,6 +119,29 @@ async fn delete_order(
     Ok(Json(ApiResponse::ok(())))
 }
 
+/// `DELETE /api/sidebar/project/{project_id}?dry_run=true` — remove a project
+/// and everything classified into its group (BR-19 "所见即所删").
+///
+/// With `dry_run=true` nothing is deleted; the response reports the counts that
+/// *would* be removed so the frontend can render a confirmation. A missing or
+/// non-standard `project_id` maps to `ScopeGone` → 404.
+async fn delete_project(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ApiResponse<RemoveProjectResult>>, ApiError> {
+    let params = QueryParams::parse(query.as_deref());
+    let dry_run = params.flag("dry_run");
+
+    let result = state
+        .service
+        .remove_project(&user.id, &project_id, dry_run)
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
 /// Parsed query string: percent-decoded `(key, value)` pairs. `axum::Query`
 /// (serde_urlencoded) collapses duplicate keys, so `win` — which repeats — is
 /// parsed from the raw query instead.
@@ -147,6 +171,15 @@ impl QueryParams {
             .filter(|(k, _)| k == key)
             .map(|(_, v)| v.clone())
             .collect()
+    }
+
+    /// A boolean query flag: present with no value / `true` / `1` → true;
+    /// absent or any other value → false.
+    fn flag(&self, key: &str) -> bool {
+        match self.single(key) {
+            None => false,
+            Some(v) => v.is_empty() || v == "true" || v == "1",
+        }
     }
 
     /// `limit` as an `i64`; a present-but-non-numeric value is a 400.

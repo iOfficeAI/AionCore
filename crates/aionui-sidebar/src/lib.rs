@@ -7,12 +7,14 @@
 //! `boundary-rules.md`).
 
 mod cascade;
+mod ports;
 mod service;
 mod types;
 
 pub mod routes;
 
 pub use cascade::UserOrderDeleteHook;
+pub use ports::RemoveProjectPorts;
 pub use routes::{SidebarRouterState, sidebar_routes};
 pub use service::SidebarService;
 pub use types::SidebarError;

@@ -34,7 +34,7 @@ use aionui_mcp::{
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
 };
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
-use aionui_project::ProjectRouterState;
+use aionui_project::{ProjectRouterState, ProjectService};
 use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
 use aionui_shell::ShellRouterState;
 use aionui_sidebar::{SidebarRouterState, SidebarService};
@@ -334,6 +334,17 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"
     );
+    // Late-inject the sidebar's remove-project ports: the team service is built
+    // after the sidebar state above, so the wiring cannot happen inside
+    // `build_sidebar_state`. `set_remove_project_ports` is set-once.
+    states
+        .sidebar
+        .service
+        .set_remove_project_ports(Arc::new(RemoveProjectAdapter {
+            conversation: services.conversation_service.clone(),
+            team: states.team.service.clone(),
+            project: services.project_service.clone(),
+        }));
     states
         .conversation
         .service
@@ -520,6 +531,41 @@ pub fn build_sidebar_state(services: &AppServices) -> SidebarRouterState {
     );
     SidebarRouterState {
         service: Arc::new(service),
+    }
+}
+
+/// Adapts the concrete conversation / team / project services to the sidebar's
+/// [`aionui_sidebar::RemoveProjectPorts`] trait so `remove_project` (BR-19) can
+/// reuse the existing per-unit delete paths (`ConversationService::delete`,
+/// `TeamSessionService::remove_team`, `ProjectService::delete_project`) without
+/// the sidebar crate depending on any of them.
+struct RemoveProjectAdapter {
+    conversation: ConversationService,
+    team: Arc<TeamSessionService>,
+    project: ProjectService,
+}
+
+#[async_trait::async_trait]
+impl aionui_sidebar::RemoveProjectPorts for RemoveProjectAdapter {
+    async fn delete_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), String> {
+        self.conversation
+            .delete(user_id, conversation_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), String> {
+        self.team
+            .remove_team(user_id, team_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn delete_project_record(&self, user_id: &str, project_id: &str) -> Result<(), String> {
+        self.project
+            .delete_project(user_id, project_id)
+            .await
+            .map_err(|err| err.to_string())
     }
 }
 

@@ -157,7 +157,10 @@ pub use shell::{
     OpenExternalRequest, OpenFileRequest, OpenFolderWithRequest, ShowItemInFolderRequest, SpeechToTextConfig,
     SpeechToTextProvider, SpeechToTextResult, SttStreamClientMessage, SttStreamServerMessage, ToolType,
 };
-pub use sidebar::{SidebarGroup, SidebarItem, SidebarItemsResponse, SidebarResponse, SidebarScope, SidebarTeamItem};
+pub use sidebar::{
+    RemoveProjectResult, SidebarGroup, SidebarItem, SidebarItemsResponse, SidebarResponse, SidebarScope,
+    SidebarTeamItem,
+};
 pub use skill::{
     AddExternalPathRequest, DeleteSkillRequest, ExportSkillRequest, ExternalSkillSourceResponse,
     ImportSkillFailureResponse, ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest,

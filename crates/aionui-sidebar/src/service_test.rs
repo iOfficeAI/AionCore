@@ -4,18 +4,21 @@
 //! double-render regression, cross-user scoping (BR-24), dangling project ids,
 //! keyset paging continuity, and the ScopeGone 404.
 
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aionui_api_types::{SidebarItem, SidebarScope};
 use aionui_db::{
-    Database, ISidebarStore, IUserOrderStore, SqlitePool, SqliteSidebarStore, SqliteUserOrderStore,
-    init_database_memory,
+    Database, ISidebarStore, IUserOrderStore, OrderItemRef, OrderItemType, SqlitePool, SqliteSidebarStore,
+    SqliteUserOrderStore, init_database_memory,
 };
 use aionui_project::canonical;
+use async_trait::async_trait;
 use tempfile::TempDir;
 
 use super::{SidebarError, SidebarService};
+use crate::ports::RemoveProjectPorts;
 
 const USER: &str = "user-1";
 const OTHER: &str = "user-2";
@@ -547,4 +550,264 @@ async fn items_on_missing_scope_is_scope_gone() {
     // A syntactically bad scope is a 400, not a 404.
     let err = fx.service.items(USER, "bogus", None, Some(10)).await.unwrap_err();
     assert!(matches!(err, SidebarError::BadRequest(_)));
+}
+
+// -- remove_project (BR-19 / D13 "所见即所删") --------------------------------
+
+/// A `RemoveProjectPorts` that performs the same real deletes production does
+/// (conversation row + its `user_order` rows via the same store; team + folded
+/// members; project record), so a test can assert both the returned counts and
+/// the on-disk orphan cleanup. `fail` ids/records make a single port call error
+/// to exercise best-effort orchestration.
+struct FakePorts {
+    pool: SqlitePool,
+    user_order: Arc<dyn IUserOrderStore>,
+    fail: HashSet<String>,
+    deleted_convs: Mutex<Vec<String>>,
+    deleted_teams: Mutex<Vec<String>>,
+    project_deleted: Mutex<bool>,
+}
+
+impl FakePorts {
+    fn new(pool: SqlitePool, user_order: Arc<dyn IUserOrderStore>, fail: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            pool,
+            user_order,
+            fail: fail.iter().map(|s| s.to_string()).collect(),
+            deleted_convs: Mutex::new(Vec::new()),
+            deleted_teams: Mutex::new(Vec::new()),
+            project_deleted: Mutex::new(false),
+        })
+    }
+}
+
+#[async_trait]
+impl RemoveProjectPorts for FakePorts {
+    async fn delete_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), String> {
+        if self.fail.contains(conversation_id) {
+            return Err(format!("forced failure deleting {conversation_id}"));
+        }
+        sqlx::query("DELETE FROM conversations WHERE id = ? AND user_id = ?")
+            .bind(conversation_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        // Mirror the production path-1 cascade so orphan rows are cleaned up.
+        self.user_order
+            .remove_item(
+                user_id,
+                &OrderItemRef::new(OrderItemType::Conversation, conversation_id),
+            )
+            .await
+            .unwrap();
+        self.deleted_convs.lock().unwrap().push(conversation_id.to_owned());
+        Ok(())
+    }
+
+    async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), String> {
+        if self.fail.contains(team_id) {
+            return Err(format!("forced failure removing team {team_id}"));
+        }
+        // Member conversations are folded into the team and go with it.
+        let members: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM conversations WHERE user_id = ? AND json_extract(extra, '$.teamId') = ?",
+        )
+        .bind(user_id)
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        for member in &members {
+            sqlx::query("DELETE FROM conversations WHERE id = ?")
+                .bind(member)
+                .execute(&self.pool)
+                .await
+                .unwrap();
+            self.user_order
+                .remove_item(user_id, &OrderItemRef::new(OrderItemType::Conversation, member))
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM teams WHERE id = ? AND user_id = ?")
+            .bind(team_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        self.user_order
+            .remove_item(user_id, &OrderItemRef::new(OrderItemType::Team, team_id))
+            .await
+            .unwrap();
+        self.deleted_teams.lock().unwrap().push(team_id.to_owned());
+        Ok(())
+    }
+
+    async fn delete_project_record(&self, user_id: &str, project_id: &str) -> Result<(), String> {
+        if self.fail.contains(project_id) {
+            return Err(format!("forced failure deleting project {project_id}"));
+        }
+        sqlx::query("DELETE FROM project_explorer WHERE project_id = ?")
+            .bind(project_id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM projects WHERE project_id = ? AND user_id = ?")
+            .bind(project_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        *self.project_deleted.lock().unwrap() = true;
+        Ok(())
+    }
+}
+
+/// A `user_order` store over the same pool the service uses — `SqliteUserOrderStore`
+/// is stateless over the pool, so a fresh instance behaves identically.
+fn uo_store(pool: &SqlitePool) -> Arc<dyn IUserOrderStore> {
+    Arc::new(SqliteUserOrderStore::new(pool.clone()))
+}
+
+async fn conv_exists(pool: &SqlitePool, id: &str) -> bool {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    n > 0
+}
+
+async fn user_order_count(pool: &SqlitePool, user: &str, item_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM user_order WHERE user_id = ? AND item_id = ?")
+        .bind(user)
+        .bind(item_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The delete set is the render construct: the bound conversation, the
+/// path-merged unbound conversation, and the bound team (with its folded
+/// members) all go; unrelated dir/chats rows stay. Pinned rows are included
+/// (pinning only hoists display) and their `user_order` rows are cleaned up.
+#[tokio::test]
+async fn remove_project_deletes_the_visible_construct_and_orphan_rows() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_std_project(
+        pool,
+        USER,
+        "proj-std",
+        "Std",
+        &canon_of("/repo/std"),
+        &file_uri("/repo/std"),
+    )
+    .await;
+
+    insert_conv(pool, USER, "c1", Some("proj-std"), "{}", 100).await; // bound (case 1)
+    insert_conv_ws(pool, USER, "c3", "/repo/std", 90).await; // path-merged (case 3)
+    insert_team(pool, USER, "T1", "", Some("proj-std"), 200).await; // bound team
+    insert_member(pool, USER, "m1", "T1", 150).await;
+    insert_member(pool, USER, "m2", "T1", 160).await;
+    insert_conv_ws(pool, USER, "c4", "/repo/other", 70).await; // dir group -> keep
+    insert_conv_ws(pool, USER, "c5", &fx.temp_workspace("s"), 60).await; // chats -> keep
+
+    // Pin a conversation and the team so we can assert orphan cleanup.
+    fx.service.pin(USER, "pinned", "conversation", "c1").await.unwrap();
+    fx.service.pin(USER, "pinned", "team", "T1").await.unwrap();
+
+    let ports = FakePorts::new(pool.clone(), uo_store(pool), &[]);
+    fx.service.set_remove_project_ports(ports.clone());
+
+    // Dry run reports the set without touching anything.
+    let preview = fx.service.remove_project(USER, "proj-std", true).await.unwrap();
+    assert_eq!(preview.teams_deleted, 1);
+    assert_eq!(preview.conversations_deleted, 2, "c1 + c3");
+    assert!(conv_exists(pool, "c1").await, "dry run must not delete");
+    assert_eq!(ports.deleted_convs.lock().unwrap().len(), 0);
+
+    // Live delete matches the preview exactly.
+    let result = fx.service.remove_project(USER, "proj-std", false).await.unwrap();
+    assert_eq!(result.teams_deleted, preview.teams_deleted);
+    assert_eq!(result.conversations_deleted, preview.conversations_deleted);
+
+    // The whole visible construct is gone: bound conv, merged conv, team, members.
+    assert!(!conv_exists(pool, "c1").await);
+    assert!(!conv_exists(pool, "c3").await);
+    assert!(!conv_exists(pool, "m1").await);
+    assert!(!conv_exists(pool, "m2").await);
+    let team_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teams WHERE id = 'T1'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(team_left, 0);
+    let proj_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE project_id = 'proj-std'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(proj_left, 0, "project record removed");
+
+    // Unrelated rows survive.
+    assert!(conv_exists(pool, "c4").await, "dir-group conv untouched");
+    assert!(conv_exists(pool, "c5").await, "chats conv untouched");
+
+    // Orphan cleanup: no dangling user_order rows for the removed conv/team.
+    assert_eq!(user_order_count(pool, USER, "c1").await, 0, "pinned conv row gone");
+    assert_eq!(user_order_count(pool, USER, "T1").await, 0, "pinned team row gone");
+}
+
+/// A failing port call does not abort the sweep: siblings still delete and the
+/// reported count reflects only the successes.
+#[tokio::test]
+async fn remove_project_is_best_effort_on_port_failure() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_std_project(
+        pool,
+        USER,
+        "proj-std",
+        "Std",
+        &canon_of("/repo/std"),
+        &file_uri("/repo/std"),
+    )
+    .await;
+    insert_conv(pool, USER, "c1", Some("proj-std"), "{}", 100).await;
+    insert_conv(pool, USER, "c2", Some("proj-std"), "{}", 90).await;
+
+    // Deleting c1 fails; c2 must still be removed.
+    let ports = FakePorts::new(pool.clone(), uo_store(pool), &["c1"]);
+    fx.service.set_remove_project_ports(ports.clone());
+
+    let result = fx.service.remove_project(USER, "proj-std", false).await.unwrap();
+    assert_eq!(result.conversations_deleted, 1, "only c2 counted");
+    assert!(conv_exists(pool, "c1").await, "failed delete left c1 in place");
+    assert!(!conv_exists(pool, "c2").await, "sibling delete still ran");
+    assert!(
+        *ports.project_deleted.lock().unwrap(),
+        "project record delete still attempted"
+    );
+}
+
+/// A missing or non-standard target is a 404 (`ScopeGone`), before any port is
+/// touched.
+#[tokio::test]
+async fn remove_project_on_missing_or_nonstandard_scope_is_scope_gone() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_temp_project(pool, USER, "proj-temp").await;
+
+    let ports = FakePorts::new(pool.clone(), uo_store(pool), &[]);
+    fx.service.set_remove_project_ports(ports.clone());
+
+    // Unknown project id.
+    let err = fx.service.remove_project(USER, "no-such", false).await.unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone));
+    // A temp project is not a removable standard-project scope.
+    let err = fx.service.remove_project(USER, "proj-temp", false).await.unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone));
+
+    // Neither attempt invoked a port.
+    assert!(ports.deleted_convs.lock().unwrap().is_empty());
+    assert!(!*ports.project_deleted.lock().unwrap());
 }
