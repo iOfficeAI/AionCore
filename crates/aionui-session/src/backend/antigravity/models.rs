@@ -44,11 +44,7 @@ pub(crate) fn parse_agy_models(stdout: &str) -> Vec<ModelInfo> {
             if !looks_like_model_id(id) {
                 return None;
             }
-            let display = fields
-                .next()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or(id);
+            let display = fields.next().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(id);
             Some(ModelInfo {
                 id: id.to_owned(),
                 name: display.to_owned(),
@@ -160,11 +156,7 @@ gpt-oss-120b-medium\tGPT OSS 120B (Medium)
         let models = parse_agy_models(out);
         assert_eq!(
             models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec![
-                "gemini-3.1-pro-high",
-                "claude-opus-4-6-thinking",
-                "gpt-oss-120b-medium",
-            ]
+            vec!["gemini-3.1-pro-high", "claude-opus-4-6-thinking", "gpt-oss-120b-medium",]
         );
         assert_eq!(models[0].name, "Gemini 3.1 Pro (High) · Advanced reasoning");
         assert_eq!(models[1].name, "Claude Opus 4.6 (Thinking) · Most capable");
