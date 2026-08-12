@@ -732,9 +732,18 @@ impl ConversationService {
         let has_task = agent.is_some();
         let task_status = agent.as_ref().and_then(|agent| agent.status());
         let pending_confirmations = agent.as_ref().map(|agent| agent.get_confirmations().len()).unwrap_or(0);
+        let supports_midturn_delivery = agent
+            .as_ref()
+            .map(|agent| agent.supports_midturn_delivery())
+            .unwrap_or(false);
 
-        self.runtime_state
-            .summary_from_parts(conversation_id, task_status, has_task, pending_confirmations)
+        self.runtime_state.summary_from_parts(
+            conversation_id,
+            task_status,
+            has_task,
+            pending_confirmations,
+            supports_midturn_delivery,
+        )
     }
 
     pub async fn active_count_for_user(&self, user_id: &str) -> Result<usize, ConversationError> {

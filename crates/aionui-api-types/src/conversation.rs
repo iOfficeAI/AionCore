@@ -192,6 +192,12 @@ pub struct ConversationRuntimeSummary {
     pub is_processing: bool,
     pub pending_confirmations: usize,
     pub turn_id: Option<String>,
+    /// Whether a message sent right now reaches the agent without waiting for the
+    /// current turn to end. The ONLY capability bit the frontend may gate mid-turn
+    /// UI on — see `Capabilities::supports_midturn_delivery` for why
+    /// `accepts_proactive_input` must never be exposed.
+    #[serde(default)]
+    pub supports_midturn_delivery: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

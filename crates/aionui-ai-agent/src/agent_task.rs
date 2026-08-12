@@ -74,6 +74,16 @@ pub trait IAgentTask: Send + Sync {
         PromptMediaCaps::default()
     }
 
+    /// Whether a message sent right now reaches the agent without waiting for
+    /// the current turn to end (task-1 brief: mid-turn interjection). Mirrors
+    /// `aionui_session::Capabilities::supports_midturn_delivery` — defaults
+    /// false (ACP-like) so only backends that genuinely deliver mid-turn
+    /// (the clean-slate `Session` variant reading claude/codex capabilities)
+    /// opt in.
+    fn supports_midturn_delivery(&self) -> bool {
+        false
+    }
+
     /// Send a user message to the agent. Returns once the agent has
     /// accepted the turn; actual streaming proceeds on the broadcast
     /// channel returned by [`Self::subscribe`].
@@ -248,6 +258,12 @@ impl AgentInstance {
     /// Subscribe to the stream event channel.
     pub fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.as_task().subscribe()
+    }
+
+    /// Whether a message sent right now reaches the agent without waiting
+    /// for the current turn to end. See `IAgentTask::supports_midturn_delivery`.
+    pub fn supports_midturn_delivery(&self) -> bool {
+        self.as_task().supports_midturn_delivery()
     }
 
     /// Send a user message to the agent.

@@ -72,6 +72,19 @@ pub struct Capabilities {
     /// it — a dead button (MX-QUEUE-3). `can_queue` MUST read this bit, never
     /// `caps.steer`. Default false; only claude sets it true.
     pub accepts_proactive_input: bool,
+    /// Whether a message written while a turn is IN FLIGHT reaches the agent
+    /// without waiting for that turn to end.
+    ///
+    /// ⚠️ DELIBERATELY SEPARATE from `accepts_proactive_input`, whose meaning
+    /// varies by backend: agy sets it true merely to keep the input box usable
+    /// (one process per turn — it ignores stdin mid-turn), while claude sets it
+    /// true because a mid-turn write is genuinely consumed. Gating any UI
+    /// affordance on `accepts_proactive_input` would light a mid-turn control on
+    /// agy that it cannot honour (the MX-QUEUE-3 dead button).
+    ///
+    /// This bit is the ONLY one the wire and the frontend may read. Default
+    /// false so a newly integrated backend behaves like ACP until proven.
+    pub supports_midturn_delivery: bool,
     /// NEW (#101): user-invokable slash commands the backend advertises (claude
     /// `control_request{initialize}` response `commands[]`; ACP `session/update`
     /// `available_commands_update`; incl. MCP/plugin/skill-derived). Open set,
@@ -211,4 +224,15 @@ pub struct SignalSet {
     /// unchanged. P0's only backend (claude) = true (always emits result);
     /// the false branch has no fixture (recorded as a 04 residual).
     pub terminal_result: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn midturn_delivery_is_opt_in_and_antigravity_is_excluded() {
+        // Default MUST be false: a new backend is ACP-like until proven otherwise.
+        assert!(!Capabilities::default().supports_midturn_delivery);
+    }
 }

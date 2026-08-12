@@ -606,6 +606,10 @@ pub fn codex_capabilities() -> Capabilities {
         // can_queue off steer here would be the MX-QUEUE-3 dead button.) Flips true
         // only when B5 wires Steer routing.
         accepts_proactive_input: false,
+        // Verified backend matrix (see `Capabilities::supports_midturn_delivery`):
+        // codex is a direct-CLI backend that can deliver a mid-turn message to
+        // the agent without waiting for the current turn to end.
+        supports_midturn_delivery: true,
         // #101: codex's app-server has no slash-command discovery wire (112 methods
         // audited, none lists commands — samples/codex-cli/0.137.0/schema-full/
         // ClientRequest.json). The legacy codex-acp bridge instead advertised a
@@ -4326,6 +4330,13 @@ mod tests {
     use crate::event::PermissionKind;
     use crate::testing::FakeAgentIo;
     use futures_util::StreamExt;
+
+    /// Verified backend matrix (task-1 brief): codex MUST advertise
+    /// `supports_midturn_delivery` so mid-turn UI can gate on it.
+    #[test]
+    fn capabilities_advertise_midturn_delivery() {
+        assert!(codex_capabilities().supports_midturn_delivery);
+    }
 
     /// A retrying error must reach the user, not just tick the heartbeat.
     ///

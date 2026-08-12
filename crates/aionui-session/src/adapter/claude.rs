@@ -1235,6 +1235,10 @@ impl BackendAdapter for ClaudeAdapter {
             // layer CAN proactively queue. This (NOT supported_commands.steer,
             // which is false here anyway) is what can_queue gates on.
             accepts_proactive_input: true,
+            // Verified backend matrix (see `Capabilities::supports_midturn_delivery`):
+            // claude is a direct-CLI backend that can deliver a mid-turn message to
+            // the agent without waiting for the current turn to end.
+            supports_midturn_delivery: true,
             // #101: static default empty; the clean-slate ClaudeConnection fills it
             // from the control_request{initialize} response (the legacy adapter has
             // no discovery wire). capabilities() merges the discovered set on read.
@@ -1462,6 +1466,14 @@ mod tests {
     }
 
     /// 009 R8: a STRING tool_result content → one Text part (e.g. Bash stdout).
+    /// Verified backend matrix (task-1 brief): claude MUST advertise
+    /// `supports_midturn_delivery` so mid-turn UI can gate on it.
+    #[test]
+    fn capabilities_advertise_midturn_delivery() {
+        let a = ClaudeAdapter::new();
+        assert!(a.capabilities().supports_midturn_delivery);
+    }
+
     #[test]
     fn parse_user_tool_result_string_content_to_text() {
         let a = ClaudeAdapter::new();

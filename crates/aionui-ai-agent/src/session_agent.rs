@@ -1106,6 +1106,10 @@ impl IAgentTask for SessionAgentTask {
         self.runtime.tx.subscribe()
     }
 
+    fn supports_midturn_delivery(&self) -> bool {
+        self.backend.capabilities().supports_midturn_delivery
+    }
+
     fn prompt_media_caps(&self) -> PromptMediaCaps {
         let blocks = self.backend.capabilities().prompt_blocks;
         PromptMediaCaps {
@@ -8881,6 +8885,52 @@ mod force_kill_tests {
         }
         async fn terminate(&self) {
             self.terminate_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Task-1 brief: `SessionAgentTask::supports_midturn_delivery` must read
+    /// straight through to the backend's declared capability bit — no
+    /// reinterpretation, no default override.
+    struct MidturnCapableBackend {
+        supports_midturn_delivery: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for MidturnCapableBackend {
+        async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::NoTurn,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_midturn_delivery: self.supports_midturn_delivery,
+                ..Capabilities::default()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supports_midturn_delivery_reads_through_backend_capabilities() {
+        for expected in [true, false] {
+            let backend: Arc<dyn SessionBackend> = Arc::new(MidturnCapableBackend {
+                supports_midturn_delivery: expected,
+            });
+            let task = SessionAgentTask::new(
+                AgentType::Acp,
+                "conv-1".into(),
+                "user-1".into(),
+                "/w".into(),
+                backend,
+                None,
+            );
+            assert_eq!(IAgentTask::supports_midturn_delivery(task.as_ref()), expected);
         }
     }
 
