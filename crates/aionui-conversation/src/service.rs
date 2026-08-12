@@ -3407,6 +3407,7 @@ impl ConversationService {
         hidden: bool,
         agent: AgentInstance,
         active_turn_id: String,
+        inject_skills: Vec<String>,
     ) -> Result<MidturnOutcome, ConversationError> {
         let user_msg_id = Self::mint_msg_id();
         let persisted = self
@@ -3452,7 +3453,7 @@ impl ConversationService {
             msg_id: user_msg_id.clone(),
             turn_id: Some(active_turn_id.clone()),
             files: resolved.files.clone(),
-            inject_skills: Vec::new(),
+            inject_skills,
         };
         match agent.deliver_midturn(data).await {
             Ok(()) => {
@@ -3606,7 +3607,15 @@ impl ConversationService {
                 );
             } else {
                 match self
-                    .deliver_midturn_message(user_id, conversation_id, &resolved, req.hidden, agent, active_turn_id)
+                    .deliver_midturn_message(
+                        user_id,
+                        conversation_id,
+                        &resolved,
+                        req.hidden,
+                        agent,
+                        active_turn_id,
+                        req.inject_skills.clone(),
+                    )
                     .await?
                 {
                     MidturnOutcome::Delivered(response) => return Ok(response),
