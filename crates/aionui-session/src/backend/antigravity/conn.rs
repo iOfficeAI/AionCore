@@ -353,6 +353,9 @@ impl AntigravitySessionBackend {
             .cli_program
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from("agy"));
+        // Same env conversation turns use (proxy / agent env_override). The
+        // model registry call needs the same network path as a real turn.
+        let spawn_env = self.config.spawn_env.clone();
 
         // Serve a list an earlier session already paid for. agy's models are a
         // property of the signed-in account, not of the conversation, so
@@ -368,7 +371,7 @@ impl AntigravitySessionBackend {
         }
 
         tokio::spawn(async move {
-            let found = probe_models(&spawner, &program, &session_id).await;
+            let found = probe_models(&spawner, &program, &session_id, &spawn_env).await;
             if !found.is_empty() {
                 store_models(&found);
             }

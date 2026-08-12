@@ -1,14 +1,19 @@
 //! Model discovery for agy (`agy models`).
 //!
-//! agy prints one model id per line. Those ids ALREADY encode reasoning effort
-//! (`-high` / `-medium` / `-low`), and agy only accepts a complete id: a
-//! stripped one is silently dropped and it falls back to another model without
-//! reporting anything. So the ids are surfaced verbatim and no separate effort
-//! axis is advertised.
+//! agy model ids ALREADY encode reasoning effort (`-high` / `-medium` /
+//! `-low`), and agy only accepts a complete id: a stripped one is silently
+//! dropped and it falls back to another model without reporting anything. So
+//! the ids are surfaced verbatim and no separate effort axis is advertised.
+//!
+//! Output formats observed in the wild:
+//! - bare id per line (`gemini-3.6-flash-high`) — older builds
+//! - TSV `id<TAB>display name` — newer builds (e.g. current `agy models`)
+//!
+//! Both are accepted. Status / error lines that are not model ids are dropped.
 
 use std::sync::Arc;
 
-use aionui_common::CommandSpec;
+use aionui_common::{CommandSpec, EnvVar};
 use aionui_process::Spawner;
 
 use crate::capability::ModelInfo;
@@ -16,9 +21,9 @@ use crate::capability::ModelInfo;
 /// A model id is a single lowercase-ish token: no spaces, no punctuation beyond
 /// `-`/`.`/`_`. Used to tell ids apart from the human-readable errors agy
 /// prints to stdout (e.g. the signed-out notice).
-fn looks_like_model_id(line: &str) -> bool {
-    !line.is_empty()
-        && line
+fn looks_like_model_id(token: &str) -> bool {
+    !token.is_empty()
+        && token
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
 }
@@ -27,13 +32,26 @@ pub(crate) fn parse_agy_models(stdout: &str) -> Vec<ModelInfo> {
     stdout
         .lines()
         .map(str::trim)
-        .filter(|l| looks_like_model_id(l))
-        .map(|id| ModelInfo {
-            id: id.to_owned(),
-            name: id.to_owned(),
-            description: None,
-            // Deliberately empty — see the module docs.
-            reasoning_efforts: Vec::new(),
+        .filter(|line| !line.is_empty())
+        // Status / progress chatter some builds emit before the list.
+        .filter(|line| !line.eq_ignore_ascii_case("Fetching available models..."))
+        .filter_map(|line| {
+            // Newer agy builds print `id<TAB>display name`. Older builds print
+            // the bare id alone. Split on the first tab only so a display name
+            // may itself contain tabs without shifting the id.
+            let mut fields = line.splitn(2, '\t');
+            let id = fields.next().unwrap_or("").trim();
+            if !looks_like_model_id(id) {
+                return None;
+            }
+            let display = fields.next().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(id);
+            Some(ModelInfo {
+                id: id.to_owned(),
+                name: display.to_owned(),
+                description: None,
+                // Deliberately empty — see the module docs.
+                reasoning_efforts: Vec::new(),
+            })
         })
         .collect()
 }
@@ -43,15 +61,21 @@ pub(crate) fn parse_agy_models(stdout: &str) -> Vec<ModelInfo> {
 /// Best-effort by contract: any failure (agy missing, signed out, slow) yields
 /// an empty list rather than an error, because a model picker that cannot be
 /// populated must not stop the user from opening a session.
+///
+/// `spawn_env` is the same env conversation turns receive (agent
+/// `env_override` / proxy settings). The model-registry call needs network
+/// access under the same conditions as a real turn; probing without it is a
+/// common reason the picker stays empty while chat still works.
 pub(crate) async fn probe_models(
     spawner: &Arc<dyn Spawner>,
     program: &std::path::Path,
     owner_tag: &str,
+    spawn_env: &[EnvVar],
 ) -> Vec<ModelInfo> {
     let spec = CommandSpec {
         command: program.to_path_buf(),
         args: vec!["models".to_owned()],
-        env: Vec::new(),
+        env: spawn_env.to_vec(),
         cwd: None,
     };
     let Ok(proc) = spawner.spawn(spec, &[], owner_tag).await else {
@@ -102,7 +126,7 @@ mod tests {
 
     #[test]
     fn parses_one_id_per_line() {
-        // Real `agy models` output (2026-07-31).
+        // Real bare-id `agy models` output (2026-07-31).
         let out = "gemini-3.6-flash-high\ngemini-3.6-flash-low\ngemini-3.1-pro-high\nclaude-sonnet-4-6\ngpt-oss-120b-medium\n";
         let models = parse_agy_models(out);
         assert_eq!(
@@ -114,6 +138,42 @@ mod tests {
                 "claude-sonnet-4-6",
                 "gpt-oss-120b-medium",
             ]
+        );
+        // Bare-id format: name falls back to the id.
+        assert_eq!(models[0].name, "gemini-3.6-flash-high");
+    }
+
+    #[test]
+    fn parses_tsv_id_and_display_name() {
+        // Real current `agy models` output: id + tab + display label.
+        // Without TSV support every row is discarded (display names contain
+        // spaces), so the picker stays empty while chat still works.
+        let out = "\
+gemini-3.1-pro-high\tGemini 3.1 Pro (High) · Advanced reasoning
+claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking) · Most capable
+gpt-oss-120b-medium\tGPT OSS 120B (Medium)
+";
+        let models = parse_agy_models(out);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["gemini-3.1-pro-high", "claude-opus-4-6-thinking", "gpt-oss-120b-medium",]
+        );
+        assert_eq!(models[0].name, "Gemini 3.1 Pro (High) · Advanced reasoning");
+        assert_eq!(models[1].name, "Claude Opus 4.6 (Thinking) · Most capable");
+        assert_eq!(models[2].name, "GPT OSS 120B (Medium)");
+        assert!(models.iter().all(|m| m.reasoning_efforts.is_empty()));
+    }
+
+    #[test]
+    fn tsv_with_status_line_still_parses_models() {
+        let out = "\
+Fetching available models...
+gemini-3.1-pro-high\tGemini 3.1 Pro (High)
+";
+        let models = parse_agy_models(out);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["gemini-3.1-pro-high"]
         );
     }
 
@@ -180,7 +240,7 @@ mod tests {
 
         let models = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            probe_models(&spawner, &program, "probe-test"),
+            probe_models(&spawner, &program, "probe-test", &[]),
         )
         .await
         .expect("probe hung — stdin was left open, so stdout never reached EOF");
