@@ -173,6 +173,26 @@ impl BackgroundStreamWatcher {
             // release by a frame, and missing it would leave claude's
             // follow-up turn unclaimed. Only Session instances emit these.
             if let AgentStreamEvent::MessageLifecycle(data) = &ev {
+                // B5 receipt badge (Task 4): any consumption/terminal echo means
+                // the agent TOOK the message — flip its persisted status from
+                // "queued" (待接收) to "finish" (已接收) and broadcast
+                // message.statusChanged. Guarded to rows currently "queued", so
+                // an echo can never touch an ordinary message. Cancelled also
+                // counts: claude only cancels an echo it had already started
+                // (still-queued messages are unaffected by an interrupt and
+                // self-start later — spec §6甲.7).
+                if !matches!(data.phase, MessageLifecyclePhase::Queued) {
+                    crate::service::apply_message_receipt(
+                        &self.repo,
+                        &self.broadcaster,
+                        &self.user_id,
+                        &self.conversation_id,
+                        &data.client_msg_id,
+                        crate::service::MIDTURN_STATUS_RECEIVED,
+                        true,
+                    )
+                    .await;
+                }
                 match data.phase {
                     MessageLifecyclePhase::Started => {
                         if let Some((prev, _)) = pending_user_msg.as_ref()
@@ -781,6 +801,104 @@ mod tests {
         eventually(async || (!rig.runtime_state.is_claimed("conv-1")).then_some(()))
             .await
             .expect("the claim must be released after the turn finished");
+    }
+
+    /// B5 receipt badge (Task 4): a `MessageLifecycle{Started}` echo for a
+    /// mid-turn user message flips its persisted status "pending" → "finish"
+    /// and broadcasts `message.statusChanged`, so the 待接收 badge resolves.
+    /// A second echo (Completed) or an echo for an unknown/ordinary message
+    /// must not produce further updates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_started_flips_pending_user_message_and_broadcasts() {
+        let rig = rig().await;
+        // Seed the mid-turn user row exactly as deliver_midturn_message writes it.
+        rig.repo
+            .insert_message(
+                &rig.user_id,
+                &aionui_db::models::MessageRow {
+                    id: "um-1".into(),
+                    conversation_id: "conv-1".into(),
+                    msg_id: Some("um-1".into()),
+                    r#type: "text".into(),
+                    content: serde_json::json!({"content": "mid-turn interjection"}).to_string(),
+                    position: Some("right".into()),
+                    status: Some("pending".into()),
+                    hidden: false,
+                    created_at: now_ms(),
+                    backend_turn_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        // An ordinary (finish) user row an echo must never touch.
+        rig.repo
+            .insert_message(
+                &rig.user_id,
+                &aionui_db::models::MessageRow {
+                    id: "um-2".into(),
+                    conversation_id: "conv-1".into(),
+                    msg_id: Some("um-2".into()),
+                    r#type: "text".into(),
+                    content: serde_json::json!({"content": "ordinary"}).to_string(),
+                    position: Some("right".into()),
+                    status: Some("finish".into()),
+                    hidden: false,
+                    created_at: now_ms(),
+                    backend_turn_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::MessageLifecycle(MessageLifecycleData {
+                client_msg_id: "um-1".into(),
+                phase: MessageLifecyclePhase::Started,
+            }))
+            .unwrap();
+
+        let row = eventually(async || {
+            rows_of_type(&rig, "text")
+                .await
+                .into_iter()
+                .find(|m| m.id == "um-1" && m.status.as_deref() == Some("finish"))
+        })
+        .await
+        .expect("Started echo must flip the pending user row to finish");
+        assert_eq!(row.status.as_deref(), Some("finish"));
+
+        let mut saw_status_changed = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && !saw_status_changed {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), ws.recv()).await {
+                Ok(Ok(evt)) => {
+                    if evt.name == "message.statusChanged" {
+                        assert_eq!(evt.data["conversation_id"], "conv-1");
+                        assert_eq!(evt.data["msg_id"], "um-1");
+                        assert_eq!(evt.data["status"], "finish");
+                        saw_status_changed = true;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(saw_status_changed, "message.statusChanged must be broadcast");
+
+        // An echo for an already-finish row is a no-op (guarded flip).
+        rig.tx
+            .send(AgentStreamEvent::MessageLifecycle(MessageLifecycleData {
+                client_msg_id: "um-2".into(),
+                phase: MessageLifecyclePhase::Completed,
+            }))
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut extra = 0;
+        while let Ok(evt) = ws.try_recv() {
+            if evt.name == "message.statusChanged" {
+                extra += 1;
+            }
+        }
+        assert_eq!(extra, 0, "an echo for an ordinary message must not broadcast");
     }
 
     /// #758 design intent: a pure background continuation (a detached exec

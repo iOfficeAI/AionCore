@@ -1203,7 +1203,12 @@ impl BackendAdapter for ClaudeAdapter {
                 terminal_result: true,
             },
             supported_commands: crate::capability::CommandSet {
-                steer: false,
+                // B5: mid-turn delivery routes Command::Steer to a direct stdin
+                // user-frame write (claude's persistent stdin accepts writes any
+                // time; the CLI queues and consumes them itself — command_lifecycle
+                // echoes our uuid, design spec §6.1/§6甲.2). No turn_gen bump, no
+                // FSM involvement (NoTurn admission).
+                steer: true,
                 cancel_tool: false,
                 answer_permission: true,
                 answer_auth: false,
@@ -1258,8 +1263,8 @@ impl BackendAdapter for ClaudeAdapter {
             auth_methods: Vec::new(), // no mid-session re-auth on local path
             // 009 R2: claude's persistent stdin is a FIFO — a write while a turn
             // is in flight is buffered and consumed as the next turn, so the conv
-            // layer CAN proactively queue. This (NOT supported_commands.steer,
-            // which is false here anyway) is what can_queue gates on.
+            // layer CAN proactively queue. This (NOT supported_commands.steer)
+            // is what can_queue gates on.
             accepts_proactive_input: true,
             // Verified backend matrix (see `Capabilities::supports_midturn_delivery`):
             // claude is a direct-CLI backend that can deliver a mid-turn message to

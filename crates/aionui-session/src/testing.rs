@@ -550,9 +550,14 @@ pub mod invariants {
 
     fn gated_commands() -> Vec<GatedCommand> {
         vec![
-            ("steer", Command::Steer { content: Vec::new() }, |c| {
-                c.supported_commands.steer
-            }),
+            (
+                "steer",
+                Command::Steer {
+                    content: Vec::new(),
+                    client_msg_id: None,
+                },
+                |c| c.supported_commands.steer,
+            ),
             (
                 "cancel_tool",
                 Command::Cancel {

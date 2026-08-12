@@ -284,7 +284,14 @@ async fn send_msg(
         .send_message(&user.id, &id, req, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
-    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
+    // B5: a mid-turn delivery already handed the message to the RUNNING turn —
+    // that is a completed delivery (200), not a scheduled one (202).
+    let status = if response.delivered_midturn {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((status, Json(ApiResponse::ok(response))))
 }
 
 async fn list_artifacts(

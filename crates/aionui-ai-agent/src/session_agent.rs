@@ -476,6 +476,91 @@ impl SessionAgentTask {
         self.command_seq.fetch_add(1, Ordering::Relaxed) as u64
     }
 
+    /// Build the multimodal `ContentBlock` vector for a prompt: partition
+    /// attachments by the backend's declared prompt blocks — capable media
+    /// becomes native Image/Audio blocks; everything else keeps the
+    /// pre-multimodal form (path in the [[AION_FILES]] text + resource link).
+    /// A read failure degrades that attachment back to a resource link — the
+    /// path also remains in the original text because partition already ran,
+    /// which the adapters tolerate (they resolve links independently of the
+    /// text). Shared by `send_message` and `deliver_midturn`.
+    async fn build_prompt_blocks(&self, data: &SendMessageData) -> Vec<ContentBlock> {
+        let partition = crate::media::partition_media(&data.content, &data.files, self.prompt_media_caps());
+        let mut content: Vec<ContentBlock> = Vec::new();
+        if !partition.content.is_empty() {
+            content.push(ContentBlock::Text(partition.content));
+        }
+        for path in partition.path_files {
+            // File paths ride as resource links; the claude/codex adapters resolve
+            // them (Read tool / base64) at dispatch time.
+            content.push(ContentBlock::ResourceLink {
+                uri: path,
+                mime_type: None,
+            });
+        }
+        for attachment in &partition.media {
+            match crate::media::read_media_bytes(attachment).await {
+                Some(bytes) => content.push(match attachment.kind {
+                    crate::media::MediaKind::Image => ContentBlock::Image {
+                        data: bytes,
+                        media_type: attachment.mime.clone(),
+                    },
+                    crate::media::MediaKind::Audio => ContentBlock::Audio {
+                        data: bytes,
+                        media_type: attachment.mime.clone(),
+                    },
+                }),
+                None => content.push(ContentBlock::ResourceLink {
+                    uri: attachment.path.clone(),
+                    mime_type: Some(attachment.mime.clone()),
+                }),
+            }
+        }
+        if !partition.media.is_empty() {
+            let (images, audios) = content.iter().fold((0usize, 0usize), |(i, a), b| match b {
+                ContentBlock::Image { .. } => (i + 1, a),
+                ContentBlock::Audio { .. } => (i, a + 1),
+                _ => (i, a),
+            });
+            tracing::info!(
+                conversation_id = %self.conversation_id,
+                msg_id = %data.msg_id,
+                images,
+                audios,
+                "session prompt carries native media content blocks"
+            );
+        }
+        content
+    }
+
+    /// B5 mid-turn delivery: hand a message to the RUNNING turn instead of
+    /// opening a new one. Dispatches `Command::Steer` (codex `turn/steer`;
+    /// claude direct stdin user-frame write) with `data.msg_id` as the
+    /// correlation id both CLIs round-trip (claude user-frame `uuid` echoed via
+    /// `command_lifecycle`; codex `clientUserMessageId`).
+    ///
+    /// Deliberately NOT `send_message`: no `AgentStreamEvent::Start` emit and
+    /// no status flip — the message folds into the ACTIVE turn, whose relay and
+    /// status are already live (a stray Start would open a phantom turn
+    /// boundary mid-stream).
+    pub async fn deliver_midturn(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        self.runtime.touch();
+        let content = self.build_prompt_blocks(&data).await;
+        self.dump_session_cli_final_input(&content, Some(data.msg_id.as_str()));
+        let cmd = Command::Steer {
+            content,
+            client_msg_id: Some(data.msg_id),
+        };
+        self.backend
+            .dispatch(cmd)
+            .await
+            .map(|_| ())
+            // Preserve the backend's message text: the conversation layer
+            // classifies codex's "no active turn to steer" rejection to fall
+            // back to the normal new-turn path.
+            .map_err(|e| AgentSendError::from_agent_error(AgentError::bad_gateway(e.to_string())))
+    }
+
     /// DEV (`--dump-prompts`): dump this turn's final input blocks as a
     /// `session-cli-final-input` JSON, symmetric with the ACP path's
     /// `acp-final-input`. Best-effort: a failure only warns and never affects
@@ -1120,58 +1205,7 @@ impl IAgentTask for SessionAgentTask {
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.runtime.touch();
-        // Partition attachments by the backend's declared prompt blocks:
-        // capable media becomes native Image/Audio blocks; everything else
-        // keeps the pre-multimodal form (path in the [[AION_FILES]] text +
-        // resource link). A read failure degrades that attachment back to a
-        // resource link — the path also remains in the original text because
-        // partition already ran, which the adapters tolerate (they resolve
-        // links independently of the text).
-        let partition = crate::media::partition_media(&data.content, &data.files, self.prompt_media_caps());
-        let mut content: Vec<ContentBlock> = Vec::new();
-        if !partition.content.is_empty() {
-            content.push(ContentBlock::Text(partition.content));
-        }
-        for path in partition.path_files {
-            // File paths ride as resource links; the claude/codex adapters resolve
-            // them (Read tool / base64) at dispatch time.
-            content.push(ContentBlock::ResourceLink {
-                uri: path,
-                mime_type: None,
-            });
-        }
-        for attachment in &partition.media {
-            match crate::media::read_media_bytes(attachment).await {
-                Some(bytes) => content.push(match attachment.kind {
-                    crate::media::MediaKind::Image => ContentBlock::Image {
-                        data: bytes,
-                        media_type: attachment.mime.clone(),
-                    },
-                    crate::media::MediaKind::Audio => ContentBlock::Audio {
-                        data: bytes,
-                        media_type: attachment.mime.clone(),
-                    },
-                }),
-                None => content.push(ContentBlock::ResourceLink {
-                    uri: attachment.path.clone(),
-                    mime_type: Some(attachment.mime.clone()),
-                }),
-            }
-        }
-        if !partition.media.is_empty() {
-            let (images, audios) = content.iter().fold((0usize, 0usize), |(i, a), b| match b {
-                ContentBlock::Image { .. } => (i + 1, a),
-                ContentBlock::Audio { .. } => (i, a + 1),
-                _ => (i, a),
-            });
-            tracing::info!(
-                conversation_id = %self.conversation_id,
-                msg_id = %data.msg_id,
-                images,
-                audios,
-                "session prompt carries native media content blocks"
-            );
-        }
+        let content = self.build_prompt_blocks(&data).await;
         // DEV (`--dump-prompts`): borrow the final blocks BEFORE they move into
         // Command::Send. No-op / best-effort — never affects the dispatch.
         self.dump_session_cli_final_input(&content, Some(data.msg_id.as_str()));

@@ -3898,6 +3898,209 @@ async fn send_message_returns_accepted() {
     assert_ne!(response.msg_id, response.turn_id, "turn_id must not reuse msg_id");
 }
 
+/// B5 test double: a mid-turn-capable agent that records `deliver_midturn`
+/// calls; `scripted_error` lets a test replay a steer rejection. `held_claim`
+/// (when set) is dropped BEFORE the rejection returns — modelling the live
+/// race where codex's turn ends (claim released) between the routing check and
+/// the steer write, so the fallback's fresh claim succeeds deterministically.
+struct MidturnMockAgent {
+    conversation_id: String,
+    event_tx: broadcast::Sender<AgentStreamEvent>,
+    delivered: Mutex<Vec<SendMessageData>>,
+    scripted_error: Mutex<Option<AgentSendError>>,
+    held_claim: Mutex<Option<crate::runtime_state::TurnClaim>>,
+}
+
+impl MidturnMockAgent {
+    fn new(conversation_id: &str) -> Self {
+        let (event_tx, _) = broadcast::channel(16);
+        Self {
+            conversation_id: conversation_id.to_owned(),
+            event_tx,
+            delivered: Mutex::new(Vec::new()),
+            scripted_error: Mutex::new(None),
+            held_claim: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl IAgentTask for MidturnMockAgent {
+    fn agent_type(&self) -> AgentType {
+        AgentType::Acp
+    }
+    fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+    fn workspace(&self) -> &str {
+        "/tmp/test"
+    }
+    fn status(&self) -> Option<ConversationStatus> {
+        None
+    }
+    fn last_activity_at(&self) -> aionui_common::TimestampMs {
+        aionui_common::now_ms()
+    }
+    fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
+        self.event_tx.subscribe()
+    }
+    fn supports_midturn_delivery(&self) -> bool {
+        true
+    }
+    async fn send_message(&self, _data: SendMessageData) -> Result<(), AgentSendError> {
+        // Emit finish so a fallback-opened normal turn's relay completes.
+        let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData::default()));
+        Ok(())
+    }
+    async fn cancel(&self) -> Result<(), AgentError> {
+        Ok(())
+    }
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl IMockAgent for MidturnMockAgent {
+    async fn deliver_midturn(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        if let Some(err) = self.scripted_error.lock().unwrap().take() {
+            // The turn "ended": release the held claim so the fallback's
+            // fresh claim succeeds (deterministic stand-in for the live race).
+            self.held_claim.lock().unwrap().take();
+            return Err(err);
+        }
+        self.delivered.lock().unwrap().push(data);
+        Ok(())
+    }
+}
+
+/// B5 routing (spec §4.3): an ACTIVE turn + a supporting backend → the message
+/// is delivered mid-turn (no 409, no new turn id), persisted with the
+/// pending-receipt status, and `message.userCreated` carries the correlation
+/// id.
+#[tokio::test]
+async fn midturn_send_delivers_into_the_active_turn() {
+    let (svc, broadcaster, repo, _d) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let _claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn_active")
+        .expect("claim the active turn");
+    let agent = Arc::new(MidturnMockAgent::new(&conv.id));
+    let task_mgr = Arc::new(MockTaskManager::new());
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+    broadcaster.take_events();
+
+    let response = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .expect("mid-turn send must not 409");
+
+    assert_eq!(response.turn_id, "turn_active", "response carries the ACTIVE turn id");
+    assert!(response.delivered_midturn, "response flags the mid-turn delivery");
+    let delivered = agent.delivered.lock().unwrap().clone();
+    assert_eq!(delivered.len(), 1, "delivered through the mid-turn path exactly once");
+    assert_eq!(delivered[0].content, "Hello");
+    assert_eq!(
+        delivered[0].msg_id, response.msg_id,
+        "the wire correlation id IS the persisted msg_id"
+    );
+    assert_eq!(delivered[0].turn_id.as_deref(), Some("turn_active"));
+    // The active claim was never stolen and no new turn id was minted.
+    assert_eq!(
+        svc.runtime_state().active_turn_id_for(&conv.id).as_deref(),
+        Some("turn_active")
+    );
+    // userCreated carries the correlation id + pending-receipt status.
+    let events = broadcaster.take_events();
+    let created = events
+        .iter()
+        .find(|e| e.name == "message.userCreated")
+        .expect("userCreated broadcast");
+    assert_eq!(created.data["client_msg_id"], response.msg_id.as_str());
+    assert_eq!(created.data["status"], "pending");
+    // Persisted with the pending-receipt status.
+    let rows: Vec<_> = repo
+        .messages
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.msg_id.as_deref() == Some(response.msg_id.as_str()))
+        .cloned()
+        .collect();
+    assert_eq!(rows.len(), 1, "persisted exactly once");
+    assert_eq!(rows[0].status.as_deref(), Some("pending"));
+}
+
+/// B5 fallback (spec §6甲.1): codex rejected the steer because the turn ended
+/// → the send falls back to opening a NEW turn; the already-persisted message
+/// is reused (no duplicate row) and its status leaves the pending state.
+#[tokio::test]
+async fn midturn_steer_rejection_turn_ended_falls_back_to_a_new_turn() {
+    let (svc, _broadcaster, repo, _d) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn_active")
+        .expect("claim the active turn");
+    let agent = Arc::new(MidturnMockAgent::new(&conv.id));
+    // codex wording verbatim (locked): both rejections are -32600; only the
+    // message text distinguishes them.
+    *agent.scripted_error.lock().unwrap() = Some(AgentSendError::from_agent_error(AgentError::bad_gateway(
+        "backend transport error: no active turn to steer",
+    )));
+    *agent.held_claim.lock().unwrap() = Some(claim);
+    let task_mgr = Arc::new(MockTaskManager::new());
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+
+    let response = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .expect("the fallback must open a new turn, not fail");
+
+    assert_ne!(response.turn_id, "turn_active", "a NEW turn id is minted on fallback");
+    assert!(response.turn_id.starts_with("turn_"));
+    assert!(
+        !response.delivered_midturn,
+        "a fallback send is an ordinary new-turn send"
+    );
+    assert!(
+        agent.delivered.lock().unwrap().is_empty(),
+        "nothing was delivered mid-turn"
+    );
+    // Exactly ONE persisted user row (reused, not duplicated), no longer pending.
+    let rows: Vec<_> = repo
+        .messages
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.msg_id.as_deref() == Some(response.msg_id.as_str()))
+        .cloned()
+        .collect();
+    assert_eq!(rows.len(), 1, "the fallback must reuse the row, not duplicate it");
+    assert_eq!(rows[0].status.as_deref(), Some("finish"));
+    wait_for_turn_released(&svc, &conv.id).await;
+}
+
+/// The §6甲.1 message-text classification is load-bearing — lock it so a codex
+/// wording change (or an error-mapping change that drops the text) fails here
+/// instead of silently degrading every turn-ended fallback into a hard error.
+#[test]
+fn steer_rejection_classifier_matches_only_the_turn_ended_text() {
+    let turn_ended = AgentSendError::from_agent_error(AgentError::bad_gateway(
+        "backend transport error: no active turn to steer",
+    ));
+    assert!(crate::service::steer_rejection_is_turn_ended(&turn_ended));
+    let other = AgentSendError::from_agent_error(AgentError::bad_gateway(
+        "backend transport error: turn/steer rejected: expected active turn id `a` but found `b`",
+    ));
+    assert!(!crate::service::steer_rejection_is_turn_ended(&other));
+    let unrelated = AgentSendError::from_agent_error(AgentError::bad_gateway("boom"));
+    assert!(!crate::service::steer_rejection_is_turn_ended(&unrelated));
+}
+
 #[tokio::test]
 async fn send_message_injects_conversation_runtime_context() {
     let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();

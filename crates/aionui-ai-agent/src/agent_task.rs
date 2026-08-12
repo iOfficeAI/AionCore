@@ -142,6 +142,11 @@ pub trait IMockAgent: IAgentTask {
     fn get_session_key(&self) -> Option<String> {
         None
     }
+    /// B5 mid-turn delivery test seam. Default: forward to `send_message` so
+    /// simple mocks behave; mid-turn tests override to record the routed call.
+    async fn deliver_midturn(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        self.send_message(data).await
+    }
     async fn mode(&self) -> Result<aionui_api_types::AgentModeResponse, AgentError> {
         Ok(aionui_api_types::AgentModeResponse {
             mode: "default".into(),
@@ -269,6 +274,22 @@ impl AgentInstance {
     /// Send a user message to the agent.
     pub async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.as_task().send_message(data).await
+    }
+
+    /// B5 mid-turn delivery: hand a message to the RUNNING turn instead of
+    /// opening a new one. Only meaningful when
+    /// [`Self::supports_midturn_delivery`] is true — the conversation layer
+    /// gates on that bit before routing here. Variants without the path reject
+    /// (the caller must not have routed them here).
+    pub async fn deliver_midturn(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        match self {
+            Self::Acp(_) | Self::Aionrs(_) => Err(AgentSendError::from_agent_error(AgentError::BadRequest(
+                "mid-turn delivery is not supported by this agent".into(),
+            ))),
+            Self::Session(m) => m.deliver_midturn(data).await,
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(m) => m.deliver_midturn(data).await,
+        }
     }
 
     /// Cancel the current streaming response without killing the agent.
