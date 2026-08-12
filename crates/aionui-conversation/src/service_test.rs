@@ -8392,6 +8392,41 @@ async fn cancel_during_the_build_is_recorded_instead_of_dropped() {
     );
 }
 
+/// Remembering the cancel is only half of it — the client has to be told.
+///
+/// The turn ends on the server, but every terminal frame on the send path comes
+/// from the `StreamRelay`, which the deferred-cancel branch returns before
+/// building. So the server settled and the UI kept spinning until the 15s
+/// watchdog. Live symptom (agy 1.1.12, 2026-08-12): the conversation produced no
+/// stream frames at all, not even `start`, and the live cancel test failed 4/4;
+/// with the frame it settles in ~200ms.
+///
+/// The sibling test above asserts only that the request is recorded, which is
+/// why it stayed green through all of that.
+#[tokio::test]
+async fn a_turn_cancelled_before_its_agent_exists_tells_the_client_it_ended() {
+    let (svc, broadcaster, _repo, _task_mgr) = make_service();
+
+    svc.broadcast_turn_settled_without_relay("user_1", "conv_1", "turn_1", "msg_1");
+
+    let events = broadcaster.take_events();
+    let finish = events
+        .iter()
+        .find(|e| e.name == "message.stream" && e.data["type"] == "finish")
+        .expect("a turn that ends before its relay exists must still emit a terminal frame");
+
+    assert_eq!(finish.data["conversation_id"], "conv_1");
+    assert_eq!(finish.data["turn_id"], "turn_1");
+    assert_eq!(
+        finish.data["msg_id"], "msg_1",
+        "the frame has to name the message the client is spinning on"
+    );
+    assert_eq!(
+        finish.data["hidden"], false,
+        "a hidden terminal would settle nothing the user can see"
+    );
+}
+
 #[tokio::test]
 async fn a_deferred_cancel_does_not_leak_into_a_later_turn() {
     // The record is keyed by turn: one left behind must never abort the next

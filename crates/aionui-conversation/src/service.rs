@@ -3578,6 +3578,39 @@ impl ConversationService {
         Ok(page.items.iter().rev().find_map(error_message_from_message_row))
     }
 
+    /// Emit the terminal frame for a turn that ended before any `StreamRelay`
+    /// existed.
+    ///
+    /// The relay owns every other terminal on the send path, so a turn that
+    /// returns before it is built settles on the server while the client keeps
+    /// spinning — there is no frame telling it otherwise. The only caller today
+    /// is the deferred-cancel branch in `TurnOrchestrator::run_attempt`.
+    ///
+    /// Frame shape matches `StreamRelay::broadcast_stream_payload` so the client
+    /// takes the same path it does for a normal finish. `data` is empty because
+    /// there is nothing to report: the agent never ran, so there is no usage, no
+    /// session id and no text.
+    pub(crate) fn broadcast_turn_settled_without_relay(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        msg_id: &str,
+    ) {
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            "message.stream",
+            serde_json::json!({
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "msg_id": msg_id,
+                "turn_id": turn_id,
+                "type": "finish",
+                "data": {},
+                "hidden": false,
+            }),
+        ));
+    }
+
     pub(crate) async fn persist_and_broadcast_send_failure_tip(
         &self,
         user_id: &str,
