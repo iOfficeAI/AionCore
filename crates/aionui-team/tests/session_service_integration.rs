@@ -2014,6 +2014,7 @@ async fn recovery_creates_system_run_intents_without_restoring_old_memory_run() 
                 name: "Recover".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -2077,6 +2078,7 @@ async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
                 name: "Recover Teammate".into(),
                 agents: aionrs_two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -2138,6 +2140,7 @@ async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
                 name: "Self Only".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -2483,6 +2486,7 @@ async fn renew_active_lease_records_all_team_agent_conversations() {
                 name: "Lease Team".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -2545,6 +2549,7 @@ async fn renew_active_lease_rejects_team_owned_by_other_user() {
                 name: "Lease Team".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -2589,6 +2594,7 @@ async fn tc1_create_team_with_multiple_agents() {
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -2620,6 +2626,7 @@ async fn create_team_rejects_existing_conversation_id_request_side_adoption() {
                     conversation_id: Some("solo-conv-1".into()),
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -2648,6 +2655,7 @@ async fn create_team_with_workspace_writes_same_workspace_to_team_and_initial_ag
                 name: "Shared".into(),
                 agents: two_agent_input(),
                 workspace: Some(workspace.clone()),
+                locale: None,
             },
         )
         .await
@@ -2700,6 +2708,7 @@ async fn create_team_side_branch_backfills_project_binding_when_injected() {
                 name: "Bound".into(),
                 agents: two_agent_input(),
                 workspace: Some(workspace_dir.to_string_lossy().into_owned()),
+                locale: None,
             },
         )
         .await
@@ -2731,6 +2740,7 @@ async fn create_team_without_workspace_uses_leader_auto_workspace_for_all_initia
                 name: "Auto Shared".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -2817,6 +2827,7 @@ async fn tc_create_team_prefers_assistant_avatar_over_backend_logo() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -2887,6 +2898,7 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -2973,6 +2985,7 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3059,6 +3072,7 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3117,6 +3131,7 @@ async fn team_preset_assistant_snapshot_is_frozen() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3157,6 +3172,7 @@ async fn spawned_preset_assistant_snapshot_is_frozen() {
                 name: "Spawn Preset".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3213,6 +3229,7 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3306,6 +3323,7 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3400,6 +3418,7 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3440,6 +3459,7 @@ async fn tc2_create_single_agent_team() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3476,6 +3496,7 @@ async fn create_team_uses_explicit_leader_role_when_leader_is_not_first() {
                     },
                 ],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3505,6 +3526,7 @@ async fn create_team_rejects_zero_leaders() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await;
@@ -3539,6 +3561,7 @@ async fn create_team_rejects_multiple_leaders() {
                     },
                 ],
                 workspace: None,
+                locale: None,
             },
         )
         .await;
@@ -3563,6 +3586,7 @@ async fn create_team_rejects_unknown_role() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await;
@@ -3580,6 +3604,7 @@ async fn tc5_empty_agents_returns_error() {
                 name: "Empty".into(),
                 agents: vec![],
                 workspace: None,
+                locale: None,
             },
         )
         .await;
@@ -3596,6 +3621,7 @@ async fn tc3_each_agent_has_conversation_id() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3625,6 +3651,7 @@ async fn tl2_list_multiple_teams() {
             name: "A".into(),
             agents: two_agent_input(),
             workspace: None,
+            locale: None,
         },
     )
     .await
@@ -3635,6 +3662,7 @@ async fn tl2_list_multiple_teams() {
             name: "B".into(),
             agents: two_agent_input(),
             workspace: None,
+            locale: None,
         },
     )
     .await
@@ -3653,6 +3681,7 @@ async fn tl3_list_teams_filters_by_owner() {
             name: "Owned".into(),
             agents: two_agent_input(),
             workspace: None,
+            locale: None,
         },
     )
     .await
@@ -3663,6 +3692,7 @@ async fn tl3_list_teams_filters_by_owner() {
             name: "Other".into(),
             agents: two_agent_input(),
             workspace: None,
+            locale: None,
         },
     )
     .await
@@ -3691,6 +3721,7 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3726,6 +3757,7 @@ async fn tg1_get_existing_team() {
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3754,6 +3786,7 @@ async fn tg3_get_team_rejects_cross_user_access() {
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3776,6 +3809,7 @@ async fn td1_delete_existing_team() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3805,6 +3839,7 @@ async fn tr1_rename_existing_team() {
                 name: "Old".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3832,6 +3867,7 @@ async fn tr5_rename_team_rejects_cross_user_access() {
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3863,6 +3899,7 @@ async fn aa1_add_agent_to_team() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3911,6 +3948,7 @@ async fn manual_add_without_active_run_opens_system_lifecycle_run() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -3975,6 +4013,7 @@ async fn add_agent_rejects_leader_role() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -4015,6 +4054,7 @@ async fn add_agent_allows_same_assistant_id_multiple_times() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -4078,6 +4118,7 @@ async fn manual_add_agent_active_session_attaches_runtime_in_background_without_
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -4156,6 +4197,7 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -4331,6 +4373,7 @@ async fn reensure_with_failed_teammate_keeps_team_usable_and_inline() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -4445,6 +4488,7 @@ async fn failed_member_stays_inline_and_removal_restores_ready() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -4542,6 +4586,7 @@ async fn remove_during_attach_cancels_work_and_rejects_late_ready() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -4622,6 +4667,7 @@ async fn aa_add_agent_inherits_team_workspace() {
                     conversation_id: None,
                 }],
                 workspace: Some(workspace.clone()),
+                locale: None,
             },
         )
         .await
@@ -4668,6 +4714,7 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -4722,6 +4769,7 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -4783,6 +4831,7 @@ async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -4833,6 +4882,7 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -4888,6 +4938,7 @@ async fn provisioning_writes_typed_team_binding_for_create_and_add_agent() {
                 name: "Typed".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -4969,6 +5020,7 @@ async fn provisioning_resolves_acp_backend_from_agent_metadata() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5026,6 +5078,7 @@ async fn ar1_remove_agent_from_team() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5052,6 +5105,7 @@ async fn membership_persist_failure_does_not_delete_the_conversation() {
                 name: "Removal persistence failure".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5098,6 +5152,7 @@ async fn remove_tolerates_current_session_already_missing_the_slot() {
                 name: "Already absent runtime slot".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5138,6 +5193,7 @@ async fn manual_remove_agent_projects_team_system_message_without_active_team_ru
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5173,6 +5229,7 @@ async fn remove_agent_rejects_leader() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5196,6 +5253,7 @@ async fn ar4_remove_nonexistent_agent() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5215,6 +5273,7 @@ async fn an1_rename_agent() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5240,6 +5299,7 @@ async fn an3_rename_nonexistent_agent() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5263,6 +5323,7 @@ async fn es1_ensure_session_creates_session() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5333,6 +5394,7 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5391,6 +5453,7 @@ async fn leader_spawn_then_immediate_ensure_joins_the_same_attach_operation() {
                 name: "Leader spawn reconciliation".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5451,6 +5514,7 @@ async fn lead_send_agent_message_without_active_run_opens_system_lifecycle_run()
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5499,6 +5563,7 @@ async fn lead_shutdown_agent_without_active_run_opens_system_lifecycle_run() {
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5550,6 +5615,7 @@ async fn spawn_agent_in_session_aborts_lease_when_persistence_fails() {
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5596,6 +5662,7 @@ async fn spawn_agent_in_session_compensates_when_welcome_mailbox_write_fails() {
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5635,6 +5702,7 @@ async fn es2_ensure_session_is_idempotent() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5661,6 +5729,7 @@ async fn es4_ensure_session_rejects_cross_user_access() {
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5698,6 +5767,7 @@ async fn ensure_session_broadcasts_starting_and_ready_session_status() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5734,6 +5804,7 @@ async fn ensure_session_existing_ready_session_broadcasts_ready_terminal_status(
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5772,6 +5843,7 @@ async fn ss1_stop_session() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5791,6 +5863,7 @@ async fn ss3_stop_session_without_active_is_noop() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5809,6 +5882,7 @@ async fn ss4_stop_session_rejects_cross_user_access() {
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5840,6 +5914,7 @@ async fn sm1_send_message_with_active_session() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5861,6 +5936,7 @@ async fn sm2_send_message_rejects_cross_user_access() {
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5881,6 +5957,7 @@ async fn sa_send_message_to_agent_with_active_session() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5903,6 +5980,7 @@ async fn sa2_send_message_to_agent_rejects_cross_user_access() {
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5926,6 +6004,7 @@ async fn sa3_send_message_to_nonexistent_agent() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5952,6 +6031,7 @@ async fn dispose_all_cleans_up_sessions() {
                 name: "A".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5963,6 +6043,7 @@ async fn dispose_all_cleans_up_sessions() {
                 name: "B".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -5992,6 +6073,7 @@ async fn td_delete_team_stops_session() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6018,6 +6100,7 @@ async fn d9_create_team_persists_without_warming_initial_agents() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6048,6 +6131,7 @@ async fn d9_ensure_session_warms_up_only_the_lead() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6089,6 +6173,7 @@ async fn d9_ensure_session_warms_up_only_the_lead_without_teammate_stagger() {
                 name: "T".into(),
                 agents: five_agent_input_leader_not_first(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6158,6 +6243,7 @@ async fn d9_ensure_session_persists_team_mcp_stdio_config() {
                 name: "T".into(),
                 agents: aionrs_two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6176,6 +6262,7 @@ async fn d9_ensure_session_is_idempotent() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6208,6 +6295,7 @@ async fn manual_add_then_immediate_ensure_joins_attach_without_rebuilding_sessio
                 name: "Join dynamic attach".into(),
                 agents: vec![team_agent_input("Lead", "lead", "claude")],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6278,6 +6366,7 @@ async fn concurrent_ensures_launch_one_dynamic_attach() {
                 name: "Concurrent repair".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6346,6 +6435,7 @@ async fn stopped_session_rejects_late_attach_completion() {
                 name: "Stopped late attach".into(),
                 agents: vec![team_agent_input("Lead", "lead", "claude")],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6443,6 +6533,7 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6509,6 +6600,7 @@ async fn cold_bootstrap_failure_stops_session_when_leader_attach_fails() {
                 name: "T".into(),
                 agents: four_agent_input_leader_not_first(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6593,6 +6685,7 @@ async fn ensure_session_serializes_manual_add_until_rebuild_completes() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6652,6 +6745,7 @@ async fn ensure_session_serializes_manual_remove_until_rebuild_completes() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6703,6 +6797,7 @@ async fn ensure_session_serializes_manual_rename_until_rebuild_completes() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6768,6 +6863,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                     conversation_id: None,
                 }],
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6835,6 +6931,7 @@ async fn d115_remove_team_kills_every_agent_process() {
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6891,6 +6988,7 @@ async fn attach_agent_runtime_wakes_dormant_teammate() {
                 name: "Directed attach".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6937,6 +7035,7 @@ async fn attach_agent_runtime_rejects_cross_user() {
                 name: "Directed attach isolation".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -6972,6 +7071,7 @@ async fn attach_agent_runtime_rejects_unknown_slot() {
                 name: "Directed attach unknown slot".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -7003,6 +7103,7 @@ async fn waking_dormant_teammate_does_not_resurface_session_starting() {
                 name: "Lazy wakeup overlay".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -7086,6 +7187,7 @@ async fn failed_teammate_wakeup_does_not_flip_session_to_failed() {
                 name: "Teammate failure stays inline".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -7166,6 +7268,7 @@ async fn lazy_attach_failure_preserves_unread_and_skips_leader_on_human_delivery
                 name: "Lazy failure preserves unread".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await
@@ -7269,6 +7372,7 @@ async fn agent_triggered_attach_failure_notifies_leader() {
                 name: "Agent-triggered failure notifies leader".into(),
                 agents: two_agent_input(),
                 workspace: None,
+                locale: None,
             },
         )
         .await

@@ -77,6 +77,10 @@ pub struct CreateTeamRequest {
     pub agents: Vec<TeamAgentInput>,
     #[serde(default)]
     pub workspace: Option<String>,
+    /// UI locale used when snapshotting assistant rules for new team conversations
+    /// (e.g. `zh-CN`, `en-US`). Falls back to builtin `en-US` rules when omitted.
+    #[serde(default)]
+    pub locale: Option<String>,
 }
 
 /// Request body for `PATCH /api/teams/:id/name`.

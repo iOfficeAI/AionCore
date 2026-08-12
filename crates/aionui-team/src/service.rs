@@ -572,7 +572,13 @@ impl TeamSessionService {
 
         let provisioned = self
             .provisioner()
-            .provision_initial_agents(user_id, &team_id, &req.agents, shared_workspace.as_deref())
+            .provision_initial_agents(
+                user_id,
+                &team_id,
+                &req.agents,
+                shared_workspace.as_deref(),
+                req.locale.as_deref(),
+            )
             .await?;
         let agents = provisioned.agents;
         let lead_agent_id = provisioned.lead_agent_id;
@@ -2528,6 +2534,7 @@ mod tests {
                 },
             ],
             workspace: None,
+            locale: None,
         }
     }
 

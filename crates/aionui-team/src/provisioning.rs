@@ -67,6 +67,7 @@ pub struct TeamConversationCreateRequest {
     pub name: String,
     pub top_level_model: Option<ProviderWithModel>,
     pub assistant_id: Option<String>,
+    pub locale: Option<String>,
     pub extra: serde_json::Value,
 }
 
@@ -153,6 +154,7 @@ impl TeamAgentProvisioner {
         team_id: &str,
         inputs: &[TeamAgentInput],
         shared_workspace: Option<&str>,
+        locale: Option<&str>,
     ) -> Result<InitialProvisioningResult, TeamError> {
         if inputs.is_empty() {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
@@ -192,6 +194,7 @@ impl TeamAgentProvisioner {
                 leader_assistant_id.as_deref(),
                 shared_workspace,
                 None,
+                locale,
             )
             .await?;
 
@@ -244,6 +247,7 @@ impl TeamAgentProvisioner {
                     assistant_id.as_deref(),
                     Some(&team_workspace),
                     None,
+                    locale,
                 )
                 .await?;
             agents.push(TeamAgent {
@@ -533,6 +537,7 @@ impl TeamAgentProvisioner {
                 input.assistant_id.as_deref(),
                 input.workspace.as_deref(),
                 input.session_mode.as_deref(),
+                None,
             )
             .await?;
         Ok(TeamAgent {
@@ -562,6 +567,7 @@ impl TeamAgentProvisioner {
         assistant_id: Option<&str>,
         workspace: Option<&str>,
         session_mode: Option<&str>,
+        locale: Option<&str>,
     ) -> Result<ProvisionedConversation, TeamError> {
         let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, backend).await?;
         let agent_type = agent_type_for_backend(cli_metadata.as_ref(), backend)?;
@@ -607,6 +613,7 @@ impl TeamAgentProvisioner {
                 name: name.to_owned(),
                 top_level_model,
                 assistant_id: assistant_id.map(str::to_owned),
+                locale: locale.map(str::to_owned),
                 extra,
             })
             .await?;

@@ -420,7 +420,7 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
                     model: request.top_level_model,
                     assistant: request.assistant_id.map(|assistant_id| AssistantConversationRequest {
                         id: assistant_id,
-                        locale: None,
+                        locale: request.locale,
                         conversation_overrides: None,
                     }),
                     source: None,
