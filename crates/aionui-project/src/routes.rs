@@ -238,6 +238,7 @@ impl From<ProjectError> for ApiError {
                 "local_path_not_readable",
                 Some(json!({ "path": path })),
             ),
+            ProjectError::UserFilesystemDenied => (StatusCode::FORBIDDEN, "user_filesystem_denied", None),
             ProjectError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", None),
         };
         // Never leak internal DB detail to clients (Security: no internal leakage).

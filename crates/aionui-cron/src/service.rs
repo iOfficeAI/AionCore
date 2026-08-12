@@ -454,6 +454,13 @@ impl CronService {
     }
 
     pub async fn remove_job(&self, user_id: &str, job_id: &str) -> Result<(), CronError> {
+        // Verify ownership before touching the shared scheduler or on-disk
+        // skill. A guessed cross-account id must have no observable side
+        // effects, while the owner keeps the original cleanup-before-row-delete
+        // ordering so a process interruption cannot strand a live timer.
+        if self.repo.get_by_id_for_user(user_id, job_id).await?.is_none() {
+            return Err(CronError::Database(DbError::NotFound(format!("cron job '{job_id}'"))));
+        }
         self.scheduler.cancel_job(job_id);
         if let Err(err) = delete_skill_file(&self.data_dir, job_id).await {
             warn!(job_id, error = %err, "Failed to delete cron skill file during job removal");

@@ -16,6 +16,39 @@ use common::{
     sync_skill_catalog_for_test,
 };
 
+async fn setup_admin_and_login(
+    app: &mut axum::Router,
+    services: &AppServices,
+    username: &str,
+    password: &str,
+) -> (String, String) {
+    let auth = setup_and_login(app, services, username, password).await;
+    sqlx::query("UPDATE users SET site_role = 'admin' WHERE username = ?")
+        .bind(username)
+        .execute(services.database.pool())
+        .await
+        .unwrap();
+    auth
+}
+
+async fn managed_skill_upload_root(
+    services: &AppServices,
+    paths: &aionui_extension::SkillPaths,
+    username: &str,
+) -> std::path::PathBuf {
+    let user = services
+        .user_repo
+        .find_by_username(username)
+        .await
+        .unwrap()
+        .expect("test user should exist");
+    paths
+        .data_dir
+        .join("uploads")
+        .join("users")
+        .join(aionui_common::user_dir_name(&user.id).unwrap())
+}
+
 fn write_legacy_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
     let ext_root = tmp.path().join("extensions");
     let ext_dir = ext_root.join("legacy-suite");
@@ -1013,7 +1046,7 @@ async fn sm11_get_skill_paths() {
 #[tokio::test]
 async fn sm9_detect_paths() {
     let (mut app, services) = build_app().await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (token, _csrf) = setup_admin_and_login(&mut app, &services, "user1", "pass1").await;
 
     let resp = app
         .oneshot(get_with_token("/api/skills/detect-paths", &token))
@@ -1033,7 +1066,7 @@ async fn sm9_detect_paths() {
 #[tokio::test]
 async fn cp1_get_external_paths_empty() {
     let (mut app, services) = build_app().await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (token, _csrf) = setup_admin_and_login(&mut app, &services, "user1", "pass1").await;
 
     let resp = app
         .oneshot(get_with_token("/api/skills/external-paths", &token))
@@ -1236,10 +1269,12 @@ async fn sk3_read_builtin_skill_rejects_path_traversal() {
 #[tokio::test]
 async fn si1_read_skill_info_from_directory_path() {
     let tmp = TempDir::new().unwrap();
-    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
-    let skill_dir = tmp.path().join("my-skill");
+    let skill_dir = managed_skill_upload_root(&services, &paths, "user1")
+        .await
+        .join("my-skill");
     std::fs::create_dir_all(&skill_dir).unwrap();
     std::fs::write(
         skill_dir.join("SKILL.md"),
@@ -1268,10 +1303,12 @@ async fn si1_read_skill_info_from_directory_path() {
 #[tokio::test]
 async fn si2_read_skill_info_falls_back_to_directory_name_when_name_empty() {
     let tmp = TempDir::new().unwrap();
-    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
-    let skill_dir = tmp.path().join("fallback-dir");
+    let skill_dir = managed_skill_upload_root(&services, &paths, "user1")
+        .await
+        .join("fallback-dir");
     std::fs::create_dir_all(&skill_dir).unwrap();
     std::fs::write(
         skill_dir.join("SKILL.md"),
@@ -1300,10 +1337,12 @@ async fn si2_read_skill_info_falls_back_to_directory_name_when_name_empty() {
 #[tokio::test]
 async fn si3_read_skill_info_returns_not_found_for_missing_path() {
     let tmp = TempDir::new().unwrap();
-    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
-    let missing = tmp.path().join("no-such-skill");
+    let upload_root = managed_skill_upload_root(&services, &paths, "user1").await;
+    std::fs::create_dir_all(&upload_root).unwrap();
+    let missing = upload_root.join("no-such-skill");
 
     let resp = app
         .oneshot(json_with_token(
@@ -1324,10 +1363,12 @@ async fn si3_read_skill_info_returns_not_found_for_missing_path() {
 #[tokio::test]
 async fn skill_import_returns_specific_code_for_oversized_file() {
     let tmp = TempDir::new().unwrap();
-    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
-    let skill_dir = tmp.path().join("huge-skill");
+    let skill_dir = managed_skill_upload_root(&services, &paths, "user1")
+        .await
+        .join("huge-skill");
     std::fs::create_dir_all(&skill_dir).unwrap();
     std::fs::write(
         skill_dir.join("SKILL.md"),
@@ -1371,7 +1412,9 @@ async fn skill_batch_import_reports_partial_failures_without_rolling_back_succes
     let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
-    let parent_dir = tmp.path().join("parent-pack");
+    let parent_dir = managed_skill_upload_root(&services, &paths, "user1")
+        .await
+        .join("parent-pack");
     let alpha_dir = parent_dir.join("alpha-skill");
     let beta_dir = parent_dir.join("beta-skill");
     std::fs::create_dir_all(&alpha_dir).unwrap();
@@ -1487,7 +1530,9 @@ async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
 
     // Real users get custom skills through the import API, which stores
     // files under the user's scoped storage (never the legacy shared root).
-    let source_dir = tmp.path().join("import-src");
+    let source_dir = managed_skill_upload_root(&services, &paths, "user1")
+        .await
+        .join("import-src");
     write_skill(&source_dir, "my-skill", "A user-imported skill");
     let resp = app
         .clone()
@@ -1543,7 +1588,9 @@ async fn sl2_list_skills_user_custom_overrides_builtin() {
     // A user-imported skill with the same name shadows the builtin row in
     // the user's listing. The source dir name differs; the skill NAME in
     // the frontmatter is what collides.
-    let source_dir = tmp.path().join("import-src");
+    let source_dir = managed_skill_upload_root(&services, &paths, "user1")
+        .await
+        .join("import-src");
     let override_dir = source_dir.join("review-override");
     std::fs::create_dir_all(&override_dir).unwrap();
     std::fs::write(
@@ -1671,7 +1718,7 @@ async fn de1_detect_external_populates_custom_source_slug() {
     // in `tests/e2e/features/settings/skills/edge-cases.e2e.ts`.
     let tmp = TempDir::new().unwrap();
     let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (token, csrf) = setup_admin_and_login(&mut app, &services, "user1", "pass1").await;
 
     let ext_dir = tmp.path().join("external-skills");
     let skill_dir = ext_dir.join("my-ext-skill");
@@ -1723,7 +1770,7 @@ async fn de1_detect_external_populates_custom_source_slug() {
 async fn de2_detect_external_source_slugs_are_unique() {
     let tmp = TempDir::new().unwrap();
     let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (token, csrf) = setup_admin_and_login(&mut app, &services, "user1", "pass1").await;
 
     let mk = |p: &std::path::Path, skill: &str| {
         let dir = p.join(skill);

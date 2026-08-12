@@ -14,7 +14,7 @@ use tower::ServiceExt;
 
 use common::{
     body_json, build_app, build_app_with_mock_agents, delete_with_token, get_request, get_with_token, json_with_token,
-    setup_and_login,
+    managed_workspace_root, setup_and_login,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -338,8 +338,10 @@ async fn t1_5b_create_accepts_workspace_paths_with_whitespace_segments() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("my project").join("repo");
+    let workspace = managed_workspace_root(&services, "admin")
+        .await
+        .join("my project")
+        .join("repo");
     std::fs::create_dir_all(&workspace).unwrap();
 
     let body = json!({
@@ -364,8 +366,9 @@ async fn t1_5c_create_rejects_missing_workspace_path() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let missing_workspace =
-        std::env::temp_dir().join(format!("aionui-conv-missing-{}", aionui_common::generate_short_id()));
+    let missing_workspace = managed_workspace_root(&services, "admin")
+        .await
+        .join(format!("aionui-conv-missing-{}", aionui_common::generate_short_id()));
 
     let body = json!({
         "type": "acp",
@@ -392,6 +395,43 @@ async fn t1_5c_create_rejects_missing_workspace_path() {
         list_json["data"]["items"].as_array().unwrap().is_empty(),
         "invalid conversation should not be persisted"
     );
+}
+
+#[tokio::test]
+async fn t1_5d_hosted_user_cannot_select_an_outside_or_foreign_workspace() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let outside = tempfile::tempdir().unwrap();
+    let req = json_with_token(
+        "POST",
+        "/api/conversations",
+        create_body_with_extra("Outside", json!({ "workspace": outside.path() })),
+        &token,
+        &csrf,
+    );
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "FORBIDDEN");
+
+    let member_hash = aionui_auth::hash_password("MemberP@ss1").unwrap();
+    let member = services
+        .user_repo
+        .create_user("workspace-member", &member_hash)
+        .await
+        .unwrap();
+    let foreign = services.project_service.user_workspace_root(&member.id).unwrap();
+    std::fs::create_dir_all(&foreign).unwrap();
+    let req = json_with_token(
+        "POST",
+        "/api/conversations",
+        create_body_with_extra("Foreign", json!({ "workspace": foreign })),
+        &token,
+        &csrf,
+    );
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "FORBIDDEN");
 }
 
 #[tokio::test]
@@ -689,9 +729,9 @@ async fn t4_2_update_pin_and_unpin() {
 async fn t4_3_update_extra_merge() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let temp = tempfile::tempdir().unwrap();
-    let old_workspace = temp.path().join("old");
-    let new_workspace = temp.path().join("new");
+    let root = managed_workspace_root(&services, "admin").await;
+    let old_workspace = root.join("old");
+    let new_workspace = root.join("new");
     std::fs::create_dir_all(&old_workspace).unwrap();
     std::fs::create_dir_all(&new_workspace).unwrap();
 
@@ -719,6 +759,33 @@ async fn t4_3_update_extra_merge() {
         new_workspace.to_string_lossy().to_string()
     );
     assert_eq!(json["data"]["extra"]["context_file_name"], "ctx.md");
+}
+
+#[tokio::test]
+async fn t4_3b_update_rejects_workspace_outside_the_callers_root() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let req = json_with_token(
+        "POST",
+        "/api/conversations",
+        create_body("Workspace Guard"),
+        &token,
+        &csrf,
+    );
+    let response = app.clone().oneshot(req).await.unwrap();
+    let id = body_json(response).await["data"]["id"].as_str().unwrap().to_owned();
+    let outside = tempfile::tempdir().unwrap();
+
+    let req = json_with_token(
+        "PATCH",
+        &format!("/api/conversations/{id}"),
+        json!({ "extra": { "workspace": outside.path() } }),
+        &token,
+        &csrf,
+    );
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "FORBIDDEN");
 }
 
 #[tokio::test]

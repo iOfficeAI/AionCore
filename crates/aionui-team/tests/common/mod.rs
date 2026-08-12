@@ -112,7 +112,12 @@ impl ITeamRepository for MockTeamRepo {
         Ok(msgs)
     }
 
-    async fn list_messages_by_team(&self, team_id: &str, limit: i64) -> Result<Vec<MailboxMessageRow>, DbError> {
+    async fn list_messages_by_team(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        limit: i64,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let state = self.state.lock().unwrap();
         let mut msgs: Vec<MailboxMessageRow> = state
             .messages
@@ -127,6 +132,7 @@ impl ITeamRepository for MockTeamRepo {
 
     async fn list_messages_by_team_paged(
         &self,
+        _user_id: &str,
         team_id: &str,
         cursor: Option<ActivityCursor>,
         direction: PageDirection,
@@ -153,7 +159,12 @@ impl ITeamRepository for MockTeamRepo {
         Ok(msgs)
     }
 
-    async fn list_messages_by_ids(&self, ids: &[String]) -> Result<Vec<MailboxMessageRow>, DbError> {
+    async fn list_messages_by_ids(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }

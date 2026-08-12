@@ -201,12 +201,24 @@ impl ScmActor {
             .and_then(Value::as_str)
             .ok_or(ScmError::InvalidParams { what: "project_id" })?;
 
+        // Resolve before registering interest. Registering an unverified project
+        // id would leave this session subscribed even though the request fails,
+        // allowing a guessed cross-account id to receive later root-change events.
+        self.roots_of(user_id, project_id).await?;
+
         // Listing a project's repositories is also how a connection registers its
         // interest in them: from now until it disconnects it receives that
-        // project's `repositoriesChanged` frames. Registering before discovery
-        // closes the window where an attach lands between the two.
+        // project's `repositoriesChanged` frames. Resolve again after registering
+        // so a root change in the authorization-to-registration window is included
+        // in the response; later changes are covered by the registered interest.
         self.runtime.register_interest(session, project_id).await;
-        let roots = self.roots_of(user_id, project_id).await?;
+        let roots = match self.roots_of(user_id, project_id).await {
+            Ok(roots) => roots,
+            Err(error) => {
+                self.runtime.unregister_interest(session, project_id).await;
+                return Err(error);
+            }
+        };
         let repositories = self.runtime.discover(project_id, &roots).await;
         Ok(json!({ "repositories": repositories }))
     }
@@ -447,11 +459,11 @@ impl ScmActor {
                 // A pe the user cannot reach, or a path escaping its root: both
                 // are scope violations, not engine failures.
                 ProjectError::ProjectExplorerNotFound { pe_id } => ScmError::OutOfScope { pe_id },
-                ProjectError::ResourceOutsideFolder { .. } | ProjectError::InvalidRelativePath { .. } => {
-                    ScmError::OutOfScope {
-                        pe_id: file.pe_id.clone(),
-                    }
-                }
+                ProjectError::ResourceOutsideFolder { .. }
+                | ProjectError::InvalidRelativePath { .. }
+                | ProjectError::UserFilesystemDenied => ScmError::OutOfScope {
+                    pe_id: file.pe_id.clone(),
+                },
                 other => ScmError::OperationFailed {
                     context: "authorize",
                     message: other.to_string(),

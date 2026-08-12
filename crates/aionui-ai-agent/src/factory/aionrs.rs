@@ -25,14 +25,28 @@ use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
 use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig};
+
+fn runtime_tool_policy(host_tools_allowed: bool) -> aion_agent::tool_policy::ToolPolicy {
+    if host_tools_allowed {
+        aion_agent::tool_policy::ToolPolicy::Unrestricted
+    } else {
+        aion_agent::tool_policy::ToolPolicy::allow_only(std::iter::empty::<String>())
+    }
+}
+
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AionrsSessionBuildContext,
     model: ProviderWithModel,
     ctx: FactoryContext,
+    host_tools_allowed: bool,
 ) -> Result<AgentInstance, AgentError> {
     let mut overrides = build_context.config;
-    let resolved_skills = overrides.skills.clone();
+    let resolved_skills = if host_tools_allowed {
+        overrides.skills.clone()
+    } else {
+        Vec::new()
+    };
 
     // Merge preset assistant rules into system_prompt (used as custom_prompt
     // in aionrs's build_system_prompt). Mirrors the old architecture's
@@ -48,8 +62,12 @@ pub(super) async fn build(
         });
     }
 
-    let mut extra_mcp_servers = resolve_mcp_servers(&overrides);
-    if let Some(repo) = deps.mcp_server_repo.as_ref() {
+    let mut extra_mcp_servers = if host_tools_allowed {
+        resolve_mcp_servers(&overrides)
+    } else {
+        HashMap::new()
+    };
+    if host_tools_allowed && let Some(repo) = deps.mcp_server_repo.as_ref() {
         for (name, config) in load_user_mcp_servers(
             repo.as_ref(),
             overrides.mcp_server_ids.as_deref(),
@@ -62,14 +80,16 @@ pub(super) async fn build(
             extra_mcp_servers.entry(name).or_insert(config);
         }
     }
-    merge_session_snapshot_mcp_servers(
-        &mut extra_mcp_servers,
-        &overrides.session_mcp_servers,
-        &ctx.user_id,
-        &ctx.conversation_id,
-        deps.broadcaster.clone(),
-    )
-    .await;
+    if host_tools_allowed {
+        merge_session_snapshot_mcp_servers(
+            &mut extra_mcp_servers,
+            &overrides.session_mcp_servers,
+            &ctx.user_id,
+            &ctx.conversation_id,
+            deps.broadcaster.clone(),
+        )
+        .await;
+    }
 
     if !extra_mcp_servers.is_empty() {
         info!(
@@ -109,6 +129,12 @@ pub(super) async fn build(
         row.is_full_url,
         model_overrides.openai_api_mode,
     );
+    enforce_member_provider_runtime(
+        host_tools_allowed,
+        &row.platform,
+        base_url.as_deref().unwrap_or(&row.base_url),
+    )
+    .await?;
     compat_overrides.image_input = model_overrides.image_input;
 
     if provider == "openai" {
@@ -198,6 +224,7 @@ pub(super) async fn build(
         bedrock_config,
         runtime_env: ctx.runtime_env,
         prompt_dump_dir: crate::dev_prompt_dump::dump_dir_for_data_dir(&deps.data_dir, deps.dump_prompts),
+        tool_policy: runtime_tool_policy(host_tools_allowed),
     };
 
     if let Some(system_prompt) = config.system_prompt.as_deref()
@@ -234,6 +261,19 @@ pub(super) async fn build(
 
     let agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session).await?;
     Ok(AgentInstance::Aionrs(Arc::new(agent)))
+}
+
+async fn enforce_member_provider_runtime(
+    host_tools_allowed: bool,
+    platform: &str,
+    base_url: &str,
+) -> Result<(), AgentError> {
+    if host_tools_allowed {
+        return Ok(());
+    }
+    aionui_system::validate_member_provider_runtime(platform, base_url)
+        .await
+        .map_err(|error| AgentError::bad_request(error.to_string()))
 }
 
 /// Map AionUi DB platform/protocol settings to the aionrs provider identifier.
@@ -1947,5 +1987,38 @@ mod tests {
         }
 
         assert_eq!(overrides.system_prompt.as_deref(), Some("Be concise."));
+    }
+
+    #[test]
+    fn hosted_member_policy_denies_every_registered_tool() {
+        let policy = runtime_tool_policy(false);
+        for name in ["Read", "Write", "Edit", "ExecCommand", "Skill", "ToolSearch", "Spawn"] {
+            assert!(!policy.allows(name), "{name} must remain unavailable to hosted members");
+        }
+    }
+
+    #[test]
+    fn trusted_operator_policy_keeps_desktop_tool_surface() {
+        assert!(runtime_tool_policy(true).allows("ExecCommand"));
+    }
+
+    #[tokio::test]
+    async fn hosted_member_runtime_rejects_private_and_unapproved_provider_endpoints() {
+        for base_url in ["http://127.0.0.1:11434/v1", "https://attacker.example/v1"] {
+            let error = enforce_member_provider_runtime(false, "custom", base_url)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, AgentError::BadRequest(_)),
+                "{base_url} must fail closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_operator_runtime_retains_local_provider_support() {
+        enforce_member_provider_runtime(true, "custom", "http://127.0.0.1:11434/v1")
+            .await
+            .unwrap();
     }
 }

@@ -1,4 +1,5 @@
 mod fetchers;
+pub(crate) mod network_guard;
 mod url_fixer;
 
 use std::sync::Arc;
@@ -9,6 +10,8 @@ use aionui_db::IProviderRepository;
 
 use crate::error::SystemError;
 use crate::provider::deserialize_opt;
+
+pub use network_guard::OutboundNetworkPolicy;
 
 /// Internal configuration extracted from a provider row for model fetching.
 #[derive(Debug)]
@@ -52,9 +55,10 @@ impl ModelFetchService {
         user_id: &str,
         provider_id: &str,
         req: &FetchModelsRequest,
+        network_policy: OutboundNetworkPolicy,
     ) -> Result<FetchModelsResponse, SystemError> {
         let config = self.load_provider_config(user_id, provider_id).await?;
-        self.fetch_with_config(&config, req.try_fix).await
+        self.fetch_with_config(&config, req.try_fix, network_policy).await
     }
 
     /// Fetch models using credentials supplied in the request, without a
@@ -63,6 +67,7 @@ impl ModelFetchService {
     pub async fn fetch_models_anonymous(
         &self,
         req: &FetchModelsAnonymousRequest,
+        network_policy: OutboundNetworkPolicy,
     ) -> Result<FetchModelsResponse, SystemError> {
         validate_anonymous_request(req)?;
         let config = FetchConfig {
@@ -71,19 +76,36 @@ impl ModelFetchService {
             api_key: extract_first_key(&req.api_key),
             bedrock_config: req.bedrock_config.clone(),
         };
-        self.fetch_with_config(&config, req.try_fix).await
+        self.fetch_with_config(&config, req.try_fix, network_policy).await
     }
 
     /// Shared fetch+try_fix branch used by both the by-id and anonymous
     /// entry points.
-    async fn fetch_with_config(&self, config: &FetchConfig, try_fix: bool) -> Result<FetchModelsResponse, SystemError> {
-        match fetchers::fetch_for_platform(&self.http_client, config).await {
+    async fn fetch_with_config(
+        &self,
+        config: &FetchConfig,
+        try_fix: bool,
+        network_policy: OutboundNetworkPolicy,
+    ) -> Result<FetchModelsResponse, SystemError> {
+        if network_policy == OutboundNetworkPolicy::PublicOnly && config.platform == "bedrock" {
+            return Err(SystemError::BadRequest(
+                "Bedrock provider access is available only to site administrators".into(),
+            ));
+        }
+
+        let http_client = if uses_configured_http_endpoint(&config.platform) {
+            network_guard::client_for_url(&self.http_client, network_policy, &config.base_url).await?
+        } else {
+            self.http_client.clone()
+        };
+
+        match fetchers::fetch_for_platform(&http_client, config).await {
             Ok(models) => Ok(FetchModelsResponse {
                 models,
                 fixed_base_url: None,
             }),
             Err(err) if try_fix && supports_url_fix(&config.platform) => {
-                url_fixer::try_fix_url(&self.http_client, config).await.map_err(|_| err)
+                url_fixer::try_fix_url(&http_client, config).await.map_err(|_| err)
             }
             Err(err) => Err(err),
         }
@@ -111,6 +133,10 @@ impl ModelFetchService {
             bedrock_config,
         })
     }
+}
+
+fn uses_configured_http_endpoint(platform: &str) -> bool {
+    !matches!(platform, "bedrock" | "vertex-ai" | "minimax")
 }
 
 /// Validate a `FetchModelsAnonymousRequest` — platform / base_url / api_key
@@ -238,7 +264,10 @@ mod tests {
         let (svc, db) = setup().await;
         let id = create_provider(&db, "vertex-ai", "https://unused", "fake-key").await;
         let req = FetchModelsRequest { try_fix: false };
-        let resp = svc.fetch_models(TEST_USER_ID, &id, &req).await.unwrap();
+        let resp = svc
+            .fetch_models(TEST_USER_ID, &id, &req, OutboundNetworkPolicy::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(resp.models.len(), 2);
         assert!(resp.fixed_base_url.is_none());
     }
@@ -248,7 +277,10 @@ mod tests {
         let (svc, db) = setup().await;
         let id = create_provider(&db, "minimax", "https://unused", "fake-key").await;
         let req = FetchModelsRequest { try_fix: false };
-        let resp = svc.fetch_models(TEST_USER_ID, &id, &req).await.unwrap();
+        let resp = svc
+            .fetch_models(TEST_USER_ID, &id, &req, OutboundNetworkPolicy::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(resp.models.len(), 3);
     }
 
@@ -256,7 +288,10 @@ mod tests {
     async fn fetch_models_nonexistent_provider() {
         let (svc, _db) = setup().await;
         let req = FetchModelsRequest { try_fix: false };
-        let err = svc.fetch_models(TEST_USER_ID, "no_such_id", &req).await.unwrap_err();
+        let err = svc
+            .fetch_models(TEST_USER_ID, "no_such_id", &req, OutboundNetworkPolicy::Unrestricted)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SystemError::NotFound(_)));
     }
 
@@ -270,7 +305,10 @@ mod tests {
             bedrock_config: None,
             try_fix: false,
         };
-        let resp = svc.fetch_models_anonymous(&req).await.unwrap();
+        let resp = svc
+            .fetch_models_anonymous(&req, OutboundNetworkPolicy::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(resp.models.len(), 3);
         assert!(resp.fixed_base_url.is_none());
     }
@@ -285,7 +323,10 @@ mod tests {
             bedrock_config: None,
             try_fix: false,
         };
-        let err = svc.fetch_models_anonymous(&req).await.unwrap_err();
+        let err = svc
+            .fetch_models_anonymous(&req, OutboundNetworkPolicy::Unrestricted)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SystemError::BadRequest(_)));
     }
 
@@ -299,7 +340,10 @@ mod tests {
             bedrock_config: None,
             try_fix: false,
         };
-        let err = svc.fetch_models_anonymous(&req).await.unwrap_err();
+        let err = svc
+            .fetch_models_anonymous(&req, OutboundNetworkPolicy::Unrestricted)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SystemError::BadRequest(_)));
     }
 
@@ -317,6 +361,33 @@ mod tests {
             try_fix: false,
         };
         assert!(validate_anonymous_request(&req).is_ok());
+    }
+
+    #[tokio::test]
+    async fn hosted_member_cannot_probe_bedrock_with_access_keys() {
+        let (svc, _db) = setup().await;
+        let req = FetchModelsAnonymousRequest {
+            platform: "bedrock".into(),
+            base_url: "https://bedrock.us-east-1.amazonaws.com".into(),
+            api_key: "".into(),
+            bedrock_config: Some(aionui_api_types::BedrockConfig {
+                auth_method: aionui_api_types::BedrockAuthMethod::AccessKey,
+                region: "us-east-1".into(),
+                access_key_id: Some("AKIA_TEST".into()),
+                secret_access_key: Some("secret".into()),
+                profile: None,
+            }),
+            try_fix: false,
+        };
+
+        let error = svc
+            .fetch_models_anonymous(&req, OutboundNetworkPolicy::PublicOnly)
+            .await
+            .unwrap_err();
+        match error {
+            SystemError::BadRequest(message) => assert!(message.contains("only to site administrators")),
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     // ── extract_first_key ─────────────────────────────────────────────
@@ -357,7 +428,10 @@ mod tests {
             bedrock_config: None,
             try_fix: false,
         };
-        let resp = svc.fetch_models_anonymous(&req).await.unwrap();
+        let resp = svc
+            .fetch_models_anonymous(&req, OutboundNetworkPolicy::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(resp.models.len(), 3);
     }
 

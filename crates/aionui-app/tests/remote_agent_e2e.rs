@@ -372,3 +372,42 @@ async fn t8_full_crud_lifecycle() {
     let json = body_json(resp).await;
     assert!(json["data"].as_array().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn hosted_member_can_read_personal_catalog_but_cannot_manage_connections() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "member", "StrongP@ss2").await;
+
+    let response = app
+        .clone()
+        .oneshot(get_with_token("/api/remote-agents", &token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = [
+        json_with_token("POST", "/api/remote-agents", bearer_agent_body(), &token, &csrf),
+        json_with_token(
+            "PUT",
+            "/api/remote-agents/missing",
+            json!({ "url": "wss://remote.example.com" }),
+            &token,
+            &csrf,
+        ),
+        delete_with_token("/api/remote-agents/missing", &token, &csrf),
+        json_with_token(
+            "POST",
+            "/api/remote-agents/test-connection",
+            json!({ "url": "ws://127.0.0.1:9" }),
+            &token,
+            &csrf,
+        ),
+        json_with_token("POST", "/api/remote-agents/missing/handshake", json!({}), &token, &csrf),
+    ];
+
+    for request in requests {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "ADMIN_REQUIRED");
+    }
+}

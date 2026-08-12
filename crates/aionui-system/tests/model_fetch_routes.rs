@@ -16,8 +16,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use aionui_auth::CurrentUser;
 use aionui_common::encrypt_string;
 use aionui_db::{
-    CreateProviderParams, IProviderRepository, SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository,
-    SqliteProviderRepository, SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
+    CreateProviderParams, IProviderRepository, SiteRole, SqliteClientPreferenceRepository,
+    SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteSettingsRepository, UserStatus, UserType,
+    init_database_memory,
 };
 use aionui_realtime::BroadcastEventBus;
 use aionui_system::{
@@ -97,6 +98,10 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 }
 
 fn post_request(uri: &str, body: serde_json::Value) -> Request<Body> {
+    post_request_with_role(uri, body, SiteRole::Admin)
+}
+
+fn post_request_with_role(uri: &str, body: serde_json::Value, site_role: SiteRole) -> Request<Body> {
     let mut req = Request::builder()
         .method("POST")
         .uri(uri)
@@ -108,6 +113,8 @@ fn post_request(uri: &str, body: serde_json::Value) -> Request<Body> {
         username: TEST_USER_ID.to_owned(),
         user_type: UserType::Local,
         status: UserStatus::Active,
+        site_role,
+        must_change_password: false,
     });
     req
 }
@@ -122,6 +129,42 @@ async fn fetch_models_nonexistent_provider() {
     let req = post_request("/api/providers/nonexistent/models", json!({"try_fix": false}));
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn member_cannot_fetch_models_from_loopback_provider() {
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "openai", "http://127.0.0.1:9", "test-key").await;
+    let req = post_request_with_role(
+        &format!("/api/providers/{id}/models"),
+        json!({"try_fix": false}),
+        SiteRole::Member,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "BAD_REQUEST");
+}
+
+#[tokio::test]
+async fn member_cannot_fetch_models_anonymously_from_metadata_address() {
+    let (router, _db) = setup().await;
+    let req = post_request_with_role(
+        "/api/providers/fetch-models",
+        json!({
+            "platform": "openai",
+            "base_url": "http://169.254.169.254/latest/meta-data",
+            "api_key": "test-key",
+            "try_fix": false
+        }),
+        SiteRole::Member,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "BAD_REQUEST");
 }
 
 #[tokio::test]

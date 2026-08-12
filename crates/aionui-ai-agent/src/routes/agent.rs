@@ -10,6 +10,7 @@
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, State};
+use axum::middleware::from_fn;
 use axum::routing::{get, patch, post, put};
 
 use aionui_api_types::{
@@ -17,18 +18,21 @@ use aionui_api_types::{
     DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse, SetAgentOverridesRequest,
     SetEnabledRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, admin_required_middleware};
 use aionui_common::ApiError;
+use aionui_db::SiteRole;
 
 use crate::routes::error_mapping::agent_error_to_api_error;
 use crate::routes::state::AgentRouterState;
 
 pub fn agent_routes(state: AgentRouterState) -> Router {
-    Router::new()
+    let public_catalog = Router::new()
         .route("/api/agents/logos", get(list_agent_logos))
+        .route("/api/agents/provider-health-check", post(provider_health_check));
+
+    let host_management = Router::new()
         .route("/api/agents/management", get(list_management_agents))
         .route("/api/agents/{id}/health-check", post(health_check_by_id))
-        .route("/api/agents/provider-health-check", post(provider_health_check))
         .route("/api/agents/{id}/enabled", patch(set_agent_enabled))
         .route(
             "/api/agents/{id}/overrides",
@@ -36,8 +40,15 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
         )
         .route("/api/agents/custom", post(create_custom))
         .route("/api/agents/custom/{id}", put(update_custom).delete(delete_custom))
-        .route("/api/agents/custom/try-connect", post(try_connect_custom))
-        .with_state(state)
+        .route("/api/agents/custom/try-connect", post(try_connect_custom));
+
+    let host_management = if state.require_host_admin {
+        host_management.route_layer(from_fn(admin_required_middleware))
+    } else {
+        host_management
+    };
+
+    public_catalog.merge(host_management).with_state(state)
 }
 
 async fn list_agent_logos(
@@ -86,10 +97,11 @@ async fn provider_health_check(
     body: Result<Json<ProviderHealthCheckRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProviderHealthCheckResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let host_access_allowed = !state.require_host_admin || user.site_role == SiteRole::Admin;
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .provider_health_check(&user.id, req)
+            .provider_health_check(&user.id, req, host_access_allowed)
             .await
             .map_err(agent_error_to_api_error)?,
     )))

@@ -9,7 +9,7 @@ mod config;
 mod router;
 mod services;
 
-pub use config::{AppConfig, IdentityMode, derive_encryption_key};
+pub use config::{AppConfig, IdentityMode, derive_encryption_key, parse_allowed_origins, validate_local_client_secret};
 pub use router::{
     ChannelOrchestratorComponents, ModuleStates, RouterBuildError, RouterRuntime, build_assistant_state,
     build_conversation_state, build_extension_states, build_module_states, build_ws_state, create_router,

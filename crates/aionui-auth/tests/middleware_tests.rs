@@ -504,6 +504,8 @@ async fn authenticated_action_limit_uses_user_id_key() {
                     username: "admin".into(),
                     user_type: UserType::Local,
                     status: UserStatus::Active,
+                    site_role: aionui_db::SiteRole::Admin,
+                    must_change_password: false,
                 });
                 Ok::<_, std::convert::Infallible>(next.run(request).await)
             },

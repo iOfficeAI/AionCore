@@ -443,14 +443,14 @@ async fn list_messages_by_team_orders_desc_and_clamps_limit() {
     }
 
     // limit smaller than total keeps the newest ones, newest first.
-    let latest = repo.list_messages_by_team("t1", 3).await.unwrap();
+    let latest = repo.list_messages_by_team(DEFAULT_USER_ID, "t1", 3).await.unwrap();
     assert_eq!(latest.len(), 3);
     assert_eq!(latest[0].id, "m5");
     assert_eq!(latest[1].id, "m4");
     assert_eq!(latest[2].id, "m3");
 
     // limit above total returns everything (whole team, not a single mailbox).
-    let all = repo.list_messages_by_team("t1", 1000).await.unwrap();
+    let all = repo.list_messages_by_team(DEFAULT_USER_ID, "t1", 1000).await.unwrap();
     assert_eq!(all.len(), 5);
     assert_eq!(all.first().unwrap().id, "m5");
 }
@@ -465,7 +465,7 @@ async fn list_messages_by_team_limit_one() {
         repo.write_message(DEFAULT_USER_ID, &msg).await.unwrap();
     }
 
-    let one = repo.list_messages_by_team("t1", 1).await.unwrap();
+    let one = repo.list_messages_by_team(DEFAULT_USER_ID, "t1", 1).await.unwrap();
     assert_eq!(one.len(), 1);
     assert_eq!(one[0].id, "m3");
 }
@@ -475,7 +475,7 @@ async fn list_messages_by_team_empty() {
     let (repo, _db) = repo().await;
     repo.create_team(&make_team("t1", "Team")).await.unwrap();
 
-    let msgs = repo.list_messages_by_team("t1", 500).await.unwrap();
+    let msgs = repo.list_messages_by_team(DEFAULT_USER_ID, "t1", 500).await.unwrap();
     assert!(msgs.is_empty());
 }
 
@@ -490,17 +490,64 @@ async fn list_messages_by_ids_hits_empty_and_partial() {
     }
 
     // Empty ids -> empty result without touching the DB.
-    let none = repo.list_messages_by_ids(&[]).await.unwrap();
+    let none = repo.list_messages_by_ids(DEFAULT_USER_ID, "t1", &[]).await.unwrap();
     assert!(none.is_empty());
 
     // Mix of existing and missing ids returns only the hits, newest first.
     let hits = repo
-        .list_messages_by_ids(&["m1".to_string(), "m3".to_string(), "missing".to_string()])
+        .list_messages_by_ids(
+            DEFAULT_USER_ID,
+            "t1",
+            &["m1".to_string(), "m3".to_string(), "missing".to_string()],
+        )
         .await
         .unwrap();
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].id, "m3");
     assert_eq!(hits[1].id, "m1");
+}
+
+#[tokio::test]
+async fn team_message_listing_queries_enforce_owner_and_team() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team_for_user("team-a", "user-a", "A"))
+        .await
+        .unwrap();
+    repo.create_team(&make_team_for_user("team-b", "user-b", "B"))
+        .await
+        .unwrap();
+    repo.write_message(
+        "user-a",
+        &make_mailbox_msg("message-a", "team-a", "lead", "worker", "message"),
+    )
+    .await
+    .unwrap();
+    repo.write_message(
+        "user-b",
+        &make_mailbox_msg("message-b", "team-b", "lead", "worker", "message"),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        repo.list_messages_by_team("user-a", "team-b", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        repo.list_messages_by_team_paged("user-a", "team-b", None, PageDirection::Desc, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let rows = repo
+        .list_messages_by_ids("user-a", "team-a", &["message-a".to_owned(), "message-b".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "message-a");
 }
 
 #[tokio::test]
@@ -1050,7 +1097,7 @@ async fn paged_messages_desc_walks_older_with_stable_tiebreak() {
 
     // First page desc, limit 2 -> newest two: m5(4000), m4(3000,id"m4").
     let page1 = repo
-        .list_messages_by_team_paged("t1", None, PageDirection::Desc, 2)
+        .list_messages_by_team_paged(DEFAULT_USER_ID, "t1", None, PageDirection::Desc, 2)
         .await
         .unwrap();
     assert_eq!(page1.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["m5", "m4"]);
@@ -1061,7 +1108,7 @@ async fn paged_messages_desc_walks_older_with_stable_tiebreak() {
         id: "m4".into(),
     };
     let page2 = repo
-        .list_messages_by_team_paged("t1", Some(cursor), PageDirection::Desc, 2)
+        .list_messages_by_team_paged(DEFAULT_USER_ID, "t1", Some(cursor), PageDirection::Desc, 2)
         .await
         .unwrap();
     assert_eq!(page2.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["m3", "m2"]);
@@ -1077,7 +1124,7 @@ async fn paged_messages_asc_walks_newer_from_oldest() {
         repo.write_message(DEFAULT_USER_ID, &msg).await.unwrap();
     }
     let page1 = repo
-        .list_messages_by_team_paged("t1", None, PageDirection::Asc, 2)
+        .list_messages_by_team_paged(DEFAULT_USER_ID, "t1", None, PageDirection::Asc, 2)
         .await
         .unwrap();
     assert_eq!(page1.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["m1", "m2"]);
@@ -1087,7 +1134,7 @@ async fn paged_messages_asc_walks_newer_from_oldest() {
         id: "m2".into(),
     };
     let page2 = repo
-        .list_messages_by_team_paged("t1", Some(cursor), PageDirection::Asc, 2)
+        .list_messages_by_team_paged(DEFAULT_USER_ID, "t1", Some(cursor), PageDirection::Asc, 2)
         .await
         .unwrap();
     assert_eq!(page2.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["m3"]);

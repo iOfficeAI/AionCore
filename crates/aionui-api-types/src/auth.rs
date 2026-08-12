@@ -7,6 +7,108 @@ use serde::{Deserialize, Serialize};
 pub struct PublicUser {
     pub id: String,
     pub username: String,
+    pub role: UserRole,
+    pub status: AccountStatus,
+    pub must_change_password: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UserRole {
+    Admin,
+    #[default]
+    Member,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountStatus {
+    #[default]
+    Active,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AdminUserType {
+    Local,
+    Aionpro,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminUser {
+    pub id: String,
+    pub username: String,
+    pub user_type: AdminUserType,
+    pub role: UserRole,
+    pub status: AccountStatus,
+    pub must_change_password: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_login: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListAdminUsersQuery {
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminUserListResponse {
+    pub items: Vec<AdminUser>,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateAdminUserRequest {
+    pub username: String,
+    pub role: UserRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TemporaryPasswordResponse {
+    pub user: AdminUser,
+    pub temporary_password: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateAdminUsernameRequest {
+    pub username: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateAdminRoleRequest {
+    pub role: UserRole,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateAdminStatusRequest {
+    pub status: AccountStatus,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListAdminAuditQuery {
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdminAuditEntry {
+    pub id: String,
+    pub occurred_at: i64,
+    pub actor_user_id: Option<String>,
+    pub actor_username: Option<String>,
+    pub action: String,
+    pub target_user_id: Option<String>,
+    pub target_username: Option<String>,
+    pub details: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdminAuditListResponse {
+    pub items: Vec<AdminAuditEntry>,
+    pub next_cursor: Option<String>,
 }
 
 /// Login request body for `POST /login`.
@@ -209,6 +311,9 @@ mod tests {
         let user = PublicUser {
             id: "auth_1712345678_abc".into(),
             username: "admin".into(),
+            role: UserRole::Admin,
+            status: AccountStatus::Active,
+            must_change_password: false,
         };
         let json = serde_json::to_value(&user).unwrap();
         assert_eq!(json["id"], "auth_1712345678_abc");
@@ -235,6 +340,9 @@ mod tests {
         let user = PublicUser {
             id: "user_1".into(),
             username: "admin".into(),
+            role: UserRole::Admin,
+            status: AccountStatus::Active,
+            must_change_password: false,
         };
         let resp = LoginResponse::new(user.clone(), "jwt_token".into());
         assert!(resp.success);
@@ -249,6 +357,9 @@ mod tests {
             PublicUser {
                 id: "auth_123".into(),
                 username: "admin".into(),
+                role: UserRole::Admin,
+                status: AccountStatus::Active,
+                must_change_password: false,
             },
             "eyJhbGciOi".into(),
         );

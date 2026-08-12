@@ -856,24 +856,31 @@ impl ITeamRepository for FullMockTeamRepo {
     }
     async fn list_messages_by_team(
         &self,
+        user_id: &str,
         team_id: &str,
         limit: i64,
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-        self.inner.list_messages_by_team(team_id, limit).await
+        self.inner.list_messages_by_team(user_id, team_id, limit).await
     }
     async fn list_messages_by_team_paged(
         &self,
+        user_id: &str,
         team_id: &str,
         cursor: Option<ActivityCursor>,
         direction: PageDirection,
         limit: i64,
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
         self.inner
-            .list_messages_by_team_paged(team_id, cursor, direction, limit)
+            .list_messages_by_team_paged(user_id, team_id, cursor, direction, limit)
             .await
     }
-    async fn list_messages_by_ids(&self, ids: &[String]) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-        self.inner.list_messages_by_ids(ids).await
+    async fn list_messages_by_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+        self.inner.list_messages_by_ids(user_id, team_id, ids).await
     }
     async fn delete_mailbox_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
         self.inner.delete_mailbox_by_team(user_id, team_id).await

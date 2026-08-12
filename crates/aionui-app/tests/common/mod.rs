@@ -20,6 +20,53 @@ pub async fn build_app() -> (axum::Router, AppServices) {
     (router, services)
 }
 
+/// Build a WebUi-authenticated app whose file routes retain the embedded
+/// desktop host-path policy. Existing file behavior tests use this explicitly;
+/// multi-user isolation tests use the production user-session policy.
+pub async fn build_app_with_legacy_file_access() -> (axum::Router, AppServices) {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let mut services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let (mut states, _) = build_module_states(&services).await.expect("build module states");
+    states.file.file_service = std::sync::Arc::new(FileService::new(
+        services.event_bus.clone(),
+        states.file.allowed_roots.clone(),
+    ));
+    let store = std::sync::Arc::new(aionui_db::SqliteProjectStore::new(services.database.pool().clone()));
+    let project_service = aionui_project::ProjectService::new(store, services.work_dir.join("conversations"));
+    services.project_service = project_service.clone();
+    states.file.project = std::sync::Arc::new(project_service);
+    let router = create_router_with_states(&services, states);
+    (router, services)
+}
+
+pub async fn build_app_at(root: &std::path::Path) -> (axum::Router, AppServices) {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let config = AppConfig {
+        data_dir: root.to_path_buf(),
+        work_dir: root.to_path_buf(),
+        ..Default::default()
+    };
+    let services = AppServices::from_config(db, &config).await.unwrap();
+    let router = create_router(&services).await.expect("build router");
+    (router, services)
+}
+
+pub async fn build_app_at_with_bootstrap_workspace(
+    root: &std::path::Path,
+    bootstrap_workspace: &std::path::Path,
+) -> (axum::Router, AppServices) {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let config = AppConfig {
+        data_dir: root.to_path_buf(),
+        work_dir: bootstrap_workspace.to_path_buf(),
+        bootstrap_workspace: Some(bootstrap_workspace.to_path_buf()),
+        ..Default::default()
+    };
+    let services = AppServices::from_config(db, &config).await.unwrap();
+    let router = create_router(&services).await.expect("build router");
+    (router, services)
+}
+
 /// Build an app whose skill router uses the given temp directories.
 ///
 /// Use for HTTP integration tests that need deterministic on-disk layouts
@@ -105,9 +152,13 @@ pub async fn build_app_with_noop_opener() -> (axum::Router, AppServices) {
 
 pub async fn build_app_with_file_roots(allowed_roots: Vec<std::path::PathBuf>) -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let mut services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
     let (mut states, _) = build_module_states(&services).await.expect("build module states");
     states.file.file_service = std::sync::Arc::new(FileService::new(services.event_bus.clone(), allowed_roots));
+    let store = std::sync::Arc::new(aionui_db::SqliteProjectStore::new(services.database.pool().clone()));
+    let project_service = aionui_project::ProjectService::new(store, services.work_dir.join("conversations"));
+    services.project_service = project_service.clone();
+    states.file.project = std::sync::Arc::new(project_service);
     let router = create_router_with_states(&services, states);
     (router, services)
 }
@@ -340,6 +391,20 @@ pub async fn setup_and_login(
     let token = json["token"].as_str().unwrap().to_owned();
 
     (token, csrf)
+}
+
+/// Create and return the server-derived private workspace root for a test
+/// account. Call this after [`setup_and_login`] has created the identity.
+pub async fn managed_workspace_root(services: &AppServices, username: &str) -> std::path::PathBuf {
+    let user = services
+        .user_repo
+        .find_by_username(username)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("user '{username}' must exist"));
+    let root = services.project_service.user_workspace_root(&user.id).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    root
 }
 
 /// Log in an account that already exists — for a second app instance brought up

@@ -14,6 +14,9 @@ pub trait IUserRepository: Send + Sync {
     /// The system default user (empty password_hash) does not count.
     async fn has_users(&self) -> Result<bool, DbError>;
 
+    /// Returns true when at least one active local administrator can log in.
+    async fn has_usable_admin(&self) -> Result<bool, DbError>;
+
     /// Returns the system default user (`id = "system_default_user"`).
     async fn get_system_user(&self) -> Result<Option<User>, DbError>;
 
@@ -104,4 +107,19 @@ pub trait IUserRepository: Send + Sync {
 
     /// Increments a user's session generation and returns the new value.
     async fn increment_session_generation(&self, user_id: &str) -> Result<i64, DbError>;
+
+    /// Creates a persistent authentication session and returns its opaque ID.
+    async fn create_auth_session(&self, user_id: &str, expires_at: i64) -> Result<String, DbError>;
+
+    /// Returns whether a persistent session is active for this user.
+    async fn is_auth_session_active(&self, session_id: &str, user_id: &str) -> Result<bool, DbError>;
+
+    /// Updates last-seen time for an active persistent session.
+    async fn touch_auth_session(&self, session_id: &str, user_id: &str) -> Result<(), DbError>;
+
+    /// Revokes one persistent authentication session.
+    async fn revoke_auth_session(&self, session_id: &str, user_id: &str, reason: &str) -> Result<(), DbError>;
+
+    /// Revokes all active persistent sessions for a user.
+    async fn revoke_all_auth_sessions(&self, user_id: &str, reason: &str) -> Result<u64, DbError>;
 }

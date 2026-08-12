@@ -1,8 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use aionui_common::generate_short_id;
-use aionui_db::{FolderRow, IProjectStore, ProjectExplorerRow, ProjectKind, Role};
+use aionui_db::{
+    FolderRow, IProjectStore, IResourceShareRepository, ProjectExplorerRow, ProjectKind, ResourceAccess, Role,
+    ShareResourceType,
+};
 use chrono::{Datelike, Local};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -10,9 +13,18 @@ use crate::canonical::{self, Canonical};
 use crate::containment;
 use crate::scm::ScmInbound;
 use crate::types::{
-    AttachInput, FolderDto, ProjectDetail, ProjectError, ProjectExplorerEntry, ProjectExplorerView, ReferenceInput,
-    ResolveOutput, ResolvedResource, RuntimeStatus,
+    AttachInput, FileOp, FolderDto, ProjectDetail, ProjectError, ProjectExplorerEntry, ProjectExplorerView,
+    ReferenceInput, ResolveOutput, ResolvedResource, RuntimeStatus,
 };
+
+#[derive(Clone)]
+enum FilesystemAccess {
+    Local,
+    UserSession {
+        upload_root: PathBuf,
+        bootstrap_workspace: Option<PathBuf>,
+    },
+}
 
 /// Orchestrates the three project-bind tables through an injected
 /// [`IProjectStore`]. Owns filesystem operations (temp-dir creation,
@@ -20,7 +32,9 @@ use crate::types::{
 #[derive(Clone)]
 pub struct ProjectService {
     store: Arc<dyn IProjectStore>,
+    share_repo: Option<Arc<dyn IResourceShareRepository>>,
     temp_root: PathBuf,
+    filesystem_access: FilesystemAccess,
     /// Sink for project-root changes to the source-control actor. Shared across
     /// clones (behind `Arc`) so the one instance the scm monitor installs the
     /// sender on is the same one the HTTP handlers see. Set once at startup;
@@ -33,9 +47,126 @@ impl ProjectService {
     pub fn new(store: Arc<dyn IProjectStore>, temp_root: PathBuf) -> Self {
         Self {
             store,
+            share_repo: None,
             temp_root,
+            filesystem_access: FilesystemAccess::Local,
             scm_roots_tx: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Attach the resource-share repository so collaborators with `edit` can
+    /// mutate shared projects (reads already work via store-level share checks).
+    pub fn with_share_repo(mut self, share_repo: Arc<dyn IResourceShareRepository>) -> Self {
+        self.share_repo = Some(share_repo);
+        self
+    }
+
+    /// Construct the project service for a browser session deployment.
+    ///
+    /// Unlike embedded local mode, browser users may only bind and dereference
+    /// paths below their server-managed workspace and upload roots.
+    pub fn new_user_session(
+        store: Arc<dyn IProjectStore>,
+        temp_root: PathBuf,
+        upload_root: PathBuf,
+        bootstrap_workspace: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            store,
+            share_repo: None,
+            temp_root,
+            filesystem_access: FilesystemAccess::UserSession {
+                upload_root,
+                bootstrap_workspace,
+            },
+            scm_roots_tx: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Resolve the store actor user id for a write: the project owner when the
+    /// caller is owner or holds an `edit` share. View-only and outsiders get
+    /// not-found (no existence leak).
+    async fn resolve_write_owner(&self, user_id: &str, project_id: &str) -> Result<String, ProjectError> {
+        let Some(owner_id) = self.store.project_owner_user_id(project_id).await? else {
+            return Err(ProjectError::ProjectNotFound {
+                project_id: project_id.to_owned(),
+            });
+        };
+        if owner_id == user_id {
+            return Ok(owner_id);
+        }
+        if let Some(share_repo) = &self.share_repo {
+            let access = share_repo
+                .resolve_access(ShareResourceType::Project, project_id, user_id)
+                .await?;
+            if access == ResourceAccess::Edit {
+                return Ok(owner_id);
+            }
+        }
+        Err(ProjectError::ProjectNotFound {
+            project_id: project_id.to_owned(),
+        })
+    }
+
+    /// Whether callers retain the embedded application's host-path behavior.
+    pub fn allows_host_paths(&self) -> bool {
+        matches!(&self.filesystem_access, FilesystemAccess::Local)
+    }
+
+    /// Server-derived root for an authenticated user's conversation workspaces.
+    pub fn user_workspace_root(&self, user_id: &str) -> Result<PathBuf, ProjectError> {
+        let dir = aionui_common::user_dir_name(user_id).map_err(|_| ProjectError::UserFilesystemDenied)?;
+        Ok(self.temp_root.join("users").join(dir))
+    }
+
+    /// Server-derived upload root for an authenticated user.
+    pub fn user_upload_root(&self, user_id: &str) -> Result<PathBuf, ProjectError> {
+        match &self.filesystem_access {
+            FilesystemAccess::Local => Ok(std::env::temp_dir().join("aionui")),
+            FilesystemAccess::UserSession { upload_root, .. } => {
+                let dir = aionui_common::user_dir_name(user_id).map_err(|_| ProjectError::UserFilesystemDenied)?;
+                Ok(upload_root.join("users").join(dir))
+            }
+        }
+    }
+
+    /// Resolve a client-supplied path and enforce the current identity mode's
+    /// filesystem boundary. Local mode intentionally preserves the desktop
+    /// application's host-path behavior. User-session modes resolve symlinks
+    /// and allow only the caller's managed workspace (and, when requested,
+    /// upload) root.
+    pub fn authorize_user_path(
+        &self,
+        user_id: &str,
+        path: &Path,
+        op: FileOp,
+        include_uploads: bool,
+    ) -> Result<PathBuf, ProjectError> {
+        if self.allows_host_paths() {
+            return Ok(path.to_path_buf());
+        }
+
+        let candidate = canonical_path_for_operation(path, op)?;
+        let mut roots = vec![self.user_workspace_root(user_id)?];
+        if include_uploads {
+            roots.push(self.user_upload_root(user_id)?);
+        }
+        if user_id == "system_default_user"
+            && let FilesystemAccess::UserSession {
+                bootstrap_workspace: Some(root),
+                ..
+            } = &self.filesystem_access
+        {
+            roots.push(root.clone());
+        }
+        let allowed = roots
+            .iter()
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .any(|root| candidate.starts_with(root));
+        if !allowed {
+            return Err(ProjectError::UserFilesystemDenied);
+        }
+        Ok(candidate)
     }
 
     /// Install the sink that carries project-root changes to the source-control
@@ -67,6 +198,7 @@ impl ProjectService {
     pub async fn create_standard(&self, user_id: &str, uri: String) -> Result<ResolveOutput, ProjectError> {
         let canonical = canonical::canonicalize(&uri)?;
         self.ensure_accessible(&canonical)?;
+        self.ensure_user_managed_folder(user_id, &canonical)?;
         self.resolve_core(user_id, canonical, uri, ProjectKind::Standard, None)
             .await
     }
@@ -76,9 +208,9 @@ impl ProjectService {
     /// surfaces `temp_dir_exists`; an auto `short_uuid` collision is retried.
     pub async fn create_temp(&self, user_id: &str, basename: Option<String>) -> Result<ResolveOutput, ProjectError> {
         let dir = match basename.as_deref() {
-            Some(name) if !name.is_empty() => self.make_temp_dir(name)?,
+            Some(name) if !name.is_empty() => self.make_temp_dir(user_id, name)?,
             _ => loop {
-                match self.make_temp_dir(&generate_short_id()) {
+                match self.make_temp_dir(user_id, &generate_short_id()) {
                     Ok(dir) => break dir,
                     Err(ProjectError::TempDirExists { .. }) => continue,
                     Err(err) => return Err(err),
@@ -97,6 +229,7 @@ impl ProjectService {
     pub async fn resolve_existing(&self, user_id: &str, uri: String) -> Result<ResolveOutput, ProjectError> {
         let canonical = canonical::canonicalize(&uri)?;
         self.ensure_accessible(&canonical)?;
+        self.ensure_user_managed_folder(user_id, &canonical)?;
         let kind = if self.is_under_temp_root(&canonical) {
             ProjectKind::Temp
         } else {
@@ -157,16 +290,12 @@ impl ProjectService {
     /// Attach a non-workspace folder. Rejects duplicates and parent-overlap;
     /// a child of an existing entry returns that entry (focus-in-place).
     pub async fn attach_folder(&self, user_id: &str, input: AttachInput) -> Result<ProjectExplorerRow, ProjectError> {
-        // Ownership gate: without it a caller could hang entries off another
-        // user's project_id (their scoped entry list would just look empty).
-        self.store
-            .get_project(user_id, &input.project_id)
-            .await?
-            .ok_or_else(|| ProjectError::ProjectNotFound {
-                project_id: input.project_id.clone(),
-            })?;
+        // Write gate: owner or edit share. Store ops run as the project owner so
+        // explorer rows keep a single owner_user_id.
+        let owner_id = self.resolve_write_owner(user_id, &input.project_id).await?;
         let canonical = canonical::canonicalize(&input.uri)?;
         self.ensure_accessible(&canonical)?;
+        self.ensure_user_managed_folder(user_id, &canonical)?;
         let folder = self.store.upsert_folder(canonical.as_str(), &input.uri).await?;
 
         let entries = self.store.list_entries(user_id, &input.project_id).await?;
@@ -197,7 +326,7 @@ impl ProjectService {
         let row = self
             .store
             .insert_attached_entry(
-                user_id,
+                &owner_id,
                 &input.project_id,
                 &folder.folder_id,
                 input.display_name.as_deref(),
@@ -220,12 +349,13 @@ impl ProjectService {
                 .ok_or_else(|| ProjectError::ProjectExplorerNotFound {
                     pe_id: pe_id.to_owned(),
                 })?;
+        let owner_id = self.resolve_write_owner(user_id, &entry.project_id).await?;
         if entry.role == Role::Workspace.as_str() {
             return Err(ProjectError::WorkspaceEntryImmutable {
                 pe_id: pe_id.to_owned(),
             });
         }
-        self.store.remove_entry(user_id, pe_id).await?;
+        self.store.remove_entry(&owner_id, pe_id).await?;
         // Detaching a folder can drop a repository from the project's set.
         self.notify_roots_changed(&entry.project_id, user_id);
         Ok(())
@@ -237,7 +367,8 @@ impl ProjectService {
         project_id: &str,
         ordered_pe_ids: &[String],
     ) -> Result<(), ProjectError> {
-        self.store.reorder(user_id, project_id, ordered_pe_ids).await?;
+        let owner_id = self.resolve_write_owner(user_id, project_id).await?;
+        self.store.reorder(&owner_id, project_id, ordered_pe_ids).await?;
         Ok(())
     }
 
@@ -247,7 +378,15 @@ impl ProjectService {
         pe_id: &str,
         display_name: Option<String>,
     ) -> Result<ProjectExplorerRow, ProjectError> {
-        match self.store.rename_entry(user_id, pe_id, display_name.as_deref()).await {
+        let entry =
+            self.store
+                .get_entry(user_id, pe_id)
+                .await?
+                .ok_or_else(|| ProjectError::ProjectExplorerNotFound {
+                    pe_id: pe_id.to_owned(),
+                })?;
+        let owner_id = self.resolve_write_owner(user_id, &entry.project_id).await?;
+        match self.store.rename_entry(&owner_id, pe_id, display_name.as_deref()).await {
             Ok(row) => Ok(row),
             // A row this owner cannot see (missing or another user's) is the
             // same "not found" to the caller — never leak internal_db_error.
@@ -312,6 +451,10 @@ impl ProjectService {
                 pe_id: input.pe_id.clone(),
             }
         })?;
+        // Mutations through the explorer path require edit (or ownership).
+        if !matches!(input.op, FileOp::Read | FileOp::Browse) {
+            self.resolve_write_owner(user_id, &entry.project_id).await?;
+        }
         let folder = self
             .store
             .get_folder(&entry.folder_id)
@@ -338,7 +481,8 @@ impl ProjectService {
                 } else {
                     real_root.join(&resolved.relative_path)
                 };
-                Some(abs.to_string_lossy().into_owned())
+                let authorized = self.authorize_user_path(user_id, &abs, input.op, false)?;
+                Some(authorized.to_string_lossy().into_owned())
             }
             None => None,
         };
@@ -402,12 +546,28 @@ impl ProjectService {
         }
     }
 
+    fn ensure_user_managed_folder(&self, user_id: &str, canonical: &Canonical) -> Result<(), ProjectError> {
+        let path = canonical::fs_path(canonical)?;
+        self.authorize_user_path(user_id, &path, FileOp::Browse, false)?;
+        Ok(())
+    }
+
     /// Create `{temp_root}/YYYY/MM/DD/{leaf}`. Errors `temp_dir_exists` if the
     /// leaf already exists (caller-name collision).
-    fn make_temp_dir(&self, leaf: &str) -> Result<PathBuf, ProjectError> {
+    fn make_temp_dir(&self, user_id: &str, leaf: &str) -> Result<PathBuf, ProjectError> {
+        let mut components = Path::new(leaf).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            return Err(ProjectError::InvalidRelativePath {
+                relative_path: leaf.to_owned(),
+            });
+        }
         let now = Local::now();
-        let dir = self
-            .temp_root
+        let root = if self.allows_host_paths() {
+            self.temp_root.clone()
+        } else {
+            self.user_workspace_root(user_id)?
+        };
+        let dir = root
             .join(format!("{:04}", now.year()))
             .join(format!("{:02}", now.month()))
             .join(format!("{:02}", now.day()))
@@ -460,6 +620,27 @@ impl ProjectService {
             runtime_status,
             runtime_error,
         }
+    }
+}
+
+fn canonical_path_for_operation(path: &Path, op: FileOp) -> Result<PathBuf, ProjectError> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error)
+            if !matches!(op, FileOp::Browse)
+                && error.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            let parent = path.parent().ok_or(ProjectError::UserFilesystemDenied)?;
+            let file_name = path.file_name().ok_or(ProjectError::UserFilesystemDenied)?;
+            let parent = std::fs::canonicalize(parent).map_err(|_| ProjectError::LocalPathNotReadable {
+                path: path.to_string_lossy().into_owned(),
+            })?;
+            Ok(parent.join(file_name))
+        }
+        Err(_) => Err(ProjectError::LocalPathNotReadable {
+            path: path.to_string_lossy().into_owned(),
+        }),
     }
 }
 

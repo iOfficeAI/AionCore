@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use reqwest::Client;
+use reqwest::{Client, redirect::Policy};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -31,6 +31,7 @@ pub struct WeixinPlugin {
     bot_info: Option<BotInfo>,
     last_error: Option<String>,
     api: Option<Arc<WeixinApi>>,
+    message_tx: Option<tokio::sync::mpsc::Sender<UnifiedIncomingMessage>>,
     poll_handle: Option<JoinHandle<()>>,
     shutdown_tx: Option<watch::Sender<bool>>,
     context_tokens: Arc<DashMap<String, String>>,
@@ -43,6 +44,7 @@ impl Default for WeixinPlugin {
             bot_info: None,
             last_error: None,
             api: None,
+            message_tx: None,
             poll_handle: None,
             shutdown_tx: None,
             context_tokens: Arc::new(DashMap::new()),
@@ -83,15 +85,13 @@ impl ChannelPlugin for WeixinPlugin {
                 ChannelError::InvalidConfig("Missing WeChat account_id".into())
             })?;
 
-        let base_url = config
-            .credentials
-            .extra
-            .get("baseUrl")
-            .and_then(|v| v.as_str())
-            .unwrap_or(DEFAULT_BASE_URL);
+        let base_url = resolve_base_url(&config)?;
 
         let http_client = Client::builder()
             .timeout(Duration::from_secs(WEIXIN_POLL_TIMEOUT.as_secs() + 10))
+            // The authenticated bot token must never follow a redirect to a
+            // different or private origin.
+            .redirect(Policy::none())
             .build()
             .map_err(|e| {
                 self.status = PluginStatus::Error;
@@ -110,18 +110,7 @@ impl ChannelPlugin for WeixinPlugin {
         info!(account_id, "WeChat bot initialized");
 
         self.api = Some(api);
-
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        self.shutdown_tx = Some(shutdown_tx);
-
-        let api_clone = Arc::clone(self.api.as_ref().expect("api just set"));
-        let context_tokens = Arc::clone(&self.context_tokens);
-        self.poll_handle = Some(tokio::spawn(poll_loop(
-            api_clone,
-            callbacks.message_tx,
-            shutdown_rx,
-            context_tokens,
-        )));
+        self.message_tx = Some(callbacks.message_tx);
 
         self.status = PluginStatus::Ready;
         Ok(())
@@ -129,6 +118,26 @@ impl ChannelPlugin for WeixinPlugin {
 
     async fn start(&mut self) -> Result<(), ChannelError> {
         self.status = PluginStatus::Starting;
+
+        let api = self
+            .api
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| ChannelError::ConnectionFailed("WeChat plugin is not initialized".into()))?;
+        let message_tx = self
+            .message_tx
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| ChannelError::ConnectionFailed("WeChat callbacks are not initialized".into()))?;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        self.shutdown_tx = Some(shutdown_tx);
+        self.poll_handle = Some(tokio::spawn(poll_loop(
+            api,
+            message_tx,
+            shutdown_rx,
+            Arc::clone(&self.context_tokens),
+        )));
+
         self.status = PluginStatus::Running;
         info!("WeChat plugin started");
         Ok(())
@@ -141,11 +150,15 @@ impl ChannelPlugin for WeixinPlugin {
             let _ = tx.send(true);
         }
 
-        if let Some(handle) = self.poll_handle.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        if let Some(mut handle) = self.poll_handle.take()
+            && tokio::time::timeout(Duration::from_secs(5), &mut handle).await.is_err()
+        {
+            handle.abort();
+            let _ = handle.await;
         }
 
         self.api = None;
+        self.message_tx = None;
         self.context_tokens.clear();
         self.status = PluginStatus::Stopped;
         info!("WeChat plugin stopped");
@@ -197,6 +210,20 @@ impl ChannelPlugin for WeixinPlugin {
     }
 }
 
+fn resolve_base_url(config: &PluginConfig) -> Result<&'static str, ChannelError> {
+    if let Some(value) = config.credentials.extra.get("baseUrl") {
+        let requested = value
+            .as_str()
+            .ok_or_else(|| ChannelError::InvalidConfig("WeChat baseUrl must be a string".into()))?;
+        if requested.trim_end_matches('/') != DEFAULT_BASE_URL {
+            return Err(ChannelError::InvalidConfig(
+                "Custom WeChat API endpoints are not supported".into(),
+            ));
+        }
+    }
+    Ok(DEFAULT_BASE_URL)
+}
+
 // ---------------------------------------------------------------------------
 // Long-polling loop (buffer-based protocol)
 // ---------------------------------------------------------------------------
@@ -219,7 +246,14 @@ async fn poll_loop(
         // Reduce each round to success or a failure reason. On success we also
         // advance the buffer and dispatch messages; on API error / transport
         // error we only record the reason.
-        let outcome: Result<(), String> = match api.get_updates(&buf).await {
+        let response = tokio::select! {
+            response = api.get_updates(&buf) => response,
+            _ = shutdown_rx.changed() => {
+                debug!("WeChat poll loop shutdown during request");
+                break;
+            }
+        };
+        let outcome: Result<(), String> = match response {
             Ok(resp) => {
                 let is_api_error = resp.ret.unwrap_or(0) != 0 || resp.errcode.unwrap_or(0) != 0;
                 if is_api_error {
@@ -600,6 +634,32 @@ mod tests {
         let result = plugin.initialize(config, callbacks).await;
         assert!(result.is_err());
         assert_eq!(plugin.status(), PluginStatus::Error);
+    }
+
+    #[test]
+    fn custom_wechat_api_origins_are_rejected_before_network_access() {
+        for base_url in [
+            "http://127.0.0.1:8080",
+            "http://169.254.169.254/latest/meta-data",
+            "https://example.com",
+        ] {
+            let mut config = make_config(Some("tok_1"), Some("acc_1"));
+            config
+                .credentials
+                .extra
+                .insert("baseUrl".into(), serde_json::Value::String(base_url.into()));
+            assert!(resolve_base_url(&config).is_err(), "{base_url} must be rejected");
+        }
+    }
+
+    #[test]
+    fn official_wechat_origin_is_pinned() {
+        let mut config = make_config(Some("tok_1"), Some("acc_1"));
+        config.credentials.extra.insert(
+            "baseUrl".into(),
+            serde_json::Value::String("https://ilinkai.weixin.qq.com/".into()),
+        );
+        assert_eq!(resolve_base_url(&config).unwrap(), DEFAULT_BASE_URL);
     }
 
     // -- Test helpers -----------------------------------------------------------

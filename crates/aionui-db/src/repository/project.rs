@@ -23,7 +23,11 @@ pub trait IProjectStore: Send + Sync {
     async fn upsert_folder(&self, canonical: &str, raw_uri: &str) -> Result<FolderRow, DbError>;
 
     async fn get_folder(&self, folder_id: &str) -> Result<Option<FolderRow>, DbError>;
+    /// Returns a project when `user_id` is the owner or holds any share.
     async fn get_project(&self, user_id: &str, project_id: &str) -> Result<Option<ProjectRow>, DbError>;
+
+    /// Owner of a project, if it exists.
+    async fn project_owner_user_id(&self, project_id: &str) -> Result<Option<String>, DbError>;
 
     /// The workspace entry (if any) of `user_id` whose folder is `folder_id`.
     /// At most one exists per owner (enforced by
@@ -34,10 +38,11 @@ pub trait IProjectStore: Send + Sync {
         folder_id: &str,
     ) -> Result<Option<ProjectExplorerRow>, DbError>;
 
+    /// Entry readable when the caller owns it or holds a share on its project.
     async fn get_entry(&self, user_id: &str, pe_id: &str) -> Result<Option<ProjectExplorerRow>, DbError>;
 
-    /// All explorer entries of a project owned by `user_id`, each joined with
-    /// its folder, ordered by `order_index`.
+    /// All explorer entries of a project the caller can read (owner or share),
+    /// each joined with its folder, ordered by `order_index`.
     async fn list_entries(
         &self,
         user_id: &str,

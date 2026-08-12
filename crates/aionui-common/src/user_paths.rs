@@ -6,6 +6,9 @@
 
 use std::fmt;
 
+use base64::Engine;
+use sha2::{Digest, Sha256};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserDirNameError {
     Empty,
@@ -35,6 +38,21 @@ pub fn user_dir_name(user_id: &str) -> Result<String, UserDirNameError> {
         return Err(UserDirNameError::Unsafe(user_id.to_owned()));
     }
     Ok(name.to_owned())
+}
+
+/// Return a bounded, filename-safe directory component for every user id.
+///
+/// Normal internal ids retain their readable representation. Unsafe legacy or
+/// external ids use a deterministic SHA-256 fingerprint instead of ever being
+/// joined into a filesystem path verbatim.
+pub fn user_dir_name_or_fingerprint(user_id: &str) -> String {
+    user_dir_name(user_id).unwrap_or_else(|_| {
+        let digest = Sha256::digest(user_id.as_bytes());
+        format!(
+            "invalid-{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+        )
+    })
 }
 
 fn is_filename_safe(name: &str) -> bool {
@@ -68,5 +86,20 @@ mod tests {
         assert!(matches!(user_dir_name("user_a/b"), Err(UserDirNameError::Unsafe(_))));
         assert!(matches!(user_dir_name("user_.."), Err(UserDirNameError::Unsafe(_))));
         assert!(matches!(user_dir_name("../etc"), Err(UserDirNameError::Unsafe(_))));
+    }
+
+    #[test]
+    fn unsafe_ids_get_bounded_safe_fingerprints() {
+        let first = user_dir_name_or_fingerprint("../other");
+        let repeated = user_dir_name_or_fingerprint("../other");
+        let different = user_dir_name_or_fingerprint("../elsewhere");
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, different);
+        assert!(first.starts_with("invalid-"));
+        assert!(!first.contains('/'));
+        assert!(!first.contains(".."));
+        assert!(first.len() < 64);
+        assert_eq!(user_dir_name_or_fingerprint("user_safe-id"), "safe-id");
     }
 }

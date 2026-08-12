@@ -3,11 +3,13 @@
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, State};
+use axum::middleware::from_fn;
 use axum::routing::{get, post};
 
 use aionui_api_types::{
     ApiResponse, HubExtensionListItem, HubOperationResponse, HubUpdateInfo as ApiHubUpdateInfo, InstallExtensionRequest,
 };
+use aionui_auth::admin_required_middleware;
 use aionui_common::ApiError;
 
 use crate::hub::index_manager::HubIndexManager;
@@ -34,11 +36,23 @@ pub struct HubRouterState {
 pub fn hub_routes(state: HubRouterState) -> Router {
     Router::new()
         .route("/api/hub/extensions", get(get_hub_extensions))
-        .route("/api/hub/install", post(install_extension))
-        .route("/api/hub/retry-install", post(retry_install))
+        .route(
+            "/api/hub/install",
+            post(install_extension).route_layer(from_fn(admin_required_middleware)),
+        )
+        .route(
+            "/api/hub/retry-install",
+            post(retry_install).route_layer(from_fn(admin_required_middleware)),
+        )
         .route("/api/hub/check-updates", post(check_updates))
-        .route("/api/hub/update", post(update_extension))
-        .route("/api/hub/uninstall", post(uninstall_extension))
+        .route(
+            "/api/hub/update",
+            post(update_extension).route_layer(from_fn(admin_required_middleware)),
+        )
+        .route(
+            "/api/hub/uninstall",
+            post(uninstall_extension).route_layer(from_fn(admin_required_middleware)),
+        )
         .with_state(state)
 }
 
@@ -151,8 +165,14 @@ mod tests {
     use super::*;
     use crate::registry::ExtensionRegistry;
     use crate::state::ExtensionStateStore;
+    use aionui_auth::CurrentUser;
+    use aionui_db::{SiteRole, UserStatus, UserType};
     use aionui_realtime::BroadcastEventBus;
+    use axum::Extension;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode, header};
     use std::sync::Arc;
+    use tower::ServiceExt;
 
     fn make_state() -> HubRouterState {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -173,5 +193,63 @@ mod tests {
     fn hub_routes_builds_router() {
         let state = make_state();
         let _router = hub_routes(state);
+    }
+
+    fn current_user(role: SiteRole) -> CurrentUser {
+        CurrentUser {
+            id: "test-user".to_owned(),
+            username: "test-user".to_owned(),
+            user_type: UserType::Local,
+            status: UserStatus::Active,
+            site_role: role,
+            must_change_password: false,
+        }
+    }
+
+    fn operation_request(path: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"name":"missing-extension"}"#))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn member_cannot_mutate_global_hub_state_but_can_list() {
+        let app = hub_routes(make_state()).layer(Extension(current_user(SiteRole::Member)));
+
+        for path in [
+            "/api/hub/install",
+            "/api/hub/retry-install",
+            "/api/hub/update",
+            "/api/hub/uninstall",
+        ] {
+            let response = app.clone().oneshot(operation_request(path)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "member mutation must fail: {path}"
+            );
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/hub/extensions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn live_local_admin_reaches_global_hub_mutation_handler() {
+        let app = hub_routes(make_state()).layer(Extension(current_user(SiteRole::Admin)));
+        let response = app.oneshot(operation_request("/api/hub/install")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

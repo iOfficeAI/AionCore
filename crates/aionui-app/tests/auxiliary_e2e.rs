@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{body_json, get_with_token, json_with_token, setup_and_login};
+use common::{body_json, get_with_token, json_with_token, managed_workspace_root, setup_and_login};
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -93,11 +93,11 @@ async fn workspace_browse_no_active_task() {
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
     // Seed a real workspace on disk so the handler can canonicalize it.
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-    std::fs::write(tmp.path().join("src/lib.rs"), b"// hi").unwrap();
+    let workspace = managed_workspace_root(&services, "user1").await;
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("src/lib.rs"), b"// hi").unwrap();
 
-    let ws = tmp.path().to_string_lossy().into_owned();
+    let ws = workspace.to_string_lossy().into_owned();
     let conv_id = create_conversation_with_workspace(&mut app, &token, &csrf, "Test Conv", "acp", &ws).await;
 
     let req = get_with_token(&format!("/api/conversations/{conv_id}/workspace?path=/src"), &token);
@@ -132,15 +132,43 @@ async fn workspace_browse_empty_path() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn hosted_workspace_browse_rejects_legacy_outside_workspace_rows() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let managed = managed_workspace_root(&services, "user1").await;
+    let managed_string = managed.to_string_lossy().into_owned();
+    let conversation_id =
+        create_conversation_with_workspace(&mut app, &token, &csrf, "Legacy Conv", "acp", &managed_string).await;
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), b"not visible").unwrap();
+    let extra = serde_json::json!({ "workspace": outside.path() }).to_string();
+    sqlx::query("UPDATE conversations SET extra = ? WHERE id = ?")
+        .bind(extra)
+        .bind(&conversation_id)
+        .execute(services.database.pool())
+        .await
+        .unwrap();
+
+    let request = get_with_token(
+        &format!("/api/conversations/{conversation_id}/workspace?path=/"),
+        &token,
+    );
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "FORBIDDEN");
+}
+
 #[cfg(unix)]
 #[tokio::test]
-async fn workspace_browse_treats_symlinked_skill_dir_as_directory() {
+async fn hosted_workspace_browse_does_not_follow_symlink_outside_root() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
-    let tmp = tempfile::tempdir().unwrap();
-    let workspace = tmp.path().join("workspace");
-    let builtin = tmp.path().join("builtin-skills/auto-inject/aionui-skills");
+    let workspace = managed_workspace_root(&services, "user1").await;
+    let outside = tempfile::tempdir().unwrap();
+    let builtin = outside.path().join("builtin-skills/auto-inject/aionui-skills");
     std::fs::create_dir_all(workspace.join(".claude/skills")).unwrap();
     std::fs::create_dir_all(&builtin).unwrap();
     std::fs::write(builtin.join("SKILL.md"), b"---\ndescription: test\n---\nbody").unwrap();
@@ -171,16 +199,8 @@ async fn workspace_browse_treats_symlinked_skill_dir_as_directory() {
         &token,
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json = body_json(resp).await;
-    let entries = json["data"].as_array().unwrap();
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry["name"] == "SKILL.md" && entry["type"] == "file"),
-        "symlinked skill dir should remain browsable: {entries:?}"
-    );
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["code"], "BAD_REQUEST");
 }
 
 // ── 9.2 Side question ───────────────────────────────────────────

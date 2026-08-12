@@ -17,23 +17,42 @@ impl SqliteProviderRepository {
     }
 }
 
+/// Owner or any share — binds `user_id` twice against alias `p`.
+const PROVIDER_READ_BY_P: &str = "(p.user_id = ? OR EXISTS ( \
+    SELECT 1 FROM resource_shares s \
+    WHERE s.resource_type = 'provider' AND s.resource_id = p.id AND s.grantee_user_id = ? \
+))";
+
+/// Owner or edit share — binds `user_id` twice against alias `p`.
+const PROVIDER_WRITE_BY_P: &str = "(p.user_id = ? OR EXISTS ( \
+    SELECT 1 FROM resource_shares s \
+    WHERE s.resource_type = 'provider' AND s.resource_id = p.id \
+      AND s.grantee_user_id = ? AND s.permission = 'edit' \
+))";
+
 #[async_trait::async_trait]
 impl IProviderRepository for SqliteProviderRepository {
     async fn list(&self, user_id: &str) -> Result<Vec<Provider>, DbError> {
-        let rows = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE user_id = ? ORDER BY created_at ASC")
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query_as::<_, Provider>(&format!(
+            "SELECT p.* FROM providers p WHERE {PROVIDER_READ_BY_P} ORDER BY p.created_at ASC"
+        ))
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
 
         Ok(rows)
     }
 
     async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<Provider>, DbError> {
-        let row = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE user_id = ? AND id = ?")
-            .bind(user_id)
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query_as::<_, Provider>(&format!(
+            "SELECT p.* FROM providers p WHERE p.id = ? AND {PROVIDER_READ_BY_P}"
+        ))
+        .bind(id)
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
 
         Ok(row)
     }
@@ -102,20 +121,32 @@ impl IProviderRepository for SqliteProviderRepository {
     }
 
     async fn update(&self, user_id: &str, id: &str, params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
-        let existing = self
-            .find_by_id(user_id, id)
-            .await?
-            .ok_or_else(|| DbError::NotFound(format!("Provider '{id}' not found")))?;
+        // Edit requires owner or edit share (view-only cannot update).
+        let existing = sqlx::query_as::<_, Provider>(&format!(
+            "SELECT p.* FROM providers p WHERE p.id = ? AND {PROVIDER_WRITE_BY_P}"
+        ))
+        .bind(id)
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("Provider '{id}' not found")))?;
 
         let merged = merge_update(existing, params);
 
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE providers SET \
                 platform = ?, name = ?, base_url = ?, api_key_encrypted = ?, \
                 models = ?, enabled = ?, capabilities = ?, context_limit = ?, \
                 model_protocols = ?, model_enabled = ?, model_health = ?, \
                 model_settings = ?, bedrock_config = ?, is_full_url = ?, updated_at = ? \
-             WHERE user_id = ? AND id = ?",
+             WHERE id = ? AND ( \
+                user_id = ? OR EXISTS ( \
+                    SELECT 1 FROM resource_shares s \
+                    WHERE s.resource_type = 'provider' AND s.resource_id = providers.id \
+                      AND s.grantee_user_id = ? AND s.permission = 'edit' \
+                ) \
+             )",
         )
         .bind(&merged.platform)
         .bind(&merged.name)
@@ -132,15 +163,21 @@ impl IProviderRepository for SqliteProviderRepository {
         .bind(&merged.bedrock_config)
         .bind(merged.is_full_url)
         .bind(merged.updated_at)
-        .bind(user_id)
         .bind(id)
+        .bind(user_id)
+        .bind(user_id)
         .execute(&self.pool)
         .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("Provider '{id}' not found")));
+        }
 
         Ok(merged)
     }
 
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        // Delete remains owner-only.
         let result = sqlx::query("DELETE FROM providers WHERE user_id = ? AND id = ?")
             .bind(user_id)
             .bind(id)

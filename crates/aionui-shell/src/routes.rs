@@ -3,6 +3,7 @@
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Extension, Multipart, State, WebSocketUpgrade};
 use axum::http::StatusCode;
+use axum::middleware::from_fn;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -13,8 +14,11 @@ use aionui_api_types::{
     ApiResponse, CheckToolInstalledRequest, CheckToolInstalledResponse, OpenExternalRequest, OpenFileRequest,
     OpenFolderWithRequest, ShowItemInFolderRequest, SpeechToTextConfig, SttStreamServerMessage,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, admin_required_middleware};
 use aionui_common::ApiError;
+use aionui_db::SiteRole;
+#[cfg(test)]
+use aionui_db::UserType;
 use aionui_system::ClientPrefService;
 
 use crate::error::{ShellError, SttError};
@@ -54,14 +58,23 @@ impl From<SttError> for ApiError {
 }
 
 pub fn shell_routes(state: ShellRouterState) -> Router {
-    Router::new()
+    let host_integration = Router::new()
         .route("/api/shell/open-file", post(open_file))
         .route("/api/shell/show-item-in-folder", post(show_item_in_folder))
         .route("/api/shell/open-external", post(open_external))
         .route("/api/shell/check-tool-installed", post(check_tool_installed))
-        .route("/api/shell/open-folder-with", post(open_folder_with))
+        .route("/api/shell/open-folder-with", post(open_folder_with));
+
+    let host_integration = if state.require_host_admin {
+        host_integration.route_layer(from_fn(admin_required_middleware))
+    } else {
+        host_integration
+    };
+
+    Router::new()
         .route("/api/stt", post(speech_to_text))
         .route("/api/stt/stream", get(speech_to_text_stream))
+        .merge(host_integration)
         .with_state(state)
 }
 
@@ -218,6 +231,16 @@ async fn speech_to_text(
             (status, Json(body))
         })?;
 
+    enforce_member_stt_endpoint(&state, &user, &config).map_err(|error| {
+        let status = error.status_code();
+        let body = serde_json::json!({
+            "success": false,
+            "error": error.public_message(),
+            "code": error.error_code(),
+        });
+        (status, Json(body))
+    })?;
+
     let result = state
         .stt_service
         .transcribe(
@@ -298,17 +321,17 @@ async fn speech_to_text_stream(
     Extension(user): Extension<CurrentUser>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| speech_to_text_stream_socket(socket, state, user.id))
+    ws.on_upgrade(move |socket| speech_to_text_stream_socket(socket, state, user))
 }
 
 /// Pump WebSocket frames in/out of the transport-agnostic streaming session.
 ///
 /// This stays a pure frame adapter: all protocol and business logic lives in
 /// `stt_stream::run_stream_session`.
-async fn speech_to_text_stream_socket(socket: WebSocket, state: ShellRouterState, user_id: String) {
+async fn speech_to_text_stream_socket(socket: WebSocket, state: ShellRouterState, user: CurrentUser) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    let config = match load_stt_config(&state.client_pref_service, &user_id).await {
+    let config = match load_stt_config(&state.client_pref_service, &user.id).await {
         Ok(config) => config,
         Err(e) => {
             tracing::error!(error = %e, "stt stream: failed to load config");
@@ -323,6 +346,18 @@ async fn speech_to_text_stream_socket(socket: WebSocket, state: ShellRouterState
             return;
         }
     };
+
+    if enforce_member_stt_endpoint(&state, &user, &config).is_err() {
+        let frame = SttStreamServerMessage::Error {
+            code: "STT_ENDPOINT_ADMIN_REQUIRED".to_owned(),
+            msg: "Custom speech-to-text endpoints require administrator access.".to_owned(),
+        };
+        if let Ok(text) = serde_json::to_string(&frame) {
+            let _ = ws_tx.send(Message::Text(text.into())).await;
+        }
+        let _ = ws_tx.send(Message::Close(None)).await;
+        return;
+    }
 
     let (client_tx, client_rx) = mpsc::channel(STT_STREAM_CHANNEL_CAPACITY);
     let (server_tx, mut server_rx) = mpsc::channel(STT_STREAM_CHANNEL_CAPACITY);
@@ -367,9 +402,54 @@ async fn speech_to_text_stream_socket(socket: WebSocket, state: ShellRouterState
     read_task.abort();
 }
 
+fn enforce_member_stt_endpoint(
+    state: &ShellRouterState,
+    user: &CurrentUser,
+    config: &SpeechToTextConfig,
+) -> Result<(), ApiError> {
+    let is_host_admin = user.site_role == SiteRole::Admin;
+    if !state.require_host_admin || is_host_admin || uses_official_stt_endpoint(config) {
+        return Ok(());
+    }
+    Err(ApiError::coded(
+        StatusCode::FORBIDDEN,
+        "STT_ENDPOINT_ADMIN_REQUIRED",
+        "Custom speech-to-text endpoints require administrator access.",
+        None,
+    ))
+}
+
+fn uses_official_stt_endpoint(config: &SpeechToTextConfig) -> bool {
+    match config.provider {
+        aionui_api_types::SpeechToTextProvider::Openai => config
+            .openai
+            .as_ref()
+            .is_some_and(|provider| official_https_endpoint(provider.base_url.as_deref(), "api.openai.com")),
+        aionui_api_types::SpeechToTextProvider::Deepgram => config
+            .deepgram
+            .as_ref()
+            .is_some_and(|provider| official_https_endpoint(provider.base_url.as_deref(), "api.deepgram.com")),
+    }
+}
+
+fn official_https_endpoint(configured: Option<&str>, expected_host: &str) -> bool {
+    let Some(configured) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    let Ok(url) = reqwest::Url::parse(configured) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str() == Some(expected_host)
+        && url.port().is_none_or(|port| port == 443)
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Extension;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -389,11 +469,48 @@ mod tests {
             shell_service: Arc::new(ShellService::new(Arc::new(NoopSystemOpener))),
             stt_service: Arc::new(SttService::new(reqwest::Client::new())),
             client_pref_service,
+            require_host_admin: false,
         }
     }
 
     fn make_router() -> Router {
         shell_routes(make_state())
+    }
+
+    fn member() -> CurrentUser {
+        CurrentUser {
+            id: "member-user".into(),
+            username: "member-user".into(),
+            user_type: UserType::Local,
+            status: aionui_db::UserStatus::Active,
+            site_role: SiteRole::Member,
+            must_change_password: false,
+        }
+    }
+
+    fn stt_config(provider: aionui_api_types::SpeechToTextProvider, base_url: Option<&str>) -> SpeechToTextConfig {
+        SpeechToTextConfig {
+            enabled: true,
+            provider,
+            auto_send: None,
+            openai: Some(aionui_api_types::OpenAISpeechToTextConfig {
+                api_key: "secret".into(),
+                base_url: base_url.map(str::to_owned),
+                model: "whisper-1".into(),
+                language: None,
+                prompt: None,
+                temperature: None,
+            }),
+            deepgram: Some(aionui_api_types::DeepgramSpeechToTextConfig {
+                api_key: "secret".into(),
+                base_url: base_url.map(str::to_owned),
+                model: "nova-2".into(),
+                language: None,
+                detect_language: None,
+                punctuate: None,
+                smart_format: None,
+            }),
+        }
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -511,6 +628,74 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn hosted_member_cannot_operate_host_shell_integrations() {
+        let mut state = make_state();
+        state.require_host_admin = true;
+        let app = shell_routes(state).layer(Extension(member()));
+        let requests = [
+            ("/api/shell/open-file", r#"{"filePath":"/etc/passwd"}"#),
+            ("/api/shell/show-item-in-folder", r#"{"filePath":"/etc/passwd"}"#),
+            ("/api/shell/open-external", r#"{"url":"https://example.com"}"#),
+            ("/api/shell/check-tool-installed", r#"{"tool":"terminal"}"#),
+            (
+                "/api/shell/open-folder-with",
+                r#"{"folderPath":"/tmp","tool":"terminal"}"#,
+            ),
+        ];
+
+        for (uri, body) in requests {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(body_json(response).await["code"], "ADMIN_REQUIRED");
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_member_stt_allows_only_official_https_endpoints() {
+        let mut state = make_state();
+        state.require_host_admin = true;
+        let member = member();
+
+        for config in [
+            stt_config(aionui_api_types::SpeechToTextProvider::Openai, None),
+            stt_config(
+                aionui_api_types::SpeechToTextProvider::Openai,
+                Some("https://api.openai.com/v1"),
+            ),
+            stt_config(aionui_api_types::SpeechToTextProvider::Deepgram, None),
+            stt_config(
+                aionui_api_types::SpeechToTextProvider::Deepgram,
+                Some("https://api.deepgram.com"),
+            ),
+        ] {
+            assert!(enforce_member_stt_endpoint(&state, &member, &config).is_ok());
+        }
+
+        for base_url in [
+            "http://api.openai.com",
+            "https://api.openai.com.evil.example",
+            "https://127.0.0.1",
+            "https://user:password@api.openai.com",
+        ] {
+            let config = stt_config(aionui_api_types::SpeechToTextProvider::Openai, Some(base_url));
+            let error = enforce_member_stt_endpoint(&state, &member, &config).unwrap_err();
+            assert_eq!(error.status_code(), StatusCode::FORBIDDEN);
+            assert_eq!(error.error_code(), "STT_ENDPOINT_ADMIN_REQUIRED");
+        }
     }
 
     #[test]

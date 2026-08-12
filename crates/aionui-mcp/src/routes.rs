@@ -14,6 +14,7 @@ use aionui_api_types::{
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
+use aionui_db::SiteRole;
 
 use crate::connection_test::McpConnectionTestService;
 use crate::error::McpError;
@@ -50,6 +51,18 @@ pub struct McpRouterState {
     pub sync_service: McpSyncService,
     pub connection_test_service: McpConnectionTestService,
     pub oauth_service: McpOAuthService,
+}
+
+fn require_infrastructure_admin(user: &CurrentUser) -> Result<(), ApiError> {
+    if user.site_role != SiteRole::Admin {
+        return Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "ADMIN_REQUIRED",
+            "Administrator access required.",
+            None,
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +131,7 @@ async fn add_server(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateMcpServerRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<McpServerResponse>>), ApiError> {
+    require_infrastructure_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let server = state
         .config_service
@@ -134,6 +148,7 @@ async fn edit_server(
     Path(id): Path<String>,
     body: Result<Json<UpdateMcpServerRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<McpServerResponse>>, ApiError> {
+    require_infrastructure_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let server = state
         .config_service
@@ -163,6 +178,7 @@ async fn toggle_server(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<McpServerResponse>>, ApiError> {
+    require_infrastructure_admin(&user)?;
     let server = state
         .config_service
         .toggle_server(&user.id, &id)
@@ -177,6 +193,7 @@ async fn batch_import(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<BatchImportMcpServersRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<McpServerResponse>>>, ApiError> {
+    require_infrastructure_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let servers = state
         .config_service
@@ -198,6 +215,7 @@ async fn test_connection(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<TestMcpConnectionRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    require_infrastructure_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let transport = McpServerTransport::from(req.transport);
     let result = state
@@ -263,6 +281,7 @@ async fn get_agent_configs(
     State(state): State<McpRouterState>,
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<DetectedMcpServerResponse>>>, ApiError> {
+    require_infrastructure_admin(&user)?;
     let configs = state
         .sync_service
         .get_agent_configs(&user.id)
@@ -281,6 +300,7 @@ async fn oauth_check_status(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<OAuthCheckStatusRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<OAuthStatusResponse>>, ApiError> {
+    require_infrastructure_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let status = state
         .oauth_service
@@ -299,6 +319,7 @@ async fn oauth_login(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<OAuthLoginRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<OAuthLoginResponse>>, ApiError> {
+    require_infrastructure_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .oauth_service
@@ -314,6 +335,7 @@ async fn oauth_logout(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<OAuthLogoutRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    require_infrastructure_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     state
         .oauth_service
@@ -328,6 +350,7 @@ async fn oauth_authenticated(
     State(state): State<McpRouterState>,
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, ApiError> {
+    require_infrastructure_admin(&user)?;
     let urls = state
         .oauth_service
         .get_authenticated_servers(&user.id)
@@ -339,6 +362,142 @@ async fn oauth_authenticated(
 #[cfg(test)]
 mod error_mapping_tests {
     use super::*;
+    use std::sync::Arc;
+
+    use aionui_db::{SiteRole, SqliteMcpServerRepository, SqliteOAuthTokenRepository, UserStatus, UserType};
+    use aionui_realtime::BroadcastEventBus;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, header};
+    use tower::ServiceExt;
+
+    async fn make_state() -> McpRouterState {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let mcp_repo = Arc::new(SqliteMcpServerRepository::new(db.pool().clone()));
+        let oauth_repo = Arc::new(SqliteOAuthTokenRepository::new(db.pool().clone()));
+        let http_client = reqwest::Client::new();
+        McpRouterState {
+            config_service: McpConfigService::new(mcp_repo.clone()),
+            sync_service: McpSyncService::new(mcp_repo, Vec::new()),
+            connection_test_service: McpConnectionTestService::new(
+                http_client.clone(),
+                Arc::new(BroadcastEventBus::new(16)),
+            ),
+            oauth_service: McpOAuthService::new(oauth_repo, http_client),
+        }
+    }
+
+    fn current_user(site_role: SiteRole) -> CurrentUser {
+        CurrentUser {
+            id: "user_route-test".into(),
+            username: "route-test".into(),
+            user_type: UserType::Local,
+            status: UserStatus::Active,
+            site_role,
+            must_change_password: false,
+        }
+    }
+
+    async fn response_code(response: Response) -> String {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn json_request(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn member_cannot_run_connection_tests_or_scan_host_agent_configs() {
+        let app = mcp_routes(make_state().await).layer(Extension(current_user(SiteRole::Member)));
+        let connection_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mcp/test-connection")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(connection_response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_code(connection_response).await, "ADMIN_REQUIRED");
+
+        let configs_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/mcp/agent-configs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(configs_response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_code(configs_response).await, "ADMIN_REQUIRED");
+    }
+
+    #[tokio::test]
+    async fn member_cannot_persist_or_authorize_executable_mcp_configuration() {
+        let app = mcp_routes(make_state().await).layer(Extension(current_user(SiteRole::Member)));
+        let requests = [
+            json_request("POST", "/api/mcp/servers"),
+            json_request("PUT", "/api/mcp/servers/server-1"),
+            json_request("POST", "/api/mcp/servers/server-1/toggle"),
+            json_request("POST", "/api/mcp/servers/import"),
+            json_request("POST", "/api/mcp/oauth/check-status"),
+            json_request("POST", "/api/mcp/oauth/login"),
+            json_request("POST", "/api/mcp/oauth/logout"),
+            Request::builder()
+                .uri("/api/mcp/oauth/authenticated")
+                .body(Body::empty())
+                .unwrap(),
+        ];
+
+        for request in requests {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response_code(response).await, "ADMIN_REQUIRED");
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_can_scan_agent_configs_and_reaches_connection_validation() {
+        let app = mcp_routes(make_state().await).layer(Extension(current_user(SiteRole::Admin)));
+        let configs_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/mcp/agent-configs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(configs_response.status(), StatusCode::OK);
+
+        let connection_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mcp/test-connection")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(connection_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_code(connection_response).await, "BAD_REQUEST");
+    }
 
     #[test]
     fn not_found_maps_to_app_not_found() {

@@ -259,24 +259,26 @@ impl ConversationService {
             });
         }
 
-        // Resolve the browsed path relative to the workspace root
-        let base = std::path::Path::new(&workspace);
+        // Re-authorize the persisted workspace at use time. This fails closed
+        // for rows created before hosted filesystem isolation was enabled.
+        let authorized_workspace = self.authorize_workspace_path(user_id, &workspace)?;
+        let base = std::path::Path::new(&authorized_workspace);
         let browse_path = if relative_path.is_empty() {
             base.to_path_buf()
         } else {
             base.join(relative_path_obj)
         };
 
-        // Security: reject direct traversal outside the workspace root, but allow
-        // symlinked directories mounted inside the workspace (e.g. native skill
-        // dirs that point at the builtin skills corpus under data-dir).
+        // Hosted sessions must resolve inside the caller's workspace root.
+        // Local desktop mode retains legacy support for symlink-mounted skill
+        // directories outside that root.
         let canonical_base = base
             .canonicalize()
             .map_err(|e| ConversationError::internal(format!("Failed to resolve workspace path: {e}")))?;
         let canonical_browse = browse_path
             .canonicalize()
             .map_err(|_| ConversationError::not_found_reason("Directory not found"))?;
-        if !browse_path.starts_with(base) && !canonical_browse.starts_with(&canonical_base) {
+        if !canonical_browse.starts_with(&canonical_base) && !self.allows_workspace_symlink_escape() {
             return Err(ConversationError::BadRequest {
                 reason: "Path traversal outside workspace is not allowed".into(),
             });

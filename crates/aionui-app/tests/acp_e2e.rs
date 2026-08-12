@@ -31,7 +31,7 @@ async fn user_id_for_username(services: &aionui_app::AppServices, username: &str
 #[tokio::test]
 async fn management_list_returns_array() {
     let (mut app, services) = build_app().await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "pass123").await;
 
     let req = get_with_token("/api/agents/management", &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -57,7 +57,7 @@ async fn legacy_refresh_agents_endpoint_is_not_found() {
 #[tokio::test]
 async fn test_custom_agent_nonexistent_command() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "pass123").await;
 
     // Endpoint was renamed from /api/agents/test to /api/agents/custom/try-connect
     // when the custom-agent CRUD routes were introduced.  The new endpoint always
@@ -80,8 +80,8 @@ async fn test_custom_agent_nonexistent_command() {
 #[tokio::test]
 async fn management_list_includes_missing_custom_agents() {
     let (mut app, services) = build_app().await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-    let user_id = user_id_for_username(&services, "user1").await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "pass123").await;
+    let user_id = user_id_for_username(&services, "admin").await;
 
     let repo: std::sync::Arc<dyn IAgentMetadataRepository> =
         std::sync::Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone()));
@@ -135,8 +135,8 @@ async fn management_list_includes_missing_custom_agents() {
 #[tokio::test]
 async fn management_list_marks_rows_with_unavailable_snapshot() {
     let (mut app, services) = build_app().await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-    let user_id = user_id_for_username(&services, "user1").await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "pass123").await;
+    let user_id = user_id_for_username(&services, "admin").await;
 
     let repo: std::sync::Arc<dyn IAgentMetadataRepository> =
         std::sync::Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone()));
@@ -216,8 +216,8 @@ async fn legacy_agents_endpoint_is_not_found() {
 #[tokio::test]
 async fn health_check_by_id_returns_missing_status_for_uninstalled_agent() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
-    let user_id = user_id_for_username(&services, "user1").await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "pass123").await;
+    let user_id = user_id_for_username(&services, "admin").await;
 
     let repo: std::sync::Arc<dyn IAgentMetadataRepository> =
         std::sync::Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone()));

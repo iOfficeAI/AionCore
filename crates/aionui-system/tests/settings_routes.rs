@@ -14,7 +14,7 @@ use tower::ServiceExt;
 
 use aionui_auth::CurrentUser;
 use aionui_db::{
-    SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
+    SiteRole, SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
     SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
 };
 use aionui_system::{
@@ -80,6 +80,8 @@ fn get_request_for_user(user_id: &str, uri: &str) -> Request<Body> {
         username: user_id.to_owned(),
         user_type: UserType::Local,
         status: UserStatus::Active,
+        site_role: SiteRole::Admin,
+        must_change_password: false,
     });
     req
 }
@@ -100,6 +102,8 @@ fn json_request_for_user(user_id: &str, method: &str, uri: &str, body: serde_jso
         username: user_id.to_owned(),
         user_type: UserType::Local,
         status: UserStatus::Active,
+        site_role: SiteRole::Admin,
+        must_change_password: false,
     });
     req
 }

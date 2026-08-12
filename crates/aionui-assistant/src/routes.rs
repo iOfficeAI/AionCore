@@ -16,8 +16,10 @@ use aionui_api_types::{
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
+use aionui_db::SiteRole;
 
 use crate::error::AssistantError;
+use crate::service::AssistantAvatarPolicy;
 pub use crate::state::AssistantRouterState;
 
 /// Build the router for `/api/assistants/*`.
@@ -66,7 +68,14 @@ async fn create(
     body: Result<Json<CreateAssistantRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<AssistantResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let created = state.service.create_for_user(&current_user.id, req).await?;
+    let created = state
+        .service
+        .create_for_user_with_avatar_policy(
+            &current_user.id,
+            req,
+            avatar_policy(state.require_host_admin, &current_user),
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(created))))
 }
 
@@ -90,7 +99,15 @@ async fn update(
     body: Result<Json<UpdateAssistantRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let updated = state.service.update_for_user(&current_user.id, &id, req).await?;
+    let updated = state
+        .service
+        .update_for_user_with_avatar_policy(
+            &current_user.id,
+            &id,
+            req,
+            avatar_policy(state.require_host_admin, &current_user),
+        )
+        .await?;
     Ok(Json(ApiResponse::ok(updated)))
 }
 
@@ -120,8 +137,23 @@ async fn import(
     body: Result<Json<ImportAssistantsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportAssistantsResult>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let result = state.service.import_for_user(&current_user.id, req).await?;
+    let result = state
+        .service
+        .import_for_user_with_avatar_policy(
+            &current_user.id,
+            req,
+            avatar_policy(state.require_host_admin, &current_user),
+        )
+        .await?;
     Ok(Json(ApiResponse::ok(result)))
+}
+
+fn avatar_policy(require_host_admin: bool, user: &CurrentUser) -> AssistantAvatarPolicy {
+    if !require_host_admin || user.site_role == SiteRole::Admin {
+        AssistantAvatarPolicy::AllowHostPaths
+    } else {
+        AssistantAvatarPolicy::ManagedOnly
+    }
 }
 
 /// Serve the raw avatar bytes for an assistant. Content-Type inferred from the
@@ -158,4 +190,48 @@ fn content_type_for_extension(ext: Option<&str>) -> HeaderValue {
         _ => "application/octet-stream",
     };
     HeaderValue::from_static(mime)
+}
+
+#[cfg(test)]
+mod tests {
+    use aionui_db::{SiteRole, UserStatus, UserType};
+
+    use super::*;
+
+    fn current_user(user_type: UserType, site_role: SiteRole) -> CurrentUser {
+        CurrentUser {
+            id: "user-1".into(),
+            username: "user-1".into(),
+            user_type,
+            status: UserStatus::Active,
+            site_role,
+            must_change_password: false,
+        }
+    }
+
+    #[test]
+    fn hosted_members_are_managed_only_in_webui_and_aionpro() {
+        for user_type in [UserType::Local, UserType::Aionpro] {
+            assert_eq!(
+                avatar_policy(true, &current_user(user_type, SiteRole::Member)),
+                AssistantAvatarPolicy::ManagedOnly,
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_admins_and_local_mode_retain_legacy_avatar_paths() {
+        assert_eq!(
+            avatar_policy(true, &current_user(UserType::Local, SiteRole::Admin)),
+            AssistantAvatarPolicy::AllowHostPaths,
+        );
+        assert_eq!(
+            avatar_policy(true, &current_user(UserType::Aionpro, SiteRole::Admin)),
+            AssistantAvatarPolicy::AllowHostPaths,
+        );
+        assert_eq!(
+            avatar_policy(false, &current_user(UserType::Local, SiteRole::Member)),
+            AssistantAvatarPolicy::AllowHostPaths,
+        );
+    }
 }

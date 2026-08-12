@@ -16,7 +16,7 @@ use aionui_api_types::{
     AgentManagementRow, AgentManagementStatus, AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource,
     AgentSourceInfo, BehaviorPolicy,
 };
-use aionui_app::{AppConfig, AppServices, ModuleStates, build_module_states, create_router_with_states};
+use aionui_app::{AppConfig, AppServices, IdentityMode, ModuleStates, build_module_states, create_router_with_states};
 use aionui_assistant::{AssistantAgentCatalogPort, AssistantRouterState, AssistantService, BuiltinAssistantRegistry};
 use aionui_common::AgentType;
 use aionui_db::{
@@ -38,6 +38,7 @@ use tower::ServiceExt;
 use common::{body_json, delete_with_token, get_with_token, json_with_token, setup_and_login};
 
 const DEFAULT_USER_ID: &str = "system_default_user";
+const LOCAL_CLIENT_SECRET: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678";
 
 // ---------------------------------------------------------------------------
 // Fixture — router + temp dirs + services
@@ -151,6 +152,10 @@ fn assert_versioned_avatar_value(value: Option<&str>, expected_path: &str) {
 /// Also logs in `admin` and hands back the session + CSRF tokens so tests
 /// can issue authenticated mutating requests.
 async fn fixture() -> Fixture {
+    fixture_with_config(AppConfig::default()).await
+}
+
+async fn fixture_with_config(config: AppConfig) -> Fixture {
     let user_tmp = TempDir::new().unwrap();
     let builtin_tmp = TempDir::new().unwrap();
     let ext_tmp = TempDir::new().unwrap();
@@ -215,7 +220,7 @@ async fn fixture() -> Fixture {
 
     // Bring up in-memory DB + services + default module states.
     let db = init_database_memory().await.unwrap();
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let services = AppServices::from_config(db, &config).await.unwrap();
     let (mut states, _): (ModuleStates, _) = build_module_states(&services).await.expect("build module states");
     for table in [
         "assistant_preferences",
@@ -337,6 +342,7 @@ async fn fixture() -> Fixture {
     service.bootstrap_assistant_storage().await.unwrap();
     states.assistant = AssistantRouterState {
         service: service.clone(),
+        require_host_admin: !services.identity_mode.is_local(),
     };
     // Rewire the skill-router dispatcher so assistant-rule / assistant-skill
     // endpoints route through the test-configured service.
@@ -344,7 +350,11 @@ async fn fixture() -> Fixture {
     states.skill.assistant_dispatcher = Some(dispatcher);
 
     let mut app = create_router_with_states(&services, states);
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = if services.identity_mode.is_local() {
+        (String::new(), String::new())
+    } else {
+        setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await
+    };
 
     Fixture {
         app,
@@ -677,6 +687,191 @@ async fn create_allows_id_that_matches_extension_registry_assistant() {
 }
 
 #[tokio::test]
+async fn hosted_member_avatar_inputs_are_managed_only_across_create_update_and_import() {
+    let fx = fixture().await;
+    let mut app = fx.app.clone();
+    let (member_token, member_csrf) = setup_and_login(&mut app, &fx.services, "avatar-member", "StrongP@ss2").await;
+    let member = fx
+        .services
+        .user_repo
+        .find_by_username("avatar-member")
+        .await
+        .unwrap()
+        .unwrap();
+    let member_dir = aionui_common::user_dir_name(&member.id).unwrap();
+    let source_avatar = fx.user_data_dir.join("host-only-avatar.png");
+    std::fs::write(&source_avatar, b"host-only-bytes").unwrap();
+    let file_uri = format!("file://{}", source_avatar.display());
+    let absolute = source_avatar.to_string_lossy().into_owned();
+
+    for (index, avatar) in [
+        absolute.as_str(),
+        file_uri.as_str(),
+        "relative/avatar.png",
+        "C:\\Users\\member\\avatar.png",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let resp = fx
+            .app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                "/api/assistants",
+                json!({
+                    "id": format!("member-path-{index}"),
+                    "name": "Rejected host path",
+                    "avatar": avatar,
+                    "agent_id": "632f31d2",
+                }),
+                &member_token,
+                &member_csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{avatar} must be rejected");
+    }
+
+    let inline_resp = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/assistants",
+            json!({ "id": "member-inline", "name": "Inline", "avatar": "🤖", "agent_id": "632f31d2" }),
+            &member_token,
+            &member_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(inline_resp.status(), StatusCode::CREATED);
+
+    let managed_resp = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/assistants",
+            json!({
+                "id": "member-managed",
+                "name": "Managed",
+                "avatar": "/api/assistants/builtin-office/avatar",
+                "agent_id": "632f31d2",
+            }),
+            &member_token,
+            &member_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(managed_resp.status(), StatusCode::CREATED);
+
+    let preserve_resp = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            "/api/assistants/member-managed",
+            json!({ "avatar": "/api/assistants/member-managed/avatar" }),
+            &member_token,
+            &member_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(preserve_resp.status(), StatusCode::OK);
+
+    let rejected_update = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            "/api/assistants/member-managed",
+            json!({ "avatar": absolute }),
+            &member_token,
+            &member_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected_update.status(), StatusCode::BAD_REQUEST);
+
+    let admin_avatar_resp = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/assistants",
+            json!({
+                "id": "admin-private-avatar",
+                "name": "Admin avatar",
+                "avatar": source_avatar.to_string_lossy(),
+                "agent_id": "632f31d2",
+            }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(admin_avatar_resp.status(), StatusCode::CREATED);
+
+    let foreign_route_resp = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/assistants",
+            json!({
+                "id": "member-foreign-copy",
+                "name": "Foreign copy",
+                "avatar": "/api/assistants/admin-private-avatar/avatar",
+                "agent_id": "632f31d2",
+            }),
+            &member_token,
+            &member_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(foreign_route_resp.status(), StatusCode::BAD_REQUEST);
+
+    let import_resp = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/assistants/import",
+            json!({
+                "assistants": [{
+                    "id": "member-import-path",
+                    "name": "Rejected import",
+                    "avatar": source_avatar.to_string_lossy(),
+                    "agent_id": "632f31d2",
+                }],
+            }),
+            &member_token,
+            &member_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(import_resp.status(), StatusCode::OK);
+    let import_body = body_json(import_resp).await;
+    assert_eq!(import_body["data"]["imported"], 0);
+    assert_eq!(import_body["data"]["failed"], 1);
+
+    let member_avatar_dir = fx.user_data_dir.join(format!("assistant-avatars/users/{member_dir}"));
+    assert!(member_avatar_dir.join("member-managed.png").is_file());
+    for rejected in [
+        "member-path-0.png",
+        "member-path-1.png",
+        "member-path-2.png",
+        "member-path-3.png",
+        "member-foreign-copy.png",
+        "member-import-path.png",
+    ] {
+        assert!(!member_avatar_dir.join(rejected).exists());
+    }
+    assert_eq!(std::fs::read(&source_avatar).unwrap(), b"host-only-bytes");
+}
+
+#[tokio::test]
 async fn create_user_avatar_from_local_file_is_served_via_assistant_avatar_route() {
     let fx = fixture().await;
     let source_avatar = fx.user_data_dir.join("picked-avatar.png");
@@ -725,6 +920,46 @@ async fn create_user_avatar_from_local_file_is_served_via_assistant_avatar_route
         .unwrap()
         .to_bytes();
     assert_eq!(&bytes[..], b"picked-avatar-bytes");
+}
+
+#[tokio::test]
+async fn local_mode_retains_local_file_avatar_workflow() {
+    let fx = fixture_with_config(AppConfig {
+        local: true,
+        identity_mode: IdentityMode::Local,
+        local_client_secret: Some(LOCAL_CLIENT_SECRET.to_string()),
+        ..AppConfig::default()
+    })
+    .await;
+    let source_avatar = fx.user_data_dir.join("local-mode-avatar.png");
+    std::fs::write(&source_avatar, b"local-mode-avatar-bytes").unwrap();
+
+    let mut request = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "local-mode-avatar",
+            "name": "Local mode avatar",
+            "avatar": source_avatar.to_string_lossy(),
+            "agent_id": "632f31d2",
+        }),
+        &fx.token,
+        &fx.csrf,
+    );
+    request.headers_mut().insert(
+        "x-aionui-local-secret",
+        axum::http::HeaderValue::from_static(LOCAL_CLIENT_SECRET),
+    );
+    let response = fx.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        std::fs::read(
+            fx.user_data_dir
+                .join("assistant-avatars/users/system_default_user/local-mode-avatar.png"),
+        )
+        .unwrap(),
+        b"local-mode-avatar-bytes",
+    );
 }
 
 #[tokio::test]
@@ -1806,11 +2041,10 @@ fn find_id<'a>(list: &'a Value, id: &str) -> Option<&'a Value> {
 // Two-user filesystem isolation: avatars
 // ---------------------------------------------------------------------------
 
-/// Two Core Users each upload an avatar. Each must land under its owner's
+/// Two Core Users each materialize an avatar. Each must land under its owner's
 /// `assistant-avatars/users/{dir}/` (never a shared flat dir), keep its own
-/// bytes, and be served per-user. (The service rejects reusing another user's
-/// assistant id outright — asserted here too — so a same-name overwrite can't
-/// even be attempted.)
+/// bytes, and be served per-user. Both users may deliberately choose the same
+/// assistant id without reserving or overwriting the other tenant's row/file.
 #[tokio::test]
 async fn avatars_of_two_users_are_physically_isolated() {
     let mut fx = fixture().await;
@@ -1826,11 +2060,10 @@ async fn avatars_of_two_users_are_physically_isolated() {
         .expect("bob should exist");
     let dir_b = aionui_common::user_dir_name(&user_b.id).unwrap();
 
-    // Same-named source file, different bytes per user.
+    // The hosted admin may use the local file-picker flow. The member uses a
+    // built-in managed route and never receives host filesystem access.
     let src_a = fx.user_data_dir.join("picked-a.png");
-    let src_b = fx.user_data_dir.join("picked-b.png");
     std::fs::write(&src_a, b"avatar-bytes-A").unwrap();
-    std::fs::write(&src_b, b"avatar-bytes-B").unwrap();
 
     for (id_body, token, csrf) in [
         (
@@ -1839,7 +2072,7 @@ async fn avatars_of_two_users_are_physically_isolated() {
             &fx.csrf,
         ),
         (
-            json!({ "id": "av-iso-b", "name": "Iso B", "avatar": src_b.to_string_lossy(), "agent_id": "632f31d2" }),
+            json!({ "id": "av-iso-b", "name": "Iso B", "avatar": "/api/assistants/builtin-office/avatar", "agent_id": "632f31d2" }),
             &token_b,
             &csrf_b,
         ),
@@ -1849,21 +2082,27 @@ async fn avatars_of_two_users_are_physically_isolated() {
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
-    // Reusing another user's assistant id is rejected outright, so a
-    // same-name avatar overwrite cannot even be attempted.
+    // Reusing another user's assistant id creates an independent tenant-local
+    // assistant and must not overwrite the first user's avatar.
     let req = json_with_token(
         "POST",
         "/api/assistants",
-        json!({ "id": "av-iso-a", "name": "Steal", "avatar": src_b.to_string_lossy(), "agent_id": "632f31d2" }),
+        json!({ "id": "av-iso-a", "name": "Steal", "avatar": "/api/assistants/builtin-office/avatar", "agent_id": "632f31d2" }),
         &token_b,
         &csrf_b,
     );
     let resp = fx.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::CONFLICT,
-        "cross-user assistant id reuse must be rejected"
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let admin_only_req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({ "id": "av-admin-only", "name": "Admin only", "avatar": src_a.to_string_lossy(), "agent_id": "632f31d2" }),
+        &fx.token,
+        &fx.csrf,
     );
+    let admin_only_resp = fx.app.clone().oneshot(admin_only_req).await.unwrap();
+    assert_eq!(admin_only_resp.status(), StatusCode::CREATED);
 
     // Physically distinct per-user files, each with its own bytes.
     let file_a = fx
@@ -1879,7 +2118,15 @@ async fn avatars_of_two_users_are_physically_isolated() {
         b"avatar-bytes-A",
         "A's avatar bytes must be untouched"
     );
-    assert_eq!(std::fs::read(&file_b).unwrap(), b"avatar-bytes-B");
+    assert_eq!(std::fs::read(&file_b).unwrap(), b"not-a-real-png");
+    assert_eq!(
+        std::fs::read(
+            fx.user_data_dir
+                .join(format!("assistant-avatars/users/{dir_b}/av-iso-a.png")),
+        )
+        .unwrap(),
+        b"not-a-real-png",
+    );
     // Nothing leaked into a shared flat root or the other user's dir.
     assert!(!fx.user_data_dir.join("assistant-avatars/av-iso-b.png").exists());
     assert!(
@@ -1891,7 +2138,8 @@ async fn avatars_of_two_users_are_physically_isolated() {
     // Serving is per-user: each token gets its own bytes.
     for (id, token, expected) in [
         ("av-iso-a", &fx.token, &b"avatar-bytes-A"[..]),
-        ("av-iso-b", &token_b, &b"avatar-bytes-B"[..]),
+        ("av-iso-a", &token_b, &b"not-a-real-png"[..]),
+        ("av-iso-b", &token_b, &b"not-a-real-png"[..]),
     ] {
         let resp = fx
             .app
@@ -1905,5 +2153,15 @@ async fn avatars_of_two_users_are_physically_isolated() {
             .unwrap()
             .to_bytes();
         assert_eq!(&bytes[..], expected);
+    }
+
+    for (id, foreign_token) in [("av-admin-only", &token_b), ("av-iso-b", &fx.token)] {
+        let resp = fx
+            .app
+            .clone()
+            .oneshot(get_with_token(&format!("/api/assistants/{id}/avatar"), foreign_token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

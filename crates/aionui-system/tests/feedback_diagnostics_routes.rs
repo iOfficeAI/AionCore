@@ -13,7 +13,7 @@ use serde_json::json;
 use tower::ServiceExt;
 
 use aionui_db::{
-    SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
+    SiteRole, SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
     SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
 };
 
@@ -134,6 +134,8 @@ fn diagnostics_request(uri: &str) -> Request<Body> {
         username: "system_default_user".to_owned(),
         user_type: UserType::Local,
         status: UserStatus::Active,
+        site_role: SiteRole::Admin,
+        must_change_password: false,
     });
     req
 }

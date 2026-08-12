@@ -106,6 +106,18 @@ fn build_test_office_state(
     }
 }
 
+async fn managed_user_root(services: &AppServices, username: &str) -> std::path::PathBuf {
+    let user = services
+        .user_repo
+        .find_by_username(username)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("user '{username}' must exist"));
+    let root = services.project_service.user_workspace_root(&user.id).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
 // ── AU-1/AU-2: Unauthenticated requests ─────────────────────────────
 
 #[tokio::test]
@@ -151,10 +163,10 @@ async fn au2_unauthenticated_all_office_endpoints() {
 
 #[tokio::test]
 async fn wp4_word_preview_officecli_not_available() {
-    let (mut app, services, tmp) = build_office_app().await;
+    let (mut app, services, _tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
-    let file_path = tmp.path().join("test.docx");
+    let file_path = managed_user_root(&services, "user1").await.join("test.docx");
     std::fs::write(&file_path, b"docx").unwrap();
 
     let body = json!({"file_path": file_path.to_str().unwrap()});
@@ -170,7 +182,7 @@ async fn wp4_word_preview_officecli_not_available() {
 }
 
 #[tokio::test]
-async fn wp5_word_preview_with_workspace_accepts_non_sandbox_path() {
+async fn wp5_word_preview_rejects_client_claimed_workspace() {
     let sandbox = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let file_path = outside.path().join("demo.docx");
@@ -186,10 +198,9 @@ async fn wp5_word_preview_with_workspace_accepts_non_sandbox_path() {
     let req = json_with_token("POST", "/api/word-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
+    assert_eq!(json["code"], "user_filesystem_denied");
 }
 
 #[tokio::test]
@@ -210,11 +221,11 @@ async fn wp6_word_preview_without_workspace_rejects_non_sandbox_path() {
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let json = body_json(resp).await;
-    assert_eq!(json["code"], "PATH_OUTSIDE_SANDBOX");
+    assert_eq!(json["code"], "user_filesystem_denied");
 }
 
 #[tokio::test]
-async fn ep1_excel_preview_with_workspace_accepts_non_sandbox_path() {
+async fn ep1_excel_preview_rejects_client_claimed_workspace() {
     let sandbox = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let file_path = outside.path().join("demo.xlsx");
@@ -230,14 +241,13 @@ async fn ep1_excel_preview_with_workspace_accepts_non_sandbox_path() {
     let req = json_with_token("POST", "/api/excel-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
+    assert_eq!(json["code"], "user_filesystem_denied");
 }
 
 #[tokio::test]
-async fn pp1_ppt_preview_with_workspace_accepts_non_sandbox_path() {
+async fn pp1_ppt_preview_rejects_client_claimed_workspace() {
     let sandbox = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let file_path = outside.path().join("demo.pptx");
@@ -253,10 +263,9 @@ async fn pp1_ppt_preview_with_workspace_accepts_non_sandbox_path() {
     let req = json_with_token("POST", "/api/ppt-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
+    assert_eq!(json["code"], "user_filesystem_denied");
 }
 
 // ── SO-1: Star Office detect route removed ───────────────────────────
@@ -291,10 +300,10 @@ async fn so2_detect_route_removed_with_preferred_url() {
 
 #[tokio::test]
 async fn dc1_excel_to_json() {
-    let (mut app, services, tmp) = build_office_app().await;
+    let (mut app, services, _tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
-    let xlsx_path = tmp.path().join("test.xlsx");
+    let xlsx_path = managed_user_root(&services, "user1").await.join("test.xlsx");
     create_test_xlsx(&xlsx_path);
 
     let body = json!({
@@ -322,17 +331,24 @@ async fn dc1_excel_to_json() {
 async fn dc4_excel_file_not_found() {
     let (mut app, services, _tmp) = build_office_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let missing_path = managed_user_root(&services, "user1").await.join("missing.xlsx");
 
     let body = json!({
-        "file_path": "/nonexistent/file.xlsx",
+        "file_path": missing_path.to_str().unwrap(),
         "to": "excel-json"
     });
     let req = json_with_token("POST", "/api/document/convert", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["code"], "BAD_REQUEST");
+    assert_eq!(json["success"], true);
+    assert_eq!(json["data"]["result"]["success"], false);
+    assert!(
+        json["data"]["result"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("file not found"))
+    );
 }
 
 #[tokio::test]
@@ -354,7 +370,7 @@ async fn dc5_document_convert_rejects_outside_sandbox() {
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let json = body_json(resp).await;
-    assert_eq!(json["code"], "PATH_OUTSIDE_SANDBOX");
+    assert_eq!(json["code"], "user_filesystem_denied");
 }
 
 // ── DC-9: Invalid conversion target ─────────────────────────────────

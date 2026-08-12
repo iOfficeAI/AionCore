@@ -58,14 +58,31 @@ impl IProjectStore for SqliteProjectStore {
     }
 
     async fn get_project(&self, user_id: &str, project_id: &str) -> Result<Option<ProjectRow>, DbError> {
+        // Owner or any explicit share (view/edit) may read project metadata.
         let row = sqlx::query_as::<_, ProjectRow>(&format!(
-            "SELECT {PROJECT_COLS} FROM projects WHERE project_id = ? AND user_id = ?"
+            "SELECT {PROJECT_COLS} FROM projects p \
+             WHERE p.project_id = ? AND ( \
+                p.user_id = ? OR EXISTS ( \
+                    SELECT 1 FROM resource_shares s \
+                    WHERE s.resource_type = 'project' AND s.resource_id = p.project_id \
+                      AND s.grantee_user_id = ? \
+                ) \
+             )"
         ))
         .bind(project_id)
+        .bind(user_id)
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    async fn project_owner_user_id(&self, project_id: &str) -> Result<Option<String>, DbError> {
+        let owner = sqlx::query_scalar::<_, String>("SELECT user_id FROM projects WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(owner)
     }
 
     async fn select_workspace_entry_by_folder(
@@ -86,9 +103,17 @@ impl IProjectStore for SqliteProjectStore {
 
     async fn get_entry(&self, user_id: &str, pe_id: &str) -> Result<Option<ProjectExplorerRow>, DbError> {
         let row = sqlx::query_as::<_, ProjectExplorerRow>(&format!(
-            "SELECT {ENTRY_COLS} FROM project_explorer WHERE pe_id = ? AND owner_user_id = ?"
+            "SELECT {ENTRY_COLS} FROM project_explorer pe \
+             WHERE pe.pe_id = ? AND ( \
+                pe.owner_user_id = ? OR EXISTS ( \
+                    SELECT 1 FROM resource_shares s \
+                    WHERE s.resource_type = 'project' AND s.resource_id = pe.project_id \
+                      AND s.grantee_user_id = ? \
+                ) \
+             )"
         ))
         .bind(pe_id)
+        .bind(user_id)
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -103,6 +128,8 @@ impl IProjectStore for SqliteProjectStore {
         // Manual join projection: project_explorer and folders share column
         // names (folder_id / created_at / updated_at), so folder columns are
         // aliased and rows are mapped by name rather than via a tuple FromRow.
+        // Access is project-scoped (owner or share) so collaborators see the
+        // same root list as the owner.
         let rows = sqlx::query(
             "SELECT pe.pe_id, pe.project_id, pe.folder_id, pe.role, pe.display_name, pe.order_index, \
                     pe.created_at, pe.updated_at, \
@@ -110,10 +137,18 @@ impl IProjectStore for SqliteProjectStore {
                     f.created_at AS f_created_at, f.updated_at AS f_updated_at \
              FROM project_explorer pe \
              JOIN folders f ON f.folder_id = pe.folder_id \
-             WHERE pe.project_id = ? AND pe.owner_user_id = ? \
+             JOIN projects p ON p.project_id = pe.project_id \
+             WHERE pe.project_id = ? AND ( \
+                p.user_id = ? OR EXISTS ( \
+                    SELECT 1 FROM resource_shares s \
+                    WHERE s.resource_type = 'project' AND s.resource_id = p.project_id \
+                      AND s.grantee_user_id = ? \
+                ) \
+             ) \
              ORDER BY pe.order_index ASC, pe.created_at ASC",
         )
         .bind(project_id)
+        .bind(user_id)
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;

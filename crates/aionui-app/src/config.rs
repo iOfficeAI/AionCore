@@ -37,6 +37,20 @@ pub struct AppConfig {
     pub local: bool,
     pub identity_mode: IdentityMode,
     pub bootstrap_secret: Option<String>,
+    /// Optional operator-configured workspace exposed only to the seeded
+    /// `system_default_user` in authenticated user-session modes.
+    pub bootstrap_workspace: Option<PathBuf>,
+    /// Enable one-time initial administrator provisioning. The process-level
+    /// WebUI bootstrap enables this explicitly; library/test defaults do not
+    /// perform credential filesystem side effects.
+    pub bootstrap_initial_admin: bool,
+    /// Per-launch capability shared only with the packaged local client.
+    /// Required in Local mode; never accepted in a URL or cookie.
+    pub local_client_secret: Option<String>,
+    /// Exact browser origins allowed to reach Core cross-origin. WebUI mode
+    /// remains same-origin; Local additionally permits the packaged `null`
+    /// origin at router assembly time.
+    pub allowed_origins: Vec<String>,
     /// Dump prompt diagnostics under `data_dir/prompt-dumps`.
     pub dump_prompts: bool,
     /// Explicitly authorize backup and rebuild for corruption-like local databases.
@@ -83,10 +97,73 @@ impl Default for AppConfig {
             local: false,
             identity_mode: IdentityMode::WebUi,
             bootstrap_secret: None,
+            bootstrap_workspace: None,
+            bootstrap_initial_admin: false,
+            local_client_secret: None,
+            allowed_origins: Vec::new(),
             dump_prompts: false,
             recover_corrupted_database: false,
         }
     }
+}
+
+/// Parse and normalize `AIONCORE_ALLOWED_ORIGINS`.
+///
+/// Entries are comma-separated exact HTTP(S) origins, or the literal `null`
+/// for packaged/native webviews. Paths, credentials, query strings,
+/// fragments, wildcards, and opaque schemes are rejected.
+pub fn parse_allowed_origins(raw: Option<&str>) -> Result<Vec<String>, String> {
+    let mut origins = Vec::new();
+    for entry in raw.unwrap_or_default().split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let normalized = if entry == "null" {
+            "null".to_string()
+        } else {
+            if entry == "*" {
+                return Err("wildcard origins are not allowed".to_string());
+            }
+            let parsed = url::Url::parse(entry).map_err(|error| format!("invalid origin '{entry}': {error}"))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(format!("origin '{entry}' must use http or https"));
+            }
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                return Err(format!("origin '{entry}' must not contain credentials"));
+            }
+            if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+                return Err(format!("origin '{entry}' must not contain a path, query, or fragment"));
+            }
+            let origin = parsed.origin().ascii_serialization();
+            if origin == "null" {
+                return Err(format!("origin '{entry}' is not a tuple origin"));
+            }
+            origin
+        };
+        if !origins.contains(&normalized) {
+            origins.push(normalized);
+        }
+    }
+    Ok(origins)
+}
+
+/// Validate the per-launch Local client capability.
+///
+/// The launcher supplies 32 random bytes as unpadded Base64URL (43 ASCII
+/// characters), which is safe in both an HTTP header value and a WebSocket
+/// subprotocol token.
+pub fn validate_local_client_secret(secret: &str) -> Result<(), String> {
+    if secret.len() != 43 {
+        return Err("local client secret must encode exactly 32 random bytes as unpadded Base64URL".to_string());
+    }
+    if !secret
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err("local client secret must contain only unpadded Base64URL characters".to_string());
+    }
+    Ok(())
 }
 
 /// Derive a 32-byte encryption key from the JWT secret using SHA-256.
@@ -110,6 +187,7 @@ mod tests {
         assert_eq!(config.app_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(config.identity_mode, IdentityMode::WebUi);
         assert!(config.bootstrap_secret.is_none());
+        assert!(config.bootstrap_workspace.is_none());
         assert!(!config.dump_prompts);
         assert!(!config.recover_corrupted_database);
     }
@@ -141,5 +219,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.database_path(), PathBuf::from("/tmp/aionui/aionui-backend.db"));
+    }
+
+    #[test]
+    fn allowed_origins_are_normalized_and_deduplicated() {
+        assert_eq!(
+            parse_allowed_origins(Some(" https://EXAMPLE.com/,null,https://example.com ")).unwrap(),
+            vec!["https://example.com", "null"]
+        );
+    }
+
+    #[test]
+    fn allowed_origins_reject_wildcards_and_non_origin_urls() {
+        for value in [
+            "*",
+            "file:///tmp/index.html",
+            "https://user@example.com",
+            "https://example.com/path",
+            "https://example.com?query=1",
+        ] {
+            assert!(parse_allowed_origins(Some(value)).is_err(), "{value} must be rejected");
+        }
+    }
+
+    #[test]
+    fn local_client_secret_requires_32_bytes_of_unpadded_base64url() {
+        assert!(validate_local_client_secret("abcdefghijklmnopqrstuvwxyzABCDEFGH012345678").is_ok());
+        assert!(validate_local_client_secret("too-short").is_err());
+        assert!(validate_local_client_secret("abcdefghijklmnopqrstuvwxyzABCDEFGH01234567=").is_err());
     }
 }

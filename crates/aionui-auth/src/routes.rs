@@ -1,38 +1,47 @@
 #![allow(clippy::disallowed_types)]
 
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, Path, State};
+use axum::extract::{Json, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::from_fn_with_state;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
 
 use aionui_api_types::{
-    ApiResponse, AuthStatusResponse, ChangePasswordRequest, EnsureExternalSessionRequest, EnsureExternalUserRequest,
-    EnsureExternalUserResponse, LoginRequest, LoginResponse, PublicUser, QrLoginRequest, RefreshResponse,
-    RefreshTokenRequest, RevokeExternalSessionRequest, RevokeExternalSessionResponse, UserInfoResponse,
+    AccountStatus, AdminAuditListResponse, AdminUser, AdminUserListResponse, ApiResponse, AuthStatusResponse,
+    ChangePasswordRequest, CreateAdminUserRequest, CreateShareRequest, EnsureExternalSessionRequest,
+    EnsureExternalUserRequest, EnsureExternalUserResponse, ListAdminAuditQuery, ListAdminUsersQuery, ListSharesQuery,
+    LoginRequest, LoginResponse, PublicUser, QrLoginRequest, RefreshResponse, RefreshTokenRequest, ResourceShare,
+    RevokeExternalSessionRequest, RevokeExternalSessionResponse, ShareListResponse, UpdateAdminRoleRequest,
+    UpdateAdminStatusRequest, UpdateAdminUsernameRequest, UserDirectoryResponse, UserInfoResponse, UserRole,
     WebuiChangePasswordRequest, WebuiChangeUsernameRequest, WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse,
     WebuiResetPasswordResponse, WsTokenResponse,
 };
 use aionui_common::ApiError;
 use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
-use aionui_db::{DbError, IUserRepository, UserStatus, UserType, models::User};
+use aionui_db::{
+    AdminUserRepositoryError, DbError, IAdminUserRepository, IResourceShareRepository, IUserRepository, UserStatus,
+    UserType, models::User,
+};
 
 use crate::error::AuthError;
 use crate::extract::extract_token_from_headers;
-use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, auth_middleware};
+use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, admin_required_middleware, auth_middleware};
 use crate::password::{dummy_password_hash, generate_password, hash_password, verify_password_timed};
 use crate::qr_token::QrTokenStore;
 use crate::rate_limit::{
     RateLimiter, api_rate_limit_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware,
 };
 use crate::service::{AuthProvisionService, ProvisionError};
+use crate::share_service::{ShareService, ShareServiceError};
 use crate::validation::{validate_password, validate_username};
+use crate::{AdminUserService, AdminUserServiceError, audit_actor};
 use crate::{CookieConfig, JwtService};
 
 const BOOTSTRAP_SECRET_HEADER: &str = "x-aioncore-bootstrap-secret";
@@ -69,6 +78,8 @@ fn db_error_to_api_error(err: DbError) -> ApiError {
 pub struct AuthRouterState {
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
+    pub admin_user_repo: Arc<dyn IAdminUserRepository>,
+    pub share_repo: Arc<dyn IResourceShareRepository>,
     /// Optional on-disk adoption side-effect (AionUi → AionPro upgrade).
     pub fs_adopter: Option<Arc<dyn crate::service::SystemDefaultFilesystemAdopter>>,
     pub cookie_config: Arc<CookieConfig>,
@@ -76,6 +87,9 @@ pub struct AuthRouterState {
     pub identity_mode: AuthIdentityMode,
     pub bootstrap_secret: Option<Arc<str>>,
     pub session_revoked_hook: Option<Arc<SessionRevokedHook>>,
+    /// One-time bootstrap credential file removed after the initial admin
+    /// successfully changes their temporary password.
+    pub initial_admin_credentials_file: Option<Arc<PathBuf>>,
     pub local: bool,
     pub aionpro_mode: bool,
 }
@@ -249,11 +263,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let auth_state = AuthState {
         jwt_service: state.jwt_service.clone(),
         user_repo: state.user_repo.clone(),
-        identity_mode: if state.aionpro_mode {
-            AuthIdentityMode::AionPro
-        } else {
-            AuthIdentityMode::UserSession
-        },
+        identity_mode: state.identity_mode,
         // Auth endpoints manage sessions themselves; the helper CLI never
         // calls them, so the runtime-token channel stays disabled here.
         runtime_token_verifier: None,
@@ -326,13 +336,51 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .route("/api/auth/user", get(user_handler))
         .route("/api/auth/change-password", post(change_password_handler))
         .route("/api/ws-token", get(ws_token_handler))
+        .route(
+            "/api/shares",
+            get(list_resource_shares_handler).post(create_share_handler),
+        )
+        .route("/api/shares/received", get(list_received_shares_handler))
+        .route("/api/shares/granted", get(list_granted_shares_handler))
+        .route("/api/shares/{id}", delete(revoke_share_handler))
+        .route("/api/users/directory", get(list_user_directory_handler))
         .route_layer(from_fn_with_state(
             action_limiter.clone(),
             authenticated_action_rate_limit_middleware,
         ))
-        .route_layer(from_fn_with_state(auth_state, auth_middleware))
+        .route_layer(from_fn_with_state(auth_state.clone(), auth_middleware))
         .route_layer(from_fn_with_state(api_limiter.clone(), api_rate_limit_middleware))
         .with_state(state.clone());
+
+    let admin = if state.identity_mode == AuthIdentityMode::UserSession && !state.aionpro_mode {
+        Router::new()
+            .route(
+                "/api/admin/users",
+                get(list_admin_users_handler).post(create_admin_user_handler),
+            )
+            .route("/api/admin/users/{id}/username", patch(update_admin_username_handler))
+            .route("/api/admin/users/{id}/role", patch(update_admin_role_handler))
+            .route("/api/admin/users/{id}/status", patch(update_admin_status_handler))
+            .route(
+                "/api/admin/users/{id}/reset-password",
+                post(reset_admin_password_handler),
+            )
+            .route(
+                "/api/admin/users/{id}/sessions/revoke",
+                post(revoke_admin_sessions_handler),
+            )
+            .route("/api/admin/audit", get(list_admin_audit_handler))
+            .route_layer(from_fn_with_state(
+                action_limiter.clone(),
+                authenticated_action_rate_limit_middleware,
+            ))
+            .route_layer(axum::middleware::from_fn(admin_required_middleware))
+            .route_layer(from_fn_with_state(auth_state, auth_middleware))
+            .route_layer(from_fn_with_state(api_limiter.clone(), api_rate_limit_middleware))
+            .with_state(state.clone())
+    } else {
+        Router::new()
+    };
 
     // API + action limited routes (token in body, no auth middleware)
     let api_action_limited = Router::new()
@@ -351,8 +399,240 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .merge(auth_rate_limited)
         .merge(api_public)
         .merge(authenticated)
+        .merge(admin)
         .merge(api_action_limited)
         .merge(static_routes)
+}
+
+async fn list_admin_users_handler(
+    State(state): State<AuthRouterState>,
+    Query(query): Query<ListAdminUsersQuery>,
+) -> Result<Json<ApiResponse<AdminUserListResponse>>, ApiError> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0);
+    let response = AdminUserService::new(state.admin_user_repo)
+        .list_users(limit, offset)
+        .await
+        .map_err(admin_service_error_to_api_error)?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+fn share_service(state: &AuthRouterState) -> ShareService {
+    ShareService::new(state.share_repo.clone(), state.user_repo.clone())
+}
+
+fn share_service_error_to_api_error(err: ShareServiceError) -> ApiError {
+    match err {
+        ShareServiceError::Database(db) => db_error_to_api_error(db),
+        ShareServiceError::NotFound(msg) => ApiError::NotFound(msg),
+        ShareServiceError::Forbidden(msg) => ApiError::Forbidden(msg),
+        ShareServiceError::Conflict(msg) => ApiError::Conflict(msg),
+        ShareServiceError::BadRequest(msg) => ApiError::BadRequest(msg),
+    }
+}
+
+async fn create_share_handler(
+    State(state): State<AuthRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<CreateShareRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ResourceShare>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let share = share_service(&state)
+        .grant(&user.id, req)
+        .await
+        .map_err(share_service_error_to_api_error)?;
+    Ok(Json(ApiResponse::ok(share)))
+}
+
+async fn revoke_share_handler(
+    State(state): State<AuthRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(share_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    share_service(&state)
+        .revoke(&user.id, &share_id)
+        .await
+        .map_err(share_service_error_to_api_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_resource_shares_handler(
+    State(state): State<AuthRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(query): Query<ListSharesQuery>,
+) -> Result<Json<ApiResponse<ShareListResponse>>, ApiError> {
+    let response = share_service(&state)
+        .list_for_resource(&user.id, query.resource_type, &query.resource_id)
+        .await
+        .map_err(share_service_error_to_api_error)?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn list_received_shares_handler(
+    State(state): State<AuthRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<ShareListResponse>>, ApiError> {
+    let response = share_service(&state)
+        .list_received_by(&user.id)
+        .await
+        .map_err(share_service_error_to_api_error)?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn list_granted_shares_handler(
+    State(state): State<AuthRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<ShareListResponse>>, ApiError> {
+    let response = share_service(&state)
+        .list_granted_by(&user.id)
+        .await
+        .map_err(share_service_error_to_api_error)?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn list_user_directory_handler(
+    State(state): State<AuthRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<UserDirectoryResponse>>, ApiError> {
+    let response = share_service(&state)
+        .list_directory(&user.id)
+        .await
+        .map_err(share_service_error_to_api_error)?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn create_admin_user_handler(
+    State(state): State<AuthRouterState>,
+    Extension(actor): Extension<CurrentUser>,
+    body: Result<Json<CreateAdminUserRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let response = AdminUserService::new(state.admin_user_repo)
+        .create_user(
+            &request.username,
+            request.role,
+            &audit_actor(&actor.id, &actor.username),
+        )
+        .await
+        .map_err(admin_service_error_to_api_error)?;
+    Ok(no_store_json(StatusCode::CREATED, ApiResponse::ok(response)))
+}
+
+async fn update_admin_username_handler(
+    State(state): State<AuthRouterState>,
+    Extension(actor): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateAdminUsernameRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<AdminUser>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let user = AdminUserService::new(state.admin_user_repo.clone())
+        .update_username(&id, &request.username, &audit_actor(&actor.id, &actor.username))
+        .await
+        .map_err(admin_service_error_to_api_error)?;
+    notify_session_revoked(&state, &id);
+    Ok(Json(ApiResponse::ok(user)))
+}
+
+async fn update_admin_role_handler(
+    State(state): State<AuthRouterState>,
+    Extension(actor): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateAdminRoleRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<AdminUser>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let user = AdminUserService::new(state.admin_user_repo.clone())
+        .update_role(&id, request.role, &audit_actor(&actor.id, &actor.username))
+        .await
+        .map_err(admin_service_error_to_api_error)?;
+    notify_session_revoked(&state, &id);
+    Ok(Json(ApiResponse::ok(user)))
+}
+
+async fn update_admin_status_handler(
+    State(state): State<AuthRouterState>,
+    Extension(actor): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateAdminStatusRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<AdminUser>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let user = AdminUserService::new(state.admin_user_repo.clone())
+        .update_status(&id, request.status, &audit_actor(&actor.id, &actor.username))
+        .await
+        .map_err(admin_service_error_to_api_error)?;
+    notify_session_revoked(&state, &id);
+    Ok(Json(ApiResponse::ok(user)))
+}
+
+async fn reset_admin_password_handler(
+    State(state): State<AuthRouterState>,
+    Extension(actor): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let response = AdminUserService::new(state.admin_user_repo.clone())
+        .reset_password(&id, &audit_actor(&actor.id, &actor.username))
+        .await
+        .map_err(admin_service_error_to_api_error)?;
+    notify_session_revoked(&state, &id);
+    Ok(no_store_json(StatusCode::OK, ApiResponse::ok(response)))
+}
+
+async fn revoke_admin_sessions_handler(
+    State(state): State<AuthRouterState>,
+    Extension(actor): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<AdminUser>>, ApiError> {
+    let user = AdminUserService::new(state.admin_user_repo.clone())
+        .revoke_sessions(&id, &audit_actor(&actor.id, &actor.username))
+        .await
+        .map_err(admin_service_error_to_api_error)?;
+    notify_session_revoked(&state, &id);
+    Ok(Json(ApiResponse::ok(user)))
+}
+
+async fn list_admin_audit_handler(
+    State(state): State<AuthRouterState>,
+    Query(query): Query<ListAdminAuditQuery>,
+) -> Result<Json<ApiResponse<AdminAuditListResponse>>, ApiError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let response = AdminUserService::new(state.admin_user_repo)
+        .list_audit(query.cursor.as_deref(), limit)
+        .await
+        .map_err(admin_service_error_to_api_error)?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+fn notify_session_revoked(state: &AuthRouterState, user_id: &str) {
+    if let Some(hook) = &state.session_revoked_hook {
+        hook(user_id);
+    }
+}
+
+fn no_store_json<T: Serialize>(status: StatusCode, body: ApiResponse<T>) -> Response {
+    (status, [(header::CACHE_CONTROL, "no-store")], Json(body)).into_response()
+}
+
+fn admin_service_error_to_api_error(error: AdminUserServiceError) -> ApiError {
+    match error {
+        AdminUserServiceError::Repository(AdminUserRepositoryError::LastActiveAdmin) => ApiError::coded(
+            StatusCode::CONFLICT,
+            "LAST_ACTIVE_ADMIN",
+            "The last active administrator cannot be changed.",
+            None,
+        ),
+        AdminUserServiceError::Repository(AdminUserRepositoryError::UnsupportedIdentity) => {
+            ApiError::coded(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "User not found.", None)
+        }
+        AdminUserServiceError::Repository(AdminUserRepositoryError::Database(error))
+        | AdminUserServiceError::Database(error) => match error {
+            DbError::NotFound(_) => ApiError::coded(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "User not found.", None),
+            DbError::Conflict(_) => {
+                ApiError::coded(StatusCode::CONFLICT, "USERNAME_TAKEN", "Username already exists.", None)
+            }
+            other => db_error_to_api_error(other),
+        },
+        AdminUserServiceError::Validation(error) => ApiError::from(error),
+        AdminUserServiceError::HashTask(error) => ApiError::Internal(format!("Password hashing failed: {error}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -464,6 +744,10 @@ async fn login_handler(
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     let (found_user, password_valid) = match user {
+        Some(u) if u.user_type != UserType::Local || u.status != UserStatus::Active => {
+            let _ = verify_password_timed(&req.password, dummy_password_hash()).await;
+            (None, false)
+        }
         Some(u) if u.password_hash.as_deref().unwrap_or_default().trim().is_empty() => {
             // Seeded user with no password yet (first-run local mode).
             // Treat as invalid credentials; run dummy verify for timing symmetry
@@ -492,28 +776,14 @@ async fn login_handler(
 
     let user = found_user.ok_or_else(|| ApiError::Unauthorized("Invalid username or password".into()))?;
 
-    let token = state
-        .jwt_service
-        .sign_with_session_generation(
-            &user.id,
-            user.username.as_deref().unwrap_or("external_user"),
-            user.session_generation,
-        )
-        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
+    let (token, cookie) = issue_persistent_session(&state, &user).await?;
 
     // Update last login (best-effort)
     if let Err(e) = state.user_repo.update_last_login(&user.id).await {
         tracing::warn!("Failed to update last login for {}: {e}", user.id);
     }
 
-    let cookie = state.cookie_config.build_session_cookie(&token);
-    let resp = LoginResponse::new(
-        PublicUser {
-            id: user.id,
-            username: user.username.unwrap_or_else(|| "external_user".to_string()),
-        },
-        token,
-    );
+    let resp = LoginResponse::new(public_user(user), token);
 
     Ok(([(header::SET_COOKIE, cookie)], Json(resp)).into_response())
 }
@@ -524,6 +794,15 @@ async fn login_handler(
 
 async fn logout_handler(State(state): State<AuthRouterState>, headers: HeaderMap) -> Result<Response, ApiError> {
     if let Some(token) = extract_token_from_headers(&headers) {
+        if let Ok(payload) = state.jwt_service.verify(&token)
+            && let Some(session_id) = payload.session_id.as_deref()
+        {
+            state
+                .user_repo
+                .revoke_auth_session(session_id, &payload.user_id, "logout")
+                .await
+                .map_err(db_error_to_api_error)?;
+        }
         state.jwt_service.blacklist_token(&token);
     }
 
@@ -543,20 +822,37 @@ async fn status_handler(
 ) -> Result<Json<AuthStatusResponse>, ApiError> {
     let has_users = state
         .user_repo
-        .has_users()
+        .has_usable_admin()
         .await
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     let user_count = state
-        .user_repo
-        .count_users()
+        .admin_user_repo
+        .count_managed_users()
         .await
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     // Check authentication without requiring it
-    let is_authenticated = extract_token_from_headers(&headers)
-        .and_then(|token| state.jwt_service.verify(&token).ok())
-        .is_some();
+    let is_authenticated = if let Some(payload) =
+        extract_token_from_headers(&headers).and_then(|token| state.jwt_service.verify(&token).ok())
+    {
+        match state.user_repo.find_active_by_id(&payload.user_id).await {
+            Ok(Some(user)) if user.session_generation == payload.session_generation => {
+                if let Some(session_id) = payload.session_id.as_deref() {
+                    state
+                        .user_repo
+                        .is_auth_session_active(session_id, &user.id)
+                        .await
+                        .unwrap_or(false)
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
 
     Ok(Json(AuthStatusResponse {
         success: true,
@@ -706,6 +1002,9 @@ async fn user_handler(Extension(user): Extension<CurrentUser>) -> Json<UserInfoR
         user: PublicUser {
             id: user.id,
             username: user.username,
+            role: map_site_role(user.site_role),
+            status: map_account_status(user.status),
+            must_change_password: user.must_change_password,
         },
     })
 }
@@ -718,11 +1017,11 @@ async fn change_password_handler(
     State(state): State<AuthRouterState>,
     Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<ChangePasswordRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
+) -> Result<Response, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
     // Validate new password strength
-    validate_password(&req.new_password)?;
+    validate_password_for_api(&req.new_password)?;
 
     // Fetch user record
     let user = state
@@ -738,7 +1037,20 @@ async fn change_password_handler(
     };
     let valid = verify_password_timed(&req.current_password, password_hash).await?;
     if !valid {
-        return Err(ApiError::Unauthorized("Current password is incorrect".into()));
+        return Err(ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "INVALID_CURRENT_PASSWORD",
+            "Current password is incorrect.",
+            None,
+        ));
+    }
+    if verify_password_timed(&req.new_password, password_hash).await? {
+        return Err(ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "PASSWORD_REUSED",
+            "New password must differ from the current password.",
+            None,
+        ));
     }
 
     // Hash new password on blocking thread
@@ -748,26 +1060,46 @@ async fn change_password_handler(
         .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))??;
 
     // Persist new password hash
-    state
-        .user_repo
-        .update_password(&current_user.id, &new_hash)
+    let updated = state
+        .admin_user_repo
+        .change_own_password(
+            &current_user.id,
+            &new_hash,
+            &audit_actor(&current_user.id, &current_user.username),
+        )
         .await
-        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
+        .map_err(|error| admin_service_error_to_api_error(AdminUserServiceError::Repository(error)))?;
+    notify_session_revoked(&state, &current_user.id);
+    let (_token, cookie) = issue_persistent_session(&state, &updated).await?;
+    if let Some(path) = &state.initial_admin_credentials_file {
+        match initial_admin_credentials_belong_to(path, &current_user.username) {
+            Ok(true) => {
+                if let Err(error) = std::fs::remove_file(path.as_ref())
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(path = %path.display(), error = %error, "failed to remove consumed initial admin credentials");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(path = %path.display(), error = %error, "failed to validate consumed initial admin credentials");
+            }
+        }
+    }
+    Ok((
+        [
+            (header::SET_COOKIE, cookie),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        Json(ApiResponse::ok(public_user(updated))),
+    )
+        .into_response())
+}
 
-    // Rotate JWT secret to invalidate all sessions
-    let new_secret = state
-        .jwt_service
-        .rotate_secret()
-        .map_err(|e| ApiError::Internal(format!("Secret rotation error: {e}")))?;
-
-    // Persist new secret to database
-    state
-        .user_repo
-        .update_jwt_secret(&current_user.id, &new_secret)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
-
-    Ok(Json(ApiResponse::message("Password changed successfully")))
+fn initial_admin_credentials_belong_to(path: &FsPath, username: &str) -> Result<bool, String> {
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let value: serde_json::Value = serde_json::from_reader(file).map_err(|error| error.to_string())?;
+    Ok(value.get("username").and_then(serde_json::Value::as_str) == Some(username))
 }
 
 // ---------------------------------------------------------------------------
@@ -803,12 +1135,37 @@ async fn refresh_handler(
         return Err(ApiError::Unauthorized("Invalid authentication session".into()));
     }
 
+    if let Some(session_id) = payload.session_id.as_deref()
+        && !state
+            .user_repo
+            .is_auth_session_active(session_id, &user.id)
+            .await
+            .map_err(db_error_to_api_error)?
+    {
+        return Err(ApiError::Unauthorized("Invalid authentication session".into()));
+    }
+
+    let session_id = if let Some(session_id) = payload.session_id {
+        state
+            .user_repo
+            .touch_auth_session(&session_id, &user.id)
+            .await
+            .map_err(db_error_to_api_error)?;
+        session_id
+    } else {
+        state
+            .user_repo
+            .create_auth_session(&user.id, aionui_common::now_ms() + crate::jwt::TOKEN_EXPIRY_MS)
+            .await
+            .map_err(db_error_to_api_error)?
+    };
     let new_token = state
         .jwt_service
-        .sign_with_session_generation(
+        .sign_with_session_id(
             &user.id,
             user.username.as_deref().unwrap_or("external_user"),
             user.session_generation,
+            &session_id,
         )
         .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
 
@@ -872,31 +1229,47 @@ async fn qr_login_handler(
         .await
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?
         .ok_or_else(|| ApiError::Internal("No primary user configured".into()))?;
+    if user.user_type != UserType::Local
+        || user.status != UserStatus::Active
+        || user.password_hash.as_deref().unwrap_or_default().is_empty()
+    {
+        return Err(ApiError::Unauthorized("No active primary user configured".into()));
+    }
 
-    let token = state
-        .jwt_service
-        .sign_with_session_generation(
-            &user.id,
-            user.username.as_deref().unwrap_or("external_user"),
-            user.session_generation,
-        )
-        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
+    let (token, cookie) = issue_persistent_session(&state, &user).await?;
 
     // Update last login (best-effort)
     if let Err(e) = state.user_repo.update_last_login(&user.id).await {
         tracing::warn!("Failed to update last login for {}: {e}", user.id);
     }
 
-    let cookie = state.cookie_config.build_session_cookie(&token);
-    let resp = LoginResponse::new(
-        PublicUser {
-            id: user.id,
-            username: user.username.unwrap_or_else(|| "external_user".to_string()),
-        },
-        token,
-    );
+    let resp = LoginResponse::new(public_user(user), token);
 
     Ok(([(header::SET_COOKIE, cookie)], Json(resp)).into_response())
+}
+
+fn public_user(user: User) -> PublicUser {
+    PublicUser {
+        id: user.id,
+        username: user.username.unwrap_or_else(|| "external_user".to_string()),
+        role: map_site_role(user.site_role),
+        status: map_account_status(user.status),
+        must_change_password: user.must_change_password,
+    }
+}
+
+fn map_site_role(role: aionui_db::SiteRole) -> UserRole {
+    match role {
+        aionui_db::SiteRole::Admin => UserRole::Admin,
+        aionui_db::SiteRole::Member => UserRole::Member,
+    }
+}
+
+fn map_account_status(status: UserStatus) -> AccountStatus {
+    match status {
+        UserStatus::Active => AccountStatus::Active,
+        UserStatus::Disabled => AccountStatus::Disabled,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,10 +1373,11 @@ async fn webui_change_password_handler(
         .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))??;
 
     state
-        .user_repo
-        .update_password(&user.id, &new_hash)
+        .admin_user_repo
+        .change_own_password(&user.id, &new_hash, &aionui_db::AuditActor::system())
         .await
-        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
+        .map_err(|error| admin_service_error_to_api_error(AdminUserServiceError::Repository(error)))?;
+    notify_session_revoked(&state, &user.id);
 
     Ok(Json(ApiResponse::message("Password changed successfully")))
 }
@@ -1026,10 +1400,11 @@ async fn webui_change_username_handler(
 
     if user.username.as_deref() != Some(trimmed.as_str()) {
         state
-            .user_repo
-            .update_username(&user.id, &trimmed)
+            .admin_user_repo
+            .update_managed_username(&user.id, &trimmed, &aionui_db::AuditActor::system())
             .await
-            .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
+            .map_err(|error| admin_service_error_to_api_error(AdminUserServiceError::Repository(error)))?;
+        notify_session_revoked(&state, &user.id);
     }
 
     Ok(Json(ApiResponse::ok(WebuiChangeUsernameResponse { username: trimmed })))
@@ -1053,12 +1428,47 @@ async fn webui_reset_password_handler(
         .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))??;
 
     state
-        .user_repo
-        .update_password(&user.id, &new_hash)
+        .admin_user_repo
+        .reset_managed_password(&user.id, &new_hash, &aionui_db::AuditActor::system())
         .await
-        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
+        .map_err(|error| admin_service_error_to_api_error(AdminUserServiceError::Repository(error)))?;
+    notify_session_revoked(&state, &user.id);
 
     Ok(Json(ApiResponse::ok(WebuiResetPasswordResponse { new_password })))
+}
+
+async fn issue_persistent_session(state: &AuthRouterState, user: &User) -> Result<(String, String), ApiError> {
+    let expires_at = aionui_common::now_ms() + crate::jwt::TOKEN_EXPIRY_MS;
+    let session_id = state
+        .user_repo
+        .create_auth_session(&user.id, expires_at)
+        .await
+        .map_err(db_error_to_api_error)?;
+    let token = state
+        .jwt_service
+        .sign_with_session_id(
+            &user.id,
+            user.username.as_deref().unwrap_or("external_user"),
+            user.session_generation,
+            &session_id,
+        )
+        .map_err(|error| ApiError::Internal(format!("Token signing error: {error}")))?;
+    let cookie = state.cookie_config.build_session_cookie(&token);
+    Ok((token, cookie))
+}
+
+fn validate_password_for_api(password: &str) -> Result<(), ApiError> {
+    validate_password(password).map_err(|error| {
+        let message = error.to_string();
+        let code = if message.contains("at least") {
+            "PASSWORD_TOO_SHORT"
+        } else if message.contains("exceed") {
+            "PASSWORD_TOO_LONG"
+        } else {
+            "PASSWORD_TOO_COMMON"
+        };
+        ApiError::coded(StatusCode::BAD_REQUEST, code, message, None)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,5 +1539,14 @@ mod error_mapping_tests {
     fn hash_error_maps_to_internal() {
         let api_err = ApiError::from(AuthError::HashError("failed".into()));
         assert_eq!(api_err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn bootstrap_credentials_are_only_consumed_by_the_matching_user() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials.json");
+        std::fs::write(&path, r#"{"username":"initial-admin","temporary_password":"secret"}"#).unwrap();
+        assert!(initial_admin_credentials_belong_to(&path, "initial-admin").unwrap());
+        assert!(!initial_admin_credentials_belong_to(&path, "other-admin").unwrap());
     }
 }

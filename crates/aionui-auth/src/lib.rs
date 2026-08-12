@@ -1,6 +1,7 @@
 #![warn(clippy::disallowed_types)]
 
 //! JWT authentication, password hashing, CSRF protection, rate limiting, and auth middleware.
+mod admin_service;
 mod cookie;
 mod csrf;
 mod error;
@@ -13,10 +14,13 @@ mod rate_limit;
 mod routes;
 mod security;
 mod service;
+mod share_service;
 mod validation;
 
 // Error type
+pub use admin_service::{AdminUserService, AdminUserServiceError, admin_user, audit_actor};
 pub use error::AuthError;
+pub use share_service::{ShareService, ShareServiceError};
 
 // JWT service
 pub use jwt::{JwtService, TokenPayload, generate_random_secret_string, resolve_jwt_secret};
@@ -53,7 +57,7 @@ pub use csrf::csrf_middleware;
 // Auth middleware
 pub use middleware::{
     AuthIdentityMode, AuthState, CurrentUser, IRuntimeTokenVerifier, RUNTIME_CONVERSATION_ID_HEADER,
-    RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, auth_middleware, local_auth_middleware,
+    RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, admin_required_middleware, auth_middleware, local_auth_middleware,
 };
 
 // QR token store

@@ -315,16 +315,23 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(rows)
     }
 
-    async fn list_messages_by_team(&self, team_id: &str, limit: i64) -> Result<Vec<MailboxMessageRow>, DbError> {
+    async fn list_messages_by_team(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        limit: i64,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let rows = sqlx::query_as::<_, MailboxMessageRow>(
             "SELECT id, team_id, to_agent_id, from_agent_id, \
                     type, content, summary, files, read, created_at \
              FROM mailbox \
              WHERE team_id = ? \
+               AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?) \
              ORDER BY created_at DESC \
              LIMIT ?",
         )
         .bind(team_id)
+        .bind(user_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -333,6 +340,7 @@ impl ITeamRepository for SqliteTeamRepository {
 
     async fn list_messages_by_team_paged(
         &self,
+        user_id: &str,
         team_id: &str,
         cursor: Option<ActivityCursor>,
         direction: PageDirection,
@@ -351,11 +359,13 @@ impl ITeamRepository for SqliteTeamRepository {
             "SELECT id, team_id, to_agent_id, from_agent_id, \
                     type, content, summary, files, read, created_at \
              FROM mailbox \
-             WHERE team_id = ? {cursor_clause}\
+             WHERE team_id = ? \
+               AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?) \
+             {cursor_clause}\
              ORDER BY created_at {order}, id {order} \
              LIMIT ?"
         );
-        let mut q = sqlx::query_as::<_, MailboxMessageRow>(&sql).bind(team_id);
+        let mut q = sqlx::query_as::<_, MailboxMessageRow>(&sql).bind(team_id).bind(user_id);
         if let Some(c) = &cursor {
             q = q.bind(c.created_at).bind(c.created_at).bind(&c.id);
         }
@@ -363,7 +373,12 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(rows)
     }
 
-    async fn list_messages_by_ids(&self, ids: &[String]) -> Result<Vec<MailboxMessageRow>, DbError> {
+    async fn list_messages_by_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -376,10 +391,12 @@ impl ITeamRepository for SqliteTeamRepository {
                 "SELECT id, team_id, to_agent_id, from_agent_id, \
                         type, content, summary, files, read, created_at \
                  FROM mailbox \
-                 WHERE id IN ({placeholders}) \
+                 WHERE team_id = ? \
+                   AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?) \
+                   AND id IN ({placeholders}) \
                  ORDER BY created_at DESC"
             );
-            let mut query = sqlx::query_as::<_, MailboxMessageRow>(&sql);
+            let mut query = sqlx::query_as::<_, MailboxMessageRow>(&sql).bind(team_id).bind(user_id);
             for id in chunk {
                 query = query.bind(id);
             }

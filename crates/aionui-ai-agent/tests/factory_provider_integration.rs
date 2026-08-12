@@ -12,8 +12,8 @@ use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_api_types::AionrsBuildExtra;
 use aionui_common::{AgentType, ProviderWithModel, encrypt_string};
 use aionui_db::{
-    CreateProviderParams, IAcpSessionRepository, IProviderRepository, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteProviderRepository, init_database_memory,
+    CreateProviderParams, IAcpSessionRepository, IProviderRepository, IUserRepository, SqliteAcpSessionRepository,
+    SqliteAgentMetadataRepository, SqliteProviderRepository, SqliteUserRepository, init_database_memory,
 };
 use aionui_realtime::BroadcastEventBus;
 
@@ -25,18 +25,20 @@ fn test_encryption_key() -> [u8; 32] {
 
 async fn setup() -> (
     Arc<dyn IProviderRepository>,
+    Arc<dyn IUserRepository>,
     Arc<AgentRegistry>,
     Arc<AcpSessionSyncService>,
 ) {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
+    let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(pool.clone()));
     let metadata_repo = Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
     let registry = AgentRegistry::new(metadata_repo);
     registry.hydrate().await.unwrap();
     let session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
     let acp_agent_service = AcpSessionSyncService::new(session_repo);
-    (provider_repo, registry, acp_agent_service)
+    (provider_repo, user_repo, registry, acp_agent_service)
 }
 
 async fn insert_test_provider(repo: &dyn IProviderRepository, id: &str, platform: &str) {
@@ -66,6 +68,7 @@ async fn insert_test_provider(repo: &dyn IProviderRepository, id: &str, platform
 
 fn make_factory(
     provider_repo: Arc<dyn IProviderRepository>,
+    user_repo: Arc<dyn IUserRepository>,
     agent_registry: Arc<AgentRegistry>,
     acp_agent_service: Arc<AcpSessionSyncService>,
 ) -> aionui_ai_agent::task_manager::AgentFactory {
@@ -83,6 +86,7 @@ fn make_factory(
     build_agent_factory(AgentFactoryDeps {
         skill_manager: AcpSkillManager::new(skill_paths),
         provider_repo,
+        user_repo,
         encryption_key: test_encryption_key(),
         agent_registry,
         acp_agent_service,
@@ -91,6 +95,7 @@ fn make_factory(
         broadcaster: Arc::new(BroadcastEventBus::new(16)),
         backend_binary_path: Arc::new(PathBuf::from("/tmp/aionrs-test/aioncore")),
         mcp_server_repo: None,
+        restrict_member_host_tools: false,
         session_spawner,
         // No hook bridge in this test: it exercises provider wiring, not the
         // Antigravity permission path.
@@ -131,8 +136,8 @@ fn make_aionrs_options(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aionrs_factory_returns_error_for_missing_provider() {
-    let (provider_repo, agent_registry, acp_agent_service) = setup().await;
-    let factory = make_factory(provider_repo, agent_registry, acp_agent_service);
+    let (provider_repo, user_repo, agent_registry, acp_agent_service) = setup().await;
+    let factory = make_factory(provider_repo, user_repo, agent_registry, acp_agent_service);
 
     let options = make_aionrs_options(
         "conv-test-1",
@@ -160,9 +165,9 @@ async fn aionrs_factory_returns_error_for_missing_provider() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aionrs_factory_resolves_provider_from_db() {
-    let (provider_repo, agent_registry, acp_agent_service) = setup().await;
+    let (provider_repo, user_repo, agent_registry, acp_agent_service) = setup().await;
     insert_test_provider(&*provider_repo, "prov-001", "openai").await;
-    let factory = make_factory(provider_repo, agent_registry, acp_agent_service);
+    let factory = make_factory(provider_repo, user_repo, agent_registry, acp_agent_service);
 
     let options = make_aionrs_options(
         "conv-test-2",
@@ -181,9 +186,9 @@ async fn aionrs_factory_resolves_provider_from_db() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aionrs_factory_respects_use_model_override() {
-    let (provider_repo, agent_registry, acp_agent_service) = setup().await;
+    let (provider_repo, user_repo, agent_registry, acp_agent_service) = setup().await;
     insert_test_provider(&*provider_repo, "prov-002", "openai").await;
-    let factory = make_factory(provider_repo, agent_registry, acp_agent_service);
+    let factory = make_factory(provider_repo, user_repo, agent_registry, acp_agent_service);
 
     let options = make_aionrs_options(
         "conv-test-3",

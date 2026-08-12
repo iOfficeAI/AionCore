@@ -283,11 +283,21 @@ impl ChannelManager {
             confirm_tx,
         };
 
-        plugin.initialize(config, callbacks).await?;
+        if let Err(error) = plugin.initialize(config, callbacks).await {
+            if let Err(cleanup_error) = plugin.stop().await {
+                warn!(
+                    plugin_id = %plugin_id,
+                    error = %cleanup_error,
+                    "failed to clean up plugin after credential test initialization error"
+                );
+            }
+            return Err(error);
+        }
 
         let bot_username = plugin.bot_info().and_then(|b| b.username.clone());
 
         // Clean up — don't leave a started connection
+        plugin.stop().await?;
         debug!(plugin_id = %plugin_id, "plugin credential test successful");
         Ok(bot_username)
     }

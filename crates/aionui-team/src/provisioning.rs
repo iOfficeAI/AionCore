@@ -5,6 +5,7 @@ use aionui_api_types::{AddAgentRequest, GetConfigOptionsResponse, TeamAgentInput
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
 use aionui_db::models::{AgentMetadataRow, TeamRow};
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
+use aionui_project::ProjectService;
 use async_trait::async_trait;
 use tracing::{info, warn};
 
@@ -25,6 +26,7 @@ pub struct TeamAgentProvisioner {
     assistant_catalog: Arc<dyn TeamAssistantCatalogPort>,
     provider_repo: Arc<dyn IProviderRepository>,
     conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+    project_service: Option<Arc<ProjectService>>,
 }
 
 pub(crate) struct InitialProvisioningResult {
@@ -140,11 +142,21 @@ impl TeamAgentProvisioner {
             assistant_catalog,
             provider_repo,
             conversation_port,
+            project_service: None,
         }
     }
 
+    pub(crate) fn with_project_service(mut self, project_service: Option<Arc<ProjectService>>) -> Self {
+        self.project_service = project_service;
+        self
+    }
+
     fn workspace_resolver(&self) -> TeamWorkspaceResolver {
-        TeamWorkspaceResolver::new(self.repo.clone(), self.conversation_port.clone())
+        TeamWorkspaceResolver::new(
+            self.repo.clone(),
+            self.conversation_port.clone(),
+            self.project_service.clone(),
+        )
     }
 
     pub(crate) async fn provision_initial_agents(

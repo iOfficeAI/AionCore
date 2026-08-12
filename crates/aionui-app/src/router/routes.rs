@@ -5,13 +5,13 @@ use std::time::Instant;
 
 use axum::Json;
 use axum::extract::DefaultBodyLimit;
-use axum::extract::Request;
-use axum::http::{HeaderName, Method, StatusCode, header};
+use axum::extract::{Request, State};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Router, middleware};
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowCredentials, AllowOrigin, Any, CorsLayer};
 
 use aionui_ai_agent::{
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, agent_routes, remote_agent_routes,
@@ -113,23 +113,26 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     // Restore enabled channel plugins (starts receiving IM messages)
     let chan_mgr = channel_components.manager;
     let chan_factory = channel_components.plugin_factory;
-    let chan_owner_user_id = channel_components.owner_user_id;
+    let restore_owner_user_ids = channel_components.restore_owner_user_ids;
     tokio::spawn(async move {
-        if let Some(chan_owner_user_id) = chan_owner_user_id {
-            if let Err(e) = chan_mgr.restore_plugins(&chan_owner_user_id, &chan_factory).await {
-                tracing::warn!(
-                    code = "BOOTSTRAP_DEGRADED_CHANNEL_RESTORE",
-                    stage = "channel.restore",
-                    owner_user_id = %chan_owner_user_id,
-                    error = %e,
-                    "failed to restore channel plugins"
-                );
-            }
-        } else {
+        if restore_owner_user_ids.is_empty() {
             tracing::info!(
                 stage = "channel.restore",
                 "skipping channel plugin restore until an owner user is available"
             );
+            return;
+        }
+
+        for owner_user_id in restore_owner_user_ids {
+            if let Err(e) = chan_mgr.restore_plugins(&owner_user_id, &chan_factory).await {
+                tracing::warn!(
+                    code = "BOOTSTRAP_DEGRADED_CHANNEL_RESTORE",
+                    stage = "channel.restore",
+                    owner_user_id = %owner_user_id,
+                    error = %e,
+                    "failed to restore channel plugins"
+                );
+            }
         }
     });
     tracing::info!(
@@ -189,6 +192,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let auth_state = AuthRouterState {
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
+        admin_user_repo: services.admin_user_repo.clone(),
+        share_repo: services.share_repo.clone(),
+        initial_admin_credentials_file: services.initial_admin_credentials_file.clone(),
         fs_adopter: Some(Arc::new(SkillFilesystemAdopter {
             skill_paths: services.skill_paths.clone(),
             skill_repo: services.skill_repo.clone(),
@@ -405,44 +411,200 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         "startup: route tree build with states completed"
     );
 
-    if services.identity_mode.is_local() {
-        let cors = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods([
-                Method::GET,
-                Method::POST,
-                Method::PUT,
-                Method::PATCH,
-                Method::DELETE,
-                Method::OPTIONS,
-            ])
-            .allow_headers(Any);
-        router.layer(cors)
-    } else {
-        // Non-local (external identity) mode: the desktop renderer is a
-        // cross-origin browser context (localhost:5173 in dev, file:// when
-        // packaged) authenticating with the session cookie, so responses must
-        // opt in to credentialed CORS. Credentialed mode forbids wildcards:
-        // reflect the request origin and enumerate headers explicitly
-        // (x-csrf-token is required by the CSRF double-submit middleware).
-        let cors = CorsLayer::new()
-            .allow_origin(AllowOrigin::mirror_request())
-            .allow_credentials(true)
-            .allow_methods([
-                Method::GET,
-                Method::POST,
-                Method::PUT,
-                Method::PATCH,
-                Method::DELETE,
-                Method::OPTIONS,
-            ])
-            .allow_headers([
-                header::CONTENT_TYPE,
-                header::AUTHORIZATION,
-                HeaderName::from_static("x-csrf-token"),
-            ]);
-        router.layer(cors)
+    let allowed_origins = effective_allowed_origins(services);
+    let router = match services.identity_mode {
+        crate::config::IdentityMode::Local => router
+            .layer(middleware::from_fn_with_state(
+                LocalClientSecretPolicy::new(
+                    services
+                        .local_client_secret
+                        .clone()
+                        .expect("validated Local services must carry a client secret"),
+                ),
+                local_client_secret_guard,
+            ))
+            .layer(middleware::from_fn_with_state(
+                NativeOriginPolicy {
+                    allowed: allowed_origins.clone(),
+                },
+                native_origin_guard,
+            )),
+        crate::config::IdentityMode::AionPro => router.layer(middleware::from_fn_with_state(
+            NativeOriginPolicy {
+                allowed: allowed_origins.clone(),
+            },
+            native_origin_guard,
+        )),
+        crate::config::IdentityMode::WebUi => router,
+    };
+
+    match services.identity_mode {
+        crate::config::IdentityMode::Local => {
+            let cors = CorsLayer::new()
+                .allow_origin(AllowOrigin::list(allowed_origins.iter().cloned()))
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::PATCH,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers(Any);
+            router.layer(cors)
+        }
+        crate::config::IdentityMode::WebUi => {
+            // The WebUI is served by the AionUI web host on the same origin.
+            // Do not opt credentialed browser requests into cross-origin access.
+            router
+        }
+        crate::config::IdentityMode::AionPro => {
+            if allowed_origins.is_empty() {
+                return router;
+            }
+            // AionPro uses an external renderer that needs cookies and CSRF
+            // headers. Only operator-configured exact origins are trusted.
+            let credential_origins = allowed_origins.clone();
+            let cors = CorsLayer::new()
+                .allow_origin(AllowOrigin::list(allowed_origins.iter().cloned()))
+                .allow_credentials(AllowCredentials::predicate(move |origin, _| {
+                    credential_origins.iter().any(|allowed| allowed == origin)
+                }))
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::PATCH,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers([
+                    header::CONTENT_TYPE,
+                    header::AUTHORIZATION,
+                    HeaderName::from_static("x-csrf-token"),
+                ]);
+            router.layer(cors)
+        }
     }
+}
+
+#[derive(Clone)]
+struct NativeOriginPolicy {
+    allowed: Arc<[HeaderValue]>,
+}
+
+#[derive(Clone)]
+struct LocalClientSecretPolicy {
+    secret: Arc<str>,
+    websocket_protocol: Arc<str>,
+}
+
+impl LocalClientSecretPolicy {
+    fn new(secret: Arc<str>) -> Self {
+        Self {
+            websocket_protocol: Arc::from(format!("aionui-local-v1.{secret}")),
+            secret,
+        }
+    }
+}
+
+fn effective_allowed_origins(services: &AppServices) -> Arc<[HeaderValue]> {
+    let mut values = Vec::new();
+    if services.identity_mode == crate::config::IdentityMode::Local {
+        values.push(HeaderValue::from_static("null"));
+    }
+    for origin in services.allowed_origins.iter() {
+        if let Ok(value) = HeaderValue::try_from(origin.as_str())
+            && !values.contains(&value)
+        {
+            values.push(value);
+        }
+    }
+    values.into()
+}
+
+async fn native_origin_guard(State(policy): State<NativeOriginPolicy>, request: Request, next: Next) -> Response {
+    if request.uri().path() == "/api/ws-token" || is_websocket_upgrade(&request) {
+        let mut origins = request.headers().get_all(header::ORIGIN).iter();
+        if let Some(origin) = origins.next()
+            && (origins.next().is_some() || !policy.allowed.iter().any(|allowed| allowed == origin))
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(
+                    "Request origin is not allowed.",
+                    "ORIGIN_NOT_ALLOWED",
+                )),
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
+}
+
+async fn local_client_secret_guard(
+    State(policy): State<LocalClientSecretPolicy>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let health_exempt = request.method() == Method::GET && request.uri().path() == "/health";
+    let authenticated = if is_websocket_upgrade(&request) {
+        websocket_protocol_matches(request.headers(), &policy.websocket_protocol)
+    } else {
+        header_secret_matches(request.headers(), &policy.secret)
+    };
+    if !health_exempt && !authenticated {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::new(
+                "Local client capability required.",
+                "LOCAL_CLIENT_SECRET_REQUIRED",
+            )),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+fn is_websocket_upgrade(request: &Request) -> bool {
+    request
+        .headers()
+        .get(header::UPGRADE)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+}
+
+fn header_secret_matches(headers: &axum::http::HeaderMap, expected: &str) -> bool {
+    let mut values = headers.get_all("x-aionui-local-secret").iter();
+    let Some(actual) = values.next() else {
+        return false;
+    };
+    values.next().is_none() && constant_time_eq(actual.as_bytes(), expected.as_bytes())
+}
+
+fn websocket_protocol_matches(headers: &axum::http::HeaderMap, expected: &str) -> bool {
+    let mut matched: Option<&str> = None;
+    for value in headers.get_all(header::SEC_WEBSOCKET_PROTOCOL) {
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        for protocol in value.split(',').map(str::trim) {
+            if protocol.is_empty() || matched.replace(protocol).is_some() {
+                return false;
+            }
+        }
+    }
+    matched.is_some_and(|actual| constant_time_eq(actual.as_bytes(), expected.as_bytes()))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for idx in 0..max_len {
+        let left = left.get(idx).copied().unwrap_or(0);
+        let right = right.get(idx).copied().unwrap_or(0);
+        diff |= usize::from(left ^ right);
+    }
+    diff == 0
 }
 
 /// Adapter running the on-disk side of AionUi → AionPro adoption over the
@@ -555,11 +717,33 @@ fn boundary_error_for_status(status: StatusCode) -> Option<(&'static str, &'stat
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Method, Request, StatusCode, header},
+    };
+    use tempfile::TempDir;
+    use tower::ServiceExt;
 
     use super::{boundary_error_for_status, create_router_with_runtime, is_global_websocket_event};
-    use crate::config::AppConfig;
+    use crate::config::{AppConfig, IdentityMode};
     use crate::services::AppServices;
+
+    const TEST_LOCAL_CLIENT_SECRET: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678";
+    const TEST_LOCAL_WS_PROTOCOL: &str = "aionui-local-v1.abcdefghijklmnopqrstuvwxyzABCDEFGH012345678";
+
+    fn local_websocket_request(path: &str, origin: Option<&str>, protocol: &str) -> Request<Body> {
+        let mut builder = Request::builder()
+            .uri(path)
+            .header(header::CONNECTION, "upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header(header::SEC_WEBSOCKET_VERSION, "13")
+            .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+            .header(header::SEC_WEBSOCKET_PROTOCOL, protocol);
+        if let Some(origin) = origin {
+            builder = builder.header(header::ORIGIN, origin);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
 
     #[test]
     fn boundary_error_for_status_covers_common_fallback_statuses() {
@@ -600,5 +784,393 @@ mod tests {
         let (_router, _runtime) = create_router_with_runtime(&services)
             .await
             .expect("router runtime should build");
+    }
+
+    async fn router_for_identity_mode(identity_mode: IdentityMode) -> (axum::Router, AppServices, TempDir) {
+        router_for_identity_mode_with_origins(identity_mode, &[]).await
+    }
+
+    async fn router_for_identity_mode_with_origins(
+        identity_mode: IdentityMode,
+        allowed_origins: &[&str],
+    ) -> (axum::Router, AppServices, TempDir) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            data_dir: temp_dir.path().join("data"),
+            work_dir: temp_dir.path().join("work"),
+            local: identity_mode == IdentityMode::Local,
+            identity_mode,
+            bootstrap_secret: (identity_mode == IdentityMode::AionPro).then(|| "test-bootstrap-secret".to_string()),
+            local_client_secret: (identity_mode == IdentityMode::Local).then(|| TEST_LOCAL_CLIENT_SECRET.to_string()),
+            allowed_origins: allowed_origins.iter().map(|value| (*value).to_string()).collect(),
+            ..AppConfig::default()
+        };
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let services = AppServices::from_config(db, &config).await.unwrap();
+        let router = super::create_router(&services).await.unwrap();
+        (router, services, temp_dir)
+    }
+
+    fn assert_no_cors_opt_in(response: &axum::response::Response) {
+        assert!(response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn webui_cross_origin_response_does_not_opt_in_to_cors() {
+        let (router, services, _temp_dir) = router_for_identity_mode(IdentityMode::WebUi).await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::ORIGIN, "https://attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_no_cors_opt_in(&response);
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn webui_cross_origin_login_preflight_is_not_approved() {
+        let (router, services, _temp_dir) = router_for_identity_mode(IdentityMode::WebUi).await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/login")
+                    .header(header::ORIGIN, "https://attacker.example")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, Method::POST.as_str())
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_no_cors_opt_in(&response);
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn webui_originless_direct_login_still_works() {
+        let (router, services, _temp_dir) = router_for_identity_mode(IdentityMode::WebUi).await;
+        let password_hash = aionui_auth::hash_password("test-password").unwrap();
+        services
+            .user_repo
+            .set_system_user_credentials("admin", &password_hash)
+            .await
+            .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"test-password"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_no_cors_opt_in(&response);
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn local_mode_only_allows_packaged_null_origin_by_default() {
+        let (router, services, _temp_dir) = router_for_identity_mode(IdentityMode::Local).await;
+        let attacker = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::ORIGIN, "https://attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(attacker.status(), StatusCode::OK);
+        assert_no_cors_opt_in(&attacker);
+
+        let packaged = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::ORIGIN, "null")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(packaged.status(), StatusCode::OK);
+        assert_eq!(
+            packaged.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&header::HeaderValue::from_static("null"))
+        );
+        assert!(
+            packaged
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none()
+        );
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn local_mode_allows_an_explicit_dev_origin() {
+        let (router, services, _temp_dir) =
+            router_for_identity_mode_with_origins(IdentityMode::Local, &["http://127.0.0.1:5173"]).await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::ORIGIN, "http://127.0.0.1:5173")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&header::HeaderValue::from_static("http://127.0.0.1:5173"))
+        );
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn aionpro_only_allows_configured_credentialed_cors() {
+        let (router, services, _temp_dir) =
+            router_for_identity_mode_with_origins(IdentityMode::AionPro, &["https://desktop.example"]).await;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::ORIGIN, "https://desktop.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&header::HeaderValue::from_static("https://desktop.example"))
+        );
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+            Some(&header::HeaderValue::from_static("true"))
+        );
+
+        let attacker = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::ORIGIN, "https://attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_no_cors_opt_in(&attacker);
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn local_ws_token_and_websocket_reject_unlisted_origins_but_allow_native_origins() {
+        let (router, services, _temp_dir) = router_for_identity_mode(IdentityMode::Local).await;
+        let local_jwt = services.jwt_service.sign("system_default_user", "local_user").unwrap();
+        let missing_secret = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/settings")
+                    .header(header::ORIGIN, "null")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_secret.status(), StatusCode::UNAUTHORIZED);
+
+        let missing_ws_token_secret = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ws-token")
+                    .header(header::ORIGIN, "null")
+                    .header(header::AUTHORIZATION, format!("Bearer {local_jwt}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_ws_token_secret.status(), StatusCode::UNAUTHORIZED);
+
+        let allowed_http = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ws-token")
+                    .header(header::ORIGIN, "null")
+                    .header("x-aionui-local-secret", TEST_LOCAL_CLIENT_SECRET)
+                    .header(header::AUTHORIZATION, format!("Bearer {local_jwt}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if allowed_http.status() != StatusCode::OK {
+            let status = allowed_http.status();
+            let body = to_bytes(allowed_http.into_body(), usize::MAX).await.unwrap();
+            panic!(
+                "allowed local ws-token failed with {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        let attacker_http = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ws-token")
+                    .header(header::ORIGIN, "https://attacker.example")
+                    .header("x-aionui-local-secret", TEST_LOCAL_CLIENT_SECRET)
+                    .header(header::AUTHORIZATION, format!("Bearer {local_jwt}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(attacker_http.status(), StatusCode::FORBIDDEN);
+
+        for path in ["/ws", "/api/stt/stream"] {
+            let missing_protocol = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::ORIGIN, "null")
+                        .header(header::CONNECTION, "upgrade")
+                        .header(header::UPGRADE, "websocket")
+                        .header(header::SEC_WEBSOCKET_VERSION, "13")
+                        .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(missing_protocol.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+            let attacker = router
+                .clone()
+                .oneshot(local_websocket_request(
+                    path,
+                    Some("https://attacker.example"),
+                    TEST_LOCAL_WS_PROTOCOL,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(attacker.status(), StatusCode::FORBIDDEN, "{path}");
+
+            let wrong_secret = router
+                .clone()
+                .oneshot(local_websocket_request(
+                    path,
+                    Some("null"),
+                    "aionui-local-v1.abcdefghijklmnopqrstuvwxyzABCDEFGH012345679",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(wrong_secret.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+            let packaged = router
+                .clone()
+                .oneshot(local_websocket_request(path, Some("null"), TEST_LOCAL_WS_PROTOCOL))
+                .await
+                .unwrap();
+            assert_ne!(packaged.status(), StatusCode::FORBIDDEN, "{path}");
+            assert_ne!(packaged.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+            let originless = router
+                .clone()
+                .oneshot(local_websocket_request(path, None, TEST_LOCAL_WS_PROTOCOL))
+                .await
+                .unwrap();
+            assert_ne!(originless.status(), StatusCode::FORBIDDEN, "{path}");
+            assert_ne!(originless.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn aionpro_ws_token_and_websocket_enforce_the_configured_origin() {
+        let (router, services, _temp_dir) =
+            router_for_identity_mode_with_origins(IdentityMode::AionPro, &["https://desktop.example"]).await;
+        let attacker_token = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ws-token")
+                    .header(header::ORIGIN, "https://attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(attacker_token.status(), StatusCode::FORBIDDEN);
+        let allowed_token = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ws-token")
+                    .header(header::ORIGIN, "https://desktop.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(allowed_token.status(), StatusCode::FORBIDDEN);
+
+        for path in ["/ws", "/api/stt/stream"] {
+            let attacker = router
+                .clone()
+                .oneshot(local_websocket_request(
+                    path,
+                    Some("https://attacker.example"),
+                    "invalid-session-token",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(attacker.status(), StatusCode::FORBIDDEN, "{path}");
+
+            let allowed = router
+                .clone()
+                .oneshot(local_websocket_request(
+                    path,
+                    Some("https://desktop.example"),
+                    "invalid-session-token",
+                ))
+                .await
+                .unwrap();
+            assert_ne!(allowed.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        services.database.close().await;
     }
 }

@@ -10,7 +10,7 @@ use aionui_api_types::TeamMcpStdioConfig;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
 use common::{
     body_json, build_app, build_app_with_mock_agents, delete_with_token, get_request, get_with_token, json_with_token,
-    setup_and_login,
+    managed_workspace_root, setup_and_login,
 };
 
 const DEFAULT_TEAM_ASSISTANT_ID: &str = "team-e2e-assistant";
@@ -371,8 +371,7 @@ async fn tc6b_workspace_with_whitespace_segment_is_accepted() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("Archive ");
+    let workspace = managed_workspace_root(&services, "admin").await.join("Archive ");
     std::fs::create_dir_all(&workspace).unwrap();
 
     let body = json!({
@@ -393,8 +392,9 @@ async fn tc6c_create_team_rejects_missing_workspace_path() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
-    let missing_workspace =
-        std::env::temp_dir().join(format!("aionui-team-missing-{}", aionui_common::generate_short_id()));
+    let missing_workspace = managed_workspace_root(&services, "admin")
+        .await
+        .join(format!("aionui-team-missing-{}", aionui_common::generate_short_id()));
 
     let body = json!({
         "name": "Alpha",
@@ -421,6 +421,26 @@ async fn tc6c_create_team_rejects_missing_workspace_path() {
         json["data"].as_array().unwrap().is_empty(),
         "invalid team should not be persisted"
     );
+}
+
+#[tokio::test]
+async fn tc6d_hosted_user_cannot_select_an_outside_team_workspace() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
+    let outside = tempfile::tempdir().unwrap();
+    let body = json!({
+        "name": "Outside",
+        "workspace": outside.path(),
+        "agents": [team_agent("Lead", "lead")]
+    });
+
+    let response = app
+        .oneshot(json_with_token("POST", "/api/teams", body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "FORBIDDEN");
 }
 
 // TC-7: Unauthenticated returns 401
@@ -845,6 +865,41 @@ async fn aa1_add_agent_to_team() {
     let json = body_json(resp).await;
     assert_eq!(json["data"]["name"], "New Agent");
     assert!(json["data"]["conversation_id"].is_string());
+}
+
+#[tokio::test]
+async fn hosted_add_agent_rejects_a_legacy_outside_team_workspace() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    sqlx::query("UPDATE teams SET workspace = ? WHERE id = ?")
+        .bind(outside.path().to_string_lossy().as_ref())
+        .bind(team_id)
+        .execute(services.database.pool())
+        .await
+        .unwrap();
+    let body = json!({
+        "name": "Blocked Agent",
+        "role": "teammate",
+        "model": "claude",
+        "assistant_id": DEFAULT_TEAM_ASSISTANT_ID
+    });
+
+    let response = app
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/agents"),
+            body,
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "FORBIDDEN");
 }
 
 // AA-2: After adding, agent count increases

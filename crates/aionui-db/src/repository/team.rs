@@ -111,13 +111,19 @@ pub trait ITeamRepository: Send + Sync {
     /// Returns the most recent messages for the whole team, ordered by
     /// `created_at` descending and capped at `limit`. Backs the read-only
     /// team activity view (all recipients, not a single mailbox).
-    async fn list_messages_by_team(&self, team_id: &str, limit: i64) -> Result<Vec<MailboxMessageRow>, DbError>;
+    async fn list_messages_by_team(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        limit: i64,
+    ) -> Result<Vec<MailboxMessageRow>, DbError>;
 
     /// Keyset-paginated team-wide messages for the activity feed. Returns up to
     /// `limit` rows strictly beyond `cursor` in `direction` order (no cursor =
     /// first page). Ordered `(created_at, id)` per direction.
     async fn list_messages_by_team_paged(
         &self,
+        user_id: &str,
         team_id: &str,
         cursor: Option<ActivityCursor>,
         direction: PageDirection,
@@ -127,7 +133,12 @@ pub trait ITeamRepository: Send + Sync {
     /// Returns the message rows with the given ids, ordered by `created_at`
     /// descending. Used to build full payloads after a batch read-mark.
     /// An empty `ids` slice yields an empty result without querying.
-    async fn list_messages_by_ids(&self, ids: &[String]) -> Result<Vec<MailboxMessageRow>, DbError>;
+    async fn list_messages_by_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MailboxMessageRow>, DbError>;
 
     /// Deletes all mailbox messages belonging to a team.
     async fn delete_mailbox_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError>;

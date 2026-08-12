@@ -27,6 +27,7 @@ mod provider;
 mod remote_agent;
 mod response;
 mod runtime;
+mod share;
 mod shell;
 mod skill;
 mod system;
@@ -70,11 +71,14 @@ pub use assistant::{
     is_local_avatar_value,
 };
 pub use auth::{
-    AuthStatusResponse, ChangePasswordRequest, EnsureExternalSessionRequest, EnsureExternalSessionResponse,
-    EnsureExternalUserRequest, EnsureExternalUserResponse, ExternalUserType, InternalAuthErrorCode, LoginRequest,
-    LoginResponse, PublicUser, QrLoginRequest, RefreshResponse, RefreshTokenRequest, RevokeExternalSessionRequest,
-    RevokeExternalSessionResponse, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
-    WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
+    AccountStatus, AdminAuditEntry, AdminAuditListResponse, AdminUser, AdminUserListResponse, AdminUserType,
+    AuthStatusResponse, ChangePasswordRequest, CreateAdminUserRequest, EnsureExternalSessionRequest,
+    EnsureExternalSessionResponse, EnsureExternalUserRequest, EnsureExternalUserResponse, ExternalUserType,
+    InternalAuthErrorCode, ListAdminAuditQuery, ListAdminUsersQuery, LoginRequest, LoginResponse, PublicUser,
+    QrLoginRequest, RefreshResponse, RefreshTokenRequest, RevokeExternalSessionRequest, RevokeExternalSessionResponse,
+    TemporaryPasswordResponse, UpdateAdminRoleRequest, UpdateAdminStatusRequest, UpdateAdminUsernameRequest,
+    UserInfoResponse, UserRole, WebuiChangePasswordRequest, WebuiChangeUsernameRequest, WebuiChangeUsernameResponse,
+    WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
 };
 pub use channel::{
     ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelAssistantSettingResponse,
@@ -150,6 +154,10 @@ pub use response::{ApiResponse, ErrorResponse};
 pub use runtime::{
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,
     RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind,
+};
+pub use share::{
+    CreateShareRequest, DirectoryUser, ListSharesQuery, ResourceShare, ShareListResponse, SharePermission,
+    ShareResourceType, UserDirectoryResponse,
 };
 pub use shell::{
     CheckToolInstalledRequest, CheckToolInstalledResponse, DeepgramSpeechToTextConfig, OpenAISpeechToTextConfig,

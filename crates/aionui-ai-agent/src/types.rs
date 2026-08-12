@@ -165,6 +165,10 @@ pub struct AionrsResolvedConfig {
     pub runtime_env: Vec<(String, String)>,
     /// Prompt dump directory when development prompt dumps are enabled.
     pub prompt_dump_dir: Option<PathBuf>,
+    /// Server-enforced runtime tool policy. Hosted members receive an empty
+    /// allow-list because aionrs filesystem and shell tools execute in the
+    /// backend process and are not an operating-system sandbox.
+    pub tool_policy: aion_agent::tool_policy::ToolPolicy,
 }
 
 #[cfg(test)]

@@ -107,6 +107,20 @@ pub trait IFileService: Send + Sync {
         conversation_id: Option<&str>,
     ) -> Result<String, FileError>;
 
+    /// Write an upload below a server-authorized root. Browser-session routes
+    /// use this with the current user's derived upload root; the default keeps
+    /// compatibility for alternate implementations.
+    async fn create_upload_file_in_root(
+        &self,
+        root: &Path,
+        file_name: &str,
+        data: &[u8],
+        conversation_id: Option<&str>,
+    ) -> Result<String, FileError> {
+        let _ = root;
+        self.create_upload_file(file_name, data, conversation_id).await
+    }
+
     // -- Image processing --
 
     /// Read a local image and return a base64 Data URL

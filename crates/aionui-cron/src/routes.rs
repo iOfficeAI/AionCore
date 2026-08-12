@@ -55,7 +55,7 @@ impl From<CronError> for ApiError {
 }
 
 pub fn cron_routes(state: CronRouterState) -> Router {
-    Router::new()
+    let routes = Router::new()
         .route("/api/cron/jobs", get(list_jobs).post(create_job))
         .route("/api/cron/jobs/{id}", get(get_job).put(update_job).delete(delete_job))
         .route("/api/cron/jobs/{id}/run", post(run_now))
@@ -65,13 +65,17 @@ pub fn cron_routes(state: CronRouterState) -> Router {
             "/api/internal/conversation-cron/jobs/{id}",
             put(update_conversation_cron),
         )
-        .route("/api/cron/internal/system-resume", post(system_resume))
         .route("/api/cron/jobs/{id}/conversations", get(list_conversations_by_cron_job))
         .route(
             "/api/cron/jobs/{id}/skill",
             get(has_skill).post(save_skill).delete(delete_skill),
-        )
-        .with_state(state)
+        );
+    let routes = if state.allow_system_resume_http {
+        routes.route("/api/cron/internal/system-resume", post(system_resume))
+    } else {
+        routes
+    };
+    routes.with_state(state)
 }
 
 async fn create_job(
@@ -293,6 +297,8 @@ mod tests {
             username: "alice".to_owned(),
             user_type: aionui_db::UserType::Aionpro,
             status: aionui_db::UserStatus::Active,
+            site_role: aionui_db::SiteRole::Member,
+            must_change_password: false,
         };
 
         assert!(matches!(
@@ -313,6 +319,8 @@ mod tests {
             username: "alice".to_owned(),
             user_type: aionui_db::UserType::Aionpro,
             status: aionui_db::UserStatus::Active,
+            site_role: aionui_db::SiteRole::Member,
+            must_change_password: false,
         };
 
         assert_eq!(trusted_header_user_id(&headers, &current_user).unwrap(), "user_a");

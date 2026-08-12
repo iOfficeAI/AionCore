@@ -8,6 +8,7 @@ async fn test_local_mode_skips_auth() {
     let db = aionui_db::init_database_memory().await.unwrap();
     let config = aionui_app::AppConfig {
         local: true,
+        local_client_secret: Some("abcdefghijklmnopqrstuvwxyzABCDEFGH012345678".to_string()),
         ..Default::default()
     };
     let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
@@ -24,7 +25,13 @@ async fn test_local_mode_skips_auth() {
 
     // An authenticated endpoint should work WITHOUT a token in local mode
     let response = router
-        .oneshot(Request::builder().uri("/api/settings").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/settings")
+                .header("x-aionui-local-secret", "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_ne!(response.status(), StatusCode::FORBIDDEN);

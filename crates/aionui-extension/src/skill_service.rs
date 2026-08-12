@@ -1062,7 +1062,7 @@ async fn replace_existing_path(path: &Path) -> Result<(), ExtensionError> {
 fn user_skill_root_for_user(paths: &SkillPaths, user_id: &str) -> PathBuf {
     // Type-first per-user root: skills/users/{user_dir}/ for every user,
     // including the default user (no more flat-root special case).
-    let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
+    let dir = aionui_common::user_dir_name_or_fingerprint(user_id);
     paths.user_skills_dir.join("users").join(dir)
 }
 
@@ -1580,6 +1580,23 @@ fn custom_source_slug(path: &str) -> String {
 /// The returned list preserves deterministic `source` slugs — see
 /// [`ExternalSkillSource::source`] for the contract.
 pub async fn detect_and_count_external_skills(custom_paths: &[NamedPath]) -> Vec<ExternalSkillSource> {
+    detect_and_count_external_skills_inner(custom_paths, None).await
+}
+
+/// Discover external skills while limiting common home-directory sources to
+/// caller-authorized canonical paths. Custom paths must be authorized by the
+/// caller before invoking this function.
+pub(crate) async fn detect_and_count_external_skills_with_allowed_common_paths(
+    custom_paths: &[NamedPath],
+    allowed_common_paths: &[PathBuf],
+) -> Vec<ExternalSkillSource> {
+    detect_and_count_external_skills_inner(custom_paths, Some(allowed_common_paths)).await
+}
+
+async fn detect_and_count_external_skills_inner(
+    custom_paths: &[NamedPath],
+    allowed_common_paths: Option<&[PathBuf]>,
+) -> Vec<ExternalSkillSource> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
@@ -1589,10 +1606,15 @@ pub async fn detect_and_count_external_skills(custom_paths: &[NamedPath]) -> Vec
     // 1. Common paths (iterate the constant table so we keep the per-entry slug).
     for (name, rel_path, slug) in COMMON_SKILL_DIRS {
         let full_path = home.join(rel_path);
-        if !full_path.exists() {
+        let Ok(canonical_path) = tokio::fs::canonicalize(&full_path).await else {
+            continue;
+        };
+        if let Some(allowed_paths) = allowed_common_paths
+            && !allowed_paths.contains(&canonical_path)
+        {
             continue;
         }
-        if let Ok(skills) = scan_skill_dirs(&full_path).await {
+        if let Ok(skills) = scan_skill_dirs(&canonical_path).await {
             sources.push(ExternalSkillSource {
                 name: (*name).to_string(),
                 path: full_path.to_string_lossy().into_owned(),
@@ -1605,8 +1627,10 @@ pub async fn detect_and_count_external_skills(custom_paths: &[NamedPath]) -> Vec
 
     // 2. Custom external paths
     for np in custom_paths {
-        let path = Path::new(&np.path);
-        if let Ok(skills) = scan_skill_dirs(path).await {
+        let Ok(canonical_path) = tokio::fs::canonicalize(Path::new(&np.path)).await else {
+            continue;
+        };
+        if let Ok(skills) = scan_skill_dirs(&canonical_path).await {
             sources.push(ExternalSkillSource {
                 name: np.name.clone(),
                 path: np.path.clone(),
@@ -2041,8 +2065,12 @@ async fn collect_skill_dirs_recursive(dir: &Path, result: &mut Vec<PathBuf>) -> 
     };
 
     while let Ok(Some(entry)) = entries.next_entry().await {
+        let file_type = entry.file_type().await?;
+        if file_type.is_symlink() {
+            continue;
+        }
         let entry_path = entry.path();
-        if entry_path.is_dir() {
+        if file_type.is_dir() {
             Box::pin(collect_skill_dirs_recursive(&entry_path, result)).await?;
         }
     }

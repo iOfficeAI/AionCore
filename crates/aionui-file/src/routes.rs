@@ -165,16 +165,36 @@ pub fn file_routes(state: FileRouterState) -> Router {
 
 async fn get_files_by_dir(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetFilesByDirRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<DirOrFileResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let items = state.file_service.get_files_by_dir(&req.dir, &req.root).await?;
+    let root = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.root),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    let dir = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.dir),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    ensure_descendant(&state, &root, &dir)?;
+    let items = state
+        .file_service
+        .get_files_by_dir(&path_string(&dir), &path_string(&root))
+        .await?;
     let response: Vec<DirOrFileResponse> = items.into_iter().map(to_dir_or_file_response).collect();
     Ok(Json(ApiResponse::ok(response)))
 }
 
 async fn list_workspace_files(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ListWorkspaceFilesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<WorkspaceFlatFileResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -182,9 +202,10 @@ async fn list_workspace_files(
     if root.is_empty() {
         return Err(ApiError::BadRequest("root is required".to_owned()));
     }
+    let root = authorize_path(&state, &user.id, Path::new(root), aionui_project::FileOp::Browse, false)?;
     let items = state
         .file_service
-        .list_workspace_files_with_extra_root(root, Some(Path::new(root)))
+        .list_workspace_files_with_extra_root(&path_string(&root), Some(&root))
         .await?;
 
     let response: Vec<WorkspaceFlatFileResponse> = items.into_iter().map(to_flat_file_response).collect();
@@ -193,25 +214,52 @@ async fn list_workspace_files(
 
 async fn get_file_metadata(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetFileMetadataRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FileMetadataResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let meta = state
-        .file_service
-        .get_file_metadata(&req.path, req.workspace.as_deref().map(Path::new))
-        .await?;
+    let path = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.path),
+        aionui_project::FileOp::Read,
+        true,
+    )?;
+    let meta = if state.project.allows_host_paths() {
+        state
+            .file_service
+            .get_file_metadata(&req.path, req.workspace.as_deref().map(Path::new))
+            .await?
+    } else {
+        state
+            .file_service
+            .get_file_metadata(&path_string(&path), Some(&path))
+            .await?
+    };
     Ok(Json(ApiResponse::ok(to_metadata_response(meta))))
 }
 
 async fn read_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ReadFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let content = state
-        .file_service
-        .read_file(&req.path, req.workspace.as_deref().map(Path::new))
-        .await?;
+    let path = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.path),
+        aionui_project::FileOp::Read,
+        true,
+    )?;
+    let content = if state.project.allows_host_paths() {
+        state
+            .file_service
+            .read_file(&req.path, req.workspace.as_deref().map(Path::new))
+            .await?
+    } else {
+        state.file_service.read_file(&path_string(&path), Some(&path)).await?
+    };
     Ok(Json(ApiResponse::ok(content)))
 }
 
@@ -227,9 +275,29 @@ async fn write_file(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
+    let workspace = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&workspace),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    let path = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.path),
+        aionui_project::FileOp::Write,
+        false,
+    )?;
+    ensure_descendant(&state, &workspace, &path)?;
     let ok = state
         .file_service
-        .write_file_for_user(&user.id, &req.path, req.data.as_bytes(), &workspace)
+        .write_file_for_user(
+            &user.id,
+            &path_string(&path),
+            req.data.as_bytes(),
+            &path_string(&workspace),
+        )
         .await?;
     Ok(Json(ApiResponse::ok(ok)))
 }
@@ -257,9 +325,24 @@ async fn copy_files(
     let dir = resolved
         .absolute_path
         .ok_or_else(|| ApiError::BadRequest("copy target is not a local path".to_owned()))?;
+    let destination = authorize_path(&state, &user.id, Path::new(&dir), aionui_project::FileOp::Write, false)?;
+    let source_root = req
+        .source_root
+        .as_deref()
+        .map(|root| authorize_path(&state, &user.id, Path::new(root), aionui_project::FileOp::Browse, true))
+        .transpose()?;
+    let mut source_paths = Vec::with_capacity(req.file_paths.len());
+    for source in &req.file_paths {
+        let source = authorize_path(&state, &user.id, Path::new(source), aionui_project::FileOp::Read, true)?;
+        if let Some(root) = &source_root {
+            ensure_descendant(&state, root, &source)?;
+        }
+        source_paths.push(path_string(&source));
+    }
+    let source_root = source_root.as_ref().map(|root| path_string(root));
     let result = state
         .file_service
-        .copy_files_to_workspace(&req.file_paths, &dir, req.source_root.as_deref())
+        .copy_files_to_workspace(&source_paths, &path_string(&destination), source_root.as_deref())
         .await?;
     Ok(Json(ApiResponse::ok(to_copy_response(result))))
 }
@@ -434,6 +517,53 @@ async fn open_system_file(
 /// ChatFileRef variants — mirrors the chat send-boundary convention.
 fn content_upload_root() -> PathBuf {
     std::env::temp_dir().join("aionui")
+}
+
+fn authorize_path(
+    state: &FileRouterState,
+    user_id: &str,
+    path: &Path,
+    op: aionui_project::FileOp,
+    include_uploads: bool,
+) -> Result<PathBuf, ApiError> {
+    state
+        .project
+        .authorize_user_path(user_id, path, op, include_uploads)
+        .map_err(ApiError::from)
+}
+
+fn ensure_descendant(state: &FileRouterState, root: &Path, path: &Path) -> Result<(), ApiError> {
+    if state.project.allows_host_paths() || path.starts_with(root) {
+        Ok(())
+    } else {
+        Err(ApiError::from(aionui_project::ProjectError::UserFilesystemDenied))
+    }
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn authorize_snapshot_path(
+    state: &FileRouterState,
+    user_id: &str,
+    workspace: &Path,
+    file_path: &str,
+) -> Result<String, ApiError> {
+    if state.project.allows_host_paths() {
+        return Ok(file_path.to_owned());
+    }
+    let candidate = if Path::new(file_path).is_absolute() {
+        PathBuf::from(file_path)
+    } else {
+        workspace.join(file_path)
+    };
+    let candidate = authorize_path(state, user_id, &candidate, aionui_project::FileOp::Write, false)?;
+    ensure_descendant(state, workspace, &candidate)?;
+    candidate
+        .strip_prefix(workspace)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|_| ApiError::from(aionui_project::ProjectError::UserFilesystemDenied))
 }
 
 /// Parse the optional `If-Match` header as a last-modified-millisecond stamp.
@@ -654,6 +784,7 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
 
 async fn upload_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let fields = extract_upload_multipart(multipart).await?;
@@ -662,22 +793,43 @@ async fn upload_file(
         ApiError::BadRequest("missing file name: provide 'file_name' or a multipart filename".to_owned())
     })?;
 
+    let upload_root = state.project.user_upload_root(&user.id).map_err(ApiError::from)?;
     let path = state
         .file_service
-        .create_upload_file(&file_name, &fields.file_data, fields.conversation_id.as_deref())
+        .create_upload_file_in_root(
+            &upload_root,
+            &file_name,
+            &fields.file_data,
+            fields.conversation_id.as_deref(),
+        )
         .await?;
     Ok(Json(ApiResponse::ok(path)))
 }
 
 async fn get_image_base64(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetImageBase64Request>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let data_url = state
-        .file_service
-        .get_image_base64(&req.path, req.workspace.as_deref().map(Path::new))
-        .await?;
+    let path = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.path),
+        aionui_project::FileOp::Read,
+        true,
+    )?;
+    let data_url = if state.project.allows_host_paths() {
+        state
+            .file_service
+            .get_image_base64(&req.path, req.workspace.as_deref().map(Path::new))
+            .await?
+    } else {
+        state
+            .file_service
+            .get_image_base64(&path_string(&path), Some(&path))
+            .await?
+    };
     Ok(Json(ApiResponse::ok(data_url)))
 }
 
@@ -696,124 +848,225 @@ async fn fetch_remote_image(
 
 async fn snapshot_init(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotInfoResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let info = state.snapshot_service.init(&req.workspace).await?;
+    let workspace = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.workspace),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    let info = state.snapshot_service.init(&path_string(&workspace)).await?;
     Ok(Json(ApiResponse::ok(to_snapshot_info_response(info))))
 }
 
 async fn snapshot_info(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotInfoResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let info = state.snapshot_service.get_info(&req.workspace).await?;
+    let workspace = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.workspace),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    let info = state.snapshot_service.get_info(&path_string(&workspace)).await?;
     Ok(Json(ApiResponse::ok(to_snapshot_info_response(info))))
 }
 
 async fn snapshot_compare(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotCompareResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let result = state.snapshot_service.compare(&req.workspace).await?;
+    let workspace = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.workspace),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    let result = state.snapshot_service.compare(&path_string(&workspace)).await?;
     Ok(Json(ApiResponse::ok(to_compare_response(result))))
 }
 
 async fn snapshot_baseline(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotBaselineRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.workspace),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    let file_path = authorize_snapshot_path(&state, &user.id, &workspace, &req.file_path)?;
     let content = state
         .snapshot_service
-        .get_baseline_content(&req.workspace, &req.file_path)
+        .get_baseline_content(&path_string(&workspace), &file_path)
         .await?;
     Ok(Json(ApiResponse::ok(content)))
 }
 
 async fn snapshot_stage_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.workspace),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    let file_path = authorize_snapshot_path(&state, &user.id, &workspace, &req.file_path)?;
     state
         .snapshot_service
-        .stage_file(&req.workspace, &req.file_path)
+        .stage_file(&path_string(&workspace), &file_path)
         .await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn snapshot_stage_all(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state.snapshot_service.stage_all(&req.workspace).await?;
+    let workspace = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.workspace),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    state.snapshot_service.stage_all(&path_string(&workspace)).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn snapshot_unstage_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.workspace),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    let file_path = authorize_snapshot_path(&state, &user.id, &workspace, &req.file_path)?;
     state
         .snapshot_service
-        .unstage_file(&req.workspace, &req.file_path)
+        .unstage_file(&path_string(&workspace), &file_path)
         .await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn snapshot_unstage_all(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state.snapshot_service.unstage_all(&req.workspace).await?;
+    let workspace = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.workspace),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    state.snapshot_service.unstage_all(&path_string(&workspace)).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn snapshot_discard(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.workspace),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    let file_path = authorize_snapshot_path(&state, &user.id, &workspace, &req.file_path)?;
     state
         .snapshot_service
-        .discard_file(&req.workspace, &req.file_path, req.operation)
+        .discard_file(&path_string(&workspace), &file_path, req.operation)
         .await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn snapshot_reset(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.workspace),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    let file_path = authorize_snapshot_path(&state, &user.id, &workspace, &req.file_path)?;
     state
         .snapshot_service
-        .reset_file(&req.workspace, &req.file_path, req.operation)
+        .reset_file(&path_string(&workspace), &file_path, req.operation)
         .await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn snapshot_branches(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let branches = state.snapshot_service.get_branches(&req.workspace).await?;
+    let workspace = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.workspace),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    let branches = state.snapshot_service.get_branches(&path_string(&workspace)).await?;
     Ok(Json(ApiResponse::ok(branches)))
 }
 
 async fn snapshot_dispose(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state.snapshot_service.dispose(&req.workspace).await?;
+    let workspace = authorize_path(
+        &state,
+        &user.id,
+        Path::new(&req.workspace),
+        aionui_project::FileOp::Browse,
+        false,
+    )?;
+    state.snapshot_service.dispose(&path_string(&workspace)).await?;
     Ok(Json(ApiResponse::success()))
 }
 

@@ -14,9 +14,10 @@ use tower::ServiceExt;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use aionui_auth::CurrentUser;
 use aionui_db::{
-    SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteSettingsRepository, init_database_memory,
+    SiteRole, SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
+    SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
 };
 use aionui_system::{
     ClientPrefService, FeedbackDiagnosticsService, ModelFetchService, ProtocolDetectionService, ProviderService,
@@ -53,12 +54,28 @@ async fn setup() -> axum::Router {
 }
 
 async fn detect(router: &axum::Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-    let req = Request::builder()
+    detect_with_role(router, body, SiteRole::Admin).await
+}
+
+async fn detect_with_role(
+    router: &axum::Router,
+    body: serde_json::Value,
+    site_role: SiteRole,
+) -> (StatusCode, serde_json::Value) {
+    let mut req = Request::builder()
         .method("POST")
         .uri("/api/providers/detect-protocol")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
+    req.extensions_mut().insert(CurrentUser {
+        id: "protocol-test-user".to_owned(),
+        username: "protocol-test-user".to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
+        site_role,
+        must_change_password: false,
+    });
 
     let resp = router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
@@ -99,6 +116,21 @@ async fn detect_protocol_empty_api_key() {
     let router = setup().await;
     let (status, _) = detect(&router, json!({"base_url": "https://example.com", "api_key": "  "})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn member_cannot_probe_loopback_or_metadata_protocol_endpoints() {
+    let router = setup().await;
+    for base_url in ["http://127.0.0.1:9", "http://169.254.169.254/latest/meta-data"] {
+        let (status, json) = detect_with_role(
+            &router,
+            json!({"base_url": base_url, "api_key": "sk-test"}),
+            SiteRole::Member,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{base_url} must be blocked");
+        assert_eq!(json["code"], "BAD_REQUEST");
+    }
 }
 
 // ---------------------------------------------------------------------------

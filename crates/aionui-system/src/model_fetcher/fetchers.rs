@@ -168,8 +168,8 @@ async fn fetch_gemini(client: &reqwest::Client, base_url: &str, api_key: &str) -
             );
             Ok(fallback_models(GEMINI_FALLBACK_MODELS))
         }
-        Err(e) => {
-            warn!(error = %e, "Gemini models API unreachable, using fallback list");
+        Err(_) => {
+            warn!("Gemini models API unreachable, using fallback list");
             Ok(fallback_models(GEMINI_FALLBACK_MODELS))
         }
     }

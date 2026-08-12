@@ -32,6 +32,22 @@ async fn migration_creates_assistant_unification_tables_and_keeps_legacy_tables(
 }
 
 #[tokio::test]
+async fn legacy_assistant_ids_are_scoped_by_user_in_primary_key() {
+    let db = init_database_memory().await.unwrap();
+
+    let primary_key_columns: Vec<(String, i64)> =
+        sqlx::query_as("SELECT name, pk FROM pragma_table_info('assistants') WHERE pk > 0 ORDER BY pk")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+
+    assert_eq!(
+        primary_key_columns,
+        vec![("user_id".to_string(), 1), ("id".to_string(), 2)],
+    );
+}
+
+#[tokio::test]
 async fn assistant_definition_table_has_expected_default_columns() {
     let db = init_database_memory().await.unwrap();
 

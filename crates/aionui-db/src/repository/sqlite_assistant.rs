@@ -188,13 +188,13 @@ impl IAssistantRepository for SqliteAssistantRepository {
     ) -> Result<AssistantRow, DbError> {
         let now = now_ms();
 
-        let result = sqlx::query(
+        sqlx::query(
             "INSERT INTO assistants \
                 (id, user_id, name, description, avatar, enabled_skills, \
                  custom_skill_names, disabled_builtin_skills, prompts, models, \
                  name_i18n, description_i18n, prompts_i18n, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(id) DO UPDATE SET \
+             ON CONFLICT(user_id, id) DO UPDATE SET \
                 name = excluded.name, \
                 description = excluded.description, \
                 avatar = excluded.avatar, \
@@ -206,8 +206,7 @@ impl IAssistantRepository for SqliteAssistantRepository {
                 name_i18n = excluded.name_i18n, \
                 description_i18n = excluded.description_i18n, \
                 prompts_i18n = excluded.prompts_i18n, \
-                updated_at = excluded.updated_at \
-             WHERE assistants.user_id = excluded.user_id",
+                updated_at = excluded.updated_at",
         )
         .bind(params.id)
         .bind(user_id)
@@ -226,13 +225,6 @@ impl IAssistantRepository for SqliteAssistantRepository {
         .bind(now)
         .execute(&self.pool)
         .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(DbError::Conflict(format!(
-                "Assistant with id '{}' already exists for another user",
-                params.id
-            )));
-        }
 
         let row = self
             .get_for_user(user_id, params.id)
@@ -1256,17 +1248,21 @@ mod tests {
     #[tokio::test]
     async fn assistants_are_scoped_by_user() {
         let (a, _o, _db) = setup().await;
-        a.create_for_user(USER_A, &params("a1", "User A Assistant"))
+        a.create_for_user(USER_A, &params("shared", "User A Assistant"))
             .await
             .unwrap();
-        a.create_for_user(USER_B, &params("b1", "User B Assistant"))
+        a.create_for_user(USER_B, &params("shared", "User B Assistant"))
             .await
             .unwrap();
 
-        assert!(a.get_for_user(USER_A, "a1").await.unwrap().is_some());
-        assert!(a.get_for_user(USER_A, "b1").await.unwrap().is_none());
-        assert!(a.get_for_user(USER_B, "a1").await.unwrap().is_none());
-        assert!(a.get_for_user(USER_B, "b1").await.unwrap().is_some());
+        assert_eq!(
+            a.get_for_user(USER_A, "shared").await.unwrap().unwrap().name,
+            "User A Assistant",
+        );
+        assert_eq!(
+            a.get_for_user(USER_B, "shared").await.unwrap().unwrap().name,
+            "User B Assistant",
+        );
 
         let user_a_ids: Vec<String> = a
             .list_for_user(USER_A)
@@ -1282,26 +1278,27 @@ mod tests {
             .into_iter()
             .map(|row| row.id)
             .collect();
-        assert_eq!(user_a_ids, vec!["a1"]);
-        assert_eq!(user_b_ids, vec!["b1"]);
+        assert_eq!(user_a_ids, vec!["shared"]);
+        assert_eq!(user_b_ids, vec!["shared"]);
     }
 
     #[tokio::test]
-    async fn assistant_upsert_rejects_cross_user_id_takeover() {
+    async fn assistant_upsert_updates_same_id_independently_per_user() {
         let (a, _o, _db) = setup().await;
         a.upsert_for_user(USER_A, &params("shared", "User A Assistant"))
             .await
             .unwrap();
-
-        let err = a
-            .upsert_for_user(USER_B, &params("shared", "User B Assistant"))
+        a.upsert_for_user(USER_B, &params("shared", "User B Assistant"))
             .await
-            .expect_err("cross-user upsert must not take over an existing assistant id");
-        assert!(matches!(err, DbError::Conflict(_)));
+            .unwrap();
+        a.upsert_for_user(USER_B, &params("shared", "User B Updated"))
+            .await
+            .unwrap();
 
         let user_a = a.get_for_user(USER_A, "shared").await.unwrap().unwrap();
         assert_eq!(user_a.name, "User A Assistant");
-        assert!(a.get_for_user(USER_B, "shared").await.unwrap().is_none());
+        let user_b = a.get_for_user(USER_B, "shared").await.unwrap().unwrap();
+        assert_eq!(user_b.name, "User B Updated");
     }
 
     #[tokio::test]

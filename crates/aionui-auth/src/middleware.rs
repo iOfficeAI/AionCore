@@ -8,7 +8,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 
 use aionui_common::ApiError;
-use aionui_db::{IUserRepository, UserStatus, UserType};
+use aionui_db::{IUserRepository, SiteRole, UserStatus, UserType};
 
 use crate::JwtService;
 use crate::extract::extract_token_from_headers;
@@ -52,6 +52,10 @@ pub struct CurrentUser {
     pub user_type: UserType,
     /// Current account status. Authenticated requests only receive active users.
     pub status: UserStatus,
+    /// Live site-wide authorization role loaded from the database.
+    pub site_role: SiteRole,
+    /// Whether this account must replace its temporary password.
+    pub must_change_password: bool,
 }
 
 impl CurrentUser {
@@ -61,6 +65,8 @@ impl CurrentUser {
             username: "system_default_user".to_string(),
             user_type: UserType::Local,
             status: UserStatus::Active,
+            site_role: SiteRole::Admin,
+            must_change_password: false,
         }
     }
 }
@@ -133,12 +139,35 @@ pub async fn auth_middleware(
         return Err(ApiError::Unauthorized("Invalid authentication session".into()));
     }
 
+    if let Some(session_id) = payload.session_id.as_deref() {
+        let active = state
+            .user_repo
+            .is_auth_session_active(session_id, &user.id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "persistent session lookup failed");
+                ApiError::Internal("Authentication service unavailable".into())
+            })?;
+        if !active {
+            return Err(ApiError::Unauthorized("Invalid authentication session".into()));
+        }
+        if let Err(error) = state.user_repo.touch_auth_session(session_id, &user.id).await {
+            tracing::warn!(user_id = %user.id, error = %error, "failed to update auth session activity");
+        }
+    }
+
+    let must_change_password = user.must_change_password;
+
     request.extensions_mut().insert(CurrentUser {
         id: user.id,
         username: user.username.unwrap_or_else(|| "external_user".to_string()),
         user_type: user.user_type,
         status: user.status,
+        site_role: user.site_role,
+        must_change_password,
     });
+
+    enforce_password_change(&request, must_change_password)?;
 
     Ok(next.run(request).await)
 }
@@ -192,13 +221,51 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
         ));
     }
 
+    let must_change_password = user.must_change_password;
     request.extensions_mut().insert(CurrentUser {
         id: user.id,
         username: user.username.unwrap_or_else(|| "external_user".to_string()),
         user_type: user.user_type,
         status: user.status,
+        site_role: user.site_role,
+        must_change_password,
     });
 
+    enforce_password_change(&request, must_change_password)?;
+
+    Ok(next.run(request).await)
+}
+
+fn enforce_password_change(request: &Request, must_change_password: bool) -> Result<(), ApiError> {
+    if !must_change_password {
+        return Ok(());
+    }
+    match request.uri().path() {
+        "/logout" | "/api/auth/user" | "/api/auth/change-password" => Ok(()),
+        _ => Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "PASSWORD_CHANGE_REQUIRED",
+            "Password change required.",
+            None,
+        )),
+    }
+}
+
+/// Authorization guard for site administrator routes. It must run after
+/// [`auth_middleware`] so the role is always the live database value.
+pub async fn admin_required_middleware(request: Request, next: Next) -> Result<Response, ApiError> {
+    let is_admin = request
+        .extensions()
+        .get::<CurrentUser>()
+        .is_some_and(|user| user.user_type == UserType::Local && user.site_role == SiteRole::Admin);
+    if !is_admin {
+        return Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "ADMIN_REQUIRED",
+            "Administrator access required.",
+            None,
+        ));
+    }
     Ok(next.run(request).await)
 }
 

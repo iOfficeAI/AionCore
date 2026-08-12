@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    EnsureExternalSessionRequest, EnsureExternalSessionResponse, EnsureExternalUserRequest, EnsureExternalUserResponse,
-    ExternalUserType, PublicUser, RevokeExternalSessionRequest, RevokeExternalSessionResponse,
+    AccountStatus, EnsureExternalSessionRequest, EnsureExternalSessionResponse, EnsureExternalUserRequest,
+    EnsureExternalUserResponse, ExternalUserType, PublicUser, RevokeExternalSessionRequest,
+    RevokeExternalSessionResponse, UserRole,
 };
 use aionui_db::{ExternalUserProjection, IUserRepository, UserStatus, UserType, models::User};
 
@@ -124,14 +125,30 @@ impl AuthProvisionService {
         }
 
         let username = user.username.clone().unwrap_or_else(|| "external_user".to_string());
+        let session_id = self
+            .user_repo
+            .create_auth_session(&user.id, aionui_common::now_ms() + crate::jwt::TOKEN_EXPIRY_MS)
+            .await?;
         let token = self
             .jwt_service
-            .sign_with_session_generation(&user.id, &username, user.session_generation)?;
+            .sign_with_session_id(&user.id, &username, user.session_generation, &session_id)?;
         self.user_repo.update_last_login(&user.id).await?;
 
         Ok(ExternalSessionExchange {
             response: EnsureExternalSessionResponse {
-                user: PublicUser { id: user.id, username },
+                user: PublicUser {
+                    id: user.id,
+                    username,
+                    role: match user.site_role {
+                        aionui_db::SiteRole::Admin => UserRole::Admin,
+                        aionui_db::SiteRole::Member => UserRole::Member,
+                    },
+                    status: match user.status {
+                        UserStatus::Active => AccountStatus::Active,
+                        UserStatus::Disabled => AccountStatus::Disabled,
+                    },
+                    must_change_password: user.must_change_password,
+                },
                 session_generation: user.session_generation,
             },
             token,

@@ -53,6 +53,8 @@ fn current_user(id: &str) -> CurrentUser {
         username: id.to_owned(),
         user_type: aionui_db::UserType::Local,
         status: aionui_db::UserStatus::Active,
+        site_role: aionui_db::SiteRole::Member,
+        must_change_password: false,
     }
 }
 
@@ -882,7 +884,8 @@ async fn setup_with_conv_runtime() -> (
     Arc<StubConvRepo>,
     Arc<ConversationService>,
 ) {
-    let (svc, cron_repo, bc, stub_conv_repo, conv_service, _, _) = setup_with_conv_runtime_and_agent_metadata().await;
+    let (svc, cron_repo, bc, stub_conv_repo, conv_service, _, _, _) =
+        setup_with_conv_runtime_and_agent_metadata().await;
     (svc, cron_repo, bc, stub_conv_repo, conv_service)
 }
 
@@ -894,6 +897,7 @@ async fn setup_with_conv_runtime_and_agent_metadata() -> (
     Arc<ConversationService>,
     Arc<dyn IAgentMetadataRepository>,
     Arc<dyn aionui_db::ISkillRepository>,
+    Arc<CronScheduler>,
 ) {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
@@ -973,7 +977,7 @@ async fn setup_with_conv_runtime_and_agent_metadata() -> (
         assistant_definition_repo: assistant_definition_repo.clone(),
         assistant_overlay_repo: assistant_overlay_repo.clone(),
         skill_repo: skill_repo.clone(),
-        scheduler,
+        scheduler: scheduler.clone(),
         executor,
         emitter,
         data_dir,
@@ -997,11 +1001,12 @@ async fn setup_with_conv_runtime_and_agent_metadata() -> (
         conv_service,
         agent_metadata_repo,
         skill_repo,
+        scheduler,
     )
 }
 
 async fn setup_with_skill_repo() -> (CronService, Arc<dyn aionui_db::ISkillRepository>) {
-    let (svc, _, _, _, _, _, skill_repo) = setup_with_conv_runtime_and_agent_metadata().await;
+    let (svc, _, _, _, _, _, skill_repo, _) = setup_with_conv_runtime_and_agent_metadata().await;
     (svc, skill_repo)
 }
 
@@ -2114,6 +2119,40 @@ async fn cj12_delete_nonexistent() {
     ));
 }
 
+#[tokio::test]
+async fn cj12_cross_user_delete_has_no_scheduler_or_skill_side_effects() {
+    let (svc, _, _, _, _, _, _, scheduler) = setup_with_conv_runtime_and_agent_metadata().await;
+    let created = svc
+        .add_job("u1", make_create_req("Private job", every_60s()))
+        .await
+        .unwrap();
+    svc.save_skill(
+        "u1",
+        &created.id,
+        SaveCronSkillRequest {
+            content: "---\nname: private\ndescription: owner only\n---\nKeep me".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(scheduler.is_scheduled(&created.id));
+
+    let error = svc
+        .remove_job("other-user", &created.id)
+        .await
+        .expect_err("cross-user delete must fail");
+    assert!(matches!(
+        error,
+        aionui_cron::error::CronError::Database(aionui_db::DbError::NotFound(_))
+    ));
+    assert!(
+        scheduler.is_scheduled(&created.id),
+        "foreign timer must remain scheduled"
+    );
+    assert!(svc.has_skill("u1", &created.id).await.unwrap().has_skill);
+    assert_eq!(svc.get_job("u1", &created.id).await.unwrap().id, created.id);
+}
+
 // ── SK-1: Save skill ──────────────────────────────────────────────
 
 #[tokio::test]
@@ -2782,7 +2821,7 @@ async fn create_for_conversation_helper_uses_assistant_metadata_full_auto_mode()
 
 #[tokio::test]
 async fn create_for_conversation_helper_uses_codex_canonical_full_auto_mode_from_fallback() {
-    let (svc, cron_repo, _, _, conv_service, agent_metadata_repo, _) =
+    let (svc, cron_repo, _, _, conv_service, agent_metadata_repo, _, _) =
         setup_with_conv_runtime_and_agent_metadata().await;
     let codex = agent_metadata_repo
         .find_builtin_by_backend("codex")
@@ -2859,6 +2898,48 @@ async fn create_for_conversation_helper_fails_when_conversation_binding_fails() 
 }
 
 #[tokio::test]
+async fn system_resume_http_route_is_registered_only_for_local_mode() {
+    let (svc, _, _, _, conv_service) = setup_with_conv_runtime().await;
+    let cron_service = Arc::new(svc);
+
+    let server_app = cron_routes(CronRouterState {
+        cron_service: cron_service.clone(),
+        conversation_service: (*conv_service).clone(),
+        allow_system_resume_http: false,
+    });
+    let server_response = server_app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/cron/internal/system-resume")
+                .header("x-aionui-internal", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(server_response.status(), StatusCode::NOT_FOUND);
+
+    let local_app = cron_routes(CronRouterState {
+        cron_service,
+        conversation_service: (*conv_service).clone(),
+        allow_system_resume_http: true,
+    });
+    let local_response = local_app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/cron/internal/system-resume")
+                .header("x-aionui-internal", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(local_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn conversation_cron_routes_create_list_and_update_claimed_job() {
     let (svc, cron_repo, _, _, conv_service) = setup_with_conv_runtime().await;
     let runtime_state = conv_service.runtime_state();
@@ -2869,6 +2950,7 @@ async fn conversation_cron_routes_create_list_and_update_claimed_job() {
     let app = cron_routes(CronRouterState {
         cron_service: Arc::new(svc),
         conversation_service: (*conv_service).clone(),
+        allow_system_resume_http: false,
     })
     .layer(Extension(current_user("u1")));
 
@@ -2954,6 +3036,7 @@ async fn conversation_cron_routes_reject_missing_headers_unclaimed_and_wrong_use
     let app = cron_routes(CronRouterState {
         cron_service: Arc::new(svc),
         conversation_service: (*conv_service).clone(),
+        allow_system_resume_http: false,
     })
     .layer(Extension(current_user("u1")));
 

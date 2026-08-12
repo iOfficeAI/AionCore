@@ -15,11 +15,12 @@ use aionui_api_types::{
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
+use aionui_db::SiteRole;
 
 use crate::client_pref::ClientPrefService;
 use crate::diagnostics::FeedbackDiagnosticsService;
 use crate::error::SystemError;
-use crate::model_fetcher::ModelFetchService;
+use crate::model_fetcher::{ModelFetchService, OutboundNetworkPolicy};
 use crate::protocol::ProtocolDetectionService;
 use crate::provider::ProviderService;
 use crate::runtime_prepare::RuntimePrepareService;
@@ -208,7 +209,7 @@ async fn create_provider(
     let Json(req) = body.map_err(ApiError::from)?;
     let provider = state
         .provider_service
-        .create(&user.id, req)
+        .create(&user.id, req, outbound_network_policy(&user))
         .await
         .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(provider))))
@@ -223,7 +224,7 @@ async fn update_provider(
     let Json(req) = body.map_err(ApiError::from)?;
     let provider = state
         .provider_service
-        .update(&user.id, &id, req)
+        .update(&user.id, &id, req, outbound_network_policy(&user))
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(provider)))
@@ -251,7 +252,7 @@ async fn fetch_models(
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .model_fetch_service
-        .fetch_models(&user.id, &id, &req)
+        .fetch_models(&user.id, &id, &req, outbound_network_policy(&user))
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
@@ -259,12 +260,13 @@ async fn fetch_models(
 
 async fn fetch_models_anonymous(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<FetchModelsAnonymousRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FetchModelsResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .model_fetch_service
-        .fetch_models_anonymous(&req)
+        .fetch_models_anonymous(&req, outbound_network_policy(&user))
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
@@ -272,12 +274,13 @@ async fn fetch_models_anonymous(
 
 async fn detect_protocol(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<DetectProtocolRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProtocolDetectionResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .protocol_detection_service
-        .detect_protocol(&req)
+        .detect_protocol(&req, outbound_network_policy(&user))
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
@@ -287,9 +290,25 @@ async fn detect_protocol(
 // System info & version check handlers
 // ===========================================================================
 
-async fn get_system_info() -> Json<ApiResponse<SystemInfoResponse>> {
-    let info = crate::sysinfo::get_system_info();
+async fn get_system_info(Extension(user): Extension<CurrentUser>) -> Json<ApiResponse<SystemInfoResponse>> {
+    let info = if may_access_host_infrastructure(&user) {
+        crate::sysinfo::get_system_info()
+    } else {
+        crate::sysinfo::get_redacted_system_info()
+    };
     Json(ApiResponse::ok(info))
+}
+
+fn outbound_network_policy(user: &CurrentUser) -> OutboundNetworkPolicy {
+    if may_access_host_infrastructure(user) {
+        OutboundNetworkPolicy::Unrestricted
+    } else {
+        OutboundNetworkPolicy::PublicOnly
+    }
+}
+
+fn may_access_host_infrastructure(user: &CurrentUser) -> bool {
+    user.site_role == SiteRole::Admin
 }
 
 async fn check_update(

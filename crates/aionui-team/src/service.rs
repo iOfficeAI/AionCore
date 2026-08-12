@@ -21,7 +21,7 @@ use aionui_db::{
     ActivityCursor, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IProviderRepository, ITeamRepository, PageDirection, UpdateTeamParams,
 };
-use aionui_project::{ProjectService, canonical};
+use aionui_project::{FileOp, ProjectError, ProjectService, canonical};
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
@@ -230,6 +230,7 @@ impl TeamSessionService {
     }
 
     pub(crate) fn provisioner(&self) -> TeamAgentProvisioner {
+        let project_service = self.project_service.read().ok().and_then(|guard| guard.clone());
         TeamAgentProvisioner::new(
             self.repo.clone(),
             self.agent_metadata_repo.clone(),
@@ -237,6 +238,7 @@ impl TeamSessionService {
             self.provider_repo.clone(),
             self.conversation_port.clone(),
         )
+        .with_project_service(project_service)
     }
 
     /// Inject the project-bind service (project-bind side branch). When unset,
@@ -245,6 +247,29 @@ impl TeamSessionService {
         if let Ok(mut guard) = self.project_service.write() {
             *guard = Some(project_service);
         }
+    }
+
+    fn authorize_workspace_path(&self, user_id: &str, workspace: &str) -> Result<String, TeamError> {
+        let normalized = validate_create_workspace_path(workspace)?;
+        let project = self
+            .project_service
+            .read()
+            .map_err(|_| TeamError::InvalidRequest("Project filesystem policy is unavailable".into()))?
+            .clone();
+        let Some(project) = project else {
+            // Standalone unit consumers retain local semantics. App
+            // composition always injects the identity-aware project service.
+            return Ok(normalized);
+        };
+        project
+            .authorize_user_path(user_id, Path::new(&normalized), FileOp::Browse, false)
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(|error| match error {
+                ProjectError::UserFilesystemDenied => {
+                    TeamError::Forbidden("Workspace is outside the current user's managed filesystem".into())
+                }
+                _ => TeamError::WorkspacePathUnavailable(normalized),
+            })
     }
 
     /// Resolve a team workspace into `(project_id, folder_id)`. Best-effort:
@@ -328,7 +353,7 @@ impl TeamSessionService {
     ) -> Result<Vec<TeamMailboxMessageResponse>, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         let clamped = limit.clamp(1, MAX_ACTIVITY_LIMIT);
-        let rows = self.repo.list_messages_by_team(team_id, clamped).await?;
+        let rows = self.repo.list_messages_by_team(user_id, team_id, clamped).await?;
         let responses: Vec<TeamMailboxMessageResponse> = rows.iter().map(mailbox_row_to_response).collect();
         info!(kind = "team", team_id, count = responses.len(), "team mailbox listed");
         Ok(responses)
@@ -406,7 +431,7 @@ impl TeamSessionService {
             ActivityKind::Message => {
                 let rows = self
                     .repo
-                    .list_messages_by_team_paged(team_id, cursor.clone(), direction, limit)
+                    .list_messages_by_team_paged(user_id, team_id, cursor.clone(), direction, limit)
                     .await?;
                 let full = rows.len() as i64 == limit;
                 (
@@ -430,7 +455,7 @@ impl TeamSessionService {
             ActivityKind::All => {
                 let msgs = self
                     .repo
-                    .list_messages_by_team_paged(team_id, cursor.clone(), direction, limit)
+                    .list_messages_by_team_paged(user_id, team_id, cursor.clone(), direction, limit)
                     .await?;
                 let tasks = self
                     .repo
@@ -563,7 +588,7 @@ impl TeamSessionService {
         }
 
         let shared_workspace = match req.workspace.as_deref() {
-            Some(workspace) if !workspace.is_empty() => Some(validate_create_workspace_path(workspace)?),
+            Some(workspace) if !workspace.is_empty() => Some(self.authorize_workspace_path(user_id, workspace)?),
             _ => None,
         };
 

@@ -11,6 +11,8 @@ use tokio::task::JoinSet;
 use tracing::debug;
 
 use crate::error::SystemError;
+use crate::model_fetcher::OutboundNetworkPolicy;
+use crate::model_fetcher::network_guard;
 
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const MAX_CONCURRENT_KEY_TESTS: usize = 5;
@@ -98,8 +100,13 @@ impl ProtocolDetectionService {
         Self { http_client }
     }
 
-    pub async fn detect_protocol(&self, req: &DetectProtocolRequest) -> Result<ProtocolDetectionResponse, SystemError> {
+    pub async fn detect_protocol(
+        &self,
+        req: &DetectProtocolRequest,
+        network_policy: OutboundNetworkPolicy,
+    ) -> Result<ProtocolDetectionResponse, SystemError> {
         validate_request(req)?;
+        let http_client = network_guard::client_for_url(&self.http_client, network_policy, &req.base_url).await?;
 
         let keys = parse_keys(&req.api_key);
         let primary_key = &keys[0];
@@ -120,7 +127,7 @@ impl ProtocolDetectionService {
 
         for protocol in &test_order {
             match self
-                .probe_protocol(*protocol, &req.base_url, primary_key, timeout)
+                .probe_protocol(&http_client, *protocol, &req.base_url, primary_key, timeout)
                 .await
             {
                 Ok(ProbeOutcome::Success {
@@ -131,7 +138,10 @@ impl ProtocolDetectionService {
                     let suggestion = success_suggestion(*protocol, req.preferred_protocol);
                     let multi_key_result = if req.test_all_keys && keys.len() > 1 {
                         let effective = fixed_base_url.as_deref().unwrap_or(&req.base_url);
-                        Some(self.test_all_keys(&keys, *protocol, effective, timeout).await)
+                        Some(
+                            self.test_all_keys(&http_client, &keys, *protocol, effective, timeout)
+                                .await,
+                        )
                     } else {
                         None
                     };
@@ -159,7 +169,10 @@ impl ProtocolDetectionService {
         if let Some((protocol, fixed_base_url)) = auth_failure {
             let multi_key_result = if req.test_all_keys && keys.len() > 1 {
                 let effective = fixed_base_url.as_deref().unwrap_or(&req.base_url);
-                Some(self.test_all_keys(&keys, protocol, effective, timeout).await)
+                Some(
+                    self.test_all_keys(&http_client, &keys, protocol, effective, timeout)
+                        .await,
+                )
             } else {
                 None
             };
@@ -188,6 +201,7 @@ impl ProtocolDetectionService {
 
     async fn probe_protocol(
         &self,
+        client: &reqwest::Client,
         protocol: ProtocolType,
         base_url: &str,
         api_key: &str,
@@ -195,14 +209,20 @@ impl ProtocolDetectionService {
     ) -> Result<ProbeOutcome, SystemError> {
         let base = base_url.trim_end_matches('/');
         match protocol {
-            ProtocolType::OpenAI => self.probe_openai(base, api_key, timeout).await,
-            ProtocolType::Anthropic => self.probe_anthropic(base, api_key, timeout).await,
-            ProtocolType::Gemini => self.probe_gemini(base, api_key, timeout).await,
+            ProtocolType::OpenAI => self.probe_openai(client, base, api_key, timeout).await,
+            ProtocolType::Anthropic => self.probe_anthropic(client, base, api_key, timeout).await,
+            ProtocolType::Gemini => self.probe_gemini(client, base, api_key, timeout).await,
             ProtocolType::Unknown => Err(SystemError::Internal("Cannot probe unknown".into())),
         }
     }
 
-    async fn probe_openai(&self, base: &str, api_key: &str, timeout: Duration) -> Result<ProbeOutcome, SystemError> {
+    async fn probe_openai(
+        &self,
+        client: &reqwest::Client,
+        base: &str,
+        api_key: &str,
+        timeout: Duration,
+    ) -> Result<ProbeOutcome, SystemError> {
         let urls = [
             (format!("{base}/models"), None),
             (format!("{base}/v1/models"), Some(format!("{base}/v1"))),
@@ -211,8 +231,7 @@ impl ProtocolDetectionService {
         let mut last_auth_failure: Option<Option<String>> = None;
 
         for (url, fixed) in &urls {
-            let resp = self
-                .http_client
+            let resp = client
                 .get(url)
                 .header("Authorization", format!("Bearer {api_key}"))
                 .timeout(timeout)
@@ -246,17 +265,22 @@ impl ProtocolDetectionService {
         Err(SystemError::BadGateway("OpenAI probe failed".into()))
     }
 
-    async fn probe_anthropic(&self, base: &str, api_key: &str, timeout: Duration) -> Result<ProbeOutcome, SystemError> {
+    async fn probe_anthropic(
+        &self,
+        client: &reqwest::Client,
+        base: &str,
+        api_key: &str,
+        timeout: Duration,
+    ) -> Result<ProbeOutcome, SystemError> {
         let url = format!("{base}/v1/models");
-        let resp = self
-            .http_client
+        let resp = client
             .get(&url)
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| SystemError::BadGateway(format!("Anthropic probe failed: {e}")))?;
+            .map_err(|_| SystemError::BadGateway("Anthropic probe request failed".into()))?;
 
         if resp.status().is_success() {
             let body: DataResponse = resp
@@ -277,15 +301,20 @@ impl ProtocolDetectionService {
         Err(SystemError::BadGateway(format!("Anthropic returned {}", resp.status())))
     }
 
-    async fn probe_gemini(&self, base: &str, api_key: &str, timeout: Duration) -> Result<ProbeOutcome, SystemError> {
+    async fn probe_gemini(
+        &self,
+        client: &reqwest::Client,
+        base: &str,
+        api_key: &str,
+        timeout: Duration,
+    ) -> Result<ProbeOutcome, SystemError> {
         let url = format!("{base}/v1beta/models?key={api_key}");
-        let resp = self
-            .http_client
+        let resp = client
             .get(&url)
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| SystemError::BadGateway(format!("Gemini probe failed: {e}")))?;
+            .map_err(|_| SystemError::BadGateway("Gemini probe request failed".into()))?;
 
         if resp.status().is_success() {
             let body: GeminiResponse = resp
@@ -315,6 +344,7 @@ impl ProtocolDetectionService {
 
     async fn test_all_keys(
         &self,
+        client: &reqwest::Client,
         keys: &[String],
         protocol: ProtocolType,
         effective_base: &str,
@@ -325,7 +355,7 @@ impl ProtocolDetectionService {
         let mut set = JoinSet::new();
 
         for (i, key) in keys.iter().enumerate() {
-            let client = self.http_client.clone();
+            let client = client.clone();
             let key = key.clone();
             let base = base.clone();
             let sem = sem.clone();
@@ -507,7 +537,7 @@ async fn test_single_key(
     let resp = req
         .send()
         .await
-        .map_err(|e| SystemError::BadGateway(format!("Request failed: {e}")))?;
+        .map_err(|_| SystemError::BadGateway("Provider key test request failed".into()))?;
 
     if resp.status().is_success() {
         Ok(())
