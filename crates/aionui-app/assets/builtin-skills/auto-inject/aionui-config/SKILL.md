@@ -1,34 +1,33 @@
 ---
 name: aionui-config
 description: >-
-  Configure AionUi itself through the bundled aioncore config CLI: create and edit assistants, update assistant rules, inspect and import skills, manage MCP servers, configure model providers, update settings, manage agents, configure scheduled tasks, and manage app configuration from an agent conversation. Use when the user wants you to set up or modify an AionUi assistant, attach skills, change an assistant's system prompt, add MCP or model provider configuration, schedule recurring work, or otherwise configure their AionUi installation, including when the user needs to know whether assistant changes affect the current conversation or only new conversations.
+  通过内置的 aioncore config CLI 配置 AionUi 本身：创建和编辑助手、更新助手规则、查看和导入 skill、管理 MCP 服务器、配置模型供应商、更新设置、管理 agent、配置定时任务，以及从 agent 对话中管理应用配置。当用户想要设置或修改 AionUi 助手、挂载 skill、修改助手的 system prompt、添加 MCP 或模型供应商配置、安排周期性任务，或以其他方式配置其 AionUi 安装时使用，包括用户需要知道助手改动是影响当前会话还是只影响新会话时。图像策略：凡是生成、绘制、画、编辑图片的请求，建议你调用 `aionui_image_generation` MCP 工具，可以生成更精美、视觉效果更好的图片；如果该工具不在你的工具列表里，可以使用代码生成。
 ---
 
-# AionUi Config
+# AionUi 配置
 
-Configure AionUi with the bundled agent-facing CLI. Do not discover ports, do
-not call raw backend paths, and do not depend on tools outside the bundled
-`aioncore` binary.
+用内置的 agent 专用 CLI 来配置 AionUi。不要去探测端口，不要直接调用后端原始路径，
+也不要依赖内置 `aioncore` 二进制之外的工具。
 
-## Rules
+## 规则
 
-1. Use only `"$AIONUI_HELPER_BIN" config ...`.
-2. Never pass, inline, export, echo, or set any `AIONUI_...` environment variable.
-3. Put all command input in stdin JSON.
-4. Do not use flags for business fields.
-5. Use `"$AIONUI_HELPER_BIN" config capabilities` when unsure which config command or stdin fields are supported.
-6. Read context before changing the current assistant.
-7. Read before writing, then read back after writing.
-8. Use `"assistant_id": "current"` when the user asks to change the assistant used by this conversation.
-9. Use `"conversation_id": "current"` when a command accepts a conversation selector.
-10. Do not show internal ids unless the user needs them for a follow-up operation.
-11. Never reveal provider keys, MCP headers, environment values, or other secrets.
-12. If the CLI fails, report the stable `CONFIG_...` error from stderr in normal prose and do not claim the change was made.
-13. After assistant changes, explain both persistence and effect timing. Saving and read-back do not mean the current running conversation has reloaded the changed runtime behavior.
+1. 只使用 `"$AIONUI_HELPER_BIN" config ...`。
+2. 绝不传递、内联、export、echo 或设置任何 `AIONUI_...` 环境变量。
+3. 所有命令输入都通过 stdin JSON 传入。
+4. 不要用命令行 flag 传业务字段。
+5. 不确定某个 config 命令或 stdin 字段是否支持时，先用 `"$AIONUI_HELPER_BIN" config capabilities` 查询。
+6. 修改当前助手前先读取上下文。
+7. 写之前先读，写之后再读回。
+8. 用户要求修改本会话所用的助手时，使用 `"assistant_id": "current"`。
+9. 命令接受会话选择器时，使用 `"conversation_id": "current"`。
+10. 除非用户后续操作需要，否则不要展示内部 id。
+11. 绝不透露供应商密钥、MCP headers、环境变量值或其他敏感信息。
+12. CLI 失败时，用自然语言把 stderr 里的稳定 `CONFIG_...` 错误码报出来，不要谎称改动已成功。
+13. 助手改动后，要同时说明持久化情况和生效时机。保存并读回不代表当前正在运行的会话已经重新加载了改动后的运行时行为。
 
-## Output
+## 输出
 
-Successful commands print a JSON envelope:
+成功的命令会打印一个 JSON 信封：
 
 ```json
 {
@@ -40,100 +39,90 @@ Successful commands print a JSON envelope:
 }
 ```
 
-Failures print one stable error line to stderr. Treat stderr as authoritative.
+失败时 stderr 会打印一行稳定的错误信息。以 stderr 为准。
 
-## Capability Discovery
+## 能力发现
 
-Ask aioncore what this version supports:
+询问 aioncore 本版本支持哪些能力：
 
 ```bash
 "$AIONUI_HELPER_BIN" config capabilities
 ```
 
-The result is a JSON envelope whose `data.domains[].commands[]` entries list
-supported command paths, input mode, expected stdin fields, selector fields,
-read-back behavior, destructive behavior, context requirements, and fields
-redacted from ordinary output.
+返回的 JSON 信封里，`data.domains[].commands[]` 列出了支持的命令路径、输入方式、
+预期的 stdin 字段、选择器字段、读回行为、是否破坏性、上下文要求，以及哪些字段在普通输出中会被脱敏。
 
-## Context
+## 上下文
 
-Read the current user, conversation, assistant, and local runtime context:
+读取当前用户、会话、助手和本地运行时上下文：
 
 ```bash
 "$AIONUI_HELPER_BIN" config context
 ```
 
-If `data.assistant` is `null`, the current conversation is not backed by an
-assistant. Ask the user which assistant to edit before changing assistant
-rules or defaults.
+如果 `data.assistant` 为 `null`，说明当前会话没有关联助手。在修改助手规则或默认值之前，
+先问用户要改哪个助手。
 
-## Assistant Change Timing
+## 助手改动生效时机
 
-AionUi persists assistant configuration immediately, but running conversations
-may keep the assistant snapshot created when the conversation started. Use this
-timing model when reporting successful assistant changes:
+AionUi 会立即持久化助手配置，但正在运行的会话可能仍然保留会话创建时的助手快照。
+上报成功的助手改动时，按以下时机模型说明：
 
-- Identity fields such as name, description, avatar, and recommended prompts are
-  saved immediately. If the open UI still shows old values, tell the user to
-  refresh or reopen the assistant view.
-- Runtime fields such as agent, default model, default permission, default
-  skills, default MCPs, thought level, and rules apply to new conversations
-  created from that assistant. Do not claim they change the current running
-  conversation.
-- Skills and MCP defaults are not retroactively injected into the current agent
-  runtime. If a tool is already available in the current conversation, it can be
-  used; otherwise the user should start a new conversation with the assistant.
+- 身份字段（如 name、description、avatar、推荐 prompts）立即保存。如果界面仍显示旧值，
+  让用户刷新或重新打开助手视图。
+- 运行时字段（如 agent、默认模型、默认权限、默认 skills、默认 MCP、思考级别、规则）
+  只对该助手新建的会话生效。不要声称它们会改变当前正在运行的会话。
+- Skills 和 MCP 默认值不会回灌进当前 agent 运行时。如果某个工具在当前会话里已经可用，
+  就能用；否则用户需要用该助手新建一个会话。
 
-When reporting a successful runtime-field change, say that the change was saved
-and read back, then state that it will affect new conversations only.
+上报成功的运行时字段改动时，先说改动已保存并读回，再说明它只对新会话生效。
 
-## Assistants
+## 助手
 
-List assistants:
+列出助手：
 
 ```bash
 "$AIONUI_HELPER_BIN" config assistants list
 ```
 
-Inspect the current assistant:
+查看当前助手：
 
 ```bash
 "$AIONUI_HELPER_BIN" config assistants get <<'JSON'
 {
   "assistant_id": "current",
-  "locale": "en-US"
+  "locale": "zh-CN"
 }
 JSON
 ```
 
-Examples use English sample text and `en-US`. For real localized assistant
-content, use the user's actual locale.
+示例使用中文样本文本和 `zh-CN`。对于真实的本地化助手内容，使用用户实际的 locale。
 
-Create an assistant:
+创建助手：
 
 ```bash
 "$AIONUI_HELPER_BIN" config assistants create <<'JSON'
 {
-  "name": "Requirements Analyst",
-  "description": "Turn rough product ideas into clear PRDs",
+  "name": "需求分析师",
+  "description": "把粗略的产品想法转化为清晰的 PRD",
   "agent_id": "2d23ff1c",
   "prompts": [
-    "Turn this feature idea into a PRD",
-    "Review this PRD and identify confusing parts for new users"
+    "把这个功能想法转化为 PRD",
+    "审阅这份 PRD，找出对新用户来说容易困惑的部分"
   ],
   "enabled_skills": ["aionui-config"]
 }
 JSON
 ```
 
-Update assistant metadata or defaults:
+更新助手元数据或默认值：
 
 ```bash
 "$AIONUI_HELPER_BIN" config assistants update <<'JSON'
 {
   "assistant_id": "current",
-  "locale": "en-US",
-  "description": "Updated assistant description",
+  "locale": "zh-CN",
+  "description": "更新后的助手描述",
   "defaults": {
     "permission": {
       "mode": "fixed",
@@ -144,13 +133,10 @@ Update assistant metadata or defaults:
 JSON
 ```
 
-For `name`, `description`, `avatar`, or recommended prompt changes, report that
-the change is saved and may require refreshing or reopening the UI to see. For
-`agent_id`, `defaults`, `enabled_skills`, or other runtime defaults (MCP
-defaults are set via `defaults.mcps`, not `default_mcp_ids`), report that the
-saved change applies to new conversations only.
+对于 `name`、`description`、`avatar` 或推荐 prompt 的改动，告诉用户改动已保存，可能需要刷新或重新打开界面才能看到。对于 `agent_id`、`defaults`、`enabled_skills` 或其他运行时默认值
+（MCP 默认值通过 `defaults.mcps` 设置，不是 `default_mcp_ids`），告诉用户保存的改动只对新会话生效。
 
-Enable, disable, or reorder an assistant:
+启用、禁用或调整助手顺序：
 
 ```bash
 "$AIONUI_HELPER_BIN" config assistants state <<'JSON'
@@ -162,50 +148,47 @@ Enable, disable, or reorder an assistant:
 JSON
 ```
 
-## Assistant Rules
+## 助手规则
 
-Assistant rules are the system prompt that defines assistant behavior.
+助手规则就是定义助手行为的 system prompt。
 
-Read the current assistant rule:
+读取当前助手规则：
 
 ```bash
 "$AIONUI_HELPER_BIN" config assistants rule read <<'JSON'
 {
   "assistant_id": "current",
-  "locale": "en-US"
+  "locale": "zh-CN"
 }
 JSON
 ```
 
-Write the current assistant rule:
+写入当前助手规则：
 
 ```bash
 "$AIONUI_HELPER_BIN" config assistants rule write <<'JSON'
 {
   "assistant_id": "current",
-  "locale": "en-US",
-  "content": "# Role\nYou are..."
+  "locale": "zh-CN",
+  "content": "# 角色\n你是一个..."
 }
 JSON
 ```
 
-For rule edits, preserve the user's existing useful instructions unless the
-user explicitly asks to replace them.
+编辑规则时，除非用户明确要求替换，否则保留用户已有的有用指令。
 
-After a successful rule write or delete, always tell the user that the rule was
-saved and read back, but it applies only to new conversations created from this
-assistant. The current conversation continues using the rule snapshot it started
-with.
+规则写入或删除成功后，始终告诉用户：规则已保存并读回，但它只对该助手新建的会话生效。
+当前会话仍使用它启动时所用的规则快照。
 
 ## Skills
 
-List available skills:
+列出可用 skills：
 
 ```bash
 "$AIONUI_HELPER_BIN" config skills list
 ```
 
-Inspect a skill directory before importing:
+导入前查看某个 skill 目录：
 
 ```bash
 "$AIONUI_HELPER_BIN" config skills info <<'JSON'
@@ -215,7 +198,7 @@ Inspect a skill directory before importing:
 JSON
 ```
 
-Import a skill:
+导入一个 skill：
 
 ```bash
 "$AIONUI_HELPER_BIN" config skills import <<'JSON'
@@ -225,7 +208,7 @@ Import a skill:
 JSON
 ```
 
-Attach skills to an assistant by updating the assistant's full skill list:
+通过更新助手的完整 skill 列表来挂载 skills：
 
 ```bash
 "$AIONUI_HELPER_BIN" config assistants update <<'JSON'
@@ -236,14 +219,12 @@ Attach skills to an assistant by updating the assistant's full skill list:
 JSON
 ```
 
-Do not append blindly. Read the assistant first, merge the list locally, then
-send the full intended `enabled_skills` value.
+不要盲目追加。先读取助手，在本地合并列表，再发送完整的 `enabled_skills` 值。
 
-Enabled skills are assistant defaults for new conversations. Do not tell the
-user that newly attached skills are available in the current conversation unless
-the current runtime already exposes them.
+已启用的 skills 是新会话的助手默认值。除非当前运行时已经暴露了某些 skills，
+否则不要告诉用户新挂载的 skills 在当前会话里可用。
 
-Manage external skill paths:
+管理外部 skill 路径：
 
 ```bash
 "$AIONUI_HELPER_BIN" config skills external-paths list
@@ -252,7 +233,7 @@ Manage external skill paths:
 ```bash
 "$AIONUI_HELPER_BIN" config skills external-paths add <<'JSON'
 {
-  "name": "Team Skills",
+  "name": "团队 Skills",
   "path": "/absolute/path/to/team-skills"
 }
 JSON
@@ -266,7 +247,7 @@ JSON
 JSON
 ```
 
-Enable or disable the skills market:
+启用或禁用 skills 市场：
 
 ```bash
 "$AIONUI_HELPER_BIN" config skills market enable
@@ -276,15 +257,15 @@ Enable or disable the skills market:
 "$AIONUI_HELPER_BIN" config skills market disable
 ```
 
-## MCP Servers
+## MCP 服务器
 
-List MCP servers:
+列出 MCP 服务器：
 
 ```bash
 "$AIONUI_HELPER_BIN" config mcp servers list
 ```
 
-Create an MCP server:
+创建 MCP 服务器：
 
 ```bash
 "$AIONUI_HELPER_BIN" config mcp servers create <<'JSON'
@@ -300,18 +281,18 @@ Create an MCP server:
 JSON
 ```
 
-Update an MCP server:
+更新 MCP 服务器：
 
 ```bash
 "$AIONUI_HELPER_BIN" config mcp servers update <<'JSON'
 {
   "server_id": "mcp_123",
-  "description": "Updated description"
+  "description": "更新后的描述"
 }
 JSON
 ```
 
-Test a server configuration:
+测试一个服务器配置：
 
 ```bash
 "$AIONUI_HELPER_BIN" config mcp test-connection <<'JSON'
@@ -326,7 +307,7 @@ Test a server configuration:
 JSON
 ```
 
-OAuth helpers:
+OAuth 辅助命令：
 
 ```bash
 "$AIONUI_HELPER_BIN" config mcp oauth check-status <<'JSON'
@@ -336,18 +317,17 @@ OAuth helpers:
 JSON
 ```
 
-Never show MCP headers or stdio env values to the user. CLI output redacts
-sensitive fields by default.
+绝不向用户展示 MCP headers 或 stdio env 值。CLI 输出默认会脱敏敏感字段。
 
-## Providers
+## 供应商
 
-List model providers:
+列出模型供应商：
 
 ```bash
 "$AIONUI_HELPER_BIN" config providers list
 ```
 
-Create a provider:
+创建供应商：
 
 ```bash
 "$AIONUI_HELPER_BIN" config providers create <<'JSON'
@@ -360,7 +340,7 @@ Create a provider:
 JSON
 ```
 
-Update a provider:
+更新供应商：
 
 ```bash
 "$AIONUI_HELPER_BIN" config providers update <<'JSON'
@@ -371,7 +351,7 @@ Update a provider:
 JSON
 ```
 
-Detect protocol, fetch models, or run a provider health check:
+探测协议、拉取模型或运行供应商健康检查：
 
 ```bash
 "$AIONUI_HELPER_BIN" config providers detect-protocol <<'JSON'
@@ -399,31 +379,31 @@ JSON
 JSON
 ```
 
-Never reveal provider keys. Do not repeat secret values from the user's input.
+绝不透露供应商密钥。不要重复用户输入里的敏感值。
 
-## Settings
+## 设置
 
-Read backend settings:
+读取后端设置：
 
 ```bash
 "$AIONUI_HELPER_BIN" config settings get
 ```
 
-Patch backend settings:
+修补后端设置：
 
 ```bash
 "$AIONUI_HELPER_BIN" config settings patch <<'JSON'
 {
-  "language": "en-US",
+  "language": "zh-CN",
   "notification_enabled": true
 }
 JSON
 ```
 
-Supported patch fields: `language`, `notification_enabled`, `cron_notification_enabled`,
-`command_queue_enabled`, `save_upload_to_workspace`. Unknown fields are silently ignored.
+支持的 patch 字段：`language`、`notification_enabled`、`cron_notification_enabled`、
+`command_queue_enabled`、`save_upload_to_workspace`。未知字段会被静默忽略。
 
-Read or update client preferences:
+读取或更新客户端偏好：
 
 ```bash
 "$AIONUI_HELPER_BIN" config settings client get
@@ -437,18 +417,18 @@ Read or update client preferences:
 JSON
 ```
 
-Client preferences are a free-form key-value map. Pass `null` to remove a key. Ask the
-user or read back first to discover keys in use — there is no fixed schema.
+客户端偏好是一个自由格式的键值表。传 `null` 可删除某个键。先问用户或先读回，
+以发现正在使用的键——没有固定 schema。
 
 ## Agents
 
-List available agents:
+列出可用 agents：
 
 ```bash
 "$AIONUI_HELPER_BIN" config agents list
 ```
 
-Enable or disable an agent:
+启用或禁用某个 agent：
 
 ```bash
 "$AIONUI_HELPER_BIN" config agents enable <<'JSON'
@@ -459,7 +439,7 @@ Enable or disable an agent:
 JSON
 ```
 
-Read or set per-agent overrides:
+读取或设置某个 agent 的覆盖项：
 
 ```bash
 "$AIONUI_HELPER_BIN" config agents overrides get <<'JSON'
@@ -478,7 +458,7 @@ JSON
 JSON
 ```
 
-Create, update, delete, or try-connect a custom agent:
+创建、更新、删除或试连接一个自定义 agent：
 
 ```bash
 "$AIONUI_HELPER_BIN" config agents custom create <<'JSON'
@@ -499,7 +479,7 @@ JSON
 JSON
 ```
 
-Test whether a custom agent binary is reachable (does not persist anything):
+测试某个自定义 agent 二进制是否可达（不会持久化任何东西）：
 
 ```bash
 "$AIONUI_HELPER_BIN" config agents custom try-connect <<'JSON'
@@ -509,88 +489,87 @@ Test whether a custom agent binary is reachable (does not persist anything):
 JSON
 ```
 
-Do not reveal agent env values or secret override values.
+不要透露 agent 的 env 值或机密的覆盖值。
 
-## Scheduled Tasks
+## 定时任务
 
-For tasks tied to the current conversation, use the cron current commands.
+对于绑定到当前会话的任务，使用 cron current 命令。
 
-List current conversation tasks:
+列出当前会话的任务：
 
 ```bash
 "$AIONUI_HELPER_BIN" config cron current list
 ```
 
-Create a task:
+创建任务：
 
 ```bash
 "$AIONUI_HELPER_BIN" config cron current create <<'JSON'
 {
-  "name": "Daily Summary",
+  "name": "每日总结",
   "schedule": "0 18 * * MON-FRI",
-  "schedule_description": "Weekdays at 6:00 PM",
-  "message": "Review the conversation context and produce a concise end-of-day summary."
+  "schedule_description": "工作日每天下午 6:00",
+  "message": "回顾会话上下文，产出一份简洁的当日总结。"
 }
 JSON
 ```
 
-Update a task:
+更新任务：
 
 ```bash
 "$AIONUI_HELPER_BIN" config cron current update <<'JSON'
 {
   "job_id": "cron_123",
-  "name": "Daily Summary",
+  "name": "每日总结",
   "schedule": "0 18 * * MON-FRI",
-  "schedule_description": "Weekdays at 6:00 PM",
-  "message": "Review the conversation context and produce a concise end-of-day summary."
+  "schedule_description": "工作日每天下午 6:00",
+  "message": "回顾会话上下文，产出一份简洁的当日总结。"
 }
 JSON
 ```
 
-After a successful create or update, explain the task name and schedule in
-normal user-facing language. Do not show `cron_...` ids unless needed.
+创建或更新成功后，用面向用户的自然语言说明任务名称和调度时间。除非需要，否则不要展示 `cron_...` id。
 
-For global cron job administration, use `config cron jobs`.
+全局 cron 任务管理用 `config cron jobs`。
 
-List all cron jobs:
+列出所有 cron 任务：
 
 ```bash
 "$AIONUI_HELPER_BIN" config cron jobs list
 ```
 
-Create a cron job:
+创建 cron 任务：
 
 ```bash
 "$AIONUI_HELPER_BIN" config cron jobs create <<'JSON'
 {
-  "name": "Weekly Report",
+  "name": "周报",
   "schedule": { "kind": "cron", "expr": "0 9 * * MON", "tz": "Asia/Shanghai" },
-  "message": "Produce the weekly report.",
+  "message": "产出周报。",
   "conversation_id": "current",
   "created_by": "user"
 }
 JSON
 ```
 
-The `schedule` field is a tagged object, not a flat string:
-- `{ "kind": "cron", "expr": "<cron-expr>", "tz": "<IANA-tz>" }` — recurring cron schedule
-- `{ "kind": "every", "every_ms": <milliseconds> }` — fixed interval
-- `{ "kind": "at", "at_ms": <epoch-ms> }` — one-shot at a specific time
+`schedule` 字段是一个带标签的对象，不是扁平字符串：
+- `{ "kind": "cron", "expr": "<cron-expr>", "tz": "<IANA-tz>" }` — 周期性 cron 调度
+- `{ "kind": "every", "every_ms": <毫秒> }` — 固定间隔
+- `{ "kind": "at", "at_ms": <epoch-毫秒> }` — 在某个具体时间触发一次
 
-`conversation_id` and `created_by` are required. `message` carries the task text.
-Use `"conversation_id": "current"` to attach the job to the current conversation.
+`conversation_id` 和 `created_by` 必填。`message` 承载任务文本。
+用 `"conversation_id": "current"` 把任务绑定到当前会话。
 
-Update, run, or manage a cron job skill:
+更新、运行或管理 cron 任务的 skill：
 
-Note: `cron jobs` uses the tagged `schedule` object (same shape as create). This
-is different from `cron current`, where `schedule` is a flat cron string.
+注意：`cron jobs` 使用带标签的 `schedule` 对象（与 create 相同）。这和 `cron current` 不同，
+后者 `schedule` 是扁平的 cron 字符串。
 
 ```bash
 "$AIONUI_HELPER_BIN" config cron jobs update <<'JSON'
 {
   "job_id": "cron_123",
-  "name": "Weekly Report",
+  "name": "周报",
   "schedule": { "kind": "cron", "expr": "0 10 * * MON" }
 }
 JSON
@@ -608,13 +587,12 @@ JSON
 "$AIONUI_HELPER_BIN" config cron jobs skill save <<'JSON'
 {
   "job_id": "cron_123",
-  "content": "# Skill\nTask-specific instructions."
+  "content": "# Skill\n任务专用指令。"
 }
 JSON
 ```
 
-## Safety
+## 安全
 
-Configuration changes affect the user's live app. Keep changes narrow, show
-what changed in plain language, and avoid exposing raw JSON unless the user
-asks for implementation detail.
+配置改动会影响用户正在运行的应用。保持改动最小化，用自然语言说明改了什么，
+除非用户要求看实现细节，否则避免暴露原始 JSON。

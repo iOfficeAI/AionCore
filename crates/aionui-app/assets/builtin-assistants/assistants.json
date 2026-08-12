@@ -1149,7 +1149,7 @@
       "models": []
     },
     {
-      "id": "team-game-development-studio",
+      "id": "game-dev-studio",
       "sort_order": 1500,
       "default_enabled": false,
       "name": "Game Development Studio",
@@ -1157,17 +1157,17 @@
         "en-US": "Game Development Studio",
         "zh-CN": "游戏开发工作室"
       },
-      "description": "Coordinate a full game studio of specialists across design, engineering, art, audio, quality, and release, driving a game from concept to launch through a phased, gate-checked workflow.",
+      "description": "A solo studio lead who always drafts a long-horizon plan first, then executes it by switching between six specialist personas (design, engineering, art, audio, quality, release) — driving a game from concept to launch through a phased, gate-checked workflow. For quick, low-cost game ideas it moves straight to execution toward the most promising direction, without waiting for step-by-step approval.",
       "description_i18n": {
-        "en-US": "Coordinate a full game studio of specialists across design, engineering, art, audio, quality, and release, driving a game from concept to launch through a phased, gate-checked workflow.",
-        "zh-CN": "统筹策划、技术、美术、音频、质量、运营六大专业成员，以七阶段工作流驱动游戏从概念到上线协同开发。"
+        "en-US": "A solo studio lead who always drafts a long-horizon plan first, then executes it by switching between six specialist personas (design, engineering, art, audio, quality, release) — driving a game from concept to launch through a phased, gate-checked workflow. For quick, low-cost game ideas it moves straight to execution toward the most promising direction, without waiting for step-by-step approval.",
+        "zh-CN": "一个人扛下整个工作室：先出一份能长程执行的计划（叫派单计划、分工计划、执行方案都行），再按策划/技术/美术/音频/质量/运营六个角色逐一换帽子执行，以七阶段工作流驱动游戏从概念到上线。对于一句话、低成本的创作需求，计划写完直接按最优、最可能'跑起来'的方向自主推进，不需要逐步等确认。"
       },
-      "avatar": "avatars/team-game-development-studio.png",
+      "avatar": "avatars/game-dev-studio.png",
       "agent_ref": "aionrs",
       "enabled_skills": [],
       "custom_skill_names": [],
       "disabled_builtin_skills": [],
-      "rule_file": "rules/team-game-development-studio.{locale}.md",
+      "rule_file": "rules/game-dev-studio.{locale}.md",
       "prompts": [
         "Help me run my game project as a studio — guide me through the right phase",
         "Brainstorm a game concept with pillars, MDA analysis, and scope tiers",
@@ -1184,168 +1184,6 @@
           "帮我头脑风暴一个游戏概念，含设计支柱、MDA分析与范围分层",
           "规划下一个冲刺：挑选就绪故事、实现、测试并收尾"
         ]
-      },
-      "models": []
-    },
-    {
-      "id": "gds-design-strategist",
-      "sort_order": 1610,
-      "default_enabled": false,
-      "name": "Vince Coyer",
-      "name_i18n": {
-        "en-US": "Vince Coyer",
-        "zh-CN": "文策渊"
-      },
-      "description": "Game Design & Narrative Strategist",
-      "description_i18n": {
-        "en-US": "Game Design & Narrative Strategist",
-        "zh-CN": "游戏策划与叙事设计师"
-      },
-      "avatar": "avatars/gds-design-strategist.png",
-      "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/gds-design-strategist.{locale}.md",
-      "prompts": [],
-      "prompts_i18n": {
-        "en-US": [],
-        "zh-CN": []
-      },
-      "models": []
-    },
-    {
-      "id": "gds-engineering-lead",
-      "sort_order": 1620,
-      "default_enabled": false,
-      "name": "Cheng Jiyan",
-      "name_i18n": {
-        "en-US": "Cheng Jiyan",
-        "zh-CN": "程基岩"
-      },
-      "description": "Game Engineering & Engine Lead",
-      "description_i18n": {
-        "en-US": "Game Engineering & Engine Lead",
-        "zh-CN": "游戏技术与引擎工程师"
-      },
-      "avatar": "avatars/gds-engineering-lead.png",
-      "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/gds-engineering-lead.{locale}.md",
-      "prompts": [],
-      "prompts_i18n": {
-        "en-US": [],
-        "zh-CN": []
-      },
-      "models": []
-    },
-    {
-      "id": "gds-art-director",
-      "sort_order": 1630,
-      "default_enabled": false,
-      "name": "Lin Wayson",
-      "name_i18n": {
-        "en-US": "Lin Wayson",
-        "zh-CN": "林绘澄"
-      },
-      "description": "Game Art & Visual Direction Lead",
-      "description_i18n": {
-        "en-US": "Game Art & Visual Direction Lead",
-        "zh-CN": "游戏美术与视觉表现指导"
-      },
-      "avatar": "avatars/gds-art-director.png",
-      "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/gds-art-director.{locale}.md",
-      "prompts": [],
-      "prompts_i18n": {
-        "en-US": [],
-        "zh-CN": []
-      },
-      "models": []
-    },
-    {
-      "id": "gds-audio-director",
-      "sort_order": 1640,
-      "default_enabled": false,
-      "name": "Ruan Hemo",
-      "name_i18n": {
-        "en-US": "Ruan Hemo",
-        "zh-CN": "阮和鸣"
-      },
-      "description": "Game Audio & Sound Design Lead",
-      "description_i18n": {
-        "en-US": "Game Audio & Sound Design Lead",
-        "zh-CN": "游戏音频与声效设计师"
-      },
-      "avatar": "avatars/gds-audio-director.png",
-      "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/gds-audio-director.{locale}.md",
-      "prompts": [],
-      "prompts_i18n": {
-        "en-US": [],
-        "zh-CN": []
-      },
-      "models": []
-    },
-    {
-      "id": "gds-quality-lead",
-      "sort_order": 1650,
-      "default_enabled": false,
-      "name": "Yan Soujin",
-      "name_i18n": {
-        "en-US": "Yan Soujin",
-        "zh-CN": "严守真"
-      },
-      "description": "Game Quality Assurance & Testing Lead",
-      "description_i18n": {
-        "en-US": "Game Quality Assurance & Testing Lead",
-        "zh-CN": "游戏质量保障与测试工程师"
-      },
-      "avatar": "avatars/gds-quality-lead.png",
-      "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/gds-quality-lead.{locale}.md",
-      "prompts": [],
-      "prompts_i18n": {
-        "en-US": [],
-        "zh-CN": []
-      },
-      "models": []
-    },
-    {
-      "id": "gds-release-ops-lead",
-      "sort_order": 1660,
-      "default_enabled": false,
-      "name": "Lu Yuanxing",
-      "name_i18n": {
-        "en-US": "Lu Yuanxing",
-        "zh-CN": "路远行"
-      },
-      "description": "Game Release & Live Ops Lead",
-      "description_i18n": {
-        "en-US": "Game Release & Live Ops Lead",
-        "zh-CN": "游戏发布与运营管理师"
-      },
-      "avatar": "avatars/gds-release-ops-lead.png",
-      "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/gds-release-ops-lead.{locale}.md",
-      "prompts": [],
-      "prompts_i18n": {
-        "en-US": [],
-        "zh-CN": []
       },
       "models": []
     },
