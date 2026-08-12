@@ -30,6 +30,19 @@ static DB_MIGRATOR: Migrator = sqlx::migrate!();
 // Keep this pinned to migration version 7 even as newer migrations land.
 const MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION: i64 = 7;
 const RECOVERABLE_DATABASE_CORRUPTION_STAGE: &str = "database.recoverable_corruption";
+/// Stage reported when the database was created by a NEWER app version than
+/// this binary: `_sqlx_migrations` contains a version the embedded migrator
+/// does not know (sqlx `MigrateError::VersionMissing`). This is a downgrade
+/// scenario, not a broken migration — the fix is upgrading the app, so hosts
+/// (AionUi) surface a dedicated "upgrade required" dialog instead of the
+/// generic migration-failure one (Sentry ELECTRON-31Z).
+pub const DATABASE_NEWER_THAN_APP_STAGE: &str = "database.newer_than_app";
+
+/// Highest migration version embedded in this binary, i.e. the newest schema
+/// this build can open. `None` only if the migrations directory is empty.
+pub fn latest_known_migration_version() -> Option<i64> {
+    DB_MIGRATOR.iter().map(|m| m.version).max()
+}
 
 /// Wraps a SQLite connection pool with lifecycle management.
 #[derive(Clone, Debug)]
@@ -392,9 +405,22 @@ async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitErro
         .await
         .map_err(|e| DatabaseInitError::new("database.migration", e))?;
 
-    let result = run_migrations_with_retry(&mut conn)
-        .await
-        .map_err(|e| DatabaseInitError::new("database.migration", e));
+    let result = run_migrations_with_retry(&mut conn).await.map_err(|e| {
+        if let Some(db_version) = e.missing_migration_version() {
+            // Downgrade: the DB holds a migration this binary doesn't ship.
+            // warn (not error) — the database is intact; the app is just older
+            // than the data. Versions are needed at info+ to diagnose from
+            // production logs which release the user must return to.
+            warn!(
+                db_migration_version = db_version,
+                app_migration_version = latest_known_migration_version(),
+                "Database was created by a newer app version; refusing to open (downgrade detected)"
+            );
+            DatabaseInitError::new(DATABASE_NEWER_THAN_APP_STAGE, e)
+        } else {
+            DatabaseInitError::new("database.migration", e)
+        }
+    });
 
     sqlx::query("PRAGMA foreign_keys = ON; PRAGMA legacy_alter_table = OFF")
         .execute(&mut *conn)

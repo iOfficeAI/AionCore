@@ -53,6 +53,16 @@ impl DbError {
         }
     }
 
+    /// The `_sqlx_migrations` version this binary does not know about, when the
+    /// error is sqlx's `VersionMissing` — the database was written by a newer
+    /// app version (downgrade scenario). `None` for every other error.
+    pub fn missing_migration_version(&self) -> Option<i64> {
+        match self {
+            DbError::Migration(sqlx::migrate::MigrateError::VersionMissing(version)) => Some(*version),
+            _ => None,
+        }
+    }
+
     /// True when this error is a UNIQUE constraint violation — either the
     /// explicit [`DbError::Conflict`] variant or a UNIQUE message from the
     /// underlying database error. Bootstrap treats these as "already done".
@@ -90,6 +100,16 @@ mod tests {
         ));
         assert!(message_indicates_unique_violation("unique constraint failed"));
         assert!(!message_indicates_unique_violation("no such column"));
+    }
+
+    #[test]
+    fn missing_migration_version_only_matches_version_missing() {
+        let downgrade = DbError::Migration(sqlx::migrate::MigrateError::VersionMissing(39));
+        assert_eq!(downgrade.missing_migration_version(), Some(39));
+
+        let mismatch = DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(7));
+        assert_eq!(mismatch.missing_migration_version(), None);
+        assert_eq!(DbError::Init("boom".into()).missing_migration_version(), None);
     }
 
     #[test]

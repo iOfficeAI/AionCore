@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.65](https://github.com/iOfficeAI/AionCore/compare/v0.1.64...v0.1.65) (2026-08-12)
+
+
+### Features
+
+* **db:** dedicated startup stage for database created by a newer app (downgrade) ([#834](https://github.com/iOfficeAI/AionCore/issues/834)) ([db7ce9a](https://github.com/iOfficeAI/AionCore/commit/db7ce9ae2fe25081bd2485aae53bae665eb7ca10))
+
+
+### Bug Fixes
+
+* **antigravity:** parse TSV output from `agy models` ([#797](https://github.com/iOfficeAI/AionCore/issues/797)) ([240e7f4](https://github.com/iOfficeAI/AionCore/commit/240e7f45f91584474f818e306f3d2186e74aced1))
+* **conversation:** tell the client when a turn is cancelled before its agent exists ([#827](https://github.com/iOfficeAI/AionCore/issues/827)) ([86eff2f](https://github.com/iOfficeAI/AionCore/commit/86eff2fa1dff988860aece3d5879bc10618dbb3a))
+
 ## [0.1.64](https://github.com/iOfficeAI/AionCore/compare/v0.1.63...v0.1.64) (2026-08-11)
 
 
