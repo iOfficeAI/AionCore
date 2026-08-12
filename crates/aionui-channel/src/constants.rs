@@ -40,6 +40,9 @@ pub const DINGTALK_MESSAGE_LIMIT: usize = 4000;
 /// Maximum characters per Slack message.
 pub const SLACK_MESSAGE_LIMIT: usize = 4000;
 
+/// Maximum characters per Discord message (`content` field limit).
+pub const DISCORD_MESSAGE_LIMIT: usize = 2000;
+
 // ---------------------------------------------------------------------------
 // Reconnection (Telegram long-polling)
 // ---------------------------------------------------------------------------
@@ -63,6 +66,13 @@ pub const LARK_EVENT_DEDUP_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// TTL for Slack event deduplication cache.
 pub const SLACK_EVENT_DEDUP_TTL: Duration = Duration::from_secs(5 * 60);
+
+// ---------------------------------------------------------------------------
+// Discord
+// ---------------------------------------------------------------------------
+
+/// TTL for Discord message deduplication cache (guards RESUME replays).
+pub const DISCORD_EVENT_DEDUP_TTL: Duration = Duration::from_secs(5 * 60);
 
 // ---------------------------------------------------------------------------
 // DingTalk
@@ -150,6 +160,16 @@ mod tests {
     #[test]
     fn slack_event_dedup_ttl_is_five_minutes() {
         assert_eq!(SLACK_EVENT_DEDUP_TTL, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn discord_message_limit() {
+        assert_eq!(DISCORD_MESSAGE_LIMIT, 2000);
+    }
+
+    #[test]
+    fn discord_event_dedup_ttl_is_five_minutes() {
+        assert_eq!(DISCORD_EVENT_DEDUP_TTL, Duration::from_secs(300));
     }
 
     #[test]

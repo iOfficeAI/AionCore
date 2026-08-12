@@ -13,6 +13,9 @@ pub mod weixin;
 #[cfg(feature = "slack")]
 pub mod slack;
 
+#[cfg(feature = "discord")]
+pub mod discord;
+
 use crate::plugin::ChannelPlugin;
 use crate::types::PluginType;
 
@@ -35,6 +38,9 @@ pub fn create_plugin(plugin_type: PluginType) -> Option<Box<dyn ChannelPlugin>> 
 
         #[cfg(feature = "slack")]
         PluginType::Slack => Some(Box::new(slack::SlackPlugin::new())),
+
+        #[cfg(feature = "discord")]
+        PluginType::Discord => Some(Box::new(discord::DiscordPlugin::new())),
 
         #[allow(unreachable_patterns)]
         _ => None,

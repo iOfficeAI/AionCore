@@ -254,6 +254,24 @@ impl IProjectStore for SqliteProjectStore {
         Ok(())
     }
 
+    async fn delete_project(&self, user_id: &str, project_id: &str) -> Result<(), DbError> {
+        // Explorer entries first, then the project row — both owner-scoped, one
+        // transaction. `folders` are global and intentionally left intact.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM project_explorer WHERE project_id = ? AND owner_user_id = ?")
+            .bind(project_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM projects WHERE project_id = ? AND user_id = ?")
+            .bind(project_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn reorder(&self, user_id: &str, project_id: &str, ordered_pe_ids: &[String]) -> Result<(), DbError> {
         let now = now_ms();
         let mut tx = self.pool.begin().await?;

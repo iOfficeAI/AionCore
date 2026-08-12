@@ -29,6 +29,7 @@ pub struct RelayConfig {
 pub fn throttle_ms_for_platform(platform: PluginType) -> u64 {
     match platform {
         PluginType::Slack => 1200,
+        PluginType::Discord => 1000,
         _ => 500,
     }
 }

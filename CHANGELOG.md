@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.64](https://github.com/iOfficeAI/AionCore/compare/v0.1.63...v0.1.64) (2026-08-11)
+
+
+### Features
+
+* **channel:** add Discord Gateway plugin ([#813](https://github.com/iOfficeAI/AionCore/issues/813)) ([f711607](https://github.com/iOfficeAI/AionCore/commit/f71160760266f8f5507ff355e484b9f11bc336b0))
+* **sidebar:** add user_order ordering base and sidebar grouping API ([#820](https://github.com/iOfficeAI/AionCore/issues/820)) ([d2f9f8c](https://github.com/iOfficeAI/AionCore/commit/d2f9f8ce9e8793a350835fdf36f2973f3cc95b3d))
+
+
+### Bug Fixes
+
+* **cli-version:** deliver the version-drift notice, and stop it reading as an error ([#817](https://github.com/iOfficeAI/AionCore/issues/817)) ([c0e9e9d](https://github.com/iOfficeAI/AionCore/commit/c0e9e9d44572a588e3ad79b6ac435fbe53f71b99))
+
 ## [0.1.63](https://github.com/iOfficeAI/AionCore/compare/v0.1.62...v0.1.63) (2026-08-10)
 
 

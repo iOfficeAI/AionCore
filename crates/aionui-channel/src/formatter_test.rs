@@ -44,3 +44,11 @@ fn slack_not_plain_escape_fallback() {
     assert_ne!(out, "**x**");
     assert_eq!(out, "*x*");
 }
+
+// Discord renders markdown natively — text passes through unchanged (no HTML
+// escaping of `<`, `>`, `&`; the old fallback would have mangled them).
+#[test]
+fn discord_passes_markdown_through_unchanged() {
+    let input = "**bold** _i_ `code` <@123> a < b & c";
+    assert_eq!(format_text_for_platform(input, PluginType::Discord), input);
+}

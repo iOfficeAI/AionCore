@@ -231,6 +231,20 @@ impl ProjectService {
         Ok(())
     }
 
+    /// Delete a project and all its explorer entries (owner-scoped, one store
+    /// transaction). Idempotent: removing an absent/foreign project succeeds
+    /// silently. Folders are global and are never removed here.
+    ///
+    /// This drops only the bind-chain rows; the conversations/teams that pointed
+    /// at the project are removed by the caller (sidebar `remove_project`
+    /// orchestration, BR-19). A best-effort `repositoriesChanged` notify lets the
+    /// source-control actor recompute (now-empty) roots for the gone project.
+    pub async fn delete_project(&self, user_id: &str, project_id: &str) -> Result<(), ProjectError> {
+        self.store.delete_project(user_id, project_id).await?;
+        self.notify_roots_changed(project_id, user_id);
+        Ok(())
+    }
+
     pub async fn reorder(
         &self,
         user_id: &str,

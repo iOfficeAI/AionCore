@@ -19,7 +19,7 @@
     "dimcode": {
       "registry_json_id": "dimcode",
       "package": "dimcode",
-      "version": "0.3.9"
+      "version": "0.3.10"
     },
     "dirac": {
       "registry_json_id": "dirac",
@@ -34,12 +34,12 @@
     "grok": {
       "registry_json_id": "grok-build",
       "package": "@xai-official/grok",
-      "version": "1.0.0"
+      "version": "1.0.1"
     },
     "kilo": {
       "registry_json_id": "kilo",
       "package": "@kilocode/cli",
-      "version": "7.4.20"
+      "version": "7.4.21"
     },
     "mimo-code": {
       "package": "@mimo-ai/cli",
@@ -62,7 +62,7 @@
     "sigit": {
       "registry_json_id": "sigit",
       "package": "@smbcloud/sigit",
-      "version": "1.5.1",
+      "version": "1.5.2",
       "skip_version_probe": true
     }
   }

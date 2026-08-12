@@ -26,11 +26,18 @@ use crate::event::{LocalizedText, NoticeLevel};
 
 /// The release a backend's wire contracts were verified against.
 ///
-/// Bumping one of these means re-verifying against captured traffic, not just
-/// editing the constant.
-pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.215";
-pub const VERIFIED_CODEX_VERSION: &str = "0.144.6";
-pub const VERIFIED_AGY_VERSION: &str = "1.1.10";
+/// Bumping one of these means the live e2e suite passed against that exact
+/// binary — not that the version number looked safe. `live_ws_http_parity_e2e`
+/// is the evidence; a schema diff or a clean changelog is not, because neither
+/// can see a behavioural regression.
+///
+/// codex is deliberately NOT on the latest release: 0.147.0 never completes a
+/// turn (its response stream disconnects with `httpStatusCode: null`, observed
+/// three times including a back-to-back control after three clean versions), so
+/// the verified release stops at 0.146.0 until upstream fixes it.
+pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.227";
+pub const VERIFIED_CODEX_VERSION: &str = "0.146.0";
+pub const VERIFIED_AGY_VERSION: &str = "1.1.11";
 
 /// The verified release for a direct-CLI backend, keyed by the program name the
 /// backend spawns. `None` for anything not version-gated here.
@@ -101,6 +108,22 @@ pub const CODE_CLI_VERSION_NEWER: &str = "CLI_VERSION_NEWER";
 /// would strand users on an old release. It is reported once so that, if the
 /// session then misbehaves, the cause is already on screen.
 ///
+/// Both directions are `Info`, which is a statement about PRESENTATION, not
+/// about how much the two verdicts matter. `Warning` renders as a filled card
+/// with the same alarm glyph an error uses, and a drifting install is not an
+/// error: nothing has failed, the turn is running, and the user is being told
+/// something about their environment. Reported live 2026-08-11 — an `Older`
+/// codex read as a failure report. `Info` is the tier the frontend draws as a
+/// quiet centred line, and `MessageTips` documents it as the tier a backend
+/// picks when it deliberately wants a notice to be unobtrusive.
+///
+/// The severity difference survives where it is acted on rather than merely
+/// read: the two verdicts keep distinct i18n codes, distinct prose ("some
+/// features may be missing. Consider upgrading" vs "should still work"), and
+/// distinct diagnostic codes on the availability probe — which is the surface
+/// that reaches the user BEFORE a conversation exists, when they are still
+/// deciding whether to rely on this agent, and which keeps its own weight.
+///
 /// Returns the English text AND its translation handle: the text is the
 /// fallback shown when the locale has no entry for the code, so both travel
 /// together rather than the caller having to rebuild one from the other.
@@ -114,7 +137,7 @@ pub fn drift_notice(cli: &str, reported: &str, verified: &str) -> Option<(Notice
     match classify(reported, verified) {
         VersionVerdict::Verified | VersionVerdict::Unknown => None,
         VersionVerdict::Older => Some((
-            NoticeLevel::Warning,
+            NoticeLevel::Info,
             format!(
                 "The installed {cli} is older than the version AionUi verified; \
                  some features may be missing. Consider upgrading {cli}. \
@@ -264,14 +287,170 @@ pub async fn session_drift_notice(
     Some(notice)
 }
 
+/// How long to keep trying to hand the notice to a subscriber.
+///
+/// Sized against the gap that produced the bug — codex broadcast at
+/// `02:18:02.863` and the session pump attached at `02:18:05.036`, 2.2s later —
+/// with room for a slower machine. A conversation that has attracted no
+/// subscriber in 30s has no one left to tell.
+const NOTICE_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const NOTICE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Broadcast a session notice, retrying until someone is subscribed.
+///
+/// `event_tx` is a `broadcast` channel, so a send with zero receivers is
+/// DISCARDED, not queued — and the version notice is one-shot: unlike a turn
+/// frame there is no later event carrying the same information, and
+/// `already_reported` guarantees the check will not run again for this session.
+///
+/// The three backends all spawn their version probe as a detached task, so
+/// whether the notice wins the race against the orchestration layer's
+/// `events()` subscription is pure timing. claude happens to win (its check is
+/// the last statement in `open_session`); codex reliably loses, because its
+/// check is deliberately placed early — before model discovery, so the
+/// reconcile path cannot skip it — and that discovery keeps `open_session`
+/// busy for seconds while `codex --version` returns in ~60ms.
+///
+/// Measured on 2026-08-11 dev logs: 13 codex drifts detected, 13 notices
+/// broadcast, 0 delivered — every one dropped by an empty channel, and every
+/// one logged as if it had been sent, because the send result was discarded
+/// with `let _ =`.
+///
+/// Retrying is free here: the caller is already a detached task whose only job
+/// is this notice.
+pub async fn broadcast_notice(
+    event_tx: &tokio::sync::broadcast::Sender<crate::backend::types::SessionEnvelope>,
+    envelope: crate::backend::types::SessionEnvelope,
+    cli: &str,
+) {
+    broadcast_notice_within(event_tx, envelope, cli, NOTICE_DELIVERY_TIMEOUT).await
+}
+
+/// [`broadcast_notice`] with an injectable deadline, so a test does not wait 30s
+/// to observe the give-up path.
+async fn broadcast_notice_within(
+    event_tx: &tokio::sync::broadcast::Sender<crate::backend::types::SessionEnvelope>,
+    envelope: crate::backend::types::SessionEnvelope,
+    cli: &str,
+    timeout: std::time::Duration,
+) {
+    let session_id = envelope.session_id.clone();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut waited = false;
+    loop {
+        // `send` fails ONLY when there is no receiver, which is precisely the
+        // condition worth retrying — a subscriber that is merely slow still
+        // takes the value into the ring buffer.
+        if event_tx.send(envelope.clone()).is_ok() {
+            if waited {
+                tracing::info!(session_id = %session_id, cli = %cli, "session notice delivered to a late subscriber");
+            }
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                session_id = %session_id,
+                cli = %cli,
+                timeout_ms = timeout.as_millis(),
+                "session notice dropped: nothing ever subscribed to this session's events"
+            );
+            return;
+        }
+        waited = true;
+        tokio::time::sleep(NOTICE_RETRY_INTERVAL).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn notice_envelope(session_id: &str) -> crate::backend::types::SessionEnvelope {
+        crate::backend::types::SessionEnvelope {
+            session_id: session_id.to_string(),
+            turn_gen: 0,
+            event: crate::event::SessionEvent::Notice {
+                level: NoticeLevel::Warning,
+                message: "drift".into(),
+                localized: None,
+                supersedes_key: None,
+            },
+        }
+    }
+
+    /// The bug this function exists for: the notice is produced BEFORE the
+    /// orchestration layer subscribes, which is what codex does every time — its
+    /// version check is placed early (so the reconcile path cannot skip it) and
+    /// `open_session` then spends seconds on model discovery. A plain
+    /// `send` drops the value on an empty channel, and 13 of 13 codex drift
+    /// notices were lost that way.
+    #[tokio::test]
+    async fn a_notice_broadcast_before_anyone_subscribes_still_arrives() {
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        // Proof the send would have been LOST as written before: no receiver
+        // exists, so the one-shot send fails outright.
+        assert!(
+            tx.send(notice_envelope("s1")).is_err(),
+            "precondition: an empty channel drops the value"
+        );
+
+        let sender = tx.clone();
+        let task = tokio::spawn(async move {
+            broadcast_notice(&sender, notice_envelope("s1"), "codex").await;
+        });
+
+        // Subscribe late, the way the session pump does (measured: 2.2s after
+        // the codex notice was broadcast).
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let mut rx = tx.subscribe();
+
+        task.await.expect("delivery task");
+        let env = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the notice must still be waiting for a late subscriber")
+            .expect("channel open");
+        assert_eq!(env.session_id, "s1");
+        assert!(matches!(env.event, crate::event::SessionEvent::Notice { .. }));
+    }
+
+    /// The claude timing — a subscriber is already attached — must not regress
+    /// into waiting for anything.
+    #[tokio::test]
+    async fn an_already_subscribed_session_gets_the_notice_immediately() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let started = tokio::time::Instant::now();
+        broadcast_notice(&tx, notice_envelope("s2"), "claude").await;
+        assert!(
+            started.elapsed() < NOTICE_RETRY_INTERVAL,
+            "a live subscriber must be served without a retry sleep"
+        );
+        assert_eq!(rx.recv().await.expect("delivered").session_id, "s2");
+    }
+
+    /// A session nobody ever listens to must not keep a task alive forever.
+    #[tokio::test]
+    async fn delivery_gives_up_once_the_deadline_passes() {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        drop(rx);
+        let started = tokio::time::Instant::now();
+        broadcast_notice_within(&tx, notice_envelope("s3"), "agy", std::time::Duration::from_millis(120)).await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(120),
+            "must honour the deadline: {waited:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "must not hang past it: {waited:?}"
+        );
+    }
+
     #[test]
     fn the_verified_release_says_nothing() {
-        assert_eq!(classify("2.1.215", VERIFIED_CLAUDE_VERSION), VersionVerdict::Verified);
-        assert!(drift_notice("claude", "2.1.215", VERIFIED_CLAUDE_VERSION).is_none());
+        // Literal on purpose: this is the exact string a user on the verified
+        // release reports, so the test breaks if a bump forgets to re-verify.
+        assert_eq!(classify("2.1.227", VERIFIED_CLAUDE_VERSION), VersionVerdict::Verified);
+        assert!(drift_notice("claude", "2.1.227", VERIFIED_CLAUDE_VERSION).is_none());
     }
 
     #[test]
@@ -279,7 +458,7 @@ mod tests {
         // The bug a string compare would introduce: "0.144.6" < "0.99.0"
         // lexically, but 144 > 99.
         assert_eq!(classify("0.99.0", VERIFIED_CODEX_VERSION), VersionVerdict::Older);
-        assert_eq!(classify("0.144.7", VERIFIED_CODEX_VERSION), VersionVerdict::Newer);
+        assert_eq!(classify("0.146.1", VERIFIED_CODEX_VERSION), VersionVerdict::Newer);
     }
 
     #[test]
@@ -290,11 +469,19 @@ mod tests {
         assert_eq!(parse_version("1.1.10"), Some(vec![1, 1, 10]));
     }
 
+    /// Both drift directions are `Info` — the tier the frontend draws as a quiet
+    /// centred line. `Warning` renders with the same alarm glyph as an error,
+    /// and a drifting install is not a failure. What must stay distinguishable
+    /// is what the user acts on: the code and the prose.
     #[test]
-    fn an_older_install_warns_and_a_newer_one_only_informs() {
+    fn an_older_install_is_told_apart_by_its_words_not_by_an_alarm() {
         let (level, text, localized) =
             drift_notice("claude", "2.1.100", VERIFIED_CLAUDE_VERSION).expect("older drifts");
-        assert_eq!(level, NoticeLevel::Warning);
+        assert_eq!(level, NoticeLevel::Info, "a drifting install must not read as an error");
+        assert!(
+            text.contains("older") && text.contains("Consider upgrading"),
+            "the older case must still say what to do: {text}"
+        );
         assert!(text.contains("2.1.100") && text.contains(VERIFIED_CLAUDE_VERSION));
         assert_eq!(localized.code, CODE_CLI_VERSION_OLDER);
         assert_eq!(localized.params.get("cli").and_then(|v| v.as_str()), Some("claude"));

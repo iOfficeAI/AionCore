@@ -413,15 +413,24 @@ impl AntigravitySessionBackend {
                 return;
             };
             if let Some(backend) = weak.and_then(|w| w.upgrade()) {
-                backend.emit(
-                    backend.turn_gen.load(Ordering::SeqCst),
-                    SessionEvent::Notice {
-                        level,
-                        message,
-                        localized: Some(localized),
-                        supersedes_key: None,
+                // Not `emit`: that drops the value when nobody is subscribed
+                // yet, which is fine for a turn frame (another one follows) but
+                // loses this notice outright — the check runs once per session.
+                crate::backend::cli_version::broadcast_notice(
+                    &backend.event_tx,
+                    SessionEnvelope {
+                        session_id: backend.session_id.clone(),
+                        turn_gen: backend.turn_gen.load(Ordering::SeqCst),
+                        event: SessionEvent::Notice {
+                            level,
+                            message,
+                            localized: Some(localized),
+                            supersedes_key: None,
+                        },
                     },
-                );
+                    "agy",
+                )
+                .await;
             }
         });
     }

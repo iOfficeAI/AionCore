@@ -67,6 +67,12 @@ pub trait IProjectStore: Send + Sync {
     ) -> Result<ProjectExplorerRow, DbError>;
 
     async fn remove_entry(&self, user_id: &str, pe_id: &str) -> Result<(), DbError>;
+
+    /// Delete a project owned by `user_id` and all of its explorer entries in one
+    /// transaction. Idempotent: an absent or foreign `project_id` deletes nothing
+    /// and still succeeds. `folders` are global (no owner) and are never removed
+    /// here — a folder may still back other projects or be re-adopted later.
+    async fn delete_project(&self, user_id: &str, project_id: &str) -> Result<(), DbError>;
     async fn reorder(&self, user_id: &str, project_id: &str, ordered_pe_ids: &[String]) -> Result<(), DbError>;
     async fn rename_entry(
         &self,
