@@ -518,6 +518,8 @@ $RECYCLE.BIN/
 
 # Build artifacts
 /target
+.build-out/
+.cargo-install-tmp/
 debug/
 *.d
 *.o
