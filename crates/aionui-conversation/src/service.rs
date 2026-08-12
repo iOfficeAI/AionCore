@@ -630,6 +630,7 @@ impl ConversationService {
             persistence: self.runtime_persistence(),
             runtime_state: Arc::clone(&self.runtime_state),
             title_only,
+            pending_started_ttl: crate::background_stream::PENDING_STARTED_TTL,
         };
         let rx = agent.subscribe();
         let join = tokio::spawn(watcher.run(rx));
