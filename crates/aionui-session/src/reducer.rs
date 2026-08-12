@@ -447,7 +447,10 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // 009 R6: BackendSuspended is FSM-invisible (the wake re-spawns on the
         // same event_tx). The orchestrator clears the roster on it; the reducer
         // does NOT move SessionState (suspend ≠ a turn boundary).
-        | SessionEvent::BackendSuspended => (state.clone(), Vec::new()),
+        | SessionEvent::BackendSuspended
+        // Task 2: a pure observability signal (queued/started/completed/cancelled
+        // echo of a user message) — no consumer yet (Task 3). Never a turn signal.
+        | SessionEvent::MessageLifecycle { .. } => (state.clone(), Vec::new()),
 
         // ⭐ SubagentUpdate: the ONE §6b b1 reducer READ. Upsert into
         // Running.subagents by `ref` (last-write-wins). This is the SOLE

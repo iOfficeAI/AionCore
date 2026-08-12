@@ -604,6 +604,19 @@ pub enum SessionEvent {
     /// pass-through, reducer no-op, never persisted as an event. Only codex
     /// emits it today; backends without a turn-anchored fork never do.
     BackendTurnBound { backend_turn_id: String },
+
+    /// Task 2 (mid-turn interjection observability): claude echoes back the
+    /// `uuid` WE minted on a user frame via a `command_lifecycle` frame
+    /// (`{"type":"command_lifecycle","command_uuid":"<uuid>","state":"queued"
+    /// |"started"|"completed"|"cancelled"}`, verified 2.1.226, design spec
+    /// §6.1). `client_msg_id` is that echoed uuid — the SAME correlation key
+    /// the pending-queue already tracks — so consumers need no guessing.
+    /// Reducer no-op today (no consumer yet — Task 3); this is a pure
+    /// observation of "the user message was consumed by the agent".
+    MessageLifecycle {
+        client_msg_id: String,
+        phase: MessageLifecyclePhase,
+    },
 }
 
 // ==========================================================================
@@ -677,6 +690,22 @@ pub enum PermissionKind {
     #[default]
     Tool,
     Auth,
+}
+
+/// Phase of a user message the CLI reports back. claude emits these as
+/// `command_lifecycle` frames echoing the `uuid` WE minted on the user frame,
+/// so correlation needs no guessing (verified 2.1.226; see the design spec
+/// §6.1). Advertised as `msg_lifecycle_v1` in `system/init` capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MessageLifecyclePhase {
+    /// Written to the CLI, not yet consumed into a turn.
+    Queued,
+    /// The agent has taken the message into a turn.
+    Started,
+    /// The turn that consumed it has finished.
+    Completed,
+    /// Dropped without being consumed.
+    Cancelled,
 }
 
 /// LC-8a: one entry in a [`SessionEvent::Plan`] to-do snapshot. Unified shape over
@@ -950,7 +979,8 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | MessageFinalized(..)
         | SessionInfo { .. }
         | SessionTitle { .. }
-        | CheckpointList { .. } => EventClass::BackendProduced,
+        | CheckpointList { .. }
+        | MessageLifecycle { .. } => EventClass::BackendProduced,
     }
 }
 
@@ -987,6 +1017,9 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             // the phase list is re-declared on the next run's first progress frame
             WorkflowPhase { .. } => PersistTier::Ephemeral,
             Plan { .. } => PersistTier::Ephemeral, // LC-8a: live to-do snapshot, full-replace + re-derivable (not history)
+            // Task 2: a pure liveness/correlation signal (queued→started→completed/
+            // cancelled), re-derivable from the next turn's own frames — not history.
+            MessageLifecycle { .. } => PersistTier::Ephemeral,
             ToolCall { .. }
             | ToolResult { .. }
             | UsageDelta { .. }
@@ -1438,16 +1471,26 @@ mod additive_tests {
             ),
             // ── backend-produced, State ──
             ("Rewound", SessionEvent::Rewound { to_turn: 1 }, BackendProduced, State),
+            // Task 2: a pure correlation/liveness signal, re-derivable — Ephemeral.
+            (
+                "MessageLifecycle",
+                SessionEvent::MessageLifecycle {
+                    client_msg_id: "u-1".into(),
+                    phase: MessageLifecyclePhase::Queued,
+                },
+                BackendProduced,
+                Ephemeral,
+            ),
         ];
 
-        // Tripwire: every SessionEvent variant must appear. 33 variants today
-        // (7 orchestration-lowered + 26 backend-produced, incl. Notice +
-        // ToolOutputDelta + TurnDiffUpdated + SessionInfo + SessionTitle);
-        // AdapterSpecific appears twice for its raw-timing vs structured split
-        // → 34 rows. A new variant trips.
+        // Tripwire: every SessionEvent variant must appear. 34 variants today
+        // (7 orchestration-lowered + 27 backend-produced, incl. Notice +
+        // ToolOutputDelta + TurnDiffUpdated + SessionInfo + SessionTitle +
+        // MessageLifecycle); AdapterSpecific appears twice for its raw-timing
+        // vs structured split → 35 rows. A new variant trips.
         assert_eq!(
             table.len(),
-            34,
+            35,
             "every SessionEvent variant (+ the AdapterSpecific timing split) must be routed here"
         );
 
@@ -1665,6 +1708,10 @@ mod additive_tests {
             SessionEvent::SessionInfo {
                 context_usage: None,
                 cost_text: Some("Total cost: $0.1180".into()),
+            },
+            SessionEvent::MessageLifecycle {
+                client_msg_id: "u-1".into(),
+                phase: MessageLifecyclePhase::Started,
             },
         ];
         for ev in events {

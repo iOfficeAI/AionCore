@@ -313,6 +313,10 @@ impl ClaudeAdapter {
             // message_stop) carries no FSM signal — the regular `assistant`/`user`
             // frames already deliver the content — so they stay opaque.
             "stream_event" => self.parse_stream_event(v),
+            // Task 2 (mid-turn interjection observability): claude echoes back the
+            // uuid WE minted on the user frame, reporting where it landed in the
+            // turn lifecycle (verified 2.1.226, design spec §6.1).
+            "command_lifecycle" => self.parse_command_lifecycle(v),
             // unknown top-level type → opaque catch-all (I8/I13, never panic).
             other => vec![SessionEvent::AdapterSpecific {
                 tag: other.to_string(),
@@ -965,6 +969,28 @@ impl ClaudeAdapter {
             }],
         }
     }
+
+    /// A `command_lifecycle` frame: claude echoing back the `uuid` WE minted on
+    /// a user frame, reporting where it landed (§6.1). `command_uuid` is that
+    /// SAME correlation key; missing it degrades to no event (never guess an id).
+    fn parse_command_lifecycle(&self, v: &Value) -> Vec<SessionEvent> {
+        let Some(id) = v.get("command_uuid").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        // An unrecognised phase degrades to NO event rather than a guess: this
+        // frame is additive and claude may grow states we have not probed.
+        let phase = match v.get("state").and_then(Value::as_str) {
+            Some("queued") => crate::event::MessageLifecyclePhase::Queued,
+            Some("started") => crate::event::MessageLifecyclePhase::Started,
+            Some("completed") => crate::event::MessageLifecyclePhase::Completed,
+            Some("cancelled") | Some("canceled") => crate::event::MessageLifecyclePhase::Cancelled,
+            _ => return Vec::new(),
+        };
+        vec![SessionEvent::MessageLifecycle {
+            client_msg_id: id.to_string(),
+            phase,
+        }]
+    }
 }
 
 #[async_trait::async_trait]
@@ -1472,6 +1498,36 @@ mod tests {
     fn capabilities_advertise_midturn_delivery() {
         let a = ClaudeAdapter::new();
         assert!(a.capabilities().supports_midturn_delivery);
+    }
+
+    /// Task 2: claude echoes back the uuid WE minted on a user frame via a
+    /// `command_lifecycle` frame (verified 2.1.226, design spec §6.1) — the
+    /// adapter must normalize it into `SessionEvent::MessageLifecycle`.
+    #[test]
+    fn parses_command_lifecycle_into_message_lifecycle_events() {
+        let a = ClaudeAdapter::new();
+        let frame = r#"{"type":"command_lifecycle","command_uuid":"u-1","state":"queued"}"#;
+        let v: serde_json::Value = serde_json::from_str(frame).unwrap();
+        match a.parse_command_lifecycle(&v).as_slice() {
+            [SessionEvent::MessageLifecycle { client_msg_id, phase }] => {
+                assert_eq!(client_msg_id, "u-1");
+                assert_eq!(*phase, crate::event::MessageLifecyclePhase::Queued);
+            }
+            other => panic!("expected one MessageLifecycle, got {other:?}"),
+        }
+    }
+
+    /// An unrecognised `state` degrades to NO event rather than a guess — this
+    /// frame is additive and claude may grow states we have not probed.
+    #[test]
+    fn unknown_command_lifecycle_state_is_ignored_not_panicked() {
+        let a = ClaudeAdapter::new();
+        let frame = r#"{"type":"command_lifecycle","command_uuid":"u-1","state":"future_state"}"#;
+        let v: serde_json::Value = serde_json::from_str(frame).unwrap();
+        assert!(
+            a.parse_command_lifecycle(&v).is_empty(),
+            "an unknown phase must degrade to no event"
+        );
     }
 
     #[test]
