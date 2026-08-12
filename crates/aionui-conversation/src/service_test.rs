@@ -3671,6 +3671,78 @@ struct SlowBuildTaskManager {
     built: AtomicBool,
 }
 
+struct SlowRestartTaskManager {
+    delay: Duration,
+    agent: Mutex<Option<AgentInstance>>,
+    rebuilt: AtomicBool,
+}
+
+impl SlowRestartTaskManager {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            agent: Mutex::new(None),
+            rebuilt: AtomicBool::new(false),
+        }
+    }
+
+    fn insert_agent(&self, conversation_id: &str) {
+        self.agent
+            .lock()
+            .unwrap()
+            .replace(AgentInstance::Mock(Arc::new(MockAgent::new(conversation_id))));
+    }
+
+    fn was_rebuilt(&self) -> bool {
+        self.rebuilt.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl IWorkerTaskManager for SlowRestartTaskManager {
+    fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+        self.agent.lock().unwrap().clone()
+    }
+
+    async fn get_or_build_task(
+        &self,
+        conversation_id: &str,
+        _options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        tokio::time::sleep(self.delay).await;
+        let agent = AgentInstance::Mock(Arc::new(MockAgent::new(conversation_id)));
+        self.agent.lock().unwrap().replace(agent.clone());
+        self.rebuilt.store(true, Ordering::SeqCst);
+        Ok(agent)
+    }
+
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        self.agent.lock().unwrap().take();
+        Ok(())
+    }
+
+    fn kill_and_wait(
+        &self,
+        conversation_id: &str,
+        reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let _ = self.kill(conversation_id, reason);
+        Box::pin(std::future::ready(()))
+    }
+
+    async fn clear(&self) {
+        self.agent.lock().unwrap().take();
+    }
+
+    fn active_count(&self) -> usize {
+        usize::from(self.agent.lock().unwrap().is_some())
+    }
+
+    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 impl SlowBuildTaskManager {
     fn new(delay: Duration) -> Self {
         Self {
@@ -4271,20 +4343,23 @@ async fn ensure_runtime_uses_existing_agent_snapshot_without_recovery() {
 }
 
 #[tokio::test]
-async fn restart_runtime_without_existing_task_builds_runtime_like_ensure() {
+async fn restart_runtime_without_existing_task_is_rejected() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
-    let result = svc
+    let error = svc
         .restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
         .await
-        .unwrap();
+        .unwrap_err();
 
-    assert!(result.recovered);
-    assert!(result.runtime.has_task);
-    assert!(task_mgr.get_task(&conv.id).is_some());
-    assert!(result.config_options.is_empty());
+    assert!(matches!(
+        error,
+        ConversationError::Busy { reason }
+            if reason == format!("conversation {} runtime is not ready to restart", conv.id)
+    ));
+    assert_eq!(task_mgr.kill_count(), 0);
+    assert!(task_mgr.get_task(&conv.id).is_none());
 }
 
 #[tokio::test]
@@ -4349,7 +4424,7 @@ async fn restart_runtime_cancels_active_turn_before_rebuild() {
 async fn restart_runtime_blocks_duplicate_restart_send_and_config_until_ready() {
     let repo = Arc::new(MockRepo::new());
     let broadcaster = Arc::new(MockBroadcaster::new());
-    let task_mgr = Arc::new(SlowBuildTaskManager::new(Duration::from_millis(150)));
+    let task_mgr = Arc::new(SlowRestartTaskManager::new(Duration::from_millis(150)));
     let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
     let svc = ConversationService::new(
         std::env::temp_dir(),
@@ -4361,6 +4436,7 @@ async fn restart_runtime_blocks_duplicate_restart_send_and_config_until_ready() 
         Arc::new(StubAcpSessionRepo::default()),
     );
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id);
 
     let restart_service = svc.clone();
     let restart_conversation_id = conv.id.clone();
@@ -4404,7 +4480,7 @@ async fn restart_runtime_blocks_duplicate_restart_send_and_config_until_ready() 
     assert!(matches!(config, ConversationError::Busy { .. }));
 
     let response = restart.await.expect("restart task should not panic").unwrap();
-    assert!(task_mgr.was_built());
+    assert!(task_mgr.was_rebuilt());
     assert_eq!(
         response.runtime.state,
         aionui_api_types::ConversationRuntimeStateKind::Idle
@@ -4417,6 +4493,7 @@ async fn restart_runtime_preserves_persisted_messages() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
     repo.insert_message(
         "user_1",
         &MessageRow {

@@ -3961,6 +3961,12 @@ impl ConversationService {
             });
         }
 
+        if task_manager.get_task(conversation_id).is_none() {
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} runtime is not ready to restart"),
+            });
+        }
+
         self.runtime_state.begin_restart(conversation_id)?;
         let restart_result = async {
             if let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) {
