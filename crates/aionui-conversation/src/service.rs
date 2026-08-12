@@ -3302,7 +3302,9 @@ pub(crate) const MIDTURN_STATUS_RECEIVED: &str = "finish";
 enum MidturnOutcome {
     /// The message rides the ACTIVE turn (or failed terminally and was
     /// surfaced as a failure tip — mirroring the normal path's build-failure
-    /// contract of a 200 + tip). The caller returns this response.
+    /// contract; the tip response has `delivered_midturn=false`, so the route
+    /// returns the ordinary 202 for it, 200 only for a real delivery). The
+    /// caller returns this response.
     Delivered(SendMessageResponse),
     /// codex rejected the steer with "no active turn to steer" (§6甲.1): the
     /// turn ended between our read and the write. The caller opens a NEW turn
@@ -3588,14 +3590,30 @@ impl ConversationService {
             && let Some(agent) = task_manager.get_task(conversation_id)
             && agent.supports_midturn_delivery()
         {
-            match self
-                .deliver_midturn_message(user_id, conversation_id, &resolved, req.hidden, agent, active_turn_id)
-                .await?
-            {
-                MidturnOutcome::Delivered(response) => return Ok(response),
-                // codex rejected the steer because the turn just ended → fall
-                // through and open a NEW turn for the already-persisted message.
-                MidturnOutcome::TurnEnded { user_msg_id } => fallback_user_msg = user_msg_id,
+            // §4.6: a turn blocked on a permission confirmation / question card
+            // must NOT be steered into — the card is the required answer
+            // channel, not a new instruction on the stream. Falling through to
+            // the claim below restores the exact pre-B5 contract (409) at the
+            // HTTP layer, so a direct API client cannot bypass the frontend
+            // gate. Same authoritative source the runtime summary's
+            // `pending_confirmations` reads (`get_confirmations`).
+            if !agent.get_confirmations().is_empty() {
+                info!(
+                    conversation_id = %conversation_id,
+                    route = "rejected_requires_action",
+                    active_turn_id = %active_turn_id,
+                    "mid-turn delivery refused: a confirmation is pending (spec §4.6)"
+                );
+            } else {
+                match self
+                    .deliver_midturn_message(user_id, conversation_id, &resolved, req.hidden, agent, active_turn_id)
+                    .await?
+                {
+                    MidturnOutcome::Delivered(response) => return Ok(response),
+                    // codex rejected the steer because the turn just ended → fall
+                    // through and open a NEW turn for the already-persisted message.
+                    MidturnOutcome::TurnEnded { user_msg_id } => fallback_user_msg = user_msg_id,
+                }
             }
         }
 

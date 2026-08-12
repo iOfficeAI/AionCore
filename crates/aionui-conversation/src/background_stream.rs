@@ -175,8 +175,8 @@ impl BackgroundStreamWatcher {
             if let AgentStreamEvent::MessageLifecycle(data) = &ev {
                 // B5 receipt badge (Task 4): any consumption/terminal echo means
                 // the agent TOOK the message — flip its persisted status from
-                // "queued" (待接收) to "finish" (已接收) and broadcast
-                // message.statusChanged. Guarded to rows currently "queued", so
+                // "pending" (待接收) to "finish" (已接收) and broadcast
+                // message.statusChanged. Guarded to rows currently "pending", so
                 // an echo can never touch an ordinary message. Cancelled also
                 // counts: claude only cancels an echo it had already started
                 // (still-queued messages are unaffected by an interrupt and

@@ -3909,6 +3909,9 @@ struct MidturnMockAgent {
     delivered: Mutex<Vec<SendMessageData>>,
     scripted_error: Mutex<Option<AgentSendError>>,
     held_claim: Mutex<Option<crate::runtime_state::TurnClaim>>,
+    /// Pending permission confirmations (spec §4.6 gate): while non-empty the
+    /// mid-turn routing branch must fall through to the 409 claim path.
+    confirmations: Mutex<Vec<Confirmation>>,
 }
 
 impl MidturnMockAgent {
@@ -3920,6 +3923,7 @@ impl MidturnMockAgent {
             delivered: Mutex::new(Vec::new()),
             scripted_error: Mutex::new(None),
             held_claim: Mutex::new(None),
+            confirmations: Mutex::new(Vec::new()),
         }
     }
 }
@@ -3962,6 +3966,9 @@ impl IAgentTask for MidturnMockAgent {
 
 #[async_trait::async_trait]
 impl IMockAgent for MidturnMockAgent {
+    fn get_confirmations(&self) -> Vec<Confirmation> {
+        self.confirmations.lock().unwrap().clone()
+    }
     async fn deliver_midturn(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         if let Some(err) = self.scripted_error.lock().unwrap().take() {
             // The turn "ended": release the held claim so the fallback's
@@ -4082,6 +4089,61 @@ async fn midturn_steer_rejection_turn_ended_falls_back_to_a_new_turn() {
     assert_eq!(rows.len(), 1, "the fallback must reuse the row, not duplicate it");
     assert_eq!(rows[0].status.as_deref(), Some("finish"));
     wait_for_turn_released(&svc, &conv.id).await;
+}
+
+/// §4.6 (review fix): a turn blocked on a pending permission confirmation
+/// must NOT be steered into, even for a supporting backend — the mid-turn
+/// branch falls through to the claim, restoring the exact pre-B5 409 at the
+/// HTTP API (the frontend gate alone does not bind direct API clients).
+#[tokio::test]
+async fn midturn_send_during_pending_confirmation_stays_409() {
+    let (svc, broadcaster, repo, _d) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let _claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn_active")
+        .expect("claim the active turn");
+    let agent = Arc::new(MidturnMockAgent::new(&conv.id));
+    *agent.confirmations.lock().unwrap() = vec![Confirmation {
+        id: "c1".into(),
+        call_id: "call-1".into(),
+        title: Some("Allow file edit".into()),
+        action: Some("edit_file".into()),
+        description: "Edit main.rs".into(),
+        command_type: Some("bash".into()),
+        questions: None,
+        options: vec![],
+    }];
+    let task_mgr = Arc::new(MockTaskManager::new());
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+    broadcaster.take_events();
+
+    let err = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .expect_err("a send during requires_action must be rejected");
+    assert!(
+        err.to_string().contains("already running"),
+        "the pre-B5 running-conversation conflict is preserved, got: {err}"
+    );
+    // Nothing was delivered, persisted, or broadcast.
+    assert!(
+        agent.delivered.lock().unwrap().is_empty(),
+        "no mid-turn delivery may happen while a confirmation is pending"
+    );
+    assert!(
+        repo.messages.lock().unwrap().is_empty(),
+        "the rejected message must not be persisted"
+    );
+    let events = broadcaster.take_events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.name == "message.userCreated" || e.name == "message.statusChanged"),
+        "no message events for a rejected send, got: {:?}",
+        events.iter().map(|e| e.name.clone()).collect::<Vec<_>>()
+    );
 }
 
 /// The §6甲.1 message-text classification is load-bearing — lock it so a codex
