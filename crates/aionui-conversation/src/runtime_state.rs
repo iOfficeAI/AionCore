@@ -103,6 +103,17 @@ impl ConversationRuntimeStateService {
         })
     }
 
+    /// Claim a turn the AGENT started on its own (a CLI-initiated turn, or the
+    /// follow-up turn claude opens for a mid-turn message it could not fold into
+    /// the running one — verified in the design spec §6甲.2).
+    ///
+    /// Returns `None` when a turn is already claimed: for an agent-driven turn
+    /// that is the NORMAL case (the message folded into the running turn), not an
+    /// error, so it must not surface as 409.
+    pub fn claim_for_agent_turn(self: &Arc<Self>, conversation_id: &str, turn_id: &str) -> Option<TurnClaim> {
+        self.try_claim_turn(conversation_id, turn_id).ok()
+    }
+
     pub fn is_claimed(&self, conversation_id: &str) -> bool {
         self.state
             .lock()
@@ -469,6 +480,26 @@ mod tests {
 
         assert!(!claim.release_for_turn("turn-a"));
         assert!(!state.is_claimed("conv-1"));
+    }
+
+    #[test]
+    fn a_midturn_send_does_not_mint_a_phantom_turn_id() {
+        let svc = Arc::new(ConversationRuntimeStateService::default());
+        let _claim = svc.try_claim_turn("conv-1", "t-1").expect("first claim");
+        // A second send while t-1 runs must NOT create a second claim, and the
+        // summary must keep reporting the REAL active turn.
+        assert!(svc.claim_for_agent_turn("conv-1", "t-2").is_none());
+        assert_eq!(svc.active_turn_id_for("conv-1").as_deref(), Some("t-1"));
+    }
+
+    #[test]
+    fn an_agent_started_turn_claims_after_the_previous_one_released() {
+        let svc = Arc::new(ConversationRuntimeStateService::default());
+        let claim = svc.try_claim_turn("conv-1", "t-1").expect("first claim");
+        drop(claim);
+        let adopted = svc.claim_for_agent_turn("conv-1", "t-2").expect("adopted");
+        assert_eq!(svc.active_turn_id_for("conv-1").as_deref(), Some("t-2"));
+        drop(adopted);
     }
 
     #[test]

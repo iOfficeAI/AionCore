@@ -3337,8 +3337,14 @@ impl ConversationService {
             .resolve_message_attachments(user_id, &req.content, &req.files)
             .await?;
 
-        let turn_id = Self::mint_turn_id();
-        let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
+        // Open a NEW turn: mint the id only on this branch. The mid-turn
+        // delivery path (Task 4) will instead reuse the running turn's id — a
+        // phantom turn id minted outside an actual claim must never exist.
+        let (turn_id, turn_claim) = {
+            let turn_id = Self::mint_turn_id();
+            let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
+            (turn_id, turn_claim)
+        };
 
         // Store user message. `msg_id` is server-generated so the WebSocket
         // stream, DB row, and client-side message index all agree on the same

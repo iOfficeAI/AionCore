@@ -4227,6 +4227,17 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         SessionEvent::SessionTitle { title } => {
             vec![AgentStreamEvent::AcpSessionInfo(serde_json::json!({ "title": title }))]
         }
+        // Mid-turn interjection (Task 3): lower the claude command_lifecycle echo
+        // to an internal-only stream frame so the conversation layer's
+        // BackgroundStreamWatcher can tell an agent-started turn that SERVES a
+        // user message (claim it) from a pure background continuation (leave it
+        // unclaimed). Consumed inside the relay/watcher, never forwarded to the
+        // WebSocket.
+        SessionEvent::MessageLifecycle { client_msg_id, phase } => {
+            vec![AgentStreamEvent::MessageLifecycle(
+                crate::protocol::events::MessageLifecycleData { client_msg_id, phase },
+            )]
+        }
         // Events with no origin-side counterpart (or purely internal) are dropped.
         // Cancel folds into the Finish emitted by the resulting terminal; Heartbeat,
         // PromptAccepted, Snapshot, Lagged, item lifecycle, subagent/rewound/etc. are

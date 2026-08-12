@@ -104,6 +104,16 @@ pub enum AgentStreamEvent {
     /// Never counts as user-visible turn output (see `event_is_user_visible_output`):
     /// it is an out-of-band status refresh, not the turn "saying something".
     WorkflowProgress(WorkflowProgressData),
+    /// Internal-only: lifecycle echo for a user message we wrote to a direct
+    /// CLI (claude `command_lifecycle` → `SessionEvent::MessageLifecycle`,
+    /// verified 2.1.226 — mid-turn interjection design spec §6.1).
+    /// `client_msg_id` is the uuid WE minted on the user frame, echoed back
+    /// verbatim. Consumed by the conversation layer's BackgroundStreamWatcher
+    /// to decide whether an agent-started follow-up turn SERVES a user message
+    /// (claim it) or is a pure background continuation (leave it unclaimed);
+    /// the per-turn relay consumes it silently. Never forwarded to the
+    /// WebSocket; never counts as user-visible turn output.
+    MessageLifecycle(MessageLifecycleData),
     /// Internal-only signal: the tolerant transport layer absorbed a CodeBuddy
     /// dialect notification (`session_end` / `compact-maxtoken`) that the stock
     /// ACP schema hard-rejects as `-32602`. Consumed by the empty-turn judgment
@@ -206,6 +216,21 @@ pub struct WorkflowProgressData {
     #[serde(default)]
     pub settle_only: bool,
 }
+
+/// Data for the internal-only [`AgentStreamEvent::MessageLifecycle`] event.
+///
+/// `phase` reuses the session layer's [`aionui_session::MessageLifecyclePhase`]
+/// verbatim — the pump is a pass-through here. Re-exported below so consumers
+/// of this event (the conversation layer's watcher) can match on the enum
+/// without taking their own `aionui-session` dependency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageLifecycleData {
+    /// The uuid we minted on the user frame, echoed back by the CLI.
+    pub client_msg_id: String,
+    pub phase: MessageLifecyclePhase,
+}
+
+pub use aionui_session::MessageLifecyclePhase;
 
 /// Data for the internal-only [`AgentStreamEvent::AcpDialectSignal`] event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
