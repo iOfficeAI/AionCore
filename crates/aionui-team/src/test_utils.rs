@@ -374,8 +374,8 @@ pub(crate) mod workspace_harness {
 
     use aionui_ai_agent::{AgentError, IWorkerTaskManager};
     use aionui_api_types::{
-        AcpConfigOptionDto, AcpConfigSelectOptionDto, CreateTeamRequest, GetConfigOptionsResponse, SessionMcpServer,
-        WebSocketMessage,
+        AcpConfigOptionDto, AcpConfigSelectOptionDto, ConfigOptionConfirmation, CreateTeamRequest,
+        GetConfigOptionsResponse, SessionMcpServer, SetConfigOptionRequest, SetConfigOptionResponse, WebSocketMessage,
     };
     use aionui_common::{AgentKillReason, AgentType, PaginatedResult, now_ms};
     use aionui_db::models::{
@@ -1017,21 +1017,58 @@ pub(crate) mod workspace_harness {
                 .unwrap_or("mock-model")
                 .to_owned();
             Ok(GetConfigOptionsResponse {
-                config_options: vec![AcpConfigOptionDto {
-                    id: "model".to_owned(),
-                    name: None,
-                    label: Some("Model".to_owned()),
-                    description: None,
-                    category: Some("model".to_owned()),
-                    option_type: "select".to_owned(),
-                    current_value: Some(model.clone()),
-                    options: vec![AcpConfigSelectOptionDto {
-                        value: model.clone(),
+                config_options: vec![
+                    AcpConfigOptionDto {
+                        id: "model".to_owned(),
                         name: None,
-                        label: Some(model),
+                        label: Some("Model".to_owned()),
                         description: None,
-                    }],
-                }],
+                        category: Some("model".to_owned()),
+                        option_type: "select".to_owned(),
+                        current_value: Some(model.clone()),
+                        options: vec![AcpConfigSelectOptionDto {
+                            value: model.clone(),
+                            name: None,
+                            label: Some(model),
+                            description: None,
+                        }],
+                    },
+                    AcpConfigOptionDto {
+                        id: "mode".to_owned(),
+                        name: None,
+                        label: Some("Mode".to_owned()),
+                        description: None,
+                        category: Some("mode".to_owned()),
+                        option_type: "select".to_owned(),
+                        current_value: Some("default".to_owned()),
+                        options: vec![AcpConfigSelectOptionDto {
+                            value: "default".to_owned(),
+                            name: None,
+                            label: Some("Default".to_owned()),
+                            description: None,
+                        }],
+                    },
+                ],
+            })
+        }
+
+        async fn set_config_option(
+            &self,
+            conversation_id: &str,
+            option_id: &str,
+            request: SetConfigOptionRequest,
+        ) -> Result<SetConfigOptionResponse, TeamError> {
+            let key = match option_id {
+                "model" => "current_model_id",
+                "mode" => "current_mode_id",
+                other => other,
+            };
+            self.patch_runtime_config(conversation_id, serde_json::json!({ key: request.value }))
+                .await?;
+            let config_options = self.get_config_options(conversation_id).await?.config_options;
+            Ok(SetConfigOptionResponse {
+                confirmation: ConfigOptionConfirmation::Observed,
+                config_options: Some(config_options),
             })
         }
 

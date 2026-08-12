@@ -1614,7 +1614,10 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
 
         self.permission_router.cancel_all();
 
-        if matches!(reason, Some(AgentKillReason::UserCancelTimeout)) {
+        if matches!(
+            reason,
+            Some(AgentKillReason::UserCancelTimeout | AgentKillReason::RuntimeRestart)
+        ) {
             if let Ok(mut session) = self.session.try_write() {
                 session.record_close_reason(Some(CloseReason::UserCancel));
             }

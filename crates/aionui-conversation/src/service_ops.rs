@@ -33,6 +33,11 @@ impl ConversationService {
         conversation_id: &str,
     ) -> Result<GetConfigOptionsResponse, ConversationError> {
         self.ensure_owned_conversation(user_id, conversation_id).await?;
+        if self.runtime_state().is_restarting(conversation_id) {
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} runtime is restarting"),
+            });
+        }
         self.task(conversation_id)?
             .get_config_options()
             .await
@@ -160,6 +165,11 @@ impl ConversationService {
             });
         }
         self.ensure_owned_conversation(user_id, conversation_id).await?;
+        if self.runtime_state().is_restarting(conversation_id) {
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} runtime is restarting"),
+            });
+        }
         let agent = self.task(conversation_id)?;
         let response = match agent.set_config_option(option_id, &req.value).await {
             Ok(response) => response,

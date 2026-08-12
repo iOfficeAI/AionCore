@@ -1249,10 +1249,14 @@ impl IAgentTask for SessionAgentTask {
         // turn (gate recovers in seconds, no crash card), then (2) delegate real
         // process teardown to the backend, which kills the process tree WITHOUT
         // waiting for the last Arc to drop.
-        if matches!(reason, Some(AgentKillReason::UserCancelTimeout)) {
+        if matches!(
+            reason,
+            Some(AgentKillReason::UserCancelTimeout | AgentKillReason::RuntimeRestart)
+        ) {
             tracing::info!(
                 conversation_id = %self.conversation_id,
-                "session kill(UserCancelTimeout): emitted clean Finish + delegating backend terminate (was Drop-only no-op)"
+                ?reason,
+                "session kill: emitted clean Finish and delegated backend termination"
             );
             // 1) clean converge FIRST: relay breaks → orchestrator releases the turn
             //    claim → `cancelling` cleared → gate recovers (no red crash card).
@@ -1288,10 +1292,14 @@ impl SessionAgentTask {
         &self,
         reason: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        if matches!(reason, Some(AgentKillReason::UserCancelTimeout)) {
+        if matches!(
+            reason,
+            Some(AgentKillReason::UserCancelTimeout | AgentKillReason::RuntimeRestart)
+        ) {
             tracing::info!(
                 conversation_id = %self.conversation_id,
-                "session kill_and_wait(UserCancelTimeout): emitted clean Finish + awaiting backend terminate"
+                ?reason,
+                "session kill_and_wait: emitted clean Finish and awaiting backend termination"
             );
             self.runtime.emit_finish_once(); // clean converge FIRST (sync)
             let backend = self.backend.clone();
@@ -9228,6 +9236,24 @@ mod force_kill_tests {
         let again = next_terminal(&mut rx).await;
         assert!(again.is_none(), "no second Finish broadcast, got {again:?}");
         assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Finished));
+    }
+
+    #[tokio::test]
+    async fn runtime_restart_forces_clean_finish_and_terminates_backend() {
+        let (task, counter) = build_task_with_counter();
+        let mut rx = IAgentTask::subscribe(task.as_ref());
+        start_turn(task.as_ref()).await;
+
+        let inst = AgentInstance::Session(Arc::clone(&task));
+        inst.kill_and_wait(Some(AgentKillReason::RuntimeRestart)).await;
+
+        let terminal = next_terminal(&mut rx).await.expect("a terminal frame after restart");
+        assert!(
+            matches!(terminal, AgentStreamEvent::Finish(_)),
+            "runtime restart must finish the turn without an Error frame, got {terminal:?}"
+        );
+        assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Finished));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     /// T6: isolation — non-`UserCancelTimeout` reasons keep the original

@@ -10,9 +10,10 @@ use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTas
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
     AddAgentRequest, AssistantMcpBindingChanged, CreateTeamRequest, GetConfigOptionsResponse,
-    InterruptTeamAgentRequest, TeamActivityCursor, TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
-    TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
+    InterruptTeamAgentRequest, SetConfigOptionRequest, SetConfigOptionResponse, TeamActivityCursor,
+    TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus, TeamInterruptAgentResponse,
+    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding,
+    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
     TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
@@ -54,7 +55,9 @@ use crate::session::{
 };
 use crate::team_run::TeamRunManager;
 use crate::types::{Team, TeamAgent, TeamTask, TeammateRole};
-use crate::work_coordinator::{McpRefreshDisposition, ObserveMessagesResult, RuntimeRestartRejection};
+use crate::work_coordinator::{
+    McpRefreshDisposition, ObserveMessagesResult, RuntimeConstraint, RuntimeRestartRejection,
+};
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
 
@@ -1111,6 +1114,15 @@ impl TeamSessionService {
             .clone();
         let _guard = lock.lock().await;
         let mut team = self.load_owned_team(user_id, team_id).await?;
+        let target = team
+            .agents
+            .iter()
+            .find(|agent| agent.slot_id == slot_id)
+            .cloned()
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        if self.member_runtime_is_starting(team_id, &target.slot_id) {
+            return Err(Self::member_runtime_starting_error(team_id, &target));
+        }
         let agent = team
             .agents
             .iter_mut()
@@ -1691,12 +1703,69 @@ impl TeamSessionService {
         let row = self.load_owned_team_row(user_id, team_id).await?;
 
         let team = Team::from_row(&row)?;
-        let member = team.agents.iter().any(|agent| agent.conversation_id == conversation_id);
-        if !member {
-            return Err(TeamError::AgentNotFound(conversation_id.to_owned()));
+        let member = team
+            .agents
+            .iter()
+            .find(|agent| agent.conversation_id == conversation_id)
+            .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+        if self.member_runtime_is_starting(team_id, &member.slot_id) {
+            return Err(Self::member_runtime_starting_error(team_id, member));
         }
 
         self.conversation_port.get_config_options(conversation_id).await
+    }
+
+    pub async fn set_conversation_config_option(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+        option_id: &str,
+        request: SetConfigOptionRequest,
+    ) -> Result<SetConfigOptionResponse, TeamError> {
+        let row = self.load_owned_team_row(user_id, team_id).await?;
+        let team = Team::from_row(&row)?;
+        let member = team
+            .agents
+            .iter()
+            .find(|agent| agent.conversation_id == conversation_id)
+            .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+        if self.member_runtime_is_starting(team_id, &member.slot_id) {
+            return Err(Self::member_runtime_starting_error(team_id, member));
+        }
+
+        let options = self.conversation_port.get_config_options(conversation_id).await?;
+        let is_global_mode = member.role == TeammateRole::Lead
+            && options.config_options.iter().any(|option| {
+                option.id == option_id && (option.category.as_deref() == Some("mode") || option.id == "mode")
+            });
+        if is_global_mode
+            && let Some(starting_member) = team
+                .agents
+                .iter()
+                .find(|agent| self.member_runtime_is_starting(team_id, &agent.slot_id))
+        {
+            return Err(Self::member_runtime_starting_error(team_id, starting_member));
+        }
+
+        self.conversation_port
+            .set_config_option(conversation_id, option_id, request)
+            .await
+    }
+
+    fn member_runtime_is_starting(&self, team_id: &str, slot_id: &str) -> bool {
+        self.sessions
+            .get(team_id)
+            .and_then(|entry| entry.session.work_coordinator().slot_snapshot(slot_id))
+            .is_some_and(|snapshot| matches!(snapshot.runtime_constraint, RuntimeConstraint::Starting { .. }))
+    }
+
+    fn member_runtime_starting_error(team_id: &str, member: &TeamAgent) -> TeamError {
+        TeamError::MemberRuntimeStarting {
+            team_id: team_id.to_owned(),
+            slot_id: member.slot_id.clone(),
+            conversation_id: member.conversation_id.clone(),
+        }
     }
 
     fn broadcast_session_status<F>(
@@ -2713,6 +2782,13 @@ impl TeamSessionService {
 
     pub async fn set_session_mode(&self, user_id: &str, team_id: &str, mode: &str) -> Result<(), TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
+        if let Some(starting_member) = team
+            .agents
+            .iter()
+            .find(|agent| self.member_runtime_is_starting(team_id, &agent.slot_id))
+        {
+            return Err(Self::member_runtime_starting_error(team_id, starting_member));
+        }
         let provisioner = self.provisioner();
         self.repo
             .update_team(
@@ -2853,7 +2929,9 @@ mod tests {
         ActiveLeaseRegistry, AgentError, AgentInstance, AgentSendError, AgentStreamEvent, IAgentTask, IMockAgent,
         IWorkerTaskManager, IdleCleanupCoordinator,
     };
-    use aionui_api_types::{AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionResponse, TeamRunTargetRole};
+    use aionui_api_types::{
+        AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionRequest, SetConfigOptionResponse, TeamRunTargetRole,
+    };
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs, now_ms};
     use aionui_db::{IConversationRepository, ITeamRepository};
     use tokio::sync::broadcast;
@@ -3473,6 +3551,128 @@ mod tests {
             "unexpected stopped-member error: {error:?}"
         );
         assert!(task_manager.kills().is_empty());
+    }
+
+    #[tokio::test]
+    async fn starting_member_blocks_only_its_config_and_model_updates() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Starting Config Gate"))
+            .await
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let lead = created.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        session
+            .work_coordinator()
+            .set_runtime_constraint(&lead.slot_id, RuntimeConstraint::Ready);
+        session
+            .work_coordinator()
+            .set_runtime_constraint(&worker.slot_id, RuntimeConstraint::Starting { operation_id: 42 });
+
+        let lead_result = svc
+            .set_conversation_config_option(
+                "user-test",
+                &created.id,
+                &lead.conversation_id,
+                "model",
+                SetConfigOptionRequest {
+                    value: "ready-slot-model".to_owned(),
+                },
+            )
+            .await
+            .expect("a Ready slot remains configurable");
+        assert_eq!(lead_result.confirmation, ConfigOptionConfirmation::Observed);
+
+        let global_mode_error = svc
+            .set_conversation_config_option(
+                "user-test",
+                &created.id,
+                &lead.conversation_id,
+                "mode",
+                SetConfigOptionRequest {
+                    value: "full_auto".to_owned(),
+                },
+            )
+            .await
+            .expect_err("leader mode must not partially update while another member is Starting");
+        assert!(matches!(
+            global_mode_error,
+            TeamError::MemberRuntimeStarting { ref slot_id, .. } if slot_id == &worker.slot_id
+        ));
+
+        let config_error = svc
+            .set_conversation_config_option(
+                "user-test",
+                &created.id,
+                &worker.conversation_id,
+                "model",
+                SetConfigOptionRequest {
+                    value: "blocked-model".to_owned(),
+                },
+            )
+            .await
+            .expect_err("a Starting slot must reject config changes");
+        assert!(matches!(
+            config_error,
+            TeamError::MemberRuntimeStarting { ref slot_id, .. } if slot_id == &worker.slot_id
+        ));
+
+        let model_error = svc
+            .update_agent_model("user-test", &created.id, &worker.slot_id, "blocked-model")
+            .await
+            .expect_err("the model endpoint must share the Starting gate");
+        assert!(matches!(
+            model_error,
+            TeamError::MemberRuntimeStarting { ref slot_id, .. } if slot_id == &worker.slot_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_mode_update_is_rejected_before_persistence_when_any_member_is_starting() {
+        let (svc, repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Starting Mode Gate"))
+            .await
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        session
+            .work_coordinator()
+            .set_runtime_constraint(&worker.slot_id, RuntimeConstraint::Starting { operation_id: 42 });
+        let before = repo
+            .get_team("user-test", &created.id)
+            .await
+            .unwrap()
+            .expect("team row")
+            .session_mode;
+
+        let error = svc
+            .set_session_mode("user-test", &created.id, "full_auto")
+            .await
+            .expect_err("global mode must wait for every member runtime");
+
+        assert!(matches!(
+            error,
+            TeamError::MemberRuntimeStarting { ref slot_id, .. } if slot_id == &worker.slot_id
+        ));
+        let after = repo
+            .get_team("user-test", &created.id)
+            .await
+            .unwrap()
+            .expect("team row")
+            .session_mode;
+        assert_eq!(after, before);
     }
 
     #[tokio::test]

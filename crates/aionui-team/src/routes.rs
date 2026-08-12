@@ -6,15 +6,15 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
     GetConfigOptionsResponse, InterruptTeamAgentRequest, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
-    SendAgentMessageRequest, SendTeamMessageRequest, SetModeRequest, SetModelRequest, TeamActivityPageResponse,
-    TeamAgentResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse,
-    TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
+    SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
+    SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamInterruptAgentResponse, TeamListResponse,
+    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -94,6 +94,20 @@ impl From<TeamError> for ApiError {
                     "conversation_id": conversation_id,
                 })),
             ),
+            TeamError::MemberRuntimeStarting {
+                team_id,
+                slot_id,
+                conversation_id,
+            } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_MEMBER_RUNTIME_STARTING",
+                "Team member runtime is starting",
+                Some(serde_json::json!({
+                    "team_id": team_id,
+                    "slot_id": slot_id,
+                    "conversation_id": conversation_id,
+                })),
+            ),
             TeamError::MemberUnsupported {
                 team_id,
                 slot_id,
@@ -152,6 +166,10 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route(
             "/api/teams/{id}/conversations/{conversation_id}/config-options",
             get(get_conversation_config_options),
+        )
+        .route(
+            "/api/teams/{id}/conversations/{conversation_id}/config-options/{option_id}",
+            put(set_conversation_config_option),
         )
         .route("/api/teams/{id}/runs/{team_run_id}/cancel", post(cancel_run))
         .route(
@@ -575,6 +593,21 @@ async fn get_conversation_config_options(
     )))
 }
 
+async fn set_conversation_config_option(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, conversation_id, option_id)): Path<(String, String, String)>,
+    body: Result<Json<SetConfigOptionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<SetConfigOptionResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .set_conversation_config_option(&user.id, &id, &conversation_id, &option_id, req)
+            .await?,
+    )))
+}
+
 async fn stop_session(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -749,6 +782,26 @@ mod tests {
         .into();
         assert_eq!(err.status_code(), StatusCode::CONFLICT);
         assert_eq!(err.error_code(), "TEAM_MEMBER_BUSY");
+        assert_eq!(
+            err.error_details(),
+            Some(json!({
+                "team_id": "team-1",
+                "slot_id": "slot-2",
+                "conversation_id": "conv-2",
+            }))
+        );
+    }
+
+    #[test]
+    fn member_runtime_starting_maps_to_coded_conflict() {
+        let err: ApiError = TeamError::MemberRuntimeStarting {
+            team_id: "team-1".into(),
+            slot_id: "slot-2".into(),
+            conversation_id: "conv-2".into(),
+        }
+        .into();
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "TEAM_MEMBER_RUNTIME_STARTING");
         assert_eq!(
             err.error_details(),
             Some(json!({

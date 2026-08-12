@@ -243,3 +243,64 @@ async fn update_agent_model_rejects_missing_agents() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     assert_eq!(body_json(resp).await["code"], "NOT_FOUND");
 }
+
+#[tokio::test]
+async fn set_team_config_option_requires_authentication() {
+    let (app, _services) = build_app().await;
+    let csrf = "csrf-test";
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri("/api/teams/team-1/conversations/conversation-1/config-options/model")
+        .header("content-type", "application/json")
+        .header("x-csrf-token", csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(axum::body::Body::from(r#"{"value":"gpt-5.6-sol"}"#))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(resp).await["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn set_team_config_option_requires_csrf() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let team = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = team["id"].as_str().unwrap();
+    let conversation_id = team["assistants"][1]["conversation_id"].as_str().unwrap();
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri(format!(
+            "/api/teams/{team_id}/conversations/{conversation_id}/config-options/model"
+        ))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(r#"{"value":"gpt-5.6-sol"}"#))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["code"], "CSRF_INVALID");
+}
+
+#[tokio::test]
+async fn set_team_config_option_rejects_cross_user_access() {
+    let (mut app, services) = build_app().await;
+    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let team = create_team(&mut app, &services, &owner_token, &owner_csrf).await;
+    let team_id = team["id"].as_str().unwrap();
+    let conversation_id = team["assistants"][1]["conversation_id"].as_str().unwrap();
+    let (other_token, other_csrf) = setup_and_login(&mut app, &services, "other", "StrongP@ss2").await;
+    let req = json_with_token(
+        "PUT",
+        &format!("/api/teams/{team_id}/conversations/{conversation_id}/config-options/model"),
+        json!({ "value": "gpt-5.6-sol" }),
+        &other_token,
+        &other_csrf,
+    );
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(resp).await["code"], "NOT_FOUND");
+}

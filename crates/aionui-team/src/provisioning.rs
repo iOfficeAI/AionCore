@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    AddAgentRequest, GetConfigOptionsResponse, McpRuntimeSnapshot, TeamAgentInput, TeamMcpSelection, TeamToolTransport,
-    assistant_mcp_binding_fingerprint,
+    AddAgentRequest, GetConfigOptionsResponse, McpRuntimeSnapshot, SetConfigOptionRequest, SetConfigOptionResponse,
+    TeamAgentInput, TeamMcpSelection, TeamToolTransport, assistant_mcp_binding_fingerprint,
 };
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
 use aionui_db::models::{AgentMetadataRow, TeamRow};
@@ -118,6 +118,17 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
     async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError>;
 
     async fn get_config_options(&self, conversation_id: &str) -> Result<GetConfigOptionsResponse, TeamError>;
+
+    async fn set_config_option(
+        &self,
+        _conversation_id: &str,
+        _option_id: &str,
+        _request: SetConfigOptionRequest,
+    ) -> Result<SetConfigOptionResponse, TeamError> {
+        Err(TeamError::InvalidRequest(
+            "team conversation config updates are unavailable".to_owned(),
+        ))
+    }
 
     async fn supports_context_reset(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, TeamError> {
         Ok(false)

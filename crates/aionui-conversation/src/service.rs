@@ -3961,22 +3961,31 @@ impl ConversationService {
             });
         }
 
-        if let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) {
-            self.cancel(user_id, conversation_id, &turn_id, task_manager).await?;
+        self.runtime_state.begin_restart(conversation_id)?;
+        let restart_result = async {
+            if let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) {
+                self.cancel(user_id, conversation_id, &turn_id, task_manager).await?;
+            }
+
+            info!(conversation_id, "Restarting conversation runtime");
+            task_manager
+                .kill_and_wait(conversation_id, Some(AgentKillReason::RuntimeRestart))
+                .await;
+            self.runtime_state.clear_turn_state_for_restart(conversation_id);
+
+            let (agent, recovered) = self
+                .ensure_runtime_agent(user_id, conversation_id, task_manager, "runtime_restart")
+                .await?;
+            let config_options = agent
+                .get_config_options()
+                .await
+                .map_err(ConversationError::from)?
+                .config_options;
+            Ok::<_, ConversationError>((recovered, config_options))
         }
-
-        info!(conversation_id, "Restarting conversation runtime");
-        task_manager.kill_and_wait(conversation_id, None).await;
-        self.runtime_state.clear_conversation(conversation_id);
-
-        let (agent, recovered) = self
-            .ensure_runtime_agent(user_id, conversation_id, task_manager, "runtime_restart")
-            .await?;
-        let config_options = agent
-            .get_config_options()
-            .await
-            .map_err(ConversationError::from)?
-            .config_options;
+        .await;
+        self.runtime_state.clear_restarting(conversation_id);
+        let (recovered, config_options) = restart_result?;
 
         Ok(EnsureConversationRuntimeResponse {
             recovered,

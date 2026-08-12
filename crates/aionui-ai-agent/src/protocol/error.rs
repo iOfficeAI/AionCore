@@ -61,6 +61,7 @@ impl CloseReason {
                 Some(AgentKillReason::TeamDeleted) => "Agent killed: team deleted".to_owned(),
                 Some(AgentKillReason::ConversationDeleted) => "Agent killed: conversation deleted".to_owned(),
                 Some(AgentKillReason::UserCancelTimeout) => "Conversation cancelled; agent restarted".to_owned(),
+                Some(AgentKillReason::RuntimeRestart) => "Conversation cancelled; agent restarted".to_owned(),
                 Some(AgentKillReason::RuntimeCapabilityChanged) => {
                     "Agent killed: runtime capability changed".to_owned()
                 }

@@ -4310,7 +4310,10 @@ async fn restart_runtime_evicts_existing_task_before_rebuild() {
         .unwrap();
 
     assert_eq!(task_mgr.kill_count(), 1);
-    assert_eq!(task_mgr.kill_records(), vec![(conv.id.clone(), None)]);
+    assert_eq!(
+        task_mgr.kill_records(),
+        vec![(conv.id.clone(), Some(AgentKillReason::RuntimeRestart))]
+    );
     assert!(result.recovered);
     assert!(result.runtime.has_task);
     assert!(
@@ -4340,6 +4343,73 @@ async fn restart_runtime_cancels_active_turn_before_rebuild() {
     assert_eq!(task_mgr.kill_count(), 1);
     assert!(result.runtime.has_task);
     assert!(!svc.runtime_state().is_claimed(&conv.id));
+}
+
+#[tokio::test]
+async fn restart_runtime_blocks_duplicate_restart_send_and_config_until_ready() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let task_mgr = Arc::new(SlowBuildTaskManager::new(Duration::from_millis(150)));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster,
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr_dyn.clone(),
+        repo,
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let restart_service = svc.clone();
+    let restart_conversation_id = conv.id.clone();
+    let restart_task_manager = task_mgr_dyn.clone();
+    let restart = tokio::spawn(async move {
+        restart_service
+            .restart_runtime("user_1", &restart_conversation_id, &restart_task_manager)
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !svc.runtime_state().is_restarting(&conv.id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("restart gate should become observable");
+
+    let summary = svc.runtime_summary_for(&conv.id).await;
+    assert_eq!(
+        summary.state,
+        aionui_api_types::ConversationRuntimeStateKind::Restarting
+    );
+
+    let duplicate = svc
+        .restart_runtime("user_1", &conv.id, &task_mgr_dyn)
+        .await
+        .expect_err("duplicate restart must fail");
+    assert!(matches!(duplicate, ConversationError::Busy { .. }));
+
+    let send = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .expect_err("send must fail at the backend gate while restart is in progress");
+    assert!(matches!(send, ConversationError::Busy { .. }));
+
+    let config = svc
+        .get_config_options("user_1", &conv.id)
+        .await
+        .expect_err("config access must fail while restart is in progress");
+    assert!(matches!(config, ConversationError::Busy { .. }));
+
+    let response = restart.await.expect("restart task should not panic").unwrap();
+    assert!(task_mgr.was_built());
+    assert_eq!(
+        response.runtime.state,
+        aionui_api_types::ConversationRuntimeStateKind::Idle
+    );
+    assert!(!svc.runtime_state().is_restarting(&conv.id));
 }
 
 #[tokio::test]
