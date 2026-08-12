@@ -44,9 +44,6 @@ if ($newSum -eq $oldSum) {
     Write-Output ""
     Write-Output "$label unchanged (sha256: $($newSum.Substring(0, 16)))"
 } else {
-    if ($Mode -eq "release") {
-        Invoke-Native "powershell.exe" @("-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/just/install.ps1", "release")
-    }
     Set-Content -LiteralPath $sumFile -Value $newSum -NoNewline
     Write-Output ""
     Write-Output "$label complete (sha256: $($newSum.Substring(0, 16)))"

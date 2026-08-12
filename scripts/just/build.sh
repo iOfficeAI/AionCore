@@ -50,9 +50,6 @@ if [[ "$new_sum" == "$old_sum" ]]; then
     echo
     echo "$label unchanged (sha256: ${new_sum:0:16})"
 else
-    if [[ "$mode" == "release" ]]; then
-        bash scripts/just/install.sh release
-    fi
     echo "$new_sum" > "$sum_file"
     echo
     echo "$label complete (sha256: ${new_sum:0:16})"
