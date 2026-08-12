@@ -1,4 +1,4 @@
-"""Mureka AI music generation CLI — single entry point for all operations."""
+"""Mureka AI 音乐生成命令行工具，统一提供歌曲、纯音乐、歌词和上传操作。"""
 
 import argparse
 import json
@@ -8,8 +8,48 @@ import time
 
 import requests
 
+
+class ChineseHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """将 argparse 的固定帮助标题本地化为简体中文。"""
+
+
+class ChineseArgumentParser(argparse.ArgumentParser):
+    """使用简体中文帮助标题和常见参数错误的解析器。"""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("formatter_class", ChineseHelpFormatter)
+        super().__init__(*args, **kwargs)
+
+    def format_help(self):
+        self._positionals.title = "位置参数"
+        self._optionals.title = "选项"
+        for action in self._actions:
+            if isinstance(action, argparse._HelpAction):
+                action.help = "显示此帮助信息并退出"
+        help_text = super().format_help()
+        return help_text.replace("usage: ", "用法：", 1)
+
+    def print_usage(self, file=None):
+        usage_text = super().format_usage().replace("usage: ", "用法：", 1)
+        self._print_message(usage_text, file)
+
+    def error(self, message):
+        replacements = {
+            "the following arguments are required:": "缺少以下必需参数：",
+            "unrecognized arguments:": "无法识别的参数：",
+            "invalid choice:": "无效选项：",
+            "choose from": "可选值为",
+            "expected one argument": "需要一个参数",
+            "argument ": "参数 ",
+        }
+        for source, target in replacements.items():
+            message = message.replace(source, target)
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: 错误：{message}\n")
+
+
 # ---------------------------------------------------------------------------
-# API Client
+# API 客户端
 # ---------------------------------------------------------------------------
 
 API_BASE = os.getenv("MUREKA_API_URL", "https://api.mureka.ai").rstrip("/")
@@ -20,7 +60,7 @@ POLL_TIMEOUT = 600
 def get_api_key():
     key = os.getenv("MUREKA_API_KEY")
     if not key:
-        print("Error: MUREKA_API_KEY is not set", file=sys.stderr)
+        print("错误：未设置 MUREKA_API_KEY", file=sys.stderr)
         sys.exit(1)
     return key
 
@@ -70,16 +110,16 @@ def poll_task(query_path, task_id, api_key=None, interval=POLL_INTERVAL, timeout
     while True:
         data = get_json(path, api_key=key)
         status = data.get("status", "")
-        print(f"  [{status}] task {task_id}", file=sys.stderr)
+        print(f"  [{status}] 任务 {task_id}", file=sys.stderr)
 
         if status in terminal:
             if status != "succeeded":
                 reason = data.get("failed_reason", status)
-                raise RuntimeError(f"Task {task_id} ended with status: {status}. Reason: {reason}")
+                raise RuntimeError(f"任务 {task_id} 结束，状态：{status}。原因：{reason}")
             return data
 
         if time.time() > deadline:
-            raise RuntimeError(f"Task {task_id} timed out after {timeout}s (last status: {status})")
+            raise RuntimeError(f"任务 {task_id} 在 {timeout} 秒后超时（最后状态：{status}）")
 
         time.sleep(interval)
 
@@ -94,10 +134,10 @@ def download_audio(url, output_path):
 
 
 def download_choices(result, args):
-    """Download audio files into output directory."""
+    """将音频文件下载到输出目录。"""
     choices = result.get("choices", [])
     if not choices:
-        print("No results generated.", file=sys.stderr)
+        print("未生成任何结果。", file=sys.stderr)
         sys.exit(1)
 
     out_dir = args.output
@@ -116,17 +156,17 @@ def download_choices(result, args):
             filename = f"audio.{args.format}"
 
         output_path = os.path.join(out_dir, filename)
-        print(f"Downloading choice {idx} ({duration_ms / 1000:.1f}s) → {output_path}", file=sys.stderr)
+        print(f"正在下载候选 {idx}（{duration_ms / 1000:.1f} 秒）→ {output_path}", file=sys.stderr)
         download_audio(url, output_path)
         print(output_path)
 
 
 # ---------------------------------------------------------------------------
-# Subcommands
+# 子命令
 # ---------------------------------------------------------------------------
 
 def cmd_song(args):
-    """Generate a song with lyrics and vocals."""
+    """生成带歌词和人声的歌曲。"""
     payload = {"lyrics": args.lyrics, "model": args.model}
     if args.prompt:
         payload["prompt"] = args.prompt
@@ -139,28 +179,28 @@ def cmd_song(args):
     if args.n:
         payload["n"] = args.n
 
-    # Save lyrics and prompt to output directory
+    # 将歌词和提示词保存到输出目录
     os.makedirs(args.output, exist_ok=True)
     lyrics_path = os.path.join(args.output, "lyrics.txt")
     with open(lyrics_path, "w", encoding="utf-8") as f:
         f.write(args.lyrics)
         if args.prompt:
-            f.write(f"\n\n---\nPrompt: {args.prompt}\n")
-    print(f"Lyrics saved → {lyrics_path}", file=sys.stderr)
+            f.write(f"\n\n---\n提示词：{args.prompt}\n")
+    print(f"歌词已保存 → {lyrics_path}", file=sys.stderr)
 
-    print("Submitting song generation task...", file=sys.stderr)
+    print("正在提交歌曲生成任务……", file=sys.stderr)
     task = post_json("/v1/song/generate", payload)
     task_id = task["id"]
-    print(f"Task ID: {task_id}", file=sys.stderr)
+    print(f"任务 ID：{task_id}", file=sys.stderr)
 
-    print("Polling for completion...", file=sys.stderr)
+    print("正在轮询任务状态……", file=sys.stderr)
     result = poll_task("/v1/song/query", task_id,
                        interval=args.poll_interval, timeout=args.poll_timeout)
     download_choices(result, args)
 
 
 def cmd_instrumental(args):
-    """Generate an instrumental track."""
+    """生成纯音乐。"""
     payload = {"model": args.model}
     if args.prompt:
         payload["prompt"] = args.prompt
@@ -169,25 +209,25 @@ def cmd_instrumental(args):
     if args.n:
         payload["n"] = args.n
 
-    print("Submitting instrumental generation task...", file=sys.stderr)
+    print("正在提交纯音乐生成任务……", file=sys.stderr)
     task = post_json("/v1/instrumental/generate", payload)
     task_id = task["id"]
-    print(f"Task ID: {task_id}", file=sys.stderr)
+    print(f"任务 ID：{task_id}", file=sys.stderr)
 
-    print("Polling for completion...", file=sys.stderr)
+    print("正在轮询任务状态……", file=sys.stderr)
     result = poll_task("/v1/instrumental/query", task_id,
                        interval=args.poll_interval, timeout=args.poll_timeout)
     download_choices(result, args)
 
 
 def cmd_lyrics(args):
-    """Generate or extend lyrics."""
+    """生成或扩写歌词。"""
     if args.lyrics_command == "generate":
         result = post_json("/v1/lyrics/generate", {"prompt": args.prompt})
         title = result.get("title", "")
         lyrics = result.get("lyrics", "")
         if title:
-            print(f"Title: {title}\n")
+            print(f"标题：{title}\n")
         print(lyrics)
     elif args.lyrics_command == "extend":
         result = post_json("/v1/lyrics/extend", {"lyrics": args.lyrics})
@@ -195,89 +235,89 @@ def cmd_lyrics(args):
 
 
 def cmd_upload(args):
-    """Upload a file to Mureka."""
-    print(f"Uploading {args.file} (purpose={args.purpose})...", file=sys.stderr)
+    """向 Mureka 上传文件。"""
+    print(f"正在上传 {args.file}（purpose={args.purpose}）……", file=sys.stderr)
     result = upload_file_api(args.file, args.purpose)
     file_id = result.get("id", "")
-    print(f"File ID: {file_id}")
+    print(f"文件 ID：{file_id}")
     print(json.dumps(result, indent=2))
 
 
 # ---------------------------------------------------------------------------
-# Shared argument helpers
+# 通用参数辅助函数
 # ---------------------------------------------------------------------------
 
 def add_generation_args(parser, default_output="./output"):
-    """Add common generation arguments."""
+    """添加通用生成参数。"""
     parser.add_argument("--model", default="mureka-8",
-                        help="Model (default: mureka-8)")
+                        help="模型（默认：mureka-8）")
     parser.add_argument("-n", "--n", type=int, default=None, dest="n",
-                        help="Number of results to generate (default 2, max 3)")
+                        help="生成结果数量（默认 2，最多 3）")
     parser.add_argument("--output", default=default_output,
-                        help=f"Output directory (default: {default_output})")
+                        help=f"输出目录（默认：{default_output}）")
     parser.add_argument("--format", choices=["mp3", "flac", "wav"], default="mp3",
-                        help="Download format (default: mp3)")
+                        help="下载格式（默认：mp3）")
     parser.add_argument("--poll-interval", type=int, default=5,
-                        help="Poll interval in seconds (default: 5)")
+                        help="轮询间隔秒数（默认：5）")
     parser.add_argument("--poll-timeout", type=int, default=600,
-                        help="Poll timeout in seconds (default: 600)")
+                        help="轮询超时秒数（默认：600）")
 
 
 # ---------------------------------------------------------------------------
-# Main
+# 主入口
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Mureka AI music generation CLI",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""examples:
+    parser = ChineseArgumentParser(
+        description="Mureka AI 音乐生成命令行工具",
+        epilog="""示例：
   %(prog)s song --lyrics "[Verse]\\nHello world" --prompt "pop, 120 BPM, female vocal"
   %(prog)s instrumental --prompt "ambient, 80 BPM, soft pads"
   %(prog)s lyrics generate "a summer love song"
   %(prog)s lyrics extend "[Verse]\\nExisting lyrics..."
-  %(prog)s upload my_voice.mp3 --purpose vocal
+  %(prog)s upload reference.mp3 --purpose reference
 """)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # --- song ---
-    p_song = sub.add_parser("song", help="Generate a song with lyrics and vocals")
+    # --- 歌曲 ---
+    p_song = sub.add_parser("song", help="生成带歌词和人声的歌曲")
     p_song.add_argument("--lyrics", required=True,
-                        help="Song lyrics (max 3000 chars). Use structure tags: [Verse], [Chorus], etc.")
+                        help="歌曲歌词（最多 3000 字符），使用 [Verse]、[Chorus] 等结构标签")
     p_song.add_argument("--prompt", default=None,
-                        help="Style/scene prompt (max 1024 chars)")
+                        help="风格或场景 prompt（最多 1024 字符）")
     p_song.add_argument("--reference-id", default=None,
-                        help="Reference audio file ID (purpose=reference)")
+                        help="参考音频文件 ID（purpose=reference）")
     p_song.add_argument("--vocal-id", default=None,
-                        help="Vocal file ID (purpose=vocal)")
+                        help="已有 Vocal ID（不是文件上传 purpose）")
     p_song.add_argument("--melody-id", default=None,
-                        help="Melody file ID (purpose=melody). Cannot combine with other control options")
+                        help="旋律文件 ID（purpose=melody），不能与其他控制选项同时使用")
     add_generation_args(p_song, "./output")
 
-    # --- instrumental ---
-    p_inst = sub.add_parser("instrumental", help="Generate an instrumental track")
+    # --- 纯音乐 ---
+    p_inst = sub.add_parser("instrumental", help="生成纯音乐")
     p_inst.add_argument("--prompt", default=None,
-                        help="Style/scene prompt (max 1024 chars)")
+                        help="风格或场景 prompt（最多 1024 字符）")
     p_inst.add_argument("--instrumental-id", default=None,
-                        help="Reference instrumental file ID (purpose=instrumental)")
+                        help="参考纯音乐文件 ID（purpose=instrumental）")
     add_generation_args(p_inst, "./instrumental")
 
-    # --- lyrics ---
-    p_lyrics = sub.add_parser("lyrics", help="Generate or extend lyrics")
+    # --- 歌词 ---
+    p_lyrics = sub.add_parser("lyrics", help="生成或扩写歌词")
     lyrics_sub = p_lyrics.add_subparsers(dest="lyrics_command", required=True)
 
-    p_lyrics_gen = lyrics_sub.add_parser("generate", help="Generate lyrics from a prompt")
-    p_lyrics_gen.add_argument("prompt", help="Theme or description for lyrics")
+    p_lyrics_gen = lyrics_sub.add_parser("generate", help="根据 prompt 生成歌词")
+    p_lyrics_gen.add_argument("prompt", help="歌词主题或描述")
 
-    p_lyrics_ext = lyrics_sub.add_parser("extend", help="Extend existing lyrics")
-    p_lyrics_ext.add_argument("lyrics", help="Existing lyrics to continue writing")
+    p_lyrics_ext = lyrics_sub.add_parser("extend", help="扩写现有歌词")
+    p_lyrics_ext.add_argument("lyrics", help="要继续扩写的现有歌词")
 
-    # --- upload ---
-    p_upload = sub.add_parser("upload", help="Upload a file to Mureka")
-    p_upload.add_argument("file", help="Path to the audio file (mp3, m4a, or mid for melody)")
+    # --- 上传 ---
+    p_upload = sub.add_parser("upload", help="向 Mureka 上传文件")
+    p_upload.add_argument("file", help="上传文件路径；格式和时长须符合所选 purpose")
     p_upload.add_argument("--purpose", required=True,
-                          choices=["reference", "vocal", "melody", "instrumental", "voice", "audio"],
-                          help="Purpose: reference (30s), vocal (15-30s), melody (5-60s), instrumental (30s), voice (5-15s), audio (general)")
+                          choices=["reference", "melody", "instrumental", "voice",
+                                   "audio", "remix", "soundtrack", "lyrics-video"],
+                          help="用途：reference、melody、instrumental、voice、audio、remix、soundtrack 或 lyrics-video；具体格式和限制见 skill 文档")
 
     args = parser.parse_args()
 

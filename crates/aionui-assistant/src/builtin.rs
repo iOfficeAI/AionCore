@@ -301,6 +301,96 @@ mod tests {
     }
 
     #[test]
+    fn load_embedded_threejs_skills_default_on_web_game_assistants() {
+        let reg = BuiltinAssistantRegistry::load_embedded();
+        let expected = [
+            "threejs-game-director",
+            "threejs-gameplay-systems",
+            "threejs-aaa-graphics-builder",
+            "threejs-game-ui-designer",
+            "threejs-debug-profiler",
+            "threejs-qa-release",
+            "threejs-3d-generator",
+            "threejs-image-generator",
+            "threejs-audio-generator",
+        ];
+        for id in ["game-dev-studio", "game-3d"] {
+            let assistant = reg.get(id).unwrap_or_else(|| panic!("missing builtin {id}"));
+            assert_eq!(
+                assistant.enabled_skills, expected,
+                "{id} should default-enable threejs skills"
+            );
+        }
+        let butler = reg.get("aionui-assistant").expect("aionui-assistant");
+        for skill in expected {
+            assert!(
+                butler.enabled_skills.iter().any(|s| s == skill),
+                "butler should default-enable {skill} for Guid out-of-box web games"
+            );
+        }
+        assert!(
+            butler.enabled_skills.iter().any(|s| s == "aionui-config"),
+            "butler must keep config skills"
+        );
+        for id in [
+            "spatial-GameDesigner",
+            "spatial-TechnicalArtist",
+            "spatial-NarrativeDesigner",
+            "spatial-LevelDesigner",
+            "spatial-GameAudioEngineer",
+            "spatial-UnityArchitect",
+        ] {
+            let assistant = reg.get(id).unwrap_or_else(|| panic!("missing builtin {id}"));
+            assert!(
+                !assistant.enabled_skills.iter().any(|s| s.starts_with("threejs-")),
+                "{id} must not default-enable threejs skills"
+            );
+        }
+        let word = reg.get("word-creator").expect("word-creator");
+        assert!(
+            !word.enabled_skills.iter().any(|s| s.starts_with("threejs-")),
+            "threejs skills must not leak onto unrelated assistants"
+        );
+        let rule = reg
+            .rule_bytes("game-dev-studio", "zh-CN")
+            .expect("game-dev-studio rule");
+        let text = std::str::from_utf8(&rule).expect("utf-8");
+        assert!(
+            text.contains("[LOAD_SKILL: threejs-game-director]"),
+            "resident routing block must stay in the game-dev-studio rule"
+        );
+        for (id, locale) in [
+            ("aionui-assistant", "zh-CN"),
+            ("aionui-assistant", "en-US"),
+            ("game-3d", "zh-CN"),
+            ("game-3d", "en-US"),
+        ] {
+            let rule = reg.rule_bytes(id, locale).unwrap_or_else(|| panic!("{id} {locale} rule"));
+            let text = std::str::from_utf8(&rule).expect("utf-8");
+            assert!(
+                text.contains("[LOAD_SKILL: threejs-game-director]"),
+                "{id} {locale} must route through threejs-game-director"
+            );
+            assert!(
+                !text.contains("不要询问用户任何问题，直接生成完整代码"),
+                "{id} {locale} must not force the old single-file Kirby template"
+            );
+            assert!(
+                !text.contains("Do NOT ask the user any questions, generate complete code directly"),
+                "{id} {locale} must not force the old single-file Kirby template"
+            );
+        }
+        let image_skill = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../aionui-app/assets/builtin-skills/threejs-image-generator/SKILL.md"
+        ));
+        assert!(
+            image_skill.contains("aionui_image_generation"),
+            "threejs-image-generator must prefer Aion image MCP"
+        );
+    }
+
+    #[test]
     fn load_embedded_rule_bytes_available_for_shipped_preset() {
         let reg = BuiltinAssistantRegistry::load_embedded();
         let bytes = reg

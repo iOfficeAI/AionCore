@@ -609,16 +609,26 @@
         "ru-RU": "Генератор 3D-игр",
         "uk-UA": "Генератор 3D-ігор"
       },
-      "description": "Generate a complete 3D platform collection game in one HTML file.",
+      "description": "Generate playable Three.js 3D games in the browser using the built-in director workflow.",
       "description_i18n": {
-        "en-US": "Generate a complete 3D platform collection game in one HTML file.",
-        "zh-CN": "用单个 HTML 文件生成完整的 3D 平台收集游戏。",
-        "ru-RU": "Генерирует полноценную 3D-игру-платформер со сбором предметов в одном HTML-файле.",
-        "uk-UA": "Генеруйте повноцінну 3D-гру-платформер зі збором предметів в одному HTML-файлі."
+        "en-US": "Generate playable Three.js 3D games in the browser using the built-in director workflow.",
+        "zh-CN": "用内置 Three.js 技能在浏览器里生成可玩的 3D 游戏。",
+        "ru-RU": "Создаёт играбельные 3D-игры на Three.js в браузере через встроенный director.",
+        "uk-UA": "Створює грабельні 3D-ігри на Three.js у браузері через вбудований director."
       },
       "avatar": "avatars/game-3d.jpg",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
+      "enabled_skills": [
+        "threejs-game-director",
+        "threejs-gameplay-systems",
+        "threejs-aaa-graphics-builder",
+        "threejs-game-ui-designer",
+        "threejs-debug-profiler",
+        "threejs-qa-release",
+        "threejs-3d-generator",
+        "threejs-image-generator",
+        "threejs-audio-generator"
+      ],
       "custom_skill_names": [],
       "disabled_builtin_skills": [],
       "rule_file": "rules/game-3d.{locale}.md",
@@ -1109,7 +1119,16 @@
       "enabled_skills": [
         "aionui-config",
         "aionui-troubleshooting",
-        "aionui-webui-public"
+        "aionui-webui-public",
+        "threejs-game-director",
+        "threejs-gameplay-systems",
+        "threejs-aaa-graphics-builder",
+        "threejs-game-ui-designer",
+        "threejs-debug-profiler",
+        "threejs-qa-release",
+        "threejs-3d-generator",
+        "threejs-image-generator",
+        "threejs-audio-generator"
       ],
       "custom_skill_names": [],
       "disabled_builtin_skills": [],
@@ -1118,32 +1137,37 @@
         "Add a new LLM provider and API key, then set it as the default model",
         "Set up remote access for me, so I can open AionUi from my phone when I'm out",
         "A conversation is stuck — please diagnose what's wrong",
-        "Create a new assistant and attach a skill to it"
+        "Create a new assistant and attach a skill to it",
+        "Make a small 3D game I can play in the browser"
       ],
       "prompts_i18n": {
         "en-US": [
           "Add a new LLM provider and API key, then set it as the default model",
           "Set up remote access for me, so I can open AionUi from my phone when I'm out",
           "A conversation is stuck — please diagnose what's wrong",
-          "Create a new assistant and attach a skill to it"
+          "Create a new assistant and attach a skill to it",
+          "Make a small 3D game I can play in the browser"
         ],
         "zh-CN": [
           "添加一个新的 LLM 模型和 API Key，并设为默认模型",
           "帮我配置远程访问，让我在外面用手机也能打开 AionUi",
           "有个会话卡住了，帮我诊断哪里出了问题",
-          "创建一个新助手，并给它绑定一个技能"
+          "创建一个新助手，并给它绑定一个技能",
+          "做一个能在浏览器里玩的 3D 小游戏"
         ],
         "ru-RU": [
           "Добавь нового провайдера LLM и API-ключ, затем сделай его моделью по умолчанию",
           "Настрой удалённый доступ, чтобы я мог открывать AionUi с телефона, когда меня нет",
           "Разговор завис — пожалуйста, диагностируй, что не так",
-          "Создай нового ассистента и подключи к нему навык"
+          "Создай нового ассистента и подключи к нему навык",
+          "Сделай небольшую 3D-игру, в которую можно играть в браузере"
         ],
         "uk-UA": [
           "Додай нового провайдера LLM та API-ключ, потім зроби його моделлю за замовчуванням",
           "Налаштуй віддалений доступ, щоб я міг відкривати AionUi з телефона, коли мене немає",
           "Розмова зависла — будь ласка, діагностуй, що не так",
-          "Створи нового асистента й підключи до нього навичку"
+          "Створи нового асистента й підключи до нього навичку",
+          "Зроби невелику 3D-гру, в яку можна грати в браузері"
         ]
       },
       "models": []
@@ -1152,1152 +1176,455 @@
       "id": "game-dev-studio",
       "sort_order": 1500,
       "default_enabled": false,
-      "name": "Game Development Studio",
-      "name_i18n": {
-        "en-US": "Game Development Studio",
-        "zh-CN": "游戏开发工作室"
-      },
-      "description": "A solo studio lead who always drafts a long-horizon plan first, then executes it by switching between six specialist personas (design, engineering, art, audio, quality, release) — driving a game from concept to launch through a phased, gate-checked workflow. For quick, low-cost game ideas it moves straight to execution toward the most promising direction, without waiting for step-by-step approval.",
-      "description_i18n": {
-        "en-US": "A solo studio lead who always drafts a long-horizon plan first, then executes it by switching between six specialist personas (design, engineering, art, audio, quality, release) — driving a game from concept to launch through a phased, gate-checked workflow. For quick, low-cost game ideas it moves straight to execution toward the most promising direction, without waiting for step-by-step approval.",
-        "zh-CN": "一个人扛下整个工作室：先出一份能长程执行的计划（叫派单计划、分工计划、执行方案都行），再按策划/技术/美术/音频/质量/运营六个角色逐一换帽子执行，以七阶段工作流驱动游戏从概念到上线。对于一句话、低成本的创作需求，计划写完直接按最优、最可能'跑起来'的方向自主推进，不需要逐步等确认。"
-      },
+      "name": "游戏开发工作室",
+      "description": "一个人切换策划、工程、视觉、音频、质量、发布六顶帽子，把游戏从概念推进到可验证交付。Web 项目走内置 Three.js 技能；没有引擎时交付文档、代码和概念图，不假装已经跑通。",
       "avatar": "avatars/game-dev-studio.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/game-dev-studio.{locale}.md",
-      "prompts": [
-        "Help me run my game project as a studio — guide me through the right phase",
-        "Brainstorm a game concept with pillars, MDA analysis, and scope tiers",
-        "Plan the next sprint: pick ready stories, implement, QA, and close them"
+      "enabled_skills": [
+        "threejs-game-director",
+        "threejs-gameplay-systems",
+        "threejs-aaa-graphics-builder",
+        "threejs-game-ui-designer",
+        "threejs-debug-profiler",
+        "threejs-qa-release",
+        "threejs-3d-generator",
+        "threejs-image-generator",
+        "threejs-audio-generator"
       ],
-      "prompts_i18n": {
-        "en-US": [
-          "Help me run my game project as a studio — guide me through the right phase",
-          "Brainstorm a game concept with pillars, MDA analysis, and scope tiers",
-          "Plan the next sprint: pick ready stories, implement, QA, and close them"
-        ],
-        "zh-CN": [
-          "帮我把游戏项目当工作室来推进，先告诉我现在该走哪个阶段",
-          "帮我头脑风暴一个游戏概念，含设计支柱、MDA分析与范围分层",
-          "规划下一个冲刺：挑选就绪故事、实现、测试并收尾"
-        ]
-      },
-      "models": []
+      "rule_file": "rules/game-dev-studio.md",
+      "prompts": [
+        "我只有一句话概念，帮我做成可试玩的最小范围，并先出核心循环和一张目标画面",
+        "现有 Unity 项目卡在垂直切片，帮我按六顶帽子列出本周可验证的交付和风险",
+        "做一个能在浏览器里跑起来的 3D 小游戏，画面和手感都要像样"
+      ]
     },
     {
       "id": "team-promo-creator",
       "sort_order": 1510,
       "default_enabled": false,
-      "name": "Promo Creator Team",
-      "name_i18n": {
-        "en-US": "Promo Creator Team",
-        "zh-CN": "宣传片创作团队"
-      },
-      "description": "6 specialized roles collaborate across 6 phases for end-to-end product promo video production",
-      "description_i18n": {
-        "en-US": "6 specialized roles collaborate across 6 phases for end-to-end product promo video production",
-        "zh-CN": "6 位专业角色分 6 个阶段协作，端到端完成产品宣传片制作。"
-      },
+      "name": "宣传片创作团队",
+      "description": "宣传片制片负责人。当前对话可单人完成简报到成片方案；完整协作请用 Team 快捷配方拉起简报、分镜、素材、剪辑、配乐。",
       "avatar": "avatars/team-promo-creator.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/team-promo-creator.{locale}.md",
+      "rule_file": "rules/team-promo-creator.md",
       "prompts": [
-        "Create a product promo video for me",
-        "Make a 60s launch video for my GitHub project",
-        "Design BGM for my product demo video"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Create a product promo video for me",
-          "Make a 60s launch video for my GitHub project",
-          "Design BGM for my product demo video"
-        ],
-        "zh-CN": [
-          "帮我做一支产品宣传片",
-          "给我的GitHub项目做一支60秒发布视频",
-          "为我的产品演示视频设计配乐"
-        ]
-      },
-      "models": []
+        "根据我的产品做一支 30 秒发布宣传片，先出简报和三张关键帧",
+        "给我的 GitHub 项目做 60 秒发布视频方案，真实界面和生成画面要分开",
+        "已有分镜，帮我把配乐卡点和终剪清单补齐"
+      ]
     },
     {
       "id": "promo-brief-strategist",
       "sort_order": 1710,
       "default_enabled": false,
-      "name": "Bella",
-      "name_i18n": {
-        "en-US": "Bella",
-        "zh-CN": "Bella"
-      },
-      "description": "Creative Strategist",
-      "description_i18n": {
-        "en-US": "Creative Strategist",
-        "zh-CN": "创意策略师"
-      },
+      "name": "简报策略师",
+      "description": "把产品事实写成可拍、可审、有视觉方向的宣传片简报",
       "avatar": "avatars/promo-brief-strategist.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/promo-brief-strategist.{locale}.md",
-      "prompts": [],
-      "prompts_i18n": {
-        "en-US": [],
-        "zh-CN": []
-      },
-      "models": []
+      "rule_file": "rules/promo-brief-strategist.md"
     },
     {
       "id": "promo-storyboard-artist",
       "sort_order": 1720,
       "default_enabled": false,
-      "name": "Sean",
-      "name_i18n": {
-        "en-US": "Sean",
-        "zh-CN": "Sean"
-      },
-      "description": "Storyboard Artist",
-      "description_i18n": {
-        "en-US": "Storyboard Artist",
-        "zh-CN": "分镜师"
-      },
+      "name": "分镜师",
+      "description": "把简报落成逐镜头时间线，并产出能拍板的关键帧",
       "avatar": "avatars/promo-storyboard-artist.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/promo-storyboard-artist.{locale}.md",
-      "prompts": [],
-      "prompts_i18n": {
-        "en-US": [],
-        "zh-CN": []
-      },
-      "models": []
+      "rule_file": "rules/promo-storyboard-artist.md"
     },
     {
       "id": "promo-asset-producer",
       "sort_order": 1730,
       "default_enabled": false,
-      "name": "Ada",
-      "name_i18n": {
-        "en-US": "Ada",
-        "zh-CN": "Ada"
-      },
-      "description": "Asset Producer",
-      "description_i18n": {
-        "en-US": "Asset Producer",
-        "zh-CN": "素材制作人"
-      },
+      "name": "素材制作人",
+      "description": "按分镜生成、采集并登记可发布素材，真实界面与概念图严格分开",
       "avatar": "avatars/promo-asset-producer.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/promo-asset-producer.{locale}.md",
-      "prompts": [],
-      "prompts_i18n": {
-        "en-US": [],
-        "zh-CN": []
-      },
-      "models": []
+      "rule_file": "rules/promo-asset-producer.md"
     },
     {
       "id": "promo-video-editor",
       "sort_order": 1740,
       "default_enabled": false,
-      "name": "Ethan",
-      "name_i18n": {
-        "en-US": "Ethan",
-        "zh-CN": "Ethan"
-      },
-      "description": "Video Editor & Motion Designer",
-      "description_i18n": {
-        "en-US": "Video Editor & Motion Designer",
-        "zh-CN": "剪辑师兼动效师"
-      },
+      "name": "剪辑师",
+      "description": "把分镜、素材和配乐剪成可审查时间线；有渲染工具才交付成片",
       "avatar": "avatars/promo-video-editor.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/promo-video-editor.{locale}.md",
-      "prompts": [],
-      "prompts_i18n": {
-        "en-US": [],
-        "zh-CN": []
-      },
-      "models": []
+      "rule_file": "rules/promo-video-editor.md"
     },
     {
       "id": "promo-music-director",
       "sort_order": 1750,
       "default_enabled": false,
-      "name": "Melody",
-      "name_i18n": {
-        "en-US": "Melody",
-        "zh-CN": "Melody"
-      },
-      "description": "Music Director",
-      "description_i18n": {
-        "en-US": "Music Director",
-        "zh-CN": "音乐总监"
-      },
+      "name": "音乐总监",
+      "description": "写出可生成的英文 BGM prompt，并按镜头卡点",
       "avatar": "avatars/promo-music-director.png",
       "agent_ref": "aionrs",
       "enabled_skills": [
         "bgm-prompting"
       ],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/promo-music-director.{locale}.md",
-      "prompts": [],
-      "prompts_i18n": {
-        "en-US": [],
-        "zh-CN": []
-      },
-      "models": []
+      "rule_file": "rules/promo-music-director.md"
     },
     {
       "id": "spatial-GameDesigner",
       "sort_order": 1200,
       "default_enabled": false,
-      "name": "Game Designer",
-      "name_i18n": {
-        "en-US": "Game Designer",
-        "zh-CN": "游戏设计师"
-      },
-      "description": "Game Systems & Mechanics Designer",
-      "description_i18n": {
-        "en-US": "Game Systems & Mechanics Designer",
-        "zh-CN": "游戏系统与机制设计师"
-      },
+      "name": "游戏设计师",
+      "description": "把玩法做成可验证的核心循环、经济模型和最小原型范围",
       "avatar": "avatars/spatial-GameDesigner.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-GameDesigner.{locale}.md",
+      "rule_file": "rules/spatial-GameDesigner.md",
       "prompts": [
-        "I have a game concept to validate—help me write the fun hypothesis and 3-5 design pillars first, then break down the core loop.",
-        "Help me design the economy for my game—draw the sources and sinks, and check for inflation risk.",
-        "This mechanic feels off but I can't tell why. Help me diagnose it from feedback channels to the mechanic itself."
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "I have a game concept to validate—help me write the fun hypothesis and 3-5 design pillars first, then break down the core loop.",
-          "Help me design the economy for my game—draw the sources and sinks, and check for inflation risk.",
-          "This mechanic feels off but I can't tell why. Help me diagnose it from feedback channels to the mechanic itself."
-        ],
-        "zh-CN": [
-          "我有一个游戏概念想验证，帮我先写出 fun hypothesis 和 3-5 条 design pillars，再拆解核心循环。",
-          "帮我设计游戏的经济系统，画出 sources 和 sinks，并检查有没有通胀风险。",
-          "这个机制感觉不对但说不清哪里，帮我从反馈通道到机制本身逐层诊断。"
-        ]
-      },
-      "models": []
+        "把这个一句话概念拆成设计支柱、核心循环和最小可玩原型",
+        "帮我画经济来源与消耗，并标出通胀和死循环风险",
+        "这个机制不好玩但说不清原因，从反馈通道到选择深度帮我诊断"
+      ]
     },
     {
       "id": "spatial-TechnicalArtist",
       "sort_order": 1210,
       "default_enabled": false,
-      "name": "Otis",
-      "name_i18n": {
-        "en-US": "Otis",
-        "zh-CN": "技美美"
-      },
-      "description": "Technical Artist",
-      "description_i18n": {
-        "en-US": "Technical Artist",
-        "zh-CN": "技术美术"
-      },
+      "name": "技术美术",
+      "description": "在目标帧预算内落地材质、VFX、资产规范和画面目标",
       "avatar": "avatars/spatial-TechnicalArtist.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-TechnicalArtist.{locale}.md",
+      "rule_file": "rules/spatial-TechnicalArtist.md",
       "prompts": [
-        "Our game needs technical art support to bridge art and development. Please, Technical Artist, help us optimize game art effects.",
-        "Optimize art asset performance and quality balance",
-        "Design art tools and automation scripts"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Our game needs technical art support to bridge art and development. Please, Technical Artist, help us optimize game art effects.",
-          "Optimize art asset performance and quality balance",
-          "Design art tools and automation scripts"
-        ],
-        "zh-CN": [
-          "我们的游戏需要技术美术支持,连接美术和开发的桥梁,请技术美术帮我们优化游戏美术效果。",
-          "优化美术资源性能和质量平衡",
-          "设计美术工具和自动化脚本"
-        ]
-      },
-      "models": []
+        "按移动端 30fps 给这套场景出材质分级、贴图预算和一张目标光照图",
+        "角色装备过亮、场景脏，帮我定可复用材质参数和禁止项",
+        "VFX 把 fillrate 打满了，帮我做质量和性能的降级方案"
+      ]
     },
     {
       "id": "spatial-NarrativeDesigner",
       "sort_order": 1220,
       "default_enabled": false,
-      "name": "Kent",
-      "name_i18n": {
-        "en-US": "Kent",
-        "zh-CN": "剧本本"
-      },
-      "description": "Narrative Designer",
-      "description_i18n": {
-        "en-US": "Narrative Designer",
-        "zh-CN": "叙事设计师"
-      },
+      "name": "叙事设计师",
+      "description": "把世界观写成可分支、可配音、可验收的剧情与对白",
       "avatar": "avatars/spatial-NarrativeDesigner.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-NarrativeDesigner.{locale}.md",
+      "rule_file": "rules/spatial-NarrativeDesigner.md",
       "prompts": [
-        "Our game needs compelling storylines and dialogue. Please, Narrative Designer, help us write game stories.",
-        "Write character backstories and story branches",
-        "Develop narrative pacing and emotional experience plan"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Our game needs compelling storylines and dialogue. Please, Narrative Designer, help us write game stories.",
-          "Write character backstories and story branches",
-          "Develop narrative pacing and emotional experience plan"
-        ],
-        "zh-CN": [
-          "我们的游戏需要引人入胜的剧情和对话,请叙事设计师帮我们编写游戏剧情。",
-          "撰写角色背景和剧情分支",
-          "制定叙事节奏和情感体验方案"
-        ]
-      },
-      "models": []
+        "根据这个设定写出三幕结构和第一场可配音对白",
+        "设计一个会改变后续关卡的关键选择，并写出失败/成功两支",
+        "剧情说明太多，帮我改成环境叙事和短对白"
+      ]
     },
     {
       "id": "spatial-LevelDesigner",
       "sort_order": 1230,
       "default_enabled": false,
-      "name": "Jack",
-      "name_i18n": {
-        "en-US": "Jack",
-        "zh-CN": "关卡卡"
-      },
-      "description": "Level Designer",
-      "description_i18n": {
-        "en-US": "Level Designer",
-        "zh-CN": "关卡设计师"
-      },
+      "name": "关卡设计师",
+      "description": "用空间、节奏和引导把关卡做成可玩的体验，并出关键房间概念",
       "avatar": "avatars/spatial-LevelDesigner.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-LevelDesigner.{locale}.md",
+      "rule_file": "rules/spatial-LevelDesigner.md",
       "prompts": [
-        "Our game level design needs optimization to improve player experience. Please, Level Designer, help us design game levels.",
-        "Plan level difficulty curve and player guidance",
-        "Optimize level pacing and exploration experience"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Our game level design needs optimization to improve player experience. Please, Level Designer, help us design game levels.",
-          "Plan level difficulty curve and player guidance",
-          "Optimize level pacing and exploration experience"
-        ],
-        "zh-CN": [
-          "我们的游戏关卡设计需要优化,提升玩家体验,请关卡设计师帮我们设计游戏关卡。",
-          "规划关卡难度曲线和玩家引导",
-          "优化关卡节奏和探索体验"
-        ]
-      },
-      "models": []
+        "设计一个 8 分钟教程关：灰盒尺寸、遭遇和一张地标概念图",
+        "玩家在这个区域迷路，帮我重做视线、地标和节奏",
+        "给竞技地图做出生安全、轮转和制高点检查"
+      ]
     },
     {
       "id": "spatial-GameAudioEngineer",
       "sort_order": 1240,
       "default_enabled": false,
-      "name": "Carl",
-      "name_i18n": {
-        "en-US": "Carl",
-        "zh-CN": "音效效"
-      },
-      "description": "Game Audio Engineer",
-      "description_i18n": {
-        "en-US": "Game Audio Engineer",
-        "zh-CN": "游戏音频工程师"
-      },
+      "name": "游戏音频工程师",
+      "description": "按事件、总线和实时线程约束设计可集成的音乐与音效",
       "avatar": "avatars/spatial-GameAudioEngineer.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-GameAudioEngineer.{locale}.md",
+      "rule_file": "rules/spatial-GameAudioEngineer.md",
       "prompts": [
-        "Our game needs professional audio design and sound effects production. Please, Game Audio Engineer, help us design a game audio system.",
-        "Design adaptive music and spatial audio systems",
-        "Optimize audio performance budgeting and memory management"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Our game needs professional audio design and sound effects production. Please, Game Audio Engineer, help us design a game audio system.",
-          "Design adaptive music and spatial audio systems",
-          "Optimize audio performance budgeting and memory management"
-        ],
-        "zh-CN": [
-          "我们的游戏需要专业的音频设计和音效制作,请游戏音频工程师帮我们设计游戏音频系统。",
-          "设计自适应音乐和空间音效系统",
-          "优化音频性能预算和内存管理"
-        ]
-      },
-      "models": []
+        "给核心战斗出事件清单、优先级、总线和内存预算",
+        "设计随紧张度变化的自适应音乐层，并写集成接口",
+        "音频线程偶发卡顿，帮我查回调里的阻塞和跨线程问题"
+      ]
     },
     {
       "id": "spatial-UnityArchitect",
       "sort_order": 1250,
       "default_enabled": false,
-      "name": "Page",
-      "name_i18n": {
-        "en-US": "Page",
-        "zh-CN": "解耦达"
-      },
-      "description": "Unity Architect",
-      "description_i18n": {
-        "en-US": "Unity Architect",
-        "zh-CN": "Unity架构师"
-      },
+      "name": "Unity 架构师",
+      "description": "设计可测试、可热更的 Unity 模块边界、数据和资源策略",
       "avatar": "avatars/spatial-UnityArchitect.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-UnityArchitect.{locale}.md",
+      "rule_file": "rules/spatial-UnityArchitect.md",
       "prompts": [
-        "Our Unity project needs refactoring to avoid code coupling and maintenance difficulties. Please, Unity Architect, help us design a decoupled architecture solution.",
-        "Build ScriptableObject data-driven systems",
-        "Develop Unity project standards and component design patterns"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Our Unity project needs refactoring to avoid code coupling and maintenance difficulties. Please, Unity Architect, help us design a decoupled architecture solution.",
-          "Build ScriptableObject data-driven systems",
-          "Develop Unity project standards and component design patterns"
-        ],
-        "zh-CN": [
-          "我们的Unity项目需要重构,避免代码耦合和维护困难,请Unity架构师帮我们设计解耦的架构方案。",
-          "搭建ScriptableObject数据驱动系统",
-          "制定Unity项目规范和组件设计模式"
-        ]
-      },
-      "models": []
+        "审核当前程序集和场景依赖，给出最小解耦改造路径",
+        "用 ScriptableObject 做配置和事件，但不要把场景实例塞进去",
+        "规划 Addressables 加载、释放和场景切换，避免泄漏"
+      ]
     },
     {
       "id": "spatial-UnrealSystemEngineer",
       "sort_order": 1260,
       "default_enabled": false,
-      "name": "Wade",
-      "name_i18n": {
-        "en-US": "Wade",
-        "zh-CN": "虚幻通"
-      },
-      "description": "Unreal System Engineer",
-      "description_i18n": {
-        "en-US": "Unreal System Engineer",
-        "zh-CN": "Unreal系统工程师"
-      },
+      "name": "Unreal 系统工程师",
+      "description": "用 GAS、子系统和复制把玩法做成可维护的 Unreal 系统",
       "avatar": "avatars/spatial-UnrealSystemEngineer.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-UnrealSystemEngineer.{locale}.md",
+      "rule_file": "rules/spatial-UnrealSystemEngineer.md",
       "prompts": [
-        "Our Unreal game needs system-level development support. Please, Unreal System Engineer, help us implement game systems.",
-        "Optimize Nanite/Lumen rendering performance",
-        "Build Gameplay Ability System game systems"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Our Unreal game needs system-level development support. Please, Unreal System Engineer, help us implement game systems.",
-          "Optimize Nanite/Lumen rendering performance",
-          "Build Gameplay Ability System game systems"
-        ],
-        "zh-CN": [
-          "我们的虚幻游戏需要系统层面的开发支持,请虚幻系统工程师帮我们实现游戏系统。",
-          "优化Nanite/Lumen渲染性能",
-          "搭建Gameplay Ability System游戏系统"
-        ]
-      },
-      "models": []
+        "用 Gameplay Ability System 设计技能、冷却和复制边界",
+        "现有 Actor 逻辑太散，帮我收成子系统和模块接口",
+        "列出这个系统在目标 UE 版本上的 API 假设和替代方案"
+      ]
     },
     {
       "id": "spatial-UnrealWorldBuilder",
       "sort_order": 1270,
       "default_enabled": false,
-      "name": "Zack",
-      "name_i18n": {
-        "en-US": "Zack",
-        "zh-CN": "造世界"
-      },
-      "description": "Unreal World Builder",
-      "description_i18n": {
-        "en-US": "Unreal World Builder",
-        "zh-CN": "Unreal世界构建师"
-      },
+      "name": "Unreal 世界构建师",
+      "description": "用 World Partition、HLOD 和 PCG 搭建可流送的开放世界",
       "avatar": "avatars/spatial-UnrealWorldBuilder.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-UnrealWorldBuilder.{locale}.md",
+      "rule_file": "rules/spatial-UnrealWorldBuilder.md",
       "prompts": [
-        "Our Unreal game needs world and level construction. Please, Unreal World Builder, help us design the game world.",
-        "Design World Partition and HLOD plan",
-        "Optimize level streaming and procedural foliage"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Our Unreal game needs world and level construction. Please, Unreal World Builder, help us design the game world.",
-          "Design World Partition and HLOD plan",
-          "Optimize level streaming and procedural foliage"
-        ],
-        "zh-CN": [
-          "我们的虚幻游戏需要构建世界和关卡,请虚幻世界构建者帮我们设计游戏世界。",
-          "设计World Partition和HLOD方案",
-          "优化关卡流加载和程序化植被"
-        ]
-      },
-      "models": []
+        "按玩家移速和内存预算规划分区网格、加载范围和地标",
+        "给一个生物群系出 PCG 密度、排除区和一张远景概念图",
+        "高速载具穿越会 hitch，帮我做流送和 HLOD 验证路线"
+      ]
     },
     {
       "id": "spatial-UnrealMultiplayerArchitect",
       "sort_order": 1280,
       "default_enabled": false,
-      "name": "Uris",
-      "name_i18n": {
-        "en-US": "Uris",
-        "zh-CN": "联机达"
-      },
-      "description": "Unreal Multiplayer Architect",
-      "description_i18n": {
-        "en-US": "Unreal Multiplayer Architect",
-        "zh-CN": "Unreal多人架构师"
-      },
+      "name": "Unreal 多人架构师",
+      "description": "设计服务端权威的 Unreal 复制、预测与反作弊边界",
       "avatar": "avatars/spatial-UnrealMultiplayerArchitect.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-UnrealMultiplayerArchitect.{locale}.md",
+      "rule_file": "rules/spatial-UnrealMultiplayerArchitect.md",
       "prompts": [
-        "Our Unreal game needs multiplayer architecture with professional network architecture design. Please, Unreal Multiplayer Architect, help us design a multiplayer system.",
-        "Build server-authoritative and network prediction systems",
-        "Optimize multiplayer sync and lag compensation strategy"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Our Unreal game needs multiplayer architecture with professional network architecture design. Please, Unreal Multiplayer Architect, help us design a multiplayer system.",
-          "Build server-authoritative and network prediction systems",
-          "Optimize multiplayer sync and lag compensation strategy"
-        ],
-        "zh-CN": [
-          "我们的虚幻游戏需要多人架构,需要专业的网络架构设计,请虚幻多人架构师帮我们设计多人系统。",
-          "搭建服务器权威和网络预测系统",
-          "优化多人同步和延迟补偿策略"
-        ]
-      },
-      "models": []
+        "为射击核心循环设计复制、预测和回滚，哪些必须服务器权威",
+        "经济与掉落不能信客户端，帮我划 RPC 和校验边界",
+        "延迟 120ms 时手感差，给出可测的补偿和带宽预算"
+      ]
     },
     {
       "id": "spatial-UnrealTechnicalArtist",
       "sort_order": 1290,
       "default_enabled": false,
-      "name": "Yana",
-      "name_i18n": {
-        "en-US": "Yana",
-        "zh-CN": "材质通"
-      },
-      "description": "Unreal Technical Artist",
-      "description_i18n": {
-        "en-US": "Unreal Technical Artist",
-        "zh-CN": "Unreal技术美术"
-      },
+      "name": "Unreal 技术美术",
+      "description": "用材质、Niagara、Nanite/Lumen 约束把画面落到目标平台",
       "avatar": "avatars/spatial-UnrealTechnicalArtist.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-UnrealTechnicalArtist.{locale}.md",
+      "rule_file": "rules/spatial-UnrealTechnicalArtist.md",
       "prompts": [
-        "Our Unreal project needs technical art optimization. Please, Unreal Technical Artist, help us optimize visual effects.",
-        "Design Procedural Content Generation (PCG) plan",
-        "Optimize art-to-engine pipeline workflow"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Our Unreal project needs technical art optimization. Please, Unreal Technical Artist, help us optimize visual effects.",
-          "Design Procedural Content Generation (PCG) plan",
-          "Optimize art-to-engine pipeline workflow"
-        ],
-        "zh-CN": [
-          "我们的虚幻项目需要技术美术优化,请虚幻技术美术帮我们优化画面效果。",
-          "设计程序化内容生成PCG方案",
-          "优化美术到引擎的管线流程"
-        ]
-      },
-      "models": []
+        "给这套场景出材质函数、质量分级和一张目标光照图",
+        "Niagara 在中端机掉帧，帮我做 LOD 和生成上限",
+        "Lumen 在室内漏光，给出可验证的排查步骤"
+      ]
     },
     {
       "id": "spatial-UnityMultiplayerEngineer",
       "sort_order": 1300,
       "default_enabled": false,
-      "name": "Seth",
-      "name_i18n": {
-        "en-US": "Seth",
-        "zh-CN": "同步达"
-      },
-      "description": "Unity Multiplayer Engineer",
-      "description_i18n": {
-        "en-US": "Unity Multiplayer Engineer",
-        "zh-CN": "Unity多人联机工程师"
-      },
+      "name": "Unity 多人工程师",
+      "description": "用 Netcode 做延迟补偿与服务端权威同步，并标明 P2P 风险",
       "avatar": "avatars/spatial-UnityMultiplayerEngineer.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-UnityMultiplayerEngineer.{locale}.md",
+      "rule_file": "rules/spatial-UnityMultiplayerEngineer.md",
       "prompts": [
-        "Our Unity game needs multiplayer network functionality. Please, Unity Multiplayer Engineer, help us implement network synchronization.",
-        "Integrate Unity Gaming Services (Relay/Lobby)",
-        "Optimize client-server authority and lag compensation"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Our Unity game needs multiplayer network functionality. Please, Unity Multiplayer Engineer, help us implement network synchronization.",
-          "Integrate Unity Gaming Services (Relay/Lobby)",
-          "Optimize client-server authority and lag compensation"
-        ],
-        "zh-CN": [
-          "我们的Unity游戏需要多人网络功能,请Unity多人工程师帮我们实现网络同步。",
-          "集成Unity Gaming Services (Relay/Lobby)",
-          "优化客户端-服务器权威和延迟补偿"
-        ]
-      },
-      "models": []
+        "用 NGO 做主机权威移动同步，并写清作弊与断线边界",
+        "不要用纯 P2P 做经济和竞技，帮我改成独立权威或明确风险",
+        "设计快照、插值和带宽预算，避免每帧同步全量状态"
+      ]
     },
     {
       "id": "spatial-UnityShaderGraphArtist",
       "sort_order": 1310,
       "default_enabled": false,
-      "name": "Troy",
-      "name_i18n": {
-        "en-US": "Troy",
-        "zh-CN": "着色师"
-      },
-      "description": "Unity Shader Graph Artist",
-      "description_i18n": {
-        "en-US": "Unity Shader Graph Artist",
-        "zh-CN": "Unity着色器图表艺术家"
-      },
+      "name": "Unity 着色器艺术家",
+      "description": "用 Shader Graph 做可分级、可维护的实时材质，并出目标效果图",
       "avatar": "avatars/spatial-UnityShaderGraphArtist.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-UnityShaderGraphArtist.{locale}.md",
+      "rule_file": "rules/spatial-UnityShaderGraphArtist.md",
       "prompts": [
-        "We need to create shader effects for Unity. Please, Unity Shader Graph Artist, help us design Shader effects.",
-        "Write HLSL custom render passes",
-        "Optimize URP/HDRP rendering pipeline effects"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "We need to create shader effects for Unity. Please, Unity Shader Graph Artist, help us design Shader effects.",
-          "Write HLSL custom render passes",
-          "Optimize URP/HDRP rendering pipeline effects"
-        ],
-        "zh-CN": [
-          "我们需要为Unity创建着色器效果,请Unity着色器图艺术家帮我们设计Shader效果。",
-          "编写HLSL自定义渲染Pass",
-          "优化URP/HDRP渲染管线效果"
-        ]
-      },
-      "models": []
+        "做一层湿润岩石材质：参数给美术，移动端要有降级",
+        "这个溶解特效在 URP 上过亮，帮我改节点并出目标图",
+        "把常用效果收成可复用 Sub Graph，写清参数含义"
+      ]
     },
     {
       "id": "spatial-UnityEditorToolDeveloper",
       "sort_order": 1320,
       "default_enabled": false,
-      "name": "Reed",
-      "name_i18n": {
-        "en-US": "Reed",
-        "zh-CN": "插件达"
-      },
-      "description": "Unity Editor Tool Developer",
-      "description_i18n": {
-        "en-US": "Unity Editor Tool Developer",
-        "zh-CN": "Unity编辑器工具开发者"
-      },
+      "name": "Unity 工具开发者",
+      "description": "做编辑器窗口、导入管线和校验工具，减少手工误差",
       "avatar": "avatars/spatial-UnityEditorToolDeveloper.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-UnityEditorToolDeveloper.{locale}.md",
+      "rule_file": "rules/spatial-UnityEditorToolDeveloper.md",
       "prompts": [
-        "Our Unity development efficiency is not high, and we need to develop editor tools. Please, Unity Editor Tool Developer, help us create editor plugins.",
-        "Build automated asset processing and import pipeline",
-        "Design PropertyDrawers and ScriptedImporters"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Our Unity development efficiency is not high, and we need to develop editor tools. Please, Unity Editor Tool Developer, help us create editor plugins.",
-          "Build automated asset processing and import pipeline",
-          "Design PropertyDrawers and ScriptedImporters"
-        ],
-        "zh-CN": [
-          "我们的Unity开发效率不高,需要开发编辑器工具,请Unity编辑器工具开发者帮我们制作编辑器插件。",
-          "搭建自动化Asset处理和导入管线",
-          "设计PropertyDrawer和ScriptedImporter"
-        ]
-      },
-      "models": []
+        "做一个资源导入校验：命名、压缩、读写权限一次查完",
+        "给策划做关卡标记窗口，写入 ScriptableObject 而不是改场景隐藏物体",
+        "用 AssetPostprocessor 自动处理贴图，失败要可回滚"
+      ]
     },
     {
       "id": "spatial-GodotGameScriptEngineer",
       "sort_order": 1330,
       "default_enabled": false,
-      "name": "Earl",
-      "name_i18n": {
-        "en-US": "Earl",
-        "zh-CN": "节点通"
-      },
-      "description": "Godot Game Script Engineer",
-      "description_i18n": {
-        "en-US": "Godot Game Script Engineer",
-        "zh-CN": "Godot游戏脚本工程师"
-      },
+      "name": "Godot 脚本工程师",
+      "description": "用场景树、信号和资源做出稳定可复用的 Godot 玩法",
       "avatar": "avatars/spatial-GodotGameScriptEngineer.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-GodotGameScriptEngineer.{locale}.md",
+      "rule_file": "rules/spatial-GodotGameScriptEngineer.md",
       "prompts": [
-        "We use the Godot engine for game development and need professional GDScript and engine usage support. Please, Godot Game Script Engineer, help us implement game features.",
-        "Design node-based composition architecture and signal systems",
-        "Integrate C# modules and type-safe design"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "We use the Godot engine for game development and need professional GDScript and engine usage support. Please, Godot Game Script Engineer, help us implement game features.",
-          "Design node-based composition architecture and signal systems",
-          "Integrate C# modules and type-safe design"
-        ],
-        "zh-CN": [
-          "我们使用Godot引擎开发游戏,需要专业的GDScript和引擎使用支持,请Godot游戏脚本工程师帮我们实现游戏功能。",
-          "设计基于节点的组合架构和信号系统",
-          "集成C#模块和类型安全设计"
-        ]
-      },
-      "models": []
+        "按组合节点重做角色控制器，信号和所有权写清楚",
+        "这个场景在重载后状态错乱，帮我查持久化与生命周期",
+        "给出 Godot 4.x 版本下的 API，不编造已移除的写法"
+      ]
     },
     {
       "id": "spatial-GodotMultiplayerEngineer",
       "sort_order": 1340,
       "default_enabled": false,
-      "name": "Faith",
-      "name_i18n": {
-        "en-US": "Faith",
-        "zh-CN": "联网达"
-      },
-      "description": "Godot Multiplayer Engineer",
-      "description_i18n": {
-        "en-US": "Godot Multiplayer Engineer",
-        "zh-CN": "Godot多人联机工程师"
-      },
+      "name": "Godot 多人工程师",
+      "description": "用 MultiplayerAPI 做权威同步、生成复制和断线恢复",
       "avatar": "avatars/spatial-GodotMultiplayerEngineer.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-GodotMultiplayerEngineer.{locale}.md",
+      "rule_file": "rules/spatial-GodotMultiplayerEngineer.md",
       "prompts": [
-        "Our Godot game needs multiplayer online functionality. Please, Godot Multiplayer Engineer, help us implement a multiplayer network system.",
-        "Design MultiplayerAPI scene replication and RPC plan",
-        "Optimize ENet/WebRTC transport and authority models"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Our Godot game needs multiplayer online functionality. Please, Godot Multiplayer Engineer, help us implement a multiplayer network system.",
-          "Design MultiplayerAPI scene replication and RPC plan",
-          "Optimize ENet/WebRTC transport and authority models"
-        ],
-        "zh-CN": [
-          "我们的Godot游戏需要多人在线功能,请Godot多人工程师帮我们实现多人网络系统。",
-          "设计MultiplayerAPI场景复制和RPC方案",
-          "优化ENet/WebRTC传输和权威模型"
-        ]
-      },
-      "models": []
+        "设计 MultiplayerSpawner 与权威移动，客户端只发输入",
+        "RPC 太多导致抖动，帮我改成状态同步和优先级",
+        "主机掉线后如何迁移权威，写出可测步骤"
+      ]
     },
     {
       "id": "spatial-GodotShaderDeveloper",
       "sort_order": 1350,
       "default_enabled": false,
-      "name": "Hope",
-      "name_i18n": {
-        "en-US": "Hope",
-        "zh-CN": "渲染达"
-      },
-      "description": "Godot Shader Developer",
-      "description_i18n": {
-        "en-US": "Godot Shader Developer",
-        "zh-CN": "Godot着色器开发者"
-      },
+      "name": "Godot 着色器开发者",
+      "description": "写 Godot 着色器并守住移动端 fillrate，先出目标效果再给代码",
       "avatar": "avatars/spatial-GodotShaderDeveloper.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-GodotShaderDeveloper.{locale}.md",
+      "rule_file": "rules/spatial-GodotShaderDeveloper.md",
       "prompts": [
-        "We need to develop shader effects for Godot games. Please, Godot Shader Developer, help us implement visual effects.",
-        "Optimize shader rendering performance and cross-platform compatibility",
-        "Design parameterized shaders for artist-friendly tweaking"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "We need to develop shader effects for Godot games. Please, Godot Shader Developer, help us implement visual effects.",
-          "Optimize shader rendering performance and cross-platform compatibility",
-          "Design parameterized shaders for artist-friendly tweaking"
-        ],
-        "zh-CN": [
-          "我们需要为Godot游戏开发着色器效果,请Godot着色器开发者帮我们实现视觉特效。",
-          "优化Shader渲染性能和跨平台兼容",
-          "设计参数化Shader方便美术调整"
-        ]
-      },
-      "models": []
+        "写一个可参数化的边缘光 shader，并出移动端降级版",
+        "后处理全屏过耗，帮我改成局部或降分辨率路径",
+        "先出目标效果图，再给 spatial/canvas_item 代码"
+      ]
     },
     {
       "id": "spatial-RobloxExperienceDesigner",
       "sort_order": 1360,
       "default_enabled": false,
-      "name": "Mary",
-      "name_i18n": {
-        "en-US": "Mary",
-        "zh-CN": "乐体验"
-      },
-      "description": "Roblox Experience Designer",
-      "description_i18n": {
-        "en-US": "Roblox Experience Designer",
-        "zh-CN": "Roblox体验设计师"
-      },
+      "name": "Roblox 体验设计师",
+      "description": "面向儿童与社交场设计可留存的 Roblox 体验，埋点遵守隐私最小化",
       "avatar": "avatars/spatial-RobloxExperienceDesigner.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-RobloxExperienceDesigner.{locale}.md",
+      "rule_file": "rules/spatial-RobloxExperienceDesigner.md",
       "prompts": [
-        "We want to design experiences and gameplay on Roblox. Please, Roblox Experience Designer, help us design Roblox games.",
-        "Plan Roblox virtual environment and interaction design",
-        "Develop Roblox monetization strategy"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "We want to design experiences and gameplay on Roblox. Please, Roblox Experience Designer, help us design Roblox games.",
-          "Plan Roblox virtual environment and interaction design",
-          "Develop Roblox monetization strategy"
-        ],
-        "zh-CN": [
-          "我们想在Roblox上设计体验和玩法,请Roblox体验设计师帮我们设计Roblox游戏。",
-          "规划Roblox虚拟场景和交互设计",
-          "制定Roblox商业化变现策略"
-        ]
-      },
-      "models": []
+        "设计 10 分钟新手会话：社交钩子、循环和安全边界",
+        "这个地图留不住人，从会话目标和反馈帮我改",
+        "埋点只保留必要事件，不采集聊天和可识别信息"
+      ]
     },
     {
       "id": "spatial-RobloxSystemScriptEngineer",
       "sort_order": 1370,
       "default_enabled": false,
-      "name": "Nora",
-      "name_i18n": {
-        "en-US": "Nora",
-        "zh-CN": "脚本通"
-      },
-      "description": "Roblox System Script Engineer",
-      "description_i18n": {
-        "en-US": "Roblox System Script Engineer",
-        "zh-CN": "Roblox系统脚本工程师"
-      },
+      "name": "Roblox 脚本工程师",
+      "description": "用服务端权威 Luau 做安全、可扩展的数据与玩法系统",
       "avatar": "avatars/spatial-RobloxSystemScriptEngineer.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-RobloxSystemScriptEngineer.{locale}.md",
+      "rule_file": "rules/spatial-RobloxSystemScriptEngineer.md",
       "prompts": [
-        "Our Roblox game needs complex system logic. Please, Roblox System Script Engineer, help us implement game systems.",
-        "Build Roblox data storage and network communication architecture",
-        "Optimize Roblox script performance and server-side logic"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Our Roblox game needs complex system logic. Please, Roblox System Script Engineer, help us implement game systems.",
-          "Build Roblox data storage and network communication architecture",
-          "Optimize Roblox script performance and server-side logic"
-        ],
-        "zh-CN": [
-          "我们的Roblox游戏需要复杂的系统逻辑,请Roblox系统脚本工程师帮我们实现游戏系统。",
-          "搭建Roblox数据存储和网络通信架构",
-          "优化Roblox脚本性能和服务端逻辑"
-        ]
-      },
-      "models": []
+        "经济与背包必须服务端权威，写出 Remote 校验",
+        "DataStore 失败和会话冲突怎么恢复，给重试与回滚",
+        "客户端只负责表现，帮我拆现有脚本的信任边界"
+      ]
     },
     {
       "id": "spatial-RobloxAvatarCreator",
       "sort_order": 1380,
       "default_enabled": false,
-      "name": "Luke",
-      "name_i18n": {
-        "en-US": "Luke",
-        "zh-CN": "捏脸达"
-      },
-      "description": "Roblox Avatar Creator",
-      "description_i18n": {
-        "en-US": "Roblox Avatar Creator",
-        "zh-CN": "Roblox虚拟形象创作者"
-      },
+      "name": "Roblox 形象创作者",
+      "description": "做符合 UGC 规范、可装备且性能合格的虚拟形象，并出造型图",
       "avatar": "avatars/spatial-RobloxAvatarCreator.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-RobloxAvatarCreator.{locale}.md",
+      "rule_file": "rules/spatial-RobloxAvatarCreator.md",
       "prompts": [
-        "We want to create avatars on Roblox and need professional Avatar creation. Please, Roblox Avatar Creator, help us design a character system.",
-        "Create Roblox UGC virtual item listing plan",
-        "Optimize avatar model performance and compatibility"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "We want to create avatars on Roblox and need professional Avatar creation. Please, Roblox Avatar Creator, help us design a character system.",
-          "Create Roblox UGC virtual item listing plan",
-          "Optimize avatar model performance and compatibility"
-        ],
-        "zh-CN": [
-          "我们想在Roblox上创建角色,需要专业的Avatar制作,请Roblox角色创建者帮我们设计角色系统。",
-          "制作Roblox UGC虚拟商品上架方案",
-          "优化角色模型性能和兼容性"
-        ]
-      },
-      "models": []
+        "按 UGC 规范设计一套可分层服装，并出三视图概念",
+        "配件穿模、面数超标，帮我改结构和预算",
+        "给捏脸参数出安全范围，避免违规或不可读的脸"
+      ]
     },
     {
       "id": "spatial-VisionOsSpatialEngineer",
       "sort_order": 1390,
       "default_enabled": false,
-      "name": "Xerxes",
-      "name_i18n": {
-        "en-US": "Xerxes",
-        "zh-CN": "空间通"
-      },
-      "description": "visionOS Spatial Engineer",
-      "description_i18n": {
-        "en-US": "visionOS Spatial Engineer",
-        "zh-CN": "visionOS空间工程师"
-      },
+      "name": "visionOS 空间工程师",
+      "description": "用 RealityKit 做窗口、体积与空间锚点体验，并出空间布局概念",
       "avatar": "avatars/spatial-VisionOsSpatialEngineer.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-VisionOsSpatialEngineer.{locale}.md",
+      "rule_file": "rules/spatial-VisionOsSpatialEngineer.md",
       "prompts": [
-        "We want to develop spatial computing applications for visionOS and need native spatial interface design. Please, visionOS Spatial Engineer, help us design spatial applications.",
-        "Design spatial UI interaction and gesture control plan",
-        "Optimize visionOS rendering performance and 3D experience"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "We want to develop spatial computing applications for visionOS and need native spatial interface design. Please, visionOS Spatial Engineer, help us design spatial applications.",
-          "Design spatial UI interaction and gesture control plan",
-          "Optimize visionOS rendering performance and 3D experience"
-        ],
-        "zh-CN": [
-          "我们想为visionOS开发空间计算应用,需要原生空间界面设计,请visionOS空间工程师帮我们设计空间应用。",
-          "设计空间UI交互和手势操作方案",
-          "优化visionOS渲染性能和3D体验"
-        ]
-      },
-      "models": []
+        "设计一个体积窗口应用：锚定、手势和舒适距离",
+        "沉浸切换时丢失上下文，帮我做过渡和回退",
+        "先出空间布局概念图，再给 RealityKit 结构"
+      ]
     },
     {
       "id": "spatial-MacOsSpatialMetalEngineer",
       "sort_order": 1400,
       "default_enabled": false,
-      "name": "Vale",
-      "name_i18n": {
-        "en-US": "Vale",
-        "zh-CN": "渲染师"
-      },
-      "description": "macOS Spatial Metal Engineer",
-      "description_i18n": {
-        "en-US": "macOS Spatial Metal Engineer",
-        "zh-CN": "macOS空间Metal工程师"
-      },
+      "name": "Metal 空间工程师",
+      "description": "用 Metal 与 RealityKit 做 macOS 空间渲染路径和性能预算",
       "avatar": "avatars/spatial-MacOsSpatialMetalEngineer.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-MacOsSpatialMetalEngineer.{locale}.md",
+      "rule_file": "rules/spatial-MacOsSpatialMetalEngineer.md",
       "prompts": [
-        "We want to develop Metal rendering applications on macOS and need professional Metal programming support. Please, macOS Spatial Metal Engineer, help us design rendering solutions.",
-        "Optimize Metal shader rendering pipeline performance",
-        "Design spatial computing GPU acceleration and parallel plan"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "We want to develop Metal rendering applications on macOS and need professional Metal programming support. Please, macOS Spatial Metal Engineer, help us design rendering solutions.",
-          "Optimize Metal shader rendering pipeline performance",
-          "Design spatial computing GPU acceleration and parallel plan"
-        ],
-        "zh-CN": [
-          "我们想在macOS上开发Metal渲染应用,需要专业的Metal编程支持,请macOS空间Metal工程师帮我们设计渲染方案。",
-          "优化Metal Shader渲染管线性能",
-          "设计空间计算GPU加速和并行方案"
-        ]
-      },
-      "models": []
+        "规划 Metal 渲染通道、资源驻留和帧预算",
+        "和 RealityKit 混用时同步出问题，帮我划所有权",
+        "给出可在 Xcode 里验证的 GPU 抓帧步骤"
+      ]
     },
     {
       "id": "spatial-XrImmersiveDeveloper",
       "sort_order": 1410,
       "default_enabled": false,
-      "name": "Zion",
-      "name_i18n": {
-        "en-US": "Zion",
-        "zh-CN": "沉浸达"
-      },
-      "description": "XR Immersive Developer",
-      "description_i18n": {
-        "en-US": "XR Immersive Developer",
-        "zh-CN": "XR沉浸式开发者"
-      },
+      "name": "XR 沉浸式开发者",
+      "description": "做舒适、可定位、可交互的 XR 场景，并先出沉浸布局图",
       "avatar": "avatars/spatial-XrImmersiveDeveloper.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-XrImmersiveDeveloper.{locale}.md",
+      "rule_file": "rules/spatial-XrImmersiveDeveloper.md",
       "prompts": [
-        "We want to develop immersive XR experiences and need professional XR development skills. Please, XR Immersive Developer, help us implement immersive applications.",
-        "Design spatial awareness and environment mapping features",
-        "Optimize XR app frame rate and motion sickness prevention"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "We want to develop immersive XR experiences and need professional XR development skills. Please, XR Immersive Developer, help us implement immersive applications.",
-          "Design spatial awareness and environment mapping features",
-          "Optimize XR app frame rate and motion sickness prevention"
-        ],
-        "zh-CN": [
-          "我们想开发沉浸式XR体验,需要专业的XR开发技能,请XR沉浸式开发者帮我们实现沉浸式应用。",
-          "设计空间感知和环境映射功能",
-          "优化XR应用帧率和晕动症预防"
-        ]
-      },
-      "models": []
+        "设计站立式 6DoF 体验：传送、边界和舒适度",
+        "定位丢失时怎么降级，不要让玩家穿模或摔倒",
+        "出一张沉浸布局概念图，再给交互和性能预算"
+      ]
     },
     {
       "id": "spatial-XrInterfaceArchitect",
       "sort_order": 1420,
       "default_enabled": false,
-      "name": "Ace",
-      "name_i18n": {
-        "en-US": "Ace",
-        "zh-CN": "空间界"
-      },
-      "description": "XR Interface Architect",
-      "description_i18n": {
-        "en-US": "XR Interface Architect",
-        "zh-CN": "XR界面架构师"
-      },
+      "name": "XR 界面架构师",
+      "description": "设计空间 UI、注视/手势与可读性，避免平面 HUD 硬搬进 XR",
       "avatar": "avatars/spatial-XrInterfaceArchitect.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-XrInterfaceArchitect.{locale}.md",
+      "rule_file": "rules/spatial-XrInterfaceArchitect.md",
       "prompts": [
-        "Our XR interface needs architectural redesign to improve user experience. Please, XR Interface Architect, help us design the XR interface architecture.",
-        "Develop XR design guidelines and usability standards",
-        "Build XR component library and design system"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Our XR interface needs architectural redesign to improve user experience. Please, XR Interface Architect, help us design the XR interface architecture.",
-          "Develop XR design guidelines and usability standards",
-          "Build XR component library and design system"
-        ],
-        "zh-CN": [
-          "我们的XR界面需要重新设计架构,提升用户体验,请XR界面架构师帮我们设计XR界面架构。",
-          "制定XR设计规范和可用性标准",
-          "搭建XR组件库和设计系统"
-        ]
-      },
-      "models": []
+        "把这个设置菜单改成空间面板：距离、角度和可读字号",
+        "注视加手势容易误触，帮我做确认和取消",
+        "出三张界面布局概念，再给组件层级"
+      ]
     },
     {
       "id": "spatial-XrCockpitInteractionExpert",
       "sort_order": 1430,
       "default_enabled": false,
-      "name": "Yvaine",
-      "name_i18n": {
-        "en-US": "Yvaine",
-        "zh-CN": "座舱师"
-      },
-      "description": "XR Cockpit Interaction Expert",
-      "description_i18n": {
-        "en-US": "XR Cockpit Interaction Expert",
-        "zh-CN": "XR座舱交互专家"
-      },
+      "name": "XR 座舱交互专家",
+      "description": "设计座舱控件、手部追踪与误触防护，安全优先于炫技",
       "avatar": "avatars/spatial-XrCockpitInteractionExpert.png",
       "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/spatial-XrCockpitInteractionExpert.{locale}.md",
+      "rule_file": "rules/spatial-XrCockpitInteractionExpert.md",
       "prompts": [
-        "We want to develop cockpit interaction interfaces for XR devices and need professional interaction design experience. Please, XR Cockpit Interaction Expert, help us design interaction solutions.",
-        "Develop in-vehicle AR-HUD interface and information architecture",
-        "Optimize cockpit multi-modal interaction and safety"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "We want to develop cockpit interaction interfaces for XR devices and need professional interaction design experience. Please, XR Cockpit Interaction Expert, help us design interaction solutions.",
-          "Develop in-vehicle AR-HUD interface and information architecture",
-          "Optimize cockpit multi-modal interaction and safety"
-        ],
-        "zh-CN": [
-          "我们想为XR设备开发驾驶舱交互界面,需要专业的交互设计经验,请XR驾驶舱交互专家帮我们设计交互方案。",
-          "制定车载AR-HUD界面和信息架构",
-          "优化座舱多模态交互和安全性"
-        ]
-      },
-      "models": []
+        "设计方向盘与中控的手部交互，误触不能影响驾驶安全",
+        "HUD 信息过载，帮我做层级和出现时机",
+        "出座舱布局概念图，标出可达范围和禁止遮挡区"
+      ]
     }
   ]
 }

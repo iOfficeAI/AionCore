@@ -147,6 +147,45 @@ async fn unified_skill_list_includes_auto_inject_entries_from_embedded_corpus() 
     }
 }
 
+#[tokio::test]
+async fn unified_skill_list_includes_threejs_game_director_as_opt_in() {
+    let fx = fixture_embedded().await;
+
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/skills", &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    let arr = json["data"].as_array().unwrap();
+    let director = arr
+        .iter()
+        .find(|item| item["name"] == "threejs-game-director")
+        .expect("Skills Hub must list threejs-game-director after install");
+    assert_eq!(director["source"], "builtin");
+    assert_eq!(director["relative_location"], "threejs-game-director/SKILL.md");
+    assert_eq!(director["is_auto_inject"], false);
+    for name in [
+        "threejs-gameplay-systems",
+        "threejs-aaa-graphics-builder",
+        "threejs-game-ui-designer",
+        "threejs-debug-profiler",
+        "threejs-qa-release",
+        "threejs-3d-generator",
+        "threejs-image-generator",
+        "threejs-audio-generator",
+    ] {
+        assert!(
+            arr.iter().any(|item| item["name"] == name && item["is_auto_inject"] == false),
+            "Skills Hub missing opt-in builtin {name}"
+        );
+    }
+}
+
 // ===========================================================================
 // POST /api/skills/builtin-skill
 // ===========================================================================
@@ -402,6 +441,43 @@ async fn materialize_for_agent_returns_source_path_for_opt_in_skill() {
     assert!(
         std::path::Path::new(source_path).join("SKILL.md").exists(),
         "mermaid source_path must exist: {source_path}",
+    );
+}
+
+#[tokio::test]
+async fn materialize_for_agent_returns_source_path_for_threejs_game_director() {
+    let fx = fixture_embedded().await;
+
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/materialize-for-agent",
+            json!({
+                "conversation_id": "conv-threejs",
+                "skills": ["threejs-game-director"],
+            }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: Value = body_json(resp).await;
+    let skills = json["data"]["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0]["name"], "threejs-game-director");
+    let source_path = skills[0]["source_path"].as_str().unwrap();
+    let path = std::path::Path::new(source_path);
+    assert!(path.is_dir(), "source_path must exist: {source_path}");
+    assert!(
+        path.join("SKILL.md").exists(),
+        "source_path must contain SKILL.md at {source_path}",
+    );
+    assert!(
+        source_path.contains("builtin-skills") && source_path.contains("threejs-game-director"),
+        "expected threejs-game-director under builtin-skills, got {source_path}",
     );
 }
 

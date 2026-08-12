@@ -3456,6 +3456,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embedded_includes_threejs_game_director_as_opt_in() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_embedded_paths(tmp.path()).await;
+        let items = list_builtin_skills_from_disk(&paths.builtin_skills_dir).await;
+        let director = items
+            .iter()
+            .find(|item| item.name == "threejs-game-director")
+            .unwrap_or_else(|| {
+                panic!(
+                    "threejs-game-director missing; got {:?}",
+                    items.iter().map(|i| &i.name).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            director.relative_location.as_deref(),
+            Some("threejs-game-director/SKILL.md")
+        );
+        let autos = list_auto_inject_skills_from_disk(&paths).await.unwrap();
+        assert!(
+            autos.iter().all(|item| !item.name.starts_with("threejs-")),
+            "threejs skills must not be auto-injected into every assistant"
+        );
+        let content = read_builtin_skill(&paths, "threejs-game-director/SKILL.md")
+            .await
+            .unwrap();
+        assert!(content.contains("name: threejs-game-director"));
+    }
+
+    #[tokio::test]
     async fn embedded_rejects_path_traversal() {
         let tmp = TempDir::new().unwrap();
         let paths = make_embedded_paths(tmp.path()).await;
