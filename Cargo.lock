@@ -419,7 +419,6 @@ dependencies = [
  "aionui-runtime",
  "aionui-session",
  "aionui-shell",
- "aionui-sidebar",
  "aionui-system",
  "aionui-team",
  "aionui-team-prompts",
@@ -904,31 +903,6 @@ dependencies = [
  "tracing",
  "which 7.0.3",
  "wiremock",
-]
-
-[[package]]
-name = "aionui-sidebar"
-version = "0.1.64"
-dependencies = [
- "aionui-api-types",
- "aionui-auth",
- "aionui-common",
- "aionui-conversation",
- "aionui-db",
- "aionui-project",
- "async-trait",
- "axum",
- "base64",
- "http-body-util",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
- "url",
 ]
 
 [[package]]

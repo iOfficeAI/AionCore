@@ -13,14 +13,13 @@ use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    IProjectStore, ISkillRepository, IUserOrderStore, IUserRepository, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore,
-    SqliteProviderRepository, SqliteSkillRepository, SqliteUserOrderStore, SqliteUserRepository,
+    IProjectStore, ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
+    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository,
+    SqliteSkillRepository, SqliteUserRepository,
 };
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
-use aionui_sidebar::UserOrderDeleteHook;
 
 pub struct AppServices {
     pub database: Database,
@@ -38,10 +37,6 @@ pub struct AppServices {
     /// Project-bind service (project-bind side branch). Shared by conversation
     /// and team wiring to bind/backfill project/folder rows. Cheap to clone.
     pub project_service: ProjectService,
-    /// Sidebar ordering store (`user_order` table). Shared by the conversation
-    /// delete hook (path-1 cascade), the team service (path-2 cascade), and the
-    /// sidebar read state. Cheap to clone (Arc). See sidebar design §4.
-    pub user_order_store: Arc<dyn IUserOrderStore>,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -99,7 +94,6 @@ impl AppServices {
             runtime_base_url: self.runtime_base_url.clone(),
             runtime_token_service: self.runtime_token_service.clone(),
             project_service: self.project_service.clone(),
-            user_order_store: self.user_order_store.clone(),
         });
         self
     }
@@ -191,11 +185,6 @@ impl AppServices {
         let project_store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(database.pool().clone()));
         let project_service = ProjectService::new(project_store, work_dir.join("conversations"));
 
-        // Sidebar ordering store (`user_order` table). Built early so it can be
-        // shared by the conversation delete hook, the team service, and the
-        // sidebar read state.
-        let user_order_store: Arc<dyn IUserOrderStore> = Arc::new(SqliteUserOrderStore::new(database.pool().clone()));
-
         // Skill paths need app resource dir (for builtin rules) + data dir
         // (for user skills + materialized views). AcpSkillManager uses these
         // for first-message skill index/body loading.
@@ -285,7 +274,6 @@ impl AppServices {
             runtime_base_url: runtime_base_url.clone(),
             runtime_token_service: runtime_token_service.clone(),
             project_service: project_service.clone(),
-            user_order_store: user_order_store.clone(),
         });
 
         Ok(Self {
@@ -303,7 +291,6 @@ impl AppServices {
             conversation_runtime_state,
             conversation_service,
             project_service,
-            user_order_store,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
@@ -338,10 +325,6 @@ struct ConversationServiceDeps<'a> {
     runtime_base_url: String,
     runtime_token_service: Arc<RuntimeTokenService>,
     project_service: ProjectService,
-    /// Sidebar ordering store. Wired as a second delete hook so deleting a
-    /// conversation cascades away its `user_order` rows (sidebar design §4.3,
-    /// path 1).
-    user_order_store: Arc<dyn IUserOrderStore>,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -374,8 +357,6 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     if let Some(hook) = deps.task_manager_delete_hook {
         service.with_delete_hook(hook);
     }
-    // Path-1 cascade: a deleted conversation drops its `user_order` rows.
-    service.with_delete_hook(Arc::new(UserOrderDeleteHook::new(deps.user_order_store)));
     service.with_project_service(Arc::new(deps.project_service));
     service
 }

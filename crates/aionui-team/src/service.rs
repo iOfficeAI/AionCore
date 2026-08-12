@@ -19,8 +19,7 @@ use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_i
 use aionui_db::models::TeamRow;
 use aionui_db::{
     ActivityCursor, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IProviderRepository, ITeamRepository, IUserOrderStore, OrderItemRef, OrderItemType, PageDirection,
-    UpdateTeamParams,
+    IProviderRepository, ITeamRepository, PageDirection, UpdateTeamParams,
 };
 use aionui_project::{ProjectService, canonical};
 use aionui_realtime::EventBroadcaster;
@@ -144,10 +143,6 @@ pub struct TeamSessionService {
     /// Project-bind side branch (optional). `None` → team binding is a no-op,
     /// so team create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
-    /// Sidebar ordering store (optional). Set → `remove_team` cascade-deletes the
-    /// team's `user_order` rows (design §4.3, path 2). `None` → no-op, so team
-    /// deletion behaves exactly as before.
-    user_order: Arc<RwLock<Option<Arc<dyn IUserOrderStore>>>>,
     /// Back-pointer used by [`TeamSession::spawn_agent`] to reach DB-facing
     /// orchestration without threading the service through every session method.
     /// Stored as `Weak` so the session map does not create a strong cycle with
@@ -230,7 +225,6 @@ impl TeamSessionService {
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
             project_service: Arc::new(RwLock::new(None)),
-            user_order: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
         })
     }
@@ -250,34 +244,6 @@ impl TeamSessionService {
     pub fn with_project_service(&self, project_service: Arc<ProjectService>) {
         if let Ok(mut guard) = self.project_service.write() {
             *guard = Some(project_service);
-        }
-    }
-
-    /// Inject the sidebar ordering store so `remove_team` cascade-deletes the
-    /// team's `user_order` rows (design §4.3, path 2). When unset, the cascade is
-    /// a no-op. Member conversations are handled separately by the conversation
-    /// delete hook (they route through `ConversationService::delete`).
-    pub fn with_user_order_store(&self, user_order: Arc<dyn IUserOrderStore>) {
-        if let Ok(mut guard) = self.user_order.write() {
-            *guard = Some(user_order);
-        }
-    }
-
-    /// Best-effort cascade of a removed team's `user_order` row (design §4.3,
-    /// path 2). Store unset → no-op. An error is logged, not propagated: an
-    /// orphan `team` row self-heals on read (the pinned group only emits teams
-    /// present in the live aggregate), so it must never block team deletion.
-    async fn remove_team_order_row(&self, user_id: &str, team_id: &str) {
-        let store = self.user_order.read().ok().and_then(|guard| guard.clone());
-        let Some(store) = store else { return };
-        let item = OrderItemRef::new(OrderItemType::Team, team_id);
-        if let Err(err) = store.remove_item(user_id, &item).await {
-            warn!(
-                user_id = %user_id,
-                team_id = %team_id,
-                error = %err,
-                "sidebar: failed to cascade-delete user_order row for removed team"
-            );
         }
     }
 
@@ -717,13 +683,6 @@ impl TeamSessionService {
         self.repo.delete_mailbox_by_team(user_id, team_id).await?;
         self.repo.delete_tasks_by_team(user_id, team_id).await?;
         self.repo.delete_team(user_id, team_id).await?;
-
-        // Cascade the team's sidebar ordering row (design §4.3, path 2). Members'
-        // conversation rows are dropped by the conversation delete hook via the
-        // `delete_team_conversation` calls above. Best-effort: an orphan `team`
-        // row self-heals on read (the pinned group only emits teams present in
-        // the live aggregate), so it never blocks deletion.
-        self.remove_team_order_row(user_id, team_id).await;
 
         self.add_agent_locks.remove(team_id);
 
