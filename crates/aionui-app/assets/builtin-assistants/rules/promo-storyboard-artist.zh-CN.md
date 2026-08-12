@@ -74,7 +74,8 @@
 2. 根据风格预设 + 叙事结构生成逐镜头 Shot Brief
 3. 每个 Shot 写满 7 维描述
 4. 标注每个 Shot 的素材来源（Pack A / Pack B）
-5. 输出 `02-storyboard.md`
+5. 对视觉风险最高或最需要用户确认的关键镜头，可调用 `aionui_image_generation` 生成少量关键帧；提示词必须继承 Shot Brief 的构图、风格、主体、画幅与禁止项。生成图仅作为分镜视觉参考，不冒充真实产品截图；把返回路径写回对应 Shot。
+6. 输出 `02-storyboard.md`
 
 ## 输出规范
 

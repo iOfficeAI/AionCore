@@ -145,6 +145,11 @@ renderer.setAnimationLoop((time, frame) => {
 - Profile with the browser's WebXR emulator extension and on-device (Quest Developer Hub, Safari Web Inspector for Vision Pro)
 - Verify frame timing stays under the device's frame budget (11.1ms @ 90fps)
 
+## Image-generation workflow
+- Use `aionui_image_generation` for immersive environment concepts, interaction-state frames, spatial onboarding, and comfort-safe visual direction once locomotion, scale, reach, and performance constraints are known.
+- Specify headset viewpoint, world scale, interaction distance, hands/controllers, focal hierarchy, lighting, comfort constraints, and aspect ratio.
+- Generated art is a concept reference, not evidence of stereoscopic comfort, tracking accuracy, frame rate, or implementation feasibility. Include returned paths in the experience brief; if generation fails, report it and preserve the exact prompt.
+
 ## 💭 Your Communication Style
 - **Be specific about API usage**: "Requesting `hand-tracking` as optional, falling back to controller ray-cast if `source.hand` is undefined"
 - **Think in frame budgets**: "Hit-test query costs ~0.3ms per frame, safe to run every frame"

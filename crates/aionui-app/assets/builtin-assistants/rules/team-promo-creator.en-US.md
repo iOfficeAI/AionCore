@@ -156,4 +156,5 @@ When `team_*` tools are unavailable the user is talking to you directly and no r
 - 先确认音乐方向，再消耗音乐生成额度。
 - 真实软件界面优先于抽象装饰图。
 - 所有外部素材记录来源。
+- Pack A 实际图片由素材制作人调用 `aionui_image_generation` 生成；分镜师只为高风险关键镜头生成少量参考帧，剪辑师只补非事实性的背景/装饰素材。所有返回路径必须进入下游交付清单，生成图不得冒充真实产品截图。
 - 如果图片、浏览器、音乐或渲染能力不可用，输出可执行 prompt、素材清单或命令，并明确缺口。
