@@ -22,13 +22,14 @@ members = [
     "crates/aionui-team-prompts",
     "crates/aionui-team",
     "crates/aionui-project",
+    "crates/aionui-sidebar",
     "crates/aionui-cron",
     "crates/aionui-assistant",
     "crates/aionui-app",
 ]
 
 [workspace.package]
-version = "0.1.58"
+version = "0.1.64"
 edition = "2024"
 license = "MIT"
 
@@ -55,16 +56,17 @@ aionui-channel = { path = "crates/aionui-channel" }
 aionui-team-prompts = { path = "crates/aionui-team-prompts" }
 aionui-team = { path = "crates/aionui-team" }
 aionui-project = { path = "crates/aionui-project" }
+aionui-sidebar = { path = "crates/aionui-sidebar" }
 aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
-aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.8" }
-aion-providers = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.8" }
-aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.8" }
-aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.8" }
-aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.8" }
-aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.8" }
+aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.10" }
+aion-providers = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.10" }
+aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.10" }
+aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.10" }
+aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.10" }
+aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.10" }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }
@@ -136,7 +138,10 @@ notify = "8"
 walkdir = "2"
 ignore = "0.4"
 zip = "2"
-git2 = { version = "0.20", default-features = false }
+git2 = { version = "0.21.0", default-features = false }
+# Source-control discard sends untracked files to the platform trash instead of
+# unlinking them (mac/win/linux, x64 + arm64).
+trash = "5"
 mime_guess = "2"
 rust-embed = "8"
 
@@ -153,6 +158,12 @@ iana-time-zone = "0.1"
 # Shell
 open = "5"
 which = "7"
+# Text-only clipboard. default-features off: `image-data` pulls `image`/`zune-jpeg`
+# which we don't use and currently fails to build. No `wayland-data-control` either:
+# it pulls wl-clipboard-rs → wayland-scanner (build-time) → the vulnerable quick-xml
+# 0.39 (RUSTSEC-2026-0194/0195). Without it, arboard uses its unconditional x11rb
+# backend on Linux (works under X11/XWayland); macOS/Windows unaffected.
+arboard = { version = "3", default-features = false }
 
 # Office
 calamine = "0.36"

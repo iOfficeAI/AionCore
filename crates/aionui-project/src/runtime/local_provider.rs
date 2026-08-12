@@ -12,6 +12,7 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use ignore::WalkBuilder;
@@ -70,6 +71,33 @@ fn inode_of(_meta: &std::fs::Metadata) -> u64 {
     0
 }
 
+/// Last-modified time of a file's metadata as epoch milliseconds, or `None` when
+/// it cannot be represented.
+///
+/// Unlike [`inode_of`], this needs no `#[cfg]` split: `Metadata::modified()` is
+/// available on all supported targets (macOS / Windows / Linux × x64 / arm64).
+/// It still returns `None` on filesystems that do not record a modification time
+/// at all, on pre-epoch timestamps, and on values too large for `i64` — every
+/// such case degrades that entry to "never reports modified" (see
+/// [`EntryFact::mtime_ms`]).
+///
+/// Precision caveat: some filesystems only record whole seconds, so two writes
+/// inside the same second can leave the timestamp unchanged and the second write
+/// goes unreported. That is the under-report direction, which this signal
+/// deliberately prefers. Should some platform turn out to under-report as a
+/// matter of course, the fallback is to compare `len()` alongside mtime — also
+/// free from the metadata already in hand, so a field addition covers it without
+/// any change to the surrounding design.
+fn mtime_ms_of(meta: &std::fs::Metadata) -> Option<i64> {
+    meta.modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .try_into()
+        .ok()
+}
+
 /// Recursively copy a directory tree using an explicit work stack (avoids
 /// boxing an async-recursive fn). Symlinks are copied as their link target
 /// content via `fs::copy`, matching shallow-copy semantics.
@@ -112,6 +140,8 @@ async fn fact_of(uri: &str, path: &Path) -> Result<EntryFact, FsError> {
         kind,
         inode: inode_of(&meta),
         symlink_target,
+        // Read off the metadata already fetched above — no extra syscall.
+        mtime_ms: mtime_ms_of(&meta),
     })
 }
 

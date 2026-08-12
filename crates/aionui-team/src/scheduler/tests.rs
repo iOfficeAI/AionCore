@@ -461,195 +461,7 @@ async fn rename_agent_allows_same_agent_own_name() {
     assert_eq!(agent.name, "WORKER1");
 }
 
-// -- execute_action: SendMessage -----------------------------------------
-
-#[tokio::test]
-async fn execute_send_message_writes_to_mailbox() {
-    let agents = make_team_agents();
-    let repo = Arc::new(MockTeamRepo::new());
-    let mailbox = Arc::new(Mailbox::new(repo.clone()));
-    let task_board = Arc::new(TaskBoard::new(repo));
-    let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new(
-        "t1".into(),
-        "user-1".into(),
-        &agents,
-        mailbox.clone(),
-        task_board,
-        broadcaster,
-    );
-
-    let action = SchedulerAction::SendMessage {
-        to: "worker-1".into(),
-        message: "Do task X".into(),
-        files: vec!["/tmp/image.png".into()],
-    };
-    mgr.execute_action("lead-1", &action).await.unwrap();
-
-    let unread = mailbox.read_unread("t1", "worker-1").await.unwrap();
-    assert_eq!(unread.len(), 1);
-    assert_eq!(unread[0].content, "Do task X");
-    assert_eq!(unread[0].from_agent_id, "lead-1");
-    assert_eq!(unread[0].files.as_deref(), Some(&["/tmp/image.png".into()][..]));
-}
-
-#[tokio::test]
-async fn execute_broadcast_message_writes_to_all_others() {
-    let agents = make_team_agents();
-    let repo = Arc::new(MockTeamRepo::new());
-    let mailbox = Arc::new(Mailbox::new(repo.clone()));
-    let task_board = Arc::new(TaskBoard::new(repo));
-    let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new(
-        "t1".into(),
-        "user-1".into(),
-        &agents,
-        mailbox.clone(),
-        task_board,
-        broadcaster,
-    );
-
-    let action = SchedulerAction::SendMessage {
-        to: "*".into(),
-        message: "Attention all".into(),
-        files: Vec::new(),
-    };
-    mgr.execute_action("lead-1", &action).await.unwrap();
-
-    let u1 = mailbox.read_unread("t1", "worker-1").await.unwrap();
-    assert_eq!(u1.len(), 1);
-    let u2 = mailbox.read_unread("t1", "worker-2").await.unwrap();
-    assert_eq!(u2.len(), 1);
-    let u_lead = mailbox.read_unread("t1", "lead-1").await.unwrap();
-    assert!(u_lead.is_empty());
-}
-
-// -- execute_action: TaskCreate ------------------------------------------
-
-#[tokio::test]
-async fn execute_task_create() {
-    let agents = make_team_agents();
-    let repo = Arc::new(MockTeamRepo::new());
-    let mailbox = Arc::new(Mailbox::new(repo.clone()));
-    let task_board = Arc::new(TaskBoard::new(repo));
-    let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new(
-        "t1".into(),
-        "user-1".into(),
-        &agents,
-        mailbox,
-        task_board.clone(),
-        broadcaster,
-    );
-
-    let action = SchedulerAction::TaskCreate {
-        subject: "Implement feature".into(),
-        description: Some("Details here".into()),
-        owner: Some("worker-1".into()),
-        blocked_by: vec![],
-    };
-    mgr.execute_action("lead-1", &action).await.unwrap();
-
-    let tasks = task_board.list_tasks("t1").await.unwrap();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].subject, "Implement feature");
-    assert_eq!(tasks[0].owner.as_deref(), Some("worker-1"));
-}
-
-// -- execute_action: TaskUpdate ------------------------------------------
-
-#[tokio::test]
-async fn execute_task_update() {
-    let agents = make_team_agents();
-    let repo = Arc::new(MockTeamRepo::new());
-    let mailbox = Arc::new(Mailbox::new(repo.clone()));
-    let task_board = Arc::new(TaskBoard::new(repo));
-    let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new(
-        "t1".into(),
-        "user-1".into(),
-        &agents,
-        mailbox,
-        task_board.clone(),
-        broadcaster,
-    );
-
-    let task = task_board.create_task("t1", "Work", None, None, &[]).await.unwrap();
-
-    let action = SchedulerAction::TaskUpdate {
-        task_id: task.id.clone(),
-        status: Some("in_progress".into()),
-        description: None,
-        owner: None,
-        blocked_by: None,
-    };
-    mgr.execute_action("worker-1", &action).await.unwrap();
-
-    let tasks = task_board.list_tasks("t1").await.unwrap();
-    assert_eq!(tasks[0].status, crate::types::TaskStatus::InProgress);
-}
-
-// -- execute_action: IdleNotification ------------------------------------
-
-#[tokio::test]
-async fn execute_idle_notification_writes_to_lead_mailbox() {
-    let agents = make_team_agents();
-    let repo = Arc::new(MockTeamRepo::new());
-    let mailbox = Arc::new(Mailbox::new(repo.clone()));
-    let task_board = Arc::new(TaskBoard::new(repo));
-    let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new(
-        "t1".into(),
-        "user-1".into(),
-        &agents,
-        mailbox.clone(),
-        task_board,
-        broadcaster,
-    );
-
-    mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
-
-    let action = SchedulerAction::IdleNotification {
-        summary: Some("Task done".into()),
-    };
-    mgr.execute_action("worker-1", &action).await.unwrap();
-
-    assert_eq!(mgr.get_status("worker-1").await.unwrap(), TeammateStatus::Idle);
-
-    let lead_msgs = mailbox.read_unread("t1", "lead-1").await.unwrap();
-    assert_eq!(lead_msgs.len(), 1);
-    assert_eq!(lead_msgs[0].msg_type, MailboxMessageType::IdleNotification);
-    assert_eq!(lead_msgs[0].from_agent_id, "worker-1");
-}
-
-#[tokio::test]
-async fn lead_idle_notification_does_not_write_to_self() {
-    let agents = make_team_agents();
-    let repo = Arc::new(MockTeamRepo::new());
-    let mailbox = Arc::new(Mailbox::new(repo.clone()));
-    let task_board = Arc::new(TaskBoard::new(repo));
-    let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new(
-        "t1".into(),
-        "user-1".into(),
-        &agents,
-        mailbox.clone(),
-        task_board,
-        broadcaster,
-    );
-
-    mgr.set_status("lead-1", TeammateStatus::Working).await.unwrap();
-
-    let action = SchedulerAction::IdleNotification {
-        summary: Some("Done delegating".into()),
-    };
-    mgr.execute_action("lead-1", &action).await.unwrap();
-
-    let lead_msgs = mailbox.read_unread("t1", "lead-1").await.unwrap();
-    assert!(lead_msgs.is_empty());
-}
-
-// -- execute_action: ShutdownAgent ---------------------------------------
+// -- request_shutdown_agent ----------------------------------------------
 
 #[tokio::test]
 async fn execute_shutdown_agent_writes_shutdown_request() {
@@ -667,11 +479,9 @@ async fn execute_shutdown_agent_writes_shutdown_request() {
         broadcaster,
     );
 
-    let action = SchedulerAction::ShutdownAgent {
-        slot_id: "worker-1".into(),
-        reason: Some("No longer needed".into()),
-    };
-    mgr.execute_action("lead-1", &action).await.unwrap();
+    mgr.request_shutdown_agent("lead-1", "worker-1", Some("No longer needed"))
+        .await
+        .unwrap();
 
     let msgs = mailbox.read_unread("t1", "worker-1").await.unwrap();
     assert_eq!(msgs.len(), 1);
@@ -684,11 +494,7 @@ async fn non_lead_cannot_shutdown_agent() {
     let agents = make_team_agents();
     let (mgr, _) = make_manager(&agents);
 
-    let action = SchedulerAction::ShutdownAgent {
-        slot_id: "worker-2".into(),
-        reason: None,
-    };
-    let result = mgr.execute_action("worker-1", &action).await;
+    let result = mgr.request_shutdown_agent("worker-1", "worker-2", None).await;
     assert!(matches!(result, Err(TeamError::InvalidRequest(_))));
 }
 
@@ -708,11 +514,9 @@ async fn lead_cannot_shutdown_lead() {
         broadcaster,
     );
 
-    let action = SchedulerAction::ShutdownAgent {
-        slot_id: "lead-1".into(),
-        reason: Some("trying to shutdown self".into()),
-    };
-    let result = mgr.execute_action("lead-1", &action).await;
+    let result = mgr
+        .request_shutdown_agent("lead-1", "lead-1", Some("trying to shutdown self"))
+        .await;
     assert!(
         matches!(&result, Err(TeamError::InvalidRequest(msg)) if msg.contains("lead")),
         "lead shutting down lead must be rejected, got {result:?}"
@@ -741,104 +545,19 @@ async fn lead_can_shutdown_worker() {
         broadcaster,
     );
 
-    let action = SchedulerAction::ShutdownAgent {
-        slot_id: "worker-1".into(),
-        reason: Some("not needed".into()),
-    };
-    mgr.execute_action("lead-1", &action).await.unwrap();
+    mgr.request_shutdown_agent("lead-1", "worker-1", Some("not needed"))
+        .await
+        .unwrap();
 
     let msgs = mailbox.read_unread("t1", "worker-1").await.unwrap();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].msg_type, MailboxMessageType::ShutdownRequest);
 }
 
-// -- execute_action: RenameAgent -----------------------------------------
-
-#[tokio::test]
-async fn execute_rename_agent() {
-    let agents = make_team_agents();
-    let (mgr, bc) = make_manager(&agents);
-
-    let action = SchedulerAction::RenameAgent {
-        slot_id: "worker-1".into(),
-        new_name: "SuperWorker".into(),
-    };
-    mgr.execute_action("lead-1", &action).await.unwrap();
-
-    let agent = mgr.get_agent("worker-1").await.unwrap();
-    assert_eq!(agent.name, "SuperWorker");
-
-    let renamed: Vec<_> = bc
-        .events()
-        .into_iter()
-        .filter(|e| e.name == "team.agentRenamed")
-        .collect();
-    assert_eq!(renamed.len(), 1);
-}
-
 // -- finalize_turn -------------------------------------------------------
 
 #[tokio::test]
-async fn finalize_turn_executes_actions_and_marks_idle() {
-    let agents = make_team_agents();
-    let repo = Arc::new(MockTeamRepo::new());
-    let mailbox = Arc::new(Mailbox::new(repo.clone()));
-    let task_board = Arc::new(TaskBoard::new(repo));
-    let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new(
-        "t1".into(),
-        "user-1".into(),
-        &agents,
-        mailbox.clone(),
-        task_board.clone(),
-        broadcaster,
-    );
-
-    mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
-    mgr.set_status("worker-2", TeammateStatus::Working).await.unwrap();
-
-    let actions = vec![
-        SchedulerAction::TaskCreate {
-            subject: "Sub-task".into(),
-            description: None,
-            owner: None,
-            blocked_by: vec![],
-        },
-        SchedulerAction::SendMessage {
-            to: "lead-1".into(),
-            message: "Done with sub-task".into(),
-            files: Vec::new(),
-        },
-    ];
-
-    let wake_signal = mgr.finalize_turn("worker-1", &actions).await.unwrap();
-
-    assert_eq!(mgr.get_status("worker-1").await.unwrap(), TeammateStatus::Idle);
-
-    let tasks = task_board.list_tasks("t1").await.unwrap();
-    assert_eq!(tasks.len(), 1);
-
-    // Two messages arrive at the lead:
-    // 1. the explicit SendMessage from the action list ("Done with sub-task")
-    // 2. the IdleNotification that mark_idle now writes automatically
-    let lead_msgs = mailbox.read_unread("t1", "lead-1").await.unwrap();
-    assert_eq!(lead_msgs.len(), 2);
-    assert!(
-        lead_msgs
-            .iter()
-            .any(|m| m.msg_type == MailboxMessageType::Message && m.content == "Done with sub-task")
-    );
-    assert!(
-        lead_msgs
-            .iter()
-            .any(|m| m.msg_type == MailboxMessageType::IdleNotification)
-    );
-
-    assert!(wake_signal.is_none(), "worker-2 still working");
-}
-
-#[tokio::test]
-async fn finalize_turn_with_idle_notification_skips_double_idle() {
+async fn finalize_turn_marks_idle_exactly_once() {
     let agents = make_team_agents();
     let repo = Arc::new(MockTeamRepo::new());
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
@@ -855,11 +574,7 @@ async fn finalize_turn_with_idle_notification_skips_double_idle() {
 
     mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
 
-    let actions = vec![SchedulerAction::IdleNotification {
-        summary: Some("All done".into()),
-    }];
-
-    mgr.finalize_turn("worker-1", &actions).await.unwrap();
+    mgr.finalize_turn("worker-1").await.unwrap();
 
     assert_eq!(mgr.get_status("worker-1").await.unwrap(), TeammateStatus::Idle);
 
@@ -883,9 +598,9 @@ async fn finalize_turn_all_teammates_done_signals_leader_wake() {
     mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
     mgr.set_status("worker-2", TeammateStatus::Working).await.unwrap();
 
-    mgr.finalize_turn("worker-1", &[]).await.unwrap();
+    mgr.finalize_turn("worker-1").await.unwrap();
 
-    let wake_signal = mgr.finalize_turn("worker-2", &[]).await.unwrap();
+    let wake_signal = mgr.finalize_turn("worker-2").await.unwrap();
     assert_eq!(wake_signal.as_deref(), Some("lead-1"));
 }
 

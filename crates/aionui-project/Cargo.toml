@@ -23,6 +23,10 @@ notify.workspace = true
 # Filename search: in-process tree walk honoring .gitignore/excludes (same walker
 # ripgrep is built on) — no ripgrep subprocess, since filename search reads no content.
 ignore.workspace = true
+# Source control: in-process git (no external binary, headless/cross-platform),
+# plus platform trash for discarding untracked files non-destructively.
+git2.workspace = true
+trash.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

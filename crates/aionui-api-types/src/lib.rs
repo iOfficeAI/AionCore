@@ -7,6 +7,7 @@ mod agent_build_extra;
 mod agent_discovery;
 mod agent_error;
 mod antigravity_hook;
+mod ask;
 mod assistant;
 mod auth;
 mod channel;
@@ -27,6 +28,7 @@ mod remote_agent;
 mod response;
 mod runtime;
 mod shell;
+mod sidebar;
 mod skill;
 mod system;
 mod team;
@@ -58,6 +60,7 @@ pub use antigravity_hook::{
     AntigravityHookConfig, AntigravityHookDecision, AntigravityHookInput, AntigravityHookOutput,
     AntigravityHookToolCall,
 };
+pub use ask::{AskAnswerRequest, AskQuestionAnswer};
 pub use assistant::{
     AssistantAgentResponse, AssistantCapabilitiesResponse, AssistantDefaultListRequest, AssistantDefaultListResponse,
     AssistantDefaultScalarRequest, AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse,
@@ -92,7 +95,7 @@ pub use conversation::{
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
     ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    MessageSearchResponse, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
     UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{
@@ -112,11 +115,11 @@ pub use extension::{
 };
 pub use file::{
     ContentEncoding, ContentMetadataRequest, CopyFailure, CopyFilesRequest, CopyFilesResponse, CopyTarget,
-    DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, FileWatchRequest,
-    GetFileMetadataRequest, GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest, ReadContentRequest,
+    DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, GetFileMetadataRequest,
+    GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest, OpenSystemFileRequest, ReadContentRequest,
     ReadFileRequest, RevealItemRequest, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest,
     SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery,
-    WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteContentRequest, WriteFileRequest,
+    WorkspaceFlatFileResponse, WriteContentRequest, WriteFileRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{
@@ -127,11 +130,12 @@ pub use mcp::{
 };
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,
-    ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, GetSnapshotContentRequest, ListSnapshotsRequest, PptJsonData,
-    PptSlideData, PreviewHistoryTargetDto, PreviewSnapshotInfoDto, PreviewState, PreviewStatusEvent,
-    PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StartPreviewRequest, StopPreviewRequest,
+    ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, PptJsonData, PptSlideData, PreviewState, PreviewStatusEvent,
+    PreviewUrlResponse, RefreshPreviewRequest, RefreshPreviewResponse, StartPreviewRequest, StopPreviewRequest,
 };
-pub use project::{AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer};
+pub use project::{
+    AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest, ResolveRefResponse,
+};
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest, DetectionSuggestion,
     FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, HealthStatus, KeyTestResult, ModelCapability,
@@ -153,6 +157,10 @@ pub use shell::{
     OpenExternalRequest, OpenFileRequest, OpenFolderWithRequest, ShowItemInFolderRequest, SpeechToTextConfig,
     SpeechToTextProvider, SpeechToTextResult, SttStreamClientMessage, SttStreamServerMessage, ToolType,
 };
+pub use sidebar::{
+    RemoveProjectItem, RemoveProjectItemKind, RemoveProjectResult, SidebarGroup, SidebarItem, SidebarItemsResponse,
+    SidebarResponse, SidebarScope, SidebarTeamItem,
+};
 pub use skill::{
     AddExternalPathRequest, DeleteSkillRequest, ExportSkillRequest, ExternalSkillSourceResponse,
     ImportSkillFailureResponse, ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest,
@@ -169,13 +177,16 @@ pub use system::{
 };
 pub use team::{
     AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, PauseTeamSlotRequest,
-    RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, TeamAgentInput,
-    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamAgentRuntimeStatusPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload,
-    TeamListResponse, TeamMcpRuntimeConfig, TeamMessageEnqueueStatus, TeamResponse, TeamRunAckResponse, TeamRunPayload,
-    TeamRunSource, TeamRunStateResponse, TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed,
-    TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
-    TeamSlotBlockedReason, TeamSlotWorkChangedPayload, TeamSlotWorkPayload, TeamSlotWorkState, TeammateMessagePayload,
+    RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, TeamActivityCursor,
+    TeamActivityItemResponse, TeamActivityKind, TeamActivityPageResponse, TeamAgentInput, TeamAgentRemovedPayload,
+    TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentRuntimeStatus, TeamAgentRuntimeStatusPayload,
+    TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload, TeamListResponse, TeamMailboxChange,
+    TeamMailboxChangedPayload, TeamMailboxMessageResponse, TeamMcpRuntimeConfig, TeamMessageEnqueueStatus,
+    TeamResponse, TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStateResponse, TeamRunStatus,
+    TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase,
+    TeamSessionStatus, TeamSessionStatusPayload, TeamSlotBlockedReason, TeamSlotWorkChangedPayload,
+    TeamSlotWorkPayload, TeamSlotWorkState, TeamTaskChange, TeamTaskChangedPayload, TeamTaskResponse,
+    TeammateMessagePayload,
 };
 pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use team_tools::{

@@ -1065,6 +1065,33 @@ async fn get_projects_fork_capability_on_detail_path() {
 }
 
 #[tokio::test]
+async fn get_projects_prompt_capability_on_detail_path() {
+    let (svc, _repo, _acp) = setup_fork().await;
+
+    // claude: migration 037 seeds image-only prompt capabilities.
+    let claude_conv = svc.create(USER_ID, fork_create_req("claude")).await.unwrap();
+    let got = svc.get(USER_ID, &claude_conv.id).await.unwrap();
+    assert_eq!(
+        got.prompt_capability,
+        Some(aionui_api_types::PromptCapabilityView {
+            image: true,
+            audio: false
+        })
+    );
+
+    // qwen: 003 seeds image + audio.
+    let qwen_conv = svc.create(USER_ID, fork_create_req("qwen")).await.unwrap();
+    let got = svc.get(USER_ID, &qwen_conv.id).await.unwrap();
+    assert_eq!(
+        got.prompt_capability,
+        Some(aionui_api_types::PromptCapabilityView {
+            image: true,
+            audio: true
+        })
+    );
+}
+
+#[tokio::test]
 async fn delete_parent_keeps_workspace_shared_with_fork() {
     let (svc, repo, acp_repo) = setup_fork().await;
     // No workspace in extra → create() auto-provisions one under

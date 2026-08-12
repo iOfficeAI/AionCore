@@ -27,11 +27,11 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 
 use super::argv::{ArgvInput, build_argv};
 use super::mcp_config::write_mcp_config;
-use super::models::{probe_models, probe_version};
+use super::models::probe_models;
 use super::skills::scan_skill_commands;
 use super::translate::Translator;
-use super::version::drift_notice;
 use super::wire::parse_line;
+use crate::backend::cli_version::session_drift_notice;
 use crate::backend::types::{
     Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
     PermissionDecision, SessionEnvelope, SessionSpec,
@@ -42,6 +42,13 @@ use crate::capability::{
     SlashCommandInfo,
 };
 use crate::event::{PermissionKind, SessionEvent, TurnOutcome};
+
+/// The literal placeholder AionUi's team-creation flow persisted as a member's
+/// model when an assistant had no concrete model (AionUi
+/// `teamCreateModelResolver.ts`, fixed in the paired AionUi change). agy never
+/// reports a model with this id, so it must not pass through the empty-list
+/// "unknown" window below; already-persisted member sessions heal at runtime.
+const UI_PLACEHOLDER_MODEL: &str = "default";
 
 /// Broadcast backlog for a session's event stream. Matches the other backends:
 /// large enough that a slow subscriber does not lose a turn's worth of frames.
@@ -75,16 +82,6 @@ fn store_models(models: &[ModelInfo]) {
     if let Ok(mut guard) = model_cache().write() {
         *guard = models.to_vec();
     }
-}
-
-/// Whether the agy version has already been reported in this process.
-///
-/// The installed binary cannot change under a running app, so repeating the
-/// notice on every session would just be noise.
-static VERSION_REPORTED: AtomicBool = AtomicBool::new(false);
-
-fn version_already_reported() -> bool {
-    VERSION_REPORTED.swap(true, Ordering::SeqCst)
 }
 
 /// How long a permission card may stay unanswered before we answer `deny` for
@@ -405,9 +402,6 @@ impl AntigravitySessionBackend {
     /// Reported once per process: the answer cannot change while agy's binary
     /// stays put, and repeating it on every session would be noise.
     fn spawn_version_check(self: &Arc<Self>) {
-        if version_already_reported() {
-            return;
-        }
         let spawner = Arc::clone(&self.spawner);
         let session_id = self.session_id.clone();
         let program = self
@@ -417,23 +411,29 @@ impl AntigravitySessionBackend {
             .unwrap_or_else(|| std::path::PathBuf::from("agy"));
         let weak = self.weak_self.get().cloned();
         tokio::spawn(async move {
-            let Some(reported) = probe_version(&spawner, &program, &session_id).await else {
+            let Some((level, message, localized)) = session_drift_notice(&spawner, "agy", &program, &session_id).await
+            else {
                 return;
             };
-            tracing::info!(session_id = %session_id, version = %reported, "antigravity: agy version detected");
-            let Some((level, message, localized)) = drift_notice(&reported) else {
-                return;
-            };
-            tracing::warn!(session_id = %session_id, version = %reported, "antigravity: agy version drift");
             if let Some(backend) = weak.and_then(|w| w.upgrade()) {
-                backend.emit(
-                    backend.turn_gen.load(Ordering::SeqCst),
-                    SessionEvent::Notice {
-                        level,
-                        message,
-                        localized: Some(localized),
+                // Not `emit`: that drops the value when nobody is subscribed
+                // yet, which is fine for a turn frame (another one follows) but
+                // loses this notice outright — the check runs once per session.
+                crate::backend::cli_version::broadcast_notice(
+                    &backend.event_tx,
+                    SessionEnvelope {
+                        session_id: backend.session_id.clone(),
+                        turn_gen: backend.turn_gen.load(Ordering::SeqCst),
+                        event: SessionEvent::Notice {
+                            level,
+                            message,
+                            localized: Some(localized),
+                            supersedes_key: None,
+                        },
                     },
-                );
+                    "agy",
+                )
+                .await;
             }
         });
     }
@@ -534,10 +534,24 @@ impl AntigravitySessionBackend {
     ///
     /// Only filters once discovery has actually produced a list; an empty list
     /// means "unknown", not "nothing is valid", so the request passes through.
+    /// The one exception is [`UI_PLACEHOLDER_MODEL`]: it is a known UI
+    /// artifact, never a real agy id, so it is dropped even while the list is
+    /// empty — this heals member sessions persisted before the AionUi fix.
     fn effective_model(&self) -> Option<String> {
         let requested = self.config.model.clone()?;
         let known = self.models.read().ok()?;
-        if known.is_empty() || known.iter().any(|m| m.id == requested) {
+        if known.is_empty() {
+            if requested == UI_PLACEHOLDER_MODEL {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    requested = %requested,
+                    "antigravity: dropping the UI placeholder model while discovery is empty; falling back to agy's default"
+                );
+                return None;
+            }
+            return Some(requested);
+        }
+        if known.iter().any(|m| m.id == requested) {
             return Some(requested);
         }
         tracing::warn!(
@@ -1540,6 +1554,17 @@ mod tests {
         // user's model here would silently ignore a perfectly good choice.
         let b = backend_with_models(&[], Some("gemini-3.1-pro-low"));
         assert_eq!(b.effective_model().as_deref(), Some("gemini-3.1-pro-low"));
+    }
+
+    #[test]
+    fn an_empty_model_list_still_drops_the_ui_placeholder() {
+        // AionUi's team-creation flow used to persist the literal placeholder
+        // "default" as a member's model. agy never reports a model with that
+        // id, so passing it through while discovery is empty fails every turn
+        // with a non-retryable model-not-found; agy's own default is strictly
+        // better. Real ids keep passing through (see the test above).
+        let b = backend_with_models(&[], Some("default"));
+        assert_eq!(b.effective_model(), None);
     }
 
     #[test]

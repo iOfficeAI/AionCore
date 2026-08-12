@@ -525,8 +525,8 @@ pub(crate) async fn dispatch_tool(
     match tool_name {
         "team_send_message" => exec_send_message(arguments, scheduler, service, team_id, caller_slot_id).await,
         "team_spawn_agent" => exec_spawn_agent(arguments, service, team_id, caller_slot_id, caller_role).await,
-        "team_task_create" => exec_task_create(arguments, scheduler).await,
-        "team_task_update" => exec_task_update(arguments, scheduler).await,
+        "team_task_create" => exec_task_create(arguments, scheduler, service, team_id, caller_slot_id).await,
+        "team_task_update" => exec_task_update(arguments, scheduler, service, team_id, caller_slot_id).await,
         "team_task_list" => exec_task_list(arguments, scheduler).await,
         "team_members" => exec_members(scheduler).await,
         "team_rename_agent" => exec_rename_agent(arguments, scheduler, service, team_id).await,
@@ -876,7 +876,103 @@ async fn exec_spawn_agent(
         .map_err(|e| ToolCallError::from_message(e.to_string()))
 }
 
-async fn exec_task_create(args: &Value, scheduler: &TeammateManager) -> Result<String, ToolCallError> {
+/// Renders the mailbox notice a task owner receives when a task becomes theirs
+/// to act on. Carries the full assignment (subject + description) so the
+/// teammate — which is prompted to read its mailbox for assignments — has
+/// everything without a separate message from the lead (Method Y).
+fn format_task_assignment_notice(task: &TeamTask) -> String {
+    let mut notice = format!("📋 Task assigned to you (#{}): {}", task.id, task.subject);
+    if let Some(desc) = task.description.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        notice.push_str("\n\n");
+        notice.push_str(desc);
+    }
+    notice
+}
+
+/// Pure eligibility gate: should `task`'s owner be notified + woken?
+///
+/// `owner_role` is the resolved role of the owner slot, or `None` when the slot
+/// is unknown/removed. Returns `true` only for a live, non-lead teammate other
+/// than the caller, on a non-terminal task with no outstanding blockers.
+fn should_wake_task_owner(task: &TeamTask, from_slot_id: &str, owner_role: Option<TeammateRole>) -> bool {
+    let Some(owner) = task.owner.as_deref() else {
+        return false;
+    };
+    // Nothing to wake for a self-assignment, the fallback "user" lane, or a
+    // broadcast marker.
+    if owner == from_slot_id || owner == "user" || owner == "*" {
+        return false;
+    }
+    // Only a live, non-lead teammate is a wake target. The lead is the assigner
+    // and manages itself; a removed/unknown slot has no runtime to wake.
+    match owner_role {
+        Some(TeammateRole::Teammate) => {}
+        Some(TeammateRole::Lead) | None => return false,
+    }
+    // Not actionable yet: terminal tasks or ones still gated by dependencies.
+    !matches!(task.status, TaskStatus::Completed | TaskStatus::Deleted) && task.blocked_by.is_empty()
+}
+
+/// Notifies and lazily wakes the owner of a task that has just become
+/// actionable (freshly created & unblocked, (re)assigned, or unblocked by an
+/// upstream completion). Reuses the same mailbox-write + enqueue + wake path as
+/// agent-to-agent messages, so an already-working owner has the notice queued
+/// and drained on its next turn boundary rather than being interrupted.
+///
+/// Best-effort: skips when there is no eligible teammate owner, and logs (never
+/// propagates) failures so it cannot fail the tool call whose task write has
+/// already committed.
+async fn maybe_notify_task_owner(
+    scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    from_slot_id: &str,
+    task: &TeamTask,
+    trigger: &str,
+) {
+    let Some(owner) = task.owner.as_deref() else {
+        return;
+    };
+    // Resolve the owner's role (None = removed/unknown slot) so the pure gate
+    // can decide eligibility.
+    let owner_role = scheduler.get_agent(owner).await.ok().map(|agent| agent.role);
+    if !should_wake_task_owner(task, from_slot_id, owner_role) {
+        return;
+    }
+    let Some(service) = service.upgrade() else {
+        return;
+    };
+
+    let notice = format_task_assignment_notice(task);
+    match service
+        .send_agent_message_from_agent(team_id, from_slot_id, owner, &notice, None)
+        .await
+    {
+        Ok(_) => info!(
+            team_id,
+            owner_slot = owner,
+            task_id = %task.id,
+            trigger,
+            "task owner notified and woken"
+        ),
+        Err(error) => warn!(
+            team_id,
+            owner_slot = owner,
+            task_id = %task.id,
+            trigger,
+            error = %error,
+            "failed to notify task owner"
+        ),
+    }
+}
+
+async fn exec_task_create(
+    args: &Value,
+    scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    caller_slot_id: &str,
+) -> Result<String, ToolCallError> {
     let input: TaskCreateInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
@@ -890,12 +986,25 @@ async fn exec_task_create(args: &Value, scheduler: &TeammateManager) -> Result<S
         .await
         .map_err(|e| ToolCallError::from_message(e.to_string()))?;
 
+    // Assigning a task to a teammate notifies and wakes it (gated: skips blocked
+    // tasks, which wake later via the upstream-completion unblock path).
+    maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, &task, "create").await;
+
     json_text(&json!({ "status": "ok", "task": task_json(&task) }))
 }
 
-async fn exec_task_update(args: &Value, scheduler: &TeammateManager) -> Result<String, ToolCallError> {
+async fn exec_task_update(
+    args: &Value,
+    scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    team_id: &str,
+    caller_slot_id: &str,
+) -> Result<String, ToolCallError> {
     let input: TaskUpdateInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
+
+    let reassigned = input.owner.is_some();
+    let completed = input.status.as_deref() == Some("completed");
 
     let task = scheduler
         .update_task(
@@ -907,6 +1016,22 @@ async fn exec_task_update(args: &Value, scheduler: &TeammateManager) -> Result<S
         )
         .await
         .map_err(|e| ToolCallError::from_message(e.to_string()))?;
+
+    // A (re)assignment to a teammate notifies the new owner.
+    if reassigned {
+        maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, &task, "reassign").await;
+    }
+
+    // Completing a task can unblock downstream tasks; wake each downstream owner
+    // whose task is now fully unblocked and actionable.
+    if completed
+        && !task.blocks.is_empty()
+        && let Ok(all_tasks) = scheduler.list_tasks().await
+    {
+        for downstream in all_tasks.iter().filter(|t| task.blocks.contains(&t.id)) {
+            maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, downstream, "unblock").await;
+        }
+    }
 
     json_text(&json!({ "status": "ok", "task": task_json(&task) }))
 }
@@ -1217,6 +1342,97 @@ fn http_bearer_token(request: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use aionui_api_types::{TeamRunTargetRole, TeamSlotWorkPayload, TeamSlotWorkState};
+
+    fn task_owned_by(owner: Option<&str>, status: TaskStatus, blocked_by: Vec<String>) -> TeamTask {
+        TeamTask {
+            id: "tk1".into(),
+            team_id: "t1".into(),
+            subject: "Build".into(),
+            description: Some("Do the thing".into()),
+            status,
+            owner: owner.map(str::to_owned),
+            blocked_by,
+            blocks: vec![],
+            metadata: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn wake_gate_notifies_live_teammate_owner() {
+        let task = task_owned_by(Some("worker-1"), TaskStatus::Pending, vec![]);
+        assert!(should_wake_task_owner(&task, "lead-1", Some(TeammateRole::Teammate)));
+    }
+
+    #[test]
+    fn wake_gate_skips_unowned_self_user_and_broadcast() {
+        // No owner.
+        assert!(!should_wake_task_owner(
+            &task_owned_by(None, TaskStatus::Pending, vec![]),
+            "lead-1",
+            Some(TeammateRole::Teammate)
+        ));
+        // Self-assignment.
+        assert!(!should_wake_task_owner(
+            &task_owned_by(Some("lead-1"), TaskStatus::Pending, vec![]),
+            "lead-1",
+            Some(TeammateRole::Teammate)
+        ));
+        // Fallback "user" lane and broadcast marker.
+        for sentinel in ["user", "*"] {
+            assert!(!should_wake_task_owner(
+                &task_owned_by(Some(sentinel), TaskStatus::Pending, vec![]),
+                "lead-1",
+                Some(TeammateRole::Teammate)
+            ));
+        }
+    }
+
+    #[test]
+    fn wake_gate_skips_lead_and_removed_owner() {
+        let task = task_owned_by(Some("owner-1"), TaskStatus::Pending, vec![]);
+        // Owner is the lead.
+        assert!(!should_wake_task_owner(&task, "lead-1", Some(TeammateRole::Lead)));
+        // Owner slot is unknown/removed (role could not be resolved).
+        assert!(!should_wake_task_owner(&task, "lead-1", None));
+    }
+
+    #[test]
+    fn wake_gate_skips_terminal_and_blocked_tasks() {
+        // Terminal statuses are not actionable.
+        for status in [TaskStatus::Completed, TaskStatus::Deleted] {
+            assert!(!should_wake_task_owner(
+                &task_owned_by(Some("worker-1"), status, vec![]),
+                "lead-1",
+                Some(TeammateRole::Teammate)
+            ));
+        }
+        // Still gated by an outstanding dependency → wake later on unblock.
+        assert!(!should_wake_task_owner(
+            &task_owned_by(Some("worker-1"), TaskStatus::Pending, vec!["tk0".into()]),
+            "lead-1",
+            Some(TeammateRole::Teammate)
+        ));
+    }
+
+    #[test]
+    fn assignment_notice_includes_subject_and_description() {
+        let task = task_owned_by(Some("worker-1"), TaskStatus::Pending, vec![]);
+        let notice = format_task_assignment_notice(&task);
+        assert!(notice.contains("#tk1"));
+        assert!(notice.contains("Build"));
+        assert!(notice.contains("Do the thing"));
+    }
+
+    #[test]
+    fn assignment_notice_omits_empty_description() {
+        let mut task = task_owned_by(Some("worker-1"), TaskStatus::Pending, vec![]);
+        task.description = None;
+        let notice = format_task_assignment_notice(&task);
+        assert!(notice.contains("Build"));
+        assert!(!notice.contains("\n\n"));
+    }
 
     #[test]
     fn build_send_message_queued_response_serializes_json_contract() {

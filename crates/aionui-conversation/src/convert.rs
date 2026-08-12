@@ -79,6 +79,7 @@ pub fn row_to_response_with_extra(
         // Detail-path post-fill only (see `attach_fork_capability`); convert
         // stays a pure mapper with no repo access.
         fork_capability: None,
+        prompt_capability: None,
         created_at: row.created_at,
         modified_at: row.updated_at,
         extra,

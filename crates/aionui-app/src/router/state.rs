@@ -28,17 +28,16 @@ use aionui_extension::{
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
-use aionui_file::{FileRouterState, FileService, FileWatchService, SnapshotService};
+use aionui_file::{FileRouterState, FileService, SnapshotService};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
 };
-use aionui_office::{
-    ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
-};
-use aionui_project::ProjectRouterState;
+use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
+use aionui_project::{ProjectRouterState, ProjectService};
 use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
 use aionui_shell::ShellRouterState;
+use aionui_sidebar::{SidebarRouterState, SidebarService};
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
     ProtocolDetectionService, ProviderService, RuntimePrepareService, SettingsService, SystemRouterState,
@@ -131,6 +130,7 @@ pub struct ModuleStates {
     pub connection_test: ConnectionTestRouterState,
     pub file: FileRouterState,
     pub project: ProjectRouterState,
+    pub sidebar: SidebarRouterState,
     pub mcp: McpRouterState,
     pub extension: ExtensionRouterState,
     pub hub: HubRouterState,
@@ -311,6 +311,7 @@ pub async fn build_module_states(
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
         project: build_module_state_phase(&boot, "project", || build_project_state(services)),
+        sidebar: build_module_state_phase(&boot, "sidebar", || build_sidebar_state(services)),
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
         hub: hub_state,
@@ -333,6 +334,17 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"
     );
+    // Late-inject the sidebar's remove-project ports: the team service is built
+    // after the sidebar state above, so the wiring cannot happen inside
+    // `build_sidebar_state`. `set_remove_project_ports` is set-once.
+    states
+        .sidebar
+        .service
+        .set_remove_project_ports(Arc::new(RemoveProjectAdapter {
+            conversation: services.conversation_service.clone(),
+            team: states.team.service.clone(),
+            project: services.project_service.clone(),
+        }));
     states
         .conversation
         .service
@@ -472,22 +484,28 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
     let broadcaster = services.event_bus.clone();
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
     let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
-    // Non-fatal: watcher creation failure (e.g. inotify limit) yields a disabled
-    // watch service, never a bootstrap abort. See ELECTRON-2PM.
-    let watch_service = Arc::new(FileWatchService::new(broadcaster));
     let snapshot_service = Arc::new(SnapshotService::new());
-    // Reveal-in-file-manager for `/api/fs/reveal`: an adapter over the shell
-    // service, injected as the file crate's revealer port (keeps aionui-file
-    // free of a shell dependency).
-    let revealer: aionui_file::ItemRevealerRef = Arc::new(super::item_revealer::ShellItemRevealer::new(Arc::new(
-        aionui_shell::ShellService::new(Arc::new(aionui_shell::DefaultSystemOpener)),
+    // Shell-backed capabilities for `/api/fs/reveal` (open enclosing folder) and
+    // `/api/fs/open-system` (open with the default application): adapters over one
+    // shared shell service, injected as the file crate's ports so aionui-file stays
+    // free of a shell dependency.
+    let shell = Arc::new(aionui_shell::ShellService::new(Arc::new(
+        aionui_shell::DefaultSystemOpener,
     )));
+    let revealer: aionui_file::ItemRevealerRef = Arc::new(super::item_revealer::ShellItemRevealer::new(shell.clone()));
+    let system_opener: aionui_file::SystemFileOpenerRef =
+        Arc::new(super::system_file_opener::ShellSystemFileOpener::new(shell.clone()));
+    // Clipboard capability for `/api/fs/copy-absolute-path`: the backend resolves
+    // the path and writes it to the clipboard itself, so the abs never returns.
+    let clipboard: aionui_file::ClipboardWriterRef =
+        Arc::new(super::clipboard_writer::ShellClipboardWriter::new(shell));
     Ok(FileRouterState {
         file_service,
-        watch_service,
         snapshot_service,
         project: Arc::new(services.project_service.clone()),
         revealer,
+        system_opener,
+        clipboard,
         allowed_roots,
     })
 }
@@ -496,6 +514,58 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
 pub fn build_project_state(services: &AppServices) -> ProjectRouterState {
     ProjectRouterState {
         project: Arc::new(services.project_service.clone()),
+    }
+}
+
+/// Build the sidebar read/ordering router state from application services.
+/// The sidebar store and ordering store share the app-wide pool; `work_dir` is
+/// the conversation temp-workspace root used for path classification (must match
+/// `ProjectService`'s temp root).
+pub fn build_sidebar_state(services: &AppServices) -> SidebarRouterState {
+    let sidebar_store: Arc<dyn aionui_db::ISidebarStore> =
+        Arc::new(aionui_db::SqliteSidebarStore::new(services.database.pool().clone()));
+    let service = SidebarService::new(
+        sidebar_store,
+        services.user_order_store.clone(),
+        services.work_dir.join("conversations"),
+    );
+    SidebarRouterState {
+        service: Arc::new(service),
+    }
+}
+
+/// Adapts the concrete conversation / team / project services to the sidebar's
+/// [`aionui_sidebar::RemoveProjectPorts`] trait so `remove_project` (BR-19) can
+/// reuse the existing per-unit delete paths (`ConversationService::delete`,
+/// `TeamSessionService::remove_team`, `ProjectService::delete_project`) without
+/// the sidebar crate depending on any of them.
+struct RemoveProjectAdapter {
+    conversation: ConversationService,
+    team: Arc<TeamSessionService>,
+    project: ProjectService,
+}
+
+#[async_trait::async_trait]
+impl aionui_sidebar::RemoveProjectPorts for RemoveProjectAdapter {
+    async fn delete_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), String> {
+        self.conversation
+            .delete(user_id, conversation_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), String> {
+        self.team
+            .remove_team(user_id, team_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn delete_project_record(&self, user_id: &str, project_id: &str) -> Result<(), String> {
+        self.project
+            .delete_project(user_id, project_id)
+            .await
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -758,6 +828,8 @@ pub fn build_team_state(
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
     service.with_project_service(Arc::new(services.project_service.clone()));
+    // Path-2 cascade: removing a team drops its `user_order` row (sidebar §4.3).
+    service.with_user_order_store(services.user_order_store.clone());
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),
@@ -860,13 +932,11 @@ pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
         Arc::new(aionui_office::DefaultProcessSpawner::new(data_dir.to_path_buf()));
     let watch_manager = Arc::new(OfficecliWatchManager::new(spawner, services.event_bus.clone()));
 
-    let snapshot_service = Arc::new(OfficeSnapshotService::new(data_dir));
     let conversion_service = Arc::new(ConversionService::with_data_dir(None, data_dir.to_path_buf()));
     let proxy_service = Arc::new(ProxyService::new(watch_manager.clone()));
 
     OfficeRouterState {
         watch_manager,
-        snapshot_service,
         conversion_service,
         proxy_service,
         allowed_roots,
@@ -1366,11 +1436,4 @@ mod tests {
 
         services.database.close().await;
     }
-
-    // NOTE (ELECTRON-2PM): the former `file_watch_init_error_maps_to_bootstrap_server_failed`
-    // test was removed intentionally. File-watch init is no longer a fatal
-    // bootstrap stage — `FileWatchService::new` is infallible and degrades to a
-    // disabled state, so there is no error-to-BOOTSTRAP_SERVER_FAILED mapping to
-    // assert here. Disabled-state behavior is covered in `aionui-file`
-    // (watch_service disabled-path tests + the `FILE_WATCH_UNAVAILABLE` mapping).
 }

@@ -7,6 +7,12 @@ pub trait ISystemOpener: Send + Sync {
     fn open_detached(&self, target: &str) -> Result<(), ShellError>;
     async fn run_command(&self, program: &str, args: &[&str]) -> Result<(), ShellError>;
     fn is_tool_available(&self, tool_name: &str) -> bool;
+    /// Write `text` to the OS clipboard. Used by the copy-absolute-path endpoint
+    /// so the resolved path is placed on the clipboard entirely server-side and
+    /// never returned to the client (mirrors the reveal/open capabilities: the
+    /// backend performs the OS action itself). Fails on headless/no-clipboard
+    /// environments rather than panicking.
+    fn copy_to_clipboard(&self, text: &str) -> Result<(), ShellError>;
 }
 
 pub struct DefaultSystemOpener;
@@ -43,6 +49,18 @@ impl ISystemOpener for DefaultSystemOpener {
     fn is_tool_available(&self, tool_name: &str) -> bool {
         which::which(tool_name).is_ok()
     }
+
+    fn copy_to_clipboard(&self, text: &str) -> Result<(), ShellError> {
+        // arboard is cross-platform (mac/win/linux). Any failure — including a
+        // headless/no-display environment (e.g. a remote WebUI server) — maps to a
+        // command error rather than a panic. aioncore is long-lived, so on X11 it
+        // remains the clipboard owner and the content persists after this returns.
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| ShellError::CommandFailed(format!("clipboard: {e}")))?;
+        clipboard
+            .set_text(text.to_owned())
+            .map_err(|e| ShellError::CommandFailed(format!("clipboard: {e}")))
+    }
 }
 
 pub struct NoopSystemOpener;
@@ -59,6 +77,10 @@ impl ISystemOpener for NoopSystemOpener {
 
     fn is_tool_available(&self, _tool_name: &str) -> bool {
         true
+    }
+
+    fn copy_to_clipboard(&self, _text: &str) -> Result<(), ShellError> {
+        Ok(())
     }
 }
 

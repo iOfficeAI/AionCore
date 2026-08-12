@@ -989,6 +989,7 @@ mod tests {
                     requires_action: crate::state::RequiresActionSet {
                         waiting_on_approval: if can_queue { 0 } else { 1 },
                         waiting_on_auth: 0,
+                        waiting_on_question: 0,
                     },
                     subagents: Vec::new(),
                 }

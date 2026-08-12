@@ -1,6 +1,7 @@
 #![warn(clippy::disallowed_types)]
 
 //! Multi-agent team sessions with role-based prompts, task board, mailbox, and scheduling.
+pub mod activity_mapping;
 pub mod capability;
 pub mod crash_detection;
 pub mod error;
@@ -53,10 +54,8 @@ pub use provisioning::{
 };
 pub use routes::{TeamRouterState, team_routes};
 pub use runtime_tools::ResolvedTeamToolContext;
-pub use scheduler::{
-    SchedulerAction, TeammateManager, WAKE_TIMEOUT_MS, WakePayload, format_crash_testament, normalize_name,
-};
-pub use service::{TeamIdleCleanupCoordinator, TeamSessionService};
+pub use scheduler::{TeammateManager, WAKE_TIMEOUT_MS, WakePayload, format_crash_testament, normalize_name};
+pub use service::{ActivityKind, TeamIdleCleanupCoordinator, TeamSessionService};
 pub use session::{TeamSession, WakeInput};
 pub use task_board::{TaskBoard, TaskUpdate};
 pub use team_run::{TeamRunManager, target_role_for};

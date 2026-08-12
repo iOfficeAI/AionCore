@@ -24,7 +24,6 @@ mod wake;
 #[cfg(test)]
 mod tests;
 
-pub use actions::SchedulerAction;
 pub use crash_recovery::format_crash_testament;
 
 // ---------------------------------------------------------------------------

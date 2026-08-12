@@ -174,6 +174,22 @@ impl AgentAvailabilityService {
     }
 }
 
+/// The program name for a direct-CLI backend, or `None` for anything that is
+/// not version-gated (ACP agents run their vendor's own protocol and are not
+/// pinned to a verified release here).
+///
+/// Keyed on `backend` rather than `agent_type` because that is what identifies
+/// the vendor; the returned name is what `cli_version::verified_version`
+/// expects and what the drift text names to the user.
+fn direct_cli_program(meta: &AgentMetadata) -> Option<&'static str> {
+    match meta.backend.as_deref() {
+        Some("antigravity") => Some("agy"),
+        Some("claude") => Some("claude"),
+        Some("codex") => Some("codex"),
+        _ => None,
+    }
+}
+
 async fn run_probe(
     registry: &Arc<AgentRegistry>,
     provider_repo: &Arc<dyn IProviderRepository>,
@@ -200,24 +216,23 @@ async fn run_probe(
         // the user is explicitly waiting and large Node CLIs load slowly.
         match crate::cli_probe::validate_with_budget(meta, crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT).await {
             Ok(success) => {
-                // agy is the only one of these whose version is out of our
-                // hands: claude and codex are pinned into managed-resources, so
-                // which version is installed is our own decision and there is
-                // nothing to warn about. The probe already ran `--version` for
+                // Every direct-CLI backend runs the user's own install, so the
+                // installed version is out of our hands for all of them. claude
+                // and codex were exempt only while the app bundled a pinned
+                // copy of each; that bundling is gone, so they get the same
+                // check agy always had. The probe already ran `--version` for
                 // the integrity check and used to discard the output, so this
                 // costs no extra process.
                 //
                 // Reported HERE and not only mid-conversation: this is where the
                 // user is deciding whether to rely on the agent, and the
                 // session-time notice arrives long after that choice is made.
-                let drift = (meta.backend.as_deref() == Some("antigravity"))
-                    .then(|| {
-                        success
-                            .reported_version
-                            .as_deref()
-                            .and_then(aionui_session::version_drift)
-                    })
-                    .flatten();
+                let drift = direct_cli_program(meta).and_then(|cli| {
+                    success
+                        .reported_version
+                        .as_deref()
+                        .and_then(|reported| aionui_session::version_drift(cli, reported))
+                });
                 match drift {
                     // Status stays ONLINE — the agent works. The code rides the
                     // error_code column because that is what the UI translates,
@@ -784,7 +799,16 @@ mod tests {
 
         assert_eq!(row.status, AgentManagementStatus::Online);
         assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Manual));
-        assert!(row.last_check_error_code.is_none());
+        // Same as the restore test: a direct CLI now runs from the developer's
+        // own install, so a version-drift code may ride along on an otherwise
+        // healthy check. Only a real failure code would falsify "online".
+        assert!(
+            row.last_check_error_code
+                .as_deref()
+                .is_none_or(|code| code.starts_with("version_drift_")),
+            "a healthy direct CLI may only carry a version-drift code, got {:?}",
+            row.last_check_error_code
+        );
     }
 
     /// Manual health check must reach its real probe even when the binary is
@@ -968,6 +992,17 @@ mod tests {
             .unwrap();
         assert_eq!(row.status, AgentManagementStatus::Online);
         assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Manual));
-        assert!(row.last_check_error_code.is_none());
+        // claude runs from the developer's own install now, so whichever
+        // version is on this machine decides whether a drift code rides along.
+        // The restore itself is what this test pins: status back to Online, and
+        // no FAILURE code. A drift code is informational and must not be read as
+        // a failed check (`last_success_at` keys off status, not the code).
+        assert!(
+            row.last_check_error_code
+                .as_deref()
+                .is_none_or(|code| code.starts_with("version_drift_")),
+            "a restored agent may only carry a version-drift code, got {:?}",
+            row.last_check_error_code
+        );
     }
 }

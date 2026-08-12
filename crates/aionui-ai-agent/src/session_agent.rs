@@ -30,7 +30,7 @@ use crate::protocol::events::{
 };
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::PersistedSessionState;
-use crate::types::SendMessageData;
+use crate::types::{PromptMediaCaps, SendMessageData};
 use aionui_api_types::AcpBuildExtra;
 use aionui_common::AgentType;
 use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStateParams};
@@ -78,6 +78,11 @@ fn resolve_current_model_efforts(models: &[aionui_session::ModelInfo], current_m
 struct SessionRuntime {
     tx: broadcast::Sender<AgentStreamEvent>,
     last_activity_ms: AtomicI64,
+    /// Live (declared, not yet terminal) background containers — the pump's
+    /// `workflow_cards` ledger size, mirrored here so the idle scanner can see
+    /// that background work outlives the turn (status=Finished + no frames
+    /// otherwise reads as idle and gets the agent killed mid-flight).
+    live_background_tasks: std::sync::atomic::AtomicUsize,
     /// Coarse status derived from the FSM edge the translator observes.
     status: std::sync::Mutex<Option<ConversationStatus>>,
     /// The CLI-assigned backend session id, learned from `BackendBound`. The ACP
@@ -108,6 +113,9 @@ struct SessionRuntime {
 impl SessionRuntime {
     fn touch(&self) {
         self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+    }
+    fn set_live_background_tasks(&self, count: usize) {
+        self.live_background_tasks.store(count, Ordering::Relaxed);
     }
     fn set_status(&self, s: ConversationStatus) {
         if let Ok(mut g) = self.status.lock() {
@@ -431,6 +439,7 @@ impl SessionAgentTask {
         let runtime = Arc::new(SessionRuntime {
             tx,
             last_activity_ms: AtomicI64::new(now_ms()),
+            live_background_tasks: std::sync::atomic::AtomicUsize::new(0),
             status: std::sync::Mutex::new(None),
             session_id: std::sync::Mutex::new(None),
             mode_override: std::sync::Mutex::new(None),
@@ -539,7 +548,14 @@ impl SessionAgentTask {
             .map(|p| {
                 let is_ask = p.tool_name == "AskUserQuestion";
                 let options = if is_ask {
-                    ask_user_question_options(p.questions.as_ref())
+                    // `p.questions` is the bare `questions[]` ARRAY, but the
+                    // projector expects the whole tool input and does its own
+                    // `.get("questions")` — passing the array straight through
+                    // made recovery silently degrade to the generic
+                    // Allow/AllowAlways/Reject card (live e2e catch, 2026-08-04).
+                    // Re-wrap to the input shape the live path uses.
+                    let input = p.questions.as_ref().map(|qs| serde_json::json!({ "questions": qs }));
+                    ask_user_question_options(input.as_ref())
                 } else {
                     Vec::new()
                 };
@@ -555,6 +571,10 @@ impl SessionAgentTask {
                     action: None,
                     description: String::new(),
                     command_type: None,
+                    // The full question payload rides along so the frontend
+                    // recovery rebuilds the REAL question card; the flattened
+                    // options above stay as the fallback for older frontends.
+                    questions: if is_ask { p.questions.clone() } else { None },
                     options: options
                         .into_iter()
                         .map(|o| aionui_common::ConfirmationOption {
@@ -578,6 +598,54 @@ impl SessionAgentTask {
     ///     (claude keys the AskUserQuestion answer by the chosen label — see
     ///     claude_conn `build_control_response`; single-select single-question path).
     ///
+    /// Answer a structured question card (AskUserQuestion) — the DEDICATED
+    /// typed channel (2026-08-05 ruling: question answers do not ride the
+    /// permission confirm endpoint). `answers: None` = the user dismissed the
+    /// card; the claude adapter maps that to a deny (an allow with no answers
+    /// is silent data loss — claude drops unanswered questions, live 2.1.178).
+    pub fn answer_ask(
+        &self,
+        request_id: &str,
+        answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+    ) -> Result<(), AgentError> {
+        // api-types is the conversation layer's currency; convert to the
+        // session command's own type at this boundary.
+        let answers = answers.map(|list| {
+            list.into_iter()
+                .map(|a| aionui_session::QuestionAnswer {
+                    question: a.question,
+                    labels: a.labels,
+                })
+                .collect::<Vec<_>>()
+        });
+        let backend = self.backend.clone();
+        let request_id = request_id.to_string();
+        let conv_id = self.conversation_id.clone();
+        // Same fire-and-forget shape as confirm(): the REST reply has already
+        // returned by the time the dispatch runs, so a failure here MUST be
+        // surfaced in the log or a wedged ask is undiagnosable in production.
+        tokio::spawn(async move {
+            let command = aionui_session::Command::AnswerAsk {
+                request_id: request_id.clone(),
+                answers,
+            };
+            match backend.dispatch(command).await {
+                Ok(_) => tracing::info!(
+                    conv_id = %conv_id,
+                    request_id = %request_id,
+                    "ask answer delivered to backend (dedicated channel)"
+                ),
+                Err(e) => tracing::error!(
+                    conv_id = %conv_id,
+                    request_id = %request_id,
+                    error = %e,
+                    "ask answer FAILED after REST reply already returned success — claude stays blocked on can_use_tool"
+                ),
+            }
+        });
+        Ok(())
+    }
+
     /// `always_allow` (legacy flag) forces AllowAlways regardless.
     pub fn confirm(
         &self,
@@ -1030,23 +1098,75 @@ impl IAgentTask for SessionAgentTask {
         self.runtime.last_activity_ms.load(Ordering::Relaxed)
     }
 
+    fn live_background_tasks(&self) -> usize {
+        self.runtime.live_background_tasks.load(Ordering::Relaxed)
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.runtime.tx.subscribe()
     }
 
+    fn prompt_media_caps(&self) -> PromptMediaCaps {
+        let blocks = self.backend.capabilities().prompt_blocks;
+        PromptMediaCaps {
+            image: blocks.image,
+            audio: blocks.audio,
+        }
+    }
+
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.runtime.touch();
+        // Partition attachments by the backend's declared prompt blocks:
+        // capable media becomes native Image/Audio blocks; everything else
+        // keeps the pre-multimodal form (path in the [[AION_FILES]] text +
+        // resource link). A read failure degrades that attachment back to a
+        // resource link — the path also remains in the original text because
+        // partition already ran, which the adapters tolerate (they resolve
+        // links independently of the text).
+        let partition = crate::media::partition_media(&data.content, &data.files, self.prompt_media_caps());
         let mut content: Vec<ContentBlock> = Vec::new();
-        if !data.content.is_empty() {
-            content.push(ContentBlock::Text(data.content));
+        if !partition.content.is_empty() {
+            content.push(ContentBlock::Text(partition.content));
         }
-        for path in data.files {
+        for path in partition.path_files {
             // File paths ride as resource links; the claude/codex adapters resolve
             // them (Read tool / base64) at dispatch time.
             content.push(ContentBlock::ResourceLink {
                 uri: path,
                 mime_type: None,
             });
+        }
+        for attachment in &partition.media {
+            match crate::media::read_media_bytes(attachment).await {
+                Some(bytes) => content.push(match attachment.kind {
+                    crate::media::MediaKind::Image => ContentBlock::Image {
+                        data: bytes,
+                        media_type: attachment.mime.clone(),
+                    },
+                    crate::media::MediaKind::Audio => ContentBlock::Audio {
+                        data: bytes,
+                        media_type: attachment.mime.clone(),
+                    },
+                }),
+                None => content.push(ContentBlock::ResourceLink {
+                    uri: attachment.path.clone(),
+                    mime_type: Some(attachment.mime.clone()),
+                }),
+            }
+        }
+        if !partition.media.is_empty() {
+            let (images, audios) = content.iter().fold((0usize, 0usize), |(i, a), b| match b {
+                ContentBlock::Image { .. } => (i + 1, a),
+                ContentBlock::Audio { .. } => (i, a + 1),
+                _ => (i, a),
+            });
+            tracing::info!(
+                conversation_id = %self.conversation_id,
+                msg_id = %data.msg_id,
+                images,
+                audios,
+                "session prompt carries native media content blocks"
+            );
         }
         // DEV (`--dump-prompts`): borrow the final blocks BEFORE they move into
         // Command::Send. No-op / best-effort — never affects the dispatch.
@@ -1784,7 +1904,13 @@ fn resolve_session_cli_program(
         });
     }
 
-    aionui_runtime::resolve_bundled_cli(backend_label).or_else(|| aionui_runtime::resolve_command_path(backend_label))
+    // PATH only. claude/codex used to prefer a bundled, version-pinned copy,
+    // which silently diverged from whatever the user had installed: the same
+    // prompt behaved differently in AionUi and in the user's terminal, with
+    // nothing on screen explaining why. They are now treated exactly like agy —
+    // the user's own install is the one that runs, and a drift from the version
+    // this integration was verified against is reported rather than hidden.
+    aionui_runtime::resolve_command_path(backend_label)
 }
 
 /// Assemble the direct-CLI spawn env (legacy spawn-surface parity; order
@@ -2175,6 +2301,8 @@ fn session_event_name(e: &SessionEvent) -> &'static str {
         SessionEvent::Detached { .. } => "Detached",
         SessionEvent::Permission { .. } => "Permission",
         SessionEvent::PermissionResolved { .. } => "PermissionResolved",
+        SessionEvent::Ask { .. } => "Ask",
+        SessionEvent::AskResolved { .. } => "AskResolved",
         SessionEvent::UsageDelta { .. } => "UsageDelta",
         SessionEvent::ConfigChanged { .. } => "ConfigChanged",
         SessionEvent::BackendBound { .. } => "BackendBound",
@@ -2406,7 +2534,8 @@ fn spawn_event_pump(
                     | SessionEvent::ThoughtDelta { .. }
                     | SessionEvent::ToolCall { .. }
                     | SessionEvent::ToolResult { .. }
-                    | SessionEvent::Permission { .. } => {
+                    | SessionEvent::Permission { .. }
+                    | SessionEvent::Ask { .. } => {
                         tracing::info!(
                             conv_id = %conversation_id,
                             event = session_event_name(&env.event),
@@ -2583,6 +2712,7 @@ fn spawn_event_pump(
                 // turns (forward + persist), so no pump-side broadcast bypass.
                 let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
             }
+            runtime.set_live_background_tasks(workflow_cards.len());
 
             // Track in-flight workflow/subagent refs so a non-blocking Workflow's
             // intermediate `result` frame does not prematurely terminate the turn.
@@ -2684,6 +2814,7 @@ fn spawn_event_pump(
                             ) {
                                 let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
                             }
+                            runtime.set_live_background_tasks(workflow_cards.len());
                             // Same per-turn closure the real terminal arm performs:
                             // close every tool call left open as Canceled BEFORE the
                             // Finish (the relay stops forwarding the turn at Finish).
@@ -2790,7 +2921,30 @@ fn spawn_event_pump(
                     ) {
                         let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
                     }
+                    runtime.set_live_background_tasks(workflow_cards.len());
+                    // Calls deliberately left running past this turn end (see below);
+                    // re-registered after the drain so their late frames still resolve.
+                    let mut kept_open: Vec<(String, String)> = Vec::new();
                     for (call_id, name) in open_tools.drain() {
+                        // codex's unified exec starts the command in a background PTY
+                        // and lets the model END ITS TURN while the process runs; the
+                        // completion item arrives later (verified live 0.145.0: every
+                        // commandExecution item carries `source: "unifiedExecStartup"`).
+                        // Cancelling such a card on a CLEAN turn end is a lie — the
+                        // command is still running and its own terminal will settle the
+                        // card — and it is exactly what users read as "the AI stopped by
+                        // itself". Same rule as background-task cards above: keep them on
+                        // a clean end, take them down on cancel/error/crash.
+                        if keep_background && is_detached_exec_call(tool_args.get(&call_id)) {
+                            tracing::info!(
+                                conv_id = %conversation_id,
+                                %call_id,
+                                tool = %name,
+                                "session-pump: leaving detached exec tool call open past turn end"
+                            );
+                            kept_open.push((call_id, name));
+                            continue;
+                        }
                         tracing::info!(
                             conv_id = %conversation_id,
                             %call_id,
@@ -2806,6 +2960,9 @@ fn spawn_event_pump(
                             output: None,
                             description: None,
                         }));
+                    }
+                    for (call_id, name) in kept_open {
+                        open_tools.insert(call_id, name);
                     }
                     // A terminal TurnResult decided this turn; a later Detached is then
                     // an absorbed teardown, not a mid-turn crash (see `crash_outcome`).
@@ -2832,9 +2989,12 @@ fn spawn_event_pump(
                     }
                     // Live tool-output accumulators are per-turn; the authoritative
                     // full output already rode each ToolResult. Drop them so a long
-                    // session doesn't retain every turn's stdout.
-                    tool_output.clear();
-                    tool_name.clear();
+                    // session doesn't retain every turn's stdout — EXCEPT for calls
+                    // still open past this turn end (detached exec): their terminal
+                    // arrives minutes later and `stamp_tool_name` must still find the
+                    // name, or the card re-renders nameless.
+                    tool_output.retain(|call_id, _| open_tools.contains_key(call_id));
+                    tool_name.retain(|call_id, _| open_tools.contains_key(call_id));
                     // Reset the per-turn visibility flag for the next turn.
                     saw_visible_output = false;
                 }
@@ -2962,6 +3122,7 @@ fn spawn_event_pump(
         ) {
             let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
         }
+        runtime.set_live_background_tasks(workflow_cards.len());
     });
 }
 
@@ -3582,6 +3743,21 @@ fn update_workflow_cards(
 /// long ago. Without this a killed or crashed workflow leaves its container card
 /// and every agent row spinning forever, and `hasRunningToolMessages` keeps the
 /// conversation's running indicator lit with nothing left to clear it.
+/// Does this tool call's recorded arguments identify a codex command that runs
+/// DETACHED from the prompt turn?
+///
+/// codex's `unified_exec` starts the process in a PTY with a background exit
+/// watcher, so the model may finish its turn long before the command's own
+/// completion item arrives. The item carries that provenance verbatim in
+/// `source: "unifiedExecStartup"` (a codex wire field passed through by
+/// `codex_conn`, live-captured 0.145.0); `unifiedExecInteraction` is the
+/// follow-up interaction shape of the same family.
+fn is_detached_exec_call(args: Option<&serde_json::Value>) -> bool {
+    args.and_then(|v| v.get("source"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| s.starts_with("unifiedExec"))
+}
+
 fn settle_workflow_cards(
     cards: &mut std::collections::HashMap<String, crate::workflow_progress::WorkflowCard>,
     status: crate::workflow_progress::CardStatus,
@@ -3699,6 +3875,7 @@ fn empty_turn_tip(outcome: &aionui_session::TurnOutcome) -> Option<TipsEventData
         tip_type,
         code: Some(code.to_owned()),
         params: None,
+        supersedes_key: None,
     })
 }
 
@@ -3894,6 +4071,22 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 ),
             )]
         }
+        // Structured question (claude AskUserQuestion) → its own `ask` frame; the
+        // frontend renders a multi-question card and answers via confirm with the
+        // full per-question set. Deliberately NOT projected into AcpPermission
+        // options anymore — that flattening dropped every question after the first
+        // (the reason the tool was disabled at spawn until 2026-08-04).
+        SessionEvent::Ask { request_id, questions } => {
+            vec![AgentStreamEvent::Ask(serde_json::json!({
+                "session_id": conversation_id,
+                "request_id": request_id,
+                "questions": questions,
+            }))]
+        }
+        // The FSM counter side is handled by the reducer; the frontend closes the
+        // card on its own answer. A cross-client "someone else answered" push is a
+        // follow-up (the recovery REST path re-lists open asks on reload).
+        SessionEvent::AskResolved { .. } => Vec::new(),
         // Per-turn usage/cost → the AcpContextUsage passthrough frame the frontend
         // usage indicator reads (shape: cumulative token counters).
         SessionEvent::UsageDelta {
@@ -4001,6 +4194,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             level,
             message,
             localized,
+            supersedes_key,
         } => {
             let tip_type = match level {
                 aionui_session::NoticeLevel::Info => TipType::Info,
@@ -4019,6 +4213,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 tip_type,
                 code,
                 params,
+                supersedes_key,
             })]
         }
         // Agent-generated session title (claude generate_session_title, spec
@@ -4888,6 +5083,7 @@ mod translate_tests {
                     level,
                     message: "set effort: rejected by agent".into(),
                     localized: None,
+                    supersedes_key: None,
                 },
                 "conv-1",
                 false,
@@ -6002,6 +6198,235 @@ mod pump_tests {
         }
     }
 
+    /// Backend that records every dispatched Command and advertises
+    /// image-capable prompt blocks — for asserting the media partition at
+    /// the Command::Send boundary.
+    struct RecordingBackend {
+        commands: std::sync::Mutex<Vec<Command>>,
+        blocks: aionui_session::BlockSet,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for RecordingBackend {
+        async fn dispatch(&self, c: Command) -> Result<CommandReceipt, BackendError> {
+            let admission = match c {
+                Command::Send { .. } => Admission::Started,
+                _ => Admission::NoTurn,
+            };
+            self.commands.lock().unwrap().push(c);
+            Ok(CommandReceipt {
+                accepted: true,
+                admission,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::iter(Vec::new()).boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                prompt_blocks: self.blocks,
+                ..Capabilities::default()
+            }
+        }
+    }
+
+    // Image-capable backend: an image attachment leaves the [[AION_FILES]]
+    // text and rides as a native Image block; non-media files keep the
+    // path-text + resource-link form.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_message_partitions_image_into_native_block() {
+        let dir = std::env::temp_dir().join("aionui-session-media-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("cat.png");
+        std::fs::write(&img, b"catbytes").unwrap();
+        let img = img.to_string_lossy().into_owned();
+        let pdf = dir.join("doc.pdf");
+        std::fs::write(&pdf, b"pdfbytes").unwrap();
+        let pdf = pdf.to_string_lossy().into_owned();
+
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet {
+                text: true,
+                image: true,
+                audio: false,
+                resource: true,
+                at_mention: false,
+            },
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend.clone() as Arc<dyn SessionBackend>,
+            None,
+        );
+        let marker = aionui_common::constants::AIONUI_FILES_MARKER;
+        crate::agent_task::IAgentTask::send_message(
+            task.as_ref(),
+            SendMessageData {
+                content: format!("see\n\n{marker}\n{img}\n{pdf}"),
+                msg_id: "m-media".into(),
+                turn_id: None,
+                files: vec![img.clone(), pdf.clone()],
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let commands = backend.commands.lock().unwrap();
+        let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
+            panic!("expected a Send command");
+        };
+        assert_eq!(content.len(), 3, "text + pdf link + image block: {content:?}");
+        let ContentBlock::Text(text) = &content[0] else {
+            panic!("expected text first: {content:?}");
+        };
+        assert_eq!(text, &format!("see\n\n{marker}\n{pdf}"));
+        let ContentBlock::ResourceLink { uri, .. } = &content[1] else {
+            panic!("expected resource link second: {content:?}");
+        };
+        assert_eq!(uri, &pdf);
+        let ContentBlock::Image { data, media_type } = &content[2] else {
+            panic!("expected image block third: {content:?}");
+        };
+        assert_eq!(data, b"catbytes");
+        assert_eq!(media_type, "image/png");
+    }
+
+    /// A codex detached exec (`source: unifiedExecStartup`) is still RUNNING when
+    /// the model ends its prompt turn; the pump must not paint it Canceled — the
+    /// command's own completion settles it later. A foreground tool left open at
+    /// the same clean turn end must still be cancelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_turn_end_keeps_detached_exec_card_but_cancels_others() {
+        use aionui_session::TurnOutcome;
+        let detached = SessionEvent::ToolCall {
+            tool_use_id: "call-detached".into(),
+            name: "commandExecution".into(),
+            subagent: aionui_session::SubagentKind::Inline,
+            input: serde_json::json!({
+                "type": "commandExecution",
+                "command": "/bin/zsh -lc 'bun run build'",
+                "status": "inProgress",
+                "source": "unifiedExecStartup"
+            }),
+            parent_tool_use_id: None,
+        };
+        let foreground = SessionEvent::ToolCall {
+            tool_use_id: "call-plain".into(),
+            name: "fileChange".into(),
+            subagent: aionui_session::SubagentKind::Inline,
+            input: serde_json::json!({ "type": "fileChange" }),
+            parent_tool_use_id: None,
+        };
+        let clean_end = SessionEvent::TurnResult {
+            is_error: false,
+            api_error_status: None,
+            result_text: String::new(),
+            epoch: 0,
+            outcome: TurnOutcome::Completed {
+                stop_reason: aionui_session::StopReason::EndTurn,
+            },
+        };
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(ScriptBackend(vec![env(detached), env(foreground), env(clean_end)]));
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        let _ = task;
+
+        let mut canceled: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(AgentStreamEvent::ToolCall(data))) if data.status == ToolCallStatus::Canceled => {
+                    canceled.push(data.call_id);
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(
+            !canceled.iter().any(|id| id == "call-detached"),
+            "detached exec card must survive a clean turn end, got cancels: {canceled:?}"
+        );
+        assert!(
+            canceled.iter().any(|id| id == "call-plain"),
+            "a non-detached tool left open must still be cancelled, got: {canceled:?}"
+        );
+    }
+
+    /// The detached exec's terminal lands MINUTES after the turn ended. The
+    /// per-turn name map must keep the entry for calls left open, or the late
+    /// frame goes out nameless and the card re-renders with a blank title.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_terminal_of_a_kept_open_exec_still_carries_the_tool_name() {
+        use aionui_session::TurnOutcome;
+        let detached = SessionEvent::ToolCall {
+            tool_use_id: "call-detached".into(),
+            name: "commandExecution".into(),
+            subagent: aionui_session::SubagentKind::Inline,
+            input: serde_json::json!({ "type": "commandExecution", "source": "unifiedExecStartup" }),
+            parent_tool_use_id: None,
+        };
+        let clean_end = SessionEvent::TurnResult {
+            is_error: false,
+            api_error_status: None,
+            result_text: String::new(),
+            epoch: 0,
+            outcome: TurnOutcome::Completed {
+                stop_reason: aionui_session::StopReason::EndTurn,
+            },
+        };
+        let late_result = SessionEvent::ToolResult {
+            tool_use_id: "call-detached".into(),
+            is_error: false,
+            content: vec![],
+            parent_tool_use_id: None,
+        };
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(ScriptBackend(vec![env(detached), env(clean_end), env(late_result)]));
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        let _ = task;
+
+        let mut terminal_names: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(AgentStreamEvent::ToolCall(data)))
+                    if data.call_id == "call-detached" && data.status == ToolCallStatus::Completed =>
+                {
+                    terminal_names.push(data.name.clone());
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(
+            terminal_names.iter().any(|n| n == "commandExecution"),
+            "late terminal must keep the tool name, got: {terminal_names:?}"
+        );
+    }
+
     fn env(event: SessionEvent) -> SessionEnvelope {
         env_gen(1, event)
     }
@@ -6049,6 +6474,41 @@ mod pump_tests {
             // sequence flow — so no frame can predate the test's subscribe().
             futures_util::stream::once(async move { gate.notified().await })
                 .flat_map(move |_| futures_util::stream::iter(script.clone()))
+                .boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    /// Like `GatedScriptBackend`, but the stream stays OPEN after the script —
+    /// for asserting mid-flight pump state (a closed stream tears the pump down,
+    /// which settles every card and zeroes `live_background_tasks`).
+    struct HeldOpenScriptBackend {
+        script: Vec<SessionEnvelope>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for HeldOpenScriptBackend {
+        async fn dispatch(&self, c: Command) -> Result<CommandReceipt, BackendError> {
+            let admission = match c {
+                Command::Send { .. } => Admission::Started,
+                _ => Admission::NoTurn,
+            };
+            Ok(CommandReceipt {
+                accepted: true,
+                admission,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            let gate = self.gate.clone();
+            let script = self.script.clone();
+            futures_util::stream::once(async move { gate.notified().await })
+                .flat_map(move |_| futures_util::stream::iter(script.clone()))
+                .chain(futures_util::stream::pending())
                 .boxed()
         }
         fn capabilities(&self) -> Capabilities {
@@ -7222,6 +7682,134 @@ mod pump_tests {
         );
     }
 
+    /// The idle scanner reads `live_background_tasks()` to keep from killing an
+    /// agent whose background work outlives its turn (five real IdleTimeout
+    /// misfires over 2026-08-08..10, each cutting down a 10-45 min gate run).
+    /// A declared background card that survives its launch turn must be counted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_background_card_counts_as_live_background_task() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_bash".into(),
+                name: "Bash".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"command": "sleep 900", "run_in_background": true}),
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-bash".into(),
+                label: Some("local_bash".into()),
+                status: SubagentStatus::Running,
+                parent_ref: Some("toolu_bash".into()),
+                kind: Some(SubagentTaskKind::Other),
+            }),
+            // Clean turn end: the background card survives it (that is the
+            // whole point of #732) — and must keep the agent counted busy.
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+        ];
+        let gate = Arc::new(tokio::sync::Notify::new());
+        // Held-open stream: the background task is still "running", so the
+        // backend must not close (teardown settles cards and zeroes the count).
+        let backend: Arc<dyn SessionBackend> = Arc::new(HeldOpenScriptBackend {
+            script,
+            gate: gate.clone(),
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let _rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        gate.notify_one();
+
+        // The pump processes the script asynchronously; poll instead of racing it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::agent_task::IAgentTask::live_background_tasks(task.as_ref()) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "open background card never reflected in live_background_tasks"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Counterpart: the task's own terminal settles the card and the counter
+    /// must drop back to 0 — otherwise the idle scanner would protect the
+    /// agent forever and idle cleanup would never fire again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_card_terminal_clears_live_background_task() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let bash_env = |status: SubagentStatus, kind: Option<SubagentTaskKind>| {
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-bash".into(),
+                label: Some("local_bash".into()),
+                status,
+                parent_ref: Some("toolu_bash".into()),
+                kind,
+            })
+        };
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_bash".into(),
+                name: "Bash".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"command": "sleep 1", "run_in_background": true}),
+                parent_tool_use_id: None,
+            }),
+            bash_env(SubagentStatus::Running, Some(SubagentTaskKind::Other)),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+            // The out-of-turn terminal (task_notification on the wire).
+            bash_env(SubagentStatus::Completed, None),
+        ];
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
+            script,
+            gate: gate.clone(),
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        gate.notify_one();
+
+        // Drain to exhaustion: after the terminal the card is gone, the ticker
+        // disarms, and the stream quiesces. Require the card to have existed so
+        // the final 0 is a transition, not a vacuous default.
+        let mut saw_card = false;
+        while let Ok(Ok(ev)) = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+            if matches!(ev, AgentStreamEvent::WorkflowProgress(_)) {
+                saw_card = true;
+            }
+        }
+        assert!(saw_card, "the background card must have opened during the script");
+        assert_eq!(
+            crate::agent_task::IAgentTask::live_background_tasks(task.as_ref()),
+            0,
+            "a settled card must release the idle-scanner protection"
+        );
+    }
+
     // A workflow-launch result that is itself an ERROR is NOT suppressed — the user
     // must see a genuine failure even mid-workflow (suppression covers only clean
     // completion ordering, per the fixture invariant).
@@ -7334,8 +7922,7 @@ mod pump_tests {
         // watcher owns them.
         let last_turn_frame = frames
             .iter()
-            .filter(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
-            .next_back();
+            .rfind(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)));
         assert!(
             matches!(last_turn_frame, Some(AgentStreamEvent::Finish(_))),
             "the settled Finish is the turn's terminal frame, got {seq:?}"
@@ -7407,8 +7994,7 @@ mod pump_tests {
         assert!(
             frames
                 .iter()
-                .filter(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
-                .next_back()
+                .rfind(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
                 .is_some_and(|f| matches!(f, AgentStreamEvent::Finish(_))),
             "the clean result's Finish must flow while a background bash is alive, got {seq:?}"
         );
@@ -7737,12 +8323,16 @@ mod pump_tests {
         let backend: Arc<dyn SessionBackend> = Arc::new(PendingPermBackend(aionui_session::PendingPermissionView {
             request_id: "req-recover".into(),
             tool_name: "AskUserQuestion".into(),
-            questions: Some(serde_json::json!({
-                "questions": [{
-                    "question": "Which?",
-                    "options": [{"label": "A"}, {"label": "B"}]
-                }]
-            })),
+            // The BARE questions[] array — matching what claude_conn's
+            // pending_permission_requests() actually stores
+            // (`perm.input.get("questions").cloned()`). The old fixture carried
+            // the {questions:[…]} wrapper, so the projection passed here while
+            // silently degrading to Allow/Reject against the real backend
+            // (caught live in the 2026-08-04 e2e).
+            questions: Some(serde_json::json!([{
+                "question": "Which?",
+                "options": [{"label": "A"}, {"label": "B"}]
+            }])),
         }));
         let task = SessionAgentTask::new(
             AgentType::Acp,
@@ -8695,5 +9285,28 @@ mod catalog_writeback_tests {
             nested_len(msg.handshake.available_modes.as_ref(), "available_modes") > 0,
             "expected the modes-only partial to be published"
         );
+    }
+
+    #[test]
+    fn detached_exec_calls_are_recognised_by_codex_item_source() {
+        use serde_json::json;
+        // Live-captured shape (codex 0.145.0): every commandExecution item the
+        // model launches carries `source: "unifiedExecStartup"`.
+        let startup = json!({
+            "type": "commandExecution",
+            "command": "/bin/zsh -lc 'bun run build'",
+            "status": "inProgress",
+            "source": "unifiedExecStartup"
+        });
+        assert!(super::is_detached_exec_call(Some(&startup)));
+        let interaction = json!({ "type": "commandExecution", "source": "unifiedExecInteraction" });
+        assert!(super::is_detached_exec_call(Some(&interaction)));
+
+        // Foreground/other sources and non-codex tools must still be cancelled
+        // at turn end (an orphaned card would otherwise spin forever).
+        assert!(!super::is_detached_exec_call(Some(&json!({ "source": "agent" }))));
+        assert!(!super::is_detached_exec_call(Some(&json!({ "source": "userShell" }))));
+        assert!(!super::is_detached_exec_call(Some(&json!({ "command": "ls" }))));
+        assert!(!super::is_detached_exec_call(None));
     }
 }

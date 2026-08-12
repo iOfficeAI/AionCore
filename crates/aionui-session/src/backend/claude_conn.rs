@@ -231,18 +231,12 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
     // syscall-free fn.
     args.push("--allow-dangerously-skip-permissions".to_string());
 
-    // TEMPORARY: disable AskUserQuestion until the multi-question interactive card is
-    // ported to the current frontend. claude's AskUserQuestion can ask several
-    // questions at once (`{questions:[…]}`), but the active frontend only renders a
-    // single-question permission card, so a multi-question ask would silently drop all
-    // but the first. Rather than ship that half-answer behaviour, deny the tool at
-    // spawn time — claude then falls back to plain-text questions, which render fully.
-    // Mirrors the official @agentclientprotocol/claude-agent-acp adapter, which
-    // likewise lists `AskUserQuestion` in `disallowedTools` for the same reason
-    // ("not a great way to expose this over ACP at the moment"). Remove once the
-    // frontend gains a multi-question renderer.
-    args.push("--disallowed-tools".to_string());
-    args.push("AskUserQuestion".to_string());
+    // AskUserQuestion is ENABLED: the frontend now renders a real multi-question
+    // card fed by `SessionEvent::Ask` and answers through `Command::AnswerAsk`
+    // (2026-08-04 spec 2026-08-04-askuserquestion-统一问询设计.md). This used to be
+    // `--disallowed-tools AskUserQuestion` while the active frontend could only
+    // show a single-question permission card — removing the flag is the claude
+    // half of P0; the adapter routes the tool to `Ask`, never to `Permission`.
 
     if let Some(model) = config.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         args.push("--model".to_string());
@@ -352,6 +346,10 @@ impl BackendConnection for ClaudeConnection {
         // first `capabilities()` read; a late response is merged on the next read
         // (same late-discovery contract as codex `model/list`).
         backend.request_initialize().await;
+        // Report a claude whose version differs from the release AionUi
+        // verified. claude runs from the user's own install (nothing is
+        // bundled), so this is the same situation agy has always been in.
+        backend.spawn_version_check();
         Ok(Arc::new(backend))
     }
 
@@ -935,14 +933,90 @@ impl ClaudeSessionBackend {
             request_id = %request_id,
             "claude control_response (permission answer) written to stdin"
         );
-        // RA -1: the reducer leaves requires-action only on PermissionResolved.
+        // RA -1: resolve the SAME counter the originating event incremented. An
+        // AskUserQuestion raised `Ask` (waiting_on_question), and the REST
+        // recovery card answers it through THIS legacy AnswerPermission path
+        // (Confirmation options carry the answer labels) — emitting
+        // PermissionResolved here would decrement waiting_on_approval instead,
+        // leaving waiting_on_question pinned at >0 and the session locked out of
+        // can_send forever after a recovered ask is answered.
+        let cur_gen = self.turn_gen.load(Ordering::SeqCst);
+        let resolve_event = if pending.tool_name == "AskUserQuestion" {
+            SessionEvent::AskResolved {
+                request_id: request_id.to_string(),
+            }
+        } else {
+            SessionEvent::PermissionResolved {
+                request_id: request_id.to_string(),
+                kind: crate::event::PermissionKind::Tool,
+            }
+        };
+        let _ = self.event_tx.send(SessionEnvelope {
+            session_id: self.session_id.clone(),
+            turn_gen: cur_gen,
+            event: resolve_event,
+        });
+        Ok(CommandReceipt {
+            accepted: true,
+            admission: Admission::NoTurn,
+            turn_gen: cur_gen,
+        })
+    }
+
+    /// Wire an AskUserQuestion answer (`Command::AnswerAsk`) to claude's blocking
+    /// `can_use_tool` request. Same pending map + keyed `control_response` as
+    /// `answer_permission` — on the WIRE this is still can_use_tool — but the
+    /// b-side event is `AskResolved` (the question counter), and the decision is
+    /// derived from `answers`: `Some` → allow with `updatedInput.answers`
+    /// (build_control_response's existing AskUserQuestion path), `None` (user
+    /// dismissed the card) → deny. `None` MUST NOT become an allow: claude
+    /// silently drops unanswered questions on allow (live 2.1.178) — that would
+    /// be silent data loss, not a re-ask.
+    async fn answer_ask(
+        &self,
+        request_id: &str,
+        answers: Option<Vec<super::types::QuestionAnswer>>,
+    ) -> Result<CommandReceipt, BackendError> {
+        use std::sync::atomic::Ordering;
+        let pending = self
+            .pending_perms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request_id);
+        let Some(pending) = pending else {
+            return Err(BackendError::Transport(format!(
+                "no pending ask for request_id {request_id}"
+            )));
+        };
+        let (decision, answer_slice) = match &answers {
+            Some(list) => (super::types::PermissionDecision::Approved, list.as_slice()),
+            None => (super::types::PermissionDecision::Denied, &[][..]),
+        };
+        let response = build_control_response(request_id, &pending, decision, None, answer_slice);
+        {
+            let mut guard = self.stdin.lock().await;
+            let stdin = guard
+                .as_mut()
+                .ok_or_else(|| BackendError::Transport("claude stdin unavailable".into()))?;
+            self.adapter
+                .write_control_response(stdin, &response)
+                .await
+                .map_err(|e| BackendError::Transport(format!("write control_response: {e}")))?;
+        }
+        // Lifecycle marker, same wedge class as permission answers: "user answered
+        // but claude never resumed" hinges on whether this write happened.
+        tracing::info!(
+            conversation_id = %self.session_id,
+            request_id = %request_id,
+            answered = answers.is_some(),
+            "claude control_response (ask answer) written to stdin"
+        );
         let cur_gen = self.turn_gen.load(Ordering::SeqCst);
         let _ = self.event_tx.send(SessionEnvelope {
             session_id: self.session_id.clone(),
             turn_gen: cur_gen,
-            event: SessionEvent::PermissionResolved {
+            event: SessionEvent::AskResolved {
                 request_id: request_id.to_string(),
-                kind: crate::event::PermissionKind::Tool,
             },
         });
         Ok(CommandReceipt {
@@ -950,6 +1024,50 @@ impl ClaudeSessionBackend {
             admission: Admission::NoTurn,
             turn_gen: cur_gen,
         })
+    }
+
+    /// Tell the user once per conversation when the installed claude is not the
+    /// release AionUi verified.
+    ///
+    /// Fire-and-forget: the probe spawns `claude --version` and a failure only
+    /// costs the drift claim, never the session.
+    fn spawn_version_check(&self) {
+        use std::sync::atomic::Ordering;
+        // Both live on the wake recipe — it is what re-spawns the CLI, so it
+        // holds the spawner and the resolved program path.
+        let spawner = Arc::clone(&self.wake.spawner);
+        let session_id = self.session_id.clone();
+        let program = self
+            .wake
+            .cli_program
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("claude"));
+        let event_tx = self.event_tx.clone();
+        let turn_gen = Arc::clone(&self.turn_gen);
+        tokio::spawn(async move {
+            let Some((level, message, localized)) =
+                crate::backend::cli_version::session_drift_notice(&spawner, "claude", &program, &session_id).await
+            else {
+                return;
+            };
+            // Retry until subscribed: a broadcast send with no receiver is
+            // discarded, and this notice has no second chance.
+            crate::backend::cli_version::broadcast_notice(
+                &event_tx,
+                SessionEnvelope {
+                    session_id: session_id.clone(),
+                    turn_gen: turn_gen.load(Ordering::SeqCst),
+                    event: SessionEvent::Notice {
+                        level,
+                        message,
+                        localized: Some(localized),
+                        supersedes_key: None,
+                    },
+                },
+                "claude",
+            )
+            .await;
+        });
     }
 
     /// G2: send a host→CLI `control_request` (set_model / set_permission_mode) over
@@ -2151,6 +2269,7 @@ fn sniff_set_config_reject(
             level: crate::event::NoticeLevel::Warning,
             message: format!("{label} failed: {err}"),
             localized: None,
+            supersedes_key: None,
         },
     });
 }
@@ -2840,6 +2959,9 @@ impl SessionBackend for ClaudeSessionBackend {
                 self.answer_permission(&request_id, decision, selected.as_deref(), &answers)
                     .await
             }
+            // AnswerAsk: the structured-question twin (wire = same can_use_tool
+            // control_response; b-side event = AskResolved on its own counter).
+            Command::AnswerAsk { request_id, answers } => self.answer_ask(&request_id, answers).await,
             // Acknowledge: a conversation-side fold (done-unseen → seen). NO claude
             // wire; accept as a local no-op (§C1).
             Command::Acknowledge { .. } => {
@@ -3116,12 +3238,10 @@ mod tests {
                 "--permission-mode".to_string(),
                 "default".to_string(),
                 "--allow-dangerously-skip-permissions".to_string(),
-                "--disallowed-tools".to_string(),
-                "AskUserQuestion".to_string(),
             ],
             "an unconfigured claude session is gated as `default` (never silently bypassed), \
-             with runtime-bypass UNLOCKED but not activated, and AskUserQuestion denied \
-             (temporary — no multi-question frontend renderer yet)"
+             with runtime-bypass UNLOCKED but not activated, and AskUserQuestion ENABLED \
+             (the Ask card renders multi-question payloads)"
         );
         assert_eq!(build_claude_mcp_config(&[]), None, "no servers → no --mcp-config");
     }
@@ -3225,12 +3345,10 @@ mod tests {
                 "--permission-mode".to_string(),
                 "default".to_string(),
                 "--allow-dangerously-skip-permissions".to_string(),
-                "--disallowed-tools".to_string(),
-                "AskUserQuestion".to_string(),
             ],
             "a blank mode is gated as `default` (never silently bypassed); the unlock flag \
              is always present so a later in-band switch to bypass is accepted; \
-             AskUserQuestion is denied (temporary)"
+             AskUserQuestion is enabled (the Ask card renders multi-question payloads)"
         );
     }
 

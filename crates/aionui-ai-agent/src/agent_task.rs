@@ -21,7 +21,7 @@ use crate::manager::acp::{AcpAgentManager, RequiredFullAutoApplication};
 use crate::manager::aionrs::AionrsAgentManager;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
-use crate::types::SendMessageData;
+use crate::types::{PromptMediaCaps, SendMessageData};
 
 use aionui_api_types::{
     GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SetConfigOptionResponse,
@@ -56,8 +56,23 @@ pub trait IAgentTask: Send + Sync {
     /// Timestamp (ms) of the last activity (message send, event received).
     fn last_activity_at(&self) -> TimestampMs;
 
+    /// Number of live (declared, not yet terminal) background containers —
+    /// workflows, background bashes, background subagents. These outlive their
+    /// launching turn by design and emit no mid-flight frames, so `status` and
+    /// `last_activity_at` alone misread a busy agent as idle. Backends without
+    /// a background-task subsystem report 0.
+    fn live_background_tasks(&self) -> usize {
+        0
+    }
+
     /// Subscribe to the agent's stream event channel.
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent>;
+
+    /// Prompt media capabilities the agent declared. Defaults to none —
+    /// callers must then deliver attachments as file paths, not blocks.
+    fn prompt_media_caps(&self) -> PromptMediaCaps {
+        PromptMediaCaps::default()
+    }
 
     /// Send a user message to the agent. Returns once the agent has
     /// accepted the turn; actual streaming proceeds on the broadcast
@@ -100,6 +115,19 @@ pub trait IMockAgent: IAgentTask {
         _always_allow: bool,
     ) -> Result<(), AgentError> {
         Ok(())
+    }
+    /// Answer a structured question card (AskUserQuestion) — the DEDICATED
+    /// channel, separate from the permission confirm path (2026-08-05 ruling).
+    /// `answers: None` = the user dismissed the card (a deny on the wire).
+    /// Default: not a question-capable agent.
+    fn answer_ask(
+        &self,
+        _request_id: &str,
+        _answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+    ) -> Result<(), AgentError> {
+        Err(AgentError::BadRequest(
+            "answer_ask is not supported by this agent".into(),
+        ))
     }
     fn get_session_key(&self) -> Option<String> {
         None
@@ -211,6 +239,12 @@ impl AgentInstance {
         self.as_task().last_activity_at()
     }
 
+    /// Number of live background containers (workflows / background bashes /
+    /// background subagents) still in flight.
+    pub fn live_background_tasks(&self) -> usize {
+        self.as_task().live_background_tasks()
+    }
+
     /// Subscribe to the stream event channel.
     pub fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.as_task().subscribe()
@@ -291,6 +325,24 @@ impl AgentInstance {
             Self::Session(m) => m.confirm(msg_id, call_id, data, always_allow),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.confirm(msg_id, call_id, data, always_allow),
+        }
+    }
+
+    /// Answer a structured question card via the dedicated channel.
+    pub fn answer_ask(
+        &self,
+        request_id: &str,
+        answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+    ) -> Result<(), AgentError> {
+        match self {
+            // Only the direct-CLI session path has a question channel today
+            // (claude AskUserQuestion); ACP/aionrs have none to answer on.
+            Self::Acp(_) | Self::Aionrs(_) => Err(AgentError::BadRequest(
+                "answer_ask is not supported by this agent".into(),
+            )),
+            Self::Session(m) => m.answer_ask(request_id, answers),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(m) => m.answer_ask(request_id, answers),
         }
     }
 

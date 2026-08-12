@@ -260,3 +260,127 @@ async fn remove_attached_then_workspace_immutable() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["code"], "workspace_entry_immutable");
 }
+
+// ── POST /api/projects/{id}/resolve-ref ────────────────────────────────
+
+#[tokio::test]
+async fn resolve_ref_upgrades_a_local_path_under_a_root() {
+    let (router, project_id, workspace_pe_id, dir, _db) = setup().await;
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    let file = dir.path().join("src/main.rs");
+    std::fs::write(&file, b"fn main() {}").unwrap();
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        &format!("/api/projects/{project_id}/resolve-ref"),
+        Some(json!({"file": {"kind": "local", "path": file.to_string_lossy()}})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["file"]["kind"], "project");
+    assert_eq!(body["data"]["file"]["pe_id"], workspace_pe_id);
+    assert_eq!(body["data"]["file"]["relative_path"], "src/main.rs");
+    assert_eq!(body["data"]["upgraded"], true);
+
+    // The absolute path must not come back in any form: the client addresses by
+    // identity and never had this path to begin with.
+    let rendered = body.to_string();
+    assert!(
+        !rendered.contains("src/main.rs\"") || !rendered.contains(&dir.path().to_string_lossy().to_string()),
+        "response must not echo the absolute path, got {rendered}"
+    );
+    assert!(
+        !rendered.contains(&dir.path().to_string_lossy().to_string()),
+        "response must not echo the root's absolute path, got {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_ref_echoes_a_path_outside_every_root() {
+    let (router, project_id, _pe, _dir, _db) = setup().await;
+    let outside = tempfile::tempdir().unwrap();
+    let file = outside.path().join("other.txt");
+    std::fs::write(&file, b"x").unwrap();
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        &format!("/api/projects/{project_id}/resolve-ref"),
+        Some(json!({"file": {"kind": "local", "path": file.to_string_lossy()}})),
+    )
+    .await;
+
+    // Not an error: the caller still needs an addressable ref, and "outside the
+    // project" is an ordinary answer.
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["file"]["kind"], "local");
+    assert_eq!(body["data"]["upgraded"], false);
+}
+
+/// `upgraded` exists so a caller can skip a state write; it must track whether the
+/// ref actually changed, not merely whether the request succeeded.
+#[tokio::test]
+async fn resolve_ref_reports_not_upgraded_for_an_already_project_ref() {
+    let (router, project_id, workspace_pe_id, _dir, _db) = setup().await;
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        &format!("/api/projects/{project_id}/resolve-ref"),
+        Some(json!({
+            "file": {"kind": "project", "pe_id": workspace_pe_id, "relative_path": "a.md"}
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["file"]["kind"], "project");
+    assert_eq!(body["data"]["upgraded"], false);
+}
+
+/// An unknown project must not resolve. The file has to exist for this to prove
+/// anything: a missing path returns early — before any project lookup — so pointing
+/// at a nonexistent file would yield 200 regardless of the project id and the test
+/// would assert nothing about scoping.
+#[tokio::test]
+async fn resolve_ref_on_an_unknown_project_is_not_found() {
+    let (router, _project_id, _pe, dir, _db) = setup().await;
+    let file = dir.path().join("real.md");
+    std::fs::write(&file, b"x").unwrap();
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/projects/proj_does_not_exist/resolve-ref",
+        Some(json!({"file": {"kind": "local", "path": file.to_string_lossy()}})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "project_not_found");
+}
+
+/// The early return for a missing file happens before the project is read, so an
+/// unknown project plus a missing file is a 200 with the ref echoed back. Pinned
+/// deliberately: it is the ordering that makes the missing-file contract work, and
+/// a future reader moving the project lookup earlier would turn a renderable
+/// missing-file state into an error.
+#[tokio::test]
+async fn resolve_ref_returns_the_ref_when_the_file_is_missing_even_for_an_unknown_project() {
+    let (router, _project_id, _pe, dir, _db) = setup().await;
+    let missing = dir.path().join("never-written.md");
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/projects/proj_does_not_exist/resolve-ref",
+        Some(json!({"file": {"kind": "local", "path": missing.to_string_lossy()}})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["file"]["kind"], "local");
+    assert_eq!(body["data"]["upgraded"], false);
+}

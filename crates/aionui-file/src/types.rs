@@ -77,20 +77,6 @@ pub struct ContentUpdateEvent {
     pub operation: ContentUpdateOperation,
 }
 
-/// Payload for the `fileWatch.fileChanged` WebSocket event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileWatchEvent {
-    pub file_path: String,
-    pub event_type: String,
-}
-
-/// Payload for the `workspaceOfficeWatch.fileAdded` WebSocket event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OfficeFileAddedEvent {
-    pub file_path: String,
-    pub workspace: String,
-}
-
 // ---------------------------------------------------------------------------
 // Workspace snapshot
 // ---------------------------------------------------------------------------
@@ -167,28 +153,6 @@ mod tests {
         let json = serde_json::to_value(&event).unwrap();
         assert!(json.get("content").is_none());
         assert_eq!(json["operation"], "delete");
-    }
-
-    #[test]
-    fn file_watch_event_serialization() {
-        let event = FileWatchEvent {
-            file_path: "/path/to/file.txt".into(),
-            event_type: "change".into(),
-        };
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["file_path"], "/path/to/file.txt");
-        assert_eq!(json["event_type"], "change");
-    }
-
-    #[test]
-    fn office_file_added_event_serialization() {
-        let event = OfficeFileAddedEvent {
-            file_path: "/ws/report.docx".into(),
-            workspace: "/ws".into(),
-        };
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["file_path"], "/ws/report.docx");
-        assert_eq!(json["workspace"], "/ws");
     }
 
     #[test]

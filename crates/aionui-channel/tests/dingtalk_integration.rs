@@ -93,6 +93,7 @@ mod dingtalk_tests {
                 client_secret: client_secret.map(String::from),
                 account_id: None,
                 bot_token: None,
+                app_token: None,
                 extra: HashMap::new(),
             },
             config: None,
