@@ -468,19 +468,33 @@ pub struct ClaudeSessionBackend {
     title_gen: Arc<TitleGenState>,
 }
 
-/// One-shot first-turn session-title generation state (spec 2026-08-04).
+/// First-turn session-title generation state (spec 2026-08-04, retry semantics
+/// 2026-08-13).
 ///
 /// `pending` latches true only for a `SessionSpec::Fresh` open (a brand-new
 /// conversation; a Resume — even one that rebinds a fresh claude session after
-/// a lost backend — belongs to an existing conversation and never fires). The
-/// reader swaps it false on the first successful `TurnResult` and fires a
+/// a lost backend — belongs to an existing conversation and never fires).
+/// Every successful `TurnResult` while the latch is armed fires a
 /// `control_request{generate_session_title, persist:true}` over the shared
 /// stdin; `sniff_session_title` turns the success control_response into
-/// `SessionEvent::SessionTitle`. Fire-and-forget: any failure is logged and
-/// dropped — title generation must never affect the turn path.
+/// `SessionEvent::SessionTitle`. The latch is completed ONLY by a non-empty
+/// title reply: an error/empty reply, a reply timeout (30s, per spec), or a
+/// failed write keeps it armed so the next successful turn retries, bounded by
+/// [`TITLE_MAX_ATTEMPTS`]. Live 2026-08-13: claude 2.1.227 answered 12/12 title
+/// requests in 1-3s for the exact descriptions of two production conversations
+/// stuck on their placeholder names, proving the loss is on our side (silent
+/// unanswered request / lost latch) — hence retries + full observability here.
+/// Title generation must never affect the turn path.
 struct TitleGenState {
     pending: std::sync::atomic::AtomicBool,
+    /// Control requests actually reserved (== fired or attempted-to-fire).
+    attempts: std::sync::atomic::AtomicU32,
+    /// The in-flight title request awaiting a reply, keyed by its request_id.
+    /// One outstanding request at a time; cleared by the reply (any outcome),
+    /// the 30s watchdog, or a failed write.
+    inflight: std::sync::Mutex<Option<String>>,
     /// First user prompt text of the first turn — the generation `description`.
+    /// Cloned (not consumed) on fire so retries keep the user part.
     /// Prompt content: never logged (see AGENTS.md logging rules).
     description: std::sync::Mutex<Option<String>>,
     /// The backend's shared stdin slot (same Arc as `ClaudeSessionBackend.stdin`).
@@ -489,6 +503,11 @@ struct TitleGenState {
     /// Shared `ctl-N` counter (same Arc as `ClaudeSessionBackend.control_seq`).
     control_seq: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// Max title control requests per session (initial try + retries).
+const TITLE_MAX_ATTEMPTS: u32 = 3;
+/// Reply watchdog, per spec 2026-08-04 ("超时 30s"). Live: replies land in 1-3s.
+const TITLE_REPLY_TIMEOUT_SECS: u64 = 30;
 
 impl TitleGenState {
     /// Fire the one-shot `generate_session_title` control_request on a detached
@@ -503,6 +522,28 @@ impl TitleGenState {
     /// titles reliably ("User:…/Assistant:…" → "Git 版本控制系统介绍").
     fn fire(self: &Arc<Self>, session_id: &str, result_text: &str) {
         use std::sync::atomic::Ordering;
+        // Reserve synchronously on the reader thread: one outstanding request
+        // at a time, bounded total attempts (failed writes count — the cap is a
+        // safety bound, not an exact retry budget).
+        let request_id = {
+            let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            if inflight.is_some() {
+                return;
+            }
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt > TITLE_MAX_ATTEMPTS {
+                self.pending.store(false, Ordering::SeqCst);
+                tracing::warn!(
+                    session_id,
+                    max_attempts = TITLE_MAX_ATTEMPTS,
+                    "generate_session_title exhausted retries; conversation keeps its placeholder name"
+                );
+                return;
+            }
+            let id = format!("{TITLE_PREFIX}{}", self.control_seq.fetch_add(1, Ordering::SeqCst) + 1);
+            *inflight = Some(id.clone());
+            id
+        };
         let this = self.clone();
         let session_id = session_id.to_string();
         let assistant_part: String = result_text.chars().take(1000).collect();
@@ -511,7 +552,7 @@ impl TitleGenState {
                 .description
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .take()
+                .clone()
                 .unwrap_or_default();
             let mut description = String::new();
             if !user_part.is_empty() {
@@ -525,7 +566,7 @@ impl TitleGenState {
                 description.push_str("Assistant: ");
                 description.push_str(&assistant_part);
             }
-            let request_id = format!("{TITLE_PREFIX}{}", this.control_seq.fetch_add(1, Ordering::SeqCst) + 1);
+            let description_len = description.chars().count();
             let frame = serde_json::json!({
                 "type": "control_request",
                 "request_id": request_id,
@@ -535,15 +576,65 @@ impl TitleGenState {
                     "persist": true,
                 },
             });
-            let mut guard = this.stdin.lock().await;
-            let Some(stdin) = guard.as_mut() else {
-                tracing::debug!(session_id, "generate_session_title not sent: stdin unavailable");
-                return;
-            };
-            if let Err(e) = this.adapter.write_control_response(stdin, &frame).await {
-                tracing::warn!(session_id, error = %e, "generate_session_title control_request write failed");
+            {
+                let mut guard = this.stdin.lock().await;
+                let Some(stdin) = guard.as_mut() else {
+                    // Nothing went out: release the slot so the next successful
+                    // turn can retry. warn (not debug): a lost title attempt must
+                    // be diagnosable from production logs.
+                    this.clear_inflight(&request_id);
+                    tracing::warn!(session_id, "generate_session_title not sent: stdin unavailable");
+                    return;
+                };
+                if let Err(e) = this.adapter.write_control_response(stdin, &frame).await {
+                    this.clear_inflight(&request_id);
+                    tracing::warn!(session_id, error = %e, "generate_session_title control_request write failed");
+                    return;
+                }
+            }
+            let attempt = this.attempts.load(Ordering::SeqCst);
+            tracing::info!(
+                session_id,
+                request_id = %request_id,
+                attempt,
+                description_len,
+                "generate_session_title sent"
+            );
+            // Reply watchdog: if claude never answers, release the slot and log
+            // so the next successful turn retries (spec's 30s timeout; the old
+            // fire-and-forget lost these silently).
+            tokio::time::sleep(std::time::Duration::from_secs(TITLE_REPLY_TIMEOUT_SECS)).await;
+            if this.clear_inflight(&request_id) {
+                tracing::warn!(
+                    session_id,
+                    request_id = %request_id,
+                    timeout_secs = TITLE_REPLY_TIMEOUT_SECS,
+                    "generate_session_title reply timed out; will retry on the next successful turn"
+                );
             }
         });
+    }
+
+    /// Clear `inflight` iff it still holds `request_id`; true when this call
+    /// cleared it (reply and watchdog race benignly through this guard).
+    fn clear_inflight(&self, request_id: &str) -> bool {
+        let mut guard = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_deref() == Some(request_id) {
+            *guard = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A reply for `request_id` was observed. A usable (non-empty) title
+    /// completes the latch; any other outcome only releases the in-flight slot
+    /// so the next successful turn retries.
+    fn on_reply(&self, request_id: &str, got_title: bool) {
+        self.clear_inflight(request_id);
+        if got_title {
+            self.pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -749,9 +840,12 @@ impl ClaudeSessionBackend {
         let stdin = Arc::new(Mutex::new(stdin));
         let control_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
         // Spec 2026-08-04: only a Fresh open (brand-new conversation) arms the
-        // one-shot first-turn title generation.
+        // first-turn title generation (completed by a non-empty title reply,
+        // retried otherwise — see TitleGenState).
         let title_gen = Arc::new(TitleGenState {
             pending: std::sync::atomic::AtomicBool::new(fresh),
+            attempts: std::sync::atomic::AtomicU32::new(0),
+            inflight: std::sync::Mutex::new(None),
             description: std::sync::Mutex::new(None),
             stdin: stdin.clone(),
             adapter: adapter.clone(),
@@ -1535,7 +1629,7 @@ async fn reader_task(
                 sniff_session_info(v, &event_tx, &session_id, cur_gen);
                 // First-turn title generation reply (keyed ctl-title-N) →
                 // SessionEvent::SessionTitle. Done on the RAW frame.
-                sniff_session_title(v, &event_tx, &session_id, cur_gen);
+                sniff_session_title(v, &event_tx, &session_id, cur_gen, &title_gen);
                 // Subagent roster: claude emits system/task_* frames for
                 // Task/Workflow subagents (§6b b1). Translate them to
                 // SubagentUpdate so the reducer upserts Running.subagents —
@@ -1577,18 +1671,20 @@ async fn reader_task(
                 // so the flag is already false when subscribers react.
                 if matches!(ev, SessionEvent::TurnResult { .. }) {
                     turn_in_flight.store(false, Ordering::SeqCst);
-                    // Spec 2026-08-04: first SUCCESSFUL turn of a Fresh session
-                    // fires the one-shot generate_session_title (an error turn
-                    // keeps the latch armed for the next successful one). The
-                    // turn's assistant text is passed along — prompt+answer as
-                    // the description keeps the CLI's title generation from
-                    // returning null on short prompts (see TitleGenState::fire).
+                    // Spec 2026-08-04 (+retry 2026-08-13): every SUCCESSFUL turn
+                    // of a Fresh session fires generate_session_title while the
+                    // latch is armed — only a non-empty title reply completes it
+                    // (error/empty/timeout keep it armed; `fire` dedups in-flight
+                    // requests and caps total attempts). The turn's assistant
+                    // text is passed along — prompt+answer as the description
+                    // keeps the CLI's title generation from returning null on
+                    // short prompts (see TitleGenState::fire).
                     if let SessionEvent::TurnResult {
                         is_error: false,
                         result_text,
                         ..
                     } = &ev
-                        && title_gen.pending.swap(false, Ordering::SeqCst)
+                        && title_gen.pending.load(Ordering::SeqCst)
                     {
                         title_gen.fire(&session_id, result_text);
                     }
@@ -2431,6 +2527,7 @@ fn sniff_session_title(
     event_tx: &broadcast::Sender<SessionEnvelope>,
     session_id: &str,
     turn_gen: u64,
+    title_gen: &TitleGenState,
 ) {
     use serde_json::Value;
     if frame.get("type").and_then(Value::as_str) != Some("control_response") {
@@ -2442,7 +2539,12 @@ fn sniff_session_title(
         return;
     }
     if response.get("subtype").and_then(Value::as_str) != Some("success") {
-        tracing::warn!(session_id, "generate_session_title rejected by claude");
+        title_gen.on_reply(request_id, false);
+        tracing::warn!(
+            session_id,
+            request_id,
+            "generate_session_title rejected by claude; latch kept for retry"
+        );
         return;
     }
     let title = response
@@ -2452,9 +2554,21 @@ fn sniff_session_title(
         .map(str::trim)
         .unwrap_or("");
     if title.is_empty() {
-        tracing::warn!(session_id, "generate_session_title returned no title");
+        title_gen.on_reply(request_id, false);
+        tracing::warn!(
+            session_id,
+            request_id,
+            "generate_session_title returned no title; latch kept for retry"
+        );
         return;
     }
+    title_gen.on_reply(request_id, true);
+    tracing::info!(
+        session_id,
+        request_id,
+        title_len = title.chars().count(),
+        "generate_session_title succeeded"
+    );
     let _ = event_tx.send(SessionEnvelope {
         session_id: session_id.to_string(),
         turn_gen,
@@ -6076,7 +6190,9 @@ mod tests {
     #[tokio::test]
     async fn fresh_backend_fires_generate_session_title_once_after_first_success() {
         // A Fresh-open backend fires exactly ONE generate_session_title after
-        // the first successful result; a second success must not re-fire.
+        // the first successful result; a second success must not re-fire while
+        // that request is still awaiting its reply (in-flight dedup — retries
+        // only happen after an empty/error reply or the watchdog timeout).
         let frames = "\
 {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"hi\"}\n\
 {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"again\"}\n";
@@ -6097,6 +6213,113 @@ mod tests {
         // The description carries the first turn's assistant text (live-verified:
         // a bare short prompt makes the CLI's title generation return null).
         assert!(written.contains("Assistant: hi"), "wire: {written:?}");
+    }
+
+    #[tokio::test]
+    async fn empty_title_reply_keeps_latch_and_retries_on_next_success() {
+        // Retry 2026-08-13: an empty-title reply releases the in-flight slot and
+        // keeps the latch armed — the next successful turn fires a SECOND
+        // generate_session_title (new request id). Root cause: production
+        // conversations stuck on placeholder names while a standalone claude
+        // answered the same descriptions 12/12 — losses must be retried.
+        let frames = format!(
+            "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"one\"}}\n\
+{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"{TITLE_PREFIX}1\",\"response\":{{\"title\":\"  \"}}}}}}\n\
+{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"two\"}}\n"
+        );
+        let fake = FakeAgentIo::never_exits(frames.into_bytes());
+        let captured = fake.captured_stdin();
+        let _backend = ClaudeSessionBackend::build_with_io_fresh("s-retry-empty", Box::new(fake)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        assert_eq!(
+            written.matches("generate_session_title").count(),
+            2,
+            "empty-title reply must allow a retry on the next success, wire: {written:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn good_title_reply_completes_latch_and_stops_retries() {
+        // A non-empty title completes the latch: later successful turns must
+        // not fire again.
+        let frames = format!(
+            "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"one\"}}\n\
+{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"{TITLE_PREFIX}1\",\"response\":{{\"title\":\"Fix login bug\"}}}}}}\n\
+{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"two\"}}\n"
+        );
+        let fake = FakeAgentIo::never_exits(frames.into_bytes());
+        let captured = fake.captured_stdin();
+        let _backend = ClaudeSessionBackend::build_with_io_fresh("s-done", Box::new(fake)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        assert_eq!(
+            written.matches("generate_session_title").count(),
+            1,
+            "a good title completes the latch, wire: {written:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn title_retries_are_capped_at_max_attempts() {
+        // TITLE_MAX_ATTEMPTS bounds total requests: with every reply empty, the
+        // 4th (and later) successful turns must not fire.
+        let frames = format!(
+            "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"r1\"}}\n\
+{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"{TITLE_PREFIX}1\",\"response\":{{\"title\":\"\"}}}}}}\n\
+{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"r2\"}}\n\
+{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"{TITLE_PREFIX}2\",\"response\":{{\"title\":\"\"}}}}}}\n\
+{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"r3\"}}\n\
+{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"{TITLE_PREFIX}3\",\"response\":{{\"title\":\"\"}}}}}}\n\
+{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"r4\"}}\n\
+{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"r5\"}}\n"
+        );
+        let fake = FakeAgentIo::never_exits(frames.into_bytes());
+        let captured = fake.captured_stdin();
+        let _backend = ClaudeSessionBackend::build_with_io_fresh("s-cap", Box::new(fake)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        assert_eq!(
+            written.matches("generate_session_title").count(),
+            TITLE_MAX_ATTEMPTS as usize,
+            "retries stop at TITLE_MAX_ATTEMPTS, wire: {written:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_inflight_guards_by_request_id() {
+        // The reply/watchdog race resolves through clear_inflight: only the
+        // request id that is actually in flight clears the slot; a completed
+        // latch (`on_reply(true)`) also clears `pending`.
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let backend = ClaudeSessionBackend::build_with_io_fresh("s-guard", Box::new(fake)).await;
+        let tg = &backend.title_gen;
+
+        *tg.inflight.lock().unwrap() = Some(format!("{TITLE_PREFIX}7"));
+        assert!(
+            !tg.clear_inflight(&format!("{TITLE_PREFIX}6")),
+            "wrong id must not clear"
+        );
+        assert!(tg.clear_inflight(&format!("{TITLE_PREFIX}7")), "matching id clears");
+        assert!(
+            !tg.clear_inflight(&format!("{TITLE_PREFIX}7")),
+            "second clear is a no-op"
+        );
+
+        assert!(
+            tg.pending.load(std::sync::atomic::Ordering::SeqCst),
+            "fresh backend arms the latch"
+        );
+        *tg.inflight.lock().unwrap() = Some(format!("{TITLE_PREFIX}8"));
+        tg.on_reply(&format!("{TITLE_PREFIX}8"), true);
+        assert!(tg.inflight.lock().unwrap().is_none());
+        assert!(
+            !tg.pending.load(std::sync::atomic::Ordering::SeqCst),
+            "a usable title completes the latch"
+        );
     }
 
     #[tokio::test]
