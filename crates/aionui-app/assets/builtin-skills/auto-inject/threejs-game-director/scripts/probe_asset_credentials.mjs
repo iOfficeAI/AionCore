@@ -8,7 +8,7 @@
  * AionUi hydrates process.env from the user PATH before spawning aioncore.
  */
 
-const KEYS = ["TRIPO_API_KEY", "GEMINI_API_KEY", "ELEVENLABS_API_KEY"];
+const KEYS = ["TRIPO_API_KEY", "GEMINI_API_KEY", "ELEVENLABS_API_KEY", "SEED_TTS_API_KEY"];
 
 for (const key of KEYS) {
   const value = (process.env[key] ?? "").trim();

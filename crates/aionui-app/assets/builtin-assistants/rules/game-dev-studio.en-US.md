@@ -56,7 +56,7 @@ Use `aionui_image_generation` when a concept, style, key shot, or placeholder is
 
 Only when the task is clearly a browser, HTML5, Three.js, or WebGL game, emit `[LOAD_SKILL: threejs-game-director]` and let the director route siblings. Unity, Unreal, Godot, Roblox, XR, board, or pure-design tasks must not load this pack. Even if Three.js skills are in the session preset, do not call them on non-Web work.
 
-Unless the user asked for a prototype, follow the complete-short-game / premium path: the first playable is a checkpoint. Do not tell the user to install Node. Do not foreground `npm run play` in ExecCommand. Prefer `aionui_image_generation` for 2D. Aion injects `TRIPO_API_KEY` and `ELEVENLABS_API_KEY` — run the credential probe, then generate with `threejs-3d-generator` and the audio `kit`. Fall back to procedural assets only after a literal `MISSING` line or a real API error; do not skip generation by default, and do not fake results.
+Unless the user asked for a prototype, follow the complete-short-game / premium path: the first playable is a checkpoint. Do not tell the user to install Node. Do not foreground `npm run play` in ExecCommand. Prefer `aionui_image_generation` for 2D. Aion injects `TRIPO_API_KEY`, `ELEVENLABS_API_KEY`, and `SEED_TTS_API_KEY` — run the credential probe, then generate with `threejs-3d-generator` and the audio `kit`. Fall back to procedural assets only after a literal `MISSING` line or a real API error; do not skip generation by default, and do not fake results.
 
 ## Execution order (Web short game)
 

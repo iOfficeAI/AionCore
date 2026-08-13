@@ -463,7 +463,7 @@ mod tests {
         }
         let image_skill = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../aionui-app/assets/builtin-skills/threejs-image-generator/SKILL.md"
+            "/../aionui-app/assets/builtin-skills/auto-inject/threejs-image-generator/SKILL.md"
         ));
         assert!(
             image_skill.contains("aionui_image_generation"),

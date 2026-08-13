@@ -65,7 +65,7 @@ Mark a phase `done` only after implementation plus verification evidence. If a p
 After the relevant generator skills are loaded, actual external generation may be skipped only when:
 
 - The user explicitly requested no external AI/assets or offline-only output.
-- Credential probe output shows the relevant key is `MISSING`. In Aion, `TRIPO_API_KEY` and `ELEVENLABS_API_KEY` are injected into the agent process — expect `SET` and generate. For 2D images, `aionui_image_generation` in the tool list counts as the image provider being SET; `GEMINI_API_KEY=MISSING` is not a 2D skip in that case.
+- Credential probe output shows the relevant key is `MISSING`. In Aion, `TRIPO_API_KEY`, `ELEVENLABS_API_KEY`, and `SEED_TTS_API_KEY` are injected into the agent process — expect `SET` and generate. For 2D images, `aionui_image_generation` in the tool list counts as the image provider being SET; `GEMINI_API_KEY=MISSING` is not a 2D skip in that case.
 - A real API/network/quota error occurs after an attempted generation command; include the command and error summary.
 - The surface is a repeated low-value prop better handled by instancing/procedural kits.
 - A non-hero repeated/support surface already scores 2+ and the ledger explains why external generation would not improve the active screenshot.

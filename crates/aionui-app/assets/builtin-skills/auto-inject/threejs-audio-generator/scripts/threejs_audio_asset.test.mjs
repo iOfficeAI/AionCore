@@ -11,20 +11,28 @@ const script = fileURLToPath(new URL('./threejs_audio_asset.mjs', import.meta.ur
 function run(args, env = {}) {
   return spawnSync(process.execPath, [script, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, ELEVENLABS_API_KEY: '', ...env },
+    env: {
+      ...process.env,
+      ELEVENLABS_API_KEY: '',
+      SEED_TTS_API_KEY: '',
+      AIONUI_BUILTIN_ARK_IMAGE_PLAN_API_KEY: '',
+      ...env,
+    },
   });
 }
 
 test('probe reports MISSING without a key', () => {
-  const result = run(['probe'], { ELEVENLABS_API_KEY: '' });
+  const result = run(['probe'], { ELEVENLABS_API_KEY: '', SEED_TTS_API_KEY: '' });
   assert.equal(result.status, 0);
   assert.match(result.stdout, /ELEVENLABS_API_KEY=MISSING/);
+  assert.match(result.stdout, /SEED_TTS_API_KEY=MISSING/);
 });
 
-test('probe reports SET when the env key is present', () => {
-  const result = run(['probe'], { ELEVENLABS_API_KEY: 'sk_test' });
+test('probe reports SET when the env keys are present', () => {
+  const result = run(['probe'], { ELEVENLABS_API_KEY: 'sk_test', SEED_TTS_API_KEY: 'ark_test' });
   assert.equal(result.status, 0);
   assert.match(result.stdout, /ELEVENLABS_API_KEY=SET/);
+  assert.match(result.stdout, /SEED_TTS_API_KEY=SET/);
 });
 
 test('kit refuses to run without a scene', () => {

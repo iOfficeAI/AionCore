@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Generate first-game audio with ElevenLabs.
+ * Generate first-game audio: ElevenLabs for music/SFX, seed-tts-2.0 for speech.
  * Prefer this Node script. python3 threejs_audio_asset.py is fallback only.
  * Never run bare `python`.
  */
@@ -17,10 +17,16 @@ import {
   resolveVoicePolicy,
   voiceLineEntries,
 } from './audio_kit_lib.mjs';
+import {
+  SEED_TTS_RESOURCE_ID,
+  SEED_TTS_URL,
+  mp3FromTtsStream,
+  resolveSeedTtsApiKey,
+  seedTtsRequestBody,
+} from './seed_tts_lib.mjs';
 
 const BASE_URL = 'https://api.elevenlabs.io/v1';
 const DEFAULT_OUTPUT_FORMAT = 'mp3_44100_128';
-const DEFAULT_TTS_VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb';
 
 class AudioGeneratorError extends Error {}
 
@@ -28,6 +34,18 @@ function apiKey(args) {
   const key = args.apiKey || process.env.ELEVENLABS_API_KEY;
   if (!key) {
     throw new AudioGeneratorError('Missing API key. Set ELEVENLABS_API_KEY or pass --api-key.');
+  }
+  return key;
+}
+
+function ttsApiKey(args) {
+  const key = resolveSeedTtsApiKey({
+    ttsApiKey: args.command === 'tts' ? args.apiKey : undefined,
+  });
+  if (!key) {
+    throw new AudioGeneratorError(
+      'Missing TTS API key. Set SEED_TTS_API_KEY (Aion injects the Ark plan key as this).',
+    );
   }
   return key;
 }
@@ -104,13 +122,44 @@ function usage() {
   node threejs_audio_asset.mjs kit --genre <text> --out <game-dir> [--emotion <text>] [--scene <text> | --explore --pressure --settle] [--verb <text>] [--spoken <text>] [--voice auto|on|off] [--lines "a|b"] [--dry-run]
   node threejs_audio_asset.mjs music --out <file> [--genre <text>] [--emotion <text>] [--scene <text>] [--voice auto|on|off]
   node threejs_audio_asset.mjs sfx --prompt <text> --out <file> [--duration 1.2] [--loop]
-  node threejs_audio_asset.mjs tts --text <text> --out <file> [--voice-id <id>]`);
+  node threejs_audio_asset.mjs tts --text <text> --out <file> [--voice-id <speaker>]`);
+}
+
+async function synthesizeTts(args, text, out) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 180_000);
+  try {
+    const response = await fetch(SEED_TTS_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Api-Key': ttsApiKey(args),
+        'X-Api-Resource-Id': SEED_TTS_RESOURCE_ID,
+        'X-Api-Request-Id': crypto.randomUUID(),
+      },
+      body: JSON.stringify(seedTtsRequestBody({ text, speaker: args.voiceId })),
+      signal: controller.signal,
+    });
+    const raw = await response.text();
+    if (!response.ok) {
+      throw new AudioGeneratorError(`HTTP ${response.status}: ${raw}`);
+    }
+    writeFile(out, mp3FromTtsStream(raw));
+  } catch (error) {
+    if (error instanceof AudioGeneratorError) throw error;
+    if (error.name === 'AbortError') throw new AudioGeneratorError('Network error: timeout');
+    throw new AudioGeneratorError(`TTS error: ${error.message}`);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function cmdProbe(args) {
-  const marker = args.apiKey || process.env.ELEVENLABS_API_KEY ? 'SET' : 'MISSING';
-  console.log(`ELEVENLABS_API_KEY=${marker}`);
-  if (args.validate && marker === 'SET') {
+  const eleven = args.apiKey || process.env.ELEVENLABS_API_KEY ? 'SET' : 'MISSING';
+  const tts = resolveSeedTtsApiKey() ? 'SET' : 'MISSING';
+  console.log(`ELEVENLABS_API_KEY=${eleven}`);
+  console.log(`SEED_TTS_API_KEY=${tts}`);
+  if (args.validate && eleven === 'SET') {
     const data = await requestBytes('GET', '/user', apiKey(args));
     const user = JSON.parse(data.toString('utf8'));
     console.log(`VALID_USER=${user.email || user.user_id || 'ok'}`);
@@ -186,6 +235,7 @@ async function cmdKit(args) {
   if (voice.tts && kit.voice.lines.length === 0) {
     console.error('TTS_LINES=0 pass --lines "a|b" or the overlay has nothing to speak');
   }
+  if (!args.dryRun && kit.voice.lines.length > 0) ttsApiKey(args);
 
   if (args.dryRun) {
     writeFile(kitPath, Buffer.from(`${JSON.stringify(kit, null, 2)}\n`));
@@ -215,12 +265,7 @@ async function cmdKit(args) {
   }
 
   for (const line of kit.voice.lines) {
-    await postJsonAudio(
-      args,
-      `/text-to-speech/${encodeURIComponent(args.voiceId || DEFAULT_TTS_VOICE_ID)}`,
-      { text: line.text, model_id: 'eleven_multilingual_v2' },
-      path.join(publicRoot, line.file),
-    );
+    await synthesizeTts(args, line.text, path.join(publicRoot, line.file));
   }
 
   writeFile(kitPath, Buffer.from(`${JSON.stringify(kit, null, 2)}\n`));
@@ -253,12 +298,7 @@ async function cmdSfx(args) {
 
 async function cmdTts(args) {
   if (!args.text || !args.out) throw new AudioGeneratorError('tts requires --text and --out');
-  await postJsonAudio(
-    args,
-    `/text-to-speech/${encodeURIComponent(args.voiceId || DEFAULT_TTS_VOICE_ID)}`,
-    { text: args.text, model_id: args.modelId || 'eleven_multilingual_v2' },
-    path.resolve(args.out),
-  );
+  await synthesizeTts(args, args.text, path.resolve(args.out));
   return 0;
 }
 

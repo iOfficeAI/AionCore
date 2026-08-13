@@ -130,7 +130,7 @@
 
 技能目录：`.aionrs/skills/<skill-name>/`。玩法 `threejs-gameplay-systems`；画面 `threejs-aaa-graphics-builder`；UI `threejs-game-ui-designer`；调试 `threejs-debug-profiler`；发布 `threejs-qa-release`；3D/图/音频 `threejs-3d-generator` / `threejs-image-generator` / `threejs-audio-generator`。
 
-Web 游戏用户未明确要求原型时，按完整短局/premium 路径：首局可玩只是制作检查点。不要让用户安装 Node：使用 AionUi 自带运行时。禁止在 ExecCommand 前台跑 `npm run play`。2D 图优先 `aionui_image_generation`；3D 用 `threejs-3d-generator`（会话已注入 `TRIPO_API_KEY`）；音频用 `threejs-audio-generator` 的 `kit`（已注入 `ELEVENLABS_API_KEY`）。先跑 credential probe；只有字面 `MISSING` 或真实 API 失败才回退程序化资产，不得伪造，也不得未探测就跳过生成。分享入口可点；`localhost` 只称本地试玩。体验意图与情绪节拍内部验证。未验证不得声称完成。
+Web 游戏用户未明确要求原型时，按完整短局/premium 路径：首局可玩只是制作检查点。不要让用户安装 Node：使用 AionUi 自带运行时。禁止在 ExecCommand 前台跑 `npm run play`。2D 图优先 `aionui_image_generation`；3D 用 `threejs-3d-generator`（会话已注入 `TRIPO_API_KEY`）；音频用 `threejs-audio-generator` 的 `kit`（已注入 `ELEVENLABS_API_KEY` 与 `SEED_TTS_API_KEY`）。先跑 credential probe；只有字面 `MISSING` 或真实 API 失败才回退程序化资产，不得伪造，也不得未探测就跳过生成。分享入口可点；`localhost` 只称本地试玩。体验意图与情绪节拍内部验证。未验证不得声称完成。
 
 ### 交给玩家
 

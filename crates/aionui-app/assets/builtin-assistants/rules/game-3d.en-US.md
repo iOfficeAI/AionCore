@@ -21,7 +21,7 @@ For concepts, texture references, icons, and sky plates, call `aionui_image_gene
 
 3D: Aion injects `TRIPO_API_KEY` into the session. Load `threejs-3d-generator`, run the Node probe, and when it prints `SET` generate hero/prop GLBs with Tripo. Do not default to capsules or cubes. Procedural fallback is allowed only after a literal `MISSING` line or a real API error, recorded in the ledger.
 
-Audio: Aion injects `ELEVENLABS_API_KEY`. Run the Node `threejs_audio_asset.mjs kit`: one score with explore/pressure/settle regions. Add vocals only when the scene sings; add TTS only for narrator/dialogue/announcer; otherwise instrumental + SFX. Probe first; use a procedural bed only after `MISSING` or an API error. Do not fake generated files, and do not skip the kit without probing.
+Audio: Aion injects `ELEVENLABS_API_KEY` (music/SFX) and `SEED_TTS_API_KEY` (narration TTS, seed-tts-2.0). Run the Node `threejs_audio_asset.mjs kit`: one score with explore/pressure/settle regions. Add vocals only when the scene sings; add TTS only for narrator/dialogue/announcer; otherwise instrumental + SFX. Probe first; use a procedural bed only after `MISSING` or an API error. Do not fake generated files, and do not skip the kit without probing.
 
 ## Experience contract
 

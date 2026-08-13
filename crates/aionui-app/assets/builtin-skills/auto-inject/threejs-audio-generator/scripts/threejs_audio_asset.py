@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Generate and process Three.js game audio assets with ElevenLabs.
+"""Generate and process Three.js game audio assets.
 
+Music/SFX/isolate/voice-change: ElevenLabs.
+Spoken TTS: Volcengine seed-tts-2.0 (Plan unidirectional HTTP).
 Prefer the Node twin `threejs_audio_asset.mjs` for probe, kit, and music.
 This file remains for sfx/tts/isolate/voice-change fallback. Never run bare `python`.
 """
@@ -8,6 +10,7 @@ This file remains for sfx/tts/isolate/voice-change fallback. Never run bare `pyt
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import mimetypes
 import os
@@ -23,6 +26,9 @@ from typing import Any
 BASE_URL = "https://api.elevenlabs.io/v1"
 DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"
 DEFAULT_TTS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
+SEED_TTS_URL = "https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional"
+SEED_TTS_RESOURCE_ID = "seed-tts-2.0"
+DEFAULT_SEED_TTS_SPEAKER = "zh_female_vv_uranus_bigtts"
 
 
 class AudioGeneratorError(RuntimeError):
@@ -38,6 +44,69 @@ def api_key(args: argparse.Namespace) -> str:
     if not key:
         raise AudioGeneratorError("Missing API key. Set ELEVENLABS_API_KEY or pass --api-key.")
     return key
+
+
+def seed_tts_key(args: argparse.Namespace) -> str:
+    key = (
+        getattr(args, "api_key", None)
+        or os.environ.get("SEED_TTS_API_KEY")
+        or os.environ.get("AIONUI_BUILTIN_ARK_IMAGE_PLAN_API_KEY")
+    )
+    if not key:
+        raise AudioGeneratorError("Missing TTS API key. Set SEED_TTS_API_KEY or pass --api-key.")
+    return str(key).strip()
+
+
+def parse_concatenated_json(text: str) -> list[Any]:
+    objects: list[Any] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        start = i
+        depth = 0
+        in_string = False
+        escaped = False
+        while i < n:
+            c = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif c == "\\":
+                    escaped = True
+                elif c == '"':
+                    in_string = False
+            elif c == '"':
+                in_string = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    objects.append(json.loads(text[start : i + 1]))
+                    i += 1
+                    break
+            i += 1
+        else:
+            break
+    return objects
+
+
+def mp3_from_tts_stream(text: str) -> bytes:
+    parts: list[bytes] = []
+    for obj in parse_concatenated_json(text):
+        code = obj.get("code")
+        if code not in (None, 0, 20000000):
+            raise AudioGeneratorError(f"TTS {code}: {obj.get('message') or 'error'}")
+        data = obj.get("data")
+        if isinstance(data, str) and data:
+            parts.append(base64.b64decode(data))
+    if not parts:
+        raise AudioGeneratorError("TTS returned no audio")
+    return b"".join(parts)
 
 
 def build_url(path: str, query: dict[str, Any] | None = None) -> str:
@@ -152,9 +221,18 @@ def voice_settings(args: argparse.Namespace) -> dict[str, Any] | None:
 
 
 def cmd_probe(args: argparse.Namespace) -> int:
-    marker = "SET" if (args.api_key or os.environ.get("ELEVENLABS_API_KEY")) else "MISSING"
-    print(f"ELEVENLABS_API_KEY={marker}")
-    if args.validate and marker == "SET":
+    eleven = "SET" if (args.api_key or os.environ.get("ELEVENLABS_API_KEY")) else "MISSING"
+    tts = (
+        "SET"
+        if (
+            os.environ.get("SEED_TTS_API_KEY")
+            or os.environ.get("AIONUI_BUILTIN_ARK_IMAGE_PLAN_API_KEY")
+        )
+        else "MISSING"
+    )
+    print(f"ELEVENLABS_API_KEY={eleven}")
+    print(f"SEED_TTS_API_KEY={tts}")
+    if args.validate and eleven == "SET":
         data = request_bytes("GET", "/user", api_key(args))
         user = json.loads(data.decode("utf-8"))
         print(f"VALID_USER={user.get('email') or user.get('user_id') or 'ok'}")
@@ -174,15 +252,37 @@ def cmd_sfx(args: argparse.Namespace) -> int:
     return 0
 
 
+def resolve_seed_tts_speaker(speaker: str | None) -> str:
+    ident = (speaker or "").strip()
+    lower = ident.lower()
+    if "uranus_bigtts" in lower or "saturn_bigtts" in lower or lower.startswith("saturn_"):
+        return ident
+    return DEFAULT_SEED_TTS_SPEAKER
+
+
 def cmd_tts(args: argparse.Namespace) -> int:
     payload: dict[str, Any] = {
-        "text": args.text,
-        "model_id": args.model_id,
+        "user": {"uid": "aion-game-audio"},
+        "req_params": {
+            "text": args.text,
+            "speaker": resolve_seed_tts_speaker(args.voice_id),
+            "audio_params": {"format": "mp3", "sample_rate": 24000, "bit_rate": 128000},
+        },
     }
-    settings = voice_settings(args)
-    if settings:
-        payload["voice_settings"] = settings
-    post_json_audio(args, f"/text-to-speech/{urllib.parse.quote(args.voice_id)}", payload, Path(args.out))
+    req = urllib.request.Request(SEED_TTS_URL, data=json.dumps(payload).encode("utf-8"), method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("X-Api-Key", seed_tts_key(args))
+    req.add_header("X-Api-Resource-Id", SEED_TTS_RESOURCE_ID)
+    req.add_header("X-Api-Request-Id", str(uuid.uuid4()))
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise AudioGeneratorError(f"HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise AudioGeneratorError(f"Network error: {exc.reason}") from exc
+    write_file(Path(args.out), mp3_from_tts_stream(raw))
     return 0
 
 
@@ -265,7 +365,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_voice_settings(tts)
     tts.add_argument("--text", required=True)
     tts.add_argument("--out", required=True)
-    tts.add_argument("--voice-id", default=DEFAULT_TTS_VOICE_ID)
+    tts.add_argument("--voice-id", default=DEFAULT_SEED_TTS_SPEAKER)
     tts.add_argument("--model-id", default="eleven_multilingual_v2")
     tts.set_defaults(func=cmd_tts)
 

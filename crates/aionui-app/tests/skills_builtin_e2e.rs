@@ -148,7 +148,7 @@ async fn unified_skill_list_includes_auto_inject_entries_from_embedded_corpus() 
 }
 
 #[tokio::test]
-async fn unified_skill_list_includes_threejs_game_director_as_opt_in() {
+async fn unified_skill_list_includes_threejs_game_director_as_auto_inject() {
     let fx = fixture_embedded().await;
 
     let resp = fx
@@ -167,8 +167,11 @@ async fn unified_skill_list_includes_threejs_game_director_as_opt_in() {
         .find(|item| item["name"] == "threejs-game-director")
         .expect("Skills Hub must list threejs-game-director after install");
     assert_eq!(director["source"], "builtin");
-    assert_eq!(director["relative_location"], "threejs-game-director/SKILL.md");
-    assert_eq!(director["is_auto_inject"], false);
+    assert_eq!(
+        director["relative_location"],
+        "auto-inject/threejs-game-director/SKILL.md"
+    );
+    assert_eq!(director["is_auto_inject"], true);
     for name in [
         "threejs-gameplay-systems",
         "threejs-aaa-graphics-builder",
@@ -180,8 +183,8 @@ async fn unified_skill_list_includes_threejs_game_director_as_opt_in() {
         "threejs-audio-generator",
     ] {
         assert!(
-            arr.iter().any(|item| item["name"] == name && item["is_auto_inject"] == false),
-            "Skills Hub missing opt-in builtin {name}"
+            arr.iter().any(|item| item["name"] == name && item["is_auto_inject"] == true),
+            "Skills Hub missing auto-inject builtin {name}"
         );
     }
 }

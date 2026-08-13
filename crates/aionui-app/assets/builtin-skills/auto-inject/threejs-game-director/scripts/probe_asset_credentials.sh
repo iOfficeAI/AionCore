@@ -15,6 +15,7 @@ PROBE_SNIPPET='
   report_key TRIPO_API_KEY "${TRIPO_API_KEY:-}"
   report_key GEMINI_API_KEY "${GEMINI_API_KEY:-}"
   report_key ELEVENLABS_API_KEY "${ELEVENLABS_API_KEY:-}"
+  report_key SEED_TTS_API_KEY "${SEED_TTS_API_KEY:-}"
 '
 
 if command -v zsh >/dev/null 2>&1; then

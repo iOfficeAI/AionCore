@@ -21,7 +21,7 @@
 
 3D：Aion 已向会话注入 `TRIPO_API_KEY`。加载 `threejs-3d-generator`，先跑 Node probe；`SET` 时必须走 Tripo 生成英雄/道具 GLB，不得默认胶囊或方块。只有字面 `MISSING` 或真实 API 失败才回退程序化资产，并写入账本。
 
-音频：Aion 已注入 `ELEVENLABS_API_KEY`。用 Node `threejs_audio_asset.mjs kit`：一条配乐切 explore/pressure/settle；人声只在场景需要时生成（歌唱进配乐，旁白/对白走 TTS），否则只做器乐和音效。先 probe；只有 `MISSING` 或 API 失败才回退程序化床，不得伪造，也不得未探测就跳过。
+音频：Aion 已注入 `ELEVENLABS_API_KEY`（配乐/音效）和 `SEED_TTS_API_KEY`（旁白 TTS，seed-tts-2.0）。用 Node `threejs_audio_asset.mjs kit`：一条配乐切 explore/pressure/settle；人声只在场景需要时生成（歌唱进配乐，旁白/对白走 TTS），否则只做器乐和音效。先 probe；只有 `MISSING` 或 API 失败才回退程序化床，不得伪造，也不得未探测就跳过。
 
 ## 体验契约
 

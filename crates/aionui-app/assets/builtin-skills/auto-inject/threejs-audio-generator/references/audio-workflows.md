@@ -74,7 +74,7 @@ Avoid prompts that are only mood words (`epic`, `AAA`, `cool`). Name the gamepla
 
 ## Voice Strategy
 
-Use TTS when the line can be generated from text and exact acting is less important.
+Use TTS (`seed-tts-2.0`) when the line can be generated from text and exact acting is less important. Default speaker is `zh_female_vv_uranus_bigtts`; pass `--voice-id` with a `*_uranus_bigtts` voice.
 
 Use voice-change when:
 

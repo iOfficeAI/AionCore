@@ -1,19 +1,19 @@
 ---
 name: threejs-audio-generator
-description: "Generate first-game audio kits and individual assets for Three.js browser games using ElevenLabs. Prefer the Node kit command: one score with explore/pressure/settle regions, event SFX, and scene-aware vocals or TTS. Fall back to python3 only when node is missing or Node exits non-zero."
+description: "Generate first-game audio kits and individual assets for Three.js browser games. Music and SFX use ElevenLabs; spoken lines use Volcengine seed-tts-2.0. Prefer the Node kit command: one score with explore/pressure/settle regions, event SFX, and scene-aware vocals or TTS. Fall back to python3 only when node is missing or Node exits non-zero."
 ---
 
 # Three.js Audio Generator
 
 ## Purpose
 
-Create game-ready audio for Three.js projects. First complete games use one `kit` command, not twenty invented prompts. Provider: ElevenLabs. Never put API keys in skill files or browser/game code.
+Create game-ready audio for Three.js projects. First complete games use one `kit` command, not twenty invented prompts. Music and SFX: ElevenLabs. Spoken TTS: Volcengine `seed-tts-2.0` (`https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional`). Never put API keys in skill files or browser/game code.
 
 Resolve `<this-skill-dir>` in this order: `.aionrs/skills/threejs-audio-generator`, `~/.claude/skills/threejs-audio-generator`, `~/.codex/skills/threejs-audio-generator`, `~/.agents/skills/threejs-audio-generator`, or repo `skills/threejs-audio-generator`.
 
 ## First Game Path
 
-1. Probe with Node. Paste the literal `ELEVENLABS_API_KEY=SET|MISSING` line. In Aion the desktop shell injects this key; expect `SET`. Do not skip the kit because you assume it is missing.
+1. Probe with Node. Paste the literal `ELEVENLABS_API_KEY=SET|MISSING` and `SEED_TTS_API_KEY=SET|MISSING` lines. In Aion the desktop shell injects both; expect `SET`. Do not skip the kit because you assume a key is missing.
 
 ```bash
 node <this-skill-dir>/scripts/threejs_audio_asset.mjs probe
@@ -54,7 +54,7 @@ node <this-skill-dir>/scripts/threejs_audio_asset.mjs kit \
   --out ./my-game
 ```
 
-The kit writes one `audio/music/score.mp3` plus `kit.json` loop regions for `explore` / `pressure` / `settle`. Do not generate three unrelated songs. Overlay `AudioSystem` loads `/audio/kit.json` after user-gesture unlock, plays intro/settle TTS from `voice.lines[].cue`, and fires SFX from score/complete/speed/chapter diagnostics plus Space dash and Escape pause. If the key is missing or the API fails, report the blocker; the overlay still plays a procedural bed so the game is not silent.
+The kit writes one `audio/music/score.mp3` plus `kit.json` loop regions for `explore` / `pressure` / `settle`. Do not generate three unrelated songs. Overlay `AudioSystem` loads `/audio/kit.json` after user-gesture unlock, plays intro/settle TTS from `voice.lines[].cue`, and fires SFX from score/complete/speed/chapter diagnostics plus Space dash and Escape pause. If the key is missing or the API fails, report the blocker; the overlay still plays a procedural bed so the game is not silent. Spoken lines need `SEED_TTS_API_KEY=SET`; music/SFX need `ELEVENLABS_API_KEY=SET`.
 
 `--dry-run` writes `kit.json` only (no API). Use it to confirm `VOICE=instrumental|vocals|tts|vocals+tts` before spending credits.
 
@@ -97,7 +97,7 @@ Load `references/audio-workflows.md` when adding more than the first kit, wiring
 
 ## Required Report
 
-- Probe line `ELEVENLABS_API_KEY=SET|MISSING` (and `--validate` if a present key still fails).
+- Probe lines `ELEVENLABS_API_KEY=SET|MISSING` and `SEED_TTS_API_KEY=SET|MISSING` (and `--validate` if a present ElevenLabs key still fails).
 - `VOICE=...` from the kit command.
 - Paths: `public/audio/kit.json`, `public/audio/music/score.mp3`, SFX files, TTS files if any.
 - Whether overlay `AudioSystem` is present (scaffold create applies it).

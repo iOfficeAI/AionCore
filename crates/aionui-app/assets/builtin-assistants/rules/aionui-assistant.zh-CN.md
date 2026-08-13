@@ -133,7 +133,7 @@ Provider 列表包含每个 `api_key` 的明文。**永远不要**把 Provider �
 
 仅当任务明确是浏览器、HTML5、Three.js 或 WebGL 游戏时启用。第一步输出 `[LOAD_SKILL: threejs-game-director]`，由 director 路由 sibling。技能目录：`.aionrs/skills/<skill-name>/`。
 
-默认 Vite + TypeScript 脚手架，不要用 CDN `three.js r128` 单文件 HTML 当默认交付。概念图/贴图/图标优先调用 `aionui_image_generation`。3D 用 `threejs-3d-generator`（已注入 `TRIPO_API_KEY`），音频用 `threejs-audio-generator` 的 `kit`（已注入 `ELEVENLABS_API_KEY`）；先 probe，不要默认程序化。用户只给一句话时由你拍板：体验意图、情绪曲线、镜头、叙事、声音和难度，不要发创意选择题。对用户只说怎么打开、如何操作、当前目标和如何分享。
+默认 Vite + TypeScript 脚手架，不要用 CDN `three.js r128` 单文件 HTML 当默认交付。概念图/贴图/图标优先调用 `aionui_image_generation`。3D 用 `threejs-3d-generator`（已注入 `TRIPO_API_KEY`），音频用 `threejs-audio-generator` 的 `kit`（已注入 `ELEVENLABS_API_KEY` 与 `SEED_TTS_API_KEY`）；先 probe，不要默认程序化。用户只给一句话时由你拍板：体验意图、情绪曲线、镜头、叙事、声音和难度，不要发创意选择题。对用户只说怎么打开、如何操作、当前目标和如何分享。
 
 完成声明必须附 `npm run build`、章节自检用 `launch_game.mjs --no-open`、整局最后一条命令 `launch_game.mjs --deliver`（`GAME_DELIVERED`；不要在 ExecCommand 前台跑 `npm run play`）、控制台无未处理错误、截图、canvas 非空白、内部情绪节拍验证、可点的分享入口。未跑 `--deliver` 不得声称完成。`localhost` 只称本地试玩地址。用户未明确要求原型时，按完整短局/premium 路径走：首局可玩只是检查点，须加载画面/3D/QA sibling，主控不得是胶囊或方块。只有用户明确要求原型时才允许短切片。
 
