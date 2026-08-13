@@ -2,6 +2,26 @@
 
 Use this reference before generating or integrating audio for a game.
 
+## First Game Kit
+
+For a new complete game, run the Node kit once instead of inventing a full matrix by hand:
+
+```bash
+node <this-skill-dir>/scripts/threejs_audio_asset.mjs probe
+node <this-skill-dir>/scripts/threejs_audio_asset.mjs kit \
+  --genre "<english genre>" --emotion "<english emotions>" \
+  --verb "<experience-intent verb>" \
+  --explore "<heard space, materials>" \
+  --pressure "<escalation hearables>" \
+  --settle "<aftertaste hearables>" \
+  --spoken "no dialogue" \
+  --voice auto --out <game-dir>
+```
+
+`--genre` plus `--scene` or `--explore/--pressure/--settle` are required. ElevenLabs `positive_styles` must be English; the kit maps common Chinese scene words, but English hearables produce a better score. Overlay plays generated SFX/TTS from `__THREE_GAME_DIAGNOSTICS__` (score, complete, speed, optional `chapter` / `failed` / `hits` / `paused` / `dashing`).
+
+Voice follows the scene: singing/lyrics → music vocals; 旁白/对白/announcer → TTS; otherwise instrumental + SFX only. One score file, three loop regions (`explore` / `pressure` / `settle`). Overlay `AudioSystem` fetches `/audio/kit.json`. Expand the matrix below only for extra events the kit does not cover.
+
 ## Audio Planning
 
 Create an audio matrix before generating files:
@@ -46,7 +66,7 @@ Avoid prompts that are only mood words (`epic`, `AAA`, `cool`). Name the gamepla
 
 - Generate short SFX individually instead of one long mixed file.
 - Make loops deliberately with `--loop`; test them looping in the game.
-- Keep music out of SFX prompts. Generate music beds as their own looping files (20-40s) with genre, function (sting / explore / pressure / climax / settle), and mix notes. Do not invent a new vendor API; use the existing generator or a procedural motif and report what was actually heard.
+- Keep music out of SFX prompts. First games use `kit` (`POST /v1/music`, one score, three regions). Extra beds may use `music`. Do not fake a song with `--loop` SFX. Instrumental scenes must keep vocals out of the score.
 - Keep UI sounds quieter and shorter than gameplay SFX.
 - Generate variants for high-frequency events to avoid repetition.
 - Normalize in the game through volume groups, not by editing every file manually during early iteration.

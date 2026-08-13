@@ -33,13 +33,17 @@ Reference files resolve the same way: `<skill-dir>/references/<file>.md`. Siblin
 
 ## Sibling Skill Loading
 
-For broad work (complete, premium, AAA, polished, high-fidelity, showcase, from-scratch, upgrade, release-ready), load all five phase skills before implementation: `threejs-gameplay-systems`, `threejs-aaa-graphics-builder`, `threejs-game-ui-designer`, `threejs-debug-profiler`, `threejs-qa-release`. For narrow director-invoked work, load the directly relevant sibling plus `threejs-qa-release`. Do not skip sibling loading because this director bundles a phase playbook.
+For a first playable game (`做个游戏`, from-scratch, arcade, cozy, collect), load only these three before writing files:
 
-Load generator skills before deciding generated assets are unnecessary, whenever their trigger surfaces exist in premium/AAA/showcase/complete/release-ready/"less basic" work:
+1. `threejs-gameplay-systems/SKILL.md` — scaffold create, overlay session, `apply_look.mjs`
+2. `threejs-image-generator/SKILL.md` — sky / ground / HUD icon into `public/look/`
+3. `threejs-audio-generator/SKILL.md` — one `kit` command
 
-- `threejs-3d-generator/SKILL.md` — characters, creatures, bosses, vehicles, ships, weapons, buildings, signature props, complex pickups, hero environment pieces, rigging/animation, textured imports.
-- `threejs-image-generator/SKILL.md` — concept/reference sheets, texture and material references, skies/backgrounds, logos, icons, decals, GUI/title/menu art, terrain/sky plates, image-to-3D inputs.
-- `threejs-audio-generator/SKILL.md` — SFX, ambience, UI sounds, vehicle/weapon/boss audio, announcer/dialogue, voice conversion, audio cleanup.
+Do not load `threejs-aaa-graphics-builder`, `threejs-game-ui-designer`, `threejs-debug-profiler`, `threejs-qa-release`, or `threejs-3d-generator` before the first `LAUNCH_OK` and a screenshot, unless the user's first message already asked for premium, AAA, showcase, high-fidelity, or "less basic". After that screenshot, load the remaining siblings only if the frame is still primitive-dominated or the user asked to polish.
+
+For narrow director-invoked work, load the directly relevant sibling plus `threejs-qa-release` when verification is in scope.
+
+When premium/AAA/showcase/"less basic" is in the first message, load the five phase skills and the three generators as before. Do not skip a generator `SKILL.md` before recording that generator as not-needed.
 
 ## External Asset Sourcing Gate
 
@@ -97,6 +101,28 @@ node <threejs-gameplay-systems-skill-dir>/scripts/launch_game.mjs ./my-game
 ```
 
 Use `launch_game.mjs` (not foreground `npm run play`): Vite must be detached or ExecCommand times out and kills the server. Give `npm install` a long timeout. After `LAUNCH_OK`, if `aionui-browser` is available, open `http://127.0.0.1:5188`. Playwright is QA, not a playability gate.
+
+After scaffold create, apply generated sky/ground/icon, then generate audio with the Node kit (not foreground Python, not twenty SFX prompts). Voice follows the scene: lyrics/song → vocals; 旁白/对白/announcer → TTS; otherwise instrumental + SFX only.
+
+```bash
+node <threejs-gameplay-systems-skill-dir>/scripts/apply_look.mjs \
+  --out ./my-game --title "<title>" \
+  --sky <sky> --ground <ground> --icon <icon>
+```
+
+```bash
+node <threejs-audio-generator-skill-dir>/scripts/threejs_audio_asset.mjs probe
+node <threejs-audio-generator-skill-dir>/scripts/threejs_audio_asset.mjs kit \
+  --genre "<english genre>" --emotion "<english emotions>" \
+  --verb "<experience-intent verb>" \
+  --explore "<heard space, materials>" \
+  --pressure "<escalation hearables>" \
+  --settle "<aftertaste hearables>" \
+  --spoken "no dialogue" \
+  --voice auto --out ./my-game
+```
+
+Pass the beat sheet as `--explore/--pressure/--settle` (or one `--scene` that contains them). If anyone speaks, add `--spoken "旁白"` and `--lines "a|b"`. Do not call kit with only `--genre arcade`. Overlay `AudioSystem` plays kit SFX/TTS from diagnostics and input; do not leave generated files unplayed.
 
 ## Premium Completion Rule
 

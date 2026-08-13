@@ -24,6 +24,10 @@ function scaffoldDir() {
   return path.join(skillDir(), 'assets', 'threejs-vite-game');
 }
 
+function overlayDir() {
+  return path.join(skillDir(), 'assets', 'aion-overlay');
+}
+
 function normalizedProjectName(target) {
   const name = path
     .basename(path.resolve(target))
@@ -73,6 +77,7 @@ function createGame(target, force) {
 
   fs.mkdirSync(target, { recursive: true });
   copyTree(source, target);
+  applyAionOverlay(target);
 
   const projectName = normalizedProjectName(target);
   rewriteJsonName(path.join(target, 'package.json'), projectName);
@@ -80,6 +85,12 @@ function createGame(target, force) {
 
   console.log(`Created Three.js game scaffold at ${path.resolve(target)}`);
   console.log(`Next: cd ${path.resolve(target)} && npm install && node <gameplay-skill>/scripts/launch_game.mjs .`);
+}
+
+function applyAionOverlay(target) {
+  const overlay = overlayDir();
+  if (!fs.existsSync(overlay)) return;
+  copyTree(overlay, target);
 }
 
 function parseArgs(argv) {

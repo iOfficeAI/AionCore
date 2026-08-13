@@ -1,130 +1,104 @@
 ---
 name: threejs-audio-generator
-description: "Generate, convert, clean, and prepare audio assets for Three.js browser games using ElevenLabs. Use for sound effects, looping ambience, UI sounds, impact/weapon/vehicle audio, creature or boss stingers, announcer/dialogue TTS, scratch-performance voice conversion, voice cleanup/isolation, audio manifests, and game-ready web audio integration."
+description: "Generate first-game audio kits and individual assets for Three.js browser games using ElevenLabs. Prefer the Node kit command: one score with explore/pressure/settle regions, event SFX, and scene-aware vocals or TTS. Fall back to python3 only when Node cannot run."
 ---
 
 # Three.js Audio Generator
 
 ## Purpose
 
-Create game-ready audio assets for Three.js projects. This skill consolidates game sound generation, voice generation/conversion, audio cleanup, credential probing, and runtime integration into one Three.js-focused production workflow.
+Create game-ready audio for Three.js projects. First complete games use one `kit` command, not twenty invented prompts. Provider: ElevenLabs. Never put API keys in skill files or browser/game code.
 
-Provider: ElevenLabs.
+Resolve `<this-skill-dir>` in this order: `.aionrs/skills/threejs-audio-generator`, `~/.claude/skills/threejs-audio-generator`, `~/.codex/skills/threejs-audio-generator`, `~/.agents/skills/threejs-audio-generator`, or repo `skills/threejs-audio-generator`.
 
-Resolve `<this-skill-dir>` in the commands below in this order: `~/.claude/skills/threejs-audio-generator`, `~/.codex/skills/threejs-audio-generator`, `~/.agents/skills/threejs-audio-generator`, or repo `skills/threejs-audio-generator`.
+## First Game Path
 
-## When To Use
-
-Use this skill for:
-
-- SFX: jumps, hits, weapons, explosions, coins, pickups, collisions, UI clicks, confirms, errors.
-- Ambience: wind, rain, city bed, engine hum, portal loop, dungeon room tone, battle arena beds.
-- Music: looping beds and stingers that follow the emotion curve (explore/pressure/climax/settle as needed), not one unchanging track unless the brief documents a single restrained bed.
-- Voice: announcer barks, boss lines, tutorial prompts, menu narration, generated placeholder dialogue.
-- Voice conversion: convert a scratch performance into a target character voice while preserving timing and emotion.
-- Cleanup: isolate or denoise dialogue before voice conversion, TTS replacement, or transcription.
-- Three.js integration: Web Audio loading, looping, sprite/manifest mapping, volume groups, pause/resume, user gesture unlock.
-
-For complete, premium, AAA, or showcase game work, audio is not cosmetic. Generate or integrate interaction SFX plus the music states required by the emotion beat sheet unless the user explicitly requests mute/offline-only output or credentials/API attempts are blocked.
-
-## API Key
-
-Never store API keys in skill files or browser/game code, and never paste a key value into a report. The script reads `--api-key` or `ELEVENLABS_API_KEY`.
-
-Step 0, before declaring the key unavailable: run this skill's own probe and paste its literal output into the report.
+1. Probe with Node. Paste the literal `ELEVENLABS_API_KEY=SET|MISSING` line.
 
 ```bash
-python3 <this-skill-dir>/scripts/threejs_audio_asset.py probe   # prints ELEVENLABS_API_KEY=SET|MISSING
+node <this-skill-dir>/scripts/threejs_audio_asset.mjs probe
 ```
 
-`ELEVENLABS_API_KEY=MISSING` is only a valid skip/blocker reason when this output is shown. Keys defined only in a shell profile can be absent from the process env; if the plain probe prints MISSING unexpectedly, wrap it: `zsh -lc 'source ~/.zprofile 2>/dev/null || true; source ~/.zshrc 2>/dev/null || true; python3 <this-skill-dir>/scripts/threejs_audio_asset.py probe'`. When the director skill is loaded, prefer `threejs-game-director/scripts/probe_asset_credentials.sh`, which probes all three asset keys at once.
+`python3 <this-skill-dir>/scripts/threejs_audio_asset.py probe` is fallback only. Never run bare `python`. If the director skill is loaded, you may use `threejs-game-director/scripts/probe_asset_credentials.sh` for all three asset keys, then still run this Node probe for audio.
 
-Audio-specific: add `--validate` to the probe to call ElevenLabs `GET /user` and confirm the key actually works (prints `VALID_USER=...`); use it when a key is present but a generation still fails. A valid key can still be blocked by an out-of-credit or plan-tier limit — those surface as an `HTTP 4xx` from a real generation attempt. Report that as a purchase/plan blocker, do not silently skip.
+2. Decide voice from the **scene**, not a global default:
 
-## Required Reference
+- Need sung vocals (歌词 / 主题曲 / lyrics / choir) → music may include vocals.
+- Need spoken voice (旁白 / 对白 / announcer / narrator) → generate TTS lines; keep music instrumental unless the scene also sings.
+- Otherwise → instrumental score + SFX only. Do not add vocals to fill time.
 
-Load `references/audio-workflows.md` before building a game audio plan, generating multiple assets, wiring runtime audio, cleaning/converting voices, or claiming premium game audio.
+`--voice auto` (default) infers from `--genre --emotion --scene`. `--voice on|off` overrides.
 
-Track it in the reference ledger. Do not mark the audio phase complete while this reference is skipped.
-
-## Tool Script
-
-Run from the user's current game project directory:
+3. Generate the kit into the game directory (writes `public/audio/...` for Vite). `--genre` is required, plus either `--scene` or `--explore --pressure --settle`. Write hearables in English when possible. Chinese is accepted for voice detection; ElevenLabs styles are English-only.
 
 ```bash
-python3 <this-skill-dir>/scripts/threejs_audio_asset.py --help
+node <this-skill-dir>/scripts/threejs_audio_asset.mjs kit \
+  --genre "cozy lantern ferry" \
+  --emotion "safety, attachment" \
+  --verb "carry light across water" \
+  --explore "wooden dock at dusk, water lapping, lantern glass" \
+  --pressure "crossing chop, lanterns dim" \
+  --settle "far pier, warm glass" \
+  --spoken "no dialogue" \
+  --voice auto \
+  --out ./my-game
 ```
 
-Probe:
+If the scene has spoken lines, pass them:
 
 ```bash
-python3 <this-skill-dir>/scripts/threejs_audio_asset.py probe
+node <this-skill-dir>/scripts/threejs_audio_asset.mjs kit \
+  --genre "story climb" \
+  --scene "旁白讲述身世" \
+  --lines "你还记得上山的路。|不要回头。" \
+  --out ./my-game
 ```
 
-Generate SFX:
+The kit writes one `audio/music/score.mp3` plus `kit.json` loop regions for `explore` / `pressure` / `settle`. Do not generate three unrelated songs. Overlay `AudioSystem` loads `/audio/kit.json` after user-gesture unlock, plays intro/settle TTS from `voice.lines[].cue`, and fires SFX from score/complete/speed/chapter diagnostics plus Space dash and Escape pause. If the key is missing or the API fails, report the blocker; the overlay still plays a procedural bed so the game is not silent.
+
+`--dry-run` writes `kit.json` only (no API). Use it to confirm `VOICE=instrumental|vocals|tts|vocals+tts` before spending credits.
+
+## Scene Voice Rule
+
+| Scene need | Music | Speech |
+| --- | --- | --- |
+| Action, cozy, puzzle, horror without talk | Instrumental only | None |
+| Ending theme, rhythm/lyrics, choir | Vocals allowed | Only if the scene also speaks |
+| 旁白 / 对白 / announcer / tutorial voice | Instrumental | TTS lines |
+| User said silent / offline | Skip generation | Skip |
+
+Do not generate TTS because a kit exists. Do not put lyrics on a stealth or cozy bed unless the scene asks for singing.
+
+## Individual Commands
+
+Use these after the kit, for extra events only:
 
 ```bash
-python3 <this-skill-dir>/scripts/threejs_audio_asset.py sfx \
-  --prompt "tight futuristic boost pickup, bright transient, short sparkling tail, arcade racing game" \
-  --duration 1.2 \
-  --prompt-influence 0.65 \
-  --out assets/audio/sfx/boost-pickup.mp3
-```
+node <this-skill-dir>/scripts/threejs_audio_asset.mjs sfx \
+  --prompt "short shield absorb, glassy hit, 0.8s tail, no music, no voice" \
+  --duration 0.8 \
+  --out assets/audio/sfx/shield.mp3
 
-Generate looping ambience:
+node <this-skill-dir>/scripts/threejs_audio_asset.mjs music \
+  --genre "boss approach" \
+  --scene "instrumental pressure" \
+  --out assets/audio/music/boss.mp3
 
-```bash
-python3 <this-skill-dir>/scripts/threejs_audio_asset.py sfx \
-  --prompt "seamless cyber resort mini golf ambience, distant surf, soft neon transformer hum, gentle crowd bed" \
-  --duration 12 \
-  --loop \
-  --prompt-influence 0.45 \
-  --out assets/audio/ambience/cyber-resort-loop.mp3
-```
-
-Generate TTS/announcer line:
-
-```bash
-python3 <this-skill-dir>/scripts/threejs_audio_asset.py tts \
+node <this-skill-dir>/scripts/threejs_audio_asset.mjs tts \
   --text "Perfect shot." \
-  --voice-id JBFqnCBsd6RMkjVDRZzb \
   --out assets/audio/voice/perfect-shot.mp3
 ```
 
-Clean dialogue:
+`python3 .../threejs_audio_asset.py` still covers `sfx`, `tts`, `isolate`, and `voice-change`. Prefer Node for `probe`, `kit`, and `music`.
 
-```bash
-python3 <this-skill-dir>/scripts/threejs_audio_asset.py isolate \
-  --input assets/audio/source/noisy-boss-line.wav \
-  --out assets/audio/voice/boss-line-clean.mp3
-```
+## Required Reference
 
-Convert a scratch performance to a target voice:
-
-```bash
-python3 <this-skill-dir>/scripts/threejs_audio_asset.py voice-change \
-  --input assets/audio/source/scratch-boss-line.wav \
-  --voice-id JBFqnCBsd6RMkjVDRZzb \
-  --remove-background-noise \
-  --out assets/audio/voice/boss-line-final.mp3
-```
-
-## Game Audio Defaults
-
-- SFX: `mp3_44100_128`, 0.5-2.5s, prompt influence `0.55-0.8`.
-- UI: 0.15-0.8s, high prompt influence, keep transients clear.
-- Ambience loops: 8-30s, `--loop`, prompt influence `0.3-0.55`.
-- Voice: TTS for clean generated lines; voice-change when timing/acting from a scratch performance matters.
-- Cleanup: isolate noisy speech before voice-change or final dialogue use.
-- Runtime: generate locally, commit/import files, and load them via Web Audio/Three.js integration. Never put API keys in browser code.
+Load `references/audio-workflows.md` when adding more than the first kit, wiring extra events, or claiming premium audio. First-kit-only work can proceed after this SKILL.md.
 
 ## Required Report
 
-Report:
-
-- Credential probe output or real blocker.
-- Reference ledger.
-- Generated/processed file paths.
-- Prompts/text/input files, voice IDs, durations, loop flags, and output formats.
-- Runtime integration notes: audio groups, trigger events, loop behavior, unlock gesture, pause/resume, volume/mute controls.
-- Remaining audio gaps and any licensing/plan assumptions tied to the user's ElevenLabs account.
+- Probe line `ELEVENLABS_API_KEY=SET|MISSING` (and `--validate` if a present key still fails).
+- `VOICE=...` from the kit command.
+- Paths: `public/audio/kit.json`, `public/audio/music/score.mp3`, SFX files, TTS files if any.
+- Whether overlay `AudioSystem` is present (scaffold create applies it).
+- Blocker if generation failed (HTTP/quota/network). Do not claim files exist that were not written.

@@ -97,6 +97,8 @@ EXTERNAL_OUTPUT_PATTERNS = [
 
 AUDIO_OUTPUT_PATTERNS = [
     re.compile(r"\b[\w./-]*assets/audio/[\w./-]+\.(mp3|wav|ogg|m4a)\b"),
+    re.compile(r"\b[\w./-]*public/audio/[\w./-]+\.(mp3|wav|ogg|m4a|json)\b"),
+    re.compile(r"\bpublic/audio/kit\.json\b"),
 ]
 
 NON_CREDENTIAL_BLOCKER_MARKERS = [

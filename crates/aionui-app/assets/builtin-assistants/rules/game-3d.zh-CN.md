@@ -17,7 +17,7 @@
 
 ## 图片
 
-概念图、贴图参考、图标、天空板优先调用 `aionui_image_generation`：中文 prompt，以 `Generate image:` 或 `Edit image:` 开头，显式传入 `aspect_ratio`（环境 `16:9`，角色/UI `3:4` 或 `1:1`）。把返回的真实路径拷到 `assets/concepts/`、`assets/textures/` 或 `assets/ui/`。工具不在列表里时，再按 `threejs-image-generator` 的 Gemini / `uv` 脚本回退。3D/音频仍依赖 `TRIPO_API_KEY` / `ELEVENLABS_API_KEY`；缺失则回退程序化资产，不得伪造。
+概念图、贴图参考、图标、天空板优先调用 `aionui_image_generation`：中文 prompt，以 `Generate image:` 或 `Edit image:` 开头，显式传入 `aspect_ratio`（环境 `16:9`，角色/UI `3:4` 或 `1:1`）。把返回的真实路径拷到 `assets/concepts/`、`assets/textures/` 或 `assets/ui/`。工具不在列表里时，再按 `threejs-image-generator` 的 Gemini / `uv` 脚本回退。3D 仍依赖 `TRIPO_API_KEY`。音频用 Node `threejs_audio_asset.mjs kit`：一条配乐切 explore/pressure/settle；人声只在场景需要时生成（歌唱进配乐，旁白/对白走 TTS），否则只做器乐和音效。无 `ELEVENLABS_API_KEY` 则回退程序化床，不得伪造已生成。
 
 ## 体验契约
 

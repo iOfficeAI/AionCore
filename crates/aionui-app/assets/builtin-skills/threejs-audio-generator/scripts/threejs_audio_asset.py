@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Generate and process Three.js game audio assets with ElevenLabs."""
+"""Generate and process Three.js game audio assets with ElevenLabs.
+
+Prefer the Node twin `threejs_audio_asset.mjs` for probe, kit, and music.
+This file remains for sfx/tts/isolate/voice-change fallback. Never run bare `python`.
+"""
 
 from __future__ import annotations
 

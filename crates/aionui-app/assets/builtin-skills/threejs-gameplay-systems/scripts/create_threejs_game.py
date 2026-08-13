@@ -31,6 +31,10 @@ def scaffold_dir() -> Path:
     return skill_dir() / "assets" / "threejs-vite-game"
 
 
+def overlay_dir() -> Path:
+    return skill_dir() / "assets" / "aion-overlay"
+
+
 def normalized_project_name(target: Path) -> str:
     name = re.sub(r"[^a-z0-9._-]+", "-", target.resolve().name.lower()).strip("-")
     return name or "threejs-vite-game"
@@ -64,6 +68,9 @@ def create_game(target: Path, force: bool) -> None:
 
     target.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, target, dirs_exist_ok=True, ignore=ignore)
+    overlay = overlay_dir()
+    if overlay.is_dir():
+        shutil.copytree(overlay, target, dirs_exist_ok=True, ignore=ignore)
 
     project_name = normalized_project_name(target)
     rewrite_json_name(target / "package.json", project_name)

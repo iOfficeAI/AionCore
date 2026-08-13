@@ -97,7 +97,7 @@ Load these files before the matching phase starts:
 - Bot playtest, for release-ready gameplay claims or difficulty/fairness verification: `threejs-qa-release/references/playtest-bot.md` and `threejs-qa-release/references/checklists/bot-playtest.md`
 - 3D generator, when loaded by the external asset sourcing gate: `threejs-3d-generator/references/api-notes.md` and `threejs-3d-generator/references/threejs-integration.md`
 - 3D plus image generator, when both are loaded: `threejs-3d-generator/references/image-generator-workflows.md`
-- Audio generator, when loaded for a game: `threejs-audio-generator/references/audio-workflows.md`
+- Audio generator, when loaded for a game: `threejs-audio-generator/references/audio-workflows.md`. First complete games run the Node `kit` after scaffold create; load the full workflow only when adding events beyond the kit.
 
 Prompt templates are packaged in `references/prompt-templates.md` under the director and relevant sibling skills. Load them only when the user asks for a reusable prompt or task template.
 

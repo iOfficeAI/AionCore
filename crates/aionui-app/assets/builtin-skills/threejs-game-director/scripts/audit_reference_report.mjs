@@ -64,7 +64,11 @@ const EXTERNAL_OUTPUT_PATTERNS = [
   /\b[\w./-]+\.(glb|gltf|fbx)\b/,
 ];
 
-const AUDIO_OUTPUT_PATTERNS = [/\b[\w./-]*assets\/audio\/[\w./-]+\.(mp3|wav|ogg|m4a)\b/];
+const AUDIO_OUTPUT_PATTERNS = [
+  /\b[\w./-]*assets\/audio\/[\w./-]+\.(mp3|wav|ogg|m4a)\b/,
+  /\b[\w./-]*public\/audio\/[\w./-]+\.(mp3|wav|ogg|m4a|json)\b/,
+  /\bpublic\/audio\/kit\.json\b/,
+];
 
 const NON_CREDENTIAL_BLOCKER_MARKERS = [
   'api error',

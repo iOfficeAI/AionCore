@@ -17,7 +17,7 @@ If the user does not specify a genre, default to a 3D platformer with jump, coll
 
 ## Images
 
-For concepts, texture references, icons, and sky plates, call `aionui_image_generation` first: prompt in the user's language, start with `Generate image:` or `Edit image:`, and pass `aspect_ratio` (`16:9` environments, `3:4` or `1:1` characters/UI). Copy the returned path into `assets/concepts/`, `assets/textures/`, or `assets/ui/`. If that tool is not in the tool list, fall back to the Gemini / `uv` script in `threejs-image-generator`. 3D/audio still need `TRIPO_API_KEY` / `ELEVENLABS_API_KEY`; if missing, fall back to procedural assets and do not fake generation.
+For concepts, texture references, icons, and sky plates, call `aionui_image_generation` first: prompt in the user's language, start with `Generate image:` or `Edit image:`, and pass `aspect_ratio` (`16:9` environments, `3:4` or `1:1` characters/UI). Copy the returned path into `assets/concepts/`, `assets/textures/`, or `assets/ui/`. If that tool is not in the tool list, fall back to the Gemini / `uv` script in `threejs-image-generator`. 3D still needs `TRIPO_API_KEY`. For audio, run the Node `threejs_audio_asset.mjs kit`: one score with explore/pressure/settle regions. Add vocals only when the scene sings; add TTS only for narrator/dialogue/announcer; otherwise instrumental + SFX. If `ELEVENLABS_API_KEY` is missing, use the procedural bed and do not fake generated files.
 
 ## Experience contract
 

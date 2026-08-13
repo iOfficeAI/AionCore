@@ -33,7 +33,7 @@ Load `references/checklists/endless-runner-premium-quality.md` for endless runne
 
 Load `references/prompt-templates.md` only when the user asks for reusable prompts, starter prompts, or a task template.
 
-Load `threejs-audio-generator` when implementing real SFX, ambience, music beds, UI sounds, voice/TTS, or audio cleanup beyond simple placeholder hooks. Gameplay code should emit audio events; the audio skill should generate or process the actual assets and define the runtime audio matrix.
+Load `threejs-audio-generator` when implementing real SFX, ambience, music beds, UI sounds, voice/TTS, or audio cleanup beyond simple placeholder hooks. New games: run the Node `kit` command so overlay `AudioSystem` can load `/audio/kit.json`. Voice follows the scene (vocals only when the scene sings; TTS only when it speaks). Overlay already plays pickup/dash/win/pause and intro/settle TTS from diagnostics and input; call `audio.hit()` / `audio.fail()` or publish `hits` / `failed` / `chapter` on `__THREE_GAME_DIAGNOSTICS__` when those events exist. Do not keep the vendor oscillator as the final mix.
 
 1. Inspect project structure, scripts, dependencies, current loop, input, camera, entities, state, UI, and diagnostics.
 2. Write the compact game design brief: player promise, experience intent (primary/supporting/anti-goal emotions), target feeling, primary verb, objective, pressure, reward, fail/retry, skill expression, non-goals.
@@ -57,7 +57,7 @@ node <this-skill-dir>/scripts/launch_game.mjs ./my-game
 
 Prefer the `.mjs` creator. Launch with `launch_game.mjs`; do not foreground `npm run play` in ExecCommand.
 
-The script copies `assets/threejs-vite-game/`, rewrites the project name in `package.json` and `package-lock.json`, and keeps generated games self-contained with their own visual test and canvas-inspection script. Use `--force` only when the target directory may be overwritten.
+The script copies `assets/threejs-vite-game/`, then applies `assets/aion-overlay/` (stylized player, chapter session, pause/share, look loader, audio mixer). Rewrite the project name in `package.json` and `package-lock.json`. After image generation, run `scripts/apply_look.mjs` so sky/ground/icon land in `public/look/`, not `assets/concepts/`. Use `--force` only when the target directory may be overwritten.
 
 ## Library Guidance
 

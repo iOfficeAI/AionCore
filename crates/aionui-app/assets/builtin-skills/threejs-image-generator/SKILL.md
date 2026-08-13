@@ -43,6 +43,27 @@ uv run <this-skill-dir>/scripts/generate_image.py probe   # prints GEMINI_API_KE
 
 `GEMINI_API_KEY=MISSING` is a valid 2D skip/blocker only when the MCP tool is also absent and this probe output is shown. Keys defined only in a shell profile can be absent from the process env; if the plain probe prints MISSING unexpectedly, wrap it: `zsh -lc 'source ~/.zprofile 2>/dev/null || true; source ~/.zshrc 2>/dev/null || true; uv run <this-skill-dir>/scripts/generate_image.py probe'`. When the director skill is loaded, still run `threejs-game-director/scripts/probe_asset_credentials.sh` for Tripo/Gemini/ElevenLabs, but treat MCP availability as the image provider for Aion sessions.
 
+## First Game Look
+
+For a new Three.js game, generate three images and apply them into the running game, not `assets/concepts/`:
+
+1. Sky plate, `aspect_ratio` `16:9`
+2. Ground albedo, seamless, `aspect_ratio` `1:1`
+3. HUD icon, `aspect_ratio` `1:1`
+
+Then copy them in:
+
+```bash
+node <threejs-gameplay-systems-skill-dir>/scripts/apply_look.mjs \
+  --out ./my-game \
+  --title "<game title>" \
+  --sky <generated-sky> \
+  --ground <generated-ground> \
+  --icon <generated-icon>
+```
+
+`LOOK_OK` must show `public/look/look.json`. Overlay `LookSystem` loads `/look/look.json` and applies sky/ground/icon. Leaving the only copy under `assets/concepts/` is a miss for these three surfaces.
+
 ## Generate With Aion MCP (default)
 
 Call `aionui_image_generation`. Do not write a Python/Gemini script to work around it.
@@ -52,7 +73,7 @@ Call `aionui_image_generation`. Do not write a Python/Gemini script to work arou
 - Include subject, camera/lens, light (direction/quality/color temperature), materials, color, composition, frame, and negatives. Reuse the Prompt Patterns below as the subject description after the prefix.
 - Pass `aspect_ratio` explicitly: environments `16:9`, characters/UI `3:4` or `1:1`, vertical `9:16`. Do not pass pixel dimensions.
 - For edits, put existing local paths or URLs in `image_uris`.
-- Copy or move the returned real file into `assets/concepts/`, `assets/textures/`, `assets/decals/`, or `assets/ui/` and record that path in the ledger. Do not leave the only copy under a timestamped MCP dump if the game expects a stable asset path.
+- First-game sky, ground, and HUD icon go through `apply_look.mjs` into `public/look/`. Other images may still land in `assets/concepts/`, `assets/textures/`, `assets/decals/`, or `assets/ui/`. Do not leave the only copy under a timestamped MCP dump if the game expects a stable asset path.
 - If the MCP call fails, report the tool error, then try the Gemini script below. If that is also blocked, fall back to procedural assets and do not fake an image.
 
 ## Gemini Script (fallback only)
