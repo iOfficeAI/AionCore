@@ -1,6 +1,6 @@
 ---
 name: threejs-audio-generator
-description: "Generate first-game audio kits and individual assets for Three.js browser games using ElevenLabs. Prefer the Node kit command: one score with explore/pressure/settle regions, event SFX, and scene-aware vocals or TTS. Fall back to python3 only when Node cannot run."
+description: "Generate first-game audio kits and individual assets for Three.js browser games using ElevenLabs. Prefer the Node kit command: one score with explore/pressure/settle regions, event SFX, and scene-aware vocals or TTS. Fall back to python3 only when node is missing or Node exits non-zero."
 ---
 
 # Three.js Audio Generator
@@ -19,7 +19,7 @@ Resolve `<this-skill-dir>` in this order: `.aionrs/skills/threejs-audio-generato
 node <this-skill-dir>/scripts/threejs_audio_asset.mjs probe
 ```
 
-`python3 <this-skill-dir>/scripts/threejs_audio_asset.py probe` is fallback only. Never run bare `python`. If the director skill is loaded, you may use `threejs-game-director/scripts/probe_asset_credentials.mjs` for all three asset keys, then still run this Node probe for audio.
+Fall back to `python3 <this-skill-dir>/scripts/threejs_audio_asset.py probe` only when the shell reports `node` is not found, or Node exits non-zero with an error on stderr. Exit 0 with empty stdout is a script bug — retry the same Node command or stop; do not switch to Python. Never run bare `python`. If the director skill is loaded, you may use `threejs-game-director/scripts/probe_asset_credentials.mjs` for all three asset keys, then still run this Node probe for audio.
 
 2. Decide voice from the **scene**, not a global default:
 
@@ -89,7 +89,7 @@ node <this-skill-dir>/scripts/threejs_audio_asset.mjs tts \
   --out assets/audio/voice/perfect-shot.mp3
 ```
 
-`python3 .../threejs_audio_asset.py` still covers `sfx`, `tts`, `isolate`, and `voice-change`. Prefer Node for `probe`, `kit`, and `music`.
+`python3 .../threejs_audio_asset.py` still covers `sfx`, `tts`, `isolate`, and `voice-change` when Node is missing or exited non-zero. Prefer Node for `probe`, `kit`, and `music`. Do not switch to Python because Node printed nothing and exited 0.
 
 ## Required Reference
 

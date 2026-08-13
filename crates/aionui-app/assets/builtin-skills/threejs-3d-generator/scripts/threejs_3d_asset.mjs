@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
  * Tripo OpenAPI 3D asset helper.
- * Prefer this Node script. python3 threejs_3d_asset.py is fallback only.
+ * Prefer this Node script. python3 threejs_3d_asset.py is fallback only
+ * when node is missing or this process exits non-zero.
  * Never run bare `python` (Windows Store stub).
  */
 
 import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import {
   clipNameFromPreset,
   findDownloadedModel,
@@ -630,12 +630,7 @@ async function main(argv) {
   );
 }
 
-const invokedDirectly =
-  Boolean(process.argv[1]) && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
-
-if (invokedDirectly) {
-  main(process.argv.slice(2)).catch((error) => {
-    eprint(error instanceof Error ? error.message : String(error));
-    process.exit(1);
-  });
-}
+main(process.argv.slice(2)).catch((error) => {
+  eprint(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+});

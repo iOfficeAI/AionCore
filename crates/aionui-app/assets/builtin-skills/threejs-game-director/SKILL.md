@@ -15,7 +15,7 @@ Before planning, note what this runner can do and adapt:
 
 1. **Invoke sibling skills directly?** Usually not — the runner invokes only this skill. Load sibling `SKILL.md` files with file-read tools instead. Never claim a skill was "invoked" when it was only loaded/read.
 2. **Read files by path?** Resolve every skill and reference path through the path ladder below. If a required file cannot be read anywhere on the ladder, record the failure in the ledger and use `references/phase-playbook.md` as the fallback procedure for that phase.
-3. **Run shell commands (node)?** If yes, use the packaged Node scripts (scaffold creator, `launch_game.mjs`, canvas inspector, report audit). `python3` is optional fallback. Never run bare `python` (Windows Store stub). If node/npm are missing from the shell, say so; do not tell the user to install Node — AionUi provides a managed runtime on Windows, macOS, and Linux.
+3. **Run shell commands (node)?** If yes, use the packaged Node scripts (scaffold creator, `launch_game.mjs`, canvas inspector, report audit). `python3` is optional fallback only when `node` is missing from PATH or the Node command exits non-zero. Exit 0 with empty stdout is a script bug — retry Node or stop; do not switch to Python. Never run bare `python` (Windows Store stub). If node/npm are missing from the shell, say so; do not tell the user to install Node — AionUi provides a managed runtime on Windows, macOS, and Linux.
 4. **Drive a browser / run Playwright?** If yes, capture screenshots and canvas inspection yourself. If not, ask the user to run `npm run verify:visual` and `npm run inspect:canvas` and paste the results; report unverified visuals as a residual risk, never as verified.
 
 ### Skill Path Ladder
@@ -182,7 +182,7 @@ When shell tools are available, draft the final evidence report to a markdown fi
 node <director-skill-dir>/scripts/audit_reference_report.mjs /path/to/final-report.md
 ```
 
-Prefer the `.mjs` auditor. `python3 .../audit_reference_report.py` is fallback only. Never run bare `python`.
+Prefer the `.mjs` auditor. Fall back to `python3 .../audit_reference_report.py` only when `node` is missing or Node exits non-zero. Exit 0 with empty stdout is not a fallback reason. Never run bare `python`.
 
 Default (no flag) already requires experience intent, emotion beat, chapter ledger, share, play/launch, and music/audio state. Use `--premium` for premium/AAA/showcase/high-fidelity/polished/complete/release-ready/"less basic" claims; add `--physics` for physics-heavy games; add `--audio` when generated or integrated audio is in scope; add `--no-design` only for debug/perf/QA-only reports with no gameplay claims. If the audit fails, fix the missing sections or state the exact blocker instead of claiming completion. If the script is unavailable, manually enforce the same sections listed in Required Verification.
 

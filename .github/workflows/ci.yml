@@ -60,6 +60,16 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace
 
+  skill-scripts:
+    name: Skill scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.11.0"
+      - run: node --test $(find crates/aionui-app/assets/builtin-skills -name '*.test.mjs')
+
   changes:
     name: Detect dependency changes
     runs-on: ubuntu-latest
