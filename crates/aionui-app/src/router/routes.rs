@@ -31,7 +31,7 @@ use aionui_conversation::{conversation_ops_routes, conversation_routes};
 use aionui_cron::cron_routes;
 use aionui_extension::{extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
-use aionui_mcp::mcp_routes;
+use aionui_mcp::{mcp_routes, permission_policy_routes};
 use aionui_office::{office_proxy_routes, office_routes};
 use aionui_project::project_routes;
 use aionui_realtime::{NoopMessageRouter, WsHandlerState, ws_upgrade_handler};
@@ -292,6 +292,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let mcp_authenticated =
         mcp_routes(states.mcp).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // Agent permission-policy routes protected by auth middleware
+    let permission_policy_authenticated = permission_policy_routes(states.permission_policy.clone())
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Extension routes protected by auth middleware
     let extension_authenticated =
         extension_routes(states.extension).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -371,6 +375,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(project_authenticated)
         .merge(sidebar_authenticated)
         .merge(mcp_authenticated)
+        .merge(permission_policy_authenticated)
         .merge(extension_authenticated)
         .merge(hub_authenticated)
         .merge(skill_authenticated)

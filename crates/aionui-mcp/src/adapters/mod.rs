@@ -6,6 +6,7 @@ mod codebuddy;
 mod codex;
 mod gemini;
 mod opencode;
+mod opencode_permission;
 mod qwen;
 
 pub use aionrs::AionrsAdapter;
@@ -15,4 +16,5 @@ pub use codebuddy::CodeBuddyAdapter;
 pub use codex::CodexAdapter;
 pub use gemini::GeminiAdapter;
 pub use opencode::OpencodeAdapter;
+pub use opencode_permission::OpenCodePermissionAdapter;
 pub use qwen::QwenAdapter;

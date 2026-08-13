@@ -31,7 +31,8 @@ use aionui_extension::{
 use aionui_file::{FileRouterState, FileService, SnapshotService};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
-    McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
+    McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpenCodePermissionAdapter,
+    OpencodeAdapter, PermissionPolicyAdapter, PermissionRouterState, QwenAdapter,
 };
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
 use aionui_project::{ProjectRouterState, ProjectService};
@@ -132,6 +133,7 @@ pub struct ModuleStates {
     pub project: ProjectRouterState,
     pub sidebar: SidebarRouterState,
     pub mcp: McpRouterState,
+    pub permission_policy: PermissionRouterState,
     pub extension: ExtensionRouterState,
     pub hub: HubRouterState,
     pub skill: SkillRouterState,
@@ -313,6 +315,9 @@ pub async fn build_module_states(
         project: build_module_state_phase(&boot, "project", || build_project_state(services)),
         sidebar: build_module_state_phase(&boot, "sidebar", || build_sidebar_state(services)),
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
+        permission_policy: build_module_state_phase(&boot, "permission_policy", || {
+            build_permission_policy_state(services)
+        }),
         extension: ext_state,
         hub: hub_state,
         skill: skill_state,
@@ -596,6 +601,16 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
         connection_test_service: McpConnectionTestService::new(http_client.clone(), services.event_bus.clone()),
         oauth_service: aionui_mcp::McpOAuthService::new(oauth_token_repo, http_client),
     }
+}
+
+/// Build the `PermissionRouterState` with all permission-policy adapters.
+///
+/// Only the OpenCode pilot is wired today; future agents (Claude Code, Codex,
+/// Gemini) add an adapter here. Each agent shares one adapter instance (state-free).
+pub fn build_permission_policy_state(_services: &AppServices) -> PermissionRouterState {
+    let adapters: Vec<std::sync::Arc<dyn PermissionPolicyAdapter>> =
+        vec![std::sync::Arc::new(OpenCodePermissionAdapter)];
+    PermissionRouterState { adapters }
 }
 
 /// Adapter exposing the assistant service's lazy generated-assistant
