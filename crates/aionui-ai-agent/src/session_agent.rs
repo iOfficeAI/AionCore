@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, now_ms};
 use aionui_session::{
-    BackendError, Command, CommandMeta, ContentBlock, SessionBackend, SessionEnvelope, SessionEvent, ToolResultContent,
+    BackendError, Command, CommandMeta, ContentBlock, ModeInfo, ModelInfo, SessionBackend, SessionEnvelope,
+    SessionEvent, ToolResultContent,
 };
 use futures_util::stream::BoxStream;
 use tokio::sync::broadcast;
@@ -108,6 +109,17 @@ struct SessionRuntime {
     /// (`get_config_options`) prefers this over the (synchronously-seeded) caps value so
     /// the observed re-read confirms the switch. `None` until the user picks a level.
     effort_override: std::sync::Mutex<Option<String>>,
+    /// Raw material from the last `CatalogUpdated`, kept so a later `ConfigChanged`
+    /// can re-project the WHOLE options snapshot.
+    ///
+    /// Needed because the two constraints collide: the frontend REPLACES its whole
+    /// snapshot on every `acp_config_option` frame (`useAcpConfigOptions` ->
+    /// `replaceSnapshot`), so a confirmation frame must carry every category or it
+    /// wipes the sibling pickers — yet the pump deliberately holds no backend Arc
+    /// (see `spawn_event_pump`) and therefore cannot rebuild the catalog itself.
+    /// Empty until the first catalog lands; a confirmation arriving before that
+    /// degrades to "update the override, emit nothing" (REST re-read still corrects).
+    last_catalog: std::sync::Mutex<Option<(Vec<ModeInfo>, Vec<ModelInfo>)>>,
 }
 
 impl SessionRuntime {
@@ -153,6 +165,14 @@ impl SessionRuntime {
     }
     fn effort_override(&self) -> Option<String> {
         self.effort_override.lock().ok().and_then(|g| g.clone())
+    }
+    fn set_last_catalog(&self, modes: Vec<ModeInfo>, models: Vec<ModelInfo>) {
+        if let Ok(mut g) = self.last_catalog.lock() {
+            *g = Some((modes, models));
+        }
+    }
+    fn last_catalog(&self) -> Option<(Vec<ModeInfo>, Vec<ModelInfo>)> {
+        self.last_catalog.lock().ok().and_then(|g| g.clone())
     }
 
     /// Atomic clean-converge frame: if not already `Finished`, set status ←
@@ -445,6 +465,7 @@ impl SessionAgentTask {
             mode_override: std::sync::Mutex::new(None),
             model_override: std::sync::Mutex::new(None),
             effort_override: std::sync::Mutex::new(None),
+            last_catalog: std::sync::Mutex::new(None),
         });
         // Subscribe to the backend's event stream HERE (sync), then hand ONLY the
         // stream to the pump — never a backend Arc (see `spawn_event_pump` for why
@@ -2328,6 +2349,95 @@ fn session_event_name(e: &SessionEvent) -> &'static str {
 }
 
 /// Drain the backend's `events()` and re-broadcast each as an `AgentStreamEvent`.
+/// Project the direct-CLI catalog into a WHOLE `acp_config_option` snapshot and
+/// broadcast it.
+///
+/// Emitted whole (mode + model + effort together) because the frontend REPLACES its
+/// entire snapshot on this frame (`useAcpConfigOptions` -> `replaceSnapshot`) — a
+/// partial frame would wipe the sibling pickers. Built here rather than in the
+/// stateless `translate_event` because every current-value highlight comes from the
+/// runtime's overrides.
+///
+/// Two callers, deliberately sharing one projection: the catalog arrival itself, and a
+/// later `ConfigChanged` confirming an agent-applied mode/model.
+fn emit_config_options_snapshot(modes: &[ModeInfo], models: &[ModelInfo], runtime: &SessionRuntime) {
+    let mut config_options: Vec<aionui_api_types::AcpConfigOptionDto> = Vec::new();
+    if !modes.is_empty() {
+        config_options.push(aionui_api_types::AcpConfigOptionDto {
+            id: "mode".into(),
+            name: Some("Mode".into()),
+            label: None,
+            description: None,
+            category: Some("mode".into()),
+            option_type: "select".into(),
+            current_value: runtime.mode_override(),
+            options: modes
+                .iter()
+                .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
+                    value: m.id.clone(),
+                    name: Some(m.name.clone()),
+                    label: None,
+                    description: m.description.clone(),
+                })
+                .collect(),
+        });
+    }
+    if !models.is_empty() {
+        config_options.push(aionui_api_types::AcpConfigOptionDto {
+            id: "model".into(),
+            name: Some("Model".into()),
+            label: None,
+            description: None,
+            category: Some("model".into()),
+            option_type: "select".into(),
+            current_value: runtime.model_override(),
+            options: models
+                .iter()
+                .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
+                    value: m.id.clone(),
+                    name: Some(m.name.clone()),
+                    label: None,
+                    description: m.description.clone(),
+                })
+                .collect(),
+        });
+    }
+    // Reasoning-effort axis (claude per-model `supportedEffortLevels`). Re-emitted here
+    // too — otherwise a push would wipe the effort option that `get_config_options`
+    // (REST) surfaced. The pump has no backend Arc, so the current model is resolved
+    // from the pushed catalog and the highlight comes from the runtime's optimistic
+    // effort override (claude emits no effort echo). Emitted only when the current model
+    // advertises efforts (union fallback when the current model is unknown).
+    let efforts = resolve_current_model_efforts(models, runtime.model_override().as_deref());
+    if !efforts.is_empty() {
+        config_options.push(aionui_api_types::AcpConfigOptionDto {
+            id: "reasoning_effort".into(),
+            name: Some("Thinking".into()),
+            label: None,
+            description: None,
+            category: Some("thought_level".into()),
+            option_type: "select".into(),
+            current_value: runtime.effort_override(),
+            options: efforts
+                .iter()
+                .map(|e| aionui_api_types::AcpConfigSelectOptionDto {
+                    value: e.clone(),
+                    name: Some(e.clone()),
+                    label: None,
+                    description: None,
+                })
+                .collect(),
+        });
+    }
+    // No categories → nothing to re-project; a spurious empty-snapshot frame would only
+    // clobber the frontend's picker.
+    if !config_options.is_empty()
+        && let Ok(v) = serde_json::to_value(serde_json::json!({ "config_options": config_options }))
+    {
+        let _ = runtime.tx.send(AgentStreamEvent::AcpConfigOption(v));
+    }
+}
+
 fn spawn_event_pump(
     mut events: BoxStream<'static, SessionEnvelope>,
     runtime: Arc<SessionRuntime>,
@@ -2592,83 +2702,10 @@ fn spawn_event_pump(
                 slash_commands,
             } = &env.event
             {
-                let mut config_options: Vec<aionui_api_types::AcpConfigOptionDto> = Vec::new();
-                if !modes.is_empty() {
-                    config_options.push(aionui_api_types::AcpConfigOptionDto {
-                        id: "mode".into(),
-                        name: Some("Mode".into()),
-                        label: None,
-                        description: None,
-                        category: Some("mode".into()),
-                        option_type: "select".into(),
-                        current_value: runtime.mode_override(),
-                        options: modes
-                            .iter()
-                            .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
-                                value: m.id.clone(),
-                                name: Some(m.name.clone()),
-                                label: None,
-                                description: m.description.clone(),
-                            })
-                            .collect(),
-                    });
-                }
-                if !models.is_empty() {
-                    config_options.push(aionui_api_types::AcpConfigOptionDto {
-                        id: "model".into(),
-                        name: Some("Model".into()),
-                        label: None,
-                        description: None,
-                        category: Some("model".into()),
-                        option_type: "select".into(),
-                        current_value: runtime.model_override(),
-                        options: models
-                            .iter()
-                            .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
-                                value: m.id.clone(),
-                                name: Some(m.name.clone()),
-                                label: None,
-                                description: m.description.clone(),
-                            })
-                            .collect(),
-                    });
-                }
-                // Reasoning-effort axis (claude per-model `supportedEffortLevels`). The
-                // frontend REPLACES its whole config-options snapshot on this frame, so we
-                // MUST re-emit effort here too — otherwise a late catalog push would wipe
-                // the effort option that `get_config_options` (REST) surfaced. The pump has
-                // no backend Arc, so the current model is resolved from the pushed catalog
-                // and the highlight comes from the runtime's optimistic effort override
-                // (claude emits no effort echo). Emitted only when the current model
-                // advertises efforts (union fallback when the current model is unknown).
-                let efforts = resolve_current_model_efforts(models, runtime.model_override().as_deref());
-                if !efforts.is_empty() {
-                    config_options.push(aionui_api_types::AcpConfigOptionDto {
-                        id: "reasoning_effort".into(),
-                        name: Some("Thinking".into()),
-                        label: None,
-                        description: None,
-                        category: Some("thought_level".into()),
-                        option_type: "select".into(),
-                        current_value: runtime.effort_override(),
-                        options: efforts
-                            .iter()
-                            .map(|e| aionui_api_types::AcpConfigSelectOptionDto {
-                                value: e.clone(),
-                                name: Some(e.clone()),
-                                label: None,
-                                description: None,
-                            })
-                            .collect(),
-                    });
-                }
-                // No categories (both lists empty) → nothing to re-project; a spurious
-                // empty-snapshot frame would only clobber the frontend's picker.
-                if !config_options.is_empty()
-                    && let Ok(v) = serde_json::to_value(serde_json::json!({ "config_options": config_options }))
-                {
-                    let _ = runtime.tx.send(AgentStreamEvent::AcpConfigOption(v));
-                }
+                // Retain the raw catalog so a later `ConfigChanged` can re-project the
+                // WHOLE snapshot (the pump cannot rebuild it — it holds no backend Arc).
+                runtime.set_last_catalog(modes.clone(), models.clone());
+                emit_config_options_snapshot(modes, models, &runtime);
                 // Slash-command catalog. claude advertises its command list in the
                 // async `initialize` response — the same late-catalog timing that
                 // strands the model/mode picker — and the frontend's mount-time REST
@@ -2694,6 +2731,32 @@ fn spawn_event_pump(
                         }));
                 }
                 continue;
+            }
+
+            // An agent-CONFIRMED mode/model switch: claude's `system/status{permissionMode}`
+            // (verified: samples/claude-cli/2.1.227/set_permission_mode/) or codex's
+            // `thread/settings/updated`. This is the only honest "it actually took effect"
+            // signal — unlike the optimistic override `set_config_option` writes at REQUEST
+            // time, which reads straight back and so always reports success. Adopt the
+            // confirmed value as the authoritative highlight and re-project the whole
+            // snapshot, so the picker stops showing a mode the agent has not applied (codex
+            // applies a settings update only from the NEXT turn; verified:
+            // samples/codex-cli/0.146.0/schema/v2/ThreadSettingsUpdateParams.json).
+            //
+            // Deliberately NO `continue`: the event must still reach `persist_side_effects`
+            // below, which is what writes `current_mode_id` for the next respawn/resume.
+            if let SessionEvent::ConfigChanged { mode, model } = &env.event {
+                if let Some(mode) = mode {
+                    runtime.set_mode_override(mode.clone());
+                }
+                if let Some(model) = model {
+                    runtime.set_model_override(model.clone());
+                }
+                // Nothing to re-project until a catalog has landed. The override is still
+                // updated, so the next REST read reports the confirmed value.
+                if let Some((modes, models)) = runtime.last_catalog() {
+                    emit_config_options_snapshot(&modes, &models, &runtime);
+                }
             }
 
             // Project a running workflow's roster to the UI. Everything a workflow
@@ -4138,14 +4201,14 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             usage["output_tokens"] = serde_json::json!(output_tokens);
             vec![AgentStreamEvent::AcpContextUsage(usage)]
         }
-        // A confirmed mode/model switch is NOT forwarded as a stream frame. The origin
-        // frontend's mode/model pickers (AgentModeSelector / AcpModelSelector) track the
-        // selection in local state updated optimistically on the PUT /config-options
-        // call + its REST response — they do NOT consume a config stream frame. And the
-        // origin `useAcpMessage` has no `acp_config_option` case, so any such frame falls
-        // into its `default:` arm and lights the turn timer bar (`setRunning(true)`) —
-        // the "switching mode shows a spurious timer" regression. So emit nothing here;
-        // the selection persist is handled separately by `persist_side_effects`.
+        // Nothing HERE, because this function is stateless: the current-value highlight
+        // lives in the runtime's overrides, so all `translate_event` could build is a
+        // mode-only frame — and the frontend REPLACES its whole snapshot on
+        // `acp_config_option`, which would wipe the sibling model/effort pickers.
+        //
+        // The confirmation is surfaced by the EVENT PUMP instead, which holds the runtime
+        // and re-projects the full snapshot (`emit_config_options_snapshot`). Persisting
+        // the selection is handled separately by `persist_side_effects`.
         SessionEvent::ConfigChanged { .. } => Vec::new(),
         // Handled earlier in the pump (needs runtime overrides for the current-value
         // highlight; projected to an AcpConfigOption frame there). Never reaches this
@@ -5098,13 +5161,24 @@ mod translate_tests {
         }
     }
 
-    // A ConfigChanged must NOT produce any stream frame: the origin frontend's mode/
-    // model pickers track selection in local state (optimistic on the PUT + its REST
-    // response), and an `acp_config_option` frame would fall into origin useAcpMessage's
-    // `default:` arm and light a spurious turn timer bar. The selection is still
-    // persisted separately (see persist_tests::config_changed_persists_mode_and_model).
+    // A ConfigChanged produces no frame FROM `translate_event` — this function is
+    // stateless and cannot read the runtime's overrides, so it could only build a
+    // mode-only frame, and the frontend REPLACES its whole snapshot on
+    // `acp_config_option` (`useAcpConfigOptions` -> `replaceSnapshot`), which would wipe
+    // the model/effort pickers.
+    //
+    // The confirmation IS surfaced — by the event pump, which holds the runtime and
+    // re-projects the WHOLE snapshot (see
+    // pump_tests::config_changed_projects_confirmed_mode_to_frontend). The selection is
+    // persisted separately (persist_tests::config_changed_persists_mode_and_model).
+    //
+    // NOTE: an earlier version of this comment justified the suppression by claiming the
+    // frontend "does not consume a config stream frame" and that such a frame lands in
+    // `useAcpMessage`'s `default:` arm lighting a spurious timer. Both were fixed
+    // upstream: `useAcpConfigOptions` subscribes to `acp_config_option`, and
+    // `useAcpMessage` has an explicit no-op case for it.
     #[test]
-    fn config_changed_emits_no_frame() {
+    fn config_changed_emits_no_frame_from_stateless_translate() {
         let events = translate_event(
             SessionEvent::ConfigChanged {
                 mode: Some("plan".into()),
@@ -6780,6 +6854,92 @@ mod pump_tests {
             model_values,
             vec!["default", "opus"],
             "the parsed model ids ride the frame"
+        );
+    }
+
+    // An agent-CONFIRMED mode switch must reach the frontend as an `acp_config_option`
+    // frame carrying the confirmed value. This is the ONLY honest "it actually took
+    // effect" signal: for the direct-CLI backends the PUT response is optimistic —
+    // `set_config_option` caches the requested value as an override and reads it
+    // straight back — so without this frame the picker shows a mode the agent may not
+    // have applied. codex applies `thread/settings/update` only from the NEXT turn
+    // (verified: samples/codex-cli/0.146.0/schema/v2/ThreadSettingsUpdateParams.json,
+    // "Override the approval policy for subsequent turns"), and claude confirms
+    // asynchronously via `system/status{permissionMode}` (verified:
+    // samples/claude-cli/2.1.227/set_permission_mode/).
+    //
+    // The frame carries the WHOLE snapshot (mode + model together) because the frontend
+    // REPLACES its snapshot on this frame (`useAcpConfigOptions.ts` -> `replaceSnapshot`);
+    // a mode-only frame would wipe the model picker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn config_changed_projects_confirmed_mode_to_frontend() {
+        use aionui_session::{ModeInfo, ModelInfo};
+        let script = vec![
+            // The catalog must land first: the pump holds no backend Arc (see
+            // `spawn_event_pump`) and so cannot rebuild the option list on its own.
+            env(SessionEvent::CatalogUpdated {
+                models: vec![ModelInfo {
+                    id: "opus".into(),
+                    name: "Opus".into(),
+                    description: None,
+                    reasoning_efforts: Vec::new(),
+                }],
+                modes: vec![
+                    ModeInfo {
+                        id: "default".into(),
+                        name: "Default".into(),
+                        description: None,
+                    },
+                    ModeInfo {
+                        id: "plan".into(),
+                        name: "Plan".into(),
+                        description: None,
+                    },
+                ],
+                slash_commands: Vec::new(),
+            }),
+            // The agent reports it really switched (claude `system/status`, codex
+            // `thread/settings/updated`).
+            env(SessionEvent::ConfigChanged {
+                mode: Some("plan".into()),
+                model: None,
+            }),
+        ];
+        let frames = drain_script(script).await;
+        let config_frames: Vec<&serde_json::Value> = frames
+            .iter()
+            .filter_map(|f| match f {
+                AgentStreamEvent::AcpConfigOption(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            config_frames.len() >= 2,
+            "the confirmation must project its own frame (catalog frame + confirmation frame), got {} frame(s)",
+            config_frames.len()
+        );
+        let options = config_frames
+            .last()
+            .unwrap()
+            .get("config_options")
+            .and_then(|v| v.as_array())
+            .expect("config_options array");
+        let mode_opt = options
+            .iter()
+            .find(|o| o.get("category").and_then(|c| c.as_str()) == Some("mode"))
+            .expect("mode category must ride the confirmation frame");
+        assert_eq!(
+            mode_opt.get("current_value").and_then(|v| v.as_str()),
+            Some("plan"),
+            "the picker must highlight the mode the AGENT confirmed, not the optimistic request"
+        );
+        let categories: Vec<&str> = options
+            .iter()
+            .filter_map(|o| o.get("category").and_then(|c| c.as_str()))
+            .collect();
+        assert!(
+            categories.contains(&"model"),
+            "the sibling model category must survive the confirmation frame (frontend REPLACES), got {categories:?}"
         );
     }
 

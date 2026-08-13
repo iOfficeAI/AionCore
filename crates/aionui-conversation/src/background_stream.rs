@@ -153,6 +153,14 @@ impl BackgroundStreamWatcher {
             }
             match &ev {
                 AgentStreamEvent::WorkflowProgress(data) => self.handle_card_refresh(data).await,
+                // Config snapshots / mode confirmations arriving BETWEEN turns. These are
+                // exactly the frames that carry "the switch actually took effect" for the
+                // backends that apply one only from the next turn, plus an agent's own
+                // autonomous mode change — and by then no relay exists to carry them.
+                // Dropping them left the picker showing a mode the agent was not in.
+                AgentStreamEvent::AcpConfigOption(_) | AgentStreamEvent::AcpModeInfo(_) => {
+                    self.forward_out_of_turn_frame(&ev)
+                }
                 ev_ref if Self::is_orphan_turn_content(ev_ref) => {
                     self.run_orphan_turn(ev.clone(), &mut rx).await;
                 }
@@ -239,6 +247,36 @@ impl BackgroundStreamWatcher {
                 }),
             ));
         }
+    }
+
+    /// Forward an out-of-turn frame to the frontend, projected EXACTLY as the per-turn
+    /// relay would project it (`type`/`data` read off the event's own serde tag, keys
+    /// normalized to snake_case — see `StreamRelay::forward_to_websocket_with_msg_id`),
+    /// so the frontend cannot tell which path delivered it.
+    ///
+    /// `msg_id`/`turn_id` are empty: a config snapshot belongs to no message and no
+    /// turn — that is precisely why it has no relay to ride.
+    fn forward_out_of_turn_frame(&self, ev: &AgentStreamEvent) {
+        let mut event_data = match serde_json::to_value(ev) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %ErrorChain(&e), "background stream: out-of-turn frame serialize failed");
+                return;
+            }
+        };
+        normalize_keys_to_snake_case(&mut event_data);
+        self.broadcaster.broadcast(aionui_api_types::WebSocketMessage::new(
+            "message.stream",
+            json!({
+                "conversation_id": self.conversation_id,
+                "user_id": self.user_id,
+                "msg_id": "",
+                "turn_id": "",
+                "type": event_data.get("type").cloned().unwrap_or(json!("unknown")),
+                "data": event_data.get("data").cloned().unwrap_or(json!({})),
+                "hidden": false,
+            }),
+        ));
     }
 
     /// Run a CLI-initiated turn through a REGULAR relay so it gets everything a
@@ -755,5 +793,83 @@ mod tests {
             }
         }
         assert!(saw_name_updated, "nameUpdated must be broadcast");
+    }
+
+    /// A config-options snapshot arriving BETWEEN turns must still reach the frontend.
+    ///
+    /// This is exactly when a mode confirmation lands for the backends that apply a
+    /// switch only from the next turn (codex: "for subsequent turns", verified in
+    /// samples/codex-cli/0.146.0/schema/v2/ThreadSettingsUpdateParams.json), and also
+    /// when an agent changes mode on its own (claude's autonomous plan-exit emits a
+    /// `system/status{permissionMode}` while idle). The per-turn relay is gone by then,
+    /// so the watcher is the only path left — dropping the frame here left the picker
+    /// showing a mode the agent was no longer in, with no way to notice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn between_turns_config_option_snapshot_is_forwarded() {
+        let rig = rig().await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::AcpConfigOption(serde_json::json!({
+                "config_options": [{
+                    "id": "mode",
+                    "category": "mode",
+                    "type": "select",
+                    "current_value": "plan",
+                    "options": [{"value": "plan"}, {"value": "default"}]
+                }]
+            })))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut forwarded: Option<aionui_api_types::WebSocketMessage<serde_json::Value>> = None;
+        while std::time::Instant::now() < deadline && forwarded.is_none() {
+            while let Ok(msg) = ws.try_recv() {
+                if msg.name == "message.stream" && msg.data["type"] == "acp_config_option" {
+                    forwarded = Some(msg);
+                    break;
+                }
+            }
+            if forwarded.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        let msg = forwarded.expect("an out-of-turn acp_config_option must be forwarded to the frontend");
+        assert_eq!(msg.data["conversation_id"], "conv-1");
+        assert_eq!(
+            msg.data["data"]["config_options"][0]["current_value"], "plan",
+            "the confirmed value must survive the hop"
+        );
+    }
+
+    /// The ACP analogue of the test above. An ACP agent reports an applied mode via
+    /// `current_mode_update`, which translates to `AcpModeInfo` — and per the ACP schema
+    /// the agent may change mode on its own ("Agents may also change modes autonomously
+    /// and notify the client via `current_mode_update`",
+    /// agent-client-protocol-schema-1.5.0/src/v1/agent.rs), i.e. with no turn in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn between_turns_acp_mode_info_is_forwarded() {
+        let rig = rig().await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::AcpModeInfo(serde_json::json!({
+                "current_mode_id": "plan"
+            })))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut forwarded: Option<aionui_api_types::WebSocketMessage<serde_json::Value>> = None;
+        while std::time::Instant::now() < deadline && forwarded.is_none() {
+            while let Ok(msg) = ws.try_recv() {
+                if msg.name == "message.stream" && msg.data["type"] == "acp_mode_info" {
+                    forwarded = Some(msg);
+                    break;
+                }
+            }
+            if forwarded.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        let msg = forwarded.expect("an out-of-turn acp_mode_info must be forwarded to the frontend");
+        assert_eq!(msg.data["data"]["current_mode_id"], "plan");
     }
 }
