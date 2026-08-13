@@ -226,6 +226,23 @@ pub struct SignalSet {
     pub terminal_result: bool,
 }
 
+/// Backend-STATIC view of [`Capabilities::supports_midturn_delivery`], keyed by
+/// the runtime backend identifier (the `extra.backend` / assistant
+/// `runtime_backend` string the conversation layer persists and the session
+/// factories dispatch on).
+///
+/// The bit is a property of the backend TYPE, not of any live session: claude
+/// and codex are the direct-CLI backends whose mid-turn write genuinely reaches
+/// the agent; antigravity, aionrs, and every ACP agent are one-prompt-at-a-time.
+/// Consumers use this when no live `SessionBackend` exists (fresh or dormant
+/// conversations) so the reported capability cannot flap with agent liveness.
+/// Unknown/empty identifiers are conservatively `false` (ACP-like until proven,
+/// same default as `Capabilities`). Locked against the real capability
+/// constructors by tests below and module-local asserts in each backend.
+pub fn backend_supports_midturn_delivery(backend: &str) -> bool {
+    matches!(backend, "claude" | "codex")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +251,28 @@ mod tests {
     fn midturn_delivery_is_opt_in_and_antigravity_is_excluded() {
         // Default MUST be false: a new backend is ACP-like until proven otherwise.
         assert!(!Capabilities::default().supports_midturn_delivery);
+    }
+
+    /// The static per-backend table must never drift from the bit the real
+    /// capability constructors declare. (claude has no pub constructor — its
+    /// lock lives module-local in `adapter::claude` tests.)
+    #[test]
+    fn static_backend_table_matches_capability_constructors() {
+        assert_eq!(
+            backend_supports_midturn_delivery("codex"),
+            crate::backend::codex_capabilities().supports_midturn_delivery,
+        );
+        assert_eq!(
+            backend_supports_midturn_delivery("antigravity"),
+            crate::backend::antigravity_capabilities().supports_midturn_delivery,
+        );
+        // Any ACP agent id (open set) falls through to the ACP connection's bit.
+        assert_eq!(
+            backend_supports_midturn_delivery("gemini"),
+            crate::backend::acp_capabilities().supports_midturn_delivery,
+        );
+        // Unknown/empty backends are conservatively false.
+        assert!(!backend_supports_midturn_delivery(""));
+        assert!(!backend_supports_midturn_delivery("aionrs"));
     }
 }

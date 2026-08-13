@@ -733,10 +733,16 @@ impl ConversationService {
         let has_task = agent.is_some();
         let task_status = agent.as_ref().and_then(|agent| agent.status());
         let pending_confirmations = agent.as_ref().map(|agent| agent.get_confirmations().len()).unwrap_or(0);
-        let supports_midturn_delivery = agent
-            .as_ref()
-            .map(|agent| agent.supports_midturn_delivery())
-            .unwrap_or(false);
+        // `supports_midturn_delivery` is a STATIC property of the backend TYPE:
+        // a live agent reads it from its capabilities (authoritative), and
+        // without one it MUST come from the conversation's backend identity —
+        // hardcoding false here made a fresh (pre-ensure) or dormant claude
+        // conversation report false, so the frontend hydrate fetch raced the
+        // send accept and gated the whole first turn into the queue panel.
+        let supports_midturn_delivery = match agent.as_ref() {
+            Some(agent) => agent.supports_midturn_delivery(),
+            None => self.static_supports_midturn_delivery(conversation_id).await,
+        };
 
         self.runtime_state.summary_from_parts(
             conversation_id,
@@ -745,6 +751,31 @@ impl ConversationService {
             pending_confirmations,
             supports_midturn_delivery,
         )
+    }
+
+    /// Backend-static `supports_midturn_delivery` for a conversation with no
+    /// live agent task, resolved from the persisted backend identity
+    /// (`extra.backend` — the same string create() persists from the assistant
+    /// snapshot and the session factories dispatch on) through the session
+    /// layer's static table. Any resolution failure (missing row, unparsable
+    /// extra, unknown backend) conservatively reports `false`.
+    ///
+    /// Perf note: the DB load only fires when no live agent exists, and
+    /// `runtime_summary_for` is only invoked on single-conversation paths
+    /// (detail GET, send/turn responses) — `list()` never embeds a runtime
+    /// summary — so this adds no per-row N+1.
+    async fn static_supports_midturn_delivery(&self, conversation_id: &str) -> bool {
+        let Ok(Some(user_id)) = self.conversation_repo.owner_user_id(conversation_id).await else {
+            return false;
+        };
+        let Ok(Some(row)) = self.conversation_repo.get(&user_id, conversation_id).await else {
+            return false;
+        };
+        serde_json::from_str::<serde_json::Value>(&row.extra)
+            .ok()
+            .as_ref()
+            .and_then(|extra| extra.get("backend").and_then(serde_json::Value::as_str))
+            .is_some_and(aionui_ai_agent::backend_supports_midturn_delivery)
     }
 
     pub async fn active_count_for_user(&self, user_id: &str) -> Result<usize, ConversationError> {
@@ -3399,6 +3430,7 @@ impl ConversationService {
     /// without text/time guessing (spec §4.5). The receipt flip to
     /// [`MIDTURN_STATUS_RECEIVED`] arrives via `MessageLifecycle` echoes
     /// (background watcher) for both backends.
+    #[allow(clippy::too_many_arguments)]
     async fn deliver_midturn_message(
         &self,
         user_id: &str,

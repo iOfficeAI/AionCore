@@ -1503,6 +1503,12 @@ mod tests {
     fn capabilities_advertise_midturn_delivery() {
         let a = ClaudeAdapter::new();
         assert!(a.capabilities().supports_midturn_delivery);
+        // Lock the backend-static table against the real constructor (claude
+        // has no pub capability constructor, so the lock lives here).
+        assert_eq!(
+            crate::capability::backend_supports_midturn_delivery("claude"),
+            a.capabilities().supports_midturn_delivery,
+        );
     }
 
     /// Task 2: claude echoes back the uuid WE minted on a user frame via a

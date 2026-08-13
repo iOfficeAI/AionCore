@@ -4286,6 +4286,45 @@ async fn send_message_returns_msg_id_and_turn_id_and_summary_tracks_turn() {
     assert!(!runtime.can_send_message);
 }
 
+/// Bugfix: `supports_midturn_delivery` is a STATIC property of the
+/// conversation's backend type, not of agent liveness. A fresh (pre-ensure)
+/// or dormant claude conversation must still report `true`, otherwise the
+/// frontend hydrate fetch races the send accept and gates the whole first
+/// turn into the client queue panel.
+#[tokio::test]
+async fn runtime_summary_reports_backend_static_midturn_bit_without_live_agent() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+
+    // No runtime/ensure has run: MockTaskManager holds no task for any of
+    // these conversations, so the bit must come from the backend identity.
+    for (backend, expected) in [
+        ("claude", true),
+        ("codex", true),
+        ("antigravity", false),
+        ("gemini", false),
+    ] {
+        let conv = svc
+            .create("user_1", make_create_req_with_backend(backend))
+            .await
+            .unwrap();
+        let runtime = svc.runtime_summary_for(&conv.id).await;
+        assert!(!runtime.has_task, "precondition: no live agent for {backend}");
+        assert_eq!(
+            runtime.supports_midturn_delivery, expected,
+            "backend {backend} must report static supports_midturn_delivery={expected} without a live agent"
+        );
+    }
+
+    // No backend identity at all (legacy/unknown row) → conservative false.
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let runtime = svc.runtime_summary_for(&conv.id).await;
+    assert!(!runtime.supports_midturn_delivery);
+
+    // Unknown conversation id → conservative false, no panic.
+    let runtime = svc.runtime_summary_for("conv-does-not-exist").await;
+    assert!(!runtime.supports_midturn_delivery);
+}
+
 #[tokio::test]
 async fn send_message_rejects_legacy_runtime_conversations_as_archived() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
