@@ -14,6 +14,7 @@ export class LookSystem {
         ...data,
         chapters: data.chapters?.length ? data.chapters : defaultSession().chapters,
         look: { ...defaultSession().look, ...data.look },
+        models: { ...defaultSession().models, ...data.models },
       };
     } catch {
       return defaultSession();

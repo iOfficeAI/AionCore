@@ -13,6 +13,11 @@ export type Session = {
   objective: string;
   chapters: Chapter[];
   look: { sky: string; ground: string; icon: string };
+  models?: {
+    player?: { file: string; walk?: string; run?: string; height?: number };
+    enemy?: { file: string; walk?: string; run?: string; height?: number };
+    pickup?: { file: string };
+  };
 };
 
 export function defaultSession(): Session {
@@ -53,6 +58,7 @@ export function defaultSession(): Session {
       ground: 'look/ground.jpg',
       icon: 'look/icon.png',
     },
+    models: {},
   };
 }
 

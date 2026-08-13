@@ -57,6 +57,7 @@ node <director-skill-dir>/scripts/probe_asset_credentials.mjs
 Prefer the Node probe (works on Windows without bash). `bash .../probe_asset_credentials.sh` is Unix fallback only.
 
 - For 2D images in Aion: if `aionui_image_generation` is in the tool list, record `AIONUI_IMAGE_MCP=SET` and use that MCP via `threejs-image-generator`. `GEMINI_API_KEY=MISSING` is not a 2D skip/blocker in that case. Gemini/`uv` is fallback only when the MCP tool is absent or the MCP call failed.
+- For 3D and audio in Aion: the desktop shell injects `TRIPO_API_KEY` and `ELEVENLABS_API_KEY` into the agent process. Run the Node probe. Treat `SET` as the default path: generate with `threejs-3d-generator` and `threejs-audio-generator`. Do not skip those generators because you assume keys are missing. Procedural fallback is allowed only after a literal `MISSING` line or a real API/network/quota error.
 
 - For premium hero surfaces (player, enemy, boss, creature, vehicle, ship, weapon, building, signature prop), procedural-only is not an allowed final answer without real blocker evidence: a `MISSING` probe line, or an attempted generation command plus its API/network/quota error. Otherwise at least one high-value surface must show a 3D generator task ID, downloaded GLB/GLTF/FBX path, image generator output path, or documented hybrid chain.
 - For premium active gameplay, missing audio is a reported gap unless the user asked for silent/offline output or the audio key/API is blocked.
@@ -126,6 +127,18 @@ node <threejs-gameplay-systems-skill-dir>/scripts/apply_look.mjs \
   --sky <sky> --ground <ground> --icon <icon>
 ```
 
+Then generate T-pose concepts and run **one** `cast` into `public/look` + `look.json` models. Prefer `--player-image` / `--pickup-image` (image-to-3D). First-person may omit `--player-image` but must still `--enemy-image` for every visible character. Do not pass `--animate-in-place`. Overlay `Player`/`Pickup` load those files; kitbash stays as fallback.
+
+```bash
+node <threejs-3d-generator-skill-dir>/scripts/threejs_3d_asset.mjs probe
+node <threejs-3d-generator-skill-dir>/scripts/threejs_3d_asset.mjs cast \
+  --out ./my-game \
+  --player-image assets/concepts/player-tpose.png \
+  --pickup-image assets/concepts/pickup.png
+```
+
+`--deliver` audits the **game source and look.json files**, not the markdown report. Cones/capsules/icosahedrons in `src/`, or missing model files, print `ART_FAIL` and never `GAME_DELIVERED`.
+
 ```bash
 node <threejs-audio-generator-skill-dir>/scripts/threejs_audio_asset.mjs probe
 node <threejs-audio-generator-skill-dir>/scripts/threejs_audio_asset.mjs kit \
@@ -150,7 +163,7 @@ Premium, AAA, polished, complete, release-ready, and showcase requests require v
 - Game design brief (including experience intent), core loop contract, emotion beat sheet, chapter ledger, and level/encounter plan for broad game creation or major gameplay changes.
 - Active desktop and mobile screenshots plus nonblank canvas pixel evidence.
 - Main input/objective/fail-or-restart path exercised through named chapters, not only the first minute.
-- Hero/player is not a capsule/cube/primitive-plus-glow in the final delivery.
+- Hero/player is not a capsule/cube/primitive-plus-glow in the final delivery. `--deliver` is blocked (`ART_FAIL`) until `cast` wrote look.json model files and `src/` has no Cone/Capsule/Icosahedron/Tetrahedron meshes. First-person may omit `player.glb` but must ship `enemy.glb` for visible characters.
 - Audio matrix with emotion-driven music states (or a documented blocker); not one unchanging loop unless the genre intent is a single restrained bed with contrast.
 - Share control on pause/settle; `localhost` reported as a local playtest URL only.
 - Visual scorecard with measured evidence for premium/AAA claims, plus a fresh-eyes review pass per `threejs-aaa-graphics-builder/references/visual-scorecard.md`.

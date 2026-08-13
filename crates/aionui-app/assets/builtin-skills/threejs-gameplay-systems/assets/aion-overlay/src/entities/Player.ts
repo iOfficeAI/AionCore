@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type { InputController } from '../core/InputController';
+import { loadCastVisual, type CastSlot, type CastVisual } from '../studio/cast';
 
 export type PlayerTuning = {
   speed: number;
@@ -40,6 +41,8 @@ export class Player {
   private readonly headGeometry = new THREE.SphereGeometry(0.22, 12, 10);
   private readonly emblemGeometry = new THREE.SphereGeometry(0.12, 10, 8);
   private readonly legGeometry = new THREE.BoxGeometry(0.16, 0.42, 0.18);
+  private cast: CastVisual | null = null;
+  private gait: 'idle' | 'walk' | 'run' = 'idle';
 
   constructor() {
     const torso = new THREE.Mesh(this.torsoGeometry, this.cloth);
@@ -73,6 +76,15 @@ export class Player {
     this.group.add(leftLeg, rightLeg);
   }
 
+  async applyCast(slot?: CastSlot): Promise<void> {
+    if (!slot?.file) return;
+    const visual = await loadCastVisual(slot);
+    if (!visual) return;
+    for (const child of this.group.children) child.visible = false;
+    this.group.add(visual.group);
+    this.cast = visual;
+  }
+
   update(delta: number, elapsed: number, input: InputController, tuning: PlayerTuning, bounds: ArenaBounds): void {
     input.readMovement(this.move);
     const dash = input.isDashHeld() ? tuning.dashMultiplier : 1;
@@ -89,7 +101,27 @@ export class Player {
       this.group.rotation.y = Math.atan2(this.velocity.x, -this.velocity.z);
     }
 
+    if (this.cast) {
+      this.updateGait(input.isDashHeld(), delta);
+      this.group.position.y = 0;
+      return;
+    }
+
     this.group.position.y = 0.06 + Math.sin(elapsed * 9) * Math.min(this.velocity.length() / 40, 0.08);
+  }
+
+  private updateGait(dashing: boolean, delta: number): void {
+    if (!this.cast) return;
+    const speed = this.velocity.length();
+    const gait: 'idle' | 'walk' | 'run' = dashing || speed > 4.2 ? 'run' : speed > 0.18 ? 'walk' : 'idle';
+    if (gait !== this.gait) {
+      const previous = this.cast.actions[this.gait];
+      const next = this.cast.actions[gait] ?? this.cast.actions.walk ?? this.cast.actions.idle;
+      previous?.fadeOut(0.2);
+      next?.reset().fadeIn(0.2).play();
+      this.gait = gait;
+    }
+    this.cast.mixer.update(delta);
   }
 
   dispose(): void {

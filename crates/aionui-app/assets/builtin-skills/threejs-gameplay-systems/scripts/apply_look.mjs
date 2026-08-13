@@ -3,7 +3,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { defaultSession, lookPaths } from './studio_session_lib.mjs';
+import { defaultSession, lookPaths, mergeCastModels, modelLookPaths } from './studio_session_lib.mjs';
 
 function parseArgs(argv) {
   const args = {};
@@ -50,6 +50,49 @@ function main(argv) {
   if (args.sky) copyLookFile(path.resolve(args.sky), path.join(root, 'public', paths.sky));
   if (args.ground) copyLookFile(path.resolve(args.ground), path.join(root, 'public', paths.ground));
   if (args.icon) copyLookFile(path.resolve(args.icon), path.join(root, 'public', paths.icon));
+
+  const modelInput = {
+    player: args.player,
+    playerWalk: args['player-walk'],
+    playerRun: args['player-run'],
+    enemy: args.enemy,
+    enemyWalk: args['enemy-walk'],
+    enemyRun: args['enemy-run'],
+    pickup: args.pickup,
+  };
+  const modelDest = modelLookPaths(modelInput);
+  const models = { ...(session.models || {}) };
+  if (modelDest.player && args.player) {
+    copyLookFile(path.resolve(args.player), path.join(root, 'public', modelDest.player));
+    models.player = {
+      ...(models.player || {}),
+      file: modelDest.player,
+      ...(modelDest.playerWalk ? { walk: modelDest.playerWalk } : {}),
+      ...(modelDest.playerRun ? { run: modelDest.playerRun } : {}),
+    };
+  }
+  if (modelDest.playerWalk && args['player-walk']) {
+    copyLookFile(path.resolve(args['player-walk']), path.join(root, 'public', modelDest.playerWalk));
+    if (models.player) models.player.walk = modelDest.playerWalk;
+  }
+  if (modelDest.playerRun && args['player-run']) {
+    copyLookFile(path.resolve(args['player-run']), path.join(root, 'public', modelDest.playerRun));
+    if (models.player) models.player.run = modelDest.playerRun;
+  }
+  if (modelDest.enemy && args.enemy) {
+    copyLookFile(path.resolve(args.enemy), path.join(root, 'public', modelDest.enemy));
+    models.enemy = {
+      ...(models.enemy || {}),
+      file: modelDest.enemy,
+      ...(modelDest.enemyWalk ? { walk: modelDest.enemyWalk } : {}),
+      ...(modelDest.enemyRun ? { run: modelDest.enemyRun } : {}),
+    };
+  }
+  if (modelDest.pickup && args.pickup) {
+    copyLookFile(path.resolve(args.pickup), path.join(root, 'public', modelDest.pickup));
+    models.pickup = { file: modelDest.pickup };
+  }
+  Object.assign(session, mergeCastModels(session, models));
 
   fs.mkdirSync(publicLook, { recursive: true });
   fs.writeFileSync(kitPath, `${JSON.stringify(session, null, 2)}\n`);

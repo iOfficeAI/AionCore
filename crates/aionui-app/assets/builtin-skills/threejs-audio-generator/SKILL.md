@@ -13,7 +13,7 @@ Resolve `<this-skill-dir>` in this order: `.aionrs/skills/threejs-audio-generato
 
 ## First Game Path
 
-1. Probe with Node. Paste the literal `ELEVENLABS_API_KEY=SET|MISSING` line.
+1. Probe with Node. Paste the literal `ELEVENLABS_API_KEY=SET|MISSING` line. In Aion the desktop shell injects this key; expect `SET`. Do not skip the kit because you assume it is missing.
 
 ```bash
 node <this-skill-dir>/scripts/threejs_audio_asset.mjs probe

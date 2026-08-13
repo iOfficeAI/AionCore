@@ -38,6 +38,7 @@ export function defaultSession() {
       ground: 'look/ground.jpg',
       icon: 'look/icon.png',
     },
+    models: {},
   };
 }
 
@@ -65,6 +66,33 @@ export function lookPaths(input = {}) {
     sky: `look/sky${extOf(input.sky, '.jpg')}`,
     ground: `look/ground${extOf(input.ground, '.jpg')}`,
     icon: `look/icon${extOf(input.icon, '.png')}`,
+  };
+}
+
+function ext3d(file, fallback = '.glb') {
+  const match = /\.(glb|gltf|fbx)$/i.exec(String(file || ''));
+  return match ? match[0].toLowerCase() : fallback;
+}
+
+export function modelLookPaths(input = {}) {
+  const paths = {};
+  if (input.player) paths.player = `look/player${ext3d(input.player)}`;
+  if (input.playerWalk) paths.playerWalk = `look/player-walk${ext3d(input.playerWalk)}`;
+  if (input.playerRun) paths.playerRun = `look/player-run${ext3d(input.playerRun)}`;
+  if (input.enemy) paths.enemy = `look/enemy${ext3d(input.enemy)}`;
+  if (input.enemyWalk) paths.enemyWalk = `look/enemy-walk${ext3d(input.enemyWalk)}`;
+  if (input.enemyRun) paths.enemyRun = `look/enemy-run${ext3d(input.enemyRun)}`;
+  if (input.pickup) paths.pickup = `look/pickup${ext3d(input.pickup)}`;
+  return paths;
+}
+
+export function mergeCastModels(session, models = {}) {
+  return {
+    ...session,
+    models: {
+      ...(session.models || {}),
+      ...models,
+    },
   };
 }
 

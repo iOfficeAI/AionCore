@@ -31,3 +31,23 @@ test('apply_look copies generated images into public/look and writes look.json',
   assert.equal(look.look.sky, 'look/sky.png');
   assert.doesNotMatch(JSON.stringify(look), /concepts/);
 });
+
+test('apply_look copies cast models into public/look and records slots', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aion-look-models-'));
+  const player = path.join(dir, 'idle.fbx');
+  const pickup = path.join(dir, 'mark.glb');
+  fs.writeFileSync(player, 'fbx');
+  fs.writeFileSync(pickup, 'glb');
+
+  const result = spawnSync(
+    process.execPath,
+    [script, '--out', dir, '--player', player, '--pickup', pickup],
+    { encoding: 'utf8' },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(path.join(dir, 'public', 'look', 'player.fbx')), true);
+  assert.equal(fs.existsSync(path.join(dir, 'public', 'look', 'pickup.glb')), true);
+  const look = JSON.parse(fs.readFileSync(path.join(dir, 'public', 'look', 'look.json'), 'utf8'));
+  assert.equal(look.models.player.file, 'look/player.fbx');
+  assert.equal(look.models.pickup.file, 'look/pickup.glb');
+});

@@ -4,6 +4,8 @@ import {
   chapterFromScore,
   defaultSession,
   lookPaths,
+  mergeCastModels,
+  modelLookPaths,
   sharePayload,
 } from './studio_session_lib.mjs';
 
@@ -37,6 +39,40 @@ test('look paths stay under public/look, not assets/concepts', () => {
   for (const file of Object.values(paths)) {
     assert.doesNotMatch(file, /concepts/);
   }
+});
+
+test('default session has empty model slots for the cast kit', () => {
+  const session = defaultSession();
+  assert.deepEqual(session.models, {});
+});
+
+test('model look paths copy GLB/FBX into public/look, not tripo-character', () => {
+  const paths = modelLookPaths({
+    player: '/tmp/tripo-character/animated/idle.fbx',
+    playerWalk: '/tmp/tripo-character/animated/walk.fbx',
+    playerRun: '/tmp/tripo-character/animated/run.fbx',
+    enemy: '/tmp/enemy.glb',
+    pickup: '/tmp/mark.glb',
+  });
+  assert.equal(paths.player, 'look/player.fbx');
+  assert.equal(paths.playerWalk, 'look/player-walk.fbx');
+  assert.equal(paths.playerRun, 'look/player-run.fbx');
+  assert.equal(paths.enemy, 'look/enemy.glb');
+  assert.equal(paths.pickup, 'look/pickup.glb');
+  for (const file of Object.values(paths)) {
+    assert.doesNotMatch(file, /tripo-character|concepts/);
+  }
+});
+
+test('mergeCastModels writes player/enemy/pickup slots into look.json shape', () => {
+  const session = mergeCastModels(defaultSession(), {
+    player: { file: 'look/player.fbx', walk: 'look/player-walk.fbx', run: 'look/player-run.fbx', height: 1.7 },
+    pickup: { file: 'look/pickup.glb' },
+  });
+  assert.equal(session.models.player.file, 'look/player.fbx');
+  assert.equal(session.models.player.walk, 'look/player-walk.fbx');
+  assert.equal(session.models.pickup.file, 'look/pickup.glb');
+  assert.equal(session.models.enemy, undefined);
 });
 
 test('share payload marks localhost as a local playtest', () => {

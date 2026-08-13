@@ -8,6 +8,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+  clipNameFromPreset,
+  findDownloadedModel,
+  parseAnimationList,
+  retargetJobs,
+} from "./character_pipeline_lib.mjs";
 
 const BASE_URL = "https://api.tripo3d.ai/v2/openapi";
 const FINAL_STATUSES = new Set(["success", "failed", "banned", "expired", "cancelled", "unknown"]);
@@ -383,33 +389,65 @@ async function cmdPostprocess(args) {
   await maybeWaitAndDownload(apiKey, taskId, args);
 }
 
+async function generateBaseModel(apiKey, args, outDir) {
+  if (args.image) {
+    let fileObj;
+    if (String(args.image).startsWith("http://") || String(args.image).startsWith("https://")) {
+      fileObj = { type: "image", url: args.image };
+    } else {
+      fileObj = { type: "image", file_token: await multipartUpload(apiKey, args.image) };
+    }
+    const payload = {
+      type: "image_to_model",
+      file: fileObj,
+      model_version: args.modelVersion || "v3.1-20260211",
+      texture_quality: args.textureQuality || "detailed",
+      geometry_quality: args.geometryQuality || "standard",
+      pbr: true,
+    };
+    if (args.enableImageAutofix) payload.enable_image_autofix = true;
+    if (args.textureAlignment) payload.texture_alignment = args.textureAlignment;
+    if (args.faceLimit) payload.face_limit = Number(args.faceLimit);
+    const modelTaskId = await submitTask(apiKey, payload);
+    const modelTask = await waitForTask(apiKey, modelTaskId, args.interval || 8, args.timeout || 900);
+    if (modelTask.status !== "success") throw new TripoError(`Model task failed: ${modelTask.status}`);
+    await downloadOutputs(modelTask, path.join(outDir, "base"));
+    return modelTaskId;
+  }
+  if (!args.prompt) {
+    throw new TripoError("--prompt or --image is required unless --model-task-id reuses an existing generation task");
+  }
+  let prompt = args.prompt;
+  if ((args.rigType == null || args.rigType === "biped") && !/t-pose|a-pose/i.test(prompt)) {
+    prompt = `${prompt}, full-body T-pose for rigging, arms straight out to the sides, legs apart and visible, front facing, symmetric, no props attached to the body`;
+  }
+  const payload = {
+    type: "text_to_model",
+    prompt,
+    model_version: args.modelVersion || "v3.1-20260211",
+    texture_quality: args.textureQuality || "detailed",
+    geometry_quality: args.geometryQuality || "standard",
+    pbr: true,
+  };
+  if (args.faceLimit) payload.face_limit = Number(args.faceLimit);
+  const modelTaskId = await submitTask(apiKey, payload);
+  const modelTask = await waitForTask(apiKey, modelTaskId, args.interval || 8, args.timeout || 900);
+  if (modelTask.status !== "success") throw new TripoError(`Model task failed: ${modelTask.status}`);
+  await downloadOutputs(modelTask, path.join(outDir, "base"));
+  return modelTaskId;
+}
+
 async function cmdCharacterPipeline(args) {
   const apiKey = apiKeyFrom(args);
-  if (!args.modelTaskId && !args.prompt) {
-    throw new TripoError("--prompt is required unless --model-task-id reuses an existing generation task");
+  if (!args.modelTaskId && !args.prompt && !args.image) {
+    throw new TripoError("--prompt or --image is required unless --model-task-id reuses an existing generation task");
   }
   const outDir = args.outDir || "tripo-character";
   const interval = args.interval || 8;
   const timeout = args.timeout || 900;
   let modelTaskId = args.modelTaskId;
   if (!modelTaskId) {
-    let prompt = args.prompt;
-    if ((args.rigType == null || args.rigType === "biped") && !/t-pose|a-pose/i.test(prompt)) {
-      prompt = `${prompt}, full-body T-pose for rigging, arms straight out to the sides, legs apart and visible, front facing, symmetric, no props attached to the body`;
-    }
-    const payload = {
-      type: "text_to_model",
-      prompt,
-      model_version: args.modelVersion || "v3.1-20260211",
-      texture_quality: args.textureQuality || "detailed",
-      geometry_quality: args.geometryQuality || "standard",
-      pbr: true,
-    };
-    if (args.faceLimit) payload.face_limit = Number(args.faceLimit);
-    modelTaskId = await submitTask(apiKey, payload);
-    const modelTask = await waitForTask(apiKey, modelTaskId, interval, timeout);
-    if (modelTask.status !== "success") throw new TripoError(`Model task failed: ${modelTask.status}`);
-    await downloadOutputs(modelTask, path.join(outDir, "base"));
+    modelTaskId = await generateBaseModel(apiKey, args, outDir);
   }
   const checkId = await submitTask(apiKey, { type: "animate_prerigcheck", original_model_task_id: modelTaskId });
   const checkTask = await waitForTask(apiKey, checkId, interval, timeout);
@@ -433,10 +471,7 @@ async function cmdCharacterPipeline(args) {
     if (problems.length) throw new TripoError(`Rig validation failed: ${problems.join("; ")}`);
     console.log("Rig looks structurally valid.");
   }
-  const animations = String(args.animations ?? "preset:idle,preset:walk,preset:run")
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
+  const animations = parseAnimationList(args.animations);
   if (animations.length === 0) return;
   if (args.spec === "mixamo") {
     throw new TripoError("spec=mixamo rigs cannot be used with Tripo animate_retarget.");
@@ -446,21 +481,118 @@ async function cmdCharacterPipeline(args) {
       throw new TripoError(`Unknown animation preset ${animation}`);
     }
   }
-  const retargetPayload = {
-    type: "animate_retarget",
-    original_model_task_id: rigId,
-    out_format: rigType === "biped" ? "fbx" : "glb",
-  };
-  if (rigType === "biped") {
-    retargetPayload.animation = animations[0];
-  } else {
-    retargetPayload.animations = animations.slice(0, 5);
-    retargetPayload.model_version = RIG_MODEL_VERSION;
+  const jobs = retargetJobs(rigType, animations, {
+    rigModelVersion: rigType === "biped" ? "v1.0-20240301" : RIG_MODEL_VERSION,
+  });
+  for (const job of jobs) {
+    const retargetPayload = {
+      type: job.type,
+      original_model_task_id: rigId,
+      out_format: job.out_format,
+    };
+    if (job.animation) retargetPayload.animation = job.animation;
+    if (job.animations) retargetPayload.animations = job.animations;
+    if (job.model_version) retargetPayload.model_version = job.model_version;
+    const retargetId = await submitTask(apiKey, retargetPayload);
+    const retargetTask = await waitForTask(apiKey, retargetId, interval, timeout);
+    if (retargetTask.status !== "success") throw new TripoError(`Retarget failed: ${retargetTask.status}`);
+    const label = clipNameFromPreset(job.animation || job.animations?.[0] || "clip");
+    await downloadOutputs(retargetTask, path.join(outDir, "animated", label));
   }
-  const retargetId = await submitTask(apiKey, retargetPayload);
-  const retargetTask = await waitForTask(apiKey, retargetId, interval, timeout);
-  if (retargetTask.status !== "success") throw new TripoError(`Retarget failed: ${retargetTask.status}`);
-  await downloadOutputs(retargetTask, path.join(outDir, "animated"));
+}
+
+function copyCastFile(source, dest) {
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.copyFileSync(source, dest);
+}
+
+function installCastLook(gameDir, sources) {
+  const lookDir = path.join(gameDir, "public", "look");
+  fs.mkdirSync(lookDir, { recursive: true });
+  const kitPath = path.join(lookDir, "look.json");
+  const session = fs.existsSync(kitPath) ? JSON.parse(fs.readFileSync(kitPath, "utf8")) : {};
+  session.models = { ...(session.models || {}) };
+
+  const copyRole = (role, files) => {
+    if (!files?.file) return;
+    const destName = `${role}${path.extname(files.file) || ".glb"}`;
+    copyCastFile(files.file, path.join(lookDir, destName));
+    const slot = { file: `look/${destName}`, height: 1.7 };
+    if (files.walk) {
+      const walkName = `${role}-walk${path.extname(files.walk)}`;
+      copyCastFile(files.walk, path.join(lookDir, walkName));
+      slot.walk = `look/${walkName}`;
+    }
+    if (files.run) {
+      const runName = `${role}-run${path.extname(files.run)}`;
+      copyCastFile(files.run, path.join(lookDir, runName));
+      slot.run = `look/${runName}`;
+    }
+    session.models[role] = slot;
+  };
+
+  copyRole("player", sources.player);
+  copyRole("enemy", sources.enemy);
+  if (sources.pickup?.file) {
+    const destName = `pickup${path.extname(sources.pickup.file) || ".glb"}`;
+    copyCastFile(sources.pickup.file, path.join(lookDir, destName));
+    session.models.pickup = { file: `look/${destName}` };
+  }
+  fs.writeFileSync(kitPath, `${JSON.stringify(session, null, 2)}\n`);
+  return kitPath;
+}
+
+async function cmdCast(args) {
+  if (!args.out) throw new TripoError("cast requires --out <game-dir>");
+  if (
+    !args.playerImage &&
+    !args.playerPrompt &&
+    !args.enemyImage &&
+    !args.enemyPrompt &&
+    !args.pickupImage &&
+    !args.pickupPrompt
+  ) {
+    throw new TripoError("cast requires --player-image/--enemy-image/--pickup-image (or matching --*-prompt)");
+  }
+  const gameDir = path.resolve(args.out);
+  const tmp = path.join(gameDir, "tripo-cast");
+  const sources = {};
+
+  const runCharacter = async (role, image, prompt) => {
+    if (!image && !prompt) return;
+    const roleDir = path.join(tmp, role);
+    await cmdCharacterPipeline({
+      ...args,
+      image,
+      prompt,
+      modelTaskId: undefined,
+      outDir: roleDir,
+      animations: args.animations || "preset:idle,preset:walk,preset:run",
+    });
+    sources[role] = {
+      file:
+        findDownloadedModel(path.join(roleDir, "animated", "idle")) ||
+        findDownloadedModel(path.join(roleDir, "animated")),
+      walk: findDownloadedModel(path.join(roleDir, "animated", "walk")),
+      run: findDownloadedModel(path.join(roleDir, "animated", "run")),
+    };
+  };
+
+  await runCharacter("player", args.playerImage, args.playerPrompt);
+  await runCharacter("enemy", args.enemyImage, args.enemyPrompt);
+
+  if (args.pickupImage || args.pickupPrompt) {
+    const pickupDir = path.join(tmp, "pickup");
+    if (args.pickupImage) {
+      await cmdImage({ ...args, image: args.pickupImage, wait: true, download: true, outDir: pickupDir });
+    } else {
+      await cmdText({ ...args, prompt: args.pickupPrompt, wait: true, download: true, outDir: pickupDir });
+    }
+    sources.pickup = { file: findDownloadedModel(pickupDir) };
+  }
+
+  const kitPath = installCastLook(gameDir, sources);
+  console.log(`CAST_OK path=${kitPath}`);
 }
 
 async function main(argv) {
@@ -476,6 +608,7 @@ async function main(argv) {
   if (command === "download") return cmdDownload(args);
   if (command === "postprocess") return cmdPostprocess(args);
   if (command === "character-pipeline") return cmdCharacterPipeline(args);
+  if (command === "cast") return cmdCast(args);
   if (command === "validate-rig") {
     const glbPath = args._[1];
     if (!glbPath) throw new TripoError("validate-rig requires a GLB path");
@@ -493,7 +626,7 @@ async function main(argv) {
     return;
   }
   throw new TripoError(
-    "Usage: threejs_3d_asset.mjs <probe|text|image|status|download|postprocess|character-pipeline|validate-rig|validate-animation> [options]"
+    "Usage: threejs_3d_asset.mjs <probe|text|image|status|download|postprocess|character-pipeline|cast|validate-rig|validate-animation> [options]"
   );
 }
 

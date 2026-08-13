@@ -9,7 +9,8 @@
  *
  * Chapter QA / screenshots: `--no-open` (prints LAUNCH_OK, no browser).
  * Whole-game handoff: `--deliver` (prints GAME_DELIVERED and opens the
- * system default browser). Do not use `--deliver` after a single chapter.
+ * system default browser). `--deliver` first audits game source + look.json
+ * models; ART_FAIL prints no GAME_DELIVERED and does not open a browser.
  *
  * Run `npm install` as its own command first. This script does not install.
  */
@@ -17,6 +18,7 @@
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import path from 'node:path';
+import { auditGameArt } from './audit_game_art_lib.mjs';
 
 const URL = 'http://127.0.0.1:5188/';
 const READY_MS = 20_000;
@@ -112,6 +114,13 @@ function report(alreadyRunning, deliver) {
 
 const { noOpen, deliver, target } = parseArgs(process.argv.slice(2));
 const gameDir = path.resolve(target);
+if (deliver) {
+  const art = auditGameArt(gameDir);
+  if (!art.ok) {
+    for (const line of art.failures) console.error(`ART_FAIL ${line}`);
+    process.exit(2);
+  }
+}
 const inApp = Boolean(process.env.AIONUI_CDP_ACTIVE_PORT);
 const skipViteOpen = noOpen || deliver || inApp;
 

@@ -110,6 +110,8 @@ export class Game {
   private async bootLook(): Promise<void> {
     this.session = await this.look.load('/look/look.json');
     if (this.floor) await this.look.apply(this.scene, this.floor, this.session);
+    await this.player.applyCast(this.session.models?.player);
+    await Promise.all(this.pickups.map((pickup) => pickup.applyCast(this.session.models?.pickup)));
     this.applyChapter(chapterFromScore(this.session, this.score, this.complete), true);
     const title = document.querySelector('title');
     if (title) title.textContent = this.session.title;

@@ -9,11 +9,13 @@ description: "Generate, texture, rig, animate, stylize, convert, and download 3D
 
 Create production-oriented 3D assets, then prepare them for Three.js games. This is the Three.js game system's 3D-generation layer; it uses Tripo as the provider for text-to-3D, image-to-3D, texturing, rigging, retargeting, stylization, conversion, and downloadable GLB/FBX outputs.
 
-Resolve `<this-skill-dir>` in the commands below in this order: `~/.claude/skills/threejs-3d-generator`, `~/.codex/skills/threejs-3d-generator`, `~/.agents/skills/threejs-3d-generator`, or repo `skills/threejs-3d-generator`.
+Resolve `<this-skill-dir>` in the commands below in this order: `.aionrs/skills/threejs-3d-generator`, `~/.claude/skills/threejs-3d-generator`, `~/.codex/skills/threejs-3d-generator`, `~/.agents/skills/threejs-3d-generator`, or repo `skills/threejs-3d-generator`.
 
 ## API Key
 
 Never store API keys in skill files or client-side game code, and never paste a key value into a report. The script reads `--api-key` or `TRIPO_API_KEY`.
+
+In Aion, the desktop shell injects `TRIPO_API_KEY` into the agent process. Run the probe first; expect `SET`. Do not skip Tripo because you assume the key is absent. Procedural meshes are allowed only after a literal `MISSING` line or a real API error.
 
 Step 0, before declaring the key unavailable: run this skill's own probe and paste its literal output into the report.
 
@@ -121,13 +123,24 @@ node <this-skill-dir>/scripts/threejs_3d_asset.mjs postprocess \
   --wait --download --out-dir assets/models/voxel
 ```
 
-Animated character pipeline (generation -> prerigcheck -> validated rig with retries -> retargets -> downloads). The pipeline routes itself by body plan: biped characters automatically use the v1.0-20240301 anatomical rig with one FBX per animation (plain preset names are mapped onto the preset:biped:* library); creatures use the v2.5-20260210 rig with GLB clips:
+Animated character pipeline (generation -> prerigcheck -> validated rig with retries -> retargets -> downloads). The pipeline routes itself by body plan: biped characters automatically use the v1.0-20240301 anatomical rig with **one FBX per clip** (idle, walk, and run are separate retarget tasks); creatures use the v2.5-20260210 rig with GLB clips. Prefer `--image` (T-pose concept → image-to-3D) over default text-to-3D. Never pass `--animate-in-place`.
+
+For an Aion Vite game, one `cast` command generates the slots and writes `public/look` + `look.json` models (overlay loads them):
+
+```bash
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs cast \
+  --out ./my-game \
+  --player-image assets/concepts/player-tpose.png \
+  --pickup-image assets/concepts/pickup.png
+```
+
+First-person games may omit `--player-image` but must pass `--enemy-image` for visible characters.
 
 ```bash
 node <this-skill-dir>/scripts/threejs_3d_asset.mjs character-pipeline \
-  --prompt "stylized cyber runner character, T-pose, full body, game-ready outfit, readable silhouette" \
-  --animations preset:idle,preset:walk,preset:run,preset:jump \
-  --out-dir assets/models/cyber-runner
+  --image assets/concepts/player-tpose.png \
+  --animations preset:idle,preset:walk,preset:run \
+  --out-dir assets/models/hero
 
 # Creature example: stance language matters — generate in the pose the preset expects.
 node <this-skill-dir>/scripts/threejs_3d_asset.mjs character-pipeline \

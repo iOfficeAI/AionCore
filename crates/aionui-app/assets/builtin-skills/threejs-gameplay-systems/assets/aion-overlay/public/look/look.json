@@ -34,5 +34,6 @@
     "sky": "look/sky.jpg",
     "ground": "look/ground.jpg",
     "icon": "look/icon.png"
-  }
+  },
+  "models": {}
 }

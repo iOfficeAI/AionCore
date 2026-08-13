@@ -11,13 +11,17 @@
 3. 按阶段加载：玩法 `threejs-gameplay-systems`；画面 `threejs-aaa-graphics-builder`；UI `threejs-game-ui-designer`；调试 `threejs-debug-profiler`；发布 `threejs-qa-release`；3D/图/音频 `threejs-3d-generator` / `threejs-image-generator` / `threejs-audio-generator`。
 4. 默认走 Vite + TypeScript 脚手架（gameplay skill 的 `create_threejs_game.mjs`）。**禁止**把 CDN `three.js r128` 单文件 HTML 当作默认交付。
 5. 仅当用户明确要求「单个 HTML / 不要 npm / 不要构建」时，才允许单文件原型，并在报告里标明这是降级，不是 premium。
-6. 完成声明必须附：`npm run build`（单文件降级则改为本地打开 HTML）、章节自检用 `launch_game.mjs --no-open`、整局最后一条命令 `launch_game.mjs --deliver`（`GAME_DELIVERED`，打开系统默认浏览器；不要在 ExecCommand 前台跑 `npm run play`、不要用 `aionui-browser` 代替）、控制台无未处理错误、截图、canvas 非空白、体验意图与情绪节拍已内部验证、分享入口可点。未跑 `--deliver` 不得声称完成。对用户的最后一段用大白话说明游戏已打开、操作、当前目标和分享入口，不能用技术命令作为第一句话。用户未明确要求原型时，按完整短局/premium 走：首局可玩只是检查点，须加载画面/3D/QA sibling，主控不得是胶囊或方块。
+6. 完成声明必须附：`npm run build`（单文件降级则改为本地打开 HTML）、章节自检用 `launch_game.mjs --no-open`、整局最后一条命令 `launch_game.mjs --deliver`（`GAME_DELIVERED`，打开系统默认浏览器；`--deliver` 会审计源码与 `look.json` 模型，三角锥过不了；不要在 ExecCommand 前台跑 `npm run play`、不要用 `aionui-browser` 代替）、控制台无未处理错误、截图、canvas 非空白、体验意图与情绪节拍已内部验证、分享入口可点。未跑 `--deliver` 不得声称完成。对用户的最后一段用大白话说明游戏已打开、操作、当前目标和分享入口，不能用技术命令作为第一句话。用户未明确要求原型时，按完整短局/premium 走：首局可玩只是检查点，须加载画面/3D/QA sibling，主控不得是胶囊或方块；用 `cast` 写入角色/道具模型，第一人称可见角色仍需 enemy 模型。
 
 用户没指定玩法时，默认做一个可跳、可收集、有失败重开的 3D 平台游戏，做成 3～5 个章节、能通关的短局，并按题材适配的情绪曲线做完，仍走 director，不要套固定关卡或固定函数名模板。只有用户明确要求原型时才允许短切片。
 
-## 图片
+## 图片、3D 与音频
 
-概念图、贴图参考、图标、天空板优先调用 `aionui_image_generation`：中文 prompt，以 `Generate image:` 或 `Edit image:` 开头，显式传入 `aspect_ratio`（环境 `16:9`，角色/UI `3:4` 或 `1:1`）。把返回的真实路径拷到 `assets/concepts/`、`assets/textures/` 或 `assets/ui/`。工具不在列表里时，再按 `threejs-image-generator` 的 Gemini / `uv` 脚本回退。3D 仍依赖 `TRIPO_API_KEY`。音频用 Node `threejs_audio_asset.mjs kit`：一条配乐切 explore/pressure/settle；人声只在场景需要时生成（歌唱进配乐，旁白/对白走 TTS），否则只做器乐和音效。无 `ELEVENLABS_API_KEY` 则回退程序化床，不得伪造已生成。
+概念图、贴图参考、图标、天空板优先调用 `aionui_image_generation`：中文 prompt，以 `Generate image:` 或 `Edit image:` 开头，显式传入 `aspect_ratio`（环境 `16:9`，角色/UI `3:4` 或 `1:1`）。把返回的真实路径拷到 `assets/concepts/`、`assets/textures/` 或 `assets/ui/`。工具不在列表里时，再按 `threejs-image-generator` 的 Gemini / `uv` 脚本回退。
+
+3D：Aion 已向会话注入 `TRIPO_API_KEY`。加载 `threejs-3d-generator`，先跑 Node probe；`SET` 时必须走 Tripo 生成英雄/道具 GLB，不得默认胶囊或方块。只有字面 `MISSING` 或真实 API 失败才回退程序化资产，并写入账本。
+
+音频：Aion 已注入 `ELEVENLABS_API_KEY`。用 Node `threejs_audio_asset.mjs kit`：一条配乐切 explore/pressure/settle；人声只在场景需要时生成（歌唱进配乐，旁白/对白走 TTS），否则只做器乐和音效。先 probe；只有 `MISSING` 或 API 失败才回退程序化床，不得伪造，也不得未探测就跳过。
 
 ## 体验契约
 

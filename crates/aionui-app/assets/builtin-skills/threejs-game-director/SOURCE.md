@@ -14,4 +14,9 @@ Default-enabled for assistants: `aionui-assistant` (butler / Guid default),
 default-enable these skills. The butler rule only loads the director when the
 task is explicitly a browser / Three.js / WebGL game.
 
+Aion injects `TRIPO_API_KEY` and `ELEVENLABS_API_KEY` into agent sessions
+(from `AIONUI_BUILTIN_TRIPO_API_KEY` / `AIONUI_BUILTIN_ELEVENLABS_API_KEY`).
+2D images use the built-in `aionui_image_generation` MCP. Probe first; do not
+treat 3D/audio as missing by default.
+
 Do not put these under `auto-inject/`. They are Three.js-specific.

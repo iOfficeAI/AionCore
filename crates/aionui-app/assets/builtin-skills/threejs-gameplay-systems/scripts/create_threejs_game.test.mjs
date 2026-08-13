@@ -24,6 +24,16 @@ test('new games get the overlay mixer, not the vendor oscillator-only file', () 
   assert.doesNotMatch(player, /CapsuleGeometry/);
   assert.doesNotMatch(player, /ConeGeometry/);
   assert.match(player, /torso|cloak|emblem/i);
+  assert.match(player, /applyCast|loadCastVisual/);
+
+  const pickup = fs.readFileSync(path.join(dir, 'src', 'entities', 'Pickup.ts'), 'utf8');
+  assert.doesNotMatch(pickup, /IcosahedronGeometry/);
+  assert.match(pickup, /applyCast|loadCastVisual/);
+
+  const cast = fs.readFileSync(path.join(dir, 'src', 'studio', 'cast.ts'), 'utf8');
+  assert.match(cast, /Root\.position/);
+  assert.match(cast, /FBXLoader/);
+  assert.doesNotMatch(cast, /animate-in-place|animateInPlace/);
 
   const game = fs.readFileSync(path.join(dir, 'src', 'game', 'Game.ts'), 'utf8');
   assert.match(game, /chapterFromScore|diagnostics\.chapter/);

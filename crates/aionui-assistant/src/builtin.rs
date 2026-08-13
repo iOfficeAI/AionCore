@@ -389,6 +389,15 @@ mod tests {
             text.contains("执行流程") && text.contains("实测可玩") && text.contains("--deliver"),
             "game-dev-studio must sequence make → playtest → --deliver"
         );
+        assert!(
+            text.contains("会话已注入 `TRIPO_API_KEY`")
+                && text.contains("已注入 `ELEVENLABS_API_KEY`"),
+            "game-dev-studio must tell the model Aion injects Tripo and ElevenLabs keys"
+        );
+        assert!(
+            !text.contains("3D/音频 key 缺失时回退"),
+            "game-dev-studio must not default to procedural 3D/audio"
+        );
         let en_rule = reg
             .rule_bytes("game-dev-studio", "en-US")
             .expect("game-dev-studio en-US rule");
@@ -402,6 +411,11 @@ mod tests {
                 && en_text.contains("Prove it plays")
                 && en_text.contains("--deliver"),
             "en-US game-dev-studio must keep experience intent, playtest, and --deliver"
+        );
+        assert!(
+            en_text.contains("Aion injects `TRIPO_API_KEY`")
+                && en_text.contains("ELEVENLABS_API_KEY"),
+            "en-US game-dev-studio must tell the model Aion injects Tripo and ElevenLabs keys"
         );
         for (id, locale) in [
             ("aionui-assistant", "zh-CN"),
@@ -424,6 +438,12 @@ mod tests {
             assert!(
                 !text.contains("Do NOT ask the user any questions, generate complete code directly"),
                 "{id} {locale} must not force the old single-file Kirby template"
+            );
+            assert!(
+                !text.contains("3D 仍依赖")
+                    && !text.contains("3D still needs")
+                    && !text.contains("3D по-прежнему зависит"),
+                "{id} {locale} must not tell the model Tripo is unavailable"
             );
             let has_intent = text.contains("体验意图")
                 || text.contains("experience intent")

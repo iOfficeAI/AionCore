@@ -65,7 +65,7 @@ Mark a phase `done` only after implementation plus verification evidence. If a p
 After the relevant generator skills are loaded, actual external generation may be skipped only when:
 
 - The user explicitly requested no external AI/assets or offline-only output.
-- Credential probe output shows the relevant key is `MISSING`. For 2D images, `aionui_image_generation` in the tool list counts as the image provider being SET; `GEMINI_API_KEY=MISSING` is not a 2D skip in that case.
+- Credential probe output shows the relevant key is `MISSING`. In Aion, `TRIPO_API_KEY` and `ELEVENLABS_API_KEY` are injected into the agent process — expect `SET` and generate. For 2D images, `aionui_image_generation` in the tool list counts as the image provider being SET; `GEMINI_API_KEY=MISSING` is not a 2D skip in that case.
 - A real API/network/quota error occurs after an attempted generation command; include the command and error summary.
 - The surface is a repeated low-value prop better handled by instancing/procedural kits.
 - A non-hero repeated/support surface already scores 2+ and the ledger explains why external generation would not improve the active screenshot.
@@ -186,7 +186,7 @@ Exit evidence: root cause or measured bottleneck stated; baseline/post metrics w
 
 Use before calling broad work complete.
 
-- Run build/typecheck; `npm install`; start with `launch_game.mjs --no-open` and confirm `LAUNCH_OK`. Walk every named chapter critical path, fail/retry, pause, settle, and share with real input — a screenshot is not a playtest. Run packaged tests when present. Never foreground `npm run play` in ExecCommand. Only after that gate passes, run `launch_game.mjs --deliver` and confirm `GAME_DELIVERED` (system default browser). Do not `--deliver` an untested or incomplete build.
+- Run build/typecheck; `npm install`; start with `launch_game.mjs --no-open` and confirm `LAUNCH_OK`. Walk every named chapter critical path, fail/retry, pause, settle, and share with real input — a screenshot is not a playtest. Run packaged tests when present. Never foreground `npm run play` in ExecCommand. Only after that gate passes, run `launch_game.mjs --deliver` and confirm `GAME_DELIVERED` (system default browser). `--deliver` audits game source + `look.json` models (`ART_FAIL` prints no `GAME_DELIVERED`). Do not `--deliver` an untested or incomplete build.
 - Capture active desktop and mobile screenshots; sample canvas pixels for nonblank and varied output using the generated game's `npm run inspect:canvas` or:
 
 ```bash
@@ -211,7 +211,7 @@ For a broad complete game (not an explicit prototype), and for any premium/AAA/s
 - Credential probe output plus external output evidence or blocker evidence is present for premium asset-category claims.
 - Playable loop works through real input; game design brief with experience intent, core loop contract, emotion beat sheet, chapter ledger, and level/encounter plan are reported for broad builds.
 - First-clear content is a named 3-5 segment ledger that the player can finish from opening to settle, or an explicit prototype exception is recorded.
-- Hero/player is not a capsule, cube, or primitive-plus-glow.
+- Hero/player is not a capsule, cube, or primitive-plus-glow. `--deliver` is `ART_FAIL` until `cast` wrote look.json models and `src/` has no Cone/Capsule/Icosahedron/Tetrahedron. First-person may omit player.glb; visible characters still need enemy.glb.
 - Audio states follow the emotion curve; unplanned silence or one loop for the whole session without documented contrast is a fail.
 - Share exists on pause/settle; `localhost` is not claimed as a friend-facing public URL.
 - Active-play screenshots exist for desktop and mobile.

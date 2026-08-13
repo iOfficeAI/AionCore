@@ -56,7 +56,7 @@
 
 先建立声音叙事：环境声定义空间，交互音确认因果，威胁音建立预期，角色/旁白承载信息，配乐控制情绪能量。高频声音必须有变体、冷却和响度层级。
 
-配乐不是一首循环到底。按情绪曲线设置基础、压力、高潮、回落/结算等适用状态，并用 sting、分层或交叉淡化响应玩法和叙事；切换尽量落在乐句或节拍边界。关键音效与画面接触帧同步，重要音效可短暂压低音乐以保留清晰度。安静、留白和低动态可以是专业的情绪手段，但必须有明确目的与前后对比；无计划的静音、缺失关键反馈或全程高响度均不合格。生成服务不可用时使用程序化音频或清楚记录阻塞，不伪造已试听结论。
+配乐不是一首循环到底。按情绪曲线设置基础、压力、高潮、回落/结算等适用状态，并用 sting、分层或交叉淡化响应玩法和叙事；切换尽量落在乐句或节拍边界。关键音效与画面接触帧同步，重要音效可短暂压低音乐以保留清晰度。安静、留白和低动态可以是专业的情绪手段，但必须有明确目的与前后对比；无计划的静音、缺失关键反馈或全程高响度均不合格。生成服务在 probe 为 `MISSING` 或 API 失败时使用程序化音频或清楚记录阻塞，不伪造已试听结论。不要因为「可能没 key」就默认静音或跳过 `kit`。
 
 ## 分享模式
 
@@ -98,7 +98,7 @@
 
 1. **制作**：脚手架、3～5 个命名章节、主控、画面、声音、暂停/结算/分享。首局能跑只是检查点，不是成品。
 2. **实测可玩**（质量帽）：`npm run build`；`launch_game.mjs --no-open` 得到 `LAUNCH_OK`。必须实际操作，不能只看编译通过或截一张图。走完：主输入能改变游戏状态；每一个命名章节能进入并完成该段关键目标；失败/重试可用；暂停与结算能打开；分享可点；控制台无未处理错误；截图；canvas 非空白。项目里有 `npm test` / `verify:visual` / `inspect:canvas` 就必须跑。任一项 `FAIL` 先修再测，禁止带缺陷进入下一步。
-3. **交给玩家**：仅当第 2 步全过、章节齐、交付闸门无 FAIL。最后一条命令 `launch_game.mjs --deliver`，必须看到 `GAME_DELIVERED`（系统默认浏览器）。没实测可玩就 `--deliver` 视为未完成。
+3. **交给玩家**：仅当第 2 步全过、章节齐、交付闸门无 FAIL。最后一条命令 `launch_game.mjs --deliver`，必须看到 `GAME_DELIVERED`（系统默认浏览器）。`--deliver` 会审计游戏源码和 `look.json` 模型文件（三角锥/胶囊/二十面体或缺失 GLB/FBX 会 `ART_FAIL`，不会打开浏览器）。没实测可玩就 `--deliver` 视为未完成。制作阶段用 `threejs_3d_asset.mjs cast` 写入角色/道具模型；第一人称可以没有 player 模型，但可见角色必须有 enemy 模型。
 
 ## 出片标准
 
@@ -130,7 +130,7 @@
 
 技能目录：`.aionrs/skills/<skill-name>/`。玩法 `threejs-gameplay-systems`；画面 `threejs-aaa-graphics-builder`；UI `threejs-game-ui-designer`；调试 `threejs-debug-profiler`；发布 `threejs-qa-release`；3D/图/音频 `threejs-3d-generator` / `threejs-image-generator` / `threejs-audio-generator`。
 
-Web 游戏用户未明确要求原型时，按完整短局/premium 路径：首局可玩只是制作检查点。不要让用户安装 Node：使用 AionUi 自带运行时。禁止在 ExecCommand 前台跑 `npm run play`。2D 图优先 `aionui_image_generation`；3D/音频 key 缺失时回退程序化资产，不得伪造。分享入口可点；`localhost` 只称本地试玩。体验意图与情绪节拍内部验证。未验证不得声称完成。
+Web 游戏用户未明确要求原型时，按完整短局/premium 路径：首局可玩只是制作检查点。不要让用户安装 Node：使用 AionUi 自带运行时。禁止在 ExecCommand 前台跑 `npm run play`。2D 图优先 `aionui_image_generation`；3D 用 `threejs-3d-generator`（会话已注入 `TRIPO_API_KEY`）；音频用 `threejs-audio-generator` 的 `kit`（已注入 `ELEVENLABS_API_KEY`）。先跑 credential probe；只有字面 `MISSING` 或真实 API 失败才回退程序化资产，不得伪造，也不得未探测就跳过生成。分享入口可点；`localhost` 只称本地试玩。体验意图与情绪节拍内部验证。未验证不得声称完成。
 
 ### 交给玩家
 
