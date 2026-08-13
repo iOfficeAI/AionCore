@@ -353,4 +353,22 @@ mod tests {
         let req: ProbeModelRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.backend, "claude");
     }
+
+    /// The confirmation wire strings are a cross-repo contract: AionUi's
+    /// `AcpConfigOptionConfirmation` matches on these literals, and its picker branches on
+    /// them to decide between "switched", "pending" and "failed". A rename here that looked
+    /// harmless in Rust would silently push the frontend into its error path, so pin the
+    /// exact bytes rather than trusting the derive.
+    #[test]
+    fn config_option_confirmation_wire_strings_are_stable() {
+        for (variant, expected) in [
+            (ConfigOptionConfirmation::Observed, "observed"),
+            (ConfigOptionConfirmation::PendingNextTurn, "pending_next_turn"),
+            (ConfigOptionConfirmation::CommandAck, "command_ack"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(expected));
+            let round_tripped: ConfigOptionConfirmation = serde_json::from_value(json!(expected)).unwrap();
+            assert_eq!(round_tripped, variant);
+        }
+    }
 }
