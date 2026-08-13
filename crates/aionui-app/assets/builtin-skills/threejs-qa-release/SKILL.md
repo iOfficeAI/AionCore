@@ -21,8 +21,8 @@ Load `references/playtest-bot.md` and `references/checklists/bot-playtest.md` fo
 
 1. Install dependencies if needed.
 2. Run build/typecheck.
-3. `npm install`, then `node <threejs-gameplay-systems-skill-dir>/scripts/launch_game.mjs <game-dir>`. Do not foreground `npm run play`. If `aionui-browser` is available, open `http://127.0.0.1:5188`.
-4. Confirm the page actually opened; capture console/page/network errors.
+3. `npm install`, then `node <threejs-gameplay-systems-skill-dir>/scripts/launch_game.mjs <game-dir> --no-open`. Do not foreground `npm run play`. Do not open the system browser or `aionui-browser` during QA.
+4. Confirm `LAUNCH_OK`; capture console/page/network errors. When this QA pass is the last step of a complete short game, run the same command with `--deliver` instead and confirm `GAME_DELIVERED` (system default browser).
 5. Verify nonblank canvas pixels.
 6. Capture desktop and mobile screenshots.
 7. Walk named chapter critical paths, emotion-beat events, fail/retry, recovery, climax, and settle.

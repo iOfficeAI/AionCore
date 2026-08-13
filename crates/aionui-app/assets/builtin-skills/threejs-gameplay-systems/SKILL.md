@@ -43,7 +43,7 @@ Load `threejs-audio-generator` when implementing real SFX, ambience, music beds,
 6. Implement mechanics in playable increments: input, state, entity, collision/physics, feedback, HUD/audio hook, diagnostics.
 7. Tune feel with `references/game-feel.md`: movement, acceleration, camera follow/FOV/shake, hitstop, impact feedback, cooldowns, difficulty, restart loop.
 8. Keep hot paths allocation-light and update order explicit.
-9. Verify with build, `launch_game.mjs` (`LAUNCH_OK`), screenshot, canvas pixels, console/page errors, chapter critical path, and one real input path.
+9. Verify with build, `launch_game.mjs --no-open` (`LAUNCH_OK`), screenshot, canvas pixels, console/page errors, chapter critical path, and one real input path. Hand the complete short game to the player with `launch_game.mjs --deliver` (`GAME_DELIVERED`).
 
 ## Packaged Scaffold
 
@@ -52,10 +52,10 @@ Use the bundled scaffold when starting a new project or when the user asks for a
 ```bash
 node <this-skill-dir>/scripts/create_threejs_game.mjs ./my-game
 cd ./my-game && npm install
-node <this-skill-dir>/scripts/launch_game.mjs ./my-game
+node <this-skill-dir>/scripts/launch_game.mjs ./my-game --no-open
 ```
 
-Prefer the `.mjs` creator. Launch with `launch_game.mjs`; do not foreground `npm run play` in ExecCommand.
+Prefer the `.mjs` creator. Launch with `launch_game.mjs`; do not foreground `npm run play` in ExecCommand. Use `--no-open` during making; `--deliver` only as the last step of a complete short game.
 
 The script copies `assets/threejs-vite-game/`, then applies `assets/aion-overlay/` (stylized player, chapter session, pause/share, look loader, audio mixer). Rewrite the project name in `package.json` and `package-lock.json`. After image generation, run `scripts/apply_look.mjs` so sky/ground/icon land in `public/look/`, not `assets/concepts/`. Use `--force` only when the target directory may be overwritten.
 

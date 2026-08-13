@@ -386,8 +386,8 @@ mod tests {
             "game-dev-studio must require a share mode"
         );
         assert!(
-            text.contains("launch_game.mjs"),
-            "game-dev-studio must launch with launch_game.mjs"
+            text.contains("执行流程") && text.contains("实测可玩") && text.contains("--deliver"),
+            "game-dev-studio must sequence make → playtest → --deliver"
         );
         let en_rule = reg
             .rule_bytes("game-dev-studio", "en-US")
@@ -398,8 +398,10 @@ mod tests {
             "en-US game-dev-studio must route through threejs-game-director"
         );
         assert!(
-            en_text.contains("experience intent") && en_text.contains("launch_game.mjs"),
-            "en-US game-dev-studio must keep experience intent and launch_game.mjs"
+            en_text.contains("experience intent")
+                && en_text.contains("Prove it plays")
+                && en_text.contains("--deliver"),
+            "en-US game-dev-studio must keep experience intent, playtest, and --deliver"
         );
         for (id, locale) in [
             ("aionui-assistant", "zh-CN"),

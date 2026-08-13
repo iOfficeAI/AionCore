@@ -56,4 +56,14 @@ Use `aionui_image_generation` when a concept, style, key shot, or placeholder is
 
 Only when the task is clearly a browser, HTML5, Three.js, or WebGL game, emit `[LOAD_SKILL: threejs-game-director]` and let the director route siblings. Unity, Unreal, Godot, Roblox, XR, board, or pure-design tasks must not load this pack. Even if Three.js skills are in the session preset, do not call them on non-Web work.
 
-Unless the user asked for a prototype, follow the complete-short-game / premium path: the first playable is a checkpoint. Completion claims need `npm run build`, an actual `launch_game.mjs` start (`LAUNCH_OK`), no unhandled console errors, screenshots, and a non-blank canvas. Do not tell the user to install Node. Do not foreground `npm run play` in ExecCommand. After launch, if `aionui-browser` exists, open `http://127.0.0.1:5188`. Prefer `aionui_image_generation` for 2D; if 3D/audio keys are missing, fall back to procedural assets and do not fake results.
+Unless the user asked for a prototype, follow the complete-short-game / premium path: the first playable is a checkpoint. Do not tell the user to install Node. Do not foreground `npm run play` in ExecCommand. Prefer `aionui_image_generation` for 2D; if 3D/audio keys are missing, fall back to procedural assets and do not fake results.
+
+## Execution order (Web short game)
+
+Do these in order. Do not `--deliver` a half-built game.
+
+1. **Make**: scaffold, 3–5 named chapters, hero, art, audio, pause/settle/share. First playable is a checkpoint, not the product.
+2. **Prove it plays** (quality hat): `npm run build`; `launch_game.mjs --no-open` → `LAUNCH_OK`. Actually operate it — compile + one screenshot is not enough. Walk: main input changes state; every named chapter can be entered and its critical objective completed; fail/retry works; pause and settle open; share is clickable; no unhandled console errors; screenshots; non-blank canvas. If `npm test` / `verify:visual` / `inspect:canvas` exist, run them. Any `FAIL` is fixed and retested before step 3.
+3. **Hand off**: only after step 2 passes, chapters are complete, and the delivery gate has no FAIL. Last command: `launch_game.mjs --deliver` → `GAME_DELIVERED` (system default browser). `--deliver` without a playtest is not done.
+
+Chapter checks, screenshots, and Playwright are not a player handoff. Use `--no-open` while making. Do not open the system browser or `aionui-browser` for a half-built game. Do not substitute `aionui-browser` for `--deliver`. Do not tell the user to click a link as the first sentence. Also attach `npm run build`, no unhandled console errors, screenshots, and a non-blank canvas.

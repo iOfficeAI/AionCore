@@ -99,10 +99,24 @@ New projects use the gameplay skill's scaffold creator; canvas verification uses
 ```bash
 node <threejs-gameplay-systems-skill-dir>/scripts/create_threejs_game.mjs ./my-game
 cd ./my-game && npm install
-node <threejs-gameplay-systems-skill-dir>/scripts/launch_game.mjs ./my-game
+node <threejs-gameplay-systems-skill-dir>/scripts/launch_game.mjs ./my-game --no-open
 ```
 
-Use `launch_game.mjs` (not foreground `npm run play`): Vite must be detached or ExecCommand times out and kills the server. Give `npm install` a long timeout. After `LAUNCH_OK`, if `aionui-browser` is available, open `http://127.0.0.1:5188`. Playwright is QA, not a playability gate.
+Use `launch_game.mjs` (not foreground `npm run play`): Vite must be detached or ExecCommand times out and kills the server. Give `npm install` a long timeout.
+
+## Execution order
+
+Do not skip to player handoff.
+
+1. **Make** the complete short game (3–5 named chapters). First `LAUNCH_OK` is a checkpoint. Chapter QA, screenshots, and Playwright use `--no-open` only. Do not open the system browser or `aionui-browser` on a half-built game.
+2. **Prove it plays** before `--deliver`: `npm run build`; `launch_game.mjs --no-open`; actually drive main input, every named chapter's critical path, fail/retry, pause, settle, and share; console clean; screenshots; non-blank canvas. Run `npm test` / `verify:visual` / `inspect:canvas` when those scripts exist. Fix every `FAIL` and retest. Playwright screenshots are not a substitute for walking the chapter paths.
+3. **Hand off** only the finished, playtested game:
+
+```bash
+node <threejs-gameplay-systems-skill-dir>/scripts/launch_game.mjs ./my-game --deliver
+```
+
+Require `GAME_DELIVERED` (system default browser at `http://127.0.0.1:5188/`). Do not claim done without this step, and do not `--deliver` until step 2 passed.
 
 After scaffold create, apply generated sky/ground/icon, then generate audio with the Node kit (not foreground Python, not twenty SFX prompts). Voice follows the scene: lyrics/song → vocals; 旁白/对白/announcer → TTS; otherwise instrumental + SFX only.
 
@@ -132,7 +146,7 @@ Premium, AAA, polished, complete, release-ready, and showcase requests require v
 
 ## Required Verification
 
-- Build/typecheck; launch with `launch_game.mjs` (not foreground `npm run play`) and confirm `LAUNCH_OK`; console/page error check.
+- Build/typecheck; chapter/QA launches use `launch_game.mjs --no-open` (`LAUNCH_OK`). Prove the game plays (every named chapter critical path, fail/retry, settle) before the last command `launch_game.mjs --deliver` (`GAME_DELIVERED`, system default browser). Never `--deliver` an untested or incomplete build. Never foreground `npm run play`. Console/page error check.
 - Game design brief (including experience intent), core loop contract, emotion beat sheet, chapter ledger, and level/encounter plan for broad game creation or major gameplay changes.
 - Active desktop and mobile screenshots plus nonblank canvas pixel evidence.
 - Main input/objective/fail-or-restart path exercised through named chapters, not only the first minute.

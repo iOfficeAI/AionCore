@@ -4,8 +4,12 @@
  *
  * `npm run play` is a long-lived Vite process. If the agent runs it in the
  * foreground, the tool times out (~120s) and the process group is killed.
- * This script detaches `npm run play` (which already opens the browser),
- * waits until http://127.0.0.1:5188/ answers, then exits.
+ * This script detaches Vite, waits until http://127.0.0.1:5188/ answers,
+ * then exits.
+ *
+ * Chapter QA / screenshots: `--no-open` (prints LAUNCH_OK, no browser).
+ * Whole-game handoff: `--deliver` (prints GAME_DELIVERED and opens the
+ * system default browser). Do not use `--deliver` after a single chapter.
  *
  * Run `npm install` as its own command first. This script does not install.
  */
@@ -16,27 +20,33 @@ import path from 'node:path';
 
 const URL = 'http://127.0.0.1:5188/';
 const READY_MS = 20_000;
+const USAGE = 'Usage: node launch_game.mjs <game-dir> [--no-open|--deliver]';
 
 function parseArgs(argv) {
   let noOpen = false;
+  let deliver = false;
   let target = null;
   for (const arg of argv) {
     if (arg === '--no-open') noOpen = true;
+    else if (arg === '--deliver') deliver = true;
     else if (arg === '--help' || arg === '-h') {
-      console.log('Usage: node launch_game.mjs <game-dir> [--no-open]');
+      console.log(USAGE);
       process.exit(0);
     } else if (arg.startsWith('-')) {
       throw new Error(`unknown flag: ${arg}`);
     } else if (target) {
-      throw new Error('Usage: node launch_game.mjs <game-dir> [--no-open]');
+      throw new Error(USAGE);
     } else {
       target = arg;
     }
   }
   if (!target) {
-    throw new Error('Usage: node launch_game.mjs <game-dir> [--no-open]');
+    throw new Error(USAGE);
   }
-  return { noOpen, target };
+  if (noOpen && deliver) {
+    throw new Error('use either --no-open or --deliver, not both');
+  }
+  return { noOpen, deliver, target };
 }
 
 function ping() {
@@ -62,8 +72,8 @@ async function waitReady() {
   return false;
 }
 
-function startPlay(gameDir, noOpen) {
-  const child = spawn('npm', noOpen ? ['run', 'dev'] : ['run', 'play'], {
+function startPlay(gameDir, skipViteOpen) {
+  const child = spawn('npm', skipViteOpen ? ['run', 'dev'] : ['run', 'play'], {
     cwd: gameDir,
     detached: true,
     stdio: 'ignore',
@@ -74,17 +84,45 @@ function startPlay(gameDir, noOpen) {
   child.unref();
 }
 
-const { noOpen, target } = parseArgs(process.argv.slice(2));
+function openSystemBrowser(url) {
+  const env = { ...process.env };
+  delete env.ELECTRON_RUN_AS_NODE;
+  delete env.ELECTRON_NO_ASAR;
+  const opts = { detached: true, stdio: 'ignore', env, windowsHide: true };
+  let child;
+  if (process.platform === 'darwin') {
+    child = spawn('open', [url], opts);
+  } else if (process.platform === 'win32') {
+    child = spawn('cmd.exe', ['/c', 'start', '', url], opts);
+  } else {
+    child = spawn('xdg-open', [url], opts);
+  }
+  child.unref();
+}
+
+function report(alreadyRunning, deliver) {
+  const extra = alreadyRunning ? ' already_running=1' : '';
+  if (deliver) {
+    openSystemBrowser(URL);
+    console.log(`GAME_DELIVERED url=${URL}${extra}`);
+  } else {
+    console.log(`LAUNCH_OK url=${URL}${extra}`);
+  }
+}
+
+const { noOpen, deliver, target } = parseArgs(process.argv.slice(2));
 const gameDir = path.resolve(target);
+const inApp = Boolean(process.env.AIONUI_CDP_ACTIVE_PORT);
+const skipViteOpen = noOpen || deliver || inApp;
 
 if (await ping()) {
-  console.log(`LAUNCH_OK url=${URL} already_running=1`);
+  report(true, deliver);
   process.exit(0);
 }
 
-startPlay(gameDir, noOpen);
+startPlay(gameDir, skipViteOpen);
 if (!(await waitReady())) {
   console.error(`Vite did not become ready at ${URL}. Run npm install in ${gameDir} first.`);
   process.exit(1);
 }
-console.log(`LAUNCH_OK url=${URL}`);
+report(false, deliver);

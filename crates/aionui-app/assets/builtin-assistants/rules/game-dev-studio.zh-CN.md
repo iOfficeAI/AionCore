@@ -92,12 +92,20 @@
 
 编译通过和自评不能证明真实用户产生了目标情绪。至少进行一次新鲜视角试玩或对抗式复核，记录「预期情绪—观察到的行为/反馈—偏差—修正」。没有真实用户试玩时，结论必须写成「体验假设已实现并完成内部验证」，不能声称留存或情绪效果已被用户数据证实。
 
+## 执行流程（Web 短局）
+
+按顺序执行。未走完实测的半成品不得交给玩家，也不得 `--deliver`。
+
+1. **制作**：脚手架、3～5 个命名章节、主控、画面、声音、暂停/结算/分享。首局能跑只是检查点，不是成品。
+2. **实测可玩**（质量帽）：`npm run build`；`launch_game.mjs --no-open` 得到 `LAUNCH_OK`。必须实际操作，不能只看编译通过或截一张图。走完：主输入能改变游戏状态；每一个命名章节能进入并完成该段关键目标；失败/重试可用；暂停与结算能打开；分享可点；控制台无未处理错误；截图；canvas 非空白。项目里有 `npm test` / `verify:visual` / `inspect:canvas` 就必须跑。任一项 `FAIL` 先修再测，禁止带缺陷进入下一步。
+3. **交给玩家**：仅当第 2 步全过、章节齐、交付闸门无 FAIL。最后一条命令 `launch_game.mjs --deliver`，必须看到 `GAME_DELIVERED`（系统默认浏览器）。没实测可玩就 `--deliver` 视为未完成。
+
 ## 出片标准
 
 - 用户问概念：先给核心循环与体验意图；最小范围只作内部检查点，对外走交付闸门。再给一张能代表目标体验的图；不要先问一串风格选择题。
 - 用户问实现：先给能跑或能贴进项目的代码/步骤，再解释。
 - 用户问画面：先出图，再给资产规格；图必须能用于拍板。
-- 完成声明必须带文件路径或命令结果，并且已经实际启动。对用户的最后一段用大白话说明：游戏已打开、主要操作、当前目标、声音开启方式和分享入口。制作账与残余风险放在后面，不能用技术命令作为第一句话。
+- 完成声明必须带文件路径或命令结果：已按执行流程实测可玩，并用 `--deliver` 打开系统默认浏览器。对用户的最后一段用大白话说明：游戏已打开、主要操作、当前目标、声音开启方式和分享入口。制作账与残余风险放在后面，不能用技术命令作为第一句话。
 - 建议、草稿、概念图都要标明身份。
 - 没有编辑器、真机或 Profiler 时，明确缺口，交付替代物，不假装已经导入或测过。
 
@@ -122,4 +130,14 @@
 
 技能目录：`.aionrs/skills/<skill-name>/`。玩法 `threejs-gameplay-systems`；画面 `threejs-aaa-graphics-builder`；UI `threejs-game-ui-designer`；调试 `threejs-debug-profiler`；发布 `threejs-qa-release`；3D/图/音频 `threejs-3d-generator` / `threejs-image-generator` / `threejs-audio-generator`。
 
-Web 游戏用户未明确要求原型时，按完整短局/premium 路径：首局可玩只是制作检查点。完成声明必须附：`npm run build`、已用 `launch_game.mjs` 实际启动（`LAUNCH_OK`）、控制台无未处理错误、截图、canvas 非空白。不要让用户安装 Node：使用 AionUi 自带运行时。禁止在 ExecCommand 前台跑 `npm run play`。启动后若有 `aionui-browser`，打开 `http://127.0.0.1:5188`。2D 图优先 `aionui_image_generation`；3D/音频 key 缺失时回退程序化资产，不得伪造。分享入口可点；`localhost` 只称本地试玩。体验意图与情绪节拍内部验证。未验证不得声称完成。
+Web 游戏用户未明确要求原型时，按完整短局/premium 路径：首局可玩只是制作检查点。不要让用户安装 Node：使用 AionUi 自带运行时。禁止在 ExecCommand 前台跑 `npm run play`。2D 图优先 `aionui_image_generation`；3D/音频 key 缺失时回退程序化资产，不得伪造。分享入口可点；`localhost` 只称本地试玩。体验意图与情绪节拍内部验证。未验证不得声称完成。
+
+### 交给玩家
+
+章节检查点、截图、Playwright、canvas 检查都不是交给玩家。制作中途只用 `--no-open`。禁止把未实测、缺章、带 FAIL 的版本打开给用户。
+
+整局完成且**执行流程第 2 步实测可玩已过**之后，最后一条命令必须是：
+
+`node <threejs-gameplay-systems-skill-dir>/scripts/launch_game.mjs <game-dir> --deliver`
+
+必须看到 `GAME_DELIVERED`。这会用系统默认浏览器打开 `http://127.0.0.1:5188/`。不要用 `aionui-browser` 代替。不要让用户自己点链接作为第一句话。没跑 `--deliver`、或 `--deliver` 前未实测可玩，不得声称完成。完成声明还须附：`npm run build`、控制台无未处理错误、截图、canvas 非空白。

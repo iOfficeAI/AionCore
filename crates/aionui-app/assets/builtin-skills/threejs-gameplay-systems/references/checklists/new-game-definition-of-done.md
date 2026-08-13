@@ -4,7 +4,7 @@ Prototype exception: apply only the install/build/first-input items plus a label
 
 - The project installs with `npm install`.
 - `npm run dev` starts a local Vite server.
-- `npm run play` is the package script; **launch with** `node <gameplay-skill>/scripts/launch_game.mjs <game-dir>` so Vite is detached. Do not foreground `npm run play` in ExecCommand.
+- `npm run play` is the package script; **launch with** `node <gameplay-skill>/scripts/launch_game.mjs <game-dir> --no-open` so Vite is detached. Do not foreground `npm run play` in ExecCommand.
 - `npm run build` completes.
 - The first screen is the game, not a landing page.
 - Within 5 seconds the player can tell who they are, where they are, and what to do next.
@@ -27,5 +27,5 @@ Prototype exception: apply only the install/build/first-input items plus a label
 - A screenshot proves the canvas rendered.
 - A canvas-pixel check proves the canvas is not blank.
 - A fresh-eyes or adversarial pass records expected emotion → observed behavior/feedback → delta → fix. Do not claim user-measured retention without a real player test.
-- The game was actually launched for the user. The user-facing close names how to open, controls, current goal, and share — not a command as the first sentence.
+- The complete short game was handed to the user with `launch_game.mjs --deliver` (`GAME_DELIVERED`), which opens the system default browser. Chapter checkpoints use `--no-open` only. The user-facing close says the game is open, then controls, current goal, and share — not a command as the first sentence.
 - Final report names design brief, emotion beat sheet, level/encounter plan, controls, verification evidence, share status, and remaining risks.
