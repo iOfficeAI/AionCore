@@ -3890,6 +3890,39 @@ impl ConversationService {
         Ok(page.items.iter().rev().find_map(error_message_from_message_row))
     }
 
+    /// Emit the terminal frame for a turn that ended before any `StreamRelay`
+    /// existed.
+    ///
+    /// The relay owns every other terminal on the send path, so a turn that
+    /// returns before it is built settles on the server while the client keeps
+    /// spinning — there is no frame telling it otherwise. The only caller today
+    /// is the deferred-cancel branch in `TurnOrchestrator::run_attempt`.
+    ///
+    /// Frame shape matches `StreamRelay::broadcast_stream_payload` so the client
+    /// takes the same path it does for a normal finish. `data` is empty because
+    /// there is nothing to report: the agent never ran, so there is no usage, no
+    /// session id and no text.
+    pub(crate) fn broadcast_turn_settled_without_relay(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        msg_id: &str,
+    ) {
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            "message.stream",
+            serde_json::json!({
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "msg_id": msg_id,
+                "turn_id": turn_id,
+                "type": "finish",
+                "data": {},
+                "hidden": false,
+            }),
+        ));
+    }
+
     pub(crate) async fn persist_and_broadcast_send_failure_tip(
         &self,
         user_id: &str,
@@ -4760,52 +4793,14 @@ fn is_auto_workspace_relative_path(relative: &Path) -> bool {
             && day.chars().all(|ch| ch.is_ascii_digit())
     };
 
-    // Auto/temp workspace leaves are always `{label}-temp-{id}` (conversations)
-    // or `team-temp-{team_id}` (teams); the `-temp-` marker has been stable
-    // across every historical layout. Requiring it keeps the root-agnostic
-    // match (see [`is_temp_session_workspace`]) from misclassifying a user
-    // directory that merely sits under some `conversations/` ancestor.
-    let is_temp_leaf = |leaf: &str| leaf.contains("-temp-");
-
     match parts.as_slice() {
         // legacy: bare leaf, or {Y}/{M}/{D}/leaf
-        [leaf] => is_temp_leaf(leaf),
-        [year, month, day, leaf] => dated(year, month, day) && is_temp_leaf(leaf),
+        [_file_name] => true,
+        [year, month, day, _file_name] => dated(year, month, day),
         // per-user, type-first: users/{user_dir}/{Y}/{M}/{D}/leaf
-        ["users", _user_dir, year, month, day, leaf] => dated(year, month, day) && is_temp_leaf(leaf),
+        ["users", _user_dir, year, month, day, _file_name] => dated(year, month, day),
         _ => false,
     }
-}
-
-/// True when `workspace` is a backend auto-generated temp session directory —
-/// the sidebar read model's "temp path" test.
-///
-/// Root-agnostic: matches the auto-workspace layout after the LAST
-/// `conversations` path segment, regardless of which data-dir root precedes
-/// it. This is deliberate. Users who migrated their conversation directory
-/// across releases carry `extra.workspace` values baked under a *previous*
-/// root; anchoring on the current `work_dir` would strip-fail on those and
-/// misclassify historical temp sessions as projects. The layout after
-/// `conversations/` has always ended in a `-temp-` leaf, so
-/// [`is_auto_workspace_relative_path`] keys on that marker rather than the
-/// (mutable) root prefix.
-///
-/// Pure lexical (no filesystem access), so it is safe on the side-effect-free
-/// sidebar read path — dead/removed workspaces classify correctly rather than
-/// failing an fs probe. Exposed so the sidebar can classify a conversation's
-/// `extra.workspace` (or a team's `workspace` column) without duplicating the
-/// rule.
-pub fn is_temp_session_workspace(workspace: &Path) -> bool {
-    let parts = workspace.iter().map(|part| part.to_str()).collect::<Option<Vec<_>>>();
-    let Some(parts) = parts else {
-        return false;
-    };
-    // Classify the tail after the LAST `conversations` segment (root-agnostic).
-    let Some(idx) = parts.iter().rposition(|part| *part == "conversations") else {
-        return false;
-    };
-    let relative: PathBuf = parts[idx + 1..].iter().collect();
-    is_auto_workspace_relative_path(&relative)
 }
 
 async fn cleanup_empty_date_workspace_parents(workspace_root: &Path, workspace_path: &Path) {

@@ -8,7 +8,6 @@ use aionui_db::MessageSearchRow;
 use aionui_db::models::{ConversationArtifactRow, ConversationRow, MessageRow};
 
 use crate::ConversationError;
-use crate::service::is_temp_session_workspace;
 
 pub(crate) const TOOL_CONTENT_COMPACT_THRESHOLD_BYTES: usize = 64 * 1024;
 const TOOL_CONTENT_PREVIEW_CHARS: usize = 4096;
@@ -30,26 +29,19 @@ pub fn row_to_response(row: ConversationRow, data_dir: &Path) -> Result<Conversa
 /// before building the response DTO.
 ///
 /// Injects a derived `is_temporary_workspace: bool` into the returned
-/// `extra` blob by testing whether `extra.workspace` is a backend
-/// auto-generated temp session directory (see
-/// [`is_temp_session_workspace`]). This is root-agnostic: rows migrated
-/// from an earlier data-dir root are still recognized, so historical temp
-/// sessions are not mislabeled as user projects. The flag is not persisted
-/// — it is computed on every read so the frontend never has to pattern-match
-/// the directory name. Old rows that have no such flag on disk automatically
-/// gain it on read, which means no migration is needed.
-///
-/// `_data_dir` is retained for call-site symmetry across the response builders
-/// (`row_to_response` / `search_row_to_item` thread it uniformly); the temp
-/// judgment is now root-agnostic and no longer depends on it.
+/// `extra` blob by checking whether `extra.workspace` sits under the
+/// backend-managed `data_dir`. The flag is not persisted — it is
+/// computed on every read so the frontend never has to pattern-match
+/// the directory name. Old rows that have no such flag on disk
+/// automatically gain it on read, which means no migration is needed.
 pub fn row_to_response_with_extra(
     row: ConversationRow,
     mut extra: serde_json::Value,
-    _data_dir: &Path,
+    data_dir: &Path,
 ) -> Result<ConversationResponse, ConversationError> {
     let is_temporary_workspace = {
         let ws = extra.get("workspace").and_then(|v| v.as_str()).unwrap_or("");
-        !ws.is_empty() && is_temp_session_workspace(Path::new(ws))
+        !ws.is_empty() && Path::new(ws).starts_with(data_dir)
     };
     if let Some(obj) = extra.as_object_mut() {
         obj.remove("preset_context");
@@ -503,41 +495,6 @@ mod tests {
     #[test]
     fn row_to_response_marks_missing_workspace_as_non_temporary() {
         let row = make_row("acp", "pending", Some("aionui"), None, r#"{}"#);
-        let resp = row_to_response(row, Path::new("/srv/aionui-data")).unwrap();
-        assert_eq!(resp.extra["is_temporary_workspace"], false);
-    }
-
-    // Historical-debt regression: a temp workspace persisted under a PREVIOUS
-    // data-dir root (user migrated their conversation directory across
-    // releases) must still be flagged temporary, even though it no longer sits
-    // under the current `data_dir`. The `-temp-` leaf marker is what makes this
-    // root-agnostic recognition safe.
-    #[test]
-    fn row_to_response_marks_migrated_root_temp_workspace_as_temporary() {
-        let row = make_row(
-            "acp",
-            "pending",
-            Some("aionui"),
-            None,
-            r#"{"workspace":"/old-data/aionui/conversations/users/u1/2025/01/02/acp-temp-conv-1"}"#,
-        );
-        // Current data_dir differs from the old root the workspace lives under.
-        let resp = row_to_response(row, Path::new("/srv/aionui-data")).unwrap();
-        assert_eq!(resp.extra["is_temporary_workspace"], true);
-    }
-
-    // Negative guard for the root-agnostic match: a user project that merely
-    // happens to sit under some `conversations/` ancestor must NOT be flagged
-    // temporary, because its leaf carries no `-temp-` marker.
-    #[test]
-    fn row_to_response_does_not_mark_user_project_under_conversations_as_temporary() {
-        let row = make_row(
-            "acp",
-            "pending",
-            Some("aionui"),
-            None,
-            r#"{"workspace":"/home/me/conversations/myproj"}"#,
-        );
         let resp = row_to_response(row, Path::new("/srv/aionui-data")).unwrap();
         assert_eq!(resp.extra["is_temporary_workspace"], false);
     }

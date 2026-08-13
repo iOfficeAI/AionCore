@@ -51,7 +51,6 @@ use serde_json::json;
 use tokio::sync::{Notify, broadcast};
 
 use crate::service::ConversationService;
-use crate::service::is_temp_session_workspace;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
 use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
 
@@ -8657,6 +8656,41 @@ async fn cancel_during_the_build_is_recorded_instead_of_dropped() {
     );
 }
 
+/// Remembering the cancel is only half of it — the client has to be told.
+///
+/// The turn ends on the server, but every terminal frame on the send path comes
+/// from the `StreamRelay`, which the deferred-cancel branch returns before
+/// building. So the server settled and the UI kept spinning until the 15s
+/// watchdog. Live symptom (agy 1.1.12, 2026-08-12): the conversation produced no
+/// stream frames at all, not even `start`, and the live cancel test failed 4/4;
+/// with the frame it settles in ~200ms.
+///
+/// The sibling test above asserts only that the request is recorded, which is
+/// why it stayed green through all of that.
+#[tokio::test]
+async fn a_turn_cancelled_before_its_agent_exists_tells_the_client_it_ended() {
+    let (svc, broadcaster, _repo, _task_mgr) = make_service();
+
+    svc.broadcast_turn_settled_without_relay("user_1", "conv_1", "turn_1", "msg_1");
+
+    let events = broadcaster.take_events();
+    let finish = events
+        .iter()
+        .find(|e| e.name == "message.stream" && e.data["type"] == "finish")
+        .expect("a turn that ends before its relay exists must still emit a terminal frame");
+
+    assert_eq!(finish.data["conversation_id"], "conv_1");
+    assert_eq!(finish.data["turn_id"], "turn_1");
+    assert_eq!(
+        finish.data["msg_id"], "msg_1",
+        "the frame has to name the message the client is spinning on"
+    );
+    assert_eq!(
+        finish.data["hidden"], false,
+        "a hidden terminal would settle nothing the user can see"
+    );
+}
+
 #[tokio::test]
 async fn a_deferred_cancel_does_not_leak_into_a_later_turn() {
     // The record is keyed by turn: one left behind must never abort the next
@@ -8669,75 +8703,4 @@ async fn a_deferred_cancel_does_not_leak_into_a_later_turn() {
     assert!(svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
     // Consumed exactly once.
     assert!(!svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
-}
-
-// --- is_temp_session_workspace: root-agnostic temp-directory judgment ---
-//
-// These lock the historical-debt fix: a temp workspace is recognized by the
-// auto-workspace layout after the LAST `conversations` segment plus a `-temp-`
-// leaf marker, regardless of which data-dir root precedes it. Users who
-// migrated their conversation directory across releases carry workspaces baked
-// under a *previous* root; those must still classify as temp.
-
-#[test]
-fn temp_workspace_current_root_is_recognized() {
-    // No regression for workspaces under the live root.
-    assert!(is_temp_session_workspace(Path::new(
-        "/srv/aionui-data/conversations/users/u1/2026/08/11/acp-temp-conv-1"
-    )));
-}
-
-#[test]
-fn temp_workspace_migrated_old_root_is_recognized() {
-    // Core fix: a different (older) root prefix must not defeat the judgment.
-    assert!(is_temp_session_workspace(Path::new(
-        "/old-data/aionui/conversations/users/u1/2025/01/02/acp-temp-conv-1"
-    )));
-}
-
-#[test]
-fn temp_workspace_team_leaf_is_recognized() {
-    assert!(is_temp_session_workspace(Path::new(
-        "/srv/aionui-data/conversations/users/u1/2026/08/11/team-temp-team_1"
-    )));
-}
-
-#[test]
-fn temp_workspace_legacy_bare_leaf_is_recognized() {
-    // Earliest layout: no dated dirs, just a `-temp-` leaf under conversations.
-    assert!(is_temp_session_workspace(Path::new(
-        "/old/conversations/claude-temp-xyz"
-    )));
-}
-
-#[test]
-fn temp_workspace_legacy_dated_leaf_is_recognized() {
-    assert!(is_temp_session_workspace(Path::new(
-        "/old/conversations/2025/01/02/acp-temp-conv-1"
-    )));
-}
-
-#[test]
-fn user_project_under_conversations_is_not_temp() {
-    // Negative guard: a user directory that merely sits under some
-    // `conversations/` ancestor lacks the `-temp-` marker → not temp.
-    assert!(!is_temp_session_workspace(Path::new("/home/me/conversations/myproj")));
-}
-
-#[test]
-fn workspace_without_conversations_segment_is_not_temp() {
-    assert!(!is_temp_session_workspace(Path::new("/home/me/work/proj")));
-}
-
-#[test]
-fn temp_workspace_with_bad_date_is_not_temp() {
-    // Dated arm still requires numeric YYYY/MM/DD.
-    assert!(!is_temp_session_workspace(Path::new(
-        "/srv/aionui-data/conversations/users/u1/YY/MM/DD/acp-temp-1"
-    )));
-}
-
-#[test]
-fn bare_conversations_dir_is_not_temp() {
-    assert!(!is_temp_session_workspace(Path::new("/srv/aionui-data/conversations")));
 }

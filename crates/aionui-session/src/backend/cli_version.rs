@@ -35,9 +35,9 @@ use crate::event::{LocalizedText, NoticeLevel};
 /// turn (its response stream disconnects with `httpStatusCode: null`, observed
 /// three times including a back-to-back control after three clean versions), so
 /// the verified release stops at 0.146.0 until upstream fixes it.
-pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.227";
+pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.228";
 pub const VERIFIED_CODEX_VERSION: &str = "0.146.0";
-pub const VERIFIED_AGY_VERSION: &str = "1.1.11";
+pub const VERIFIED_AGY_VERSION: &str = "1.1.12";
 
 /// The verified release for a direct-CLI backend, keyed by the program name the
 /// backend spawns. `None` for anything not version-gated here.
@@ -449,8 +449,8 @@ mod tests {
     fn the_verified_release_says_nothing() {
         // Literal on purpose: this is the exact string a user on the verified
         // release reports, so the test breaks if a bump forgets to re-verify.
-        assert_eq!(classify("2.1.227", VERIFIED_CLAUDE_VERSION), VersionVerdict::Verified);
-        assert!(drift_notice("claude", "2.1.227", VERIFIED_CLAUDE_VERSION).is_none());
+        assert_eq!(classify("2.1.228", VERIFIED_CLAUDE_VERSION), VersionVerdict::Verified);
+        assert!(drift_notice("claude", "2.1.228", VERIFIED_CLAUDE_VERSION).is_none());
     }
 
     #[test]

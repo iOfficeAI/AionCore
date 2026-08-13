@@ -230,6 +230,24 @@ impl ConversationTurnOrchestrator {
                 turn_id = %input.turn_id,
                 "Applying a cancel that arrived while the agent was still being built"
             );
+            // Tell the UI the turn is over. Every OTHER terminal on this path is
+            // emitted by the `StreamRelay`, which is built further down — so
+            // returning here without a frame settles the turn on the server and
+            // leaves the client's spinner running until the 15s watchdog.
+            //
+            // Live symptom (agy, 2026-08-12): the conversation produced NO
+            // stream frames at all, not even `start`, and
+            // `live_antigravity_cancel_settles_and_recovers` failed 4/4. agy is
+            // where it shows up because its build is the slowest — probing
+            // models, checking the CLI version, installing the permission hook
+            // and writing the MCP config — so a cancel lands inside it rather
+            // than after it. Nothing about the bug is agy-specific.
+            self.service.broadcast_turn_settled_without_relay(
+                &input.user_id,
+                &input.conv_id,
+                &input.turn_id,
+                &input.msg_id,
+            );
             return Err(ConversationTurnResult {
                 status: ConversationTurnStatus::Completed,
                 error_message: None,

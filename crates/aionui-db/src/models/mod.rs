@@ -16,7 +16,6 @@ mod skill;
 mod system_settings;
 mod team;
 mod user;
-mod user_order;
 
 pub use acp_session::AcpSessionRow;
 pub use agent_metadata::{
@@ -42,4 +41,3 @@ pub use skill::{SkillImportRecordRow, SkillRow};
 pub use system_settings::SystemSettings;
 pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};
 pub use user::{ExternalUserProjection, User, UserStatus, UserType};
-pub use user_order::{OrderItemType, OrderScene, UserOrderRow};
