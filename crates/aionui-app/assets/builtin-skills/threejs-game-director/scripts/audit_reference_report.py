@@ -27,6 +27,16 @@ DESIGN_REQUIRED = [
     "level/encounter plan",
 ]
 
+# aion: experience gate — keep as one block for vendor rebase
+AION_EXPERIENCE_REQUIRED = [
+    "experience intent",
+    "emotion beat",
+    "chapter ledger",
+    "share",
+]
+AION_PLAY_MARKERS = ["play", "launch"]
+AION_MUSIC_MARKERS = ["music", "audio state"]
+
 PHYSICS_MARKERS = [
     "physics engine",
     "timestep",
@@ -154,6 +164,14 @@ def normalize(text: str) -> str:
     text = text.replace("adversarial self-review", "fresh-eyes review")
     text = text.replace("measured visual evidence", "measured evidence")
     text = text.replace("inspector metrics", "measured evidence")
+    # aion: experience gate aliases
+    text = text.replace("体验意图", "experience intent")
+    text = text.replace("情绪节拍", "emotion beat")
+    text = text.replace("content ledger", "chapter ledger")
+    text = text.replace("章节", "chapter ledger")
+    text = text.replace("分享", "share")
+    text = text.replace("实际启动", "play")
+    text = text.replace("配乐", "music")
     return re.sub(r"\s+", " ", text)
 
 
@@ -167,6 +185,13 @@ def marker_pattern(marker: str) -> re.Pattern[str]:
 
 def missing_markers(text: str, markers: list[str]) -> list[str]:
     return [marker for marker in markers if not marker_pattern(marker).search(text)]
+
+
+# aion: experience gate
+def missing_any_group(text: str, markers: list[str], label: str) -> list[str]:
+    if any(marker_pattern(marker).search(text) for marker in markers):
+        return []
+    return [label]
 
 
 def has_external_output_evidence(text: str) -> bool:
@@ -223,6 +248,10 @@ def main() -> int:
     missing = missing_markers(text, BASE_REQUIRED)
     if not args.no_design:
         missing.extend(missing_markers(text, DESIGN_REQUIRED))
+        # aion: experience gate
+        missing.extend(missing_markers(text, AION_EXPERIENCE_REQUIRED))
+        missing.extend(missing_any_group(text, AION_PLAY_MARKERS, "play"))
+        missing.extend(missing_any_group(text, AION_MUSIC_MARKERS, "music"))
 
     if args.premium:
         missing.extend(missing_markers(text, PREMIUM_SCORECARD))

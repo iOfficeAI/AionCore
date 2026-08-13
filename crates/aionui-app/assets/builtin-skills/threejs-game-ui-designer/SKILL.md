@@ -20,7 +20,7 @@ Load `references/prompt-templates.md` only when the user asks for reusable promp
 Load `threejs-image-generator` when logos, icons, GUI art, faction marks, menu backgrounds, decals, or 2D HUD assets would improve quality. Use `threejs-3d-generator` only for 3D menu/showcase objects or diegetic 3D UI props, not normal flat HUD elements.
 
 1. Capture/inspect desktop and mobile screenshots.
-2. Inventory UI states: gameplay, pause, settings, fail/retry, win/milestone, loading, touch controls.
+2. Inventory UI states: gameplay, pause, share, settings, fail/retry, win/milestone, loading, touch controls.
 3. Define hierarchy: survival/status, objective, feedback, flavor.
 4. Replace utility stat cards with authored clusters, meters, badges, icons, alerts, and modal states.
 5. Use stable dimensions, safe-area padding, text-fit constraints, hover/pressed/focus/disabled states.

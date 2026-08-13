@@ -7,7 +7,7 @@ description: "Primary entrypoint for complete Three.js browser game creation and
 
 ## Purpose
 
-Own the end-to-end game outcome. Build the playable loop, route through the right phases, verify evidence, and do not call prototype-quality work premium. "Less basic" from the user means the current visual level is rejected: treat it as the premium bar.
+Own the end-to-end game outcome. Build the playable loop, route through the right phases, verify evidence, and do not call prototype-quality work complete. Broad "make a game" requests share one experience-intent contract across phases: player promise, emotion arc, content ledger, and audiovisual states. "Less basic" from the user means the current visual level is rejected: treat it as the premium bar.
 
 ## Runner Capability Check
 
@@ -15,7 +15,7 @@ Before planning, note what this runner can do and adapt:
 
 1. **Invoke sibling skills directly?** Usually not — the runner invokes only this skill. Load sibling `SKILL.md` files with file-read tools instead. Never claim a skill was "invoked" when it was only loaded/read.
 2. **Read files by path?** Resolve every skill and reference path through the path ladder below. If a required file cannot be read anywhere on the ladder, record the failure in the ledger and use `references/phase-playbook.md` as the fallback procedure for that phase.
-3. **Run shell commands (node + python3)?** If yes, use the packaged scripts (scaffold creator, credential probe, canvas inspector, report audit). If not, ask the user to run each command and paste the output; never fabricate script output.
+3. **Run shell commands (node)?** If yes, use the packaged Node scripts (scaffold creator, `launch_game.mjs`, canvas inspector, report audit). `python3` is optional fallback. Never run bare `python` (Windows Store stub). If node/npm are missing from the shell, say so; do not tell the user to install Node — AionUi provides a managed runtime on Windows, macOS, and Linux.
 4. **Drive a browser / run Playwright?** If yes, capture screenshots and canvas inspection yourself. If not, ask the user to run `npm run verify:visual` and `npm run inspect:canvas` and paste the results; report unverified visuals as a residual risk, never as verified.
 
 ### Skill Path Ladder
@@ -91,9 +91,12 @@ When a sibling skill file is loaded, follow its workflow for that phase. Phase e
 New projects use the gameplay skill's scaffold creator; canvas verification uses the generated game's `npm run inspect:canvas` or the QA skill's packaged inspector:
 
 ```bash
-python3 <threejs-gameplay-systems-skill-dir>/scripts/create_threejs_game.py ./my-game
-node <threejs-qa-release-skill-dir>/scripts/inspect-threejs-canvas.mjs --url http://127.0.0.1:5188
+node <threejs-gameplay-systems-skill-dir>/scripts/create_threejs_game.mjs ./my-game
+cd ./my-game && npm install
+node <threejs-gameplay-systems-skill-dir>/scripts/launch_game.mjs ./my-game
 ```
+
+Use `launch_game.mjs` (not foreground `npm run play`): Vite must be detached or ExecCommand times out and kills the server. Give `npm install` a long timeout. After `LAUNCH_OK`, if `aionui-browser` is available, open `http://127.0.0.1:5188`. Playwright is QA, not a playability gate.
 
 ## Premium Completion Rule
 
@@ -101,15 +104,18 @@ Premium, AAA, polished, complete, release-ready, and showcase requests require v
 
 ## Required Verification
 
-- Build/typecheck; local browser run; console/page error check.
-- Game design brief, core loop contract, and level/encounter plan for broad game creation or major gameplay changes.
+- Build/typecheck; launch with `launch_game.mjs` (not foreground `npm run play`) and confirm `LAUNCH_OK`; console/page error check.
+- Game design brief (including experience intent), core loop contract, emotion beat sheet, chapter ledger, and level/encounter plan for broad game creation or major gameplay changes.
 - Active desktop and mobile screenshots plus nonblank canvas pixel evidence.
-- Main input/objective/fail-or-restart path exercised.
+- Main input/objective/fail-or-restart path exercised through named chapters, not only the first minute.
+- Hero/player is not a capsule/cube/primitive-plus-glow in the final delivery.
+- Audio matrix with emotion-driven music states (or a documented blocker); not one unchanging loop unless the genre intent is a single restrained bed with contrast.
+- Share control on pause/settle; `localhost` reported as a local playtest URL only.
 - Visual scorecard with measured evidence for premium/AAA claims, plus a fresh-eyes review pass per `threejs-aaa-graphics-builder/references/visual-scorecard.md`.
 - External asset sourcing ledger, credential probe output, and real external outputs or blocker evidence for premium asset-category claims.
-- Audio evidence or a reported blocker for premium active-gameplay claims.
 - Renderer diagnostics when graphics changed; technical art budget and VFX/readability evidence when premium graphics changed.
 - Visual test harness decision, and bot playtest evidence when release-ready gameplay is claimed.
+- Fresh-eyes note: expected emotion → observed behavior/feedback → delta → fix. Do not claim user-measured retention without a real player test.
 - Final ledgers with evidence and remaining blockers.
 
 ## Report Audit
@@ -117,11 +123,15 @@ Premium, AAA, polished, complete, release-ready, and showcase requests require v
 When shell tools are available, draft the final evidence report to a markdown file and audit it before finalizing broad or premium work:
 
 ```bash
-python3 <director-skill-dir>/scripts/audit_reference_report.py --premium /path/to/final-report.md
+node <director-skill-dir>/scripts/audit_reference_report.mjs /path/to/final-report.md
 ```
 
-Use `--premium` for premium/AAA/showcase/high-fidelity/polished/complete/release-ready/"less basic" claims; add `--physics` for physics-heavy games; add `--audio` when generated or integrated audio is in scope; add `--no-design` only for debug/perf/QA-only reports with no gameplay claims. If the audit fails, fix the missing sections or state the exact blocker instead of claiming completion. If the script is unavailable, manually enforce the same sections listed in Required Verification.
+Prefer the `.mjs` auditor. `python3 .../audit_reference_report.py` is fallback only. Never run bare `python`.
+
+Default (no flag) already requires experience intent, emotion beat, chapter ledger, share, play/launch, and music/audio state. Use `--premium` for premium/AAA/showcase/high-fidelity/polished/complete/release-ready/"less basic" claims; add `--physics` for physics-heavy games; add `--audio` when generated or integrated audio is in scope; add `--no-design` only for debug/perf/QA-only reports with no gameplay claims. If the audit fails, fix the missing sections or state the exact blocker instead of claiming completion. If the script is unavailable, manually enforce the same sections listed in Required Verification.
 
 ## Final Response
 
-Report the ledgers (compacted per the rule above), game design brief, core loop contract, level/encounter plan, files changed, run URL, controls, verification commands, screenshots/artifacts, renderer/performance notes, technical art budget, visual test harness decision, quality gates passed, skipped phases, and remaining risks. For premium/AAA/showcase claims, include the filled visual scorecard with measured evidence and automatic failures remaining. Be precise: "invoked" means a slash/tool skill invocation; "loaded" means the file was read into context; "executed phase" means the work was performed under loaded skill guidance or the phase playbook.
+Lead with the user-facing close in plain language: the game is open (or how to open it), controls, current goal, how to enable audio, and where share lives. Do not start with an npm command. Do not name reference titles or claim a production grade.
+
+Then report the ledgers (compacted per the rule above), experience intent, game design brief, core loop contract, emotion beat sheet, level/encounter plan, files changed, run URL (label `localhost` as local playtest), controls, verification commands, screenshots/artifacts, renderer/performance notes, technical art budget, visual test harness decision, quality gates passed, skipped phases, share status, and remaining risks. For premium/AAA/showcase claims, include the filled visual scorecard with measured evidence and automatic failures remaining. Be precise: "invoked" means a slash/tool skill invocation; "loaded" means the file was read into context; "executed phase" means the work was performed under loaded skill guidance or the phase playbook.

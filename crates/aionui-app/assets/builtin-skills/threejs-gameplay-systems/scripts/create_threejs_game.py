@@ -70,7 +70,7 @@ def create_game(target: Path, force: bool) -> None:
     rewrite_json_name(target / "package-lock.json", project_name)
 
     print(f"Created Three.js game scaffold at {target.resolve()}")
-    print(f"Next: cd {target} && npm install && npm run dev")
+    print(f"Next: cd {target} && npm install && node <gameplay-skill>/scripts/launch_game.mjs .")
 
 
 def main(argv: list[str]) -> int:

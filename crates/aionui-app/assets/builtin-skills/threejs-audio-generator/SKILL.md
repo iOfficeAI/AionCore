@@ -19,12 +19,13 @@ Use this skill for:
 
 - SFX: jumps, hits, weapons, explosions, coins, pickups, collisions, UI clicks, confirms, errors.
 - Ambience: wind, rain, city bed, engine hum, portal loop, dungeon room tone, battle arena beds.
+- Music: looping beds and stingers that follow the emotion curve (explore/pressure/climax/settle as needed), not one unchanging track unless the brief documents a single restrained bed.
 - Voice: announcer barks, boss lines, tutorial prompts, menu narration, generated placeholder dialogue.
 - Voice conversion: convert a scratch performance into a target character voice while preserving timing and emotion.
 - Cleanup: isolate or denoise dialogue before voice conversion, TTS replacement, or transcription.
 - Three.js integration: Web Audio loading, looping, sprite/manifest mapping, volume groups, pause/resume, user gesture unlock.
 
-For premium/AAA/showcase game work, audio is not cosmetic. Generate or integrate at least a minimal interaction audio set for the main loop unless the user explicitly requests mute/offline-only output or credentials/API attempts are blocked.
+For complete, premium, AAA, or showcase game work, audio is not cosmetic. Generate or integrate interaction SFX plus the music states required by the emotion beat sheet unless the user explicitly requests mute/offline-only output or credentials/API attempts are blocked.
 
 ## API Key
 

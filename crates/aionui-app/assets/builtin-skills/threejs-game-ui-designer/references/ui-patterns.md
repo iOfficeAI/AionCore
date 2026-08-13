@@ -17,6 +17,7 @@ Inventory states before designing:
 
 - Gameplay HUD.
 - Pause/resume.
+- Share overlay on pause and settle/win: prefer `navigator.share`, fall back to clipboard copy of `location.href`; show success or a clear failure. `?shared=1` opens a share landing that still reaches play in one action. Report `localhost` as a local playtest URL; never claim a friend can open it unless a verified public URL exists.
 - Settings or audio/accessibility controls when useful.
 - Fail/retry.
 - Win/milestone/level complete when relevant.

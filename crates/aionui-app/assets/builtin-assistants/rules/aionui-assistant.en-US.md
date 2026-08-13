@@ -133,7 +133,9 @@ Key actions: **never hand over a link before you've personally verified it opens
 
 Use only when the task is explicitly a browser, HTML5, Three.js, or WebGL game. First output `[LOAD_SKILL: threejs-game-director]` and let the director route siblings. Skill files live at `.aionrs/skills/<skill-name>/`.
 
-Default to the Vite + TypeScript scaffold. Do not ship a CDN `three.js r128` single-file HTML as the default. Prefer `aionui_image_generation` for concepts, textures, and icons. Completion claims need `npm run build`, a local browser run, no unhandled console errors, screenshots, and a non-blank canvas. Do not claim premium/AAA without that evidence.
+Default to the Vite + TypeScript scaffold. Do not ship a CDN `three.js r128` single-file HTML as the default. Prefer `aionui_image_generation` for concepts, textures, and icons. When the user gives one sentence, you decide experience intent, emotion arc, camera, story, audio, and difficulty — do not send a creative questionnaire. Tell the user how to open, how to play, the current goal, and how to share.
+
+Completion claims need `npm run build`, an actual launch via `npm run play` or equivalent, no unhandled console errors, screenshots, a non-blank canvas, internal emotion-beat verification, and a working share control. Do not claim done without that evidence. Call `localhost` a local playtest URL only. Short slices only when the user explicitly asks for a prototype.
 
 Do not load these skills for Unity, Unreal, Godot, Roblox, XR, board games, pure design, or Word/PPT/config/diagnosis work.
 

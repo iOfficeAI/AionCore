@@ -2,6 +2,7 @@ mod managed;
 mod system;
 mod types;
 
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -81,6 +82,49 @@ pub async fn ensure_node_runtime_with_reporter(
 
 pub async fn ensure_runtime_command(command: &str) -> Result<ResolvedCommand, NodeRuntimeError> {
     ensure_runtime_command_with_reporter(command, None).await
+}
+
+/// Prepend `dir` to PATH in `runtime_env` (Windows `Path`/`PATH`, Unix `PATH`).
+///
+/// Used so agent shells can resolve `node`/`npm`/`npx` from the managed runtime
+/// on Windows, macOS, and Linux without a system Node install.
+pub fn prepend_dir_to_path_env(runtime_env: &mut Vec<(String, String)>, dir: &Path) {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let prefix = dir.to_string_lossy();
+    let existing = runtime_env
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    let merged = if existing.is_empty() {
+        prefix.into_owned()
+    } else {
+        format!("{prefix}{sep}{existing}")
+    };
+    runtime_env.retain(|(key, _)| !key.eq_ignore_ascii_case("PATH"));
+    runtime_env.push(("PATH".to_owned(), merged));
+}
+
+/// Ensure the managed Node runtime and put its bin directory first on PATH.
+///
+/// Does not copy isolated `npm_config_*` values, so the user's `.npmrc` (registry
+/// mirror, proxy) still applies to `npm install` in a game workspace.
+/// Failure is non-fatal: the agent keeps the process PATH.
+pub async fn inject_managed_node_path(runtime_env: &mut Vec<(String, String)>) {
+    match ensure_node_runtime().await {
+        Ok(runtime) => {
+            if let Some(bin_dir) = runtime.node_path.parent() {
+                prepend_dir_to_path_env(runtime_env, bin_dir);
+            }
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "managed Node unavailable for agent shell; node/npm stay on process PATH"
+            );
+        }
+    }
 }
 
 pub async fn ensure_runtime_command_with_reporter(
@@ -720,5 +764,45 @@ mod tests {
         );
 
         *managed_runtime_cache().lock().await = None;
+    }
+
+    #[test]
+    fn prepend_dir_to_path_env_puts_managed_bin_first() {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let mut env = vec![
+            ("AIONUI_USER_ID".to_owned(), "user-1".to_owned()),
+            ("PATH".to_owned(), format!("/usr/bin{sep}/bin")),
+        ];
+        prepend_dir_to_path_env(&mut env, Path::new("/managed/node/bin"));
+
+        let path = env
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.as_str())
+            .expect("PATH");
+        assert!(
+            path.starts_with(&format!("/managed/node/bin{sep}")),
+            "managed bin should be first: {path}"
+        );
+        assert!(
+            env.iter()
+                .any(|(key, value)| key == "AIONUI_USER_ID" && value == "user-1")
+        );
+        assert_eq!(
+            env.iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn prepend_dir_to_path_env_replaces_case_variant_path_key() {
+        let mut env = vec![("Path".to_owned(), "legacy-path".to_owned())];
+        prepend_dir_to_path_env(&mut env, Path::new("/managed/node/bin"));
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "PATH");
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        assert_eq!(env[0].1, format!("/managed/node/bin{sep}legacy-path"));
     }
 }

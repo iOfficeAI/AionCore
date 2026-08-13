@@ -33,25 +33,29 @@ Load `references/checklists/endless-runner-premium-quality.md` for endless runne
 
 Load `references/prompt-templates.md` only when the user asks for reusable prompts, starter prompts, or a task template.
 
-Load `threejs-audio-generator` when implementing real SFX, ambience, UI sounds, voice/TTS, or audio cleanup beyond simple placeholder hooks. Gameplay code should emit audio events; the audio skill should generate or process the actual assets and define the runtime audio matrix.
+Load `threejs-audio-generator` when implementing real SFX, ambience, music beds, UI sounds, voice/TTS, or audio cleanup beyond simple placeholder hooks. Gameplay code should emit audio events; the audio skill should generate or process the actual assets and define the runtime audio matrix.
 
 1. Inspect project structure, scripts, dependencies, current loop, input, camera, entities, state, UI, and diagnostics.
-2. Write the compact game design brief: player promise, target feeling, primary verb, objective, pressure, reward, fail/retry, skill expression, non-goals.
+2. Write the compact game design brief: player promise, experience intent (primary/supporting/anti-goal emotions), target feeling, primary verb, objective, pressure, reward, fail/retry, skill expression, non-goals.
 3. Define the core loop contract: verb, objective, pressure, reward/progression, fail/retry.
-4. Define the level/encounter plan before implementation: start, first decision, first threat, first reward, landmarks, escalation, recovery beats, readability, and tuning knobs.
+4. Define the emotion beat sheet and chapter ledger (3-5 named segments forming a completable short game unless the user asked for a prototype), then the level/encounter plan: start, first decision, first threat, first reward, landmarks, escalation, recovery beats, readability, and tuning knobs.
 5. Choose small architecture boundaries: `core`, `game`, `entities`, `systems`, `assets`, `ui`, `tests`.
 6. Implement mechanics in playable increments: input, state, entity, collision/physics, feedback, HUD/audio hook, diagnostics.
 7. Tune feel with `references/game-feel.md`: movement, acceleration, camera follow/FOV/shake, hitstop, impact feedback, cooldowns, difficulty, restart loop.
 8. Keep hot paths allocation-light and update order explicit.
-9. Verify with build, browser, screenshot, canvas pixels, console/page errors, and one real input path.
+9. Verify with build, `launch_game.mjs` (`LAUNCH_OK`), screenshot, canvas pixels, console/page errors, chapter critical path, and one real input path.
 
 ## Packaged Scaffold
 
 Use the bundled scaffold when starting a new project or when the user asks for a starter game:
 
 ```bash
-python3 <this-skill-dir>/scripts/create_threejs_game.py ./my-game
+node <this-skill-dir>/scripts/create_threejs_game.mjs ./my-game
+cd ./my-game && npm install
+node <this-skill-dir>/scripts/launch_game.mjs ./my-game
 ```
+
+Prefer the `.mjs` creator. Launch with `launch_game.mjs`; do not foreground `npm run play` in ExecCommand.
 
 The script copies `assets/threejs-vite-game/`, rewrites the project name in `package.json` and `package-lock.json`, and keeps generated games self-contained with their own visual test and canvas-inspection script. Use `--force` only when the target directory may be overwritten.
 
@@ -75,4 +79,4 @@ The script copies `assets/threejs-vite-game/`, rewrites the project name in `pac
 
 ## Final Response
 
-Report the reference ledger, game design brief, core loop contract, level/encounter plan, gameplay checklist outcome, behavior, controls, changed files, architecture choices, tuned values, verification evidence, artifacts, and remaining edge cases.
+Report the reference ledger, experience intent, game design brief, core loop contract, emotion beat sheet, level/encounter plan, gameplay checklist outcome, behavior, controls, changed files, architecture choices, tuned values, verification evidence, artifacts, and remaining edge cases. Lead any user-facing close with how to open, controls, current goal, and share.

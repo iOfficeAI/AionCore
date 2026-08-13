@@ -3,7 +3,7 @@
 - The first screen is the playable game or a deliberate modal state, not a landing page.
 - HUD hierarchy matches gameplay priority: survival/status, objective, feedback, secondary flavor.
 - UI visual language matches the game's genre, world materials, color, and motion.
-- Menus include expected states: pause, resume, restart, settings, win/lose when relevant.
+- Menus include expected states: pause, resume, restart, settings, win/lose when relevant, and share on pause/settle (Web Share with clipboard fallback, success/failure feedback, `?shared=1` entry).
 - Buttons and controls have stable dimensions plus hover, pressed, focus, and disabled states.
 - Icons are used for compact tool/actions when recognizable; ambiguous icons have labels or tooltips.
 - UI does not use nested cards, marketing-page layout, or generic dashboard styling.

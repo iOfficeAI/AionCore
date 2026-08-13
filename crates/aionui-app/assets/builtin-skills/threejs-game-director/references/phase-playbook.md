@@ -7,14 +7,15 @@ Path resolution for every file named here uses the Skill Path Ladder in `threejs
 ## Non-Negotiable Rules
 
 - Do not claim another skill was invoked unless the runner actually invoked it; "loaded" means its file was read into context.
-- Broad game builds start with a compact game design brief, core loop contract, and level/encounter plan before implementation.
+- Broad game builds start with a compact game design brief (including experience intent), core loop contract, emotion beat sheet, chapter ledger, and level/encounter plan before implementation.
 - Load each phase's required reference files at phase entry, not at final judgment. A phase cannot be `done` if its required references were skipped.
 - Record an external asset sourcing ledger before the graphics phase; run the credential probe before claiming any generator key is unavailable.
 - Premium graphics phases include a technical-art budget and readability pass, not only visual polish.
 - QA phases decide whether a visual test harness is warranted and report added/extended/skipped evidence.
-- A broad request is not complete at first playable slice when the user asked for premium, AAA, polished, showcase, complete, release-ready, or "less basic".
-- Prefer a small authored vertical slice over a larger placeholder scene. Treat primitive-dominant models, box skylines, flat arenas, generic stat-card HUDs, and glow/fog-only detail as prototype placeholders.
-- Verify through browser evidence before calling the game done.
+- A broad request is not complete at first playable slice unless the user explicitly asked for a prototype. First playable is an internal checkpoint.
+- Prefer a small authored vertical slice over a larger placeholder scene during greybox. Treat primitive-dominant models, box skylines, flat arenas, generic stat-card HUDs, and glow/fog-only detail as prototype placeholders in the final delivery.
+- Experience intent is the shared contract across gameplay, graphics, UI, audio, and QA. Emotion shifts must be playable events.
+- Verify through browser evidence and actually launch the page (`launch_game.mjs`, not foreground `npm run play`) before calling the game done.
 
 ## Ledger Templates
 
@@ -104,17 +105,19 @@ Prompt templates are packaged in `references/prompt-templates.md` under the dire
 
 - Inspect package scripts, dependencies, app structure, renderer setup, loop ownership, input, camera, UI, diagnostics, and existing screenshots.
 - Define the design brief: player promise, target feeling, primary verb, objective, pressure, reward/progression, fail/retry, skill expression, and non-goals.
+- Define the experience intent: primary emotion, supporting emotions, anti-goals, and how they bind to the primary verb.
+- Write an emotion beat sheet and a 3-5 segment chapter ledger for a completable short game unless the user asked for a prototype.
 - Define the core loop contract: player verb, objective, pressure, reward, fail state, restart.
 - Define the first level/encounter plan: spatial format, player start, first decision, first threat, first reward, landmarks, escalation, recovery beats, and readability.
 - Define target devices and performance budget. If absent, assume desktop plus mobile browser, WebGL/WebGL2 fallback, and capped DPR.
 - Identify the highest-risk surfaces: blank/broken canvas, no playable loop, weak controls, basic graphics, unreadable UI, or unverified release.
 
-Exit evidence: current scripts/dependencies known; game design brief, core loop contract, and level/encounter plan stated; phase ledger initialized.
+Exit evidence: current scripts/dependencies known; experience intent, emotion beat sheet, game design brief, core loop contract, and level/encounter plan stated; phase ledger initialized.
 
 For a new project, use the gameplay skill's packaged scaffold creator:
 
 ```bash
-python3 <threejs-gameplay-systems-skill-dir>/scripts/create_threejs_game.py ./my-game
+node <threejs-gameplay-systems-skill-dir>/scripts/create_threejs_game.mjs ./my-game
 ```
 
 ## Phase 2: Gameplay Systems
@@ -183,36 +186,41 @@ Exit evidence: root cause or measured bottleneck stated; baseline/post metrics w
 
 Use before calling broad work complete.
 
-- Run build/typecheck; start dev or preview server; check console/page/network errors.
+- Run build/typecheck; `npm install`; start with `launch_game.mjs` and confirm `LAUNCH_OK`. Never foreground `npm run play` in ExecCommand.
 - Capture active desktop and mobile screenshots; sample canvas pixels for nonblank and varied output using the generated game's `npm run inspect:canvas` or:
 
 ```bash
 node <threejs-qa-release-skill-dir>/scripts/inspect-threejs-canvas.mjs --url http://127.0.0.1:5188
 ```
 
-- Trigger main input, objective progression, fail/retry, and recent risky paths.
+- Trigger main input, objective progression, fail/retry, named chapter transitions, emotion-beat events, and recent risky paths.
 - Verify HUD text fit, safe areas, touch targets, resize, and mobile input.
+- Verify pause/settle share (Web Share or clipboard fallback) and `?shared=1` entry; label `localhost` as local playtest only.
 - Decide whether to add or extend a visual test harness (Playwright screenshot baselines with deterministic test hooks); report added/extended/skipped.
 - Run the bot playtest for release-ready gameplay claims; report time-to-first-fail, progression, and softlock evidence.
-- For premium/AAA claims, run the fresh-eyes scorecard review per `threejs-aaa-graphics-builder/references/visual-scorecard.md`.
+- For premium/AAA claims, run the fresh-eyes scorecard review per `threejs-aaa-graphics-builder/references/visual-scorecard.md`. For every broad complete game, record expected emotion → observed behavior/feedback → delta → fix.
 - For release, verify production preview, base path, static assets, debug gating, bundle/large assets, and deployment assumptions.
 
 Exit evidence: commands run with pass/fail; URL used; screenshot/artifact paths; inspector metrics JSON; visual test harness decision with states covered, thresholds, and flake risks; bot playtest results when run; issues fixed or listed with owners; residual risks.
 
 ## Completion Gate
 
-For premium/AAA/showcase claims, all of these must be true:
+For a broad complete game (not an explicit prototype), and for any premium/AAA/showcase claim, all of these must be true:
 
 - Skill-loading, reference, and external asset sourcing ledgers are present.
 - Credential probe output plus external output evidence or blocker evidence is present for premium asset-category claims.
-- Playable loop works through real input; game design brief, core loop contract, and level/encounter plan are reported for broad builds.
+- Playable loop works through real input; game design brief with experience intent, core loop contract, emotion beat sheet, chapter ledger, and level/encounter plan are reported for broad builds.
+- First-clear content is a named 3-5 segment ledger that the player can finish from opening to settle, or an explicit prototype exception is recorded.
+- Hero/player is not a capsule, cube, or primitive-plus-glow.
+- Audio states follow the emotion curve; unplanned silence or one loop for the whole session without documented contrast is a fail.
+- Share exists on pause/settle; `localhost` is not claimed as a friend-facing public URL.
 - Active-play screenshots exist for desktop and mobile.
-- Visual scorecard uses the authored rubric, cites measured evidence, has no category below 2, and averages at least 2.3.
-- A fresh-eyes review pass confirmed or corrected the scorecard (subagent review, or the adversarial self-review fallback).
+- Visual scorecard uses the authored rubric, cites measured evidence, has no category below 2, and averages at least 2.3 — required for premium/AAA/showcase claims; for other complete games, hero/world/lighting must still clear automatic failures in `visual-scorecard.md`.
+- A fresh-eyes review pass confirmed or corrected the scorecard (subagent review, or the adversarial self-review fallback) and recorded expected emotion versus observed feedback.
 - HUD/menu states are readable and responsive.
 - Renderer diagnostics and technical art budget target-vs-actuals exist after graphics changes.
 - Visual test harness decision is reported; bot playtest evidence exists for release-ready gameplay claims.
-- Build and browser QA passed or blockers are clearly reported.
+- Build and browser QA passed, the page was actually launched, or blockers are clearly reported.
 - Physics-heavy games include engine choice, timestep, collider strategy, sensors, CCD use, and body/collider diagnostics.
 
-If any gate fails, continue iterating or report the exact blocker instead of calling the game premium.
+If any gate fails, continue iterating or report the exact blocker instead of calling the game done.

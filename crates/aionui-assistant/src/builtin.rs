@@ -359,11 +359,29 @@ mod tests {
             text.contains("[LOAD_SKILL: threejs-game-director]"),
             "resident routing block must stay in the game-dev-studio rule"
         );
+        assert!(
+            text.contains("体验意图"),
+            "game-dev-studio must require an experience intent"
+        );
+        assert!(
+            text.contains("交付闸门"),
+            "game-dev-studio must keep a delivery gate"
+        );
+        assert!(
+            text.contains("分享"),
+            "game-dev-studio must require a share mode"
+        );
+        assert!(
+            text.contains("npm run play") || text.contains("实际启动"),
+            "game-dev-studio must require an actual launch"
+        );
         for (id, locale) in [
             ("aionui-assistant", "zh-CN"),
             ("aionui-assistant", "en-US"),
+            ("aionui-assistant", "ru-RU"),
             ("game-3d", "zh-CN"),
             ("game-3d", "en-US"),
+            ("game-3d", "ru-RU"),
         ] {
             let rule = reg.rule_bytes(id, locale).unwrap_or_else(|| panic!("{id} {locale} rule"));
             let text = std::str::from_utf8(&rule).expect("utf-8");
@@ -379,6 +397,20 @@ mod tests {
                 !text.contains("Do NOT ask the user any questions, generate complete code directly"),
                 "{id} {locale} must not force the old single-file Kirby template"
             );
+            let has_intent = text.contains("体验意图")
+                || text.contains("experience intent")
+                || text.contains("намерени");
+            let has_share = text.contains("分享")
+                || text.contains("share")
+                || text.contains("поделиться")
+                || text.contains("шаринг");
+            let has_launch = text.contains("npm run play")
+                || text.contains("实际启动")
+                || text.contains("actual launch")
+                || text.contains("фактическ");
+            assert!(has_intent, "{id} {locale} must name an experience intent");
+            assert!(has_share, "{id} {locale} must require share");
+            assert!(has_launch, "{id} {locale} must require an actual launch");
         }
         let image_skill = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),

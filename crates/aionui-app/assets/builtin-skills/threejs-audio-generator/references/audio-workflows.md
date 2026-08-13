@@ -14,12 +14,16 @@ Create an audio matrix before generating files:
 | Threat | enemy attack, warning, impact, boss cue | 4-12 | no | sfx |
 | Ambience | room tone, wind, engines, crowd, weather | 1-4 | yes | ambience |
 | Voice | announcer, boss, tutorial, combat barks | optional | no | voice |
+| Music | sting, base/explore, pressure, climax, settle — generate only the states the emotion curve needs | 2-5 | yes (beds) | music |
 
-For a first premium pass, generate at least:
+Sound narrative first: ambience defines space, interaction confirms cause, threat sets expectation, voice carries information, music controls emotional energy. High-frequency sounds need variants, cooldowns, and loudness ranks.
+
+For a first complete pass, generate at least:
 
 - 1 ambience loop.
 - 3 UI sounds.
 - 5 gameplay SFX tied to real events.
+- Music states required by the emotion beat sheet (not a fixed four-track kit for every genre). A cozy or puzzle game may need a restrained bed plus a sting; an action game may need pressure and climax beds. One unchanged loop for the whole session is a fail unless the brief documents that single bed and its contrast.
 - Optional voice only if the design benefits from dialogue or callouts.
 
 ## Prompting
@@ -42,10 +46,11 @@ Avoid prompts that are only mood words (`epic`, `AAA`, `cool`). Name the gamepla
 
 - Generate short SFX individually instead of one long mixed file.
 - Make loops deliberately with `--loop`; test them looping in the game.
-- Avoid music inside SFX prompts unless the user asked for music.
+- Keep music out of SFX prompts. Generate music beds as their own looping files (20-40s) with genre, function (sting / explore / pressure / climax / settle), and mix notes. Do not invent a new vendor API; use the existing generator or a procedural motif and report what was actually heard.
 - Keep UI sounds quieter and shorter than gameplay SFX.
 - Generate variants for high-frequency events to avoid repetition.
 - Normalize in the game through volume groups, not by editing every file manually during early iteration.
+- Switch music on emotion/gameplay state with stings, layers, or crossfades; prefer phrase or beat boundaries. Duck music briefly under important SFX. Planned quiet is valid; unplanned silence, missing contact SFX, or constant peak loudness are not.
 
 ## Voice Strategy
 
@@ -68,9 +73,10 @@ Use a small audio manager instead of ad hoc `new Audio()` calls once a game has 
 - Load sounds after user gesture unlock.
 - Maintain groups: `master`, `sfx`, `ui`, `ambience`, `voice`, `music`.
 - Expose mute and per-group volume.
-- Loop ambience through `AudioBufferSourceNode` or a library wrapper that handles loop restarts.
+- Loop ambience and music beds through `AudioBufferSourceNode` or a library wrapper that handles loop restarts.
+- Switch music beds on gameplay/emotion state with stings, layers, or crossfades; duck music under important SFX; prefer phrase boundaries.
 - Stop/dispose old sources when restarting scenes.
-- Do not trigger the same high-volume SFX every frame; add cooldowns or variant pools.
+- Do not trigger the same high-frequency SFX every frame; add cooldowns or variant pools.
 - Pause/resume audio with the game pause state and page visibility.
 
 Minimal Web Audio shape:

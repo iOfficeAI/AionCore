@@ -75,7 +75,8 @@ pub fn build_agent_factory(deps: AgentFactoryDeps) -> AgentFactory {
 
 async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, AgentError> {
     let context = options.context;
-    let ctx = FactoryContext::resolve(&context).await?;
+    let mut ctx = FactoryContext::resolve(&context).await?;
+    aionui_runtime::inject_managed_node_path(&mut ctx.runtime_env).await;
     let model = context.model.clone();
     match context.kind {
         AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx).await,

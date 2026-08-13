@@ -21,16 +21,16 @@ Load `references/playtest-bot.md` and `references/checklists/bot-playtest.md` fo
 
 1. Install dependencies if needed.
 2. Run build/typecheck.
-3. Start dev or preview server.
-4. Open browser target.
-5. Capture console/page/network errors.
-6. Verify nonblank canvas pixels.
-7. Capture desktop and mobile screenshots.
-8. Trigger main input, objective progression, fail/retry, and recent risky paths.
+3. `npm install`, then `node <threejs-gameplay-systems-skill-dir>/scripts/launch_game.mjs <game-dir>`. Do not foreground `npm run play`. If `aionui-browser` is available, open `http://127.0.0.1:5188`.
+4. Confirm the page actually opened; capture console/page/network errors.
+5. Verify nonblank canvas pixels.
+6. Capture desktop and mobile screenshots.
+7. Walk named chapter critical paths, emotion-beat events, fail/retry, recovery, climax, and settle.
+8. Check share on pause/settle and `?shared=1`; label `localhost` as local playtest only.
 9. Check HUD text fit, safe areas, touch targets, responsive layout.
 10. Decide whether to add or extend a visual test harness. For premium/release UI or generated-asset work, prefer a harness unless determinism is a real blocker.
 10b. Decide whether to run the bot playtest (`tests/bot-playtest.template.ts` in scaffold games). For release-ready gameplay claims, run it and report the metrics JSON.
-11. If audio changed, verify user-gesture unlock, SFX triggers, ambience loop start/stop, pause/restart cleanup, mute/volume behavior, and decode/load errors.
+11. If audio changed, verify user-gesture unlock, SFX triggers, music state switches, ambience loop start/stop, pause/restart cleanup, mute/volume behavior, and decode/load errors.
 12. Record artifacts and issues.
 
 ## Packaged Canvas Inspector
@@ -56,6 +56,6 @@ The inspector JSON includes a `metrics` block (color entropy, edge density, lumi
 
 ## Final Response
 
-Lead with pass/fail. Include the reference ledger, QA matrix/checklist result, commands, URL, controls, screenshots/artifacts, issues found/fixed, deployment notes, and risks.
+Lead with pass/fail, then a plain-language note on how to open, controls, current goal, and share. Include the reference ledger, QA matrix/checklist result, commands, URL (label `localhost` as local playtest), screenshots/artifacts, emotion-beat observations, issues found/fixed, deployment notes, and risks.
 When visual baselines are in scope, include the harness decision, states covered, update/compare commands, artifact paths, thresholds/masks, and flake risks.
 When the bot playtest ran, include its metrics JSON (frames, score progression, distance, softlock windows, seed) and the added/extended/skipped decision.

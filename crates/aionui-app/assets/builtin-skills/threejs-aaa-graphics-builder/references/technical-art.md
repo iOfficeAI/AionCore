@@ -97,6 +97,8 @@ Use event-driven VFX over permanent particle clutter:
 
 Pool effects and reuse geometries/materials. Permanent particle fields must stay cheap and sparse.
 
+Match intensity to the experience-intent beat, not a universal explosion kit. Stimulation can raise motion, exposure, camera, and particles; tension can withhold information and delay cadence; awe comes from scale, framing, and light/color. Same-frame contact stack (motion, hitstop, camera, VFX, SFX) for ranked events. If an effect hides the next decision, holds peak for too long, or blows the render budget, it is a defect.
+
 ## Instancing, LOD, And Culling
 
 Use instancing for many copies with the same geometry/material and different transforms: windows, bolts, lane markers, city lights, debris, foliage-like props, stars, crowd cards, track panels, repeated pickups, background modules.

@@ -21,7 +21,8 @@ pub use node_runtime::{
     NodeRuntimeProgressReporter, NodeRuntimeSupport, NodeTool, ResolvedCommand, ResolvedNodeRuntime,
     ResolvedNodeSource, RuntimeCommandProbe, SharedNodeRuntimeProgressReporter, doctor_snapshot,
     doctor_snapshot_for_test, ensure_node_runtime, ensure_node_runtime_with_reporter, ensure_runtime_command,
-    ensure_runtime_command_with_reporter, probe_node_runtime_supported, probe_runtime_command,
+    ensure_runtime_command_with_reporter, inject_managed_node_path, prepend_dir_to_path_env,
+    probe_node_runtime_supported, probe_runtime_command,
 };
 pub use registry_npx_lock::{RegistryNpxLockError, pin_registry_npx_args, should_skip_registry_npx_version_probe};
 pub use resolver::{resolve_command_in, resolve_command_path};

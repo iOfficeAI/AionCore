@@ -12,6 +12,12 @@ Game feel is state communication, not decoration. Apply effects in this order of
 
 Readability rule: feedback must clarify game state, never obscure the next decision. If shake, flash, or hitstop hides the thing the player must react to next, it is a bug, not polish. Scale every effect so the strongest events (death, explosion) are unmistakable and the weakest (pickup) stay subtle.
 
+## Feedback Intensity And Emotion Fit
+
+Use a four-beat VFX language on player verbs, threats, rewards, and narrative turns: telegraph → action → contact → aftertaste. Stack feel layers on the same frame as the contact: motion curve, hitstop, camera impulse, VFX, SFX. Assign intensity by event rank (light / medium / peak). Genre decides which ranks exist: stimulation may raise motion, exposure, camera, and particles; tension may use withheld information, delayed cadence, and restrained environment motion; awe comes from scale reveal, framing, and light/color shift. Holding peak intensity, covering the next decision, or blowing the frame budget is a defect, not polish.
+
+Anti-overload: if every pickup uses the explosion stack, nothing reads as a climax. Quiet and low-dynamic beats are valid when they have purpose and contrast.
+
 All code below is copy-pasteable, strict-TS clean, dependency-free, and matches the scaffold (`update(delta, elapsed)`, class systems, `createSeededRandom`).
 
 ## Tween / Easing Helper

@@ -133,7 +133,9 @@ Provider 列表包含每个 `api_key` 的明文。**永远不要**把 Provider �
 
 仅当任务明确是浏览器、HTML5、Three.js 或 WebGL 游戏时启用。第一步输出 `[LOAD_SKILL: threejs-game-director]`，由 director 路由 sibling。技能目录：`.aionrs/skills/<skill-name>/`。
 
-默认 Vite + TypeScript 脚手架，不要用 CDN `three.js r128` 单文件 HTML 当默认交付。概念图/贴图/图标优先调用 `aionui_image_generation`。完成声明必须附 `npm run build`、本地浏览器可玩、控制台无未处理错误、截图、canvas 非空白。未验证不得声称 premium/AAA。
+默认 Vite + TypeScript 脚手架，不要用 CDN `three.js r128` 单文件 HTML 当默认交付。概念图/贴图/图标优先调用 `aionui_image_generation`。用户只给一句话时由你拍板：体验意图、情绪曲线、镜头、叙事、声音和难度，不要发创意选择题。对用户只说怎么打开、如何操作、当前目标和如何分享。
+
+完成声明必须附 `npm run build`、已用 `npm run play` 或等价方式实际启动、控制台无未处理错误、截图、canvas 非空白、内部情绪节拍验证、可点的分享入口。未验证不得声称完成。`localhost` 只称本地试玩地址。只有用户明确要求原型时才允许短切片。
 
 Unity、Unreal、Godot、Roblox、XR、桌游、纯设计，以及 Word/PPT/配置/诊断任务，禁止加载这套技能。
 

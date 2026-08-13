@@ -13,6 +13,9 @@ Use before claiming a game feels good, is juicy, is polished, or is premium. Pai
 - FOV punch calls updateProjectionMatrix() and decays back to base.
 - Impact flash stores the material's base emissive value and tweens back to it.
 - Feedback never obscures the next player decision (shake/flash/hitstop stay readable).
+- Intensity matches event rank and the emotion beat; peak is not held as the default.
+- Telegraph → action → contact → aftertaste is present on ranked player verbs, threats, rewards, and narrative turns.
+- Visual and audio contact fire on the same frame for ranked events.
 - Gamepad rumble is feature-detected and matched in strength to the event.
 - Repeated audio samples use pitch/volume variance so they never sound identical.
 - All gameplay and effect randomness routes through createSeededRandom, never Math.random.

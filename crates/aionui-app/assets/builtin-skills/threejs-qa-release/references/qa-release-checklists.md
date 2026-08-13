@@ -8,20 +8,22 @@ Minimum meaningful QA:
 
 - Dependencies installed or known.
 - Build/typecheck passes.
-- Dev or preview server opened at the correct URL.
+- Dev, play, or preview server opened at the correct URL. Prefer `npm run play` so the browser opens; label `localhost` as a local playtest URL.
 - Console/page/network errors captured.
 - Canvas nonblank and visually varied through pixel sampling.
 - Desktop active-play screenshot.
 - Mobile active-play screenshot when mobile is in scope.
 - Main input path changes game state.
+- Named chapter critical paths and emotion-beat events fire.
 - Objective/progress path works.
 - Fail/retry or pause/resume path works when relevant.
+- Share on pause/settle works (Web Share or clipboard fallback); `?shared=1` still reaches play.
 - Recent or risky code paths triggered.
 - Physics-heavy games: engine choice, fixed timestep, body/collider count, collision/trigger path, high-speed tunneling check, and restart body cleanup verified.
 - HUD text fit, overlap, safe areas, and touch targets checked when UI changed.
 - Renderer diagnostics captured when graphics complexity changed.
 - Imported/generated asset paths, file sizes, and runtime load behavior checked when external assets changed.
-- Audio unlock, decode/load, loop cleanup, mute/volume, and main SFX triggers checked when audio changed.
+- Audio unlock, decode/load, loop cleanup, mute/volume, music state switches, and main SFX triggers checked when audio changed.
 - Visual test harness decision recorded when work is premium, release-ready, UI-heavy, generated-asset-heavy, or likely to regress visually.
 
 ## Interaction QA
@@ -34,9 +36,10 @@ Test what a player actually does:
 - Avoid or hit a hazard.
 - Trigger a state change: combo, wave, checkpoint, damage, shield, fail, win.
 - Pause and resume.
+- Share from pause or settle (Web Share or clipboard fallback).
 - Restart after fail.
 - For physics games, verify bodies reset cleanly after restart and no stale bodies keep simulating.
-- For audio, verify user-gesture unlock, main SFX triggers, ambience loop start/stop, pause/resume, restart cleanup, and mute/volume controls.
+- For audio, verify user-gesture unlock, main SFX triggers, music state switches, ambience loop start/stop, pause/resume, restart cleanup, and mute/volume controls.
 - Resize or rotate when responsive/mobile is in scope.
 
 Do not rely only on screenshots for gameplay changes.
