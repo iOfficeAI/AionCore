@@ -3112,6 +3112,19 @@ impl SessionBackend for ClaudeSessionBackend {
         // supply one (the snapshot's current_model is None in that case; the reader
         // fills discovered_model from the system/init frame). Read-only sync lock.
         let mut caps = self.capabilities.clone();
+        // A mode switch raised WHILE A TURN IS RUNNING does not reach the CLI now:
+        // `write_or_queue_control` parks it in `pending_controls` and `dispatch(Send)`
+        // drains it before the next prompt. Idle, the same write goes straight out and
+        // takes effect at once (verified: samples/claude-cli/2.1.227/set_permission_mode/
+        // — the ack and `system/status{permissionMode}` both land within a millisecond,
+        // and the switch governs the very next tool approval in that same turn).
+        //
+        // So the honest answer depends on right now, and only this live handle knows it.
+        caps.mode_switch_effect = if self.turn_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::capability::ModeSwitchEffect::NextTurn
+        } else {
+            crate::capability::ModeSwitchEffect::Immediate
+        };
         if caps.current_model.is_none()
             && let Some(model) = self.discovered_model.lock().unwrap_or_else(|e| e.into_inner()).clone()
         {

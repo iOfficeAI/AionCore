@@ -888,6 +888,20 @@ impl SessionBackend for AntigravitySessionBackend {
             current_model: self.config.model.clone(),
             current_mode: self.config.mode.clone(),
             slash_commands: self.slash_commands.clone(),
+            // agy runs one process per turn and `--mode` is a spawn flag, so a turn
+            // already running keeps the mode it was spawned with; the switch reaches agy
+            // only when the next turn spawns.
+            //
+            // Reported as NextTurn even though the host-side gate does move at once (the
+            // hook bridge re-reads `is_full_auto` per tool call). That is the safe
+            // direction to be imprecise in: claiming "in force" while the tightening has
+            // not reached agy would be the dangerous lie, whereas under-promising a
+            // loosening costs the user nothing.
+            mode_switch_effect: if self.in_flight.load(Ordering::SeqCst) {
+                crate::capability::ModeSwitchEffect::NextTurn
+            } else {
+                crate::capability::ModeSwitchEffect::Immediate
+            },
             ..antigravity_capabilities()
         }
     }

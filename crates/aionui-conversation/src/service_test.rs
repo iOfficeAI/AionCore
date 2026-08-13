@@ -4423,6 +4423,86 @@ async fn command_ack_does_not_persist_assistant_preference_in_core_service() {
     assert!(refreshed.extra.get("current_model_id").is_none());
 }
 
+/// A deferred switch is still the user's choice and must be remembered.
+///
+/// `PendingNextTurn` says "the agent applies this from the next turn", not "the request
+/// was refused" -- unlike `CommandAck`, which says nothing landed either way. Gating the
+/// preference write-back on `Observed` alone would silently strip preference memory from
+/// every codex conversation, since codex reports a mode switch as next-turn
+/// unconditionally (its schema documents `permissions` as being "for subsequent turns").
+#[tokio::test]
+async fn pending_next_turn_still_persists_the_users_choice() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, preference_repo) =
+        make_service_with_mock_task_manager_and_assistant_support(task_mgr.clone()).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_acp_auto",
+        "assistant-acp-auto",
+        "codex",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_acp_auto",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-auto").await;
+    let agent = Arc::new(
+        MockAgent::new(&conv.id).with_set_config_option_response(SetConfigOptionResponse {
+            confirmation: ConfigOptionConfirmation::PendingNextTurn,
+            config_options: Some(vec![AcpConfigOptionDto {
+                id: "mode".to_owned(),
+                name: None,
+                label: None,
+                description: None,
+                category: Some("mode".to_owned()),
+                option_type: "select".to_owned(),
+                // Deliberately still the OLD mode: a deferred switch reports what is in
+                // force, not what was requested.
+                current_value: Some("default".to_owned()),
+                options: vec![],
+            }]),
+        }),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+
+    let result = svc
+        .set_config_option(
+            "user_1",
+            &conv.id,
+            "mode",
+            SetConfigOptionRequest {
+                value: "plan".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.confirmation, ConfigOptionConfirmation::PendingNextTurn);
+
+    let pref = preference_repo
+        .get_for_user("user_1", "asstdef_acp_auto")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pref.last_permission_value.as_deref(),
+        Some("plan"),
+        "a deferred switch is still the user's settled choice and must be remembered"
+    );
+    let snapshot = repo.get_assistant_snapshot("user_1", &conv.id).await.unwrap().unwrap();
+    assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("plan"));
+}
+
 #[tokio::test]
 async fn set_config_option_persists_runtime_model_into_assistant_preference_when_observed() {
     let task_mgr = Arc::new(MockTaskManager::new());

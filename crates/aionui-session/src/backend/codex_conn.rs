@@ -552,6 +552,13 @@ fn build_codex_mcp_servers(servers: &[crate::backend::McpServerSpec]) -> Value {
 pub fn codex_capabilities() -> Capabilities {
     Capabilities {
         tier: CapabilityTier::Hook,
+        // Unconditional, per codex's own schema: `thread/settings/update` documents
+        // `approvalPolicy`/`sandboxPolicy`/`permissions` as "for subsequent turns"
+        // (samples/codex-cli/0.146.0/schema/v2/ThreadSettingsUpdateParams.json, identical
+        // in 0.147.0). Only `turn/start` can carry a policy for the turn it opens, and
+        // aionCore sends `turn/start` with `{threadId, input}` alone. Not a defect — this
+        // is codex's contract; the UI just has to say so.
+        mode_switch_effect: crate::capability::ModeSwitchEffect::NextTurn,
         emits: SignalSet {
             heartbeat: true,
             tool_lifecycle: true,

@@ -10,6 +10,21 @@
 /// discovery (handshake-filled open sets)" — these fields are the DISCOVERY
 /// half: which Commands a backend accepts, which input blocks, which models/
 /// modes it advertises, which auth methods (§0.5 panel).
+/// When an accepted mode switch starts governing tool approvals. See
+/// [`Capabilities::mode_switch_effect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModeSwitchEffect {
+    /// In force for the very next approval decision, even mid-turn.
+    ///
+    /// The default: a backend that reconfigures synchronously (aionrs mutates the shared
+    /// approval mode in-process) or writes straight to a live agent needs no ceremony,
+    /// and this keeps existing backends reporting what they already reported.
+    #[default]
+    Immediate,
+    /// The in-flight turn keeps the old mode; the switch governs from the next turn.
+    NextTurn,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Capabilities {
     /// Parse tier: Parsed (full-field, e.g. claude) / Hook (lifecycle hooks
@@ -72,6 +87,19 @@ pub struct Capabilities {
     /// it — a dead button (MX-QUEUE-3). `can_queue` MUST read this bit, never
     /// `caps.steer`. Default false; only claude sets it true.
     pub accepts_proactive_input: bool,
+    /// When a mode switch this backend ACCEPTS starts governing tool approvals.
+    ///
+    /// Reported per call rather than statically, because the same backend answers
+    /// differently depending on what it is doing: claude writes a `set_permission_mode`
+    /// straight to stdin while idle, but QUEUES one raised mid-turn until the next
+    /// prompt. codex is `NextTurn` unconditionally — its schema says so
+    /// ("Override the approval policy for subsequent turns",
+    /// samples/codex-cli/0.146.0/schema/v2/ThreadSettingsUpdateParams.json).
+    ///
+    /// Consumed by `set_config_option` to decide between `Observed` and
+    /// `PendingNextTurn`; without it the response was self-fulfilling (cache the request
+    /// as an override, read it straight back, report success).
+    pub mode_switch_effect: ModeSwitchEffect,
     /// NEW (#101): user-invokable slash commands the backend advertises (claude
     /// `control_request{initialize}` response `commands[]`; ACP `session/update`
     /// `available_commands_update`; incl. MCP/plugin/skill-derived). Open set,

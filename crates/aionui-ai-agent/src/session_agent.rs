@@ -951,6 +951,14 @@ impl SessionAgentTask {
             .dispatch(cmd)
             .await
             .map_err(|e| AgentError::bad_request(e.to_string()))?;
+        // Where does this switch actually land? Asked of the LIVE backend rather than
+        // assumed, because the answer moves: claude queues a control frame raised
+        // mid-turn but writes an idle one straight out, so the same backend answers
+        // differently second to second. Read right after dispatch, the closest we can get
+        // to the instant the backend decided (the alternative, threading the verdict back
+        // through `CommandReceipt`, would touch ~58 construction sites for one bit).
+        let deferred = option_id == "mode"
+            && self.backend.capabilities().mode_switch_effect == aionui_session::ModeSwitchEffect::NextTurn;
         // Cache the requested value as an optimistic override for mode/model, then
         // re-read the config-options snapshot so the response satisfies the frontend's
         // `hasObservedValue` contract (confirmation == Observed AND the option's
@@ -965,7 +973,17 @@ impl SessionAgentTask {
         // observed re-read — the frontend's `hasObservedValue` requires Observed AND the
         // option's current_value == requested, same as mode/model.
         match option_id {
-            "mode" => self.runtime.set_mode_override(value.to_string()),
+            // Adopt the value as the picker highlight ONLY when it is really in force.
+            // Writing the override for a deferred switch is exactly what made the old
+            // response self-fulfilling — it read straight back and reported Observed
+            // while the agent still enforced the previous mode. Left unwritten, the
+            // snapshot keeps reporting the mode actually governing tool approvals, and
+            // the event pump adopts the new one when the agent confirms it.
+            "mode" => {
+                if !deferred {
+                    self.runtime.set_mode_override(value.to_string());
+                }
+            }
             "model" => self.runtime.set_model_override(value.to_string()),
             "effort" | "reasoning_effort" | "thought_level" => {
                 // Optimistic highlight: claude emits no effort echo, so the streaming
@@ -1004,7 +1022,12 @@ impl SessionAgentTask {
             .and_then(|o| o.current_value.as_deref())
             == Some(value);
         Ok(aionui_api_types::SetConfigOptionResponse {
-            confirmation: if observed {
+            // `deferred` first: a deferred switch deliberately leaves `current_value` on
+            // the old mode, so `observed` is false for the honest reason and must not be
+            // downgraded to the ambiguous `CommandAck`.
+            confirmation: if deferred {
+                aionui_api_types::ConfigOptionConfirmation::PendingNextTurn
+            } else if observed {
                 aionui_api_types::ConfigOptionConfirmation::Observed
             } else {
                 aionui_api_types::ConfigOptionConfirmation::CommandAck
@@ -8624,6 +8647,72 @@ mod pump_tests {
             mode_opt.current_value.as_deref(),
             Some("plan"),
             "current_value reflects the switch"
+        );
+    }
+
+    /// A backend that applies a mode switch only from the NEXT turn, e.g. codex
+    /// ("Override the approval policy for subsequent turns" —
+    /// samples/codex-cli/0.146.0/schema/v2/ThreadSettingsUpdateParams.json), or claude
+    /// while a turn is in flight (the control frame is queued and drained before the
+    /// next prompt).
+    pub(super) struct NextTurnEffectBackend;
+
+    #[async_trait::async_trait]
+    impl SessionBackend for NextTurnEffectBackend {
+        async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::NoTurn,
+                turn_gen: 0,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                mode_switch_effect: aionui_session::ModeSwitchEffect::NextTurn,
+                ..StaticCapsBackend.capabilities()
+            }
+        }
+    }
+
+    /// When the backend cannot apply the switch until the next turn, the response must
+    /// SAY so instead of reporting `Observed`.
+    ///
+    /// `Observed` here was self-fulfilling: the task cached the requested value as an
+    /// optimistic override and then read it straight back, so the frontend was told the
+    /// switch had landed while the agent was still enforcing the old mode — the whole
+    /// point of this change. The reported `current_value` must likewise stay on the mode
+    /// actually in force, because that is what the picker shows as "the permission you
+    /// have right now".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_next_turn_backend_reports_pending_not_observed() {
+        let backend: Arc<dyn SessionBackend> = Arc::new(NextTurnEffectBackend);
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let resp = task.set_config_option("mode", "plan").await.unwrap();
+        assert!(
+            matches!(
+                resp.confirmation,
+                aionui_api_types::ConfigOptionConfirmation::PendingNextTurn
+            ),
+            "a next-turn backend must report PendingNextTurn, got {:?}",
+            resp.confirmation
+        );
+        let opts = resp.config_options.expect("config_options present");
+        let mode_opt = opts.iter().find(|o| o.id == "mode").expect("mode option");
+        assert_eq!(
+            mode_opt.current_value.as_deref(),
+            Some("default"),
+            "current_value must stay on the mode still in force, not jump to the request"
         );
     }
 

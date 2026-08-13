@@ -95,7 +95,17 @@ pub struct AcpConfigOptionDto {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigOptionConfirmation {
+    /// The agent applied it: the next tool-approval decision already uses the new value.
     Observed,
+    /// Accepted, but the agent applies it only from the NEXT turn — the in-flight turn
+    /// keeps the old value. The frontend must show the option as pending rather than
+    /// switched, and must NOT treat this as a failure.
+    ///
+    /// Exists because reporting `Observed` here was self-fulfilling: the task caches the
+    /// requested value as an optimistic override and reads it straight back, so the user
+    /// was told a switch had landed while the agent still enforced the old mode.
+    PendingNextTurn,
+    /// The command was accepted but no confirmation could be established either way.
     CommandAck,
 }
 

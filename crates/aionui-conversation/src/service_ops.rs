@@ -76,12 +76,19 @@ impl ConversationService {
 
         // Mirror runtime model/mode/thought-level switches into the persisted assistant
         // snapshot + preference so the next conversation seeded from this
-        // assistant in `auto` mode reflects the latest pick. We only act on
-        // observed confirmations — `command_ack` means the agent merely
-        // accepted the request, not that the value is in effect. Persistence
-        // failures are logged but do not roll back the
-        // user-facing config switch.
-        if response.confirmation == ConfigOptionConfirmation::Observed {
+        // assistant in `auto` mode reflects the latest pick.
+        //
+        // `PendingNextTurn` counts: it means the agent WILL apply the value from the next
+        // turn, so it is the user's settled choice, merely not in force yet. codex reports
+        // every mode switch that way (its schema documents `permissions` as "for
+        // subsequent turns"), so excluding it would strip preference memory from every
+        // codex conversation. `CommandAck` still does NOT count — it means nothing could
+        // be established either way. Persistence failures are logged but do not roll back
+        // the user-facing config switch.
+        if matches!(
+            response.confirmation,
+            ConfigOptionConfirmation::Observed | ConfigOptionConfirmation::PendingNextTurn
+        ) {
             let category = response
                 .config_options
                 .as_ref()
