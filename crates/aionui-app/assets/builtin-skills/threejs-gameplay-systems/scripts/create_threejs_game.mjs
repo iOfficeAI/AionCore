@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { withCartridgeSession } from './studio_session_lib.mjs';
 
 const EXCLUDE_DIRS = new Set([
   'node_modules',
@@ -65,7 +66,7 @@ function rewriteJsonName(filePath, name) {
   fs.writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`);
 }
 
-function createGame(target, force) {
+function createGame(target, force, cartridge) {
   const source = scaffoldDir();
   if (!fs.existsSync(source) || !fs.statSync(source).isDirectory()) {
     throw new Error(`Scaffold not found: ${source}`);
@@ -78,13 +79,25 @@ function createGame(target, force) {
   fs.mkdirSync(target, { recursive: true });
   copyTree(source, target);
   applyAionOverlay(target);
+  writeCartridgeSession(target, cartridge);
 
   const projectName = normalizedProjectName(target);
   rewriteJsonName(path.join(target, 'package.json'), projectName);
   rewriteJsonName(path.join(target, 'package-lock.json'), projectName);
 
   console.log(`Created Three.js game scaffold at ${path.resolve(target)}`);
+  console.log(`Cartridge: ${cartridge}`);
   console.log(`Next: cd ${path.resolve(target)} && npm install && node <gameplay-skill>/scripts/launch_game.mjs .`);
+}
+
+function writeCartridgeSession(target, cartridge) {
+  const kitPath = path.join(target, 'public', 'look', 'look.json');
+  const current = fs.existsSync(kitPath)
+    ? JSON.parse(fs.readFileSync(kitPath, 'utf8'))
+    : {};
+  const session = withCartridgeSession(current, cartridge);
+  fs.mkdirSync(path.dirname(kitPath), { recursive: true });
+  fs.writeFileSync(kitPath, `${JSON.stringify(session, null, 2)}\n`);
 }
 
 function applyAionOverlay(target) {
@@ -95,27 +108,39 @@ function applyAionOverlay(target) {
 
 function parseArgs(argv) {
   let force = false;
+  let cartridge = 'collect';
   const rest = [];
-  for (const arg of argv) {
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
     if (arg === '--force') {
       force = true;
     } else if (arg === '--help' || arg === '-h') {
       console.log('Create a Vite + TypeScript + Three.js browser game scaffold.\n');
-      console.log('Usage: node create_threejs_game.mjs <target> [--force]');
+      console.log('Usage: node create_threejs_game.mjs <target> [--force] [--cartridge collect|jump]');
       process.exit(0);
+    } else if (arg === '--cartridge') {
+      cartridge = argv[i + 1] || '';
+      i += 1;
+    } else if (arg.startsWith('--cartridge=')) {
+      cartridge = arg.slice('--cartridge='.length);
+    } else if (arg.startsWith('-')) {
+      throw new Error('Usage: node create_threejs_game.mjs <target> [--force] [--cartridge collect|jump]');
     } else {
       rest.push(arg);
     }
   }
   if (rest.length !== 1) {
-    throw new Error('Usage: node create_threejs_game.mjs <target> [--force]');
+    throw new Error('Usage: node create_threejs_game.mjs <target> [--force] [--cartridge collect|jump]');
   }
-  return { target: rest[0], force };
+  if (cartridge !== 'collect' && cartridge !== 'jump') {
+    throw new Error('cartridge must be collect or jump');
+  }
+  return { target: rest[0], force, cartridge };
 }
 
 try {
-  const { target, force } = parseArgs(process.argv.slice(2));
-  createGame(target, force);
+  const { target, force, cartridge } = parseArgs(process.argv.slice(2));
+  createGame(target, force, cartridge);
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);

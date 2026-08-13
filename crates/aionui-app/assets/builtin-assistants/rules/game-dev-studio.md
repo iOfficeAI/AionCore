@@ -98,14 +98,14 @@
 
 1. **制作**：脚手架、3～5 个命名章节、主控、画面、声音、暂停/结算/分享。首局能跑只是检查点，不是成品。
 2. **实测可玩**（质量帽）：`npm run build`；`launch_game.mjs --no-open` 得到 `LAUNCH_OK`。必须实际操作，不能只看编译通过或截一张图。走完：主输入能改变游戏状态；每一个命名章节能进入并完成该段关键目标；失败/重试可用；暂停与结算能打开；分享可点；控制台无未处理错误；截图；canvas 非空白。项目里有 `npm test` / `verify:visual` / `inspect:canvas` 就必须跑。任一项 `FAIL` 先修再测，禁止带缺陷进入下一步。
-3. **交给玩家**：仅当第 2 步全过、章节齐、交付闸门无 FAIL。最后一条命令 `launch_game.mjs --deliver`，必须看到 `GAME_DELIVERED`（系统默认浏览器）。`--deliver` 会审计游戏源码和 `look.json` 模型文件（三角锥/胶囊/二十面体或缺失 GLB/FBX 会 `ART_FAIL`，不会打开浏览器）。没实测可玩就 `--deliver` 视为未完成。制作阶段用 `threejs_3d_asset.mjs cast` 写入角色/道具模型；第一人称可以没有 player 模型，但可见角色必须有 enemy 模型。
+3. **交给玩家**：仅当第 2 步全过、交付闸门无 FAIL。最后一条命令 `launch_game.mjs --deliver`，必须看到 `GAME_DELIVERED dist=`。游意把 `dist` 挂进预览窗口。不要起 Vite、不要占 5188、不要开系统浏览器。`--deliver` 会审计游戏源码和 `look.json` 模型文件（三角锥/胶囊/二十面体或缺失 GLB/FBX 会 `ART_FAIL`）。没实测可玩就 `--deliver` 视为未完成。制作阶段：`create_threejs_game.mjs --cartridge collect|jump`，然后只填 look / cast / kit / `look.json` 章节字段。禁止重写 overlay 的 `Game.ts`、`Player.ts`、`Pickup.ts`、`LookSystem.ts`、`WorldKit.ts`。跳跃/平台用 `--cartridge jump`，其余用 collect。
 
 ## 出片标准
 
 - 用户问概念：先给核心循环与体验意图；最小范围只作内部检查点，对外走交付闸门。再给一张能代表目标体验的图；不要先问一串风格选择题。
 - 用户问实现：先给能跑或能贴进项目的代码/步骤，再解释。
 - 用户问画面：先出图，再给资产规格；图必须能用于拍板。
-- 完成声明必须带文件路径或命令结果：已按执行流程实测可玩，并用 `--deliver` 打开系统默认浏览器。对用户的最后一段用大白话说明：游戏已打开、主要操作、当前目标、声音开启方式和分享入口。制作账与残余风险放在后面，不能用技术命令作为第一句话。
+- 完成声明必须带文件路径或命令结果：已按执行流程实测可玩，并用 `--deliver` 得到 `GAME_DELIVERED dist=`（游戏在游意预览窗口打开）。对用户的最后一段用大白话说明：游戏已打开、主要操作、当前目标、声音开启方式和分享入口。制作账与残余风险放在后面，不能用技术命令作为第一句话。
 - 建议、草稿、概念图都要标明身份。
 - 没有编辑器、真机或 Profiler 时，明确缺口，交付替代物，不假装已经导入或测过。
 
@@ -140,4 +140,4 @@ Web 游戏用户未明确要求原型时，按完整短局/premium 路径：首�
 
 `node <threejs-gameplay-systems-skill-dir>/scripts/launch_game.mjs <game-dir> --deliver`
 
-必须看到 `GAME_DELIVERED`。这会用系统默认浏览器打开 `http://127.0.0.1:5188/`。不要用 `aionui-browser` 代替。不要让用户自己点链接作为第一句话。没跑 `--deliver`、或 `--deliver` 前未实测可玩，不得声称完成。完成声明还须附：`npm run build`、控制台无未处理错误、截图、canvas 非空白。
+必须看到 `GAME_DELIVERED dist=`。游意会在预览窗口打开游戏。不要起 Vite 端口，不要开系统浏览器，不要让用户自己点链接作为第一句话。没跑 `--deliver`、或 `--deliver` 前未实测可玩，不得声称完成。完成声明还须附：`npm run build`、控制台无未处理错误、截图、canvas 非空白。

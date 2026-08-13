@@ -1,10 +1,108 @@
 /** Pure helpers for first-game chapters, look paths, and share copy. No network. */
 
+export const ARENA = { halfWidth: 11, halfDepth: 7 };
+
+function mulberry32(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+export function normalizeCartridge(value) {
+  const text = String(value || '').toLowerCase();
+  if (
+    text.includes('jump') ||
+    text.includes('platform') ||
+    text.includes('parkour') ||
+    text.includes('跳跃') ||
+    text.includes('攀爬') ||
+    text.includes('平台')
+  ) {
+    return 'jump';
+  }
+  return 'collect';
+}
+
+export function clampDensity(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 8;
+  return Math.max(3, Math.min(16, Math.round(n)));
+}
+
+export function scaleChapters(chapters, density) {
+  const n = clampDensity(density);
+  const list = Array.isArray(chapters) ? chapters : [];
+  if (!list.length) return list;
+  return list.map((chapter, index) => ({
+    ...chapter,
+    until: Math.max(1, Math.round((n * (index + 1)) / list.length)),
+  }));
+}
+
+export function pickupLayout(session = {}) {
+  const n = clampDensity(session.density ?? session.target ?? 8);
+  const rng = mulberry32(Number(session.seed) || 1);
+  const maxX = ARENA.halfWidth - 1.5;
+  const maxZ = ARENA.halfDepth - 1.2;
+  const points = [];
+  for (let i = 0; i < n; i += 1) {
+    const angle = (i / n) * Math.PI * 2 + rng() * 0.35;
+    const radius = 3.2 + rng() * 5.2;
+    points.push({
+      x: Math.max(-maxX, Math.min(maxX, Math.cos(angle) * radius)),
+      z: Math.max(-maxZ, Math.min(maxZ, Math.sin(angle) * radius)),
+    });
+  }
+  return points;
+}
+
+export function platformLayout(session = {}) {
+  const seed = Number(session.seed) || 1;
+  const rng = mulberry32(seed + 17);
+  return [
+    { x: 0, y: 0, z: 0, w: 7, d: 5, h: 0.55 },
+    { x: -7.2, y: 1.15, z: 2.4, w: 4.2, d: 3.2, h: 0.55 },
+    { x: 7.4, y: 1.35, z: -1.6, w: 4.4, d: 3.4, h: 0.55 },
+    { x: -1.2, y: 2.4, z: -5.1, w: 4.8, d: 3.1, h: 0.55 },
+    { x: 3.6, y: 3.5, z: 4.2, w: 3.8 + rng() * 0.4, d: 3.2, h: 0.55 },
+  ];
+}
+
+export function withCartridgeSession(session, cartridge) {
+  const next = normalizeCartridge(cartridge);
+  const density = clampDensity(session?.density);
+  const base = {
+    ...session,
+    cartridge: next,
+    density,
+    seed: Number(session?.seed) || 1,
+    threat: Boolean(session?.threat),
+    chapters: scaleChapters(session?.chapters || [], density),
+  };
+  if (next === 'jump') {
+    return {
+      ...base,
+      title: session?.title && session.title !== 'Short crossing' ? session.title : 'Short climb',
+      objective:
+        session?.objective && session.objective !== 'Collect the marks'
+          ? session.objective
+          : 'Jump the ledges, collect the marks',
+    };
+  }
+  return base;
+}
+
 export function defaultSession() {
-  return {
-    title: 'Short crossing',
-    objective: 'Collect the marks',
-    chapters: [
+  return withCartridgeSession(
+    {
+      title: 'Short crossing',
+      objective: 'Collect the marks',
+      chapters: [
       {
         id: 'explore',
         name: 'Approach',
@@ -38,8 +136,10 @@ export function defaultSession() {
       ground: 'look/ground.jpg',
       icon: 'look/icon.png',
     },
-    models: {},
-  };
+      models: {},
+    },
+    'collect',
+  );
 }
 
 export function chapterFromScore(session, score, complete) {

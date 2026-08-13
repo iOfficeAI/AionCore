@@ -50,12 +50,12 @@ Load `threejs-audio-generator` when implementing real SFX, ambience, music beds,
 Use the bundled scaffold when starting a new project or when the user asks for a starter game:
 
 ```bash
-node <this-skill-dir>/scripts/create_threejs_game.mjs ./my-game
+node <this-skill-dir>/scripts/create_threejs_game.mjs ./my-game --cartridge collect
 cd ./my-game && npm install
 node <this-skill-dir>/scripts/launch_game.mjs ./my-game --no-open
 ```
 
-Prefer the `.mjs` creator. Launch with `launch_game.mjs`; do not foreground `npm run play` in ExecCommand. Use `--no-open` during making; `--deliver` only as the last step of a complete short game.
+Prefer the `.mjs` creator. Launch with `launch_game.mjs`; do not foreground `npm run play` in ExecCommand. Use `--no-open` during making; `--deliver` only as the last step (`GAME_DELIVERED dist=`). Pass `--cartridge jump` for a platformer. Do not rewrite overlay `Game.ts` to invent a new loop; fill `look.json` and generated assets.
 
 The script copies `assets/threejs-vite-game/`, then applies `assets/aion-overlay/` (stylized player, chapter session, pause/share, look loader, audio mixer). Rewrite the project name in `package.json` and `package-lock.json`. After image generation, run `scripts/apply_look.mjs` so sky/ground/icon land in `public/look/`, not `assets/concepts/`. Use `--force` only when the target directory may be overwritten.
 

@@ -6,7 +6,12 @@ import {
   lookPaths,
   mergeCastModels,
   modelLookPaths,
+  normalizeCartridge,
+  pickupLayout,
+  platformLayout,
+  scaleChapters,
   sharePayload,
+  withCartridgeSession,
 } from './studio_session_lib.mjs';
 
 test('default session has three named chapters that cover the full score', () => {
@@ -73,6 +78,50 @@ test('mergeCastModels writes player/enemy/pickup slots into look.json shape', ()
   assert.equal(session.models.player.walk, 'look/player-walk.fbx');
   assert.equal(session.models.pickup.file, 'look/pickup.glb');
   assert.equal(session.models.enemy, undefined);
+});
+
+test('default session is the collect cartridge with density-driven chapters', () => {
+  const session = defaultSession();
+  assert.equal(session.cartridge, 'collect');
+  assert.equal(session.density, 8);
+  assert.equal(session.threat, false);
+  assert.equal(session.seed, 1);
+});
+
+test('jump and unknown prompts map onto the two frozen cartridges', () => {
+  assert.equal(normalizeCartridge('jump'), 'jump');
+  assert.equal(normalizeCartridge('platformer'), 'jump');
+  assert.equal(normalizeCartridge('collect'), 'collect');
+  assert.equal(normalizeCartridge('mystery'), 'collect');
+});
+
+test('density rescales chapter until values so the last chapter is the pickup count', () => {
+  const chapters = scaleChapters(defaultSession().chapters, 6);
+  assert.equal(chapters[0].until, 2);
+  assert.equal(chapters[1].until, 4);
+  assert.equal(chapters[2].until, 6);
+});
+
+test('pickup layout is deterministic for a seed and stays inside the arena', () => {
+  const a = pickupLayout({ density: 8, seed: 3 });
+  const b = pickupLayout({ density: 8, seed: 3 });
+  const c = pickupLayout({ density: 8, seed: 9 });
+  assert.equal(a.length, 8);
+  assert.deepEqual(a, b);
+  assert.notDeepEqual(a, c);
+  for (const point of a) {
+    assert.ok(Math.abs(point.x) <= 9.6);
+    assert.ok(Math.abs(point.z) <= 6);
+  }
+});
+
+test('jump cartridge session gets platforms and does not rewrite collect defaults', () => {
+  const jump = withCartridgeSession(defaultSession(), 'jump');
+  assert.equal(jump.cartridge, 'jump');
+  assert.equal(jump.title, 'Short climb');
+  const platforms = platformLayout(jump);
+  assert.ok(platforms.length >= 4);
+  assert.equal(pickupLayout(jump).length, jump.density);
 });
 
 test('share payload marks localhost as a local playtest', () => {

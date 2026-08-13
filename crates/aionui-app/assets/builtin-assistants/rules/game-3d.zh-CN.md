@@ -11,9 +11,9 @@
 3. 按阶段加载：玩法 `threejs-gameplay-systems`；画面 `threejs-aaa-graphics-builder`；UI `threejs-game-ui-designer`；调试 `threejs-debug-profiler`；发布 `threejs-qa-release`；3D/图/音频 `threejs-3d-generator` / `threejs-image-generator` / `threejs-audio-generator`。
 4. 默认走 Vite + TypeScript 脚手架（gameplay skill 的 `create_threejs_game.mjs`）。**禁止**把 CDN `three.js r128` 单文件 HTML 当作默认交付。
 5. 仅当用户明确要求「单个 HTML / 不要 npm / 不要构建」时，才允许单文件原型，并在报告里标明这是降级，不是 premium。
-6. 完成声明必须附：`npm run build`（单文件降级则改为本地打开 HTML）、章节自检用 `launch_game.mjs --no-open`、整局最后一条命令 `launch_game.mjs --deliver`（`GAME_DELIVERED`，打开系统默认浏览器；`--deliver` 会审计源码与 `look.json` 模型，三角锥过不了；不要在 ExecCommand 前台跑 `npm run play`、不要用 `aionui-browser` 代替）、控制台无未处理错误、截图、canvas 非空白、体验意图与情绪节拍已内部验证、分享入口可点。未跑 `--deliver` 不得声称完成。对用户的最后一段用大白话说明游戏已打开、操作、当前目标和分享入口，不能用技术命令作为第一句话。用户未明确要求原型时，按完整短局/premium 走：首局可玩只是检查点，须加载画面/3D/QA sibling，主控不得是胶囊或方块；用 `cast` 写入角色/道具模型，第一人称可见角色仍需 enemy 模型。
+6. 完成声明必须附：`npm run build`、章节自检用 `launch_game.mjs --no-open`、整局最后一条命令 `launch_game.mjs --deliver`（`GAME_DELIVERED dist=`，游意预览窗口打开；`--deliver` 会审计源码与 `look.json` 模型，三角锥过不了；不要在 ExecCommand 前台跑 `npm run play`）、控制台无未处理错误、截图、canvas 非空白。未跑 `--deliver` 不得声称完成。对用户的最后一段用大白话说明游戏已打开、操作、当前目标和分享入口。用户未明确要求原型时：`create_threejs_game.mjs --cartridge collect|jump`，只填 look / cast / kit / `look.json`，禁止重写 overlay `Game.ts`；主控不得是胶囊或方块。
 
-用户没指定玩法时，默认做一个可跳、可收集、有失败重开的 3D 平台游戏，做成 3～5 个章节、能通关的短局，并按题材适配的情绪曲线做完，仍走 director，不要套固定关卡或固定函数名模板。只有用户明确要求原型时才允许短切片。
+用户没指定玩法时，默认 `--cartridge jump`（可跳、可收集、掉下去重开）。不要重写 `Game.ts` 发明第三套循环。只有用户明确要求原型时才允许短切片。
 
 ## 图片、3D 与音频
 

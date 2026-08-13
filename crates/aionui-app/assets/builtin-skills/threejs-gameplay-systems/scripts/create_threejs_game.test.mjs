@@ -47,4 +47,21 @@ test('new games get the overlay mixer, not the vendor oscillator-only file', () 
 
   const look = JSON.parse(fs.readFileSync(path.join(dir, 'public', 'look', 'look.json'), 'utf8'));
   assert.equal(look.chapters.length, 3);
+  assert.equal(look.cartridge, 'collect');
+  assert.match(game, /createWorldKit|WorldKit/);
+  assert.match(game, /cartridge === 'jump'|cartridge !== 'jump'/);
+  assert.equal(fs.existsSync(path.join(dir, 'src', 'systems', 'WorldKit.ts')), true);
+  assert.equal(fs.existsSync(path.join(dir, 'src', 'core', 'InputController.ts')), true);
+});
+
+test('jump cartridge writes look.json without replacing overlay Game.ts', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aion-create-jump-'));
+  const result = spawnSync(process.execPath, [script, dir, '--force', '--cartridge', 'jump'], {
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const look = JSON.parse(fs.readFileSync(path.join(dir, 'public', 'look', 'look.json'), 'utf8'));
+  assert.equal(look.cartridge, 'jump');
+  const game = fs.readFileSync(path.join(dir, 'src', 'game', 'Game.ts'), 'utf8');
+  assert.match(game, /createWorldKit/);
 });

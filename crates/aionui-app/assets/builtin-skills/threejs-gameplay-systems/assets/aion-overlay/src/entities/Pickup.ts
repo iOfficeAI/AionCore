@@ -19,6 +19,7 @@ export class Pickup {
     color: '#f6f1df',
   });
   private cast: CastVisual | null = null;
+  private collecting = false;
 
   constructor(
     readonly index: number,
@@ -45,6 +46,11 @@ export class Pickup {
   }
 
   update(delta: number, elapsed: number): void {
+    if (this.collecting) {
+      this.group.scale.multiplyScalar(Math.max(0.01, 1 - delta * 8));
+      if (this.group.scale.x < 0.08) this.group.visible = false;
+      return;
+    }
     if (!this.active) return;
     this.group.rotation.y += delta * 1.8;
     this.group.position.y = 0.78 + Math.sin(elapsed * 2.6 + this.index) * 0.16;
@@ -53,12 +59,14 @@ export class Pickup {
 
   collect(): void {
     this.active = false;
-    this.group.visible = false;
+    this.collecting = true;
   }
 
   reset(): void {
     this.active = true;
+    this.collecting = false;
     this.group.visible = true;
+    this.group.scale.set(1, 1, 1);
   }
 
   dispose(): void {

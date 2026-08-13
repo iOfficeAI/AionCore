@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { defaultSession, type Chapter, type Session } from '../studio/session';
+import { defaultSession, withCartridgeSession, type Chapter, type Session } from '../studio/session';
 
 export class LookSystem {
   private skyLoaded = false;
@@ -8,14 +8,17 @@ export class LookSystem {
     try {
       const response = await fetch(url);
       if (!response.ok) return defaultSession();
-      const data = (await response.json()) as Session;
-      return {
-        ...defaultSession(),
-        ...data,
-        chapters: data.chapters?.length ? data.chapters : defaultSession().chapters,
-        look: { ...defaultSession().look, ...data.look },
-        models: { ...defaultSession().models, ...data.models },
-      };
+      const data = (await response.json()) as Partial<Session>;
+      return withCartridgeSession(
+        {
+          ...defaultSession(),
+          ...data,
+          chapters: data.chapters?.length ? data.chapters : defaultSession().chapters,
+          look: { ...defaultSession().look, ...data.look },
+          models: { ...defaultSession().models, ...data.models },
+        },
+        data.cartridge || 'collect',
+      );
     } catch {
       return defaultSession();
     }
@@ -51,7 +54,11 @@ export class LookSystem {
   applyChapter(scene: THREE.Scene, floor: THREE.Mesh, sun: THREE.DirectionalLight, chapter: Chapter): void {
     if (chapter.fog) {
       const fogColor = new THREE.Color(chapter.fog);
-      if (scene.fog instanceof THREE.Fog) scene.fog.color.copy(fogColor);
+      if (scene.fog instanceof THREE.Fog) {
+        scene.fog.color.copy(fogColor);
+        if (chapter.fogNear) scene.fog.near = chapter.fogNear;
+        if (chapter.fogFar) scene.fog.far = chapter.fogFar;
+      }
       if (!this.skyLoaded) scene.background = fogColor;
     }
     if (chapter.sun) sun.color.set(chapter.sun);

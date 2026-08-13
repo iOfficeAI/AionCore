@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { InputController } from '../core/InputController';
 import { Loop } from '../core/Loop';
 import { createRenderer, resizeRenderer } from '../core/Renderer';
+import { Hazard } from '../systems/Hazard';
 import { Pickup } from '../entities/Pickup';
 import { Player, type ArenaBounds } from '../entities/Player';
 import { AudioSystem } from '../systems/AudioSystem';
@@ -11,12 +12,20 @@ import { DebugTools, type DebugTuning } from '../systems/DebugTools';
 import { Hud } from '../systems/Hud';
 import { LookSystem } from '../systems/LookSystem';
 import { PauseShare } from '../systems/PauseShare';
-import { chapterFromScore, defaultSession, type Chapter, type Session } from '../studio/session';
+import { createWorldKit, supportY, type WorldKit } from '../systems/WorldKit';
+import {
+  ARENA as SESSION_ARENA,
+  chapterFromScore,
+  defaultSession,
+  pickupLayout,
+  type Chapter,
+  type Session,
+} from '../studio/session';
 import { createSeededRandom } from '../utils/random';
 
 const ARENA: ArenaBounds = {
-  halfWidth: 11,
-  halfDepth: 7,
+  halfWidth: SESSION_ARENA.halfWidth,
+  halfDepth: SESSION_ARENA.halfDepth,
 };
 
 export class Game {
@@ -36,13 +45,15 @@ export class Game {
     () => this.render(),
   );
 
-  private readonly tuning: DebugTuning = {
+  private readonly tuning: DebugTuning & { gravity: number; jumpSpeed: number } = {
     speed: 5.8,
     dashMultiplier: 1.75,
     acceleration: 13,
     cameraLag: 0.16,
     exposure: 1.05,
     maxDpr: 2,
+    gravity: 22,
+    jumpSpeed: 8.2,
   };
 
   private readonly debugTools: DebugTools;
@@ -51,10 +62,14 @@ export class Game {
   private chapter: Chapter = this.session.chapters[0];
   private floor: THREE.Mesh | null = null;
   private sun: THREE.DirectionalLight | null = null;
+  private world: WorldKit | null = null;
+  private hazard: Hazard | null = null;
+  private worldRoot: THREE.Group | null = null;
   private frame = 0;
   private score = 0;
   private elapsed = 0;
   private complete = false;
+  private failed = false;
   private cameraPunch = 0;
   private rng = createSeededRandom(1);
   private pausedForScreenshot = false;
@@ -75,6 +90,7 @@ export class Game {
     });
 
     this.createScene();
+    this.rebuildEntities();
     this.hud.setTarget(this.pickups.length);
     this.cameraRig.snapTo(this.player.group.position);
     resizeRenderer(this.renderer, this.camera, this.tuning.maxDpr);
@@ -100,7 +116,7 @@ export class Game {
     this.audio.dispose();
     this.debugTools.dispose();
     this.pauseShare?.dispose();
-    for (const pickup of this.pickups) pickup.dispose();
+    this.clearEntities();
     this.player.dispose();
     this.renderer.dispose();
     window.__THREE_GAME_DIAGNOSTICS__ = undefined;
@@ -109,9 +125,11 @@ export class Game {
 
   private async bootLook(): Promise<void> {
     this.session = await this.look.load('/look/look.json');
+    this.rebuildEntities();
     if (this.floor) await this.look.apply(this.scene, this.floor, this.session);
     await this.player.applyCast(this.session.models?.player);
     await Promise.all(this.pickups.map((pickup) => pickup.applyCast(this.session.models?.pickup)));
+    if (this.hazard) await this.hazard.applyCast(this.session.models?.enemy);
     this.applyChapter(chapterFromScore(this.session, this.score, this.complete), true);
     const title = document.querySelector('title');
     if (title) title.textContent = this.session.title;
@@ -124,29 +142,41 @@ export class Game {
       this.publishDiagnostics();
       return;
     }
-    if (!this.complete) this.elapsed += delta;
+    if (!this.complete && !this.failed) this.elapsed += delta;
 
     resizeRenderer(this.renderer, this.camera, this.tuning.maxDpr);
     const animDelta = this.reducedMotion ? 0 : delta;
     const animElapsed = this.reducedMotion ? 0 : elapsed;
-    this.player.update(delta, animElapsed, this.input, this.tuning, ARENA);
+    const air = this.session.cartridge === 'jump';
+    this.player.update(delta, animElapsed, this.input, { ...this.tuning, air }, ARENA);
+    if (air) this.resolveJumpSupport();
 
     for (const pickup of this.pickups) {
       pickup.update(animDelta, animElapsed);
     }
+    this.hazard?.update(animDelta, animElapsed);
 
-    const collected = this.collision.collectPickups(this.player.group.position, this.pickups, 0.55);
-    for (const pickup of collected) {
-      this.score += 1;
-      this.audio.pickup(pickup.index);
-      this.hud.flashPickup();
-      this.cameraPunch = 0.28;
-      this.renderer.toneMappingExposure = this.tuning.exposure + 0.1;
-    }
+    if (!this.complete && !this.failed) {
+      const collected = this.collision.collectPickups(this.player.group.position, this.pickups, 0.55);
+      for (const pickup of collected) {
+        this.score += 1;
+        this.audio.pickup(pickup.index);
+        this.hud.flashPickup();
+        this.cameraPunch = 0.28;
+        this.renderer.toneMappingExposure = this.tuning.exposure + 0.1;
+      }
 
-    if (this.score >= this.pickups.length) {
-      this.complete = true;
-      this.pauseShare?.showSettle(true);
+      if (this.hazard?.hits(this.player.group.position)) {
+        this.failRun();
+      }
+      if (air && this.player.group.position.y < -4) {
+        this.failRun();
+      }
+
+      if (this.score >= this.pickups.length && this.pickups.length > 0) {
+        this.complete = true;
+        this.pauseShare?.showSettle(true);
+      }
     }
 
     this.applyChapter(chapterFromScore(this.session, this.score, this.complete));
@@ -158,6 +188,24 @@ export class Game {
     this.renderer.toneMappingExposure += (this.tuning.exposure - this.renderer.toneMappingExposure) * 0.12;
     this.hud.update(this.score, this.pickups.length, this.elapsed, this.complete, this.chapter.status);
     this.publishDiagnostics();
+  }
+
+  private resolveJumpSupport(): void {
+    if (!this.world) return;
+    const pos = this.player.group.position;
+    const top = supportY(this.world.platforms, pos.x, pos.z, pos.y);
+    if (top !== null && this.player.velocity.y <= 0 && pos.y <= top + 0.12) {
+      this.player.setGrounded(true, top);
+    } else {
+      this.player.setGrounded(false);
+    }
+  }
+
+  private failRun(): void {
+    if (this.failed || this.complete) return;
+    this.failed = true;
+    this.audio.fail();
+    this.pauseShare?.showSettle(true);
   }
 
   private applyChapter(next: Chapter, force = false): void {
@@ -190,102 +238,63 @@ export class Game {
     sun.shadow.camera.bottom = -12;
     this.scene.add(sun);
     this.sun = sun;
-
-    this.scene.add(this.createArena());
     this.scene.add(this.player.group);
-    this.createPickups();
   }
 
-  private createArena(): THREE.Group {
-    const arena = new THREE.Group();
-    const floorTexture = this.createFloorTexture();
-    floorTexture.wrapS = THREE.RepeatWrapping;
-    floorTexture.wrapT = THREE.RepeatWrapping;
-    floorTexture.repeat.set(ARENA.halfWidth / 2, ARENA.halfDepth / 2);
+  private rebuildEntities(): void {
+    this.clearEntities();
+    this.world = createWorldKit(this.session.cartridge, this.session);
+    this.worldRoot = this.world.group;
+    this.floor = this.world.floor;
+    this.scene.add(this.world.group);
 
-    const floor = new THREE.Mesh(
-      new THREE.PlaneGeometry(ARENA.halfWidth * 2, ARENA.halfDepth * 2, 1, 1),
-      new THREE.MeshStandardMaterial({
-        color: '#2a2c25',
-        map: floorTexture,
-        roughness: 0.72,
-        metalness: 0.02,
-      }),
-    );
-    floor.rotation.x = -Math.PI / 2;
-    floor.receiveShadow = true;
-    arena.add(floor);
-    this.floor = floor;
-
-    const railMaterial = new THREE.MeshStandardMaterial({
-      color: '#8a5a32',
-      roughness: 0.62,
-      metalness: 0.04,
-    });
-    const longRailGeometry = new THREE.BoxGeometry(ARENA.halfWidth * 2 + 1, 0.55, 0.42);
-    const shortRailGeometry = new THREE.BoxGeometry(0.42, 0.55, ARENA.halfDepth * 2 + 1);
-    const rails = [
-      new THREE.Mesh(longRailGeometry, railMaterial),
-      new THREE.Mesh(longRailGeometry, railMaterial),
-      new THREE.Mesh(shortRailGeometry, railMaterial),
-      new THREE.Mesh(shortRailGeometry, railMaterial),
-    ];
-    rails[0].position.set(0, 0.28, -ARENA.halfDepth - 0.24);
-    rails[1].position.set(0, 0.28, ARENA.halfDepth + 0.24);
-    rails[2].position.set(-ARENA.halfWidth - 0.24, 0.28, 0);
-    rails[3].position.set(ARENA.halfWidth + 0.24, 0.28, 0);
-    for (const rail of rails) {
-      rail.castShadow = true;
-      rail.receiveShadow = true;
-      arena.add(rail);
-    }
-
-    return arena;
-  }
-
-  private createPickups(): void {
-    const positions = [
-      [-8, -4],
-      [-3, -5],
-      [3, -4.8],
-      [8, -3],
-      [-7.5, 3.5],
-      [-1.5, 4.7],
-      [4.5, 3.8],
-      [8.2, 1.4],
-    ];
-
-    positions.forEach(([x, z], index) => {
-      const pickup = new Pickup(index, new THREE.Vector3(x, 0.8, z));
+    const spots = pickupLayout(this.session);
+    spots.forEach((spot, index) => {
+      const position = this.pickupPosition(spot, index);
+      const pickup = new Pickup(index, position);
       this.pickups.push(pickup);
       this.scene.add(pickup.group);
     });
-  }
 
-  private createFloorTexture(): THREE.CanvasTexture {
-    const size = 256;
-    const textureCanvas = document.createElement('canvas');
-    textureCanvas.width = size;
-    textureCanvas.height = size;
-    const context = textureCanvas.getContext('2d');
-    if (!context) throw new Error('Could not create floor texture context.');
-
-    context.fillStyle = '#282a24';
-    context.fillRect(0, 0, size, size);
-    context.strokeStyle = 'rgba(246, 241, 223, 0.08)';
-    context.lineWidth = 1;
-    for (let i = 0; i <= size; i += 32) {
-      context.beginPath();
-      context.moveTo(i, 0);
-      context.lineTo(i, size);
-      context.moveTo(0, i);
-      context.lineTo(size, i);
-      context.stroke();
+    if (this.session.threat) {
+      this.hazard = new Hazard();
+      this.scene.add(this.hazard.group);
     }
 
-    const texture = new THREE.CanvasTexture(textureCanvas);
-    texture.colorSpace = THREE.SRGBColorSpace;
-    return texture;
+    this.hud.setTarget(this.pickups.length);
+    if (this.session.cartridge === 'jump' && this.world?.platforms[0]) {
+      this.player.setGrounded(true, this.world.platforms[0].top);
+    }
+  }
+
+  private pickupPosition(spot: { x: number; z: number }, index: number): THREE.Vector3 {
+    if (this.session.cartridge !== 'jump' || !this.world?.platforms.length) {
+      return new THREE.Vector3(spot.x, 0.8, spot.z);
+    }
+    const platform = this.world.platforms[index % this.world.platforms.length];
+    const midX = (platform.minX + platform.maxX) / 2;
+    const midZ = (platform.minZ + platform.maxZ) / 2;
+    const offset = index % 2 === 0 ? 0.55 : -0.55;
+    return new THREE.Vector3(midX + offset, platform.top + 0.55, midZ);
+  }
+
+  private clearEntities(): void {
+    for (const pickup of this.pickups) {
+      this.scene.remove(pickup.group);
+      pickup.dispose();
+    }
+    this.pickups.length = 0;
+    if (this.hazard) {
+      this.scene.remove(this.hazard.group);
+      this.hazard.dispose();
+      this.hazard = null;
+    }
+    if (this.worldRoot) {
+      this.scene.remove(this.worldRoot);
+      this.worldRoot = null;
+    }
+    this.world = null;
+    this.floor = null;
   }
 
   private installTestHooks(): void {
@@ -314,9 +323,11 @@ export class Game {
     this.score = 0;
     this.elapsed = 0;
     this.complete = false;
+    this.failed = false;
     this.cameraPunch = 0;
-    this.player.group.position.set(0, this.player.group.position.y, 0);
+    this.player.group.position.set(0, this.session.cartridge === 'jump' ? 0.6 : 0, 0);
     this.player.velocity.set(0, 0, 0);
+    this.player.setGrounded(true, this.session.cartridge === 'jump' ? 0.55 : 0);
     for (const pickup of this.pickups) {
       pickup.reset();
       pickup.group.rotation.y = this.rng() * Math.PI * 2;
@@ -335,6 +346,7 @@ export class Game {
     }
     this.score = this.pickups.length;
     this.complete = true;
+    this.failed = false;
     this.applyChapter(chapterFromScore(this.session, this.score, this.complete), true);
     this.hud.update(this.score, this.pickups.length, this.elapsed, this.complete, this.chapter.status);
     this.pauseShare?.showSettle(true);
@@ -348,6 +360,7 @@ export class Game {
       score: this.score,
       targetScore: this.pickups.length,
       complete: this.complete,
+      failed: this.failed,
       chapter: this.chapter.id,
       paused: Boolean(this.pauseShare?.paused),
       player: {

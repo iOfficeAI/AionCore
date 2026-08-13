@@ -1,6 +1,10 @@
 {
   "title": "Short crossing",
   "objective": "Collect the marks",
+  "cartridge": "collect",
+  "density": 8,
+  "seed": 1,
+  "threat": false,
   "chapters": [
     {
       "id": "explore",
@@ -9,7 +13,9 @@
       "status": "Find the first marks",
       "fog": "#1a1814",
       "sun": "#fff1bf",
-      "ground": "#2a2820"
+      "ground": "#2a2820",
+      "fogNear": 18,
+      "fogFar": 42
     },
     {
       "id": "pressure",
@@ -18,7 +24,9 @@
       "status": "The remaining marks pull harder",
       "fog": "#12151a",
       "sun": "#c4d4e8",
-      "ground": "#1e2228"
+      "ground": "#1e2228",
+      "fogNear": 12,
+      "fogFar": 34
     },
     {
       "id": "settle",
@@ -27,7 +35,9 @@
       "status": "Bring them home",
       "fog": "#1c1610",
       "sun": "#ffd9a0",
-      "ground": "#2c2418"
+      "ground": "#2c2418",
+      "fogNear": 16,
+      "fogFar": 40
     }
   ],
   "look": {

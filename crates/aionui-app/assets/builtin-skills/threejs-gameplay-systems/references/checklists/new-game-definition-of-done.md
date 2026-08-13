@@ -27,5 +27,5 @@ Prototype exception: apply only the install/build/first-input items plus a label
 - A screenshot proves the canvas rendered.
 - A canvas-pixel check proves the canvas is not blank.
 - A fresh-eyes or adversarial pass records expected emotion → observed behavior/feedback → delta → fix. Do not claim user-measured retention without a real player test.
-- The complete short game was handed to the user with `launch_game.mjs --deliver` (`GAME_DELIVERED`), which opens the system default browser. Chapter checkpoints use `--no-open` only. The user-facing close says the game is open, then controls, current goal, and share — not a command as the first sentence.
+- The complete short game was handed to the user with `launch_game.mjs --deliver` (`GAME_DELIVERED dist=`). Chapter checkpoints use `--no-open` only. The user-facing close says the game is open, then controls, current goal, and share — not a command as the first sentence.
 - Final report names design brief, emotion beat sheet, level/encounter plan, controls, verification evidence, share status, and remaining risks.

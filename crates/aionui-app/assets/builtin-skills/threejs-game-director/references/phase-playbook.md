@@ -15,7 +15,7 @@ Path resolution for every file named here uses the Skill Path Ladder in `threejs
 - A broad request is not complete at first playable slice unless the user explicitly asked for a prototype. First playable is an internal checkpoint.
 - Prefer a small authored vertical slice over a larger placeholder scene during greybox. Treat primitive-dominant models, box skylines, flat arenas, generic stat-card HUDs, and glow/fog-only detail as prototype placeholders in the final delivery.
 - Experience intent is the shared contract across gameplay, graphics, UI, audio, and QA. Emotion shifts must be playable events.
-- Verify through browser evidence with `launch_game.mjs --no-open`. Before calling a complete short game done, run `launch_game.mjs --deliver` so the system default browser opens. Never foreground `npm run play`.
+- Verify through browser evidence with `launch_game.mjs --no-open`. Before calling a complete short game done, run `launch_game.mjs --deliver` and confirm `GAME_DELIVERED dist=`. Never foreground `npm run play`. Never rewrite overlay `Game.ts`.
 
 ## Ledger Templates
 
@@ -186,7 +186,7 @@ Exit evidence: root cause or measured bottleneck stated; baseline/post metrics w
 
 Use before calling broad work complete.
 
-- Run build/typecheck; `npm install`; start with `launch_game.mjs --no-open` and confirm `LAUNCH_OK`. Walk every named chapter critical path, fail/retry, pause, settle, and share with real input — a screenshot is not a playtest. Run packaged tests when present. Never foreground `npm run play` in ExecCommand. Only after that gate passes, run `launch_game.mjs --deliver` and confirm `GAME_DELIVERED` (system default browser). `--deliver` audits game source + `look.json` models (`ART_FAIL` prints no `GAME_DELIVERED`). Do not `--deliver` an untested or incomplete build.
+- Run build/typecheck; `npm install`; start with `launch_game.mjs --no-open` and confirm `LAUNCH_OK`. Walk the main input, fail/retry, pause, settle, and share with real input — a screenshot is not a playtest. Never foreground `npm run play` in ExecCommand. Only after that gate passes, run `launch_game.mjs --deliver` and confirm `GAME_DELIVERED dist=`. `--deliver` audits game source + `look.json` models (`ART_FAIL` prints no `GAME_DELIVERED`). Do not `--deliver` an untested build. Do not rewrite overlay gameplay files.
 - Capture active desktop and mobile screenshots; sample canvas pixels for nonblank and varied output using the generated game's `npm run inspect:canvas` or:
 
 ```bash
@@ -220,7 +220,7 @@ For a broad complete game (not an explicit prototype), and for any premium/AAA/s
 - HUD/menu states are readable and responsive.
 - Renderer diagnostics and technical art budget target-vs-actuals exist after graphics changes.
 - Visual test harness decision is reported; bot playtest evidence exists for release-ready gameplay claims.
-- Build and browser QA passed; the complete short game was handed off with `launch_game.mjs --deliver` (`GAME_DELIVERED`), or blockers are clearly reported.
+- Build and browser QA passed; the complete short game was handed off with `launch_game.mjs --deliver` (`GAME_DELIVERED dist=`), or blockers are clearly reported.
 - Physics-heavy games include engine choice, timestep, collider strategy, sensors, CCD use, and body/collider diagnostics.
 
 If any gate fails, continue iterating or report the exact blocker instead of calling the game done.

@@ -33,17 +33,18 @@ Reference files resolve the same way: `<skill-dir>/references/<file>.md`. Siblin
 
 ## Sibling Skill Loading
 
-For a first playable game (`做个游戏`, from-scratch, arcade, cozy, collect), load only these three before writing files **unless** the parent assistant or user already asked for a complete short game:
+For a new game, pick a frozen cartridge then fill look/cast/audio. Load only:
 
-1. `threejs-gameplay-systems/SKILL.md` — scaffold create, overlay session, `apply_look.mjs`
+1. `threejs-gameplay-systems/SKILL.md` — `create_threejs_game.mjs --cartridge collect|jump`
 2. `threejs-image-generator/SKILL.md` — sky / ground / HUD icon into `public/look/`
 3. `threejs-audio-generator/SKILL.md` — one `kit` command
+4. `threejs-3d-generator/SKILL.md` — one `cast` into `public/look` + `look.json` models
 
-Do not load `threejs-aaa-graphics-builder`, `threejs-game-ui-designer`, `threejs-debug-profiler`, `threejs-qa-release`, or `threejs-3d-generator` before the first `LAUNCH_OK` and a screenshot, unless the user's first message already asked for premium, AAA, showcase, high-fidelity, "less basic", a complete short game, 3–5 chapters, 成片, 通关, or the parent rule is `game-dev-studio` / `game-3d` / butler mode 6. Those complete-short-game requests are premium from the first turn. After a first-playable screenshot, load the remaining siblings if the frame is still primitive-dominated or the user asked to polish.
+Do not load `threejs-aaa-graphics-builder`, `threejs-game-ui-designer`, `threejs-debug-profiler`, or `threejs-qa-release` on the first game unless the user asked to polish an already delivered cartridge. Do not rewrite overlay `Game.ts`, `Player.ts`, `Pickup.ts`, `LookSystem.ts`, `AudioSystem.ts`, `PauseShare.ts`, `WorldKit.ts`, or `studio/cast.ts`. Chapters, density, threat, title, and cartridge belong in `public/look/look.json` only.
+
+Cartridge routing: jump / platform / 跳跃 / 平台 → `--cartridge jump`. Otherwise `--cartridge collect`. Never invent a third loop in source.
 
 For narrow director-invoked work, load the directly relevant sibling plus `threejs-qa-release` when verification is in scope.
-
-When premium/AAA/showcase/"less basic"/complete-short-game is in the first message or parent rule, load the five phase skills and the three generators as before. Do not skip a generator `SKILL.md` before recording that generator as not-needed.
 
 ## External Asset Sourcing Gate
 
@@ -98,26 +99,26 @@ When a sibling skill file is loaded, follow its workflow for that phase. Phase e
 New projects use the gameplay skill's scaffold creator; canvas verification uses the generated game's `npm run inspect:canvas` or the QA skill's packaged inspector:
 
 ```bash
-node <threejs-gameplay-systems-skill-dir>/scripts/create_threejs_game.mjs ./my-game
+node <threejs-gameplay-systems-skill-dir>/scripts/create_threejs_game.mjs ./my-game --cartridge collect
 cd ./my-game && npm install
 node <threejs-gameplay-systems-skill-dir>/scripts/launch_game.mjs ./my-game --no-open
 ```
 
-Use `launch_game.mjs` (not foreground `npm run play`): Vite must be detached or ExecCommand times out and kills the server. Give `npm install` a long timeout.
+Use `launch_game.mjs` (not foreground `npm run play`): Vite must be detached or ExecCommand times out and kills the server. Give `npm install` a long timeout. Pass `--cartridge jump` when the user asked for a platformer.
 
 ## Execution order
 
-Do not skip to player handoff.
+Do not skip to player handoff. Do not rewrite overlay gameplay files.
 
-1. **Make** the complete short game (3–5 named chapters). First `LAUNCH_OK` is a checkpoint. Chapter QA, screenshots, and Playwright use `--no-open` only. Do not open the system browser or `aionui-browser` on a half-built game.
-2. **Prove it plays** before `--deliver`: `npm run build`; `launch_game.mjs --no-open`; actually drive main input, every named chapter's critical path, fail/retry, pause, settle, and share; console clean; screenshots; non-blank canvas. Run `npm test` / `verify:visual` / `inspect:canvas` when those scripts exist. Fix every `FAIL` and retest. Playwright screenshots are not a substitute for walking the chapter paths.
-3. **Hand off** only the finished, playtested game:
+1. **Make** the cartridge: scaffold with `--cartridge collect|jump`, fill sky/ground/icon, audio `kit`, `cast` models, and `look.json` title/objective/density/threat/chapters. First `LAUNCH_OK` is a checkpoint. Chapter QA, screenshots, and Playwright use `--no-open` only.
+2. **Prove it plays** before `--deliver`: `npm run build`; `launch_game.mjs --no-open`; actually drive main input, fail/retry, pause, settle, and share; console clean; screenshots; non-blank canvas.
+3. **Hand off** only the playtested game:
 
 ```bash
 node <threejs-gameplay-systems-skill-dir>/scripts/launch_game.mjs ./my-game --deliver
 ```
 
-Require `GAME_DELIVERED` (system default browser at `http://127.0.0.1:5188/`). Do not claim done without this step, and do not `--deliver` until step 2 passed.
+Require `GAME_DELIVERED dist=<abs>/dist`. AionUi mounts that folder in the in-app preview. Do not start Vite, occupy port 5188, open the system browser, or tell the user to click a link. Do not `--deliver` until step 2 passed.
 
 After scaffold create, apply generated sky/ground/icon, then generate audio with the Node kit (not foreground Python, not twenty SFX prompts). Voice follows the scene: lyrics/song → vocals; 旁白/对白/announcer → TTS; otherwise instrumental + SFX only.
 
@@ -159,7 +160,7 @@ Premium, AAA, polished, complete, release-ready, and showcase requests require v
 
 ## Required Verification
 
-- Build/typecheck; chapter/QA launches use `launch_game.mjs --no-open` (`LAUNCH_OK`). Prove the game plays (every named chapter critical path, fail/retry, settle) before the last command `launch_game.mjs --deliver` (`GAME_DELIVERED`, system default browser). Never `--deliver` an untested or incomplete build. Never foreground `npm run play`. Console/page error check.
+- Build/typecheck; chapter/QA launches use `launch_game.mjs --no-open` (`LAUNCH_OK`). Prove the game plays before the last command `launch_game.mjs --deliver` (`GAME_DELIVERED dist=`). Never `--deliver` an untested build. Never foreground `npm run play`. Never rewrite overlay `Game.ts` to invent a new loop.
 - Game design brief (including experience intent), core loop contract, emotion beat sheet, chapter ledger, and level/encounter plan for broad game creation or major gameplay changes.
 - Active desktop and mobile screenshots plus nonblank canvas pixel evidence.
 - Main input/objective/fail-or-restart path exercised through named chapters, not only the first minute.

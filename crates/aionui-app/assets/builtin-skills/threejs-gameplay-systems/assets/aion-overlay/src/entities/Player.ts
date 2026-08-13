@@ -6,6 +6,9 @@ export type PlayerTuning = {
   speed: number;
   dashMultiplier: number;
   acceleration: number;
+  air?: boolean;
+  gravity?: number;
+  jumpSpeed?: number;
 };
 
 export type ArenaBounds = {
@@ -43,6 +46,7 @@ export class Player {
   private readonly legGeometry = new THREE.BoxGeometry(0.16, 0.42, 0.18);
   private cast: CastVisual | null = null;
   private gait: 'idle' | 'walk' | 'run' = 'idle';
+  private grounded = true;
 
   constructor() {
     const torso = new THREE.Mesh(this.torsoGeometry, this.cloth);
@@ -85,29 +89,56 @@ export class Player {
     this.cast = visual;
   }
 
+  setGrounded(grounded: boolean, floorY?: number): void {
+    this.grounded = grounded;
+    if (grounded && this.velocity.y < 0) this.velocity.y = 0;
+    if (grounded && floorY !== undefined) this.group.position.y = floorY;
+  }
+
   update(delta: number, elapsed: number, input: InputController, tuning: PlayerTuning, bounds: ArenaBounds): void {
     input.readMovement(this.move);
     const dash = input.isDashHeld() ? tuning.dashMultiplier : 1;
     this.targetVelocity.set(this.move.x, 0, this.move.y).multiplyScalar(tuning.speed * dash);
 
     const smoothing = 1 - Math.exp(-tuning.acceleration * delta);
-    this.velocity.lerp(this.targetVelocity, smoothing);
+    this.velocity.x += (this.targetVelocity.x - this.velocity.x) * smoothing;
+    this.velocity.z += (this.targetVelocity.z - this.velocity.z) * smoothing;
+
+    if (tuning.air) {
+      if (input.consumeJump() && this.grounded) {
+        this.velocity.y = tuning.jumpSpeed ?? 8.2;
+        this.grounded = false;
+      }
+      this.velocity.y -= (tuning.gravity ?? 22) * delta;
+    } else {
+      this.velocity.y = 0;
+    }
+
     this.group.position.addScaledVector(this.velocity, delta);
+    this.group.position.x = THREE.MathUtils.clamp(
+      this.group.position.x,
+      -bounds.halfWidth + 0.8,
+      bounds.halfWidth - 0.8,
+    );
+    this.group.position.z = THREE.MathUtils.clamp(
+      this.group.position.z,
+      -bounds.halfDepth + 0.8,
+      bounds.halfDepth - 0.8,
+    );
 
-    this.group.position.x = THREE.MathUtils.clamp(this.group.position.x, -bounds.halfWidth + 0.8, bounds.halfWidth - 0.8);
-    this.group.position.z = THREE.MathUtils.clamp(this.group.position.z, -bounds.halfDepth + 0.8, bounds.halfDepth - 0.8);
-
-    if (this.velocity.lengthSq() > 0.001) {
+    if (this.velocity.x * this.velocity.x + this.velocity.z * this.velocity.z > 0.001) {
       this.group.rotation.y = Math.atan2(this.velocity.x, -this.velocity.z);
     }
 
     if (this.cast) {
       this.updateGait(input.isDashHeld(), delta);
-      this.group.position.y = 0;
+      if (!tuning.air) this.group.position.y = 0;
       return;
     }
 
-    this.group.position.y = 0.06 + Math.sin(elapsed * 9) * Math.min(this.velocity.length() / 40, 0.08);
+    if (!tuning.air) {
+      this.group.position.y = 0.06 + Math.sin(elapsed * 9) * Math.min(this.velocity.length() / 40, 0.08);
+    }
   }
 
   private updateGait(dashing: boolean, delta: number): void {

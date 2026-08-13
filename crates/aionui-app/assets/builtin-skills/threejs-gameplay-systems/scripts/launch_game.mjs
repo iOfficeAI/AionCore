@@ -1,21 +1,17 @@
 #!/usr/bin/env node
 /**
- * Start the game server without blocking ExecCommand.
+ * Start the game server without blocking ExecCommand, or hand off a built dist.
  *
- * `npm run play` is a long-lived Vite process. If the agent runs it in the
- * foreground, the tool times out (~120s) and the process group is killed.
- * This script detaches Vite, waits until http://127.0.0.1:5188/ answers,
- * then exits.
- *
- * Chapter QA / screenshots: `--no-open` (prints LAUNCH_OK, no browser).
- * Whole-game handoff: `--deliver` (prints GAME_DELIVERED and opens the
- * system default browser). `--deliver` first audits game source + look.json
- * models; ART_FAIL prints no GAME_DELIVERED and does not open a browser.
+ * Chapter QA / screenshots: `--no-open` detaches Vite and prints LAUNCH_OK.
+ * Whole-game handoff: `--deliver` audits art, runs `npm run build`, and prints
+ * `GAME_DELIVERED dist=<abs>/dist`. It does not start Vite, occupy a port, or
+ * open a system browser — AionUi mounts that dist in the in-app preview.
  *
  * Run `npm install` as its own command first. This script does not install.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { auditGameArt } from './audit_game_art_lib.mjs';
@@ -86,46 +82,50 @@ function startPlay(gameDir, skipViteOpen) {
   child.unref();
 }
 
-function openSystemBrowser(url) {
-  const env = { ...process.env };
-  delete env.ELECTRON_RUN_AS_NODE;
-  delete env.ELECTRON_NO_ASAR;
-  const opts = { detached: true, stdio: 'ignore', env, windowsHide: true };
-  let child;
-  if (process.platform === 'darwin') {
-    child = spawn('open', [url], opts);
-  } else if (process.platform === 'win32') {
-    child = spawn('cmd.exe', ['/c', 'start', '', url], opts);
-  } else {
-    child = spawn('xdg-open', [url], opts);
+function runBuild(gameDir) {
+  const result = spawnSync('npm', ['run', 'build'], {
+    cwd: gameDir,
+    encoding: 'utf8',
+    shell: process.platform === 'win32',
+    env: process.env,
+  });
+  if (result.status !== 0) {
+    if (result.stdout) console.error(result.stdout);
+    if (result.stderr) console.error(result.stderr);
+    throw new Error(`npm run build failed in ${gameDir}`);
   }
-  child.unref();
-}
-
-function report(alreadyRunning, deliver) {
-  const extra = alreadyRunning ? ' already_running=1' : '';
-  if (deliver) {
-    openSystemBrowser(URL);
-    console.log(`GAME_DELIVERED url=${URL}${extra}`);
-  } else {
-    console.log(`LAUNCH_OK url=${URL}${extra}`);
+  const distDir = path.join(gameDir, 'dist');
+  const index = path.join(distDir, 'index.html');
+  if (!fs.existsSync(index)) {
+    throw new Error(`build did not write ${index}`);
   }
+  return distDir;
 }
 
 const { noOpen, deliver, target } = parseArgs(process.argv.slice(2));
 const gameDir = path.resolve(target);
+
 if (deliver) {
   const art = auditGameArt(gameDir);
   if (!art.ok) {
     for (const line of art.failures) console.error(`ART_FAIL ${line}`);
     process.exit(2);
   }
+  try {
+    const distDir = runBuild(gameDir);
+    console.log(`GAME_DELIVERED dist=${distDir}`);
+    process.exit(0);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
 }
+
 const inApp = Boolean(process.env.AIONUI_CDP_ACTIVE_PORT);
-const skipViteOpen = noOpen || deliver || inApp;
+const skipViteOpen = noOpen || inApp;
 
 if (await ping()) {
-  report(true, deliver);
+  console.log(`LAUNCH_OK url=${URL} already_running=1`);
   process.exit(0);
 }
 
@@ -134,4 +134,4 @@ if (!(await waitReady())) {
   console.error(`Vite did not become ready at ${URL}. Run npm install in ${gameDir} first.`);
   process.exit(1);
 }
-report(false, deliver);
+console.log(`LAUNCH_OK url=${URL}`);
