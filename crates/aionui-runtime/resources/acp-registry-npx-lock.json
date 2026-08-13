@@ -19,7 +19,7 @@
     "dimcode": {
       "registry_json_id": "dimcode",
       "package": "dimcode",
-      "version": "0.3.11"
+      "version": "0.3.12"
     },
     "dirac": {
       "registry_json_id": "dirac",
@@ -48,7 +48,7 @@
     "nova": {
       "registry_json_id": "nova",
       "package": "@compass-ai/nova",
-      "version": "1.1.32"
+      "version": "1.1.34"
     },
     "omp": {
       "package": "@oh-my-pi/pi-coding-agent",
