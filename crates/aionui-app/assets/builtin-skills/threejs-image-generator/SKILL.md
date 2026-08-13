@@ -41,7 +41,7 @@ Step 0, before declaring 2D generation unavailable:
 uv run <this-skill-dir>/scripts/generate_image.py probe   # prints GEMINI_API_KEY=SET|MISSING
 ```
 
-`GEMINI_API_KEY=MISSING` is a valid 2D skip/blocker only when the MCP tool is also absent and this probe output is shown. Keys defined only in a shell profile can be absent from the process env; if the plain probe prints MISSING unexpectedly, wrap it: `zsh -lc 'source ~/.zprofile 2>/dev/null || true; source ~/.zshrc 2>/dev/null || true; uv run <this-skill-dir>/scripts/generate_image.py probe'`. When the director skill is loaded, still run `threejs-game-director/scripts/probe_asset_credentials.sh` for Tripo/Gemini/ElevenLabs, but treat MCP availability as the image provider for Aion sessions.
+`GEMINI_API_KEY=MISSING` is a valid 2D skip/blocker only when the MCP tool is also absent and this probe output is shown. Keys defined only in a shell profile can be absent from the process env; if the plain probe prints MISSING unexpectedly, wrap it: `zsh -lc 'source ~/.zprofile 2>/dev/null || true; source ~/.zshrc 2>/dev/null || true; uv run <this-skill-dir>/scripts/generate_image.py probe'`. When the director skill is loaded, still run `threejs-game-director/scripts/probe_asset_credentials.mjs` for Tripo/Gemini/ElevenLabs, but treat MCP availability as the image provider for Aion sessions.
 
 ## First Game Look
 

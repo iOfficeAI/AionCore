@@ -19,7 +19,7 @@ Resolve `<this-skill-dir>` in this order: `.aionrs/skills/threejs-audio-generato
 node <this-skill-dir>/scripts/threejs_audio_asset.mjs probe
 ```
 
-`python3 <this-skill-dir>/scripts/threejs_audio_asset.py probe` is fallback only. Never run bare `python`. If the director skill is loaded, you may use `threejs-game-director/scripts/probe_asset_credentials.sh` for all three asset keys, then still run this Node probe for audio.
+`python3 <this-skill-dir>/scripts/threejs_audio_asset.py probe` is fallback only. Never run bare `python`. If the director skill is loaded, you may use `threejs-game-director/scripts/probe_asset_credentials.mjs` for all three asset keys, then still run this Node probe for audio.
 
 2. Decide voice from the **scene**, not a global default:
 

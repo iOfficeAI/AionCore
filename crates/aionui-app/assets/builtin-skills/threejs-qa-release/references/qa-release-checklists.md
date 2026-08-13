@@ -8,7 +8,7 @@ Minimum meaningful QA:
 
 - Dependencies installed or known.
 - Build/typecheck passes.
-- Dev, play, or preview server opened at the correct URL. Prefer `npm run play` so the browser opens; label `localhost` as a local playtest URL.
+- Dev, play, or preview server opened at the correct URL. Prefer `launch_game.mjs` (not foreground `npm run play`) so the browser opens; label `localhost` as a local playtest URL.
 - Console/page/network errors captured.
 - Canvas nonblank and visually varied through pixel sampling.
 - Desktop active-play screenshot.

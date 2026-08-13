@@ -64,8 +64,8 @@ pub struct BuiltinAssistant {
     #[serde(default)]
     pub sort_order: i32,
     /// Whether this official assistant is enabled by default when a user has
-    /// no overlay for it. Only the butler ships enabled; others default off so
-    /// they don't crowd the user's selection lists. Defaults to false.
+    /// no overlay for it. The butler, game-dev-studio, and promo team lead ship
+    /// enabled; other specialists stay off so they don't crowd selection lists.
     #[serde(default)]
     pub default_enabled: bool,
 }
@@ -332,6 +332,20 @@ mod tests {
             butler.enabled_skills.iter().any(|s| s == "aionui-config"),
             "butler must keep config skills"
         );
+        let studio = reg.get("game-dev-studio").expect("game-dev-studio");
+        assert!(
+            studio.default_enabled,
+            "game-dev-studio must be selectable without a settings toggle"
+        );
+        let promo_lead = reg.get("team-promo-creator").expect("team-promo-creator");
+        assert!(
+            promo_lead.default_enabled,
+            "promo team lead must be selectable without a settings toggle"
+        );
+        assert!(
+            promo_lead.enabled_skills.iter().any(|s| s == "bgm-prompting"),
+            "promo lead single-session fallback needs bgm-prompting"
+        );
         for id in [
             "spatial-GameDesigner",
             "spatial-TechnicalArtist",
@@ -372,8 +386,20 @@ mod tests {
             "game-dev-studio must require a share mode"
         );
         assert!(
-            text.contains("npm run play") || text.contains("实际启动"),
-            "game-dev-studio must require an actual launch"
+            text.contains("launch_game.mjs"),
+            "game-dev-studio must launch with launch_game.mjs"
+        );
+        let en_rule = reg
+            .rule_bytes("game-dev-studio", "en-US")
+            .expect("game-dev-studio en-US rule");
+        let en_text = std::str::from_utf8(&en_rule).expect("utf-8");
+        assert!(
+            en_text.contains("[LOAD_SKILL: threejs-game-director]"),
+            "en-US game-dev-studio must route through threejs-game-director"
+        );
+        assert!(
+            en_text.contains("experience intent") && en_text.contains("launch_game.mjs"),
+            "en-US game-dev-studio must keep experience intent and launch_game.mjs"
         );
         for (id, locale) in [
             ("aionui-assistant", "zh-CN"),
@@ -404,7 +430,8 @@ mod tests {
                 || text.contains("share")
                 || text.contains("поделиться")
                 || text.contains("шаринг");
-            let has_launch = text.contains("npm run play")
+            let has_launch = text.contains("launch_game.mjs")
+                || text.contains("npm run play")
                 || text.contains("实际启动")
                 || text.contains("actual launch")
                 || text.contains("фактическ");

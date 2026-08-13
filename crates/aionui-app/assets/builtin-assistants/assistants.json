@@ -609,12 +609,12 @@
         "ru-RU": "Генератор 3D-игр",
         "uk-UA": "Генератор 3D-ігор"
       },
-      "description": "Generate playable Three.js 3D games in the browser using the built-in director workflow.",
+      "description": "Browser-only Three.js specialist. For Unity/Unreal/Godot/Roblox/XR or a six-hat studio, use Game Dev Studio.",
       "description_i18n": {
-        "en-US": "Generate playable Three.js 3D games in the browser using the built-in director workflow.",
-        "zh-CN": "用内置 Three.js 技能在浏览器里生成可玩的 3D 游戏。",
-        "ru-RU": "Создаёт играбельные 3D-игры на Three.js в браузере через встроенный director.",
-        "uk-UA": "Створює грабельні 3D-ігри на Three.js у браузері через вбудований director."
+        "en-US": "Browser-only Three.js specialist. For Unity/Unreal/Godot/Roblox/XR or a six-hat studio, use Game Dev Studio.",
+        "zh-CN": "只做浏览器 Three.js。Unity / Unreal / Godot / Roblox / XR 或多引擎六帽请用「游戏开发工作室」。",
+        "ru-RU": "Только браузерный Three.js. Для Unity/Unreal/Godot/Roblox/XR или студии с шестью ролями используйте Game Dev Studio.",
+        "uk-UA": "Лише браузерний Three.js. Для Unity/Unreal/Godot/Roblox/XR або студії з шістьма ролями використовуйте Game Dev Studio."
       },
       "avatar": "avatars/game-3d.jpg",
       "agent_ref": "aionrs",
@@ -1110,7 +1110,7 @@
       "description": "Your all-in-one AionUi butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach AionUi from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
       "description_i18n": {
         "en-US": "Your all-in-one AionUi butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach AionUi from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
-        "zh-CN": "你的 AionUi 全能管家：配置助手、技能、MCP 服务器与 LLM 模型；设置远程访问，让你在手机或外网也能打开 AionUi、生成分享链接；还能诊断卡住的会话、失败的模型调用，或定时任务为何没执行。",
+        "zh-CN": "你的 AionUi 全能管家：配置助手、技能、MCP 与模型；远程访问；诊断卡住的会话。做浏览器游戏时就在本会话完成，不必换助手。",
         "ru-RU": "Ваш универсальный дворецкий AionUi: настройка ассистентов, навыков, серверов MCP и провайдеров LLM; настройка удалённого доступа, чтобы открывать AionUi с телефона или делиться ссылкой; и диагностика проблем — зависших разговоров, сбоев моделей или почему не выполнилась запланированная задача.",
         "uk-UA": "Ваш універсальний дворецький AionUi: налаштування асистентів, навичок, серверів MCP і провайдерів LLM; налаштування віддаленого доступу, щоб відкривати AionUi з телефона або ділитися посиланням; і діагностика проблем — зависань розмов, збоїв моделей або чому не виконалося заплановане завдання."
       },
@@ -1175,9 +1175,9 @@
     {
       "id": "game-dev-studio",
       "sort_order": 1500,
-      "default_enabled": false,
+      "default_enabled": true,
       "name": "游戏开发工作室",
-      "description": "一个人切换策划、工程、视觉、音频、质量、发布六顶帽子，把游戏从概念推进到可验证交付。Web 项目走内置 Three.js 技能；没有引擎时交付文档、代码和概念图，不假装已经跑通。",
+      "description": "一个人切换策划、工程、视觉、音频、质量、发布六顶帽子，把游戏从概念推进到可验证交付。浏览器项目走内置 Three.js；不要和引擎空间专家组队。没有引擎时交付文档、代码和概念图，不假装已经跑通。",
       "avatar": "avatars/game-dev-studio.png",
       "agent_ref": "aionrs",
       "enabled_skills": [
@@ -1191,19 +1191,43 @@
         "threejs-image-generator",
         "threejs-audio-generator"
       ],
-      "rule_file": "rules/game-dev-studio.md",
+      "rule_file": "rules/game-dev-studio.{locale}.md",
       "prompts": [
         "我只有一句话概念，帮我做成可试玩的最小范围，并先出核心循环和一张目标画面",
         "现有 Unity 项目卡在垂直切片，帮我按六顶帽子列出本周可验证的交付和风险",
         "做一个能在浏览器里跑起来的 3D 小游戏，画面和手感都要像样"
-      ]
+      ],
+      "prompts_i18n": {
+        "zh-CN": [
+          "我只有一句话概念，帮我做成可试玩的最小范围，并先出核心循环和一张目标画面",
+          "现有 Unity 项目卡在垂直切片，帮我按六顶帽子列出本周可验证的交付和风险",
+          "做一个能在浏览器里跑起来的 3D 小游戏，画面和手感都要像样"
+        ],
+        "en-US": [
+          "I only have a one-line concept. Make a playable minimum scope, with the core loop and one target frame.",
+          "This Unity project is stuck on a vertical slice. List this week's verifiable deliveries and risks by the six hats.",
+          "Make a 3D browser game that actually runs, with decent look and feel."
+        ]
+      },
+      "name_i18n": {
+        "en-US": "Game Dev Studio",
+        "zh-CN": "游戏开发工作室",
+        "ru-RU": "Игровая студия",
+        "uk-UA": "Ігрова студія"
+      },
+      "description_i18n": {
+        "en-US": "One assistant switching six hats (design, engineering, art, audio, QA, release) from concept to a verifiable short game. Browser projects use built-in Three.js skills. Do not team with spatial engine specialists.",
+        "zh-CN": "一个人切换策划、工程、视觉、音频、质量、发布六顶帽子，把游戏从概念推进到可验证交付。浏览器项目走内置 Three.js；不要和引擎空间专家组队。没有引擎时交付文档、代码和概念图，不假装已经跑通。",
+        "ru-RU": "Один ассистент сменяет шесть ролей и ведёт игру от концепции до проверяемой короткой сессии. Браузерные проекты — через встроенные навыки Three.js. Не объединяйте с spatial-экспертами.",
+        "uk-UA": "Один асистент змінює шість ролей і веде гру від концепції до перевірюваної короткої сесії. Браузерні проєкти — через вбудовані навички Three.js."
+      }
     },
     {
       "id": "team-promo-creator",
       "sort_order": 1510,
-      "default_enabled": false,
+      "default_enabled": true,
       "name": "宣传片创作团队",
-      "description": "宣传片制片负责人。当前对话可单人完成简报到成片方案；完整协作请用 Team 快捷配方拉起简报、分镜、素材、剪辑、配乐。",
+      "description": "Promo producer. This chat can finish a brief-to-cut plan solo; for full collaboration use Team → quick recipe → Promo Film Team.",
       "avatar": "avatars/team-promo-creator.png",
       "agent_ref": "aionrs",
       "rule_file": "rules/team-promo-creator.md",
@@ -1211,60 +1235,147 @@
         "根据我的产品做一支 30 秒发布宣传片，先出简报和三张关键帧",
         "给我的 GitHub 项目做 60 秒发布视频方案，真实界面和生成画面要分开",
         "已有分镜，帮我把配乐卡点和终剪清单补齐"
-      ]
+      ],
+      "enabled_skills": [
+        "bgm-prompting"
+      ],
+      "prompts_i18n": {
+        "zh-CN": [
+          "根据我的产品做一支 30 秒发布宣传片，先出简报和三张关键帧",
+          "给我的 GitHub 项目做 60 秒发布视频方案，真实界面和生成画面要分开",
+          "已有分镜，帮我把配乐卡点和终剪清单补齐"
+        ],
+        "en-US": [
+          "Make a 30-second launch promo from my product. Start with the brief and three keyframes.",
+          "Plan a 60-second GitHub launch video. Keep real UI and generated frames separate.",
+          "I already have a storyboard. Fill in music hit-points and the final-cut checklist."
+        ]
+      },
+      "name_i18n": {
+        "en-US": "Promo Film Team",
+        "zh-CN": "宣传片创作团队",
+        "ru-RU": "Команда промо-ролика",
+        "uk-UA": "Команда промо-ролика"
+      },
+      "description_i18n": {
+        "en-US": "Promo producer. This chat can finish a brief-to-cut plan solo; for full collaboration use Team → quick recipe → Promo Film Team.",
+        "zh-CN": "宣传片制片负责人。当前对话可单人完成简报到成片方案；完整协作请用 Team 快捷配方拉起简报、分镜、素材、剪辑、配乐。",
+        "ru-RU": "Продюсер промо. Этот чат может закрыть бриф и монтажный план в одиночку; полная команда — через рецепт Team.",
+        "uk-UA": "Продюсер промо. Цей чат може закрити бриф і монтажний план самостійно; повна команда — через рецепт Team."
+      }
     },
     {
       "id": "promo-brief-strategist",
       "sort_order": 1710,
       "default_enabled": false,
       "name": "简报策略师",
-      "description": "把产品事实写成可拍、可审、有视觉方向的宣传片简报",
+      "description": "Turn product facts into a shootable, reviewable promo brief with a visual direction.",
       "avatar": "avatars/promo-brief-strategist.png",
       "agent_ref": "aionrs",
-      "rule_file": "rules/promo-brief-strategist.md"
+      "rule_file": "rules/promo-brief-strategist.md",
+      "name_i18n": {
+        "en-US": "Brief Strategist",
+        "zh-CN": "简报策略师",
+        "ru-RU": "Стратег брифа",
+        "uk-UA": "Стратег брифу"
+      },
+      "description_i18n": {
+        "en-US": "Turn product facts into a shootable, reviewable promo brief with a visual direction.",
+        "zh-CN": "把产品事实写成可拍、可审、有视觉方向的宣传片简报",
+        "ru-RU": "Превращает факты о продукте в съёмочный бриф с визуальным направлением.",
+        "uk-UA": "Перетворює факти про продукт на знімальний бриф із візуальним напрямом."
+      }
     },
     {
       "id": "promo-storyboard-artist",
       "sort_order": 1720,
       "default_enabled": false,
       "name": "分镜师",
-      "description": "把简报落成逐镜头时间线，并产出能拍板的关键帧",
+      "description": "Turn the brief into a shot-by-shot timeline and boardable keyframes.",
       "avatar": "avatars/promo-storyboard-artist.png",
       "agent_ref": "aionrs",
-      "rule_file": "rules/promo-storyboard-artist.md"
+      "rule_file": "rules/promo-storyboard-artist.md",
+      "name_i18n": {
+        "en-US": "Storyboard Artist",
+        "zh-CN": "分镜师",
+        "ru-RU": "Раскадровщик",
+        "uk-UA": "Розкадровник"
+      },
+      "description_i18n": {
+        "en-US": "Turn the brief into a shot-by-shot timeline and boardable keyframes.",
+        "zh-CN": "把简报落成逐镜头时间线，并产出能拍板的关键帧",
+        "ru-RU": "Превращает бриф в покадровый таймлайн и утверждаемые кадры.",
+        "uk-UA": "Перетворює бриф на покадровий таймлайн і кадри для затвердження."
+      }
     },
     {
       "id": "promo-asset-producer",
       "sort_order": 1730,
       "default_enabled": false,
       "name": "素材制作人",
-      "description": "按分镜生成、采集并登记可发布素材，真实界面与概念图严格分开",
+      "description": "Generate, capture, and register shippable assets from the storyboard. Keep real UI and concepts strictly separate.",
       "avatar": "avatars/promo-asset-producer.png",
       "agent_ref": "aionrs",
-      "rule_file": "rules/promo-asset-producer.md"
+      "rule_file": "rules/promo-asset-producer.md",
+      "name_i18n": {
+        "en-US": "Asset Producer",
+        "zh-CN": "素材制作人",
+        "ru-RU": "Продюсер ассетов",
+        "uk-UA": "Продюсер асетів"
+      },
+      "description_i18n": {
+        "en-US": "Generate, capture, and register shippable assets from the storyboard. Keep real UI and concepts strictly separate.",
+        "zh-CN": "按分镜生成、采集并登记可发布素材，真实界面与概念图严格分开",
+        "ru-RU": "Собирает публикуемые ассеты по раскадровке. Реальный UI и концепты разделены.",
+        "uk-UA": "Збирає асети за розкадровкою. Реальний UI і концепти розділені."
+      }
     },
     {
       "id": "promo-video-editor",
       "sort_order": 1740,
       "default_enabled": false,
       "name": "剪辑师",
-      "description": "把分镜、素材和配乐剪成可审查时间线；有渲染工具才交付成片",
+      "description": "Cut storyboard, assets, and music into a reviewable timeline; deliver a render only when tools are available.",
       "avatar": "avatars/promo-video-editor.png",
       "agent_ref": "aionrs",
-      "rule_file": "rules/promo-video-editor.md"
+      "rule_file": "rules/promo-video-editor.md",
+      "name_i18n": {
+        "en-US": "Video Editor",
+        "zh-CN": "剪辑师",
+        "ru-RU": "Монтажёр",
+        "uk-UA": "Монтажер"
+      },
+      "description_i18n": {
+        "en-US": "Cut storyboard, assets, and music into a reviewable timeline; deliver a render only when tools are available.",
+        "zh-CN": "把分镜、素材和配乐剪成可审查时间线；有渲染工具才交付成片",
+        "ru-RU": "Монтирует раскадровку, ассеты и музыку в таймлайн; финальный рендер — только при наличии инструментов.",
+        "uk-UA": "Монтує розкадровку, асети й музику в таймлайн; фінальний рендер — лише за наявності інструментів."
+      }
     },
     {
       "id": "promo-music-director",
       "sort_order": 1750,
       "default_enabled": false,
       "name": "音乐总监",
-      "description": "写出可生成的英文 BGM prompt，并按镜头卡点",
+      "description": "Write generatable English BGM prompts and hit the cut points.",
       "avatar": "avatars/promo-music-director.png",
       "agent_ref": "aionrs",
       "enabled_skills": [
         "bgm-prompting"
       ],
-      "rule_file": "rules/promo-music-director.md"
+      "rule_file": "rules/promo-music-director.md",
+      "name_i18n": {
+        "en-US": "Music Director",
+        "zh-CN": "音乐总监",
+        "ru-RU": "Музыкальный директор",
+        "uk-UA": "Музичний директор"
+      },
+      "description_i18n": {
+        "en-US": "Write generatable English BGM prompts and hit the cut points.",
+        "zh-CN": "写出可生成的英文 BGM prompt，并按镜头卡点",
+        "ru-RU": "Пишет генерируемые английские BGM-промпты и ставит акценты по кадрам.",
+        "uk-UA": "Пише англійські BGM-промпти й розставляє акценти за кадрами."
+      }
     },
     {
       "id": "spatial-GameDesigner",
@@ -1279,7 +1390,19 @@
         "把这个一句话概念拆成设计支柱、核心循环和最小可玩原型",
         "帮我画经济来源与消耗，并标出通胀和死循环风险",
         "这个机制不好玩但说不清原因，从反馈通道到选择深度帮我诊断"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Game Designer",
+        "zh-CN": "游戏设计师",
+        "ru-RU": "Game Designer",
+        "uk-UA": "Game Designer"
+      },
+      "description_i18n": {
+        "en-US": "Turn gameplay into a verifiable core loop, economy, and minimum prototype scope.",
+        "zh-CN": "把玩法做成可验证的核心循环、经济模型和最小原型范围",
+        "ru-RU": "Turn gameplay into a verifiable core loop, economy, and minimum prototype scope.",
+        "uk-UA": "Turn gameplay into a verifiable core loop, economy, and minimum prototype scope."
+      }
     },
     {
       "id": "spatial-TechnicalArtist",
@@ -1294,7 +1417,19 @@
         "按移动端 30fps 给这套场景出材质分级、贴图预算和一张目标光照图",
         "角色装备过亮、场景脏，帮我定可复用材质参数和禁止项",
         "VFX 把 fillrate 打满了，帮我做质量和性能的降级方案"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Technical Artist",
+        "zh-CN": "技术美术",
+        "ru-RU": "Technical Artist",
+        "uk-UA": "Technical Artist"
+      },
+      "description_i18n": {
+        "en-US": "Land materials, VFX, asset specs, and picture goals inside the target frame budget.",
+        "zh-CN": "在目标帧预算内落地材质、VFX、资产规范和画面目标",
+        "ru-RU": "Land materials, VFX, asset specs, and picture goals inside the target frame budget.",
+        "uk-UA": "Land materials, VFX, asset specs, and picture goals inside the target frame budget."
+      }
     },
     {
       "id": "spatial-NarrativeDesigner",
@@ -1309,7 +1444,19 @@
         "根据这个设定写出三幕结构和第一场可配音对白",
         "设计一个会改变后续关卡的关键选择，并写出失败/成功两支",
         "剧情说明太多，帮我改成环境叙事和短对白"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Narrative Designer",
+        "zh-CN": "叙事设计师",
+        "ru-RU": "Narrative Designer",
+        "uk-UA": "Narrative Designer"
+      },
+      "description_i18n": {
+        "en-US": "Write branchable, voicable, testable story and dialogue.",
+        "zh-CN": "把世界观写成可分支、可配音、可验收的剧情与对白",
+        "ru-RU": "Write branchable, voicable, testable story and dialogue.",
+        "uk-UA": "Write branchable, voicable, testable story and dialogue."
+      }
     },
     {
       "id": "spatial-LevelDesigner",
@@ -1324,7 +1471,19 @@
         "设计一个 8 分钟教程关：灰盒尺寸、遭遇和一张地标概念图",
         "玩家在这个区域迷路，帮我重做视线、地标和节奏",
         "给竞技地图做出生安全、轮转和制高点检查"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Level Designer",
+        "zh-CN": "关卡设计师",
+        "ru-RU": "Level Designer",
+        "uk-UA": "Level Designer"
+      },
+      "description_i18n": {
+        "en-US": "Shape playable spaces with pacing and guidance, plus key-room concepts.",
+        "zh-CN": "用空间、节奏和引导把关卡做成可玩的体验，并出关键房间概念",
+        "ru-RU": "Shape playable spaces with pacing and guidance, plus key-room concepts.",
+        "uk-UA": "Shape playable spaces with pacing and guidance, plus key-room concepts."
+      }
     },
     {
       "id": "spatial-GameAudioEngineer",
@@ -1339,7 +1498,19 @@
         "给核心战斗出事件清单、优先级、总线和内存预算",
         "设计随紧张度变化的自适应音乐层，并写集成接口",
         "音频线程偶发卡顿，帮我查回调里的阻塞和跨线程问题"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Game Audio Engineer",
+        "zh-CN": "游戏音频工程师",
+        "ru-RU": "Game Audio Engineer",
+        "uk-UA": "Game Audio Engineer"
+      },
+      "description_i18n": {
+        "en-US": "Design integrable music and SFX under event, bus, and realtime-thread constraints.",
+        "zh-CN": "按事件、总线和实时线程约束设计可集成的音乐与音效",
+        "ru-RU": "Design integrable music and SFX under event, bus, and realtime-thread constraints.",
+        "uk-UA": "Design integrable music and SFX under event, bus, and realtime-thread constraints."
+      }
     },
     {
       "id": "spatial-UnityArchitect",
@@ -1354,7 +1525,19 @@
         "审核当前程序集和场景依赖，给出最小解耦改造路径",
         "用 ScriptableObject 做配置和事件，但不要把场景实例塞进去",
         "规划 Addressables 加载、释放和场景切换，避免泄漏"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Unity Architect",
+        "zh-CN": "Unity 架构师",
+        "ru-RU": "Unity Architect",
+        "uk-UA": "Unity Architect"
+      },
+      "description_i18n": {
+        "en-US": "Design testable, hot-reloadable Unity module, data, and asset boundaries.",
+        "zh-CN": "设计可测试、可热更的 Unity 模块边界、数据和资源策略",
+        "ru-RU": "Design testable, hot-reloadable Unity module, data, and asset boundaries.",
+        "uk-UA": "Design testable, hot-reloadable Unity module, data, and asset boundaries."
+      }
     },
     {
       "id": "spatial-UnrealSystemEngineer",
@@ -1369,7 +1552,19 @@
         "用 Gameplay Ability System 设计技能、冷却和复制边界",
         "现有 Actor 逻辑太散，帮我收成子系统和模块接口",
         "列出这个系统在目标 UE 版本上的 API 假设和替代方案"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Unreal Systems Engineer",
+        "zh-CN": "Unreal 系统工程师",
+        "ru-RU": "Unreal Systems Engineer",
+        "uk-UA": "Unreal Systems Engineer"
+      },
+      "description_i18n": {
+        "en-US": "Build maintainable Unreal gameplay with GAS, subsystems, and replication.",
+        "zh-CN": "用 GAS、子系统和复制把玩法做成可维护的 Unreal 系统",
+        "ru-RU": "Build maintainable Unreal gameplay with GAS, subsystems, and replication.",
+        "uk-UA": "Build maintainable Unreal gameplay with GAS, subsystems, and replication."
+      }
     },
     {
       "id": "spatial-UnrealWorldBuilder",
@@ -1384,7 +1579,19 @@
         "按玩家移速和内存预算规划分区网格、加载范围和地标",
         "给一个生物群系出 PCG 密度、排除区和一张远景概念图",
         "高速载具穿越会 hitch，帮我做流送和 HLOD 验证路线"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Unreal World Builder",
+        "zh-CN": "Unreal 世界构建师",
+        "ru-RU": "Unreal World Builder",
+        "uk-UA": "Unreal World Builder"
+      },
+      "description_i18n": {
+        "en-US": "Build streamable open worlds with World Partition, HLOD, and PCG.",
+        "zh-CN": "用 World Partition、HLOD 和 PCG 搭建可流送的开放世界",
+        "ru-RU": "Build streamable open worlds with World Partition, HLOD, and PCG.",
+        "uk-UA": "Build streamable open worlds with World Partition, HLOD, and PCG."
+      }
     },
     {
       "id": "spatial-UnrealMultiplayerArchitect",
@@ -1399,7 +1606,19 @@
         "为射击核心循环设计复制、预测和回滚，哪些必须服务器权威",
         "经济与掉落不能信客户端，帮我划 RPC 和校验边界",
         "延迟 120ms 时手感差，给出可测的补偿和带宽预算"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Unreal Multiplayer Architect",
+        "zh-CN": "Unreal 多人架构师",
+        "ru-RU": "Unreal Multiplayer Architect",
+        "uk-UA": "Unreal Multiplayer Architect"
+      },
+      "description_i18n": {
+        "en-US": "Design server-authoritative Unreal replication, prediction, and anti-cheat boundaries.",
+        "zh-CN": "设计服务端权威的 Unreal 复制、预测与反作弊边界",
+        "ru-RU": "Design server-authoritative Unreal replication, prediction, and anti-cheat boundaries.",
+        "uk-UA": "Design server-authoritative Unreal replication, prediction, and anti-cheat boundaries."
+      }
     },
     {
       "id": "spatial-UnrealTechnicalArtist",
@@ -1414,7 +1633,19 @@
         "给这套场景出材质函数、质量分级和一张目标光照图",
         "Niagara 在中端机掉帧，帮我做 LOD 和生成上限",
         "Lumen 在室内漏光，给出可验证的排查步骤"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Unreal Technical Artist",
+        "zh-CN": "Unreal 技术美术",
+        "ru-RU": "Unreal Technical Artist",
+        "uk-UA": "Unreal Technical Artist"
+      },
+      "description_i18n": {
+        "en-US": "Land the picture on target platforms with materials, Niagara, Nanite/Lumen constraints.",
+        "zh-CN": "用材质、Niagara、Nanite/Lumen 约束把画面落到目标平台",
+        "ru-RU": "Land the picture on target platforms with materials, Niagara, Nanite/Lumen constraints.",
+        "uk-UA": "Land the picture on target platforms with materials, Niagara, Nanite/Lumen constraints."
+      }
     },
     {
       "id": "spatial-UnityMultiplayerEngineer",
@@ -1429,7 +1660,19 @@
         "用 NGO 做主机权威移动同步，并写清作弊与断线边界",
         "不要用纯 P2P 做经济和竞技，帮我改成独立权威或明确风险",
         "设计快照、插值和带宽预算，避免每帧同步全量状态"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Unity Multiplayer Engineer",
+        "zh-CN": "Unity 多人工程师",
+        "ru-RU": "Unity Multiplayer Engineer",
+        "uk-UA": "Unity Multiplayer Engineer"
+      },
+      "description_i18n": {
+        "en-US": "Build latency compensation and server-authoritative sync with Netcode; flag P2P risks.",
+        "zh-CN": "用 Netcode 做延迟补偿与服务端权威同步，并标明 P2P 风险",
+        "ru-RU": "Build latency compensation and server-authoritative sync with Netcode; flag P2P risks.",
+        "uk-UA": "Build latency compensation and server-authoritative sync with Netcode; flag P2P risks."
+      }
     },
     {
       "id": "spatial-UnityShaderGraphArtist",
@@ -1444,7 +1687,19 @@
         "做一层湿润岩石材质：参数给美术，移动端要有降级",
         "这个溶解特效在 URP 上过亮，帮我改节点并出目标图",
         "把常用效果收成可复用 Sub Graph，写清参数含义"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Unity Shader Graph Artist",
+        "zh-CN": "Unity 着色器艺术家",
+        "ru-RU": "Unity Shader Graph Artist",
+        "uk-UA": "Unity Shader Graph Artist"
+      },
+      "description_i18n": {
+        "en-US": "Build scalable Shader Graph materials and show the target look first.",
+        "zh-CN": "用 Shader Graph 做可分级、可维护的实时材质，并出目标效果图",
+        "ru-RU": "Build scalable Shader Graph materials and show the target look first.",
+        "uk-UA": "Build scalable Shader Graph materials and show the target look first."
+      }
     },
     {
       "id": "spatial-UnityEditorToolDeveloper",
@@ -1459,7 +1714,19 @@
         "做一个资源导入校验：命名、压缩、读写权限一次查完",
         "给策划做关卡标记窗口，写入 ScriptableObject 而不是改场景隐藏物体",
         "用 AssetPostprocessor 自动处理贴图，失败要可回滚"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Unity Editor Tool Developer",
+        "zh-CN": "Unity 工具开发者",
+        "ru-RU": "Unity Editor Tool Developer",
+        "uk-UA": "Unity Editor Tool Developer"
+      },
+      "description_i18n": {
+        "en-US": "Build editor windows, import pipelines, and validators to cut hand error.",
+        "zh-CN": "做编辑器窗口、导入管线和校验工具，减少手工误差",
+        "ru-RU": "Build editor windows, import pipelines, and validators to cut hand error.",
+        "uk-UA": "Build editor windows, import pipelines, and validators to cut hand error."
+      }
     },
     {
       "id": "spatial-GodotGameScriptEngineer",
@@ -1474,7 +1741,19 @@
         "按组合节点重做角色控制器，信号和所有权写清楚",
         "这个场景在重载后状态错乱，帮我查持久化与生命周期",
         "给出 Godot 4.x 版本下的 API，不编造已移除的写法"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Godot Gameplay Engineer",
+        "zh-CN": "Godot 脚本工程师",
+        "ru-RU": "Godot Gameplay Engineer",
+        "uk-UA": "Godot Gameplay Engineer"
+      },
+      "description_i18n": {
+        "en-US": "Build stable reusable Godot gameplay with scene trees, signals, and resources.",
+        "zh-CN": "用场景树、信号和资源做出稳定可复用的 Godot 玩法",
+        "ru-RU": "Build stable reusable Godot gameplay with scene trees, signals, and resources.",
+        "uk-UA": "Build stable reusable Godot gameplay with scene trees, signals, and resources."
+      }
     },
     {
       "id": "spatial-GodotMultiplayerEngineer",
@@ -1489,7 +1768,19 @@
         "设计 MultiplayerSpawner 与权威移动，客户端只发输入",
         "RPC 太多导致抖动，帮我改成状态同步和优先级",
         "主机掉线后如何迁移权威，写出可测步骤"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Godot Multiplayer Engineer",
+        "zh-CN": "Godot 多人工程师",
+        "ru-RU": "Godot Multiplayer Engineer",
+        "uk-UA": "Godot Multiplayer Engineer"
+      },
+      "description_i18n": {
+        "en-US": "Build authoritative sync, spawn replication, and reconnect with MultiplayerAPI.",
+        "zh-CN": "用 MultiplayerAPI 做权威同步、生成复制和断线恢复",
+        "ru-RU": "Build authoritative sync, spawn replication, and reconnect with MultiplayerAPI.",
+        "uk-UA": "Build authoritative sync, spawn replication, and reconnect with MultiplayerAPI."
+      }
     },
     {
       "id": "spatial-GodotShaderDeveloper",
@@ -1504,7 +1795,19 @@
         "写一个可参数化的边缘光 shader，并出移动端降级版",
         "后处理全屏过耗，帮我改成局部或降分辨率路径",
         "先出目标效果图，再给 spatial/canvas_item 代码"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Godot Shader Developer",
+        "zh-CN": "Godot 着色器开发者",
+        "ru-RU": "Godot Shader Developer",
+        "uk-UA": "Godot Shader Developer"
+      },
+      "description_i18n": {
+        "en-US": "Write Godot shaders inside mobile fillrate; show the target look before code.",
+        "zh-CN": "写 Godot 着色器并守住移动端 fillrate，先出目标效果再给代码",
+        "ru-RU": "Write Godot shaders inside mobile fillrate; show the target look before code.",
+        "uk-UA": "Write Godot shaders inside mobile fillrate; show the target look before code."
+      }
     },
     {
       "id": "spatial-RobloxExperienceDesigner",
@@ -1519,7 +1822,19 @@
         "设计 10 分钟新手会话：社交钩子、循环和安全边界",
         "这个地图留不住人，从会话目标和反馈帮我改",
         "埋点只保留必要事件，不采集聊天和可识别信息"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Roblox Experience Designer",
+        "zh-CN": "Roblox 体验设计师",
+        "ru-RU": "Roblox Experience Designer",
+        "uk-UA": "Roblox Experience Designer"
+      },
+      "description_i18n": {
+        "en-US": "Design retainable Roblox experiences for kids and social spaces with privacy-minimized telemetry.",
+        "zh-CN": "面向儿童与社交场设计可留存的 Roblox 体验，埋点遵守隐私最小化",
+        "ru-RU": "Design retainable Roblox experiences for kids and social spaces with privacy-minimized telemetry.",
+        "uk-UA": "Design retainable Roblox experiences for kids and social spaces with privacy-minimized telemetry."
+      }
     },
     {
       "id": "spatial-RobloxSystemScriptEngineer",
@@ -1534,7 +1849,19 @@
         "经济与背包必须服务端权威，写出 Remote 校验",
         "DataStore 失败和会话冲突怎么恢复，给重试与回滚",
         "客户端只负责表现，帮我拆现有脚本的信任边界"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Roblox Systems Engineer",
+        "zh-CN": "Roblox 脚本工程师",
+        "ru-RU": "Roblox Systems Engineer",
+        "uk-UA": "Roblox Systems Engineer"
+      },
+      "description_i18n": {
+        "en-US": "Build safe, scalable data and gameplay with server-authoritative Luau.",
+        "zh-CN": "用服务端权威 Luau 做安全、可扩展的数据与玩法系统",
+        "ru-RU": "Build safe, scalable data and gameplay with server-authoritative Luau.",
+        "uk-UA": "Build safe, scalable data and gameplay with server-authoritative Luau."
+      }
     },
     {
       "id": "spatial-RobloxAvatarCreator",
@@ -1549,7 +1876,19 @@
         "按 UGC 规范设计一套可分层服装，并出三视图概念",
         "配件穿模、面数超标，帮我改结构和预算",
         "给捏脸参数出安全范围，避免违规或不可读的脸"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Roblox Avatar Creator",
+        "zh-CN": "Roblox 形象创作者",
+        "ru-RU": "Roblox Avatar Creator",
+        "uk-UA": "Roblox Avatar Creator"
+      },
+      "description_i18n": {
+        "en-US": "Make UGC-compliant, equippable, performant avatars and show the look.",
+        "zh-CN": "做符合 UGC 规范、可装备且性能合格的虚拟形象，并出造型图",
+        "ru-RU": "Make UGC-compliant, equippable, performant avatars and show the look.",
+        "uk-UA": "Make UGC-compliant, equippable, performant avatars and show the look."
+      }
     },
     {
       "id": "spatial-VisionOsSpatialEngineer",
@@ -1564,7 +1903,19 @@
         "设计一个体积窗口应用：锚定、手势和舒适距离",
         "沉浸切换时丢失上下文，帮我做过渡和回退",
         "先出空间布局概念图，再给 RealityKit 结构"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "visionOS Spatial Engineer",
+        "zh-CN": "visionOS 空间工程师",
+        "ru-RU": "visionOS Spatial Engineer",
+        "uk-UA": "visionOS Spatial Engineer"
+      },
+      "description_i18n": {
+        "en-US": "Build window, volume, and spatial-anchor experiences with RealityKit.",
+        "zh-CN": "用 RealityKit 做窗口、体积与空间锚点体验，并出空间布局概念",
+        "ru-RU": "Build window, volume, and spatial-anchor experiences with RealityKit.",
+        "uk-UA": "Build window, volume, and spatial-anchor experiences with RealityKit."
+      }
     },
     {
       "id": "spatial-MacOsSpatialMetalEngineer",
@@ -1579,7 +1930,19 @@
         "规划 Metal 渲染通道、资源驻留和帧预算",
         "和 RealityKit 混用时同步出问题，帮我划所有权",
         "给出可在 Xcode 里验证的 GPU 抓帧步骤"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "Metal Spatial Engineer",
+        "zh-CN": "Metal 空间工程师",
+        "ru-RU": "Metal Spatial Engineer",
+        "uk-UA": "Metal Spatial Engineer"
+      },
+      "description_i18n": {
+        "en-US": "Build macOS spatial rendering paths and budgets with Metal and RealityKit.",
+        "zh-CN": "用 Metal 与 RealityKit 做 macOS 空间渲染路径和性能预算",
+        "ru-RU": "Build macOS spatial rendering paths and budgets with Metal and RealityKit.",
+        "uk-UA": "Build macOS spatial rendering paths and budgets with Metal and RealityKit."
+      }
     },
     {
       "id": "spatial-XrImmersiveDeveloper",
@@ -1594,7 +1957,19 @@
         "设计站立式 6DoF 体验：传送、边界和舒适度",
         "定位丢失时怎么降级，不要让玩家穿模或摔倒",
         "出一张沉浸布局概念图，再给交互和性能预算"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "XR Immersive Developer",
+        "zh-CN": "XR 沉浸式开发者",
+        "ru-RU": "XR Immersive Developer",
+        "uk-UA": "XR Immersive Developer"
+      },
+      "description_i18n": {
+        "en-US": "Build comfortable, locatable, interactive XR scenes; show the layout first.",
+        "zh-CN": "做舒适、可定位、可交互的 XR 场景，并先出沉浸布局图",
+        "ru-RU": "Build comfortable, locatable, interactive XR scenes; show the layout first.",
+        "uk-UA": "Build comfortable, locatable, interactive XR scenes; show the layout first."
+      }
     },
     {
       "id": "spatial-XrInterfaceArchitect",
@@ -1609,7 +1984,19 @@
         "把这个设置菜单改成空间面板：距离、角度和可读字号",
         "注视加手势容易误触，帮我做确认和取消",
         "出三张界面布局概念，再给组件层级"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "XR Interface Architect",
+        "zh-CN": "XR 界面架构师",
+        "ru-RU": "XR Interface Architect",
+        "uk-UA": "XR Interface Architect"
+      },
+      "description_i18n": {
+        "en-US": "Design spatial UI, gaze/gesture, and readability; do not paste flat HUDs into XR.",
+        "zh-CN": "设计空间 UI、注视/手势与可读性，避免平面 HUD 硬搬进 XR",
+        "ru-RU": "Design spatial UI, gaze/gesture, and readability; do not paste flat HUDs into XR.",
+        "uk-UA": "Design spatial UI, gaze/gesture, and readability; do not paste flat HUDs into XR."
+      }
     },
     {
       "id": "spatial-XrCockpitInteractionExpert",
@@ -1624,7 +2011,19 @@
         "设计方向盘与中控的手部交互，误触不能影响驾驶安全",
         "HUD 信息过载，帮我做层级和出现时机",
         "出座舱布局概念图，标出可达范围和禁止遮挡区"
-      ]
+      ],
+      "name_i18n": {
+        "en-US": "XR Cockpit Interaction Expert",
+        "zh-CN": "XR 座舱交互专家",
+        "ru-RU": "XR Cockpit Interaction Expert",
+        "uk-UA": "XR Cockpit Interaction Expert"
+      },
+      "description_i18n": {
+        "en-US": "Design cockpit controls, hand tracking, and mis-touch guards; safety over spectacle.",
+        "zh-CN": "设计座舱控件、手部追踪与误触防护，安全优先于炫技",
+        "ru-RU": "Design cockpit controls, hand tracking, and mis-touch guards; safety over spectacle.",
+        "uk-UA": "Design cockpit controls, hand tracking, and mis-touch guards; safety over spectacle."
+      }
     }
   ]
 }

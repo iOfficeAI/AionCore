@@ -1229,7 +1229,7 @@ impl ConversationService {
             }
             None => None,
         };
-        let selected_session_mcp_servers = match extra.as_object_mut() {
+        let mut selected_session_mcp_servers = match extra.as_object_mut() {
             Some(obj) => match obj.remove("selected_session_mcp_servers") {
                 Some(value) => Some(serde_json::from_value::<Vec<SessionMcpServer>>(value).map_err(|e| {
                     ConversationError::BadRequest {
@@ -1255,15 +1255,16 @@ impl ConversationService {
             .ok()
             .and_then(|guard| guard.as_ref().cloned());
         if let Some(repo) = repo {
+            let catalog = repo
+                .list(user_id)
+                .await
+                .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?;
             let rows = match selected_mcp_server_ids.as_ref() {
                 Some(ids) => repo
                     .list_by_ids_any(user_id, ids)
                     .await
                     .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?,
-                None => repo
-                    .list(user_id)
-                    .await
-                    .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?,
+                None => catalog.clone(),
             };
             let selected_rows = rows
                 .into_iter()
@@ -1284,6 +1285,9 @@ impl ConversationService {
                     classify_repo_mcp_status(row, mcp_support),
                 );
             }
+            let mut session_servers = selected_session_mcp_servers.take().unwrap_or_default();
+            merge_enabled_builtin_session_mcp(&mut session_servers, &catalog);
+            selected_session_mcp_servers = (!session_servers.is_empty()).then_some(session_servers);
         }
 
         if let Some(session_servers) = selected_session_mcp_servers.as_ref() {
@@ -5087,6 +5091,97 @@ pub(crate) async fn apply_agent_title(
     Ok(true)
 }
 
+/// Parse a catalog row into the session MCP snapshot shape Guid already sends.
+/// Builtin rows are skipped by factory resolvers, so Team/cron creates must
+/// snapshot enabled builtins here or the agent never sees image generation.
+fn session_mcp_from_repo_row(row: &aionui_db::models::McpServerRow) -> Result<SessionMcpServer, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(&row.transport_config).map_err(|e| format!("invalid transport config: {e}"))?;
+    let headers = |field: Option<&serde_json::Value>| {
+        field
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let transport = match row.transport_type.as_str() {
+        "stdio" => {
+            let command = value
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "stdio transport is missing command".to_owned())?
+                .to_owned();
+            let args = value
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let env = value
+                .get("env")
+                .and_then(serde_json::Value::as_object)
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            SessionMcpTransport::Stdio { command, args, env }
+        }
+        "http" | "streamable_http" => {
+            let url = value
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "http transport is missing url".to_owned())?
+                .to_owned();
+            SessionMcpTransport::StreamableHttp {
+                url,
+                headers: headers(value.get("headers")),
+            }
+        }
+        "sse" => {
+            let url = value
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "sse transport is missing url".to_owned())?
+                .to_owned();
+            SessionMcpTransport::Sse {
+                url,
+                headers: headers(value.get("headers")),
+            }
+        }
+        other => return Err(format!("unknown transport type: {other}")),
+    };
+    Ok(SessionMcpServer {
+        id: row.id.clone(),
+        name: row.name.clone(),
+        transport,
+    })
+}
+
+fn merge_enabled_builtin_session_mcp(
+    existing: &mut Vec<SessionMcpServer>,
+    rows: &[aionui_db::models::McpServerRow],
+) {
+    let present: HashSet<String> = existing.iter().map(|server| server.id.clone()).collect();
+    for row in rows {
+        if !row.builtin || !row.enabled || present.contains(&row.id) {
+            continue;
+        }
+        match session_mcp_from_repo_row(row) {
+            Ok(server) => existing.push(server),
+            Err(error) => warn!(
+                server_id = %row.id,
+                server_name = %row.name,
+                error = %error,
+                "skipping enabled builtin MCP that could not be snapshotted"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5288,5 +5383,92 @@ mod tests {
         );
 
         assert_eq!(status.status, ConversationMcpStatusKind::Failed);
+    }
+
+    fn mcp_row(id: &str, name: &str, builtin: bool, enabled: bool, config: &str) -> aionui_db::models::McpServerRow {
+        aionui_db::models::McpServerRow {
+            id: id.into(),
+            user_id: "user-1".into(),
+            name: name.into(),
+            description: None,
+            enabled,
+            transport_type: "stdio".into(),
+            transport_config: config.into(),
+            tools: None,
+            last_test_status: "disconnected".into(),
+            last_connected: None,
+            original_json: None,
+            builtin,
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn merge_enabled_builtin_session_mcp_injects_enabled_builtins() {
+        let mut existing = Vec::new();
+        let rows = vec![
+            mcp_row(
+                "builtin-image",
+                "aionui_image_generation",
+                true,
+                true,
+                r#"{"command":"node","args":["/app/builtin-mcp-image-gen.js"],"env":{}}"#,
+            ),
+            mcp_row(
+                "user-mcp",
+                "custom",
+                false,
+                true,
+                r#"{"command":"npx","args":["-y","demo"],"env":{}}"#,
+            ),
+            mcp_row(
+                "builtin-off",
+                "chrome-devtools",
+                true,
+                false,
+                r#"{"command":"npx","args":["-y","chrome-devtools-mcp"],"env":{}}"#,
+            ),
+        ];
+        merge_enabled_builtin_session_mcp(&mut existing, &rows);
+        assert_eq!(existing.len(), 1);
+        assert_eq!(existing[0].id, "builtin-image");
+        assert_eq!(existing[0].name, "aionui_image_generation");
+        match &existing[0].transport {
+            SessionMcpTransport::Stdio { command, args, .. } => {
+                assert_eq!(command, "node");
+                assert_eq!(args, &["/app/builtin-mcp-image-gen.js".to_owned()]);
+            }
+            other => panic!("expected stdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_enabled_builtin_session_mcp_does_not_duplicate_guid_snapshot() {
+        let mut existing = vec![SessionMcpServer {
+            id: "builtin-image".into(),
+            name: "aionui_image_generation".into(),
+            transport: SessionMcpTransport::Stdio {
+                command: "node".into(),
+                args: vec!["already-present.js".into()],
+                env: HashMap::new(),
+            },
+        }];
+        let rows = vec![mcp_row(
+            "builtin-image",
+            "aionui_image_generation",
+            true,
+            true,
+            r#"{"command":"node","args":["/other.js"],"env":{}}"#,
+        )];
+        merge_enabled_builtin_session_mcp(&mut existing, &rows);
+        assert_eq!(existing.len(), 1);
+        match &existing[0].transport {
+            SessionMcpTransport::Stdio { args, .. } => {
+                assert_eq!(args, &["already-present.js".to_owned()]);
+            }
+            other => panic!("expected stdio, got {other:?}"),
+        }
     }
 }

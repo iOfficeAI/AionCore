@@ -82,7 +82,7 @@ Version choice is THE quality lever, and the right answer differs by body plan (
 After downloading the rig GLB and before spending retarget credits, validate the skeleton:
 
 ```bash
-python3 .../threejs_3d_asset.py validate-rig path/to/rig-model.glb --rig-type biped
+node .../threejs_3d_asset.mjs validate-rig path/to/rig-model.glb --rig-type biped
 ```
 
 A structurally valid rig has both `_Left_Limb_` and `_Right_Limb_` chains with matching chain depths per limb row (±1 bone is normal variance; healthy rigs are 5/5, 6/6, or 6/5 — broken ones are 9/4, 2/4, or 4/1, and a 1-bone leg cannot bend a knee, warping every clip), at least 3 bones per limb chain for biped/quadruped, two limb rows (`0_` arms, `1_` legs), and a plausible bone count. v1.0 rigs use anatomical names instead (validated as L_/R_ pairs: Clavicle, Upperarm, Forearm, Hand, Thigh, Calf, Foot). The `character-pipeline` command runs this check automatically; `validate-rig` runs it standalone, and `validate-animation` QAs the retargeted clips (scale tracks, limb-stretch translations, durations, channel coverage).

@@ -18,10 +18,10 @@ Never store API keys in skill files or client-side game code, and never paste a 
 Step 0, before declaring the key unavailable: run this skill's own probe and paste its literal output into the report.
 
 ```bash
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py probe   # prints TRIPO_API_KEY=SET|MISSING
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs probe   # prints TRIPO_API_KEY=SET|MISSING
 ```
 
-`TRIPO_API_KEY=MISSING` is only a valid skip/blocker reason when this output is shown. Keys defined only in a shell profile can be absent from the process env; if the plain probe prints MISSING unexpectedly, wrap it: `zsh -lc 'source ~/.zprofile 2>/dev/null || true; source ~/.zshrc 2>/dev/null || true; python3 <this-skill-dir>/scripts/threejs_3d_asset.py probe'`. When the director skill is loaded, prefer `threejs-game-director/scripts/probe_asset_credentials.sh`, which probes all three asset keys at once.
+Prefer the Node script (Windows has no `python3` by default). `python3 .../threejs_3d_asset.py` is fallback only. Never run bare `python` (Windows Store stub). `TRIPO_API_KEY=MISSING` is only a valid skip/blocker reason when this output is shown. Keys defined only in a shell profile can be absent from the process env; if the plain probe prints MISSING unexpectedly on Unix, wrap it: `zsh -lc 'source ~/.zprofile 2>/dev/null || true; source ~/.zshrc 2>/dev/null || true; node <this-skill-dir>/scripts/threejs_3d_asset.mjs probe'`. When the director skill is loaded, prefer `threejs-game-director/scripts/probe_asset_credentials.mjs`, which probes all three asset keys at once.
 
 Generated model download URLs expire quickly, so download outputs immediately after successful tasks.
 
@@ -38,7 +38,7 @@ Track required references in a reference ledger with yes/no, path, and failure r
 Run from the user's current project directory:
 
 ```bash
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py --help
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs --help
 ```
 
 ## Common Commands
@@ -46,7 +46,7 @@ python3 <this-skill-dir>/scripts/threejs_3d_asset.py --help
 Recommended premium game hero model:
 
 ```bash
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py text \
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs text \
   --prompt "game-ready [hero asset], strong readable silhouette, layered hard-surface detail, PBR materials, clean topology for browser game, centered pivot, 3/4 view, no text" \
   --model-version v3.1-20260211 \
   --texture-quality detailed \
@@ -57,7 +57,7 @@ python3 <this-skill-dir>/scripts/threejs_3d_asset.py text \
 Text to 3D:
 
 ```bash
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py text \
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs text \
   --prompt "game-ready sci-fi hover bike, sleek armored panels, readable silhouette, PBR, front facing" \
   --model-version v3.1-20260211 \
   --texture-quality detailed \
@@ -68,7 +68,7 @@ python3 <this-skill-dir>/scripts/threejs_3d_asset.py text \
 Image to 3D from a local `threejs-image-generator` concept:
 
 ```bash
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py image \
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs image \
   --image assets/concepts/hover-bike-front.png \
   --model-version v3.1-20260211 \
   --enable-image-autofix \
@@ -80,25 +80,25 @@ python3 <this-skill-dir>/scripts/threejs_3d_asset.py image \
 Status and download:
 
 ```bash
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py status TASK_ID
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py download TASK_ID --out-dir assets/models
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs status TASK_ID
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs download TASK_ID --out-dir assets/models
 ```
 
 Texture, rig, animate, or convert:
 
 ```bash
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py postprocess \
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs postprocess \
   --type texture_model --original-task-id TASK_ID \
   --texture-prompt "brushed gunmetal, orange hazard decals, worn edges" \
   --wait --download --out-dir assets/models/retextured
 
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py postprocess \
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs postprocess \
   --type animate_prerigcheck --original-task-id TASK_ID --wait
 
 # Rig version is routed by --rig-type: biped -> v1.0-20240301 (the v2.x rigger
 # fails on humanoids), other body plans -> v2.5-20260210. Only pass
 # --model-version to override that routing.
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py postprocess \
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs postprocess \
   --type animate_rig --original-task-id TASK_ID --rig-type biped --spec tripo --wait
 
 # animate_retarget takes the RIG task ID, not the generation task ID.
@@ -107,16 +107,16 @@ python3 <this-skill-dir>/scripts/threejs_3d_asset.py postprocess \
 # Non-biped rigs may batch up to 5 presets per task via --animations.
 # NEVER pass --animate-in-place: it corrupts the bake (mirrored limbs / exploded
 # skinning). Strip root motion in the engine instead.
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py postprocess \
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs postprocess \
   --type animate_retarget --original-task-id RIG_TASK_ID --rig-type quadruped \
   --animations preset:idle,preset:walk,preset:run \
   --wait --download --out-dir assets/models/animated
 
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py postprocess \
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs postprocess \
   --type conversion --original-task-id TASK_ID --format GLTF \
   --face-limit 20000 --wait --download --out-dir assets/models/gltf
 
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py postprocess \
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs postprocess \
   --type stylize_model --original-task-id TASK_ID --style voxel \
   --wait --download --out-dir assets/models/voxel
 ```
@@ -124,13 +124,13 @@ python3 <this-skill-dir>/scripts/threejs_3d_asset.py postprocess \
 Animated character pipeline (generation -> prerigcheck -> validated rig with retries -> retargets -> downloads). The pipeline routes itself by body plan: biped characters automatically use the v1.0-20240301 anatomical rig with one FBX per animation (plain preset names are mapped onto the preset:biped:* library); creatures use the v2.5-20260210 rig with GLB clips:
 
 ```bash
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py character-pipeline \
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs character-pipeline \
   --prompt "stylized cyber runner character, T-pose, full body, game-ready outfit, readable silhouette" \
   --animations preset:idle,preset:walk,preset:run,preset:jump \
   --out-dir assets/models/cyber-runner
 
 # Creature example: stance language matters — generate in the pose the preset expects.
-python3 <this-skill-dir>/scripts/threejs_3d_asset.py character-pipeline \
+node <this-skill-dir>/scripts/threejs_3d_asset.mjs character-pipeline \
   --prompt "stylized wolf, quadrupedal stance, all four legs planted and separated, full body" \
   --rig-type quadruped --animations preset:quadruped:walk \
   --out-dir assets/models/wolf
@@ -166,7 +166,7 @@ Load `references/api-notes.md` for the full parameter tables, retarget mechanics
 - Generate characters as one fused mesh: keep `--quad` and `--generate-parts` off (`generate_parts` disables texturing; `quad` forces FBX output).
 - Require full-body T-pose or A-pose, arms away from body, symmetric, no props fused to the silhouette. Verify the rendered preview is actually in T/A-pose before rigging; regenerate if not.
 - Run `animate_prerigcheck` first (it takes no model version) and use the detected `rig_type` for `animate_rig` and preset selection. `riggable=false` means regenerate with a clearer pose, not force-rig.
-- `riggable=true` does not guarantee a usable rig. After rigging, validate the skeleton before retargeting: `threejs_3d_asset.py validate-rig rig-model.glb --rig-type biped` (the `character-pipeline` does this automatically). Check both presence AND chain depth: a rig with a 1-bone leg or 2-bone arm warps every clip.
+- `riggable=true` does not guarantee a usable rig. After rigging, validate the skeleton before retargeting: `node <this-skill-dir>/scripts/threejs_3d_asset.mjs validate-rig rig-model.glb --rig-type biped` (the `character-pipeline` does this automatically). Check both presence AND chain depth: a rig with a 1-bone leg or 2-bone arm warps every clip.
 - Auto-rigging is nondeterministic. On validation failure, retry the rig task (~25 credits) before regenerating the model — `character-pipeline --rig-retries N` (default 2) automates this, and `--model-task-id TASK_ID` resumes from an existing generation. Armored/hard-surface characters need the most retries; organic meshes usually rig first try.
 - Creatures get exactly one preset (walk/march). For multi-mode creatures (crawl + fly dragons), rig the same model twice — ground rig type for the locomotion preset, `avian` for wing chains — and drive wings procedurally in Three.js or via external clips on a `mixamo`-spec rig.
 - Rig version is the main quality lever, and it differs by body plan (measured June 2026). The `character-pipeline` routes this automatically; only override `--rig-model-version` deliberately:
@@ -178,7 +178,7 @@ Load `references/api-notes.md` for the full parameter tables, retarget mechanics
 - `animate_retarget` takes the RIG task ID (not the generation task ID). Batch up to 5 presets per task with `--animations`; batched clips return named `NlaTrack`, `NlaTrack.001`, … in request order — map by index and rename after import. See `references/api-notes.md` for the v1.0-vs-v2.5 batching and out-format rules.
 - Only 16 presets exist for v2.5 rigs (no `preset:attack`; use `preset:slash`/`preset:shoot`). Non-biped rig types have a single locomotion preset each; plan extra creature motion procedurally or via external retargeting.
 - A creature's MESH STANCE drives how presets read: a quadruped walk on an upright-standing dragon looks like a human walking. Generate creatures in the stance the animation expects (horizontal body, all fours planted) — the pipeline only auto-appends T-pose language for biped rigs.
-- After download, run `threejs_3d_asset.py validate-animation clip.glb` (keyframe QA: flags scale tracks, limb-stretching translation tracks, extreme rotations, and reports per-clip duration/channel coverage), then verify motion visually in the engine.
+- After download, run `node <this-skill-dir>/scripts/threejs_3d_asset.mjs validate-animation clip.glb` (keyframe QA: flags scale tracks, limb-stretching translation tracks, extreme rotations, and reports per-clip duration/channel coverage), then verify motion visually in the engine.
 - Never use `--animate-in-place` (verified to corrupt clips: mirrored/crossed limbs on v1.0 rigs, exploded skinning on v2.5 — full detail in `references/api-notes.md`). Keep root motion baked and convert to in-place at import instead; exact engine snippet in `references/threejs-integration.md`.
 - After download, inspect `gltf.animations` clip names and counts before wiring the `AnimationMixer`.
 

@@ -4,7 +4,7 @@ Prototype exception: apply only the install/build/first-input items plus a label
 
 - The project installs with `npm install`.
 - `npm run dev` starts a local Vite server.
-- `npm run play` starts the server and opens the browser (or an equivalent launch that actually opens the page).
+- `npm run play` is the package script; **launch with** `node <gameplay-skill>/scripts/launch_game.mjs <game-dir>` so Vite is detached. Do not foreground `npm run play` in ExecCommand.
 - `npm run build` completes.
 - The first screen is the game, not a landing page.
 - Within 5 seconds the player can tell who they are, where they are, and what to do next.

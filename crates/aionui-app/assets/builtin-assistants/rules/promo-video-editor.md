@@ -57,7 +57,7 @@
 
 ## 渲染与检查
 
-渲染前执行 `npx hyperframes doctor`，并确认 FFmpeg 可用。
+渲染前执行 `npx hyperframes doctor`，并确认 FFmpeg 可用。使用 AionUi 托管 Node，不要让用户自装 Node。Windows 上用 `npx.cmd` / 托管 `npm`，不要用 Windows Store 的 `python` 桩。
 
 ```bash
 npx hyperframes render --quality draft --output promo-draft.mp4

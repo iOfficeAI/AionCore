@@ -33,17 +33,17 @@ Reference files resolve the same way: `<skill-dir>/references/<file>.md`. Siblin
 
 ## Sibling Skill Loading
 
-For a first playable game (`做个游戏`, from-scratch, arcade, cozy, collect), load only these three before writing files:
+For a first playable game (`做个游戏`, from-scratch, arcade, cozy, collect), load only these three before writing files **unless** the parent assistant or user already asked for a complete short game:
 
 1. `threejs-gameplay-systems/SKILL.md` — scaffold create, overlay session, `apply_look.mjs`
 2. `threejs-image-generator/SKILL.md` — sky / ground / HUD icon into `public/look/`
 3. `threejs-audio-generator/SKILL.md` — one `kit` command
 
-Do not load `threejs-aaa-graphics-builder`, `threejs-game-ui-designer`, `threejs-debug-profiler`, `threejs-qa-release`, or `threejs-3d-generator` before the first `LAUNCH_OK` and a screenshot, unless the user's first message already asked for premium, AAA, showcase, high-fidelity, or "less basic". After that screenshot, load the remaining siblings only if the frame is still primitive-dominated or the user asked to polish.
+Do not load `threejs-aaa-graphics-builder`, `threejs-game-ui-designer`, `threejs-debug-profiler`, `threejs-qa-release`, or `threejs-3d-generator` before the first `LAUNCH_OK` and a screenshot, unless the user's first message already asked for premium, AAA, showcase, high-fidelity, "less basic", a complete short game, 3–5 chapters, 成片, 通关, or the parent rule is `game-dev-studio` / `game-3d` / butler mode 6. Those complete-short-game requests are premium from the first turn. After a first-playable screenshot, load the remaining siblings if the frame is still primitive-dominated or the user asked to polish.
 
 For narrow director-invoked work, load the directly relevant sibling plus `threejs-qa-release` when verification is in scope.
 
-When premium/AAA/showcase/"less basic" is in the first message, load the five phase skills and the three generators as before. Do not skip a generator `SKILL.md` before recording that generator as not-needed.
+When premium/AAA/showcase/"less basic"/complete-short-game is in the first message or parent rule, load the five phase skills and the three generators as before. Do not skip a generator `SKILL.md` before recording that generator as not-needed.
 
 ## External Asset Sourcing Gate
 
@@ -51,8 +51,10 @@ When premium/AAA/showcase/"less basic" is in the first message, load the five ph
 - Before claiming an API key is unavailable, run the credential probe and paste its literal `KEY=SET|MISSING` output into the report. Each generator script also has its own `probe` subcommand.
 
 ```bash
-bash <director-skill-dir>/scripts/probe_asset_credentials.sh
+node <director-skill-dir>/scripts/probe_asset_credentials.mjs
 ```
+
+Prefer the Node probe (works on Windows without bash). `bash .../probe_asset_credentials.sh` is Unix fallback only.
 
 - For 2D images in Aion: if `aionui_image_generation` is in the tool list, record `AIONUI_IMAGE_MCP=SET` and use that MCP via `threejs-image-generator`. `GEMINI_API_KEY=MISSING` is not a 2D skip/blocker in that case. Gemini/`uv` is fallback only when the MCP tool is absent or the MCP call failed.
 
