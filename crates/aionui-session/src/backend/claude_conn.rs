@@ -5939,10 +5939,14 @@ mod tests {
     /// sniff_mode: claude's AUTHORITATIVE mode signal is `permissionMode` on a
     /// `system/status` frame — emitted for BOTH a user-driven set AND an autonomous
     /// change (plan-exit). The reader adopts it (normal→default) as current_mode AND
-    /// emits ConfigChanged{mode} (design §9.10.1 option A; README #10). Wire shape from
-    /// protocols/samples/claude-cli/2.1.187/_all_autonomous_mode.jsonl (autonomous
-    /// plan-exit emitted exactly this system/status). MUTATION-PROVEN by the autonomous
-    /// scenario: without sniff_mode the autonomous mode change is silently dropped.
+    /// emits ConfigChanged{mode} (design §9.10.1 option A; README #10).
+    ///
+    /// This case uses a SYNTHETIC frame because `normal` (claude's internal name for our
+    /// `default`) is the one value the 2.1.227 capture never produced; the real-wire
+    /// counterpart is `sniff_mode_handles_real_capture_status_frames` below.
+    ///
+    /// NOTE: this doc used to cite samples/claude-cli/2.1.187/_all_autonomous_mode.jsonl,
+    /// which no longer exists on disk (only 2.1.221/226/227/228 remain).
     #[tokio::test]
     async fn sniff_mode_emits_config_changed_from_system_status() {
         // `normal` is claude's internal name for our `default` — covers the mapping too.
@@ -5970,6 +5974,64 @@ mod tests {
             backend.capabilities().current_mode.as_deref(),
             Some("default"),
             "the inbound applied mode becomes the authoritative current_mode"
+        );
+    }
+
+    /// The same path, driven by REAL captured bytes rather than a hand-written frame.
+    ///
+    /// Frames copied verbatim from
+    /// samples/claude-cli/2.1.227/set_permission_mode/s5.inbound.jsonl (a
+    /// `set_permission_mode` issued mid-generation; harness:
+    /// scripts/probe-claude-set-permission-mode.py). This matters because the real
+    /// stream interleaves a SECOND kind of `system/status` — `{"status":"requesting"}`
+    /// with NO `permissionMode` at all — which a synthetic single-frame test never
+    /// exercises. Reading such a frame as a mode change would hand the picker a bogus
+    /// value; the guard that prevents it has no other coverage.
+    ///
+    /// Also pins the two facts the capture established: a USER-DRIVEN set really does
+    /// emit `system/status{permissionMode}` (so this confirmation path is live, not
+    /// dead code), and the switch is confirmed while the turn is still streaming.
+    #[tokio::test]
+    async fn sniff_mode_handles_real_capture_status_frames() {
+        // All three `system/status` frames of that capture, in wire order. The trailing
+        // `requesting` one is the load-bearing case: it arrives AFTER the mode was
+        // confirmed, so a reader that mistook it for a mode change would drop the
+        // picker back to nothing.
+        let captured = concat!(
+            r#"{"type": "system", "subtype": "status", "status": "requesting", "uuid": "a2e3fd0c-bf39-41ac-a01f-716392d7b9b1", "session_id": "b1f38ca8-789b-4598-ba55-d96ea7e603d5"}"#,
+            "\n",
+            r#"{"type": "system", "subtype": "status", "status": null, "permissionMode": "acceptEdits", "uuid": "ebf5aac3-1de6-405f-bb23-95cbb75671af", "session_id": "b1f38ca8-789b-4598-ba55-d96ea7e603d5"}"#,
+            "\n",
+            r#"{"type": "system", "subtype": "status", "status": "requesting", "uuid": "3460b839-35bd-45e7-83b7-f79a9637ce57", "session_id": "b1f38ca8-789b-4598-ba55-d96ea7e603d5"}"#,
+            "\n",
+        );
+        let backend =
+            ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(captured.as_bytes().to_vec())))
+                .await;
+        let mut events = backend.events();
+
+        // Collect until the stream goes quiet rather than stopping at the first event:
+        // the point of the trailing frame is that it must produce NO second event, which
+        // an early return could never observe.
+        let mut confirmations: Vec<Option<String>> = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(800), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::ConfigChanged { mode, .. } = env.event {
+                    confirmations.push(mode);
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            confirmations,
+            vec![Some("acceptEdits".to_string())],
+            "exactly one confirmation, carrying the applied mode: the two `requesting` \
+             frames carry no permissionMode and must be ignored"
+        );
+        assert_eq!(
+            backend.capabilities().current_mode.as_deref(),
+            Some("acceptEdits"),
+            "a later status frame WITHOUT permissionMode must not disturb the applied mode"
         );
     }
 
