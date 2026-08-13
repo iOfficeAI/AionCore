@@ -832,10 +832,28 @@ impl SessionBackend for AntigravitySessionBackend {
                 // in-process check never runs — the user would think they had
                 // restored approval prompts while everything still ran freely.
                 self.sync_permission_hook();
+                let turn_gen = self.turn_gen.load(Ordering::SeqCst);
+                // Confirm the switch. Unlike the other backends this signal originates
+                // here rather than on the wire — agy runs one process per turn and there
+                // is nothing to reconfigure mid-flight — but it is not self-fulfilling:
+                // the permission decision is re-read per tool call (`is_full_auto` in
+                // `request_external_permission`) and the hook file has just been synced,
+                // so the host-side gate really has changed.
+                //
+                // It is also the ONLY trigger that persists `current_mode_id` (see
+                // session_agent's `persist_side_effects`); without it a task rebuild
+                // reverted the user to the stale create-time mode.
+                self.emit(
+                    turn_gen,
+                    SessionEvent::ConfigChanged {
+                        mode: Some(mode.clone()),
+                        model: None,
+                    },
+                );
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
-                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                    turn_gen,
                 })
             }
             Command::SetModel { .. } => Ok(CommandReceipt {
@@ -1296,6 +1314,50 @@ mod tests {
         .unwrap();
 
         assert!(!hook.exists(), "full auto must not leave a hook agy would call");
+    }
+
+    /// A runtime mode switch must emit `ConfigChanged`.
+    ///
+    /// Two things ride on it, and both were broken by its absence:
+    ///   - PERSISTENCE. `ConfigChanged` is the ONLY trigger that writes
+    ///     `current_mode_id` (session_agent's `persist_side_effects`), so without it
+    ///     the switch lived only in this backend instance's `mode_override` and a task
+    ///     rebuild silently reverted the user to the stale create-time mode.
+    ///   - CONFIRMATION. It is what tells the frontend the switch really landed,
+    ///     instead of the self-fulfilling `Observed` the task layer synthesizes.
+    ///
+    /// Honest for agy specifically: the permission decision is re-read per tool call
+    /// (`is_full_auto` in `request_external_permission`), so once the override is
+    /// recorded and the hook file synced, the host-side gate HAS changed — regardless
+    /// of the already-spawned process's `--mode` flag.
+    #[tokio::test]
+    async fn a_runtime_mode_switch_emits_config_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("default"), Some("{}"));
+        let mut events = b.events();
+
+        b.dispatch(Command::SetMode {
+            mode: "yolo".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        let confirmed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            use futures_util::StreamExt as _;
+            while let Some(env) = events.next().await {
+                if let SessionEvent::ConfigChanged { mode, .. } = env.event {
+                    return mode;
+                }
+            }
+            None
+        })
+        .await
+        .expect("a mode switch must emit ConfigChanged within 2s");
+        assert_eq!(
+            confirmed.as_deref(),
+            Some("yolo"),
+            "the confirmation must carry the mode that is now in force"
+        );
     }
 
     #[test]
