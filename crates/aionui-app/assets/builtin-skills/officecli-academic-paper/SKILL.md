@@ -21,7 +21,7 @@ description: "Use this skill to build academic-style .docx output: journal / con
 
 # OfficeCLI Academic Paper Skill
 
-**This skill is a scene layer on top of `officecli-docx`.** Every docx hard rule — style architecture, heading hierarchy, shell quoting, `break=newPage` alias, belt-and-suspenders page breaks, live PAGE field, Delivery Gate, renderer quirks — is inherited, not re-taught. This file adds only what academic papers need on top: citation styles, equations, SEQ / PAGEREF cross-refs, multi-column journal layout, bibliography hanging indent, abstract/keywords/affiliation block.
+**This skill is a scene layer on top of `officecli-docx`.** Every docx hard rule — style architecture, heading hierarchy, shell quoting, page-break rules, live PAGE field, Delivery Gate, renderer quirks — is inherited, not re-taught. This file adds only what academic papers need on top: citation styles, equations, SEQ / PAGEREF cross-refs, multi-column journal layout, bibliography hanging indent, abstract/keywords/affiliation block.
 
 When the docx base rules cover it, the text here says `→ see docx v2 §X`. Read docx v2 first if you have not.
 
@@ -150,7 +150,7 @@ Four mainstream families. Pick one at project start; every downstream decision f
 | IEEE | `[1]`, `[2]`, ..., `[N]` | Order of first citation | 1.15x-1.5x, 2-col | Rare |
 | MLA 9 | `(Smith 412)` page-number | Alphabetical by author, "Works Cited" | 2x | Rare |
 
-Shared defaults across all four: reference-list paragraphs use `indent=720 hangingIndent=720` (hanging indent 0.5"); add a live TOC if 3+ Heading1s (→ see docx v2 §Table of Contents); static TOC fallback if recipient cannot recalculate (→ see docx v2 §Report-level recipes (f)).
+Shared defaults across all four: reference-list paragraphs use `indent=720 hangingIndent=720` (hanging indent 0.5"); add a live TOC if 3+ Heading1s (→ see docx v2 §Table of Contents); set `updateFields=true` and report TOC page numbers as uncomputed until a Word-compatible field engine updates them.
 
 ### APA 7 (social sciences — psychology, education, management)
 
@@ -493,7 +493,7 @@ Report every instance. If even one defect is present → REJECT; do not deliver 
 
 ## Known Issues & Pitfalls (academic-specific)
 
-→ Base pitfalls (shell escape, `\$ \t \n` literals, table cell formatting order, `pageBreakBefore` belt-and-suspenders, `shd.fill` / `ind.firstLine` schema-invalid forms, TOC cached values, watermark two-step): see docx v2 §Known Issues & Pitfalls.
+→ Base pitfalls (shell escape, `\$ \t \n` literals, table cell formatting order, page-break boundaries, `shd.fill` / `ind.firstLine` schema-invalid forms, TOC cached values, watermark two-step): see docx v2 §Known Issues & Pitfalls.
 
 Academic-specific:
 
@@ -512,7 +512,7 @@ Academic-specific:
 - **Hanging-indent canonical form is `indent=720 hangingIndent=720`.** Not `ind.firstLine=-720`. The dotted form emits `<w:ind>` after `<w:jc>` and fails schema on emit.
 - **Footnote reference runs show as empty strings in `view annotated`.** The `<w:footnoteReference>` XML element has no visible text on the reference side; the note body lives in `/footnotes/footnote[N]`. Confirm with `officecli query "$FILE" 'footnote'`, not by eyeballing `view text`.
 - **Caption placement:** Table caption ABOVE the table; Figure caption BELOW the figure. Every major style (APA, Chicago, IEEE, MLA) agrees. Putting a Table caption below the table is an academic-style error, not a rendering issue — `validate` will not catch it.
-- **TOC cached rendering / static fallback / shell-escape:** → see docx v2 §TOC delivery step, §Report-level recipes (f), §Shell escape.
+- **TOC cached rendering / shell-escape:** → see docx v2 §TOC delivery step, §Shell escape.
 
 ## Renderer quirks (cross-viewer)
 
