@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "runtime_id": "deepseek-harness",
+  "release": "2026.08.14-1",
+  "upstream_commit": "47f943859bef60e4160492346772ded9b24f765a",
+  "entry_package": "@deepseek-ai/dsh-acp-demo",
+  "entry_version": "0.0.1-rc.5",
+  "entry_path": "node_modules/@deepseek-ai/dsh-acp-demo/lib/bin.js",
+  "config_path": "cordis.yml",
+  "fixture_path": "acp-handshake.fixture.jsonl",
+  "license_path": "THIRD_PARTY_LICENSES.md"
+}

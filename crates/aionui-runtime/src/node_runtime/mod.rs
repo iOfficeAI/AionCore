@@ -1,4 +1,5 @@
 mod managed;
+mod npm_app;
 mod system;
 mod types;
 
@@ -10,6 +11,12 @@ use tracing::{debug, info, warn};
 pub use managed::{
     install_and_validate as install_managed_runtime, managed_node_contract_for_export,
     probe_support as probe_node_runtime_supported,
+};
+pub use npm_app::{
+    DEEPSEEK_HARNESS_RUNTIME_ID, DeepseekHarnessRuntime, ManagedNpmAppError, ManagedNpmAppManifest,
+    ManagedNpmAppProgress, ManagedNpmAppProgressPhase, ManagedNpmAppProgressReporter,
+    SharedManagedNpmAppProgressReporter, deepseek_harness_manifest, ensure_deepseek_harness_runtime,
+    probe_deepseek_harness_current_runtime, probe_deepseek_harness_runtime,
 };
 pub use system::{derive_runtime_root, tool_command, validate_same_root};
 pub use types::{

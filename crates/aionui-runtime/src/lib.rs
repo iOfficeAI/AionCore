@@ -17,11 +17,14 @@ pub use agent_env::agent_process_env;
 pub use cache::init;
 pub use managed_resources::{ManagedResourcesMode, managed_resources_mode, set_managed_resources_mode};
 pub use node_runtime::{
-    DoctorRow, NodeRuntimeError, NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressPhase,
-    NodeRuntimeProgressReporter, NodeRuntimeSupport, NodeTool, ResolvedCommand, ResolvedNodeRuntime,
-    ResolvedNodeSource, RuntimeCommandProbe, SharedNodeRuntimeProgressReporter, doctor_snapshot,
-    doctor_snapshot_for_test, ensure_node_runtime, ensure_node_runtime_with_reporter, ensure_runtime_command,
-    ensure_runtime_command_with_reporter, probe_node_runtime_supported, probe_runtime_command,
+    DEEPSEEK_HARNESS_RUNTIME_ID, DeepseekHarnessRuntime, DoctorRow, ManagedNpmAppError, ManagedNpmAppManifest,
+    ManagedNpmAppProgress, ManagedNpmAppProgressPhase, ManagedNpmAppProgressReporter, NodeRuntimeError,
+    NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressPhase, NodeRuntimeProgressReporter,
+    NodeRuntimeSupport, NodeTool, ResolvedCommand, ResolvedNodeRuntime, ResolvedNodeSource, RuntimeCommandProbe,
+    SharedManagedNpmAppProgressReporter, SharedNodeRuntimeProgressReporter, deepseek_harness_manifest, doctor_snapshot,
+    doctor_snapshot_for_test, ensure_deepseek_harness_runtime, ensure_node_runtime, ensure_node_runtime_with_reporter,
+    ensure_runtime_command, ensure_runtime_command_with_reporter, probe_deepseek_harness_current_runtime,
+    probe_deepseek_harness_runtime, probe_node_runtime_supported, probe_runtime_command,
 };
 pub use registry_npx_lock::{RegistryNpxLockError, pin_registry_npx_args, should_skip_registry_npx_version_probe};
 pub use resolver::{resolve_command_in, resolve_command_path};

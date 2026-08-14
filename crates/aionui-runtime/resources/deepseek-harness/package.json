@@ -1,0 +1,31 @@
+{
+  "name": "@aionui/deepseek-harness-runtime",
+  "version": "2026.08.14-1",
+  "private": true,
+  "description": "Release-locked DeepSeek Harness runtime used by AionCore",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@deepseek-ai/dsh-acp-demo": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-bash-sandbox": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-compaction-basic": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-compaction-tool-result-pruner": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-fs-observation-policy": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-fs-sandbox": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-llm-deepseek": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-pwsh-sandbox": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-sandbox-local": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-sandbox-policy": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-skill": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-skill-filesystem": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-spill-local": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-spill-policy": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-subprocess-local": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-token-meter": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-tool-bash": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-tool-fs": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-tool-fs-search": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-tool-pwsh": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-tool-skill": "0.0.1-rc.5",
+    "@deepseek-ai/dsh-user-approval": "0.0.1-rc.5"
+  }
+}
