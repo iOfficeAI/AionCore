@@ -92,6 +92,7 @@ fn test_agent_row(id: &str, backend: Option<&str>, agent_type: AgentType, name: 
         agent_source_info: AgentSourceInfo::default(),
         enabled: true,
         installed: true,
+        runtime: None,
         command: backend.map(str::to_owned),
         args: Vec::new(),
         env: Vec::new(),

@@ -273,6 +273,9 @@ pub enum AgentKillReason {
     /// The requested runtime capabilities changed, so the in-memory task must
     /// be rebuilt before handling the next turn.
     RuntimeCapabilityChanged,
+    /// A connection-scoped agent requires model changes to take effect by
+    /// rebuilding its process and opening a fresh vendor session.
+    ModelChanged,
     /// The owning user's Core session was revoked, so foreground runtime state
     /// and agent processes for that user must be torn down.
     SessionRevoked,

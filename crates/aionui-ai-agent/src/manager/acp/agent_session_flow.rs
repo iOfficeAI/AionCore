@@ -1,3 +1,4 @@
+use crate::agent_runtime::AgentLifecyclePhase;
 use crate::error::AgentError;
 use crate::manager::acp::AcpAgentManager;
 use crate::manager::acp::mode_normalize::agent_metadata_uses_meta_resume;
@@ -39,8 +40,25 @@ impl AcpAgentManager {
     ///
     /// Returns the CLI-assigned session id.
     pub(super) async fn open_session_new(&self) -> Result<String, AgentError> {
-        let req = self.params.new_session_request();
-        let (session_response, legacy_models) = self.protocol.new_session(req).await?;
+        let mut retries = 0_u8;
+        let (session_response, legacy_models) = loop {
+            let req = self.params.new_session_request();
+            match self.protocol.new_session(req).await {
+                Ok(response) => break response,
+                Err(ref error) if should_retry_session_new(self.backend(), retries, error) => {
+                    retries += 1;
+                    warn!(
+                        conversation_id = %self.params.conversation_id,
+                        backend = "deepseek-harness",
+                        phase = "session/new",
+                        attempt = retries + 1,
+                        "Retrying side-effect-free ACP session creation once"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
 
         let sid = session_response.session_id.to_string();
 
@@ -348,6 +366,7 @@ impl AcpAgentManager {
         // Scope stderr classification to this prompt so stale lines from an
         // earlier turn cannot override a later benign empty turn.
         self.process.clear_stderr().await;
+        self.runtime.transition_lifecycle(AgentLifecyclePhase::Prompting);
 
         let prompt_response = self
             .protocol
@@ -476,6 +495,12 @@ impl AcpAgentManager {
         let detail = super::stderr_error_extractor::extract_error_message(&tail)?;
         Some(classify_empty_turn_stderr_error(&detail))
     }
+}
+
+fn should_retry_session_new(backend: Option<&str>, retries: u8, error: &AcpError) -> bool {
+    backend == Some("deepseek-harness")
+        && retries == 0
+        && matches!(error, AcpError::RequestTimeout { method, .. } if method == "session/new")
 }
 
 /// Drain the supplied turn-scoped receiver and return `true` when the turn
@@ -806,7 +831,25 @@ mod tests {
         AgentCapabilities, ContentBlock, Cost, PromptResponse, Usage, UsageUpdate,
     };
 
-    use super::{end_turn_usage_frame, end_turn_usage_frame_from_response, preserve_known_window};
+    use super::{
+        end_turn_usage_frame, end_turn_usage_frame_from_response, preserve_known_window, should_retry_session_new,
+    };
+
+    #[test]
+    fn session_new_retry_is_bounded_and_dsh_specific() {
+        let timeout = AcpError::RequestTimeout {
+            method: "session/new".to_owned(),
+            timeout_secs: 30,
+        };
+        assert!(should_retry_session_new(Some("deepseek-harness"), 0, &timeout));
+        assert!(!should_retry_session_new(Some("deepseek-harness"), 1, &timeout));
+        assert!(!should_retry_session_new(Some("other-acp"), 0, &timeout));
+        assert!(!should_retry_session_new(
+            Some("deepseek-harness"),
+            0,
+            &AcpError::NotConnected,
+        ));
+    }
 
     /// The end-of-turn usage frame must stay deserializable as `UsageUpdate` —
     /// that is the contract with `agent_event_tracker`, which persists the

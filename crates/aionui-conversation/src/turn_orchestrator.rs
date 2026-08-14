@@ -246,6 +246,7 @@ impl ConversationTurnOrchestrator {
             let lifecycle = runtime_state.lifecycle_for(&input.conv_id);
             let defer_clean_terminal_errors = input.defer_clean_terminal_errors
                 && agent.agent_type() == AgentType::Acp
+                && backend.as_deref() != Some("deepseek-harness")
                 && lifecycle == RuntimeLifecycleState::Active
                 && aggregate_summary.safe_to_auto_replay();
             let relay = StreamRelay::new(

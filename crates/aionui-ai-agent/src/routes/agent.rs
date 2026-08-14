@@ -28,6 +28,7 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
         .route("/api/agents/logos", get(list_agent_logos))
         .route("/api/agents/management", get(list_management_agents))
         .route("/api/agents/{id}/health-check", post(health_check_by_id))
+        .route("/api/agents/{id}/runtime/prepare", post(prepare_runtime_by_id))
         .route("/api/agents/provider-health-check", post(provider_health_check))
         .route("/api/agents/{id}/enabled", patch(set_agent_enabled))
         .route(
@@ -75,6 +76,20 @@ async fn health_check_by_id(
         state
             .service
             .health_check_agent_by_id(&user.id, &id)
+            .await
+            .map_err(agent_error_to_api_error)?,
+    )))
+}
+
+async fn prepare_runtime_by_id(
+    State(state): State<AgentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<AgentManagementRow>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .prepare_agent_runtime(&user.id, &id)
             .await
             .map_err(agent_error_to_api_error)?,
     )))

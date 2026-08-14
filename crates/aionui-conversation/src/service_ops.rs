@@ -8,6 +8,7 @@
 //! over 2000 lines.
 
 use std::path::Component;
+use std::sync::Arc;
 
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
@@ -15,6 +16,7 @@ use aionui_api_types::{
     SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_common::{AgentKillReason, ErrorChain};
+use aionui_db::SaveRuntimeStateParams;
 use tracing::warn;
 
 use crate::ConversationError;
@@ -56,22 +58,82 @@ impl ConversationService {
         }
         self.ensure_owned_conversation(user_id, conversation_id).await?;
         let agent = self.task(conversation_id)?;
-        let response = match agent.set_config_option(option_id, &req.value).await {
-            Ok(response) => response,
-            Err(err @ AgentError::Acp(AcpError::NotConnected)) => {
-                warn!(
-                    conversation_id,
-                    option_id,
-                    reason = ?AgentKillReason::AgentErrorRecovery,
-                    error = %ErrorChain(&err),
-                    "ACP config option failed because protocol is disconnected; evicting task"
-                );
-                self.task_manager()
-                    .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
-                    .await;
-                return Err(ConversationError::from(err));
+        let response = if option_id == "model" && agent.backend() == Some("deepseek-harness") {
+            let snapshot = agent.get_config_options().await.map_err(ConversationError::from)?;
+            let model_option = snapshot
+                .config_options
+                .iter()
+                .find(|option| option.id == "model" || option.category.as_deref() == Some("model"));
+            if model_option.is_some_and(|option| {
+                !option.options.is_empty() && !option.options.iter().any(|item| item.value == req.value)
+            }) {
+                return Err(ConversationError::BadRequest {
+                    reason: format!("model '{}' is not enabled for the default DeepSeek provider", req.value),
+                });
             }
-            Err(err) => return Err(ConversationError::from(err)),
+
+            let current_model = self
+                .acp_session_repo()
+                .load_runtime_state_for_user(user_id, conversation_id)
+                .await
+                .map_err(|error| ConversationError::internal(format!("Failed to load DSH model: {error}")))?
+                .and_then(|state| state.current_model_id);
+            let options = if current_model.as_deref() == Some(req.value.as_str()) {
+                snapshot.config_options
+            } else {
+                // DSH's model is process configuration rather than a live ACP option.
+                // Persist the new model, drop the private vendor session anchor, then
+                // converge the whole process tree before opening a fresh session/new.
+                self.acp_session_repo()
+                    .save_runtime_state_for_user(
+                        user_id,
+                        conversation_id,
+                        &SaveRuntimeStateParams {
+                            current_model_id: Some(Some(req.value.as_str())),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|error| ConversationError::internal(format!("Failed to persist DSH model: {error}")))?;
+                self.acp_session_repo()
+                    .clear_session_id_for_user(user_id, conversation_id)
+                    .await
+                    .map_err(|error| ConversationError::internal(format!("Failed to clear DSH session: {error}")))?;
+                self.task_manager()
+                    .kill_and_wait(conversation_id, Some(AgentKillReason::ModelChanged))
+                    .await;
+                let task_manager = Arc::clone(self.task_manager());
+                let (replacement, _) = self
+                    .ensure_runtime_agent(user_id, conversation_id, &task_manager, "model_rebuild")
+                    .await?;
+                replacement
+                    .get_config_options()
+                    .await
+                    .map_err(ConversationError::from)?
+                    .config_options
+            };
+            SetConfigOptionResponse {
+                confirmation: ConfigOptionConfirmation::Observed,
+                config_options: Some(options),
+            }
+        } else {
+            match agent.set_config_option(option_id, &req.value).await {
+                Ok(response) => response,
+                Err(err @ AgentError::Acp(AcpError::NotConnected)) => {
+                    warn!(
+                        conversation_id,
+                        option_id,
+                        reason = ?AgentKillReason::AgentErrorRecovery,
+                        error = %ErrorChain(&err),
+                        "ACP config option failed because protocol is disconnected; evicting task"
+                    );
+                    self.task_manager()
+                        .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
+                        .await;
+                    return Err(ConversationError::from(err));
+                }
+                Err(err) => return Err(ConversationError::from(err)),
+            }
         };
 
         // Mirror runtime model/mode/thought-level switches into the persisted assistant

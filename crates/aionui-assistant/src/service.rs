@@ -3772,6 +3772,7 @@ mod tests {
             agent_source_info: aionui_api_types::AgentSourceInfo::default(),
             enabled: true,
             installed: true,
+            runtime: None,
             command: Some(backend.into()),
             args: Vec::new(),
             env: Vec::new(),

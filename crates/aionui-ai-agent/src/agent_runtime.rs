@@ -19,11 +19,52 @@ use aionui_common::{ConversationStatus, TimestampMs, now_ms};
 
 use crate::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentLifecyclePhase {
+    Starting,
+    Initialized,
+    OpeningSession,
+    Ready,
+    Prompting,
+    Cancelling,
+    Closing,
+    Closed,
+    Failed,
+}
+
+impl AgentLifecyclePhase {
+    fn can_transition_to(self, next: Self) -> bool {
+        self == next
+            || matches!(
+                (self, next),
+                (Self::Starting, Self::Initialized | Self::Failed | Self::Closing)
+                    | (
+                        Self::Initialized,
+                        Self::OpeningSession | Self::Ready | Self::Failed | Self::Closing
+                    )
+                    | (Self::OpeningSession, Self::Ready | Self::Failed | Self::Closing)
+                    | (
+                        Self::Ready,
+                        Self::OpeningSession | Self::Prompting | Self::Cancelling | Self::Closing
+                    )
+                    | (
+                        Self::Prompting,
+                        Self::Ready | Self::Cancelling | Self::Failed | Self::Closing
+                    )
+                    | (Self::Cancelling, Self::Ready | Self::Failed | Self::Closing)
+                    | (Self::Failed, Self::OpeningSession | Self::Ready | Self::Closing)
+                    | (Self::Closing, Self::Closed)
+            )
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentRuntime {
     conversation_id: Arc<str>,
     workspace: Arc<str>,
     status: Arc<RwLock<Option<ConversationStatus>>>,
+    lifecycle_phase: Arc<RwLock<AgentLifecyclePhase>>,
+    lifecycle_phase_started_at: Arc<AtomicI64>,
     last_activity: Arc<AtomicI64>,
     event_tx: broadcast::Sender<AgentStreamEvent>,
 }
@@ -40,6 +81,8 @@ impl AgentRuntime {
             conversation_id: Arc::from(conversation_id.into()),
             workspace: Arc::from(workspace.into()),
             status: Arc::new(RwLock::new(None)),
+            lifecycle_phase: Arc::new(RwLock::new(AgentLifecyclePhase::Starting)),
+            lifecycle_phase_started_at: Arc::new(AtomicI64::new(now_ms())),
             last_activity: Arc::new(AtomicI64::new(now_ms())),
             event_tx,
         }
@@ -63,6 +106,10 @@ impl AgentRuntime {
         self.last_activity.load(Ordering::Relaxed)
     }
 
+    pub fn lifecycle_phase(&self) -> AgentLifecyclePhase {
+        *self.lifecycle_phase.read().unwrap_or_else(|error| error.into_inner())
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.event_tx.subscribe()
     }
@@ -80,6 +127,36 @@ impl AgentRuntime {
 
     pub fn bump_activity(&self) {
         self.last_activity.store(now_ms(), Ordering::Relaxed);
+    }
+
+    pub fn transition_lifecycle(&self, next: AgentLifecyclePhase) -> bool {
+        let now = now_ms();
+        let mut phase = self.lifecycle_phase.write().unwrap_or_else(|error| error.into_inner());
+        let previous = *phase;
+        if !previous.can_transition_to(next) {
+            tracing::warn!(
+                conversation_id = %self.conversation_id,
+                previous = ?previous,
+                requested = ?next,
+                "Rejected invalid agent lifecycle transition"
+            );
+            return false;
+        }
+        if previous == next {
+            return true;
+        }
+        let started_at = self.lifecycle_phase_started_at.swap(now, Ordering::Relaxed);
+        *phase = next;
+        tracing::info!(
+            target: "aionui_feedback_diagnostics",
+            diagnostic_event = "feedback.runtime.agent_lifecycle_transition",
+            conversation_id = %self.conversation_id,
+            previous = ?previous,
+            phase = ?next,
+            elapsed_ms = now.saturating_sub(started_at),
+            "feedback.runtime.agent_lifecycle_transition"
+        );
+        true
     }
 
     /// Transition to `status`. Finished is absorbing — subsequent
@@ -166,6 +243,41 @@ mod tests {
         // last_activity_at should be close to `now_ms()` (within a second).
         let diff = now_ms() - rt.last_activity_at();
         assert!(diff.abs() < 1000);
+        assert_eq!(rt.lifecycle_phase(), AgentLifecyclePhase::Starting);
+    }
+
+    #[test]
+    fn lifecycle_accepts_session_and_prompt_sequence() {
+        let rt = runtime();
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::Initialized));
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::OpeningSession));
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::Ready));
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::Prompting));
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::Ready));
+        assert_eq!(rt.lifecycle_phase(), AgentLifecyclePhase::Ready);
+    }
+
+    #[test]
+    fn lifecycle_rejects_reopening_after_closed() {
+        let rt = runtime();
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::Closing));
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::Closed));
+        assert!(!rt.transition_lifecycle(AgentLifecyclePhase::OpeningSession));
+        assert_eq!(rt.lifecycle_phase(), AgentLifecyclePhase::Closed);
+    }
+
+    #[test]
+    fn cancellation_and_failed_session_recovery_converge() {
+        let rt = runtime();
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::Initialized));
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::Ready));
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::Prompting));
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::Cancelling));
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::Ready));
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::Prompting));
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::Failed));
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::OpeningSession));
+        assert!(rt.transition_lifecycle(AgentLifecyclePhase::Ready));
     }
 
     #[tokio::test]

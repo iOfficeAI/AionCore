@@ -23,6 +23,12 @@ impl CliAgentProcess {
     /// - stderr buffering
     /// - Process exit monitoring
     pub async fn spawn_for_sdk(config: CommandSpec) -> Result<Self, AgentError> {
+        let stderr_secrets = config
+            .env
+            .iter()
+            .filter(|entry| is_secret_env_name(&entry.name) && !entry.value.is_empty())
+            .map(|entry| entry.value.clone())
+            .collect::<Vec<_>>();
         let mut cmd = CmdBuilder::new(&config.command);
         let agent_env = aionui_runtime::agent_process_env().await;
         cmd.args(&config.args)
@@ -72,6 +78,7 @@ impl CliAgentProcess {
             let mut lines = reader.lines();
 
             while let Ok(Some(line)) = lines.next_line().await {
+                let line = redact_secrets(&line, &stderr_secrets);
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
                     warn!(pid, stderr = trimmed, "CLI process stderr");
@@ -124,6 +131,19 @@ impl CliAgentProcess {
     }
 }
 
+fn is_secret_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD"]
+        .iter()
+        .any(|marker| upper.contains(marker))
+}
+
+fn redact_secrets(value: &str, secrets: &[String]) -> String {
+    secrets.iter().fold(value.to_owned(), |redacted, secret| {
+        redacted.replace(secret, "[REDACTED]")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::simple_script_config;
@@ -132,6 +152,15 @@ mod tests {
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio::time::timeout;
+
+    #[test]
+    fn stderr_redaction_covers_explicit_secret_environment_values() {
+        assert!(is_secret_env_name("DEEPSEEK_API_KEY"));
+        assert_eq!(
+            redact_secrets("failed for top-secret", &["top-secret".to_owned()]),
+            "failed for [REDACTED]",
+        );
+    }
 
     // ── SDK mode tests ───────────────────────────────────────────────
 

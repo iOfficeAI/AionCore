@@ -14,6 +14,7 @@ use agent_client_protocol::schema::v1::{
 };
 use aionui_api_types::{AgentMetadata, SessionMcpServer, SessionMcpTransport};
 use aionui_common::CommandSpec;
+use aionui_common::ProviderWithModel;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -49,13 +50,14 @@ pub(crate) fn route_for_backend(backend: Option<&str>) -> BackendRoute {
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AcpSessionBuildContext,
+    model: ProviderWithModel,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
     let mut config = build_context.config;
 
     // Resolve the catalog row — prefer explicit agent_id, fall
     // back to a vendor-label match for legacy payloads.
-    let meta = resolve_catalog_metadata(&deps.agent_registry, &config, &ctx.user_id).await?;
+    let mut meta = resolve_catalog_metadata(&deps.agent_registry, &config, &ctx.user_id).await?;
 
     // Trust the catalog row over the client-supplied `backend` when an
     // `agent_id` was provided. The frontend collapses row-scoped rows
@@ -149,14 +151,41 @@ pub(super) async fn build(
         return Ok(instance);
     }
 
-    let mut command_spec = resolve_agent_command_spec(
-        &meta,
-        &ctx.user_id,
-        &ctx.workspace,
-        &ctx.conversation_id,
-        deps.broadcaster.clone(),
-    )
-    .await?;
+    let mut command_spec = if config.backend.as_deref() == Some(super::deepseek_harness::BACKEND) {
+        let launch = super::deepseek_harness::resolve_launch(
+            deps.provider_repo.as_ref(),
+            &deps.encryption_key,
+            &deps.data_dir,
+            &ctx.user_id,
+            &ctx.conversation_id,
+            &ctx.workspace,
+            &model,
+        )
+        .await?;
+        info!(
+            conversation_id = %ctx.conversation_id,
+            provider_id = %launch.provider_id,
+            model_id = %launch.model_id,
+            "DeepSeek Harness launch configuration resolved"
+        );
+        meta.handshake.available_models = Some(serde_json::json!({
+            "current_model_id": launch.model_id,
+            "available_models": launch.enabled_models.iter().map(|id| serde_json::json!({
+                "id": id,
+                "label": id,
+            })).collect::<Vec<_>>(),
+        }));
+        launch.command_spec
+    } else {
+        resolve_agent_command_spec(
+            &meta,
+            &ctx.user_id,
+            &ctx.workspace,
+            &ctx.conversation_id,
+            deps.broadcaster.clone(),
+        )
+        .await?
+    };
     apply_acp_launch_policy(
         &mut command_spec,
         AcpLaunchPolicyInput {
@@ -217,6 +246,8 @@ pub(super) async fn build(
         }
     }
 
+    let connection_scoped =
+        meta.behavior_policy.session_lifetime == aionui_api_types::SessionLifetime::ConnectionScoped;
     let params = Arc::new(
         assemble_acp_params(
             ctx.conversation_id.clone(),
@@ -255,7 +286,7 @@ pub(super) async fn build(
     // inside `AcpAgentManager::new`. The CLI-assigned session id is still
     // loaded here so the first turn after a task rebuild takes the resume
     // path.
-    if let Some(sid) = build_context.session_id {
+    if !connection_scoped && let Some(sid) = build_context.session_id {
         arc.set_session_id(sid).await;
     }
 

@@ -38,6 +38,7 @@ impl TurnRecoveryPolicy {
 
         let decision = if lifecycle == RuntimeLifecycleState::Active
             && agent_type == AgentType::Acp
+            && backend != Some("deepseek-harness")
             && outcome.terminal.is_error()
             && retryable == Some(true)
             && error_code != Some(AgentErrorCode::UserLlmProviderModelNotFound)
@@ -162,6 +163,21 @@ mod tests {
                 session_recovery_signal: None,
             }
         );
+    }
+
+    #[test]
+    fn deepseek_harness_never_auto_replays_a_sent_prompt() {
+        let outcome = retryable_clean_error();
+
+        let decision = TurnRecoveryPolicy::decide(
+            AgentType::Acp,
+            Some("deepseek-harness"),
+            &outcome,
+            RuntimeLifecycleState::Active,
+            false,
+        );
+
+        assert_eq!(decision, TurnRecoveryDecision::None);
     }
 
     #[test]

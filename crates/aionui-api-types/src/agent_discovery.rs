@@ -54,6 +54,48 @@ pub struct AgentSourceInfo {
     /// Version string for Hub or custom rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Versioned application runtime managed by AionCore rather than PATH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_runtime: Option<ManagedRuntimeSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedRuntimeSource {
+    pub runtime_id: String,
+    pub release: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRuntimeState {
+    NotInstalled,
+    Installing,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedRuntimeStatus {
+    pub runtime_id: String,
+    pub release: String,
+    pub state: ManagedRuntimeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLifetime {
+    #[default]
+    Persistent,
+    VendorResume,
+    ConnectionScoped,
 }
 
 /// Adapter-side behaviour switches. These drive code branches that used
@@ -83,6 +125,10 @@ pub struct BehaviorPolicy {
 
     #[serde(default)]
     pub supports_team: bool,
+
+    /// Whether a backend session can survive an agent-process rebuild.
+    #[serde(default)]
+    pub session_lifetime: SessionLifetime,
 }
 
 /// Handshake-derived fields captured from the ACP init/session-response.
@@ -272,6 +318,8 @@ pub struct AgentManagementRow {
     pub enabled: bool,
     pub installed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<ManagedRuntimeStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
@@ -421,7 +469,7 @@ mod tests {
 
 #[cfg(test)]
 mod behavior_policy_tests {
-    use super::BehaviorPolicy;
+    use super::{BehaviorPolicy, SessionLifetime};
 
     #[test]
     fn deserializes_new_capability_flags() {
@@ -443,6 +491,7 @@ mod behavior_policy_tests {
         assert!(!policy.self_identity_sticky);
         assert!(!policy.session_load_via_meta_field);
         assert!(!policy.supports_team);
+        assert_eq!(policy.session_lifetime, SessionLifetime::Persistent);
     }
 
     #[test]

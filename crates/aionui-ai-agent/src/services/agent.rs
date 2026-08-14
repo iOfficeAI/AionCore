@@ -13,9 +13,12 @@
 //! CRUD endpoints (see `services::custom`).
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use aionui_api_types::{AgentLogoEntry, AgentManagementRow, ProviderHealthCheckRequest, ProviderHealthCheckResponse};
+use aionui_api_types::{
+    AgentLogoEntry, AgentManagementRow, ManagedRuntimeState, ManagedRuntimeStatus, ProviderHealthCheckRequest,
+    ProviderHealthCheckResponse,
+};
 use aionui_db::IProviderRepository;
 use aionui_realtime::EventBroadcaster;
 
@@ -29,6 +32,7 @@ pub struct AgentService {
     broadcaster: Arc<dyn EventBroadcaster>,
     provider_health: ProviderHealthCheckService,
     availability: AgentAvailabilityService,
+    deepseek_runtime: Arc<RwLock<ManagedRuntimeStatus>>,
 }
 
 impl AgentService {
@@ -40,12 +44,38 @@ impl AgentService {
         data_dir: PathBuf,
     ) -> Arc<Self> {
         let provider_health = ProviderHealthCheckService::new(provider_repo.clone(), encryption_key, data_dir.clone());
-        let availability = AgentAvailabilityService::new(registry.clone(), provider_repo);
+        let availability = AgentAvailabilityService::new_with_runtime_credentials(
+            registry.clone(),
+            provider_repo,
+            encryption_key,
+            data_dir,
+        );
+        let manifest = aionui_runtime::deepseek_harness_manifest()
+            .expect("embedded DeepSeek Harness runtime manifest must be valid");
+        let current_runtime = aionui_runtime::probe_deepseek_harness_current_runtime();
+        let installed_runtime = aionui_runtime::probe_deepseek_harness_runtime();
+        let update_available = current_runtime.is_none() && installed_runtime.is_some();
+        let deepseek_runtime = Arc::new(RwLock::new(ManagedRuntimeStatus {
+            runtime_id: manifest.runtime_id,
+            release: installed_runtime
+                .as_ref()
+                .map_or(manifest.release, |runtime| runtime.release.clone()),
+            state: if installed_runtime.is_some() {
+                ManagedRuntimeState::Ready
+            } else {
+                ManagedRuntimeState::NotInstalled
+            },
+            phase: update_available.then(|| "update_available".to_owned()),
+            progress: None,
+            error_code: None,
+            error_message: None,
+        }));
         Arc::new(Self {
             registry,
             broadcaster,
             provider_health,
             availability,
+            deepseek_runtime,
         })
     }
 
@@ -67,7 +97,8 @@ impl AgentService {
 // Agent operations
 impl AgentService {
     pub async fn list_management_agents(&self, user_id: &str) -> Result<Vec<AgentManagementRow>, AgentError> {
-        self.availability.list_management_rows(user_id).await
+        let rows = self.availability.list_management_rows(user_id).await?;
+        Ok(rows.into_iter().map(|row| self.overlay_runtime_status(row)).collect())
     }
 
     /// Backend → logo URL catalog for business surfaces.
@@ -103,7 +134,107 @@ impl AgentService {
     }
 
     pub async fn health_check_agent_by_id(&self, user_id: &str, id: &str) -> Result<AgentManagementRow, AgentError> {
-        self.availability.run_manual_health_check(user_id, id).await
+        let row = self.availability.run_manual_health_check(user_id, id).await?;
+        Ok(self.overlay_runtime_status(row))
+    }
+
+    pub async fn prepare_agent_runtime(&self, user_id: &str, id: &str) -> Result<AgentManagementRow, AgentError> {
+        let row = self
+            .availability
+            .management_row_by_id(user_id, id)
+            .await?
+            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
+        let source = row
+            .agent_source_info
+            .managed_runtime
+            .as_ref()
+            .ok_or_else(|| AgentError::bad_request("Agent does not use a managed application runtime"))?;
+        if source.runtime_id != aionui_runtime::DEEPSEEK_HARNESS_RUNTIME_ID {
+            return Err(AgentError::bad_request("Managed application runtime is not supported"));
+        }
+
+        if aionui_runtime::probe_deepseek_harness_current_runtime().is_some() {
+            self.set_runtime_status(ManagedRuntimeState::Ready, Some("ready"), Some(100), None, None);
+            return Ok(self.overlay_runtime_status(row));
+        }
+
+        {
+            let mut status = self
+                .deepseek_runtime
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if status.state != ManagedRuntimeState::Installing {
+                status.state = ManagedRuntimeState::Installing;
+                status.phase = Some("waiting_for_lock".to_owned());
+                status.progress = Some(0);
+                status.error_code = None;
+                status.error_message = None;
+
+                let shared_status = self.deepseek_runtime.clone();
+                let registry = self.registry.clone();
+                tokio::spawn(async move {
+                    let reporter_status = shared_status.clone();
+                    let reporter = move |update: aionui_runtime::ManagedNpmAppProgress| {
+                        let (phase, progress) = match update.phase {
+                            aionui_runtime::ManagedNpmAppProgressPhase::WaitingForLock => ("waiting_for_lock", 0),
+                            aionui_runtime::ManagedNpmAppProgressPhase::Installing => ("installing", 25),
+                            aionui_runtime::ManagedNpmAppProgressPhase::Validating => ("validating", 90),
+                            aionui_runtime::ManagedNpmAppProgressPhase::Ready => ("ready", 100),
+                            aionui_runtime::ManagedNpmAppProgressPhase::Failed => ("failed", 0),
+                        };
+                        let mut status = reporter_status.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        status.state = if update.phase == aionui_runtime::ManagedNpmAppProgressPhase::Failed {
+                            ManagedRuntimeState::Failed
+                        } else if update.phase == aionui_runtime::ManagedNpmAppProgressPhase::Ready {
+                            ManagedRuntimeState::Ready
+                        } else {
+                            ManagedRuntimeState::Installing
+                        };
+                        status.phase = Some(phase.to_owned());
+                        status.progress = Some(progress);
+                    };
+                    match aionui_runtime::ensure_deepseek_harness_runtime(Some(&reporter), None).await {
+                        Ok(runtime) => {
+                            let candidate_release = aionui_runtime::deepseek_harness_manifest()
+                                .map(|manifest| manifest.release)
+                                .unwrap_or_default();
+                            let rolled_back = runtime.release != candidate_release;
+                            {
+                                let mut status = shared_status.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                status.state = ManagedRuntimeState::Ready;
+                                status.release = runtime.release;
+                                status.phase = Some(if rolled_back { "rollback" } else { "ready" }.to_owned());
+                                status.progress = Some(100);
+                                status.error_code = rolled_back.then(|| "runtime_update_failed".to_owned());
+                                status.error_message = rolled_back.then(|| {
+                                    "The candidate runtime failed validation; AionCore kept the previous verified release."
+                                        .to_owned()
+                                });
+                            }
+                            registry.refresh_availability().await;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                runtime_id = aionui_runtime::DEEPSEEK_HARNESS_RUNTIME_ID,
+                                error_code = "runtime_install_failed",
+                                error = %error,
+                                "Managed runtime installation failed"
+                            );
+                            let mut status = shared_status.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            status.state = ManagedRuntimeState::Failed;
+                            status.phase = Some("failed".to_owned());
+                            status.progress = None;
+                            status.error_code = Some("runtime_install_failed".to_owned());
+                            status.error_message = Some(
+                                "DeepSeek Harness runtime installation failed. Retry the installation or inspect server logs."
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                });
+            }
+        }
+        Ok(self.overlay_runtime_status(row))
     }
 
     pub async fn provider_health_check(
@@ -197,6 +328,40 @@ impl AgentService {
             },
             env_override,
         })
+    }
+}
+
+impl AgentService {
+    fn overlay_runtime_status(&self, mut row: AgentManagementRow) -> AgentManagementRow {
+        if row.agent_source_info.managed_runtime.is_some() {
+            let status = self
+                .deepseek_runtime
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            row.installed = status.state == ManagedRuntimeState::Ready;
+            row.runtime = Some(status);
+        }
+        row
+    }
+
+    fn set_runtime_status(
+        &self,
+        state: ManagedRuntimeState,
+        phase: Option<&str>,
+        progress: Option<u8>,
+        error_code: Option<&str>,
+        error_message: Option<String>,
+    ) {
+        let mut status = self
+            .deepseek_runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        status.state = state;
+        status.phase = phase.map(str::to_owned);
+        status.progress = progress;
+        status.error_code = error_code.map(str::to_owned);
+        status.error_message = error_message;
     }
 }
 

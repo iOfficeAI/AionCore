@@ -1,4 +1,4 @@
-use crate::agent_runtime::AgentRuntime;
+use crate::agent_runtime::{AgentLifecyclePhase, AgentRuntime};
 use crate::capability::PromptCtx;
 use crate::capability::cli_process::CliAgentProcess;
 use crate::capability::prompt_pipeline::PromptPipeline;
@@ -146,15 +146,25 @@ impl AcpStartupConnectError {
     }
 }
 
+fn should_retry_initialize(backend: Option<&str>, retries: u8, error: &AgentError) -> bool {
+    backend == Some("deepseek-harness")
+        && retries == 0
+        && matches!(error, AgentError::Acp(AcpError::InitTimeout { .. }))
+}
+
 async fn spawn_and_connect_acp(
     params: &AcpSessionParams,
     runtime: &AgentRuntime,
 ) -> Result<AcpStartupConnection, AgentError> {
     let mut corrupt_npx_cache_repair = CorruptNpxCacheRepair::default();
+    let mut initialize_retries = 0_u8;
 
     loop {
         match spawn_and_connect_acp_once(params, runtime).await {
-            Ok(connection) => return Ok(connection),
+            Ok(connection) => {
+                runtime.transition_lifecycle(AgentLifecyclePhase::Initialized);
+                return Ok(connection);
+            }
             Err(AcpStartupConnectError::StartupCrash {
                 exit_code,
                 signal,
@@ -170,13 +180,30 @@ async fn spawn_and_connect_acp(
                     continue;
                 }
 
+                runtime.transition_lifecycle(AgentLifecyclePhase::Failed);
                 return Err(AgentError::from(AcpError::StartupCrash {
                     exit_code,
                     signal,
                     stderr,
                 }));
             }
-            Err(error) => return Err(error.into_agent_error()),
+            Err(AcpStartupConnectError::Agent(error))
+                if should_retry_initialize(params.metadata.backend.as_deref(), initialize_retries, &error) =>
+            {
+                initialize_retries += 1;
+                warn!(
+                    conversation_id = %params.conversation_id,
+                    backend = "deepseek-harness",
+                    phase = "initialize",
+                    attempt = initialize_retries + 1,
+                    "Retrying side-effect-free ACP initialize once"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(error) => {
+                runtime.transition_lifecycle(AgentLifecyclePhase::Failed);
+                return Err(error.into_agent_error());
+            }
         }
     }
 }
@@ -1215,20 +1242,32 @@ impl AcpAgentManager {
             (s.session_id().map(ToOwned::to_owned), s.is_opened())
         };
 
-        let sid = match (session_id, opened) {
+        if opened {
+            self.runtime.transition_lifecycle(AgentLifecyclePhase::Ready);
+        } else {
+            self.runtime.transition_lifecycle(AgentLifecyclePhase::OpeningSession);
+        }
+        let sid_result = match (session_id, opened) {
             // Unbound + fork spec: the forked conversation's backend session
             // has not materialized yet → session/fork against the parent sid
             // (never session/new — that would silently drop the parent
             // context the user forked for).
             (None, _) => match self.params.config.fork.as_ref() {
-                Some(fork) => self.open_session_fork(fork).await?,
-                None => self.open_session_new().await?,
+                Some(fork) => self.open_session_fork(fork).await,
+                None => self.open_session_new().await,
             },
-            (Some(sid), false) => self.open_session_resume(&sid).await?,
-            (Some(sid), true) => sid,
+            (Some(sid), false) => self.open_session_resume(&sid).await,
+            (Some(sid), true) => Ok(sid),
+        };
+        let sid = match sid_result {
+            Ok(sid) => sid,
+            Err(error) => {
+                self.runtime.transition_lifecycle(AgentLifecyclePhase::Failed);
+                return Err(error);
+            }
         };
 
-        {
+        let opened_result = {
             let mut s = self.session.write().await;
             let sid = mark_session_opened_after_protocol_ready(
                 &mut s,
@@ -1236,9 +1275,21 @@ impl AcpAgentManager {
                 self.protocol.is_connected(),
                 &self.params.conversation_id,
                 self.backend(),
-            )?;
-            self.commit_session_changes(&mut s).await;
-            Ok(sid)
+            );
+            if sid.is_ok() {
+                self.commit_session_changes(&mut s).await;
+            }
+            sid
+        };
+        match opened_result {
+            Ok(sid) => {
+                self.runtime.transition_lifecycle(AgentLifecyclePhase::Ready);
+                Ok(sid)
+            }
+            Err(error) => {
+                self.runtime.transition_lifecycle(AgentLifecyclePhase::Failed);
+                Err(error)
+            }
         }
     }
 
@@ -1438,7 +1489,13 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
             "ACP send_message started"
         );
 
-        match self.ensure_session_and_send(&data).await {
+        let outcome = self.ensure_session_and_send(&data).await;
+        self.runtime.transition_lifecycle(if outcome.is_ok() {
+            AgentLifecyclePhase::Ready
+        } else {
+            AgentLifecyclePhase::Failed
+        });
+        match outcome {
             Ok(PromptOutcome::Completed { session_id }) => {
                 info!(
                     agent_type = "acp",
@@ -1499,9 +1556,9 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
                 //      of the AgentError is the best we can do.
                 let close_reason = self.build_close_reason_from_error(&agent_err).await;
 
-                // Operator log: full error chain + the (raw, pre-redaction)
-                // stderr peek so on-call can correlate. The redacted summary
-                // is what reaches the UI.
+                // Operator log: the structured error chain and allowlisted
+                // summary only. Buffered stderr is redacted at ingestion;
+                // the same bounded summary is what reaches the UI.
                 let summary = close_reason.user_facing_message();
                 error!(error = %ErrorChain(&agent_err), close_reason_summary = %summary, "ACP send_message failed");
 
@@ -1518,6 +1575,7 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id))]
     async fn cancel(&self) -> Result<(), AgentError> {
         info!("Cancelling ACP session");
+        self.runtime.transition_lifecycle(AgentLifecyclePhase::Cancelling);
         let session_id = self.session.read().await.session_id().map(ToOwned::to_owned);
         if let Some(sid) = &session_id {
             self.protocol
@@ -1546,6 +1604,7 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
             ?reason,
             "Killing ACP agent"
         );
+        self.runtime.transition_lifecycle(AgentLifecyclePhase::Closing);
 
         // Mark closing to prevent reconnect attempts
         self.permission_router.set_closing();
@@ -1578,6 +1637,7 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
         let process_group_id = process.process_group_id();
         let backend = backend.to_owned();
         let idle_timeout = matches!(reason, Some(AgentKillReason::IdleTimeout));
+        let runtime = self.runtime.clone();
 
         tokio::spawn(async move {
             let started_at = now_ms();
@@ -1610,6 +1670,7 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
                     );
                 }
             }
+            runtime.transition_lifecycle(AgentLifecyclePhase::Closed);
         });
 
         self.permission_router.cancel_all();
@@ -1642,9 +1703,11 @@ impl AcpAgentManager {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         let _ = crate::agent_task::IAgentTask::kill(self, reason);
         let process = Arc::clone(&self.process);
+        let runtime = self.runtime.clone();
         let grace = Duration::from_millis(ACP_KILL_GRACE_MS);
         Box::pin(async move {
             let _ = process.kill(grace).await;
+            runtime.transition_lifecycle(AgentLifecyclePhase::Closed);
         })
     }
 
@@ -1680,7 +1743,7 @@ impl AcpAgentManager {
 mod tests {
     use super::{
         build_acp_final_input_dump_value, exit_status_parts, normalize_config_option_request_value,
-        register_spawned_process, user_facing_message,
+        register_spawned_process, should_retry_initialize, user_facing_message,
     };
     use crate::agent_runtime::AgentRuntime;
     use crate::error::AgentError;
@@ -1695,6 +1758,19 @@ mod tests {
     use aionui_common::AgentType;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn initialize_retry_is_bounded_and_dsh_specific() {
+        let timeout = AgentError::Acp(AcpError::InitTimeout { timeout_secs: 30 });
+        assert!(should_retry_initialize(Some("deepseek-harness"), 0, &timeout));
+        assert!(!should_retry_initialize(Some("deepseek-harness"), 1, &timeout));
+        assert!(!should_retry_initialize(Some("other-acp"), 0, &timeout));
+        assert!(!should_retry_initialize(
+            Some("deepseek-harness"),
+            0,
+            &AgentError::Acp(AcpError::NotConnected),
+        ));
+    }
 
     fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
         use std::io::Write;

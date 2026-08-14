@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -46,13 +47,27 @@ pub struct AgentAvailabilityService {
     // Used to decide aionrs (built-in, no external CLI) availability: it is
     // usable only when at least one model provider is configured & enabled.
     provider_repo: Arc<dyn IProviderRepository>,
+    encryption_key: [u8; 32],
+    data_dir: PathBuf,
 }
 
 impl AgentAvailabilityService {
+    #[cfg(test)]
     pub fn new(registry: Arc<AgentRegistry>, provider_repo: Arc<dyn IProviderRepository>) -> Self {
+        Self::new_with_runtime_credentials(registry, provider_repo, [0; 32], std::env::temp_dir())
+    }
+
+    pub fn new_with_runtime_credentials(
+        registry: Arc<AgentRegistry>,
+        provider_repo: Arc<dyn IProviderRepository>,
+        encryption_key: [u8; 32],
+        data_dir: PathBuf,
+    ) -> Self {
         Self {
             registry,
             provider_repo,
+            encryption_key,
+            data_dir,
         }
     }
 
@@ -77,6 +92,8 @@ impl AgentAvailabilityService {
             &meta,
             user_id,
             AgentSnapshotCheckKind::Manual,
+            &self.encryption_key,
+            &self.data_dir,
         )
         .await;
         self.persist_snapshot_for_user(user_id, id, &snapshot).await?;
@@ -196,6 +213,8 @@ async fn run_probe(
     meta: &AgentMetadata,
     user_id: &str,
     kind: AgentSnapshotCheckKind,
+    encryption_key: &[u8; 32],
+    data_dir: &std::path::Path,
 ) -> AvailabilitySnapshot {
     let started_at = now_ms();
     let start = Instant::now();
@@ -203,128 +222,132 @@ async fn run_probe(
     // has nothing extra to say.
     let mut guidance: Option<String> = None;
 
-    let (status, error_code, error_message) = if meta.agent_source == AgentSource::Builtin
-        && matches!(
-            meta.backend.as_deref(),
-            Some("claude") | Some("codex") | Some("antigravity")
-        ) {
-        // These builtins are direct CLIs that do not speak ACP, so their deep
-        // check is PATH + `--version` (integrity), never a session/new-style
-        // handshake (#675). Without antigravity here, agy falls through to the
-        // `try_connect_custom_agent` branch below and every health check fails
-        // with acp_init_failed. Uses the wide recheck budget:
-        // the user is explicitly waiting and large Node CLIs load slowly.
-        match crate::cli_probe::validate_with_budget(meta, crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT).await {
-            Ok(success) => {
-                // Every direct-CLI backend runs the user's own install, so the
-                // installed version is out of our hands for all of them. claude
-                // and codex were exempt only while the app bundled a pinned
-                // copy of each; that bundling is gone, so they get the same
-                // check agy always had. The probe already ran `--version` for
-                // the integrity check and used to discard the output, so this
-                // costs no extra process.
-                //
-                // Reported HERE and not only mid-conversation: this is where the
-                // user is deciding whether to rely on the agent, and the
-                // session-time notice arrives long after that choice is made.
-                let drift = direct_cli_program(meta).and_then(|cli| {
-                    success
-                        .reported_version
-                        .as_deref()
-                        .and_then(|reported| aionui_session::version_drift(cli, reported))
-                });
-                match drift {
-                    // Status stays ONLINE — the agent works. The code rides the
-                    // error_code column because that is what the UI translates,
-                    // and `last_success_at` keys off `status`, not the code, so
-                    // a drifting agent is still recorded as a success.
-                    Some(drift) => {
-                        guidance = Some(drift.guidance);
-                        (
-                            AgentSnapshotCheckStatus::Online,
-                            Some(drift.code.to_owned()),
-                            Some(drift.detail),
-                        )
-                    }
-                    None => (AgentSnapshotCheckStatus::Online, None, None),
-                }
-            }
-            Err(failure) => (
-                AgentSnapshotCheckStatus::Offline,
-                Some(failure.error_code().to_owned()),
-                Some(failure.detail()),
-            ),
-        }
-    } else if let Some(command) = meta.command.as_deref() {
-        let env: HashMap<String, String> = meta
-            .env
-            .iter()
-            .map(|entry| (entry.name.clone(), entry.value.clone()))
-            .collect();
-        match explicit_probe_args(meta) {
-            Err(error) => (
-                AgentSnapshotCheckStatus::Offline,
-                Some("package_lock_invalid".to_owned()),
-                Some(error),
-            ),
-            Ok(args) => {
-                match custom_agent_probe::try_connect_custom_agent_with_catalog(command, &args, &env, None).await {
-                    // The probe opened a real session to reach this verdict, so its
-                    // `session/new` already carried whatever modes / models / config
-                    // options the agent advertises. Persist them through the same
-                    // channel a live conversation uses, so the pickers are populated
-                    // before the user ever opens one. Best-effort and additive:
-                    // `apply_handshake` skips `None` fields, so this never blanks a
-                    // catalog a real session had filled in, and an agent that
-                    // advertises nothing sends nothing.
-                    (TryConnectCustomAgentResponse::Success, catalog) => {
-                        if let Some(partial) = catalog {
-                            registry
-                                .catalog_sender()
-                                .send_partial(user_id.to_owned(), meta.id.clone(), *partial);
+    let (status, error_code, error_message) =
+        if meta.backend.as_deref() == Some(crate::factory::deepseek_harness::BACKEND) {
+            probe_deepseek_harness(registry, provider_repo, meta, user_id, encryption_key, data_dir).await
+        } else if meta.agent_source == AgentSource::Builtin
+            && matches!(
+                meta.backend.as_deref(),
+                Some("claude") | Some("codex") | Some("antigravity")
+            )
+        {
+            // These builtins are direct CLIs that do not speak ACP, so their deep
+            // check is PATH + `--version` (integrity), never a session/new-style
+            // handshake (#675). Without antigravity here, agy falls through to the
+            // `try_connect_custom_agent` branch below and every health check fails
+            // with acp_init_failed. Uses the wide recheck budget:
+            // the user is explicitly waiting and large Node CLIs load slowly.
+            match crate::cli_probe::validate_with_budget(meta, crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT).await {
+                Ok(success) => {
+                    // Every direct-CLI backend runs the user's own install, so the
+                    // installed version is out of our hands for all of them. claude
+                    // and codex were exempt only while the app bundled a pinned
+                    // copy of each; that bundling is gone, so they get the same
+                    // check agy always had. The probe already ran `--version` for
+                    // the integrity check and used to discard the output, so this
+                    // costs no extra process.
+                    //
+                    // Reported HERE and not only mid-conversation: this is where the
+                    // user is deciding whether to rely on the agent, and the
+                    // session-time notice arrives long after that choice is made.
+                    let drift = direct_cli_program(meta).and_then(|cli| {
+                        success
+                            .reported_version
+                            .as_deref()
+                            .and_then(|reported| aionui_session::version_drift(cli, reported))
+                    });
+                    match drift {
+                        // Status stays ONLINE — the agent works. The code rides the
+                        // error_code column because that is what the UI translates,
+                        // and `last_success_at` keys off `status`, not the code, so
+                        // a drifting agent is still recorded as a success.
+                        Some(drift) => {
+                            guidance = Some(drift.guidance);
+                            (
+                                AgentSnapshotCheckStatus::Online,
+                                Some(drift.code.to_owned()),
+                                Some(drift.detail),
+                            )
                         }
-                        (AgentSnapshotCheckStatus::Online, None, None)
+                        None => (AgentSnapshotCheckStatus::Online, None, None),
                     }
-                    (TryConnectCustomAgentResponse::FailCli { error }, _) => (
-                        AgentSnapshotCheckStatus::Offline,
-                        Some("command_not_found".to_owned()),
-                        Some(error),
-                    ),
-                    (TryConnectCustomAgentResponse::FailAcp { error }, _) => (
-                        AgentSnapshotCheckStatus::Offline,
-                        Some("acp_init_failed".to_owned()),
-                        Some(error),
-                    ),
-                    // Reachable but not authorized: still offline (unusable), but a
-                    // dedicated code lets the UI guide the user to log in.
-                    (TryConnectCustomAgentResponse::FailAuth { error }, _) => (
-                        AgentSnapshotCheckStatus::Offline,
-                        Some("auth_required".to_owned()),
-                        Some(error),
-                    ),
+                }
+                Err(failure) => (
+                    AgentSnapshotCheckStatus::Offline,
+                    Some(failure.error_code().to_owned()),
+                    Some(failure.detail()),
+                ),
+            }
+        } else if let Some(command) = meta.command.as_deref() {
+            let env: HashMap<String, String> = meta
+                .env
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.value.clone()))
+                .collect();
+            match explicit_probe_args(meta) {
+                Err(error) => (
+                    AgentSnapshotCheckStatus::Offline,
+                    Some("package_lock_invalid".to_owned()),
+                    Some(error),
+                ),
+                Ok(args) => {
+                    match custom_agent_probe::try_connect_custom_agent_with_catalog(command, &args, &env, None).await {
+                        // The probe opened a real session to reach this verdict, so its
+                        // `session/new` already carried whatever modes / models / config
+                        // options the agent advertises. Persist them through the same
+                        // channel a live conversation uses, so the pickers are populated
+                        // before the user ever opens one. Best-effort and additive:
+                        // `apply_handshake` skips `None` fields, so this never blanks a
+                        // catalog a real session had filled in, and an agent that
+                        // advertises nothing sends nothing.
+                        (TryConnectCustomAgentResponse::Success, catalog) => {
+                            if let Some(partial) = catalog {
+                                registry
+                                    .catalog_sender()
+                                    .send_partial(user_id.to_owned(), meta.id.clone(), *partial);
+                            }
+                            (AgentSnapshotCheckStatus::Online, None, None)
+                        }
+                        (TryConnectCustomAgentResponse::FailCli { error }, _) => (
+                            AgentSnapshotCheckStatus::Offline,
+                            Some("command_not_found".to_owned()),
+                            Some(error),
+                        ),
+                        (TryConnectCustomAgentResponse::FailAcp { error }, _) => (
+                            AgentSnapshotCheckStatus::Offline,
+                            Some("acp_init_failed".to_owned()),
+                            Some(error),
+                        ),
+                        // Reachable but not authorized: still offline (unusable), but a
+                        // dedicated code lets the UI guide the user to log in.
+                        (TryConnectCustomAgentResponse::FailAuth { error }, _) => (
+                            AgentSnapshotCheckStatus::Offline,
+                            Some("auth_required".to_owned()),
+                            Some(error),
+                        ),
+                    }
                 }
             }
-        }
-    } else if meta.backend.is_some() {
-        // Commandless builtin fallback: same PATH + `--version` treatment as
-        // the direct CLIs — no PATH-only side door (#675).
-        match crate::cli_probe::validate_with_budget(meta, crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT).await {
-            Ok(_) => (AgentSnapshotCheckStatus::Online, None, None),
-            Err(failure) => (
-                AgentSnapshotCheckStatus::Offline,
-                Some(failure.error_code().to_owned()),
-                Some(failure.detail()),
-            ),
-        }
-    } else if meta.agent_type == AgentType::Aionrs {
-        // aionrs is the built-in Rust agent: there is no external CLI to probe,
-        // so its usability hinges entirely on having a configured model. It is
-        // online only when at least one model provider is enabled — otherwise
-        // it cannot run a single turn.
-        probe_aionrs_provider_readiness(provider_repo, user_id).await
-    } else {
-        (AgentSnapshotCheckStatus::Online, None, None)
-    };
+        } else if meta.backend.is_some() {
+            // Commandless builtin fallback: same PATH + `--version` treatment as
+            // the direct CLIs — no PATH-only side door (#675).
+            match crate::cli_probe::validate_with_budget(meta, crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT).await {
+                Ok(_) => (AgentSnapshotCheckStatus::Online, None, None),
+                Err(failure) => (
+                    AgentSnapshotCheckStatus::Offline,
+                    Some(failure.error_code().to_owned()),
+                    Some(failure.detail()),
+                ),
+            }
+        } else if meta.agent_type == AgentType::Aionrs {
+            // aionrs is the built-in Rust agent: there is no external CLI to probe,
+            // so its usability hinges entirely on having a configured model. It is
+            // online only when at least one model provider is enabled — otherwise
+            // it cannot run a single turn.
+            probe_aionrs_provider_readiness(provider_repo, user_id).await
+        } else {
+            (AgentSnapshotCheckStatus::Online, None, None)
+        };
 
     let latency_ms = start.elapsed().as_millis() as i64;
     let status = match status {
@@ -345,6 +368,78 @@ async fn run_probe(
         guidance,
         latency_ms,
         checked_at: started_at,
+    }
+}
+
+async fn probe_deepseek_harness(
+    registry: &Arc<AgentRegistry>,
+    provider_repo: &Arc<dyn IProviderRepository>,
+    meta: &AgentMetadata,
+    user_id: &str,
+    encryption_key: &[u8; 32],
+    data_dir: &std::path::Path,
+) -> (AgentSnapshotCheckStatus, Option<String>, Option<String>) {
+    if aionui_runtime::probe_deepseek_harness_runtime().is_none() {
+        return (
+            AgentSnapshotCheckStatus::Offline,
+            Some("managed_runtime_unavailable".to_owned()),
+            Some("DeepSeek Harness runtime is not installed".to_owned()),
+        );
+    }
+    let launch = match crate::factory::deepseek_harness::resolve_probe_launch(
+        provider_repo.as_ref(),
+        encryption_key,
+        data_dir,
+        user_id,
+    )
+    .await
+    {
+        Ok(launch) => launch,
+        Err(error) => {
+            let message = error.to_string();
+            let code = if message.contains("no enabled models") {
+                "no_model"
+            } else if message.contains("provider") || message.contains("credential") || message.contains("API key") {
+                "no_provider"
+            } else {
+                "health_check_failed"
+            };
+            return (AgentSnapshotCheckStatus::Offline, Some(code.to_owned()), Some(message));
+        }
+    };
+    let command = launch.command_spec.command.to_string_lossy().into_owned();
+    let env: HashMap<String, String> = launch
+        .command_spec
+        .env
+        .iter()
+        .map(|entry| (entry.name.clone(), entry.value.clone()))
+        .collect();
+    match custom_agent_probe::try_connect_custom_agent_with_catalog(&command, &launch.command_spec.args, &env, None)
+        .await
+    {
+        (TryConnectCustomAgentResponse::Success, catalog) => {
+            if let Some(partial) = catalog {
+                registry
+                    .catalog_sender()
+                    .send_partial(user_id.to_owned(), meta.id.clone(), *partial);
+            }
+            (AgentSnapshotCheckStatus::Online, None, None)
+        }
+        (TryConnectCustomAgentResponse::FailCli { .. }, _) => (
+            AgentSnapshotCheckStatus::Offline,
+            Some("managed_runtime_unavailable".to_owned()),
+            Some("Managed DeepSeek Harness runtime could not be started".to_owned()),
+        ),
+        (TryConnectCustomAgentResponse::FailAcp { .. }, _) => (
+            AgentSnapshotCheckStatus::Offline,
+            Some("acp_init_failed".to_owned()),
+            Some("DeepSeek Harness ACP initialization failed".to_owned()),
+        ),
+        (TryConnectCustomAgentResponse::FailAuth { .. }, _) => (
+            AgentSnapshotCheckStatus::Offline,
+            Some("auth_required".to_owned()),
+            Some("DeepSeek provider authentication failed".to_owned()),
+        ),
     }
 }
 
@@ -633,6 +728,7 @@ mod tests {
                 bridge_binary: Some("npx".into()),
                 hub_package_id: None,
                 version: None,
+                managed_runtime: None,
             },
             enabled: true,
             available: true,
@@ -666,6 +762,8 @@ mod tests {
             &meta,
             "system_default_user",
             AgentSnapshotCheckKind::Manual,
+            &[0; 32],
+            &std::env::temp_dir(),
         )
         .await;
 
@@ -932,6 +1030,8 @@ mod tests {
             &meta,
             TEST_USER_ID,
             AgentSnapshotCheckKind::Manual,
+            &[0; 32],
+            &std::env::temp_dir(),
         )
         .await;
         assert_eq!(snapshot.status, "offline");

@@ -188,6 +188,18 @@ pub enum AgentInstance {
 }
 
 impl AgentInstance {
+    /// Vendor backend for lifecycle policies that must be enforced outside the
+    /// protocol implementation (for example connection-scoped model rebuilds).
+    pub fn backend(&self) -> Option<&str> {
+        match self {
+            Self::Acp(manager) => manager.backend(),
+            Self::Aionrs(_) => Some("aionrs"),
+            Self::Session(_) => None,
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(_) => None,
+        }
+    }
+
     /// Common `IAgentTask` view, regardless of variant.
     pub fn as_task(&self) -> &dyn IAgentTask {
         match self {

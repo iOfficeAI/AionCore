@@ -3867,7 +3867,7 @@ impl ConversationService {
         })
     }
 
-    async fn ensure_runtime_agent(
+    pub(crate) async fn ensure_runtime_agent(
         &self,
         user_id: &str,
         conversation_id: &str,

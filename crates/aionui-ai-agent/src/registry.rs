@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use aionui_api_types::{
     AgentEnvEntry, AgentHandshake, AgentManagementRow, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind,
-    AgentSnapshotCheckStatus, AgentSource, AgentSourceInfo, BehaviorPolicy,
+    AgentSnapshotCheckStatus, AgentSource, AgentSourceInfo, BehaviorPolicy, ManagedRuntimeState, ManagedRuntimeStatus,
 };
 use aionui_common::{AgentType, now_ms};
 use aionui_db::{AgentMetadataRow, IAgentMetadataRepository, UpdateAgentHandshakeParams};
@@ -659,6 +659,7 @@ fn is_visible(meta: &AgentMetadata) -> bool {
 fn agent_management_row(meta: AgentMetadata, reason: Option<&UnavailableReason>) -> AgentManagementRow {
     let status = derive_management_status(&meta, reason);
     let diagnostics = derive_management_diagnostics(&meta, status, reason);
+    let runtime = managed_runtime_status(&meta);
     let handshake = meta.handshake;
     AgentManagementRow {
         id: meta.id,
@@ -672,7 +673,10 @@ fn agent_management_row(meta: AgentMetadata, reason: Option<&UnavailableReason>)
         agent_source: meta.agent_source,
         agent_source_info: meta.agent_source_info,
         enabled: meta.enabled,
-        installed: meta.available,
+        installed: runtime
+            .as_ref()
+            .map_or(meta.available, |runtime| runtime.state == ManagedRuntimeState::Ready),
+        runtime,
         command: meta.command,
         args: meta.args,
         env: Vec::new(),
@@ -943,6 +947,9 @@ async fn validate_cli_availability(
     if !meta.available || meta.agent_source != AgentSource::Builtin {
         return (meta, reason, InlineProbeOutcome::NotProbed);
     }
+    if meta.agent_source_info.managed_runtime.is_some() {
+        return (meta, reason, InlineProbeOutcome::Settled);
+    }
 
     let Some(binary) = crate::cli_probe::command_name(&meta).map(str::to_owned) else {
         return (meta, reason, InlineProbeOutcome::NotProbed);
@@ -1024,7 +1031,28 @@ fn apply_cached_availability(meta: &mut AgentMetadata) -> Option<UnavailableReas
 }
 
 fn is_builtin_managed_agent(meta: &AgentMetadata) -> bool {
-    meta.agent_source == AgentSource::Builtin && matches!(meta.backend.as_deref(), Some("claude") | Some("codex"))
+    meta.agent_source == AgentSource::Builtin
+        && (matches!(meta.backend.as_deref(), Some("claude") | Some("codex"))
+            || meta.agent_source_info.managed_runtime.is_some())
+}
+
+fn managed_runtime_status(meta: &AgentMetadata) -> Option<ManagedRuntimeStatus> {
+    let source = meta.agent_source_info.managed_runtime.as_ref()?;
+    let ready = source.runtime_id == aionui_runtime::DEEPSEEK_HARNESS_RUNTIME_ID
+        && aionui_runtime::probe_deepseek_harness_runtime().is_some();
+    Some(ManagedRuntimeStatus {
+        runtime_id: source.runtime_id.clone(),
+        release: source.release.clone(),
+        state: if ready {
+            ManagedRuntimeState::Ready
+        } else {
+            ManagedRuntimeState::NotInstalled
+        },
+        phase: None,
+        progress: None,
+        error_code: None,
+        error_message: None,
+    })
 }
 
 fn has_availability_snapshot(meta: &AgentMetadata) -> bool {
@@ -1397,6 +1425,9 @@ pub(crate) fn guidance_for_snapshot_error_code(error_code: &str) -> &'static str
             "Fix the provider credentials or network issue that caused the last session failure, then start a new conversation."
         }
         "no_provider" => "Add and enable a model provider in Settings, then run Test Connection again.",
+        "no_model" => {
+            "Enable at least one model for the selected provider in Settings, then run Test Connection again."
+        }
         "version_probe_failed" => {
             "The CLI is on PATH but `--version` failed — the install is likely corrupted. Reinstall the CLI, then run Test Connection again."
         }
@@ -1535,6 +1566,21 @@ fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableRe
         return Err(UnavailableReason::Disabled);
     }
 
+    if let Some(runtime) = meta.agent_source_info.managed_runtime.as_ref() {
+        if runtime.runtime_id == aionui_runtime::DEEPSEEK_HARNESS_RUNTIME_ID {
+            return aionui_runtime::probe_deepseek_harness_runtime()
+                .map(|resolved| resolved.node_path)
+                .ok_or_else(|| UnavailableReason::ManagedRuntimeUnavailable {
+                    resource: runtime.runtime_id.clone(),
+                    detail: format!("release {} is not installed", runtime.release),
+                });
+        }
+        return Err(UnavailableReason::ManagedRuntimeUnavailable {
+            resource: runtime.runtime_id.clone(),
+            detail: "runtime type is not supported by this build".to_owned(),
+        });
+    }
+
     // Builtin claude/codex run as direct CLIs now: availability is a PATH-only
     // probe of the primary command (packaged app ships the binary, but PATH
     // presence is our proxy for "user installed + authenticated" — see
@@ -1603,7 +1649,7 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 43, "seed rows: 42 pre-existing + antigravity");
+        assert_eq!(all.len(), 44, "seed rows include antigravity and deepseek-harness");
     }
 
     #[tokio::test]
@@ -1720,7 +1766,7 @@ mod tests {
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
         let count = |t: AgentType| all.iter().filter(|m| m.agent_type == t).count();
-        assert_eq!(count(AgentType::Acp), 39);
+        assert_eq!(count(AgentType::Acp), 40);
         assert_eq!(count(AgentType::Nanobot), 1);
         assert_eq!(count(AgentType::OpenclawGateway), 1);
         assert_eq!(count(AgentType::Aionrs), 1);
@@ -1932,7 +1978,7 @@ mod tests {
     async fn diagnostic_snapshot_pairs_rows_with_reasons() {
         let reg = registry().await;
         let snapshot = reg.diagnostic_snapshot().await;
-        assert_eq!(snapshot.len(), 43, "every row appears once");
+        assert_eq!(snapshot.len(), 44, "every row appears once");
 
         for (meta, reason) in &snapshot {
             match (meta.available, reason) {
