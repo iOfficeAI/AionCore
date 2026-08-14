@@ -37,9 +37,9 @@ mod websocket;
 
 pub use acp::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AcpEnvResponse, AgentModeResponse, CanonicalReplayProjectionResponse,
-    ConfigOptionConfirmation, DetectCliRequest, DetectCliResponse, GetConfigOptionsResponse, JournalTranscriptItem,
-    JournalTranscriptResponse, ModelInfoEntry, ModelInfoPayload, ProbeModelRequest, RetainedOutputResponse,
-    SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest, SetModelRequest, SideQuestionRequest,
+    ConfigOptionConfirmation, DetectCliRequest, DetectCliResponse, GetConfigOptionsResponse, GetModelInfoResponse,
+    JournalTranscriptItem, JournalTranscriptResponse, ModelInfoEntry, ModelInfoPayload, ProbeModelRequest,
+    RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest, SetModelRequest,
     SideQuestionResponse, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse, WorkspaceBrowseQuery,
     WorkspaceEntry,
 };
