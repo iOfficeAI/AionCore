@@ -15,6 +15,7 @@ use crate::stream_persistence::{
     CanonicalEventJournal, OutputRetentionPolicy, PersistedTextSegment, StreamPersistenceAdapter, TextSegmentState,
     ThinkingSegmentState, canonical_event_id,
 };
+use crate::tool_event_pipeline::ToolEventPipeline;
 use aionui_db::IConversationRepository;
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
@@ -81,123 +82,6 @@ fn humanize_ms(ms: i64) -> String {
         (0, 0, s) => format!("{s}s"),
         (0, m, s) => format!("{m}m{s:02}s"),
         (h, m, _) => format!("{h}h{m:02}m"),
-    }
-}
-
-async fn retain_large_tool_output(
-    policy: &OutputRetentionPolicy,
-    user_id: &str,
-    conversation_id: &str,
-    event: &mut AgentStreamEvent,
-) -> Result<(), std::io::Error> {
-    async fn governed(
-        policy: &OutputRetentionPolicy,
-        user_id: &str,
-        conversation_id: &str,
-        value: &str,
-    ) -> Result<Option<String>, std::io::Error> {
-        Ok(policy.retain(user_id, conversation_id, value).await?.map(|retained| {
-            json!({
-                "preview": retained.preview,
-                "size": retained.size,
-                "sha256": retained.sha256,
-                "reference": retained.reference,
-            })
-            .to_string()
-        }))
-    }
-
-    match event {
-        AgentStreamEvent::ToolCall(data) => {
-            if let Some(output) = data.output.as_mut()
-                && let Some(replacement) = governed(policy, user_id, conversation_id, output).await?
-            {
-                *output = replacement;
-            }
-        }
-        AgentStreamEvent::AcpToolCall(data) => {
-            if let Some(raw_output) = data.update.raw_output.as_mut() {
-                let serialized = serde_json::to_string(raw_output).unwrap_or_default();
-                if let Some(replacement) = governed(policy, user_id, conversation_id, &serialized).await? {
-                    *raw_output = serde_json::from_str(&replacement).unwrap_or(serde_json::Value::Null);
-                }
-            }
-            if let Some(content) = data.update.content.as_mut() {
-                for item in content {
-                    match item {
-                        aionui_ai_agent::protocol::events::tool_call::AcpToolCallContentItem::Content { content } => {
-                            if let Some(replacement) = governed(policy, user_id, conversation_id, &content.text).await?
-                            {
-                                content.text = replacement;
-                            }
-                        }
-                        aionui_ai_agent::protocol::events::tool_call::AcpToolCallContentItem::Diff {
-                            old_text,
-                            new_text,
-                            ..
-                        } => {
-                            if let Some(value) = old_text.as_mut()
-                                && let Some(replacement) = governed(policy, user_id, conversation_id, value).await?
-                            {
-                                *value = replacement;
-                            }
-                            if let Some(replacement) = governed(policy, user_id, conversation_id, new_text).await? {
-                                *new_text = replacement;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn bound_large_tool_output(event: &mut AgentStreamEvent) {
-    fn preview(value: &str) -> String {
-        const MAX: usize = 64 * 1024;
-        if value.len() <= MAX {
-            return value.to_owned();
-        }
-        let end = value.floor_char_boundary(MAX);
-        format!("{}\n[output truncated: spill unavailable]", &value[..end])
-    }
-
-    match event {
-        AgentStreamEvent::ToolCall(data) => {
-            if let Some(output) = data.output.as_mut() {
-                *output = preview(output);
-            }
-        }
-        AgentStreamEvent::AcpToolCall(data) => {
-            if let Some(raw_output) = data.update.raw_output.as_mut() {
-                let serialized = serde_json::to_string(raw_output).unwrap_or_default();
-                if serialized.len() > 64 * 1024 {
-                    *raw_output = json!({ "preview": preview(&serialized), "spill_error": true });
-                }
-            }
-            if let Some(content) = data.update.content.as_mut() {
-                for item in content {
-                    match item {
-                        aionui_ai_agent::protocol::events::tool_call::AcpToolCallContentItem::Content { content } => {
-                            content.text = preview(&content.text);
-                        }
-                        aionui_ai_agent::protocol::events::tool_call::AcpToolCallContentItem::Diff {
-                            old_text,
-                            new_text,
-                            ..
-                        } => {
-                            if let Some(value) = old_text.as_mut() {
-                                *value = preview(value);
-                            }
-                            *new_text = preview(new_text);
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
     }
 }
 
@@ -474,12 +358,15 @@ impl StreamRelay {
 
             match recv_result {
                 Ok(mut event) => {
-                    if let Some(policy) = &self.output_retention
-                        && let Err(error) =
-                            retain_large_tool_output(policy, &self.user_id, &self.conversation_id, &mut event).await
+                    let pipeline = ToolEventPipeline::new(self.output_retention.as_ref());
+                    if let Err(error) = pipeline
+                        .post_execute(&self.user_id, &self.conversation_id, &mut event)
+                        .await
                     {
-                        warn!(error = %error, "Failed to retain large tool output; forwarding bounded in-memory event");
-                        bound_large_tool_output(&mut event);
+                        warn!(
+                            error = %error,
+                            "Tool post-execute spill failed; forwarding bounded in-memory event"
+                        );
                     }
                     // Journal first: model/host-visible history must be reconstructible
                     // from this log (see journal_transcript::derive_transcript).
