@@ -2,8 +2,21 @@
 
 /// AionUi's sentinel mode id meaning "run without approval prompts".
 ///
-/// Not one of agy's modes (default / accept-edits / plan) and never sent to it.
+/// Not one of agy's modes and never sent to it; answered by removing the approval hook.
 pub(crate) const FULL_AUTO_SENTINEL: &str = "yolo";
+
+/// AionUi's mode id meaning "ask before sensitive things" — its counterpart to
+/// [`FULL_AUTO_SENTINEL`], answered by KEEPING the approval hook installed.
+///
+/// Also not an agy value: `agy --help` lists exactly two (verified:
+/// samples/antigravity-cli/1.1.8/agy_--help.txt:12 — "Set the agent execution mode for
+/// this session (accept-edits, plan)"). Passing `--mode default` makes agy print
+/// `warning: unrecognized --mode value "default" (valid: accept-edits, plan)` and drop
+/// the flag, leaving the session on whatever agy defaults to while the UI reports the
+/// switch as applied.
+///
+/// Omitting the flag is the correct translation anyway: agy's own default IS this mode.
+pub(crate) const HOST_DEFAULT_MODE: &str = "default";
 
 /// Everything one `agy` invocation needs. There is deliberately no `effort`
 /// field: agy's model ids already carry the effort suffix (see `model`).
@@ -19,7 +32,8 @@ pub(crate) struct ArgvInput {
     /// agy silently ignores anything else and falls back to its default model
     /// without reporting an error.
     pub model: Option<String>,
-    /// `default` | `accept-edits` | `plan`.
+    /// An AionUi mode id, not necessarily an agy one. `accept-edits` / `plan` reach agy;
+    /// `yolo` and `default` are host-side and filtered out (see the constants above).
     pub mode: Option<String>,
 }
 
@@ -73,14 +87,15 @@ pub(crate) fn build_argv(input: &ArgvInput) -> Vec<String> {
     }
     // No `--effort`: effort lives inside the model id, and a stripped id is
     // silently ignored by agy.
-    // `yolo` is AionUi's sentinel for "no approval prompts", not one of agy's
-    // modes (default / accept-edits / plan). agy tolerates unknown values
-    // silently, so forwarding it would look fine and quietly leave the session
-    // on whatever mode agy defaults to.
+    // agy takes exactly two values here: `accept-edits` and `plan`. AionUi's other two
+    // modes are host-side concepts expressed through the approval hook — `yolo` by
+    // removing it, `default` by keeping it — and agy rejects both by name, warning and
+    // discarding the flag. Sending either would look fine (exit 0) while silently
+    // leaving the session on agy's default. See the two constants above.
     let mode = input
         .mode
         .as_deref()
-        .filter(|m| !m.eq_ignore_ascii_case(FULL_AUTO_SENTINEL));
+        .filter(|m| !m.eq_ignore_ascii_case(FULL_AUTO_SENTINEL) && !m.eq_ignore_ascii_case(HOST_DEFAULT_MODE));
     let mode = mode.map(str::to_owned);
     for (flag, value) in [("--model", &input.model), ("--mode", &mode)] {
         if let Some(v) = non_blank(value) {
@@ -150,10 +165,8 @@ mod tests {
 
     #[test]
     fn the_full_auto_sentinel_is_never_sent_as_agys_mode() {
-        // `yolo` is AionUi's marker, not one of agy's modes. agy accepts unknown
-        // --mode values silently (verified: `--mode default` exits 0 even though
-        // --help lists only accept-edits/plan), so forwarding it would look fine
-        // and quietly leave the session on agy's default.
+        // `yolo` is AionUi's marker, not one of agy's modes. It is answered by NOT
+        // installing the approval hook, never by a `--mode` value.
         let mut i = base();
         i.mode = Some("yolo".to_owned());
         let a = build_argv(&i);
@@ -161,9 +174,41 @@ mod tests {
         assert!(!a.iter().any(|x| x == "yolo"), "argv={a:?}");
     }
 
+    /// `default` is AionUi's "ask before sensitive things" mode, NOT an agy value.
+    ///
+    /// agy takes only `accept-edits` and `plan` (verified:
+    /// samples/antigravity-cli/1.1.8/agy_--help.txt:12 — "Set the agent execution mode
+    /// for this session (accept-edits, plan)"). Sending `--mode default` makes agy print
+    /// `warning: unrecognized --mode value "default" (valid: accept-edits, plan)` and
+    /// DROP the flag, so the session silently stays on whatever agy defaults to while the
+    /// UI reports the switch as done.
+    ///
+    /// An earlier note claimed agy "accepts unknown --mode values silently (exits 0)".
+    /// Exit 0 is not acceptance: the observed run warns and discards the argument.
+    ///
+    /// Like `yolo`, this mode is expressed by the host — `yolo` by removing the approval
+    /// hook, `default` by keeping it — so neither belongs on agy's command line. Omitting
+    /// the flag is also exactly right semantically: agy's own default IS "default".
     #[test]
+    fn the_default_mode_is_host_side_and_never_sent_to_agy() {
+        let mut i = base();
+        i.mode = Some("default".to_owned());
+        let a = build_argv(&i);
+        assert!(
+            !a.contains(&"--mode".to_string()),
+            "agy rejects `--mode default`; the flag must be omitted, argv={a:?}"
+        );
+        assert!(!a.iter().any(|x| x == "default"), "argv={a:?}");
+    }
+
+    #[test]
+    /// Only the two values agy actually documents are forwarded.
+    ///
+    /// `default` used to be in this list, which is what put an unrecognized value on
+    /// agy's command line; it is host-side and covered by
+    /// `the_default_mode_is_host_side_and_never_sent_to_agy`.
     fn agys_real_modes_are_forwarded() {
-        for mode in ["default", "accept-edits", "plan"] {
+        for mode in ["accept-edits", "plan"] {
             let mut i = base();
             i.mode = Some(mode.to_owned());
             let a = build_argv(&i);
