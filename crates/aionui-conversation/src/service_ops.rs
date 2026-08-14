@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
-    CanonicalReplayProjectionResponse, ConfigOptionConfirmation, GetConfigOptionsResponse, RetainedOutputResponse,
+    CanonicalReplayProjectionResponse, ConfigOptionConfirmation, GetConfigOptionsResponse, JournalTranscriptResponse,
+    RetainedOutputResponse,
     SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
     WorkspaceBrowseQuery, WorkspaceEntry,
 };
@@ -21,6 +22,7 @@ use aionui_db::SaveRuntimeStateParams;
 use tracing::warn;
 
 use crate::ConversationError;
+use crate::journal_transcript::{RequestedVisibility, derive_transcript};
 use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
 
 const MAX_DIR_DEPTH: usize = 10;
@@ -59,6 +61,48 @@ impl ConversationService {
             last_sequence: projection.last_sequence,
             last_event_id: projection.last_event_id,
             kind_counts: projection.kind_counts,
+            journal_sha256: projection.journal_sha256,
+        })
+    }
+
+    pub async fn derive_event_transcript(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        visibility: Option<&str>,
+    ) -> Result<JournalTranscriptResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        let requested =
+            RequestedVisibility::parse(visibility).map_err(|reason| ConversationError::BadRequest { reason })?;
+        let journal = self.canonical_event_journal();
+        let events = journal
+            .replay(user_id, conversation_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to replay canonical events: {error}")))?;
+        let projection = journal
+            .replay_projection(user_id, conversation_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to project canonical events: {error}")))?;
+        let transcript = derive_transcript(conversation_id, &events, requested);
+        Ok(JournalTranscriptResponse {
+            schema_version: transcript.schema_version,
+            conversation_id: transcript.conversation_id,
+            visibility: transcript.visibility.to_owned(),
+            items: transcript
+                .items
+                .into_iter()
+                .map(|item| aionui_api_types::JournalTranscriptItem {
+                    sequence: item.sequence,
+                    event_id: item.event_id,
+                    journal_kind: item.journal_kind,
+                    transcript_kind: item.transcript_kind.to_owned(),
+                    visibility: item.visibility.to_owned(),
+                    summary: item.summary,
+                    source_sequences: item.source_sequences,
+                })
+                .collect(),
+            model_visible_count: transcript.model_visible_count,
+            model_visible_sha256: transcript.model_visible_sha256,
             journal_sha256: projection.journal_sha256,
         })
     }

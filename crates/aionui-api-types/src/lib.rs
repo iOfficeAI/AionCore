@@ -37,6 +37,7 @@ mod websocket;
 
 pub use acp::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AcpEnvResponse, AgentModeResponse, CanonicalReplayProjectionResponse,
+    JournalTranscriptItem, JournalTranscriptResponse,
     ConfigOptionConfirmation, DetectCliRequest, DetectCliResponse, GetConfigOptionsResponse, GetModelInfoResponse,
     ModelInfoEntry, ModelInfoPayload, ProbeModelRequest, RetainedOutputResponse, SetConfigOptionRequest,
     SetConfigOptionResponse, SetModeRequest, SetModelRequest, SideQuestionRequest, SideQuestionResponse,
