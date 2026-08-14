@@ -50,10 +50,6 @@
       "package": "@compass-ai/nova",
       "version": "1.1.34"
     },
-    "omp": {
-      "package": "@oh-my-pi/pi-coding-agent",
-      "version": "17.1.8"
-    },
     "pi": {
       "registry_json_id": "pi-acp",
       "package": "pi-acp",
