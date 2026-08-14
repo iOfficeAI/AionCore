@@ -15,7 +15,7 @@ use crate::stream_persistence::{
     CanonicalEventJournal, OutputRetentionPolicy, PersistedTextSegment, StreamPersistenceAdapter, TextSegmentState,
     ThinkingSegmentState, canonical_event_id,
 };
-use crate::tool_event_pipeline::ToolEventPipeline;
+use crate::tool_event_pipeline::{ToolEventPipeline, ToolPreExecuteDisposition};
 use aionui_db::IConversationRepository;
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
@@ -359,6 +359,10 @@ impl StreamRelay {
             match recv_result {
                 Ok(mut event) => {
                     let pipeline = ToolEventPipeline::new(self.output_retention.as_ref());
+                    let pre = pipeline.pre_execute(&event);
+                    if !matches!(pre, ToolPreExecuteDisposition::Skipped) {
+                        debug!(?pre, "Tool pre-execute classified host gate");
+                    }
                     if let Err(error) = pipeline
                         .post_execute(&self.user_id, &self.conversation_id, &mut event)
                         .await

@@ -97,6 +97,8 @@ impl ConversationService {
                     transcript_kind: item.transcript_kind.to_owned(),
                     visibility: item.visibility.to_owned(),
                     summary: item.summary,
+                    content: item.content,
+                    compacted: item.compacted,
                     source_sequences: item.source_sequences,
                 })
                 .collect(),

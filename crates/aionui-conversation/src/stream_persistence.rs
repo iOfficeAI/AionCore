@@ -266,6 +266,29 @@ impl CanonicalEventJournal {
         Ok(event)
     }
 
+    /// Record the user's model-visible prompt in the journal. This is the
+    /// host equivalent of DeepSeek Harness logging `user/message` before the
+    /// turn so `deriveMessages()` can reconstruct the full context.
+    pub async fn append_user_prompt(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        msg_id: &str,
+        content: &str,
+    ) -> Result<CanonicalJournalEvent, std::io::Error> {
+        let payload = json!({
+            "type": "user_prompt",
+            "data": {
+                "msg_id": msg_id,
+                "content": content,
+            }
+        });
+        let seed = format!("user_prompt:{conversation_id}:{msg_id}");
+        let event_id = canonical_event_id(&seed, &payload);
+        self.append(user_id, conversation_id, event_id, "UserPrompt".into(), payload)
+            .await
+    }
+
     pub async fn replay(
         &self,
         user_id: &str,
@@ -1018,6 +1041,24 @@ mod output_retention_tests {
         assert_eq!(second.sequence, 2);
         assert_eq!(journal.replay("user", "conv").await.unwrap().len(), 2);
         assert!(journal.replay("other-user", "conv").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_prompt_is_journaled_as_a_model_visible_event() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = CanonicalEventJournal::new(root.path().to_path_buf());
+        let first = journal
+            .append_user_prompt("user", "conv", "msg-1", "please list files")
+            .await
+            .unwrap();
+        let duplicate = journal
+            .append_user_prompt("user", "conv", "msg-1", "please list files")
+            .await
+            .unwrap();
+        assert_eq!(first, duplicate);
+        assert_eq!(first.kind, "UserPrompt");
+        assert_eq!(first.payload["data"]["content"], "please list files");
+        assert_eq!(journal.replay("user", "conv").await.unwrap().len(), 1);
     }
 
     #[tokio::test]

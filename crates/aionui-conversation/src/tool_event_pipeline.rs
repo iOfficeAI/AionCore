@@ -3,18 +3,26 @@
 //!
 //! Agents still execute tools in their own process. AionCore owns the host
 //! gates that sit around those results:
-//! - pre-execute: permission frames already carry approval (see stream relay)
+//! - pre-execute: classify permission / in-flight tool frames
 //! - post-execute: spill oversized output, or bound it if spill fails
 //!
 //! Future sandbox / MCP / audit hooks attach here instead of forking
 //! retain/bound logic in the relay.
 
 use aionui_ai_agent::AgentStreamEvent;
+use aionui_ai_agent::protocol::events::tool_call::{AcpToolCallStatus, ToolCallStatus};
 use serde_json::json;
 
 use crate::stream_persistence::OutputRetentionPolicy;
 
 const INLINE_BOUND_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolPreExecuteDisposition {
+    Skipped,
+    NeedsApproval,
+    InFlight,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolPipelineDisposition {
@@ -31,6 +39,27 @@ pub(crate) struct ToolEventPipeline<'a> {
 impl<'a> ToolEventPipeline<'a> {
     pub(crate) fn new(retention: Option<&'a OutputRetentionPolicy>) -> Self {
         Self { retention }
+    }
+
+    /// Pre-execute host gate. Classification only; agents still run the tool.
+    pub(crate) fn pre_execute(&self, event: &AgentStreamEvent) -> ToolPreExecuteDisposition {
+        match event {
+            AgentStreamEvent::Permission(_) | AgentStreamEvent::AcpPermission(_) => {
+                ToolPreExecuteDisposition::NeedsApproval
+            }
+            AgentStreamEvent::ToolCall(data) if data.status == ToolCallStatus::Running => {
+                ToolPreExecuteDisposition::InFlight
+            }
+            AgentStreamEvent::AcpToolCall(data)
+                if matches!(
+                    data.update.status,
+                    Some(AcpToolCallStatus::Pending | AcpToolCallStatus::InProgress)
+                ) =>
+            {
+                ToolPreExecuteDisposition::InFlight
+            }
+            _ => ToolPreExecuteDisposition::Skipped,
+        }
     }
 
     /// Post-execute host gate. Must run before the event is journaled.
@@ -253,6 +282,30 @@ mod tests {
             }
             _ => panic!("expected tool call"),
         }
+    }
+
+    #[test]
+    fn permission_frames_need_approval_before_execute() {
+        let pipeline = ToolEventPipeline::new(None);
+        let event = AgentStreamEvent::Permission(serde_json::json!({"call_id":"p1"}));
+        assert_eq!(pipeline.pre_execute(&event), ToolPreExecuteDisposition::NeedsApproval);
+    }
+
+    #[test]
+    fn running_tool_calls_are_in_flight_before_execute() {
+        let pipeline = ToolEventPipeline::new(None);
+        let mut event = tool_event("partial");
+        if let AgentStreamEvent::ToolCall(data) = &mut event {
+            data.status = ToolCallStatus::Running;
+        }
+        assert_eq!(pipeline.pre_execute(&event), ToolPreExecuteDisposition::InFlight);
+    }
+
+    #[test]
+    fn completed_tool_results_skip_pre_execute() {
+        let pipeline = ToolEventPipeline::new(None);
+        let event = tool_event("done");
+        assert_eq!(pipeline.pre_execute(&event), ToolPreExecuteDisposition::Skipped);
     }
 
     #[tokio::test]
