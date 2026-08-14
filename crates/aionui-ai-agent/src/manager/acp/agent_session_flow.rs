@@ -45,11 +45,17 @@ impl AcpAgentManager {
             let req = self.params.new_session_request();
             match self.protocol.new_session(req).await {
                 Ok(response) => break response,
-                Err(ref error) if should_retry_session_new(self.backend(), retries, error) => {
+                Err(ref error)
+                    if should_retry_session_new(
+                        self.params.metadata.agent_source_info.managed_runtime.is_some(),
+                        retries,
+                        error,
+                    ) =>
+                {
                     retries += 1;
                     warn!(
                         conversation_id = %self.params.conversation_id,
-                        backend = "deepseek-harness",
+                        backend = self.backend().unwrap_or("-"),
                         phase = "session/new",
                         attempt = retries + 1,
                         "Retrying side-effect-free ACP session creation once"
@@ -497,8 +503,8 @@ impl AcpAgentManager {
     }
 }
 
-fn should_retry_session_new(backend: Option<&str>, retries: u8, error: &AcpError) -> bool {
-    backend == Some("deepseek-harness")
+fn should_retry_session_new(managed_runtime: bool, retries: u8, error: &AcpError) -> bool {
+    managed_runtime
         && retries == 0
         && matches!(error, AcpError::RequestTimeout { method, .. } if method == "session/new")
 }
@@ -836,19 +842,15 @@ mod tests {
     };
 
     #[test]
-    fn session_new_retry_is_bounded_and_dsh_specific() {
+    fn session_new_retry_is_bounded_to_managed_runtimes() {
         let timeout = AcpError::RequestTimeout {
             method: "session/new".to_owned(),
             timeout_secs: 30,
         };
-        assert!(should_retry_session_new(Some("deepseek-harness"), 0, &timeout));
-        assert!(!should_retry_session_new(Some("deepseek-harness"), 1, &timeout));
-        assert!(!should_retry_session_new(Some("other-acp"), 0, &timeout));
-        assert!(!should_retry_session_new(
-            Some("deepseek-harness"),
-            0,
-            &AcpError::NotConnected,
-        ));
+        assert!(should_retry_session_new(true, 0, &timeout));
+        assert!(!should_retry_session_new(true, 1, &timeout));
+        assert!(!should_retry_session_new(false, 0, &timeout));
+        assert!(!should_retry_session_new(true, 0, &AcpError::NotConnected));
     }
 
     /// The end-of-turn usage frame must stay deserializable as `UsageUpdate` —

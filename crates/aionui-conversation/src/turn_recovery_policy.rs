@@ -1,4 +1,4 @@
-use aionui_api_types::{AgentErrorCode, AgentErrorOwnership};
+use aionui_api_types::{AgentErrorCode, AgentErrorOwnership, SessionLifetime};
 use aionui_common::{AgentKillReason, AgentType};
 use tracing::info;
 
@@ -27,6 +27,7 @@ impl TurnRecoveryPolicy {
     pub fn decide(
         agent_type: AgentType,
         backend: Option<&str>,
+        session_lifetime: SessionLifetime,
         outcome: &RelayOutcome,
         lifecycle: RuntimeLifecycleState,
         already_replayed: bool,
@@ -38,7 +39,7 @@ impl TurnRecoveryPolicy {
 
         let decision = if lifecycle == RuntimeLifecycleState::Active
             && agent_type == AgentType::Acp
-            && backend != Some("deepseek-harness")
+            && session_lifetime != SessionLifetime::ConnectionScoped
             && outcome.terminal.is_error()
             && retryable == Some(true)
             && error_code != Some(AgentErrorCode::UserLlmProviderModelNotFound)
@@ -58,6 +59,7 @@ impl TurnRecoveryPolicy {
         info!(
             ?agent_type,
             backend = backend.unwrap_or("unknown"),
+            ?session_lifetime,
             error_code = ?error_code,
             retryable = ?retryable,
             lifecycle = ?lifecycle,
@@ -125,7 +127,7 @@ fn classify_session_recovery_signal(outcome: &RelayOutcome) -> Option<SessionRec
 
 #[cfg(test)]
 mod tests {
-    use aionui_api_types::{AgentErrorCode, AgentErrorOwnership, AgentStreamErrorData};
+    use aionui_api_types::{AgentErrorCode, AgentErrorOwnership, AgentStreamErrorData, SessionLifetime};
     use aionui_common::{AgentKillReason, AgentType};
 
     use super::*;
@@ -150,6 +152,7 @@ mod tests {
         let decision = TurnRecoveryPolicy::decide(
             AgentType::Acp,
             Some("codex"),
+            SessionLifetime::Persistent,
             &outcome,
             RuntimeLifecycleState::Active,
             false,
@@ -166,18 +169,42 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_harness_never_auto_replays_a_sent_prompt() {
+    fn connection_scoped_session_never_auto_replays_a_sent_prompt() {
         let outcome = retryable_clean_error();
 
         let decision = TurnRecoveryPolicy::decide(
             AgentType::Acp,
             Some("deepseek-harness"),
+            SessionLifetime::ConnectionScoped,
             &outcome,
             RuntimeLifecycleState::Active,
             false,
         );
 
         assert_eq!(decision, TurnRecoveryDecision::None);
+    }
+
+    #[test]
+    fn persistent_session_can_auto_replay_even_if_backend_name_is_deepseek() {
+        let outcome = retryable_clean_error();
+
+        let decision = TurnRecoveryPolicy::decide(
+            AgentType::Acp,
+            Some("deepseek-harness"),
+            SessionLifetime::Persistent,
+            &outcome,
+            RuntimeLifecycleState::Active,
+            false,
+        );
+
+        assert_eq!(
+            decision,
+            TurnRecoveryDecision::AutoReplayOnce {
+                reason: AgentKillReason::AgentErrorRecovery,
+                safe_to_auto_replay: true,
+                session_recovery_signal: None,
+            }
+        );
     }
 
     #[test]
@@ -196,6 +223,7 @@ mod tests {
         let decision = TurnRecoveryPolicy::decide(
             AgentType::Acp,
             Some("codex"),
+            SessionLifetime::Persistent,
             &outcome,
             RuntimeLifecycleState::Active,
             false,
@@ -234,6 +262,7 @@ mod tests {
         let decision = TurnRecoveryPolicy::decide(
             AgentType::Acp,
             Some("grok"),
+            SessionLifetime::Persistent,
             &outcome,
             RuntimeLifecycleState::Active,
             false,
@@ -258,6 +287,7 @@ mod tests {
         let decision = TurnRecoveryPolicy::decide(
             AgentType::Acp,
             Some("codex"),
+            SessionLifetime::Persistent,
             &outcome,
             RuntimeLifecycleState::Active,
             false,
@@ -280,6 +310,7 @@ mod tests {
         let decision = TurnRecoveryPolicy::decide(
             AgentType::Acp,
             Some("codex"),
+            SessionLifetime::Persistent,
             &outcome,
             RuntimeLifecycleState::Active,
             true,
@@ -296,6 +327,7 @@ mod tests {
         let decision = TurnRecoveryPolicy::decide(
             AgentType::Acp,
             Some("codex"),
+            SessionLifetime::Persistent,
             &outcome,
             RuntimeLifecycleState::Active,
             false,
@@ -312,6 +344,7 @@ mod tests {
         let decision = TurnRecoveryPolicy::decide(
             AgentType::Acp,
             Some("codex"),
+            SessionLifetime::Persistent,
             &outcome,
             RuntimeLifecycleState::Active,
             false,
@@ -334,6 +367,7 @@ mod tests {
         let decision = TurnRecoveryPolicy::decide(
             AgentType::Acp,
             Some("codex"),
+            SessionLifetime::Persistent,
             &outcome,
             RuntimeLifecycleState::Active,
             false,
@@ -356,6 +390,7 @@ mod tests {
         let decision = TurnRecoveryPolicy::decide(
             AgentType::Acp,
             Some("codex"),
+            SessionLifetime::Persistent,
             &outcome,
             RuntimeLifecycleState::Active,
             false,
@@ -371,6 +406,7 @@ mod tests {
         let decision = TurnRecoveryPolicy::decide(
             AgentType::Acp,
             Some("codex"),
+            SessionLifetime::Persistent,
             &outcome,
             RuntimeLifecycleState::Deleting,
             false,
@@ -383,8 +419,14 @@ mod tests {
     fn non_acp_agent_does_not_auto_replay() {
         let outcome = retryable_clean_error();
 
-        let decision =
-            TurnRecoveryPolicy::decide(AgentType::Aionrs, None, &outcome, RuntimeLifecycleState::Active, false);
+        let decision = TurnRecoveryPolicy::decide(
+            AgentType::Aionrs,
+            None,
+            SessionLifetime::Persistent,
+            &outcome,
+            RuntimeLifecycleState::Active,
+            false,
+        );
 
         assert_eq!(decision, TurnRecoveryDecision::None);
     }

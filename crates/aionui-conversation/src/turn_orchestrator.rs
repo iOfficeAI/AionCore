@@ -18,7 +18,7 @@ use crate::service::{
 use crate::stream_relay::{RelayOutcome, StreamRelay, SupersedingTipTotals, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use crate::turn_recovery_policy::{TurnRecoveryDecision, TurnRecoveryPolicy};
-use aionui_api_types::AgentErrorCode;
+use aionui_api_types::{AgentErrorCode, SessionLifetime};
 
 fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
     match &options.context.kind {
@@ -82,6 +82,7 @@ struct TurnAttemptResult {
     summary: TurnAttemptSummary,
     agent_type: AgentType,
     backend: Option<String>,
+    session_lifetime: SessionLifetime,
 }
 
 impl ConversationTurnOrchestrator {
@@ -246,7 +247,7 @@ impl ConversationTurnOrchestrator {
             let lifecycle = runtime_state.lifecycle_for(&input.conv_id);
             let defer_clean_terminal_errors = input.defer_clean_terminal_errors
                 && agent.agent_type() == AgentType::Acp
-                && backend.as_deref() != Some("deepseek-harness")
+                && agent.session_lifetime() != SessionLifetime::ConnectionScoped
                 && lifecycle == RuntimeLifecycleState::Active
                 && aggregate_summary.safe_to_auto_replay();
             let relay = StreamRelay::new(
@@ -426,6 +427,7 @@ impl ConversationTurnOrchestrator {
             summary: aggregate_summary,
             agent_type: agent.agent_type(),
             backend,
+            session_lifetime: agent.session_lifetime(),
         })
     }
 
@@ -514,6 +516,7 @@ impl ConversationTurnOrchestrator {
             let decision = TurnRecoveryPolicy::decide(
                 attempt_result.agent_type,
                 attempt_result.backend.as_deref(),
+                attempt_result.session_lifetime,
                 &recovery_outcome,
                 lifecycle,
                 replayed,
