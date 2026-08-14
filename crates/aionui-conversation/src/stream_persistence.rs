@@ -51,7 +51,7 @@ impl OutputRetentionPolicy {
     }
 
     #[cfg(test)]
-    fn with_preview_bytes(root: PathBuf, preview_bytes: usize) -> Self {
+    pub(crate) fn with_preview_bytes(root: PathBuf, preview_bytes: usize) -> Self {
         Self { root, preview_bytes }
     }
 
