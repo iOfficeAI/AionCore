@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.70](https://github.com/suoak/AionCore/compare/v0.1.69...v0.1.70) (2026-08-15)
+
+### Features
+
+* **conversation:** derive a host transcript from the canonical journal
+* **conversation:** host tool pre/post-execute pipeline around agent results
+* **agent:** drive lifecycle from declared handshake behavior policy
+* **conversation:** compact older tool results and replay surface tokens
+* **conversation:** fail-closed approval audit and model-visible journal invariant
+
 ## [0.1.69](https://github.com/suoak/AionCore/compare/v0.1.68...v0.1.69) (2026-08-14)
 
 ### Features
