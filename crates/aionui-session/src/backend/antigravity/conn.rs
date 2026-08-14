@@ -251,6 +251,8 @@ impl BackendConnection for AntigravityConnection {
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
+            turn_started_hooked: Arc::new(AtomicBool::new(false)),
+            deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
         });
 
@@ -305,6 +307,22 @@ pub struct AntigravitySessionBackend {
     /// True while a turn's process is alive. agy has no way to accept input
     /// mid-turn, so a Send arriving now has to wait for the next process.
     in_flight: Arc<AtomicBool>,
+    /// Whether the CURRENTLY RUNNING turn was spawned with the approval hook on disk.
+    ///
+    /// This is what decides whether a mid-turn mode switch can reach agy at all. The
+    /// permission gate lives on the host — agy calls back per tool use and
+    /// `request_external_permission` re-reads the mode each time — so a hooked turn
+    /// honours a switch immediately, in both directions. A turn spawned in FULL AUTO has
+    /// no hook, never calls back, and therefore cannot learn about a tightening until the
+    /// next process starts; `sync_permission_hook` writes the file back, but nothing
+    /// proves a running agy re-reads it.
+    ///
+    /// Recorded at spawn rather than derived from the current mode, because the current
+    /// mode is exactly what the user just changed.
+    turn_started_hooked: Arc<AtomicBool>,
+    /// A mode switch accepted while the running turn could not hear it. Confirmed at the
+    /// next spawn, where argv finally carries it.
+    deferred_mode_confirm: Arc<Mutex<Option<String>>>,
     /// Skills provisioned into this workspace, exposed as slash commands. agy
     /// has no command-list interface, so this is read off the skill files.
     slash_commands: Vec<SlashCommandInfo>,
@@ -517,6 +535,17 @@ impl AntigravitySessionBackend {
             .or_else(|| self.config.mode.clone())
     }
 
+    /// Whether a mode switch made RIGHT NOW would govern the turn already running.
+    ///
+    /// Between turns: yes — the next spawn reads the new mode from argv either way.
+    /// During a hooked turn: yes — agy calls back per tool use and the host gate re-reads
+    /// the mode, so the switch governs the very next tool, in both directions.
+    /// During a full-auto turn: no — that process was spawned without a hook, never calls
+    /// back, and cannot be told; only the next spawn picks it up.
+    fn switch_reaches_current_turn(&self) -> bool {
+        !self.in_flight.load(Ordering::SeqCst) || self.turn_started_hooked.load(Ordering::SeqCst)
+    }
+
     /// Whether this session currently runs without approval prompts.
     fn is_full_auto(&self) -> bool {
         self.effective_mode()
@@ -588,7 +617,24 @@ impl AntigravitySessionBackend {
             .await
             .map_err(|e| BackendError::Transport(format!("spawn agy: {e}")))?;
         *self.current.lock().await = Some(Arc::clone(&proc));
+        // Freeze whether THIS turn can hear about a later mode switch. A hooked turn
+        // calls back per tool use, so the host gate applies a switch at once; a full-auto
+        // turn never calls back and only the next spawn can pick one up.
+        self.turn_started_hooked.store(!self.is_full_auto(), Ordering::SeqCst);
         self.in_flight.store(true, Ordering::SeqCst);
+        // A switch deferred during the previous turn becomes real exactly here: this argv
+        // carries it. Confirm it now, which both clears the frontend's pending marker and
+        // persists `current_mode_id` (ConfigChanged is the only trigger for that).
+        if let Some(mode) = self.deferred_mode_confirm.lock().await.take() {
+            let turn_gen = self.turn_gen.load(Ordering::SeqCst);
+            self.emit(
+                turn_gen,
+                SessionEvent::ConfigChanged {
+                    mode: Some(mode),
+                    model: None,
+                },
+            );
+        }
 
         self.spawn_reader(Arc::clone(&proc), turn_gen);
         Ok(turn_gen)
@@ -843,13 +889,26 @@ impl SessionBackend for AntigravitySessionBackend {
                 // It is also the ONLY trigger that persists `current_mode_id` (see
                 // session_agent's `persist_side_effects`); without it a task rebuild
                 // reverted the user to the stale create-time mode.
-                self.emit(
-                    turn_gen,
-                    SessionEvent::ConfigChanged {
-                        mode: Some(mode.clone()),
-                        model: None,
-                    },
-                );
+                // Confirm ONLY when the switch really reaches the running turn.
+                //
+                // `ConfigChanged` is what clears the frontend's pending marker, so
+                // emitting it for a deferred switch would flip the picker to "in force"
+                // for precisely the case that has not taken effect — telling the user
+                // their tightening had landed while the agent kept running unattended.
+                // The deferred case confirms itself when the next turn spawns, which is
+                // when agy actually reads the mode off argv.
+                if !self.switch_reaches_current_turn() {
+                    *self.deferred_mode_confirm.lock().await = Some(mode.clone());
+                }
+                if self.switch_reaches_current_turn() {
+                    self.emit(
+                        turn_gen,
+                        SessionEvent::ConfigChanged {
+                            mode: Some(mode.clone()),
+                            model: None,
+                        },
+                    );
+                }
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -897,10 +956,10 @@ impl SessionBackend for AntigravitySessionBackend {
             // direction to be imprecise in: claiming "in force" while the tightening has
             // not reached agy would be the dangerous lie, whereas under-promising a
             // loosening costs the user nothing.
-            mode_switch_effect: if self.in_flight.load(Ordering::SeqCst) {
-                crate::capability::ModeSwitchEffect::NextTurn
-            } else {
+            mode_switch_effect: if self.switch_reaches_current_turn() {
                 crate::capability::ModeSwitchEffect::Immediate
+            } else {
+                crate::capability::ModeSwitchEffect::NextTurn
             },
             ..antigravity_capabilities()
         }
@@ -1134,6 +1193,8 @@ mod tests {
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
+            turn_started_hooked: Arc::new(AtomicBool::new(false)),
+            deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
@@ -1267,6 +1328,8 @@ mod tests {
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
+            turn_started_hooked: Arc::new(AtomicBool::new(false)),
+            deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
@@ -1328,6 +1391,93 @@ mod tests {
         .unwrap();
 
         assert!(!hook.exists(), "full auto must not leave a hook agy would call");
+    }
+
+    /// A session whose turn is running WITH the approval hook installed applies a mode
+    /// switch at once, so it must not claim otherwise.
+    ///
+    /// The gate lives on the host: agy calls back per tool use and
+    /// `request_external_permission` re-reads the mode every time. So while those
+    /// callbacks are happening, a switch governs the very next tool — in both directions.
+    #[tokio::test]
+    async fn a_hooked_turn_applies_a_mode_switch_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("default"), Some("{\"stub\":true}"));
+        b.in_flight.store(true, Ordering::SeqCst);
+        b.turn_started_hooked.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            b.capabilities().mode_switch_effect,
+            crate::capability::ModeSwitchEffect::Immediate,
+            "a hooked turn keeps calling back, so the new mode governs the next tool call"
+        );
+    }
+
+    /// The one case that genuinely has to wait: a turn that started in FULL AUTO has no
+    /// hook on disk, so agy never calls back and the host gate never runs. Tightening
+    /// cannot reach that already-spawned process; it lands when the next turn spawns.
+    ///
+    /// Claiming `Immediate` here would be the dangerous lie -- the user would be told the
+    /// permission was restored while the agent kept running unattended.
+    #[tokio::test]
+    async fn a_full_auto_turn_defers_a_tightening_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("yolo"), Some("{\"stub\":true}"));
+        b.in_flight.store(true, Ordering::SeqCst);
+        b.turn_started_hooked.store(false, Ordering::SeqCst);
+
+        assert_eq!(
+            b.capabilities().mode_switch_effect,
+            crate::capability::ModeSwitchEffect::NextTurn,
+            "no hook was installed for this turn, so agy cannot learn about the switch"
+        );
+    }
+
+    /// Between turns there is no agy process at all, so the next spawn necessarily reads
+    /// the new mode from argv.
+    #[tokio::test]
+    async fn an_idle_session_applies_a_mode_switch_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("yolo"), Some("{\"stub\":true}"));
+        assert_eq!(
+            b.capabilities().mode_switch_effect,
+            crate::capability::ModeSwitchEffect::Immediate
+        );
+    }
+
+    /// A deferred switch must NOT announce itself as applied.
+    ///
+    /// `ConfigChanged` is what clears the frontend's pending marker, so emitting it here
+    /// would flip the picker to "in force" for exactly the case that has not taken effect
+    /// -- the contradiction this pair of rules exists to prevent.
+    #[tokio::test]
+    async fn a_deferred_switch_emits_no_premature_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("yolo"), Some("{\"stub\":true}"));
+        b.in_flight.store(true, Ordering::SeqCst);
+        b.turn_started_hooked.store(false, Ordering::SeqCst);
+        let mut events = b.events();
+
+        b.dispatch(Command::SetMode {
+            mode: "default".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        let confirmed = tokio::time::timeout(std::time::Duration::from_millis(400), async {
+            use futures_util::StreamExt as _;
+            while let Some(env) = events.next().await {
+                if let SessionEvent::ConfigChanged { mode, .. } = env.event {
+                    return mode;
+                }
+            }
+            None
+        })
+        .await;
+        assert!(
+            confirmed.is_err() || confirmed.as_ref().unwrap().is_none(),
+            "a switch agy cannot see yet must not be confirmed, got {confirmed:?}"
+        );
     }
 
     /// A runtime mode switch must emit `ConfigChanged`.
@@ -1396,6 +1546,8 @@ mod tests {
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
+            turn_started_hooked: Arc::new(AtomicBool::new(false)),
+            deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
         };
         assert_eq!(b.effective_mode().as_deref(), Some("default"));
@@ -1469,6 +1621,8 @@ mod tests {
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
+            turn_started_hooked: Arc::new(AtomicBool::new(false)),
+            deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
         };
 
@@ -1601,6 +1755,8 @@ mod tests {
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
+            turn_started_hooked: Arc::new(AtomicBool::new(false)),
+            deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
